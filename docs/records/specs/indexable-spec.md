@@ -1,15 +1,14 @@
 # Indexable — the per-module materialized-view contract
 
-Status: shipped — the wasm index-guest architecture: host-written op feed,
-engine-folded read models (fluent31 changes-mode triggers), per-module view
-guests, boundary stamps, and the join-seam op-row backfill. Since the read-model
-cutover, this tier IS the human-facing read surface: canonical module
-queries serve dispatch alone (§5).
+The wasm index-guest architecture: a host-written op feed, engine-folded read
+models (fluent31 changes-mode triggers), per-module view guests, boundary
+stamps, and the join-seam op-row backfill. This tier IS the human-facing read
+surface: canonical module queries serve dispatch alone (§5).
 Code: `crates/kernel/indexer` (the host store: feed writer + guest converge),
 `crates/kernel/index-guest` (the contract + authoring SDK; `testmap` is the
 reference mapper), the chat/tasks/pages/inbox/saga modules' `src/index.rs`
 (pure decision cores) + `src/index_guest.rs` (wasm shells, packaged by
-`guest-builder --index`), `bin/noded` (the feed, the HTTP lanes, the shared
+`guest-builder --index`), `crates/noded` (the feed, the HTTP lanes, the shared
 store construction with bundled guests), `bin/node` (the validator: live
 feed, replay feed, boundary stamps, the join-seam backfill), `crates/kernel/statesync`
 (the `IndexOps` wire lane + the joiner-side walk).
@@ -157,13 +156,13 @@ the module's state machinery, never `sdk`/`host`/`indexer`.
    folded nothing yet. So a client waiting on the tip must escape by timeout,
    never block on it.
 
-   A mapper UPGRADE was once the hazard here — a swapped wasm left the tip
-   PRESENT over the previous mapper's rows. It no longer is: `converge_guest`
-   REFOLDS unconditionally on any artifact-hash change (clear the derived
-   keyspace, re-drive the fold over the `op/` rows the database already holds,
-   and WAIT it out before `open` returns), so a tip that survives an upgrade
-   vouches for rows the installed mapper produced. `op/` and `meta/` are left
-   alone: a new mapper changes what the rows MEAN, never what the feed saw.
+   A mapper UPGRADE never leaves the tip standing over the previous mapper's
+   rows: `converge_guest` REFOLDS unconditionally on any artifact-hash change
+   (clear the derived keyspace, re-drive the fold over the `op/` rows the
+   database already holds, and WAIT it out before `open` returns), so a tip
+   that survives an upgrade vouches for rows the installed mapper produced.
+   `op/` and `meta/` are left alone: a new mapper changes what the rows MEAN,
+   never what the feed saw.
 5. **Pre-index history is out of scope.** An op referencing state the feed
    never carried (enabled mid-life, boundary stamp) folds to a no-op. The
    honest fixes are replaying the chain through the feed or pulling the
@@ -217,10 +216,10 @@ The split is a DOCTRINE, not a per-module judgment call:
 - **everything a human lists, scrolls, or searches is a view here.** the
   UI's read surface is `/v1/index/{module}/view`, uniformly — chat pages
   and threads, the pages sidebar and comment panels, boards, feeds, search.
-- **modules hold no state in RAM.** the in-memory snapshot-bytes cohort is
-  a transitional shape scheduled for re-platforming onto qmdb + this tier
-  (phase 2+, in dependency order: small registries first, the hot
-  consensus-loop modules — valset, dispatch, saga, runs — last).
+- **modules hold no state in RAM.** every tenant is store-backed (qmdb) or
+  odb-backed except `runs`, the one module still riding the in-memory map
+  backing (`Backing::Map` in `crates/topology`); its re-platforming onto
+  qmdb + this tier is the remaining move.
 
 Exemptions are substrate facts, not preferences: forge's state *is* a git
 repo (cloneable, greppable — an index would be a worse second copy), and
@@ -250,9 +249,8 @@ guest included, is invisible to the sweep and survives), watermark + floor
 stamped, trigger re-registered. Its feed and views honestly BEGIN there,
 visibly via `meta/backfill`; history below a boundary re-enters only by
 replaying blocks through the feed or by the join-seam op-row backfill (§7).
-The former from-state rebuild lane (mappers re-deriving rows from canonical
-`Module::query` state) is deleted with the native mappers: one fold path,
-no second derivation with its own degradation matrix.
+There is one fold path and no second derivation: a mapper never re-derives
+rows from canonical `Module::query` state.
 
 - The index directory stays disposable: delete `<storage>/index` (or one
   module's subdirectory) and the tier heals — boundary stamps at the next
@@ -265,8 +263,8 @@ no second derivation with its own degradation matrix.
   still consumed its height), the journal replay, and post-reboot frame
   catch-up; whatever they cannot reproduce converges on the boundary stamp.
 - A standing RESIDENT feeds like a validator: the replica fold driver folds
-  finalized frames (unified-node phase 2) and applies the per-block index
-  fold from their dispatches. Boundary stamps fire only where state jumped
+  finalized frames and applies the per-block index fold from their
+  dispatches. Boundary stamps fire only where state jumped
   WITHOUT frames — the join bootstrap and backfilled heights — and the
   blocks database gains one honest boundary row there
   (`IndexStore::apply_block_record`).
@@ -377,12 +375,13 @@ The blocks database (`_blocks`) is deliberately NOT backfilled: its rows are
 node-layer observations, not derived state, and a resident writes its own
 honest boundary row instead (`IndexStore::apply_block_record`, §6).
 
-## 8. The index-only node (direction)
+## 8. The index-only node
 
-The tier's shape is chosen so an index-only node is a module-generic
-engine: block stream in (it must be able to READ applied dispatch traces
-from the wire — the one open spec item), per-module databases with their
-guests installed, generic feed writes, generic view/scan/ops routes out.
-Zero per-module native code; mapper upgrades arrive as data (the module-code
-registry distributes index guests exactly like consensus components). That
-node is fluent31's serving surface plus this crate's feed — nothing else.
+The tier's shape is chosen so an index-only node is a module-generic engine:
+block stream in, per-module databases with their guests installed, generic
+feed writes, generic view/scan/ops routes out. Zero per-module native code;
+mapper upgrades arrive as data (the module-code registry distributes index
+guests exactly like consensus components). Such a node is fluent31's serving
+surface plus this crate's feed — nothing else. What it still lacks is a wire
+lane carrying applied dispatch traces; today the feed is written only by a
+node that executes blocks.

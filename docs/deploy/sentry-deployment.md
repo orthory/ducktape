@@ -1,11 +1,9 @@
-# Sentry Deployment Recipes (Phase 1)
+# Sentry Deployment Recipes
 
 How to front a Ducktape validator with a **sentry** so it never exposes a
 public inbound port, while joiners still enter, sync, and promote through it.
-
-This runbook is the maintained source of record for the sentry deployment
-contract: authority vs. reachability, the trust model, and the current operator
-steps.
+A sentry is configuration only; the regression that proves a joiner enters
+through one is `bin/node/tests/sentry_e2e.rs`.
 
 ## Why this is safe
 
@@ -21,7 +19,8 @@ Concretely, a bootstrap hint is `pubkey@addr` and the validator's `advertised`
 address is fully independent of its real `listen` address
 (`bin/node/src/config/resolve.rs`, `resolve_advertised`). Fronting is
 therefore *configuration only*: point `advertised` (and joiners' hints) at the
-sentry, keep `listen` private.
+sentry, keep `listen` private. A sentry is addressed through a plain `direct`
+reach hint naming its public address.
 
 ## (A) Forward sentry (Cosmos-style)
 
@@ -65,9 +64,8 @@ Realizations of the splice, cheapest first:
 - **`nginx stream`** — `stream { server { listen 443; proxy_pass 10.0.0.7:52200; } }`
 - **HAProxy TCP mode** — `mode tcp` frontend/backend.
 - **A small Rust forwarder** — an accept loop that, per connection, dials the
-  target and runs `std::io::copy` in both directions. (The Phase-1 regression
-  test `bin/node/tests/sentry_e2e.rs` stands up exactly such a forwarder to
-  prove a joiner enters through it.)
+  target and runs `std::io::copy` in both directions (`sentry_e2e.rs` stands
+  up exactly such a forwarder).
 
 Run multiple sentries per validator for redundancy — each is just another
 `pubkey@sentry_addr` hint in the bootstrap set. Sentries rotate without touching
@@ -104,32 +102,32 @@ identical ("dial this address, expect this key").
   peer's *tracked address* — which is exactly a fronted validator's situation
   (peers track the sentry's address; the validator dials out from its real
   IP), and a NAT'd member's too. With the bypass, admission is the
-  cryptographic handshake plus key-in-a-tracked-set — the same authorization
-  the retired discovery dialect enforced.
+  cryptographic handshake plus key-in-a-tracked-set.
 
 - **Handshake rate limit funnels through the sentry's IP.** commonware
-  rate-limits inbound handshakes **per source IP** and per subnet (/24 for IPv4,
-  /48 for IPv6) (`allowed_handshake_rate_per_ip` / `_per_subnet`; the listener keys on the
-  accepted socket's IP). A **forward** splice (recipe A) makes the validator see
-  every joiner as coming from the sentry's single IP, so all inbound handshakes
-  share one IP's budget — under a reconnect storm or many simultaneous joiners a
-  single sentry becomes a handshake bottleneck. Today's `local` preset is
-  generous (16/s + burst per IP); the `recommended` preset is ~1 per 5s per IP.
-  Mitigate by running multiple sentries on **distinct IPs** (and distinct /24
-  subnets) — a second, load-distribution reason for the "multiple sentries"
-  guidance above, beyond redundancy. (A transparent splicer does no filtering,
-  and commonware has no PROXY-protocol parsing to recover the real client IP, so
-  fronting *blinds* the validator's own per-IP defenses rather than adding them.)
+  rate-limits inbound handshakes **per source IP** and per subnet (/24 for
+  IPv4, /48 for IPv6), keyed on the accepted socket's IP. A **forward** splice
+  (recipe A) makes the validator see every joiner as coming from the sentry's
+  single IP, so all inbound handshakes share one IP's budget — under a
+  reconnect storm or many simultaneous joiners a single sentry becomes a
+  handshake bottleneck. The `local` preset the node uses allows 16 handshakes
+  per second per IP; commonware's `recommended` preset allows about one per
+  five seconds. Mitigate by running multiple sentries on **distinct IPs** (and
+  distinct /24 subnets) — a second, load-distribution reason for the
+  "multiple sentries" guidance above, beyond redundancy. (A transparent
+  splicer does no filtering, and commonware has no PROXY-protocol parsing to
+  recover the real client IP, so fronting *blinds* the validator's own per-IP
+  defenses rather than adding them.)
 
 - **DNS re-resolution, and the hint pin.** A DNS-named edge
   (`advertised = "sentry.example.com:443"`) stays a hostname in the address
   book and is **re-resolved at every dial** (`Ingress::Dns`; see
-  `config/mod.rs`'s `ingress_of`), so a moved A-record heals on the next
-  dial without a restart. The mesh address book deliberately **pins a DNS
-  hint against live reachability adverts** (`dns_hint_pins_address` in
-  `bin/node/src/mesh_book.rs`): an advert would freeze the name to one stale
-  resolution. The flip side: a fronted validator that moves behind a *new
-  name* needs a descriptor edit — adverts will not retarget a DNS-hinted
+  `ingress_of` in `bin/node/src/config/`), so a moved A-record heals on the
+  next dial without a restart. The mesh address book deliberately **pins a
+  DNS hint against live reachability adverts** (the `dns_hint_pinned` reason
+  in `bin/node/src/mesh_book.rs`): an advert would freeze the name to one
+  stale resolution. The flip side: a fronted validator that moves behind a
+  *new name* needs a descriptor edit — adverts will not retarget a DNS-hinted
   peer.
 
 - **State-sync still terminates at a validator.** The sentry is pure path — it
@@ -140,30 +138,18 @@ identical ("dial this address, expect this key").
   *through* the sentry pipe but *terminates at* the validator behind it.
 
 - **Availability dependency — an in-path sentry is a SPOF, not just a
-  new-connection concern.** A forward splice (recipe A) or reverse tunnel (recipe
-  B) sits **in the data path**: the fronted validator advertises only the sentry
-  and keeps its real `listen` private, so the sentry carries *all* of that
-  validator's inbound mesh traffic for the process lifetime, not merely entry.
-  When the sentry/edge restarts, every inbound connection transiting it drops
-  (keepalive cannot preserve a session whose intermediary died); only sessions
-  the validator itself dialed **out** survive. So a single-sentry outage
-  **partitions that validator** from the mesh — and if it is quorum-critical
-  (e.g. a 2-of-2 set) that is a **liveness** failure (finalization stalls), not
-  merely degraded availability. Mitigate — as a liveness requirement, not an
-  optional nicety — with **multiple independent sentries on distinct IPs** (the
-  bootstrap set is a `Vec`) and/or a redundant advertised path; self-host; keep a
-  direct fallback hint. (An out-of-path *coordinator* — Phase 2 — is where the
-  "established connections survive; only new ones depend on it" framing holds.)
-
-## Scope
-
-Phase 1 ships **no consensus/production behavior change** — it converts an
-already-working, configuration-only capability into a regression-guarded,
-documented one (`bin/node/tests/sentry_e2e.rs`). The typed reach hints
-(`Direct`/`Coordinated` — `crates/workspace-config/src/lib.rs` `Reach`; a
-`Fronted` variant still sits in `Reach` and its codec — `Reach::parse` reads a
-`fronted:` hint and `invite.rs` round-trips it — but no verb emits one: it is
-dead code under the repo's no-legacy rule, left for a deletion of its own, not
-a supported hint), coordinator/STUN
-rendezvous, and the private (WireGuard) cutover are later phases; a sentry is
-addressed through a plain `Direct` hint naming its public address.
+  new-connection concern.** A forward splice (recipe A) or reverse tunnel
+  (recipe B) sits **in the data path**: the fronted validator advertises only
+  the sentry and keeps its real `listen` private, so the sentry carries *all*
+  of that validator's inbound mesh traffic for the process lifetime, not merely
+  entry. When the sentry/edge restarts, every inbound connection transiting it
+  drops (keepalive cannot preserve a session whose intermediary died); only
+  sessions the validator itself dialed **out** survive. So a single-sentry
+  outage **partitions that validator** from the mesh — and if it is
+  quorum-critical (e.g. a 2-of-2 set) that is a **liveness** failure
+  (finalization stalls), not merely degraded availability. Mitigate — as a
+  liveness requirement, not an optional nicety — with **multiple independent
+  sentries on distinct IPs** (the bootstrap set is a `Vec`) and/or a redundant
+  advertised path; self-host; keep a direct fallback hint. An out-of-path
+  [coordinator](coordinator.md) is where the "established connections
+  survive; only new ones depend on it" framing holds.

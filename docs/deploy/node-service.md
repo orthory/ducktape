@@ -12,8 +12,7 @@ checkpoint path (the same one the desktop shell uses on quit; a resident
 installs no handler and simply re-syncs at its next boot), it raises its own open-file
 soft limit to 65536 (`bin/node/src/resource_limits.rs`), and
 `ducktape service run` names systemd as its target (`bin/node/src/services.rs`,
-`RunArgs::enable`: "for scripts and systemd units"). What was missing was the
-recipe; this is it.
+`RunArgs::enable`: "for scripts and systemd units").
 
 ## Where the workspace lives
 
