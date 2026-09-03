@@ -533,20 +533,18 @@ async fn in_the_keystore<T: Send + 'static>(
         .map_err(|_| "the keystore operation did not finish".to_string())?
 }
 
-/// Mint a named wallet under `password`. Returns the 24 recovery words and
-/// pubkey; the fresh wallet becomes the active one and the in-process key
-/// cache is refreshed, so the new identity signs without a restart.
+/// BEGIN this device's key: pick its name and its 24 words, and write
+/// NOTHING. The seed lives only in [`MINTED_PHRASE`] until
+/// [`confirm_recovery_phrase`] reads three of the words back and seals the
+/// key file — so a key file that exists is a key whose only backup someone
+/// has confirmed they hold, and a ceremony abandoned halfway leaves no
+/// half-founded identity behind for the account screens to find.
 ///
-/// Mint this device's key under `password` with NO phrase shown: the words
-/// the keystore hands back are dropped here, because recovery is a passkey
-/// login from another device, not paper. Named after the host (`-2`… on a
-/// collision); the pubkey seeds the identity cache. Returns pubkey-hex.
-///
-/// The pointer write is not allowed to fail this call: it degrades to a
-/// warning, and the user lands on a wallet that is minted but not active,
-/// which the wallet list can still fix.
+/// The password is checked HERE (an 8-char floor is not worth learning after
+/// writing 24 words down) and the name is claimed here too — after the host
+/// (`-2`… on a collision). Returns the wallet name the seal will use.
 pub async fn create_device_key(password: String) -> Result<String, AppError> {
-    let (name, pubkey) = async {
+    async {
         require_password(&password)?;
         let duck = duck_home()?;
         let base = device_key_name();
@@ -558,16 +556,166 @@ pub async fn create_device_key(password: String) -> Result<String, AppError> {
             .ok_or_else(|| {
                 "this host already holds nine device keys — pick one in the wallet list".to_string()
             })?;
-        let minting = {
+        let mut seed = Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, seed.as_mut_slice());
+        hold_minted_phrase(
+            name.clone(),
+            Zeroizing::new(keystore::userkey::mnemonic_of_seed(&seed)),
+        )?;
+        Ok(name)
+    }
+    .await
+    .map_err(app_error)
+}
+
+// ============================================================================
+// the recovery-phrase ceremony — show the 24 words once, then confirm three
+// ============================================================================
+
+/// THE ONLY COPY of a phrase whose key does not exist yet, alive between
+/// [`create_device_key`] and the confirm that seals it. It is deliberately
+/// NOT app state: the screen asks for its rows, the confirm asks whether
+/// three typed words match, and neither answer hands the phrase to anything
+/// that could log, snapshot or persist it. The rows the screen draws are the
+/// one copy that leaves — a render-time `String` per word, gone with the
+/// step. Sealing drops the phrase: the words are shown once, and this app
+/// has no verb that shows them again (`ducktape user key reveal` reads them
+/// back off the key file, which is the thing the phrase is a backup FOR).
+static MINTED_PHRASE: std::sync::Mutex<Option<MintedPhrase>> = std::sync::Mutex::new(None);
+
+struct MintedPhrase {
+    /// the wallet name the confirm will seal these words under.
+    name: String,
+    words: Zeroizing<String>,
+    /// the three 1-based positions this ceremony asks back, ascending.
+    asked: [usize; 3],
+}
+
+/// One row of the phrase screen's two-column grid. Ice cannot index a list,
+/// so the pairing (`1`/`13`, `2`/`14`, …) is done here — twelve rows fit the
+/// launch window without a scroll, twenty-four do not.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct PhraseRow {
+    pub left_number: String,
+    pub left_word: String,
+    pub right_number: String,
+    pub right_word: String,
+}
+
+/// Stash a phrase for the ceremony and pick the words it will ask back.
+///
+/// A phrase too short to ask three distinct words out of is refused rather
+/// than padded: `mnemonic_of_seed` is always 24, so the only way here is a
+/// caller that has stopped handing over a mnemonic, and a prompt that asks
+/// for position 1 three times would hide that instead of showing it.
+fn hold_minted_phrase(name: String, words: Zeroizing<String>) -> Result<(), String> {
+    use rand::seq::SliceRandom as _;
+    let count = words.split_whitespace().count();
+    let mut positions: Vec<usize> = (1..=count).collect();
+    positions.shuffle(&mut rand::rngs::OsRng);
+    let [first, second, third, ..] = positions[..] else {
+        return Err(format!("a recovery phrase is 24 words, not {count}"));
+    };
+    let mut asked = [first, second, third];
+    asked.sort_unstable();
+    let mut held = MINTED_PHRASE.lock().expect("minted recovery phrase");
+    *held = Some(MintedPhrase { name, words, asked });
+    Ok(())
+}
+
+/// The phrase screen's rows, or none when no ceremony is in flight — the
+/// phrase step is reachable only straight off a mint.
+pub fn phrase_rows() -> Vec<PhraseRow> {
+    let held = MINTED_PHRASE.lock().expect("minted recovery phrase");
+    held.as_ref()
+        .map(|phrase| phrase_rows_of(&phrase.words))
+        .unwrap_or_default()
+}
+
+/// The pairing itself, over any phrase — the screen's own test drives this
+/// with a FIXED mnemonic so a capture never carries a real one.
+pub fn phrase_rows_of(words: &str) -> Vec<PhraseRow> {
+    let words: Vec<&str> = words.split_whitespace().collect();
+    let half = words.len().div_ceil(2);
+    (0..half)
+        .map(|row| PhraseRow {
+            left_number: format!("{}", row + 1),
+            left_word: words[row].to_string(),
+            right_number: format!("{}", row + half + 1),
+            right_word: words.get(row + half).copied().unwrap_or("").to_string(),
+        })
+        .collect()
+}
+
+/// "5, 12 and 20" — the positions, in the sentence the two screens name them
+/// in. Ice cannot concatenate, so both sentences are built here.
+fn asked_label(asked: &[usize; 3]) -> String {
+    format!("{}, {} and {}", asked[0], asked[1], asked[2])
+}
+
+/// What the confirm step asks for, or empty when no ceremony is in flight.
+pub fn recovery_prompt() -> String {
+    let held = MINTED_PHRASE.lock().expect("minted recovery phrase");
+    let Some(phrase) = held.as_ref() else {
+        return String::new();
+    };
+    format!(
+        "Type words {} — in that order, separated by spaces.",
+        asked_label(&phrase.asked)
+    )
+}
+
+/// THE CEREMONY'S ONE GATE, decided and nothing else: the three words back,
+/// at the positions [`recovery_prompt`] named, case-insensitively. Hands the
+/// seal below the wallet to write; the refusal names the positions and never
+/// a word.
+fn confirmed_phrase(answer: &str) -> Result<(String, Zeroizing<String>), String> {
+    let held = MINTED_PHRASE.lock().expect("minted recovery phrase");
+    let Some(phrase) = held.as_ref() else {
+        return Err("there is no recovery phrase waiting to be confirmed".to_string());
+    };
+    let words: Vec<&str> = phrase.words.split_whitespace().collect();
+    let typed: Vec<&str> = answer.split_whitespace().collect();
+    let all_three_typed = typed.len() == phrase.asked.len();
+    let every_word_matches = phrase.asked.iter().zip(typed.iter()).all(|(at, typed)| {
+        words
+            .get(at - 1)
+            .is_some_and(|word| word.eq_ignore_ascii_case(typed))
+    });
+    let confirmed = all_three_typed && every_word_matches;
+    if !confirmed {
+        return Err(format!(
+            "Those are not words {}. Check the phrase you wrote down.",
+            asked_label(&phrase.asked)
+        ));
+    }
+    Ok((phrase.name.clone(), phrase.words.clone()))
+}
+
+/// THE END OF THE CEREMONY: three right words seal the key they back.
+/// The seal is `keystore::wallet::import` — the very call `ducktape wallet
+/// import <name>` makes, so the phrase on screen restores this identity byte
+/// for byte, here or on another machine.
+///
+/// A miss (or a seal that fails) keeps the phrase and the step, so a typo
+/// costs a retry and not the account; a pass drops it, and nothing in this
+/// app can show it again. The pointer write is not allowed to fail the call:
+/// it degrades to a warning, and the user lands on a wallet that exists but
+/// is not active, which the wallet list can still fix.
+pub async fn confirm_recovery_phrase(answer: String, password: String) -> Result<String, AppError> {
+    let answer = Zeroizing::new(answer);
+    let (name, words) = confirmed_phrase(&answer).map_err(app_error)?;
+    let pubkey = async {
+        let duck = duck_home()?;
+        let sealing = {
             let (name, password) = (name.clone(), Zeroizing::new(password));
-            in_the_keystore(move || keystore::wallet::create(&duck, &name, &password))
+            in_the_keystore(move || keystore::wallet::import(&duck, &name, &words, &password))
         };
-        let (words, pubkey) = minting.await?;
-        drop(Zeroizing::new(words));
-        Ok((name, pubkey))
+        sealing.await
     }
     .await
     .map_err(app_error)?;
+    end_the_ceremony();
     if activate_wallet(&name).await.is_err() {
         tracing::warn!(
             target: "ducktape::app",
@@ -577,6 +725,12 @@ pub async fn create_device_key(password: String) -> Result<String, AppError> {
     }
     set_local_user_key(hex_decode(&pubkey).ok()).await;
     Ok(pubkey)
+}
+
+/// Let the words go, the moment the key they back exists.
+fn end_the_ceremony() {
+    let mut held = MINTED_PHRASE.lock().expect("minted recovery phrase");
+    *held = None;
 }
 
 /// Re-seal an identity from its 24 words under a new password. Returns the
@@ -750,6 +904,109 @@ mod tests {
         }
         assert!(keystore::wallet::valid_name(&"a".repeat(41)).is_ok());
         assert!(keystore::wallet::valid_name(&"a".repeat(42)).is_err());
+    }
+
+    /// A FIXED phrase — never a minted one, so nothing here can leak a real
+    /// key's backup into a test log.
+    const TEST_PHRASE: &str = "abandon amount liar amount expire adjust cage candy arch gather drum bullet absurd math era live bid rhythm alien crouch range attend journey unaware";
+
+    /// the entropy [`TEST_PHRASE`] encodes: `00 01 02 … 1f`. A fixture, not a
+    /// key — every phrase in this file's tests and in the screen captures is
+    /// this one, so no minted phrase can reach a log or a PNG.
+    const TEST_SEED: [u8; 32] = {
+        let mut seed = [0u8; 32];
+        let mut byte = 0;
+        while byte < 32 {
+            seed[byte] = byte as u8;
+            byte += 1;
+        }
+        seed
+    };
+
+    /// The grid pairs 1↔13, 2↔14 … 12↔24, which is what lets the launch
+    /// window show all 24 words without a scroll.
+    #[test]
+    fn the_phrase_grid_pairs_the_halves() {
+        let rows = phrase_rows_of(TEST_PHRASE);
+        assert_eq!(rows.len(), 12);
+        assert_eq!(rows[0].left_number, "1");
+        assert_eq!(rows[0].left_word, "abandon");
+        assert_eq!(rows[0].right_number, "13");
+        assert_eq!(rows[0].right_word, "absurd");
+        assert_eq!(rows[11].left_number, "12");
+        assert_eq!(rows[11].left_word, "bullet");
+        assert_eq!(rows[11].right_number, "24");
+        assert_eq!(rows[11].right_word, "unaware");
+        assert!(phrase_rows_of("").is_empty());
+    }
+
+    /// THE WHOLE CEREMONY, in one test because [`MINTED_PHRASE`] is a
+    /// process-global slot and two tests racing over it prove nothing: the
+    /// mint hands the words over, the prompt names three positions, a wrong
+    /// answer is refused WITHOUT naming a word and keeps the phrase, the
+    /// right answer hands back the wallet to seal, and the phrase is gone the
+    /// moment the seal is done with it.
+    ///
+    /// The gate is driven, not [`confirm_recovery_phrase`] itself: the seal
+    /// writes a key file into the real `~/.ducktape`, which is not a test's
+    /// to touch. What the seal does with what the gate returns is asserted
+    /// below instead — the phrase IS a `ducktape wallet import` phrase.
+    #[test]
+    fn the_confirm_gate_ends_the_ceremony() {
+        hold_minted_phrase(
+            "device-test".to_string(),
+            Zeroizing::new(TEST_PHRASE.into()),
+        )
+        .expect("a 24-word fixture");
+        assert!(
+            hold_minted_phrase("too-short".to_string(), Zeroizing::new("one two".into())).is_err()
+        );
+        assert_eq!(phrase_rows().len(), 12);
+        let asked = MINTED_PHRASE
+            .lock()
+            .expect("minted recovery phrase")
+            .as_ref()
+            .expect("a phrase is held")
+            .asked;
+        let prompt = recovery_prompt();
+        assert!(prompt.contains(&asked_label(&asked)), "{prompt}");
+        let words: Vec<&str> = TEST_PHRASE.split_whitespace().collect();
+        let right = asked
+            .iter()
+            .map(|at| words[at - 1])
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let refusal = confirmed_phrase("nope nope nope").expect_err("three wrong words pass");
+        assert!(refusal.contains(&asked_label(&asked)), "{refusal}");
+        for word in &words {
+            assert!(
+                !refusal.contains(word),
+                "the refusal leaked a word: {refusal}"
+            );
+        }
+        // a miss keeps the phrase: the retry is still possible.
+        assert_eq!(phrase_rows().len(), 12);
+        // and so is a short answer.
+        assert!(confirmed_phrase(words[asked[0] - 1]).is_err());
+
+        // CASE IS NOT THE TEST — the words are, in order.
+        let (name, sealing) =
+            confirmed_phrase(&right.to_uppercase()).expect("the right words in the right order");
+        assert_eq!(name, "device-test");
+        assert_eq!(sealing.as_str(), TEST_PHRASE);
+        // WHAT THE SEAL IS HANDED is what `ducktape wallet import <name>`
+        // eats — the same `keystore::wallet::import` call, so the words on
+        // screen restore this identity — and it decodes to exactly the seed
+        // the mint drew, which is the whole claim the phrase makes.
+        let seed = keystore::userkey::seed_of_mnemonic(&sealing).expect("a bip39 phrase");
+        assert_eq!(seed, TEST_SEED);
+        assert_eq!(keystore::userkey::mnemonic_of_seed(&seed), TEST_PHRASE);
+
+        end_the_ceremony();
+        assert!(phrase_rows().is_empty(), "the phrase outlived its ceremony");
+        assert_eq!(recovery_prompt(), "");
+        assert!(confirmed_phrase(&right).is_err());
     }
 
     /// A row's pubkey is shortened, never invented.

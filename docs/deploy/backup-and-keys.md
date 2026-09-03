@@ -24,10 +24,32 @@ expected shape, not as a promise.
 | `workspaces/<chain-id>/wireguard.key` | the node / `node join` (`WireGuardKeypair::load_or_generate`) | yes | The tunnel keypair. Regenerable: peers learn the new public key from the next signed mesh record. Losing it costs one re-assembly of every tunnel. |
 | `workspaces/<chain-id>/services.toml`, `work-admit.toml`, `gateway-routes.json`, `invite-fronts.json` | the `service` / `node work` / `gateway` verbs | no | Operator consent and routing. Re-runnable verbs; back them up to avoid re-consenting. |
 | `workspaces/<chain-id>/coord.cap` | the join flow (`crates/workspace-config/src/lib.rs`, `COORD_CAP_FILE`) | no (a capability, not a secret) | The coordinator admission capability a member was issued. Without it a member behind NAT cannot rendezvous through a private (`--genesis-set`) coordinator until re-issued. |
-| `keys/<name>.key` + `keys/active` | `ducktape wallet new` / `wallet import` (`crates/keystore/src/userkey.rs`: argon2id + XChaCha20-Poly1305 at rest, born 0600 with `create_new`; `wallet.rs` owns only the `keys/<name>.key` naming and the `active` pointer) | **yes** (encrypted) | **Your user identity** — the key your account's ops are signed with. The 24-word mnemonic is the backup: `ducktape wallet import` reproduces the same key. Lose both and the account is unreachable until another of its keys adds a new one (`ducktape account key add`); an account with one key is gone. `active` is a one-line pointer, regenerable with `ducktape wallet use`. |
+| `keys/<name>.key` + `keys/active` | `ducktape wallet new` / `wallet import` (`crates/keystore/src/userkey.rs`: argon2id + XChaCha20-Poly1305 at rest, born 0600 with `create_new`; `wallet.rs` owns only the `keys/<name>.key` naming and the `active` pointer) | **yes** (encrypted) | **Your user identity** — the key your account's ops are signed with. The 24-word mnemonic is the backup, and you are handed it exactly once (*The 24 words*, below). Lose both file and phrase and the account is unreachable until another of its keys adds a new one (`ducktape account key add`); an account with one key is gone. `active` is a one-line pointer, regenerable with `ducktape wallet use`. |
 | `modules/*.component.wasm`, `executors/*`, `guest/*` | `make install-node`, `ducktape agent install`, `ops/build-guest-rootfs.sh` | no | Rebuildable from the repository at the same commit. Only `modules/` matters to correctness — a network is founded from it and the genesis root pins its bytes — and it is content-addressed by the chain, so a rebuild from the wrong commit is refused, not silently accepted. |
 
 Nothing under `~/.cargo`, `/tmp/dt-vm-*` or `$XDG_RUNTIME_DIR` needs copying.
+
+### The 24 words
+
+`ducktape wallet import <name>` rebuilds the **key inside** `keys/<name>.key`
+from the mnemonic, byte for byte — stdin takes the mnemonic line first, then a
+password line (`bin/node/src/wallet_cli.rs`). The **file** is not reproduced
+and never will be: every seal draws a fresh argon2 salt and nonce
+(`seal_user_key`) under whatever password you hand it, so the ciphertext
+differs on every restore. Check a restore by the pubkey `wallet import`
+prints, never by comparing file hashes: it is the identity, and it comes back
+identical under a *different* password
+(`crates/keystore/src/wallet.rs`, `create_import_activate_round_trip`). That
+is what the words are for; there is nothing else to back up about a user key.
+
+You are handed them exactly **once**. `ducktape wallet new` prints them, and
+the desktop app's first run shows all 24 and asks three of them back at random
+positions — getting those right is what writes the key file, so an abandoned
+ceremony leaves no key behind. Neither surface will show them a second time.
+
+While you still hold the key file *and* its password, `ducktape user key
+reveal --key $DUCKTAPE_HOME/keys/<name>.key` reads the words back out of it.
+That is the only reveal there is, and it is no help once the disk is gone.
 
 Chat, DMs and members-only channels are **replicated in the clear** to every
 member's node (the chat module gates posting, not reading, and holds no
