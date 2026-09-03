@@ -217,6 +217,8 @@ fn run_node(
 ) {
     // forge_repo is derived by the caller (shared with the http upload-pack lane).
     let duckfs_dir = storage.join("duckfs");
+    // kept past the runtime config: the retained-store sampler walks it.
+    let store_root = storage.clone();
     let rt_cfg = commonware_runtime::tokio::Config::default().with_storage_directory(storage);
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
@@ -267,6 +269,11 @@ fn run_node(
         // runtime metrics. the handles are retained for the block loop's life.
         let metrics = NodeMetrics::register(&context);
         metrics.set_role_phase(noded::NodeRole::Local, noded::NodePhase::Serving);
+        // the retained stores' footprint, on its own slow background task —
+        // the blobstore and the derived index keep every applied op payload
+        // forever and nothing prunes either (#1309), and the daemon fills
+        // both exactly as a validator does.
+        noded::spawn_store_footprint_sampler(metrics.clone(), store_root);
 
         // the observability cell: this single-writer loop is the ONE
         // publisher; the status/peers routes read the cell without crossing

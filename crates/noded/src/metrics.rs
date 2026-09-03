@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     ConsensusOperationalStatus, IndexOperationalStatus, NodeHandle, NodePhase, NodeRole,
-    OperationalStatus, SyncOperationalStatus,
+    OperationalStatus, StoreOperationalStatus, SyncOperationalStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -106,6 +106,24 @@ struct ModuleLabels {
     module: String,
 }
 
+/// labels for the retained-store footprint gauges. LOW-CARDINALITY by
+/// construction: the two names below and nothing else.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct StoreLabels {
+    store: String,
+}
+
+/// the node-local stores that retain op payloads forever, by the name their
+/// gauges carry. `<storage>/blobstore` holds one flat file per op payload
+/// digest; `<storage>/index` holds one indexer op row per dispatch per module.
+const RETAINED_STORES: [(&str, &str); 2] = [("blobstore", "blobstore"), ("index", "index")];
+
+/// how often [`spawn_store_footprint_sampler`] re-walks the retained stores.
+/// they grow by OPS, not by seconds, and the walk is O(files) over a directory
+/// that holds one file per op payload — so it is slow-paced, and it never runs
+/// on a node's own task.
+const STORE_FOOTPRINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// the low-cardinality trigger KIND of a dispatch origin — the metrics label.
 fn origin_kind(origin: &sdk::Origin) -> &'static str {
     match origin {
@@ -142,6 +160,8 @@ pub struct NodeMetrics {
     checkpoint_height: Registered<raw::Gauge>,
     index_poisoned: Registered<raw::Gauge>,
     index_height: Registered<raw::Family<ModuleLabels, raw::Gauge>>,
+    store_bytes: Registered<raw::Family<StoreLabels, raw::Gauge>>,
+    store_entries: Registered<raw::Family<StoreLabels, raw::Gauge>>,
     stream_index_sweeps: Registered<raw::Family<SweepLabels, raw::Counter>>,
     stream_snapshot_samples: Registered<raw::Family<SnapshotLabels, raw::Counter>>,
     operations: Arc<RwLock<OperationalStatus>>,
@@ -260,6 +280,14 @@ impl NodeMetrics {
             index_height: context.family(
                 "ducktape_index_height",
                 "latest fully indexed height by bounded module id",
+            ),
+            store_bytes: context.family(
+                "ducktape_store_bytes",
+                "bytes on disk held by a node-local retained store; nothing prunes these",
+            ),
+            store_entries: context.family(
+                "ducktape_store_files",
+                "files on disk held by a node-local retained store; nothing prunes these",
             ),
             operations: Arc::new(RwLock::new(OperationalStatus {
                 phase_since: unix_seconds(),
@@ -458,12 +486,109 @@ impl NodeMetrics {
         status.storage.indexes = indexes;
     }
 
+    /// publish the retained stores' on-disk footprint, gauges and projection
+    /// together — the same shape [`Self::update_storage`] gives the index
+    /// watermarks.
+    ///
+    /// THESE TWO NUMBERS ONLY CLIMB. Every applied op payload is written to
+    /// `<storage>/blobstore` under its digest and to an indexer op row, and
+    /// nothing removes either (#1309), so an operator's only warning that a
+    /// node is filling its disk is the SLOPE of these gauges.
+    pub fn update_store_footprint(&self, stores: Vec<StoreOperationalStatus>) {
+        for store in &stores {
+            let labels = StoreLabels {
+                store: store.store.clone(),
+            };
+            self.store_bytes
+                .get_or_create(&labels)
+                .set(store.bytes as i64);
+            self.store_entries
+                .get_or_create(&labels)
+                .set(store.entries as i64);
+        }
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        status.storage.stores = stores;
+    }
+
     fn record_finalized_now(&self) {
         let now = unix_seconds();
         self.last_finalized_at.set(now as i64);
         let mut status = self.operations.write().expect("operations lock poisoned");
         status.last_finalized_at = Some(now);
     }
+}
+
+/// sample the retained stores under `storage` forever, off every node task.
+///
+/// The walk is O(files) over a flat directory that gains one file per op
+/// payload, so it runs on `spawn_blocking` and never on the caller's thread —
+/// this measures a growth problem, it must not become one. Started once per
+/// process by the binaries that own a storage directory; a store directory
+/// that does not exist reads as zero rather than an error, because a role that
+/// keeps no blobs is not a fault.
+pub fn spawn_store_footprint_sampler(metrics: NodeMetrics, storage: std::path::PathBuf) {
+    tokio::spawn(async move {
+        loop {
+            let roots = storage.clone();
+            let Ok(sampled) = tokio::task::spawn_blocking(move || sample_stores(&roots)).await
+            else {
+                // the blocking pool is gone: the process is shutting down.
+                return;
+            };
+            for store in &sampled {
+                tracing::debug!(
+                    target: "ducktape::storage",
+                    store = %store.store,
+                    bytes = store.bytes,
+                    entries = store.entries,
+                    "retained store footprint"
+                );
+            }
+            metrics.update_store_footprint(sampled);
+            tokio::time::sleep(STORE_FOOTPRINT_INTERVAL).await;
+        }
+    });
+}
+
+/// every retained store's footprint, in the fixed [`RETAINED_STORES`] order.
+fn sample_stores(storage: &std::path::Path) -> Vec<StoreOperationalStatus> {
+    RETAINED_STORES
+        .iter()
+        .map(|(store, dir)| {
+            let (bytes, entries) = dir_footprint(&storage.join(dir));
+            StoreOperationalStatus {
+                store: (*store).to_string(),
+                bytes,
+                entries,
+            }
+        })
+        .collect()
+}
+
+/// `(bytes, files)` under `root`, recursively. An unreadable directory or
+/// entry contributes nothing: a footprint is an observation, and a partial one
+/// beats refusing to report at all.
+fn dir_footprint(root: &std::path::Path) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            bytes = bytes.saturating_add(meta.len());
+            files = files.saturating_add(1);
+        }
+    }
+    (bytes, files)
 }
 
 fn unix_seconds() -> u64 {
@@ -547,5 +672,67 @@ mod tests {
                 "sync source leaked into an unbounded metric label:\n{scrape}"
             );
         });
+    }
+
+    /// the growth an operator has to see coming: what the retained stores hold
+    /// on disk, on the gauges AND on the projection, from ONE walk (#1309).
+    #[test]
+    fn the_retained_stores_report_what_they_hold_on_disk() {
+        use commonware_runtime::{Metrics as _, Runner as _};
+
+        let root = tempfile::tempdir().expect("tempdir");
+        // the blobstore's real shape: one flat file per op payload.
+        std::fs::create_dir_all(root.path().join("blobstore")).expect("blobstore dir");
+        for (name, len) in [("aa", 3usize), ("bb", 5)] {
+            std::fs::write(root.path().join("blobstore").join(name), vec![0u8; len])
+                .expect("blob file");
+        }
+        // the index's: per-module subdirectories, so the walk has to recurse.
+        std::fs::create_dir_all(root.path().join("index").join("chat")).expect("index dir");
+        std::fs::write(root.path().join("index").join("chat").join("db"), [1u8; 7]).expect("db");
+
+        let sampled = sample_stores(root.path());
+        assert_eq!(
+            sampled,
+            vec![
+                StoreOperationalStatus {
+                    store: "blobstore".into(),
+                    bytes: 8,
+                    entries: 2,
+                },
+                StoreOperationalStatus {
+                    store: "index".into(),
+                    bytes: 7,
+                    entries: 1,
+                },
+            ],
+        );
+
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let metrics = NodeMetrics::register(&context);
+            metrics.update_store_footprint(sample_stores(root.path()));
+
+            assert_eq!(
+                metrics.operational_status().storage.stores[0].bytes,
+                8,
+                "the projection carries the same numbers the gauges do",
+            );
+            let scrape = context.encode();
+            for sample in [
+                r#"ducktape_store_bytes{store="blobstore"} 8"#,
+                r#"ducktape_store_files{store="blobstore"} 2"#,
+                r#"ducktape_store_bytes{store="index"} 7"#,
+            ] {
+                assert!(scrape.contains(sample), "missing {sample:?}:\n{scrape}");
+            }
+        });
+    }
+
+    /// a store directory that does not exist is zero, not a panic: a role that
+    /// keeps no blobs still reports.
+    #[test]
+    fn a_missing_store_directory_reads_as_zero() {
+        let root = tempfile::tempdir().expect("tempdir");
+        assert_eq!(dir_footprint(&root.path().join("blobstore")), (0, 0));
     }
 }

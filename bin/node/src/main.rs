@@ -588,6 +588,12 @@ fn run_node(
         // encode() serves the identical exposition).
         status.wire_metrics(&metrics);
         stream_hub.wire_metrics(&metrics);
+        // the retained stores' footprint, on its own slow background task:
+        // the blobstore and the derived index keep every applied op payload
+        // forever and nothing prunes either, so their size IS the operator's
+        // only warning (#1309). Off the node's task by construction — a walk
+        // of a directory holding one file per op must never ride the loop.
+        noded::spawn_store_footprint_sampler(metrics.clone(), storage_for_sync.clone());
         let exposition_context = context.child("exposition");
         status.wire_exposition(move || exposition_context.encode());
         // `/v1/invite` — the daemon mints its own invites. Minting FOLDS this

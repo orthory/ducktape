@@ -41,6 +41,26 @@ when set, else `~/.ducktape`. The units set
   keys/                      user wallets + `active` pointer (only if you run wallet verbs as this user)
 ```
 
+### What grows, and what nothing prunes
+
+`storage/blobstore` (one flat file per applied op payload, named by its
+sha256) and `storage/index` (one indexer op row per dispatch per module) keep
+**every** op payload forever — there is no retention window, no GC pass and no
+pruning knob today, so both only ever climb. A `files` upload puts its chunk
+bytes through both, so a network moving a few GB of files a month costs each
+node roughly that much again in `blobstore` and again in `index`, plus one
+`blobstore` file per op (100k+ files in that one directory after a few months
+of real use). Watch the slope, per node:
+
+```sh
+curl -s 127.0.0.1:8844/metrics | grep ducktape_store_        # bytes + files per store
+curl -s 127.0.0.1:8844/v1/status | jq .operations.storage.stores
+```
+
+Both are node-local and derived — nothing here is consensus state — so the
+recovery for a full disk is still an operator decision, not one this node
+makes for you.
+
 Every operator verb you run against that tree needs the same view of it:
 
 ```sh

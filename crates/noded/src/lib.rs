@@ -113,7 +113,7 @@ pub use index::{
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;
-pub use metrics::NodeMetrics;
+pub use metrics::{NodeMetrics, spawn_store_footprint_sampler};
 // the block-projection seam: RootOp assembly + explorer-row bytes, shared by
 // the validator drain, the replica park loop, and (as later tasks adopt it) the
 // noded submit lane and simnode. One row shape, pinned by a golden test.
@@ -426,6 +426,23 @@ pub struct StorageOperationalStatus {
     pub checkpoint_height: u64,
     pub index_poisoned: bool,
     pub indexes: Vec<IndexOperationalStatus>,
+    /// what the node-local retained stores hold on disk. NOTHING PRUNES THEM
+    /// (#1309): every applied op payload is written to the blobstore under its
+    /// digest AND to an indexer op row, and neither is ever removed, so these
+    /// numbers only climb. Sampled on a slow cadence off the node's own task
+    /// — see `metrics::spawn_store_footprint_sampler`.
+    pub stores: Vec<StoreOperationalStatus>,
+}
+
+/// one retained node-local store's on-disk footprint.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreOperationalStatus {
+    /// the bounded store name — `blobstore` or `index`.
+    pub store: String,
+    pub bytes: u64,
+    /// files on disk. the blobstore is ONE FLAT DIRECTORY of op-payload
+    /// blobs, so this is also the count an operator's `ls` has to survive.
+    pub entries: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
