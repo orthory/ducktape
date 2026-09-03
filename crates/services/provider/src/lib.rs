@@ -111,6 +111,11 @@ pub const RUN_RUNTIME_DIR: &str = ".ducktape-run";
 /// backends read it to know what to MOUNT — see [`CliProvider::sandbox_ro_paths`].
 const SKILLS_ROOT_ENV: &str = "DUCKTAPE_RUN_SKILLS";
 const RUN_ACTION_URL_ENV: &str = "DUCKTAPE_RUN_ACTION_URL";
+/// the node this run's tool plane dials — the READ half of it, since every
+/// `ducktape mcp` read tool queries this base while writes ride
+/// [`RUN_ACTION_URL_ENV`] and the broker. A sandbox backend must tunnel its
+/// port, or unset it: see [`wire_guest_tunnels`].
+const NODE_URL_ENV: &str = "DUCKTAPE_NODE";
 
 /// the opaque per-run bearer the broker hands the child. NOT a credential: it
 /// authenticates the child to this host's loopback endpoint and dies with the
@@ -715,7 +720,13 @@ impl CliProvider {
             }
         };
 
-        let envs = self.sandbox_env(ctx, auth)?;
+        let mut envs = self.sandbox_env(ctx, auth)?;
+        // wired HERE, before the env is translated and frozen into the
+        // manifest — the name is the warning: it rewrites `envs`.
+        let tunnel_ports = wire_guest_tunnels(
+            &mut envs,
+            auth.broker.map(|broker| broker.base_url.as_str()),
+        );
         let workdir = canonical_mount_path(workdir, "microVM workdir")?;
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -797,28 +808,17 @@ impl CliProvider {
             vcpus,
             mem_mib,
             vsock_uds: microvm_socket(&slot)?,
-            // no tap: the guest reaches this node's broker over vsock and needs
-            // no interface. See the spec's egress section.
+            // no tap: the guest has no NIC, so its whole reach is the vsock
+            // tunnels above. That is no longer the same as "no egress" — those
+            // tunnels now carry this node's ENTIRE http listener, not just the
+            // broker, and `/v1/gateway/proxy` on it dispatches a
+            // `GatewayJob::Http` over the overlay to a publisher node. Its only
+            // gate (`gateway_http::gateway_api_origin_allowed`) is a header
+            // check a plain `curl` passes by sending no headers, so a run CAN
+            // reach off this host. See [`wire_guest_tunnels`] for the full
+            // reach and the open question of narrowing it (#1317).
             tap: None,
         };
-        // The loopback services the guest may reach, tunnelled over vsock: this
-        // run's credential broker and, when the run has one, the node's
-        // run-action RPC. The guest serves the SAME port numbers on its own
-        // loopback, so `http://127.0.0.1:<port>` needs no rewriting on either
-        // side — which is why the container backend's
-        // `host.containers.internal` substitution is gone rather than ported.
-        //
-        // This list IS the allowlist: the host binds one vsock listener per
-        // entry and closes over the destination, so a port that is not here is
-        // not reachable from the guest by any means.
-        let mut tunnel_ports = Vec::new();
-        if let Some(broker) = auth.broker {
-            tunnel_ports.extend(url_port(&broker.base_url));
-        }
-        if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
-            tunnel_ports.extend(url_port(run_action));
-        }
-        tunnel_ports.dedup();
 
         let manifest = guest_manifest::RunManifest {
             argv: manifest_argv,
@@ -1622,11 +1622,139 @@ impl Drop for ContextGuard {
     }
 }
 
-/// the TCP port in an `http://host:port/...` URL, if any — the egress firewall
-/// needs the broker + node-RPC ports as bare numbers.
+/// Pick the guest's tunnel allowlist AND point `envs` at it — `DUCKTAPE_NODE`
+/// is rewritten to the tunnel's own end, or removed when there is no tunnel to
+/// carry it. Both halves are one decision, so they are one call.
+///
+/// The loopback services the guest may reach, tunnelled over vsock: this run's
+/// credential broker, the node's run-action RPC when the run has one, and the
+/// node's own http surface — the READ plane every `ducktape mcp` tool dials
+/// through `DUCKTAPE_NODE`. The guest serves the SAME port numbers on its own
+/// loopback, so `http://127.0.0.1:<port>` needs no rewriting on either side —
+/// which is why the container backend's `host.containers.internal`
+/// substitution is gone rather than ported.
+///
+/// This list IS the allowlist: the host binds one vsock listener per entry and
+/// closes over the destination, so a port that is not here is not reachable
+/// from the guest by any means. It is also why this is the ONE place the node
+/// URL is decided: a `DUCKTAPE_NODE` whose port is not in this list names a
+/// socket the guest cannot open, so [`aim_node_at_guest`] takes the variable
+/// away rather than leave the run half-planed — writes landing over the
+/// run-action lane while every read dies on the guest's own loopback.
+///
+/// **The node entry is a whole http listener, not a read lane.** The VM has no
+/// NIC, so these tunnels ARE the guest's attack surface, and this one is wide.
+/// Reachable from any process in the guest, with no credential:
+/// * the reads the plane exists for — `/v1/query`, `/v1/status`, `/v1/peers`,
+///   `/v1/blocks`, `/v1/index/*`, the `/v1/files/*` duckfs reads, `/metrics`;
+/// * `/v1/submit` — NOT a scoped write: the handler discards the
+///   caller-supplied `origin` and the node re-signs the op with its OWN
+///   consensus key (`crates/noded/src/lib.rs:718`), so a guest can forge any
+///   module op under this node's identity, bypassing the per-run session
+///   signer that `crates/noded/src/agent_provision/session.rs` exists to
+///   provide. `/v1/submit/frame` needs a real signature and does not;
+/// * the routine writes — `/v1/invite` (mints an invite to this mesh),
+///   `/v1/files/` stage/commit/pin, `/v1/files/object/{path}` PUT and DELETE,
+///   `/v1/fs/workspaces` create + commit + delete, `/v1/services/hello`,
+///   `/v1/log-filter`, and the `/forge/{repo}` git receive-pack remote;
+/// * `/v1/term/sessions` — a guest can spawn an interactive terminal on this
+///   node, and with a `cred` in the body one on ANOTHER node
+///   (`term::create_remote`);
+/// * `/v1/ws` — no credential of any kind, and it carries the `logs` topic, so
+///   a guest can read this operator's log ring;
+/// * EGRESS OFF THIS HOST — `/v1/gateway/proxy` dispatches a `GatewayJob::Http`
+///   over the overlay to a publisher node, and its only gate,
+///   `gateway_http::gateway_api_origin_allowed`, is a header check a native
+///   caller passes by sending no headers. `/v1/gateway/browser` likewise.
+///
+/// Out of reach: every other port and every other address on this host (no
+/// listener is bound for them, with or without a NIC), and `/v1/admin/*` —
+/// which rides this same listener by design but whose own middleware wants the
+/// operator credential or an owner PoP, and a run's env is an allowlist that
+/// carries neither.
+///
+/// Narrowing this to a scoped read lane is the open half of #1317, and this
+/// function is the one place such a lane would replace.
+fn wire_guest_tunnels(envs: &mut Vec<(String, String)>, broker_base: Option<&str>) -> Vec<u16> {
+    let mut ports = Vec::new();
+    ports.extend(broker_base.and_then(url_port));
+    if let Some((_, run_action)) = envs.iter().find(|(key, _)| key == RUN_ACTION_URL_ENV) {
+        ports.extend(url_port(run_action));
+    }
+    // three distinct listeners on one host, so three distinct ports: nothing to
+    // dedup, and a duplicate would be a bug upstream rather than a collision to
+    // absorb here.
+    ports.extend(aim_node_at_guest(envs));
+    ports
+}
+
+/// Point `DUCKTAPE_NODE` at the guest end of its tunnel, or take it away —
+/// returning the host port to tunnel when there is one.
+///
+/// A run that keeps an unreachable node URL fails one socket at a time, deep
+/// inside an agent's tool call; a run with no node URL is TOLD it has no node
+/// (`bin/node`'s MCP server answers `NodeError::Unbound` by name). The second
+/// is the only honest half-plane.
+fn aim_node_at_guest(envs: &mut Vec<(String, String)>) -> Option<u16> {
+    let index = envs.iter().position(|(key, _)| key == NODE_URL_ENV)?;
+    match guest_node_url(&envs[index].1) {
+        Ok((port, guest_url)) => {
+            envs[index].1 = guest_url;
+            Some(port)
+        }
+        Err(reason) => {
+            // once per RUN boot — a node whose http base is not v4 loopback
+            // refuses this on every sandboxed run it ever starts — and it costs
+            // that run its whole read plane.
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                reason,
+                "this node's http base cannot be tunnelled into a guest; the run gets no read plane"
+            );
+            envs.remove(index);
+            None
+        }
+    }
+}
+
+/// The guest-side form of a node http base, and the host port that carries it.
+///
+/// The tunnel is loopback-to-loopback and BOTH ends are fixed: the guest binds
+/// `127.0.0.1:<port>` (`duck-guest-init`'s `start_tunnel`) and the host end
+/// dials `127.0.0.1:<port>` (`sandbox::microvm::serve_tunnel`). So a base that
+/// names no port, or a host this node does not serve on v4 loopback, cannot be
+/// carried at all — whatever it means on the host.
+fn guest_node_url(url: &str) -> Result<(u16, String), &'static str> {
+    let (authority, path) = split_authority(url);
+    let (host, port) = authority.rsplit_once(':').ok_or("node_url_no_port")?;
+    let port: u16 = port.parse().map_err(|_| "node_url_no_port")?;
+    // a v6 authority keeps its brackets here (`[::1]`) and fails this parse,
+    // which is the intent: `serve_tunnel` has no v6 dial to offer it.
+    let host_is_v4_loopback = host
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_loopback());
+    let host_is_loopback_name = host == "localhost";
+    if !(host_is_v4_loopback || host_is_loopback_name) {
+        return Err("node_url_not_loopback");
+    }
+    Ok((port, format!("http://127.0.0.1:{port}{path}")))
+}
+
+/// the TCP port in an `http://host:port/...` URL, if any — the tunnel
+/// allowlist needs the broker, run-action and node http ports as bare numbers.
 fn url_port(url: &str) -> Option<u16> {
+    authority_port(split_authority(url).0)
+}
+
+/// split `scheme://authority/rest` into its authority and everything from the
+/// first `/` on (`""` when there is none).
+fn split_authority(url: &str) -> (&str, &str) {
     let after_scheme = url.split("://").nth(1).unwrap_or(url);
-    let authority = after_scheme.split('/').next().unwrap_or("");
+    let end = after_scheme.find('/').unwrap_or(after_scheme.len());
+    after_scheme.split_at(end)
+}
+
+fn authority_port(authority: &str) -> Option<u16> {
     authority.rsplit(':').next()?.parse().ok()
 }
 
@@ -5398,5 +5526,78 @@ format = "text"
     #[ignore = "live model turn: spends codex quota; needs /dev/kvm and a built guest rootfs"]
     async fn codex_model_turn_in_a_microvm() {
         live_model_turn("codex").await;
+    }
+
+    fn env_of(envs: &[(String, String)], key: &str) -> Option<String> {
+        envs.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.to_string())
+    }
+
+    /// the READ plane. Writes ride the broker and the run-action lane, both
+    /// already tunnelled; without the node's own port every `ducktape mcp`
+    /// read tool dies on the guest's own loopback (#1317).
+    #[test]
+    fn the_guest_allowlist_carries_the_node_read_plane() {
+        let mut envs = vec![
+            (NODE_URL_ENV.into(), "http://127.0.0.1:8844".into()),
+            (
+                RUN_ACTION_URL_ENV.into(),
+                "http://127.0.0.1:41111/v1/run-action".into(),
+            ),
+        ];
+        let ports = wire_guest_tunnels(&mut envs, Some("http://127.0.0.1:54321/v1"));
+        assert_eq!(ports, vec![54321, 41111, 8844]);
+        assert_eq!(
+            env_of(&envs, NODE_URL_ENV).as_deref(),
+            Some("http://127.0.0.1:8844"),
+            "the guest dials the tunnel's own end"
+        );
+    }
+
+    /// a wildcard bind reaches here as loopback already ([`node_http_base`] in
+    /// `crates/noded`), so the interesting case is the one that does not: the
+    /// var must go with the tunnel it depended on.
+    #[test]
+    fn a_node_url_that_cannot_be_tunnelled_is_taken_away() {
+        for base in [
+            "http://192.168.1.5:8844", // a concrete LAN bind: no tunnel reaches it
+            "http://[::1]:8844",       // `serve_tunnel` has no v6 dial
+            "http://node.local",       // no port to bind either end on
+        ] {
+            let mut envs = vec![(NODE_URL_ENV.into(), base.to_string())];
+            let ports = wire_guest_tunnels(&mut envs, None);
+            assert!(ports.is_empty(), "{base} was tunnelled: {ports:?}");
+            assert_eq!(
+                env_of(&envs, NODE_URL_ENV),
+                None,
+                "{base} left the guest a node URL it cannot dial"
+            );
+        }
+    }
+
+    /// `localhost:<port>` is the operator's own string (node.toml's
+    /// `http_listen` is trusted verbatim when it is not a socket address), and
+    /// the guest has no resolver — so the port is tunnelled and the name is
+    /// rewritten, path and all.
+    #[test]
+    fn a_named_loopback_node_url_is_rewritten_for_the_guest() {
+        let mut envs = vec![(NODE_URL_ENV.into(), "http://localhost:8844/base".into())];
+        let ports = wire_guest_tunnels(&mut envs, None);
+        assert_eq!(ports, vec![8844]);
+        assert_eq!(
+            env_of(&envs, NODE_URL_ENV).as_deref(),
+            Some("http://127.0.0.1:8844/base")
+        );
+    }
+
+    /// no node URL at all (a node serving no http surface) is not a failure:
+    /// nothing is tunnelled and nothing is invented.
+    #[test]
+    fn a_run_with_no_node_url_tunnels_only_its_broker() {
+        let mut envs = vec![("HOME".into(), "/home/duck".into())];
+        let ports = wire_guest_tunnels(&mut envs, Some("http://127.0.0.1:54321/v1"));
+        assert_eq!(ports, vec![54321]);
+        assert_eq!(envs.len(), 1);
     }
 }
