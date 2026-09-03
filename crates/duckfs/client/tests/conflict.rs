@@ -237,7 +237,7 @@ fn rebase_arm_resubmits_once_with_the_new_head_as_base() {
 // ---- 2: a GC'd base -> re-checkout remedy, no rebase ------------------------
 
 #[test]
-fn a_gc_d_base_reports_a_re_checkout_remedy() {
+fn a_gc_d_base_stashes_local_work_and_reports_a_re_checkout_remedy() {
     let node = ModuleNode::new();
     node.seed_commit(
         None,
@@ -265,11 +265,32 @@ fn a_gc_d_base_reports_a_re_checkout_remedy() {
     let before = node.commit_calls.get();
     let err = commit(&node, dir.path(), "mine").unwrap_err();
     match err {
-        CommitError::Conflict(report) => assert!(
-            report.remedy.contains("re-checkout"),
-            "the GC'd-base remedy names a re-checkout: {}",
-            report.remedy
-        ),
+        CommitError::Conflict(report) => {
+            assert!(
+                report.remedy.contains("re-checkout"),
+                "the GC'd-base remedy names a re-checkout: {}",
+                report.remedy
+            );
+            // the remedy destroys the working copy, so the work is copied aside
+            // first and the remedy names where — the whole point of the stash.
+            let stash = dir.path().join(".duckfs").join("stash");
+            let run = fs::read_dir(&stash)
+                .expect("a stash directory")
+                .next()
+                .expect("one timestamped stash run")
+                .unwrap()
+                .path();
+            assert_eq!(
+                fs::read(run.join("mine.txt")).expect("the edited file was stashed"),
+                b"v1",
+                "the stash holds the LOCAL bytes, not the base's"
+            );
+            assert!(
+                report.remedy.contains(run.to_str().unwrap()),
+                "the remedy names the stash directory: {}",
+                report.remedy
+            );
+        }
         other => panic!("expected a conflict report, got {other}"),
     }
     assert_eq!(
