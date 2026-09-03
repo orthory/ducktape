@@ -240,7 +240,18 @@ from that wallet) only the PoP does.
 The refusals tell the two apart: a token presented to an owned `public` node is
 `401 owner_signature_invalid` (wrong credential TYPE), never `403
 operator_token_mismatch` (right type, wrong secret). `DUCKTAPE_ADMIN=off`
-removes the routes entirely — 404, and no token is minted at all.
+removes the routes entirely — 404. The token is still minted there, because it
+is no longer the admin namespace's alone (below).
+
+**The DATA plane wants a credential too.** Every MUTATING `/v1` route —
+`/v1/submit`, `/v1/invite`, the duckfs writes, `/v1/files/object/{path}`
+PUT/DELETE, `/v1/fs/workspaces`, `/v1/term/sessions`, `/v1/log-filter` — takes
+EITHER a per-request user signature or that same operator credential, in the
+same `x-ducktape-admin-token` header. Reads stay open. So a QA `curl` that
+writes carries `-H "x-ducktape-admin-token: $(cat "$WORKSPACE/admin.token")"`,
+and a `401 signature_missing` on a route that used to work means exactly that
+header is missing. The forge's `git-receive-pack` wants the same credential
+through git's `http.extraHeader`, or a `git push --signed` certificate.
 
 Never paste either credential (or a token file's contents) into a report. For
 merged-worktree cleanup, dry-run

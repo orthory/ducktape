@@ -802,7 +802,7 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
     // per-request user signature. The app already reads this same directory for
     // the service-link token, and a node with no local workspace here is a
     // REMOTE one — read-only from this device, which the node's own 401 says.
-    let client = match operator_token_for(&configured) {
+    let client = match operator_token_for(client.origin()) {
         Some(token) => client.with_operator_token(token),
         None => client,
     };
@@ -810,10 +810,17 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
     Ok(client)
 }
 
-/// The `admin.token` of the node serving `endpoint`, if this device has its
+/// The `admin.token` of the node serving `origin`, if this device has its
 /// workspace registered.
-fn operator_token_for(endpoint: &str) -> Option<String> {
-    let (_, workspace) = super::shell::workspace_at(endpoint)?;
+///
+/// Matches on the ALREADY-CANONICAL origin the client just parsed, never
+/// through `shell::workspace_at` — that canonicalizes by calling
+/// [`rpc_client`], which is where this runs, holding its cache lock. The
+/// bug that shape produced was not a slow test but a dead process.
+fn operator_token_for(origin: &str) -> Option<String> {
+    let (_, workspace) = super::shell::registered_workspaces()
+        .into_iter()
+        .find(|(_, dir)| super::shell::workspace_endpoint(dir).as_deref() == Some(origin))?;
     let token = std::fs::read_to_string(workspace.join("admin.token")).ok()?;
     let token = token.trim().to_string();
     (!token.is_empty()).then_some(token)

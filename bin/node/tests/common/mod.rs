@@ -292,6 +292,35 @@ impl NetworkShapeCluster {
         git_push_env_for(&self.workspace(idx))
     }
 
+    /// one request against node `idx`'s app surface, carrying that node's
+    /// operator credential — the shape-cluster twin of [`Cluster::http`].
+    pub fn http(
+        &self,
+        idx: usize,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        let token = noded::admin::read_operator_token(&self.workspace(idx))
+            .expect("the node minted an operator credential");
+        let bytes = body
+            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+            .unwrap_or_default();
+        let (status, raw) = nettest::try_http_bytes_with(
+            self.http_ports[idx],
+            method,
+            path,
+            "application/json",
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &token)],
+            &bytes,
+        )
+        .expect("app-surface request");
+        (
+            status,
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
     pub fn init_founder(&self, name: &str) -> String {
         // the join protocol refuses to mint an invite from a member with no reachability
         // plane, and this harness is deliberately coordinator-free — so every

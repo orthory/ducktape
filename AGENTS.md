@@ -114,8 +114,9 @@
   the wedged state you restarted to look at:
   `ducktape node log-filter 'info,ducktape::join=debug' -n <chain-id>`
   (the route MUTATES the process — a `trace` filter fills the disk — so it takes
-  a user-signed request; the verb signs with the active wallet key, `curl`
-  cannot.)
+  a credential like every other mutating `/v1` route: the verb signs with the
+  active wallet key, and a bare `curl` needs
+  `-H "x-ducktape-admin-token: $(cat <workspace>/admin.token)"`.)
 
 ## Rust Gates
 

@@ -10,23 +10,21 @@
 //! request's signature proved possession of ([`crate::signed_req::SignedBy`]) —
 //! and never a caller-supplied string. duckfs charges the commit author, the
 //! `/home/<owner>/**` authority and the staging quota to it, so it is the one
-//! thing here that must not be a default (#1312).
+//! thing here that must not be a default (#1312). A write admitted by the
+//! node's OPERATOR CREDENTIAL instead carries the node's own name, which is
+//! true: the writer there is a daemon acting for the node (`ducktape fs`
+//! signs, so a person's commit is a person's).
 //!
-//! TWO CEILINGS, both open, both stated rather than implied:
-//!
-//! 1. these routes are not in the signed-write table yet, so in practice the
-//!    acting key is still the daemon's own name. what holds them open is that
-//!    their in-tree writers hold no key: `duckfs-client`'s `HttpNode`
-//!    (`ducktape fs`), the app's storage backend, MCP, and the in-process
-//!    agent-run provisioner, which writes duckfs through
-//!    `node_link::NodeLink::files()`. see the inventory on `signed_req::Lane`.
-//! 2. even signed, `bin/node`'s validator ingress re-signs an unframed submit
-//!    with the NODE's key (`validator/run/ingress.rs`), because a frame's
-//!    origin IS its signer and the codec has no on-behalf-of field. carrying
-//!    user authorship all the way to consensus needs the CLIENT to sign the
-//!    frame (`/v1/submit/frame`, which duckfs already speaks —
-//!    `bin/node/tests/fs_signed_frame_e2e.rs`), or a codec that can carry a
-//!    delegation. either is a wire decision, not a plumbing one.
+//! THE CEILING, stated rather than implied: `bin/node`'s validator ingress
+//! re-signs an unframed submit with the NODE's key
+//! (`validator/run/ingress.rs`), because a frame's origin IS its signer and the
+//! codec has no on-behalf-of field. So on a validator the acting key threaded
+//! here reaches the actor and stops; the embedded daemon and the sim, which
+//! honour the origin they are handed, record it. Carrying user authorship all
+//! the way to consensus needs the CLIENT to sign the frame
+//! (`/v1/submit/frame`, which duckfs already speaks —
+//! `bin/node/tests/fs_signed_frame_e2e.rs`), or a codec that can carry a
+//! delegation. Either is a wire decision, not a plumbing one.
 //!
 //! extracted from `lib.rs` (which is already over the file-size cap) so the
 //! duckfs surface grows in its own module; the workspace rpc (task 9) reuses the

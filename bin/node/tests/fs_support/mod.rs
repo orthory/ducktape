@@ -45,6 +45,12 @@ impl Harness {
         self.daemon.node_url()
     }
 
+    /// the header a mutating request carries — the harness owns this node, so
+    /// it presents the operator credential the daemon minted.
+    pub fn write_header(&self) -> (&'static str, &str) {
+        self.daemon.write_header()
+    }
+
     /// a duckfs transport whose writes this node admits: the harness owns the
     /// node, so it presents the operator credential the daemon minted.
     pub fn files(&self) -> duckfs_client::http::HttpNode {
