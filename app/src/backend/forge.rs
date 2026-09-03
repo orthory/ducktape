@@ -222,9 +222,10 @@ pub async fn load_forge_discussion(
 ) -> Result<ForgeDiscussionData, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
+        let names = names();
         let (message_page, members) = tokio::try_join!(
             load_messages(&rpc, &channel_id),
-            load_channel_members(&rpc, &channel_id)
+            load_channel_members(&rpc, &channel_id, &names)
         )?;
         Ok(ForgeDiscussionData {
             channel_id,

@@ -737,11 +737,22 @@ pub(crate) async fn git_receive_pack(
     // pubkey the permanent owner and every later signed push was refused as
     // "only the owner" (#1292). The data-plane signature is NOT a third way:
     // it covers a body digest, and `git push` computes the packfile itself.
+    //
+    // CONSUME-AND-REFUSE, LIKE EVERY OTHER PUSH REFUSAL BELOW. The pack is
+    // fully received by now, and an HTTP 401 at this point is what git prints
+    // as "the remote end hung up unexpectedly" — the one sentence that says
+    // nothing about signing. A `report-status` with `ng` per ref is what git
+    // renders as `! [remote rejected] main -> main (<reason>)`, so the reason
+    // reaches the person who has to act on it.
     if cert.is_none() && operator.is_none() {
         const REFUSAL: &str = "this push carries no proof: sign it (`git push --signed`) \
                                or present this node's operator credential";
         push_refused(&repo, "push_unauthenticated", REFUSAL);
-        return error_response(StatusCode::UNAUTHORIZED, REFUSAL);
+        let results: Vec<(String, Option<String>)> = cmds
+            .into_iter()
+            .map(|(_, _, refname)| (refname, Some(REFUSAL.to_string())))
+            .collect();
+        return git_report_status(&results);
     }
 
     // only branches are pushable (no tags/notes). consume-and-refuse: the pack

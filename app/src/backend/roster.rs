@@ -1,4 +1,5 @@
 use super::*;
+use identity::{AccountNumber, AccountView, IdentityQuery, IdentityReply};
 
 /// One member of the network: a validator (quorum seat), a resident
 /// (mesh + statesync standing), or a registered agent.
@@ -22,6 +23,116 @@ pub struct MemberRow {
 pub struct MembersData {
     pub generation: i64,
     pub members: Vec<MemberRow>,
+}
+
+/// The network's name directory as this process last read it: the account
+/// name bound to every user key. Every surface that names a key reads it, and
+/// every read of the identity roster ([`read_accounts`]) rewrites it whole —
+/// on each chat load, before a row renders, and on every identity op the live
+/// stream delivers.
+static NAME_DIRECTORY: std::sync::RwLock<NameDirectory> =
+    std::sync::RwLock::new(NameDirectory::empty());
+
+/// The directory as last read — a snapshot the caller owns, so a loader can
+/// lend it across its awaits and the update thread can read it without one.
+pub(crate) fn names() -> NameDirectory {
+    NAME_DIRECTORY
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Every identity account, paged the way the module serves them: numbered
+/// from 1 with no gaps, at most `MAX_QUERY_LIMIT` per page. THE ONE read of
+/// the identity roster; the name directory is rewritten from what it returns.
+pub(crate) async fn read_accounts(client: &RpcClient) -> Result<Vec<AccountView>, String> {
+    let page_limit =
+        usize::try_from(identity::MAX_QUERY_LIMIT).expect("the identity page cap fits a usize");
+    let mut accounts: Vec<AccountView> = Vec::new();
+    let mut from: AccountNumber = 0;
+    loop {
+        let reply: IdentityReply = client
+            .query(
+                "identity",
+                &IdentityQuery::All {
+                    from,
+                    limit: identity::MAX_QUERY_LIMIT,
+                },
+            )
+            .await?;
+        let IdentityReply::Accounts(page) = reply else {
+            return Err("the identity module returned the wrong reply".to_string());
+        };
+        let page_is_last = page.len() < page_limit;
+        let Some(last) = page.last().map(|account| account.number) else {
+            break;
+        };
+        accounts.extend(page);
+        if page_is_last {
+            break;
+        }
+        from = last + 1;
+    }
+    *NAME_DIRECTORY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory_of(&accounts);
+    Ok(accounts)
+}
+
+/// The directory an account list binds: every key of an account carries the
+/// account's name.
+pub(crate) fn directory_of(accounts: &[AccountView]) -> NameDirectory {
+    NameDirectory::new(
+        accounts
+            .iter()
+            .flat_map(|account| {
+                account
+                    .keys
+                    .iter()
+                    .map(move |key| (hex_encode(&key.pubkey), account.name.clone()))
+            })
+            .collect(),
+    )
+}
+
+/// Refresh the directory and nothing else — what a chat load does before it
+/// renders a row.
+pub(crate) async fn refresh_names(client: &RpcClient) -> Result<(), String> {
+    read_accounts(client).await.map(|_accounts| ())
+}
+
+/// What every chat renderer is handed: this device's key (the `by me` facts)
+/// and the directory (every label), owned so a loader can lend a
+/// [`ChatReader`] across its awaits.
+pub(crate) struct ReaderFacts {
+    key: Option<Vec<u8>>,
+    names: NameDirectory,
+}
+
+impl ReaderFacts {
+    pub(crate) async fn current() -> Self {
+        Self {
+            key: local_user_key().await,
+            names: names(),
+        }
+    }
+
+    /// The update thread's reading — it cannot await, so it takes the cached
+    /// key (warm by the time anyone sends) and the directory as last read.
+    pub(crate) fn cached() -> Self {
+        Self {
+            key: rpc::cached_user_key(),
+            names: names(),
+        }
+    }
+
+    pub(crate) fn reader(&self) -> ChatReader<'_> {
+        ChatReader::new(self.key.as_deref(), &self.names)
+    }
+
+    pub(crate) fn names(&self) -> &NameDirectory {
+        &self.names
+    }
 }
 
 /// Load the roster: validators, then residents, then the registered agents —

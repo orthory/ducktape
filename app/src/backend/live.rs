@@ -737,12 +737,7 @@ pub fn fold_live_chat(
             .find(|message| message.seq > unread_boundary)
             .map_or(0, |message| message.seq)
     };
-    let rooms = chat_sidebar_rooms(
-        channels.clone(),
-        dm_peers.clone(),
-        me,
-        channel_reads.clone(),
-    );
+    let rooms = chat_sidebar_rooms(channels.clone(), dm_peers.clone(), channel_reads.clone());
     let dm_rows = chat_sidebar_dms(channels.clone(), dm_peers, channel_reads.clone());
 
     let has_older_history = messages
@@ -827,14 +822,14 @@ pub(crate) async fn folded_update(
     };
     match module {
         "chat" => {
-            let current_user = local_user_key().await;
+            let facts = ReaderFacts::current().await;
             let origin_kind = stream_origin_kind(&op.origin.kind);
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
                 origin_kind,
                 op.origin.id.as_deref(),
-                current_user.as_deref(),
+                facts.reader(),
                 op.height,
             );
             let delta = match folded {
@@ -997,7 +992,7 @@ fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
 /// off-loop — identical payload, no checkpoint tax.
 pub(crate) async fn load_channel_row(rpc: &str, channel_id: &str) -> Result<ChatChannel, String> {
     let rpc = rpc_client(rpc)?;
-    let (channel, _roster) = load_channel_facts(&rpc, channel_id, None).await?;
+    let (channel, _roster) = load_channel_facts(&rpc, channel_id, ChatReader::nobody()).await?;
     Ok(channel)
 }
 
@@ -1627,10 +1622,10 @@ pub async fn load_chat_hit(
         if reply.thread != Some(root_seq) {
             return Err("search result does not belong to the selected thread".into());
         }
-        let current_user = local_user_key().await;
+        let facts = ReaderFacts::current().await;
         chat.active_thread_seq = root.seq;
         chat.thread_target_seq = number_i64(target_seq);
-        chat.thread_messages = vec![root, chat_message(reply, current_user.as_deref())];
+        chat.thread_messages = vec![root, chat_message(reply, facts.reader())];
         Ok(chat)
     }
     .await
@@ -1759,21 +1754,9 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
     async {
         let client = rpc_client(&rpc)?;
         let me = local_user_key().await;
-        let reply: IdentityReply = client
-            .query(
-                "identity",
-                &IdentityQuery::All {
-                    from: 0,
-                    limit: identity::MAX_QUERY_LIMIT,
-                },
-            )
-            .await?;
-        let accounts = match reply {
-            IdentityReply::Accounts(accounts) => accounts,
-            IdentityReply::Account(_) | IdentityReply::Gen(_) => {
-                return Err("the identity module returned the wrong reply".to_string());
-            }
-        };
+        // The same read that refreshes the name directory: an identity op
+        // reloads this directory, and every label on screen moves with it.
+        let accounts = read_accounts(&client).await?;
         // self is the account THIS key is a member of (a key holds at most one).
         let is_mine = |account: &AccountView| {
             me.as_ref()
@@ -1942,12 +1925,13 @@ pub async fn open_dm(
             password.clone(),
         )
         .await?;
+        let names = names();
         let seated = members
             .iter()
             .map(|key| {
                 let handle = hex_encode(key);
                 ChatMember {
-                    label: short_label(&handle),
+                    label: names.member_label(&handle),
                     key: handle,
                 }
             })

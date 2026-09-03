@@ -154,12 +154,12 @@ on workspace_connected(next)
   return if next.generation != connect_generation
   rpc = next.rpc
   connected_rpc = next.rpc
-  network_name = network_label(account_name, connected_rpc)
+  network_name = network_label(network_chain_id, connected_rpc)
   status = next.status
   block_height = next.height
   channels = next.channels
   channel_reads = initial_channel_reads(next.channels, channel_reads)
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   unread_boundary = 0
   // A connect answers with the LATEST page of whatever room it landed on, so
@@ -340,6 +340,13 @@ on live_updated(next)
           from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", dm_peers_generation)
           try request -> done request
           done -> dm_peers_load_selected _
+        // An identity op moves the name directory, and every chat label on
+        // screen is rendered through it — so the chat plane is re-read the
+        // way a resync reads it, names first.
+        flow
+          from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", hydration_generation)
+          try request -> done request
+          done -> names_moved_selected _
         flow
           from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, "", agents_generation)
           try request -> done request
@@ -477,7 +484,7 @@ on live_resynced(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, resync_tail_channel, channel_head_seq(channels, resync_tail_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A resync carries whatever page was active WHEN IT WAS ISSUED and takes
   // several queries to answer, so a mutation landing in between leaves it
@@ -671,7 +678,7 @@ on select_shell_tab(next)
   unread_boundary = keep_i64(chat_tab_arrivals, channel_last_read(channel_reads, chat_tab_channel), unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, chat_tab_channel, channel_head_seq(channels, chat_tab_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // MENU-ONLY STATE BELONGS TO THE SCREEN THAT MOUNTED IT, and every one of
   // these surfaces is mounted under an arm of `match tab`. Left set, an armed
@@ -839,6 +846,13 @@ on dm_peers_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != dm_peers_generation
   return if obsolete_request
   run replace lane=dm_peers_load load_dm_peers(request.rpc, request.generation) -> dm_peers_loaded _ | dm_peers_failed _
+
+on names_moved_selected(request)
+  let obsolete_request = request.rpc != connected_rpc || request.generation != hydration_generation
+  return if obsolete_request
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
 
 on forge_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != forge_generation

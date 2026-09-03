@@ -551,23 +551,38 @@ fn message_actions_require_explicit_intent() {
     assert_eq!(app.message_action, MessageAction::Delete);
 }
 
+/// Seats this device's key as the reader the mint names, and returns the
+/// label a COMMITTED row of hers carries — the same directory lookup the
+/// window fold runs — so a test never hand-writes the reader's label.
+fn seat_reader(byte: u8) -> String {
+    let key = vec![byte; 32];
+    iced_test::futures::futures::executor::block_on(backend::set_local_user_key(Some(
+        key.clone(),
+    )));
+    backend::author_display(
+        &format!("user:{}", backend::hex_encode(&key)),
+        &backend::names(),
+    )
+}
+
 /// A SEND CONTINUES THE READER'S OWN RUN.
 ///
 /// The optimistic row used to be minted with a hand-written `"You"` while every
-/// committed row of the reader's own renders `"you"`, so `mark_message_groups`
-/// opened a run on it: a send that followed one of your own drew a full avatar +
-/// header that vanished — shifting the row up by the header's height — the
-/// moment the settle delta replaced it. The COMMITTED row below is the fence:
-/// without it both rows are minted by the same call and carry the same label
-/// whatever literal it uses.
+/// committed row of the reader's own carried her directory label, so
+/// `mark_message_groups` opened a run on it: a send that followed one of your
+/// own drew a full avatar + header that vanished — shifting the row up by the
+/// header's height — the moment the settle delta replaced it. The COMMITTED
+/// row below is the fence: without it both rows are minted by the same call
+/// and carry the same label whatever it is.
 #[test]
 fn consecutive_sends_stay_in_one_author_run() {
+    let me = seat_reader(0xab);
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
     app.active_channel = "general".into();
     app.messages = vec![backend::ChatMessage {
-        author: "you".into(),
+        author: me.clone(),
         ..message(40, "landed a minute ago", false)
     }];
 
@@ -582,7 +597,7 @@ fn consecutive_sends_stay_in_one_author_run() {
         .collect();
     assert_eq!(
         authors,
-        vec!["you", "you", "you"],
+        vec![me.as_str(), me.as_str(), me.as_str()],
         "the mint renders the reader the way a committed row of hers does"
     );
     let headers: Vec<bool> = app
@@ -607,6 +622,7 @@ fn consecutive_sends_stay_in_one_author_run() {
 /// same grouping the timeline draws.
 #[test]
 fn a_minted_reply_keeps_the_first_reply_header() {
+    let me = seat_reader(0xab);
     let (mut app, _) = Ducktape::__boot();
     app.connected = true;
     app.loading = false;
@@ -614,11 +630,11 @@ fn a_minted_reply_keeps_the_first_reply_header() {
     app.active_thread_seq = 7;
     app.thread_messages = vec![
         backend::ChatMessage {
-            author: "you".into(),
+            author: me.clone(),
             ..message(7, "the root", false)
         },
         backend::ChatMessage {
-            author: "you".into(),
+            author: me,
             ..message(8, "the first reply", false)
         },
     ];

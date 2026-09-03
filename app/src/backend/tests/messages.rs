@@ -32,11 +32,17 @@ fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
         channel(&dm_channel_id(a.clone(), b.clone())),
         channel("general"),
     ];
-    let rooms = chat_sidebar_rooms(listing.clone(), peers.clone(), a.clone(), Vec::new());
+    let rooms = chat_sidebar_rooms(listing.clone(), peers.clone(), Vec::new());
     assert_eq!(rooms.len(), 1);
     assert_eq!(rooms[0].channel.id, "general");
+    // A device with no account derives no DM id, so no room is a DM to it —
+    // the directory's own channel id is the ONE test, never a re-derivation.
+    let accountless = vec![DmPeer {
+        channel_id: String::new(),
+        ..peers[0].clone()
+    }];
     assert_eq!(
-        chat_sidebar_rooms(listing, peers, String::new(), Vec::new()).len(),
+        chat_sidebar_rooms(listing, accountless, Vec::new()).len(),
         2
     );
 
@@ -143,7 +149,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
 
 /// A DISPLAY NAME MUST NOT BE FORMATTED TWICE. `search_chat` already runs the
 /// wire author through `author_display`, so an Explorer hit arrives holding
-/// "you", "user 48cedb0d…" or "@quackbot". The Explorer then ran `author_name`
+/// "alice", "user 48cedb0d…" or "@quackbot". The Explorer then ran `author_name`
 /// over that a SECOND time; none of those strings carries a `user:`/`agent:`
 /// prefix to split, so every one fell through to the `_` arm and every message
 /// hit in workspace search was attributed to "system".
@@ -153,7 +159,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
 #[test]
 fn a_search_hits_author_is_not_reformatted_into_system() {
     // What `search_chat` hands the Explorer, for each kind of author.
-    for displayed in ["you", "user 48cedb0d…", "@quackbot", "chat"] {
+    for displayed in ["alice", "user 48cedb0d…", "@quackbot", "chat"] {
         assert_eq!(
             author_name(displayed),
             "system",
@@ -163,7 +169,7 @@ fn a_search_hits_author_is_not_reformatted_into_system() {
     }
 
     // And the first pass is the one that is correct.
-    assert_eq!(author_display("user:48cedb0d131f", None), "user 48cedb0d…");
+    assert_eq!(author_display("user:48cedb0d131f", &NameDirectory::default()), "user 48cedb0d…");
     assert_eq!(author_name("agent:demo/quackbot"), "@quackbot");
 
     // The call site itself, pinned: the message arm must carry the author
@@ -632,7 +638,7 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
 
     // Every prepared row carries its own unread scalar. Both sections resolve
     // it once when source state moves, never from a list-taking view call.
-    let rooms = chat_sidebar_rooms(channels.clone(), Vec::new(), String::new(), reads.clone());
+    let rooms = chat_sidebar_rooms(channels.clone(), Vec::new(), reads.clone());
     assert!(!rooms[0].unread);
     assert!(rooms[1].unread);
     let dm = DmPeer {
@@ -648,7 +654,6 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         !chat_sidebar_rooms(
             vec![channel("random", 30)],
             Vec::new(),
-            String::new(),
             reads.clone(),
         )[0]
         .unread
@@ -662,7 +667,6 @@ fn client_local_unread_tracking_seeds_marks_and_places_the_divider() {
         !chat_sidebar_rooms(
             vec![channel("general", 100)],
             Vec::new(),
-            String::new(),
             seeded,
         )[0]
         .unread

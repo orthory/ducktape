@@ -221,10 +221,10 @@ extern crate::backend
   pure fs_counts_summary(connected:bool, listed:bool, entries:&[FsEntry]) -> str
   pure fs_parent(path:str) -> str
   pure fs_child(path:str, name:str) -> str
-  files_mkdir(rpc:str, path:str) -> bool ! AppError
-  files_remove(rpc:str, path:str) -> bool ! AppError
-  files_write_text(rpc:str, path:str, text:str) -> bool ! AppError
-  files_upload(rpc:str, dir:str, dropped:str) -> bool ! AppError
+  files_mkdir(rpc:str, password:str, path:str) -> bool ! AppError
+  files_remove(rpc:str, password:str, path:str) -> bool ! AppError
+  files_write_text(rpc:str, password:str, path:str, text:str) -> bool ! AppError
+  files_upload(rpc:str, password:str, dir:str, dropped:str) -> bool ! AppError
   FsDiffEntry(path:str, kind:str)
   FsDiff(generation:i64, from:str, entries:[FsDiffEntry])
   files_diff(rpc:str, from:str, generation:i64) -> FsDiff ! HydrationError
@@ -252,7 +252,7 @@ extern crate::backend
   pure relative_time(unix_seconds:i64, wall_now:i64) -> str
   sync current_wall_seconds() -> i64
   pure mmss(seconds:i64) -> str
-  sync network_label(account_name:str, rpc:str) -> str
+  pure network_label(chain_id:str, rpc:str) -> str
   pure tray_badge(unread:i64) -> str
   pure tray_tooltip(network:str, status:str) -> str
   pure tray_bell_row(unread:i64) -> str
@@ -424,7 +424,7 @@ extern crate::backend
   pure mark_channel_read(reads:[ChannelRead], channel:str, seq:i64) -> [ChannelRead]
   ChatSidebarRow(channel:ChatChannel, unread:bool)
   DmSidebarRow(peer:DmPeer, unread:bool)
-  pure chat_sidebar_rooms(channels:[ChatChannel], peers:[DmPeer], me:str, reads:[ChannelRead]) -> [ChatSidebarRow]
+  pure chat_sidebar_rooms(channels:[ChatChannel], peers:[DmPeer], reads:[ChannelRead]) -> [ChatSidebarRow]
   pure chat_sidebar_dms(channels:[ChatChannel], peers:[DmPeer], reads:[ChannelRead]) -> [DmSidebarRow]
   pure channel_switch_facts(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64, current_name:str) -> ChannelSwitchFacts
   // A load's rows FOLD into the sidebar list; they do not replace it. The

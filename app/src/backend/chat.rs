@@ -32,7 +32,7 @@ pub fn optimistic_message(
         messages,
         body,
         message_id,
-        rpc::cached_user_key().as_deref(),
+        ReaderFacts::cached().reader(),
     ))
 }
 
@@ -48,7 +48,7 @@ pub fn optimistic_thread_message(
         messages,
         body,
         message_id,
-        rpc::cached_user_key().as_deref(),
+        ReaderFacts::cached().reader(),
     ))
 }
 
@@ -227,13 +227,13 @@ pub struct HuddleParticipant {
 /// the author renderer for the label.
 pub(crate) fn huddle_roster(
     members: &[chat::index::HuddleEntry],
-    me: Option<&[u8]>,
+    reader: ChatReader<'_>,
 ) -> Vec<HuddleParticipant> {
-    let mine = me.map(hex_encode);
+    let mine = reader.key.map(hex_encode);
     members
         .iter()
         .map(|member| {
-            let label = author_name(&format!("user:{}", member.user));
+            let label = author_display(&format!("user:{}", member.user), reader.names);
             HuddleParticipant {
                 initials: initials_of(&label),
                 // The module refuses non-User authors ("only external users
@@ -284,8 +284,8 @@ pub(crate) async fn huddle_fanout_nodes(
     channel_id: &str,
 ) -> Result<Vec<String>, String> {
     let client = rpc_client(rpc)?;
-    let me = local_user_key().await;
-    let (_channel, roster) = load_channel_facts(&client, channel_id, me.as_deref()).await?;
+    let facts = ReaderFacts::current().await;
+    let (_channel, roster) = load_channel_facts(&client, channel_id, facts.reader()).await?;
     Ok(huddle_recipient_nodes(roster))
 }
 
@@ -440,11 +440,11 @@ pub async fn load_thread_page(
         let rpc = rpc_client(&rpc)?;
         let thread = query_thread_page(&rpc, &channel_id, root_seq, after_reply_seq).await?;
         let next_reply_seq = number_i64(thread.next_reply_seq.unwrap_or(0));
-        let current_user = local_user_key().await;
+        let facts = ReaderFacts::current().await;
         let messages = thread
             .replies
             .into_iter()
-            .map(|row| chat_message(row, current_user.as_deref()))
+            .map(|row| chat_message(row, facts.reader()))
             .collect();
         Ok(ThreadPageData {
             generation,
@@ -648,10 +648,10 @@ pub async fn search_chat(
     channel_id: String,
     text: String,
 ) -> Result<ChatSearchData, AppError> {
-    // The reader, for the same `you` rendering the timeline does — a search hit
-    // was showing the RAW wire author (`user:3f8dc8…773`, the full 64-hex key
-    // with its prefix) as the row's headline, above the text it matched.
-    let current_user = local_user_key().await;
+    // The same naming the timeline does — a search hit was showing the RAW
+    // wire author (`user:3f8dc8…773`, the full 64-hex key with its prefix) as
+    // the row's headline, above the text it matched.
+    let facts = ReaderFacts::current().await;
     let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
@@ -693,7 +693,7 @@ pub async fn search_chat(
                     channel_id: hit.channel_id,
                     seq: number_i64(hit.seq),
                     root_seq: number_i64(hit.thread.unwrap_or(hit.seq)),
-                    author: author_display(&hit.author, current_user.as_deref()),
+                    author: author_display(&hit.author, facts.names()),
                     text: hit.text,
                 })
                 .collect(),

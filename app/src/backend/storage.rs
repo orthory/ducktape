@@ -363,30 +363,38 @@ async fn files_head(rpc: &RpcClient) -> Result<Option<String>, String> {
 }
 
 /// One files commit through the node's commit lane.
+/// One commit, SIGNED BY THE PERSON. The files module records a frame's
+/// verified signer as the commit's author and charges `/home/<owner>/**`
+/// authority to it, so a person's commit rides the same signed-frame lane as
+/// every other op this device's key makes. The unsigned `/v1/files/commit`
+/// lane writes as the NODE — a daemon's authority over a daemon's home,
+/// never a person's over theirs.
 async fn files_commit_one(
     rpc: &RpcClient,
+    password: String,
     message: String,
     change: serde_json::Value,
 ) -> Result<(), String> {
     let head = files_head(rpc).await?;
-    rpc.files_post(
-        "commit",
-        &serde_json::json!({
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "commit": {
             "base_snapshot": head,
             "message": message,
             "changes": [change],
-        }),
-    )
-    .await?;
+        }
+    }))
+    .map_err(|error| format!("files commit does not serialize: {error}"))?;
+    signed_write(rpc, "files", payload, password).await?;
     Ok(())
 }
 
 /// Create a directory.
-pub async fn files_mkdir(rpc: String, path: String) -> Result<bool, AppError> {
+pub async fn files_mkdir(rpc: String, password: String, path: String) -> Result<bool, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
         files_commit_one(
             &rpc,
+            password,
             format!("mkdir {path}"),
             serde_json::json!({ "mkdir": { "path": path } }),
         )
@@ -398,11 +406,12 @@ pub async fn files_mkdir(rpc: String, path: String) -> Result<bool, AppError> {
 }
 
 /// Remove a file or whole subtree.
-pub async fn files_remove(rpc: String, path: String) -> Result<bool, AppError> {
+pub async fn files_remove(rpc: String, password: String, path: String) -> Result<bool, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
         files_commit_one(
             &rpc,
+            password,
             format!("rm {path}"),
             serde_json::json!({ "rm": { "path": path } }),
         )
@@ -414,11 +423,17 @@ pub async fn files_remove(rpc: String, path: String) -> Result<bool, AppError> {
 }
 
 /// Write a text file (create or replace) as inline content.
-pub async fn files_write_text(rpc: String, path: String, text: String) -> Result<bool, AppError> {
+pub async fn files_write_text(
+    rpc: String,
+    password: String,
+    path: String,
+    text: String,
+) -> Result<bool, AppError> {
     async {
         let rpc = rpc_client(&rpc)?;
         files_commit_one(
             &rpc,
+            password,
             format!("write {path}"),
             serde_json::json!({
                 "put": {
@@ -439,7 +454,12 @@ pub async fn files_write_text(rpc: String, path: String, text: String) -> Result
 /// Upload a local file dropped onto the window into the current directory:
 /// small files ride inline; larger ones stage 1 MiB chunks then commit a
 /// chunk list. The dropped path never leaves this device — only bytes do.
-pub async fn files_upload(rpc: String, dir: String, dropped: String) -> Result<bool, AppError> {
+pub async fn files_upload(
+    rpc: String,
+    password: String,
+    dir: String,
+    dropped: String,
+) -> Result<bool, AppError> {
     // the node refuses to serve back any object larger than files_http's
     // MAX_OBJECT_BYTES, and every staged MiB is a consensus block — a cap
     // HERE turns "drop a video, drive 300 blocks, node RSS grows by 300 MB"
@@ -482,6 +502,7 @@ pub async fn files_upload(rpc: String, dir: String, dropped: String) -> Result<b
         };
         files_commit_one(
             &rpc,
+            password,
             format!("upload {name}"),
             serde_json::json!({
                 "put": { "path": target, "exec": false, "meta": {}, "content": content }

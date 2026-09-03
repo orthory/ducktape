@@ -528,7 +528,7 @@ on chat_updated(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // A LANDING ANSWERS FOR THE PEER TOO. The DM header suppresses the `#` and
@@ -602,7 +602,7 @@ on chat_hit_loaded(next)
   // through `choose_channel` -> `chat_updated`, which marks the room read when
   // she actually reaches the tail. The sidebar mirrors still refresh: the
   // `channels` fold above moved, even though the cursor did not.
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // Same landing answer as `chat_updated`: a hit in another room retires the
@@ -694,7 +694,7 @@ on channel_created(next)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A CREATE IS A ROOM SWITCH — the line below lands her IN the new channel,
   // and the composer she was typing into stays keyed to the room she left

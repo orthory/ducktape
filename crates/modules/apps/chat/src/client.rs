@@ -61,6 +61,86 @@ pub struct ChatMember {
     pub label: String,
 }
 
+/// The network's name directory: the account name bound to each user key,
+/// keyed by the key's hex. Every surface that names a key names the account
+/// holding it; a key the directory does not know is named by its handle.
+///
+/// Names are display text, NOT identity — two accounts may share one — so
+/// nothing here compares names; the directory only answers "what is this key
+/// called".
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NameDirectory {
+    names: BTreeMap<String, String>,
+}
+
+/// The directory a reader with no network in frame renders through: every
+/// key is named by its handle.
+static NOBODY_KNOWN: NameDirectory = NameDirectory::empty();
+
+impl NameDirectory {
+    pub fn new(names: BTreeMap<String, String>) -> Self {
+        Self { names }
+    }
+
+    /// A directory that knows no one — the cold state before a network has
+    /// been read.
+    pub const fn empty() -> Self {
+        Self {
+            names: BTreeMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+
+    /// The account name bound to a user key (hex), if any.
+    pub fn name_of(&self, key_hex: &str) -> Option<&str> {
+        self.names.get(key_hex).map(String::as_str)
+    }
+
+    /// A member's label: the bound name, else the shortened key.
+    pub fn member_label(&self, key_hex: &str) -> String {
+        self.name_of(key_hex)
+            .map_or_else(|| short_label(key_hex), str::to_string)
+    }
+}
+
+/// A reader's view of the timeline: the key the reader signs with — the
+/// `by me` facts hang on it — and the directory every author is named
+/// through. The reader is named the way everyone else is: by their account.
+#[derive(Clone, Copy, Debug)]
+pub struct ChatReader<'a> {
+    pub key: Option<&'a [u8]>,
+    pub names: &'a NameDirectory,
+}
+
+impl ChatReader<'static> {
+    /// No key and no directory: nothing is `by me`, every author is a handle.
+    pub fn nobody() -> Self {
+        Self {
+            key: None,
+            names: &NOBODY_KNOWN,
+        }
+    }
+}
+
+impl<'a> ChatReader<'a> {
+    pub fn new(key: Option<&'a [u8]>, names: &'a NameDirectory) -> Self {
+        Self { key, names }
+    }
+
+    /// The reader's own rendered handle (`user:{hex}`), when a key is held.
+    fn handle(&self) -> Option<String> {
+        self.key.map(|key| format!("user:{}", hex_encode(key)))
+    }
+
+    /// True when `handle` is the reader's own rendered handle.
+    fn is_me(&self, handle: &str) -> bool {
+        self.handle().as_deref() == Some(handle)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
@@ -321,7 +401,7 @@ pub fn delta_from_op(
     assigned: Option<&serde_json::Value>,
     origin_kind: &str,
     origin_id: Option<&str>,
-    current_user: Option<&[u8]>,
+    reader: ChatReader<'_>,
     height: u64,
 ) -> Result<Option<ChatDelta>, String> {
     let msg = decode_msg(payload)?;
@@ -381,7 +461,7 @@ pub fn delta_from_op(
                 reactions: Vec::new(),
                 tags: Vec::new(),
             };
-            let message = chat_message(row, current_user);
+            let message = chat_message(row, reader);
             match thread {
                 Some(root_seq) => ChatDelta::Reply {
                     channel_id,
@@ -432,7 +512,7 @@ pub fn delta_from_op(
             ChatDelta::Edited {
                 channel_id,
                 seq: number_i64(seq),
-                message: chat_message(carrier, current_user),
+                message: chat_message(carrier, reader),
             }
         }
         ChatMsg::DeleteMessage { channel_id, seq } => ChatDelta::Deleted {
@@ -443,12 +523,12 @@ pub fn delta_from_op(
             channel_id,
             seq,
             emoji,
-        } => reaction_delta(channel_id, seq, emoji, true, &origin, current_user),
+        } => reaction_delta(channel_id, seq, emoji, true, &origin, reader),
         ChatMsg::RemoveReaction {
             channel_id,
             seq,
             emoji,
-        } => reaction_delta(channel_id, seq, emoji, false, &origin, current_user),
+        } => reaction_delta(channel_id, seq, emoji, false, &origin, reader),
         ChatMsg::RegisterHook { .. } | ChatMsg::UnregisterHook { .. } => return Ok(None),
         ChatMsg::SetMembership {
             channel_id,
@@ -460,7 +540,7 @@ pub fn delta_from_op(
                 channel_id,
                 added: member,
                 member: ChatMember {
-                    label: short_label(&id),
+                    label: reader.names.member_label(&id),
                     key: id,
                 },
             }
@@ -478,10 +558,10 @@ fn reaction_delta(
     emoji: String,
     added: bool,
     origin: &OriginTag,
-    current_user: Option<&[u8]>,
+    reader: ChatReader<'_>,
 ) -> ChatDelta {
     let reactor = index::author(origin, None);
-    let by_me = current_user.is_some_and(|key| reactor == format!("user:{}", hex_encode(key)));
+    let by_me = reader.is_me(&reactor);
     ChatDelta::Reaction {
         channel_id,
         seq: number_i64(seq),
@@ -754,13 +834,17 @@ pub fn optimistic_message(
     mut messages: Vec<ChatMessage>,
     body: String,
     message_id: String,
-    current_user: Option<&[u8]>,
+    reader: ChatReader<'_>,
 ) -> Vec<ChatMessage> {
     let blocks = paragraph_blocks(&body);
-    let handle = current_user.map(|key| format!("user:{}", hex_encode(key)));
-    let (author, initial) = match handle.as_deref() {
-        Some(handle) => (author_display(handle, current_user), avatar_initial(handle)),
-        None => ("you".into(), "•".into()),
+    // A device with no key cannot sign a send, so the keyless mint is a row
+    // with no author to name: it stays unattributed rather than inventing one.
+    let (author, initial) = match reader.handle() {
+        Some(handle) => (
+            author_display(&handle, reader.names),
+            avatar_initial(&handle, reader.names),
+        ),
+        None => (String::new(), "•".into()),
     };
     // Pending sequences remain descending negatives for the existing numeric
     // guards and ordering. Each concurrent placeholder must be unique inside
@@ -1038,7 +1122,7 @@ pub fn merge_thread_reply(
 // row rendering — MsgRow (the index/feed shape) → the rendered ChatMessage
 // ============================================================================
 
-pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
+pub fn chat_message(row: MsgRow, reader: ChatReader<'_>) -> ChatMessage {
     let edited = row.rev > 0;
     let meta = if edited {
         format!("#{} · edited", row.seq)
@@ -1055,7 +1139,7 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
         id: row.message_id,
         view_key,
         seq: number_i64(row.seq),
-        author: author_display(&row.author, current_user),
+        author: author_display(&row.author, reader.names),
         meta,
         body: if row.deleted {
             "Message deleted".into()
@@ -1070,7 +1154,7 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
         reply_count: number_i64(row.reply_count),
         thread_seq: number_i64(row.thread.unwrap_or(0)),
         show_author: true,
-        initial: avatar_initial(&row.author),
+        initial: avatar_initial(&row.author, reader.names),
         avatar_kind: avatar_kind(&row.author).into(),
         height: number_i64(row.height),
         time: number_i64(row.time),
@@ -1078,7 +1162,7 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
             .reactions
             .into_iter()
             .map(|reaction| {
-                let reacted_by_me = reacted_by_user(&reaction.reactors, current_user);
+                let reacted_by_me = reacted_by_reader(&reaction.reactors, reader);
                 ChatReaction {
                     emoji: reaction.emoji,
                     count: count_i64(reaction.reactors.len()),
@@ -1092,19 +1176,10 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>) -> ChatMessage {
     .seed_render_rev()
 }
 
-/// True when the local user's rendered author string (`user:{hex}`) is among a
-/// reaction's reactors.
-fn reacted_by_user(reactors: &[String], current_user: Option<&[u8]>) -> bool {
-    current_user.is_some_and(|key| {
-        let handle = format!("user:{}", hex_encode(key));
-        reactors.contains(&handle)
-    })
-}
-
-/// True when the message's rendered author IS the local user — the same
-/// `user:{hex}` comparison the reaction check makes, against the same key.
-fn authored_by_user(author: &str, current_user: Option<&[u8]>) -> bool {
-    current_user.is_some_and(|key| author == format!("user:{}", hex_encode(key)))
+/// True when the reader's rendered handle (`user:{hex}`) is among a reaction's
+/// reactors.
+fn reacted_by_reader(reactors: &[String], reader: ChatReader<'_>) -> bool {
+    reactors.iter().any(|reactor| reader.is_me(reactor))
 }
 
 /// Slack-style grouping: a message shows its avatar + author header only when it
@@ -1313,23 +1388,22 @@ pub fn author_handle(author: &AuthorRef) -> String {
     }
 }
 
-/// The display name for a rendered author string (`user:{id}`,
-/// `agent:{module}/{agent}`, `module:{id}`, or `system`).
-/// The author label a READER sees: `you` for the reader's own writing, the
-/// rendered handle otherwise.
-///
-/// Every other surface in the shell already says `you` — the huddle roster, the
-/// member roster — while the timeline printed the reader's own messages as
-/// `user 3f8dc828…`, a hex nobody recognises as themselves. The plain
-/// [`author_name`] stays for the places that render an author with no reader in
-/// frame (a page comment's opener, a wire label).
-pub fn author_display(author: &str, current_user: Option<&[u8]>) -> String {
-    match authored_by_user(author, current_user) {
-        true => "you".into(),
-        false => author_name(author),
-    }
+/// The label an author renders under: a user by the account name the
+/// directory binds to their key, every author the directory cannot name by
+/// the plain handle rendering of [`author_name`]. The reader's own writing is
+/// named exactly like anyone else's — by their account, never by a pronoun.
+pub fn author_display(author: &str, names: &NameDirectory) -> String {
+    let Some(("user", id)) = author.split_once(':') else {
+        return author_name(author);
+    };
+    names
+        .name_of(id)
+        .map_or_else(|| author_name(author), str::to_string)
 }
 
+/// The display name for a rendered author string (`user:{id}`,
+/// `agent:{module}/{agent}`, `module:{id}`, or `system`) with no directory in
+/// frame: a user is named by the shortened key.
 pub fn author_name(author: &str) -> String {
     match author.split_once(':') {
         Some(("user", id)) => format!("user {}", short_label(id)),
@@ -1342,11 +1416,11 @@ pub fn author_name(author: &str) -> String {
     }
 }
 
-/// The stable identity an avatar is derived from: the shortened id for a user,
-/// the agent/module name otherwise.
-fn avatar_source(author: &str) -> String {
+/// The text an avatar is derived from: the user's bound name (else the
+/// shortened key), the agent/module name otherwise.
+fn avatar_source(author: &str, names: &NameDirectory) -> String {
     match author.split_once(':') {
-        Some(("user", id)) => short_label(id),
+        Some(("user", id)) => names.member_label(id),
         Some(("agent", path)) => path.rsplit('/').next().unwrap_or(path).to_string(),
         Some(("module", id)) => id.to_string(),
         _ => "system".into(),
@@ -1356,8 +1430,8 @@ fn avatar_source(author: &str) -> String {
 /// The single-glyph avatar label for an author: the first alphanumeric character
 /// of its identity, uppercased. Falls back to a neutral dot when there is
 /// nothing to show.
-fn avatar_initial(author: &str) -> String {
-    initial_of(&avatar_source(author))
+fn avatar_initial(author: &str, names: &NameDirectory) -> String {
+    initial_of(&avatar_source(author, names))
 }
 
 fn avatar_kind(author: &str) -> &'static str {
@@ -1957,8 +2031,8 @@ mod tests {
             reactions,
             tags: Vec::new(),
         };
-        let plain = chat_message(row(Vec::new()), None);
-        let identical = chat_message(row(Vec::new()), None);
+        let plain = chat_message(row(Vec::new()), ChatReader::nobody());
+        let identical = chat_message(row(Vec::new()), ChatReader::nobody());
         assert_eq!(
             plain.render_rev, identical.render_rev,
             "identical content seeds identically — the cached subtree is kept"
@@ -1968,7 +2042,7 @@ mod tests {
                 emoji: "👍".into(),
                 reactors: vec!["user:cd".into()],
             }]),
-            None,
+            ChatReader::nobody(),
         );
         assert_ne!(
             plain.render_rev, reacted.render_rev,
@@ -1980,10 +2054,10 @@ mod tests {
         // row's body never changes (the settle REPLACES the row and moves
         // `seq`), and every fresh send mints a fresh id — the field that does
         // move the seed.
-        let minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), None);
-        let re_minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), None);
+        let minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), ChatReader::nobody());
+        let re_minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), ChatReader::nobody());
         assert_eq!(minted[0].render_rev, re_minted[0].render_rev);
-        let other = optimistic_message(Vec::new(), "hello".into(), "op2".into(), None);
+        let other = optimistic_message(Vec::new(), "hello".into(), "op2".into(), ChatReader::nobody());
         assert_ne!(minted[0].render_rev, other[0].render_rev);
     }
 
@@ -2010,22 +2084,40 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_sees_their_own_writing_as_you() {
+    fn every_author_is_named_by_the_directory_the_reader_included() {
         let me = vec![0xab; 32];
         let mine = format!("user:{}", hex_encode(&me));
         let theirs = format!("user:{}", hex_encode(&[0xcd; 32]));
+        let unbound = format!("user:{}", hex_encode(&[0xef; 32]));
+        let names = NameDirectory::new(BTreeMap::from([
+            (hex_encode(&me), "alice".to_string()),
+            (hex_encode(&[0xcd; 32]), "bob".to_string()),
+        ]));
 
-        assert_eq!(author_display(&mine, Some(&me)), "you");
-        // The same row read by anyone else is still the handle.
-        assert_eq!(author_display(&mine, Some(&[0xcd; 32])), author_name(&mine));
-        assert_eq!(author_display(&theirs, Some(&me)), author_name(&theirs));
-        // No local key (the boot race) renders nobody as `you`.
-        assert_eq!(author_display(&mine, None), author_name(&mine));
-        // An agent is never the reader.
+        // The reader's own writing carries their account name, like anyone's.
+        assert_eq!(author_display(&mine, &names), "alice");
+        assert_eq!(author_display(&theirs, &names), "bob");
+        // A key the directory cannot name falls back to the handle rendering.
+        assert_eq!(author_display(&unbound, &names), author_name(&unbound));
+        assert!(author_name(&unbound).starts_with("user efefefef"));
+        // No directory at all (the boot race) names everyone by handle.
+        assert_eq!(author_display(&mine, ChatReader::nobody().names), author_name(&mine));
+        // An agent is never in the directory.
+        assert_eq!(author_display("agent:demo/quackbot", &names), "@quackbot");
+
+        // The avatar follows the name, and a member label follows the same rule.
+        assert_eq!(avatar_initial(&mine, &names), "A");
+        assert_eq!(names.member_label(&hex_encode(&me)), "alice");
         assert_eq!(
-            author_display("agent:demo/quackbot", Some(&me)),
-            "@quackbot"
+            names.member_label(&hex_encode(&[0xef; 32])),
+            short_label(&hex_encode(&[0xef; 32]))
         );
+
+        // `by me` still hangs on the reader's KEY, never on a name.
+        let reader = ChatReader::new(Some(&me), &names);
+        assert!(reacted_by_reader(std::slice::from_ref(&mine), reader));
+        assert!(!reacted_by_reader(std::slice::from_ref(&theirs), reader));
+        assert!(!reacted_by_reader(&[mine], ChatReader::nobody()));
     }
 
     #[test]
@@ -2051,7 +2143,7 @@ mod tests {
             Some(&assigned),
             "external",
             Some("ext:ab"),
-            None,
+            ChatReader::nobody(),
             276_199,
         )
         .expect("a well-formed op folds")
@@ -2308,9 +2400,15 @@ mod tests {
             format!("user:{}", hex_encode(&[0xab; 32])),
             "system".to_string(),
         ];
-        assert!(reacted_by_user(&reactors, Some(&[0xab; 32])));
-        assert!(!reacted_by_user(&reactors, Some(&[0xcd; 32])));
-        assert!(!reacted_by_user(&reactors, None));
+        let names = NameDirectory::default();
+        let me = [0xab; 32];
+        let someone_else = [0xcd; 32];
+        assert!(reacted_by_reader(&reactors, ChatReader::new(Some(&me), &names)));
+        assert!(!reacted_by_reader(
+            &reactors,
+            ChatReader::new(Some(&someone_else), &names)
+        ));
+        assert!(!reacted_by_reader(&reactors, ChatReader::nobody()));
     }
 
     #[test]

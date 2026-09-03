@@ -476,30 +476,30 @@ pub struct ChatSidebarRow {
     pub unread: bool,
 }
 
-/// The CHANNELS section, prepared when its source state moves.
+/// The CHANNELS section, prepared when its source state moves: every channel
+/// that is not one of the directory's DMs.
+///
+/// A DM is recognised by the channel id the directory ALREADY holds for each
+/// peer (`DmPeer.channel_id`), never by re-deriving one here: the derivation
+/// takes the pair of ACCOUNT NUMBERS, which only the directory load has in
+/// hand, and a peer with no account has no DM id at all.
 pub fn chat_sidebar_rooms(
     channels: Vec<ChatChannel>,
     peers: Vec<DmPeer>,
-    me: String,
     reads: Vec<ChannelRead>,
 ) -> Vec<ChatSidebarRow> {
     let read_seqs: BTreeMap<&str, i64> = reads
         .iter()
         .map(|read| (read.channel.as_str(), read.seq))
         .collect();
-    let dm_ids: BTreeSet<String> = peers
+    let dm_ids: BTreeSet<&str> = peers
         .iter()
-        .filter_map(|peer| {
-            if me.is_empty() {
-                None
-            } else {
-                Some(dm_channel_id(me.clone(), peer.key.clone()))
-            }
-        })
+        .map(|peer| peer.channel_id.as_str())
+        .filter(|id| !id.is_empty())
         .collect();
     channels
         .into_iter()
-        .filter(|channel| !dm_ids.contains(&channel.id))
+        .filter(|channel| !dm_ids.contains(channel.id.as_str()))
         .map(|channel| ChatSidebarRow {
             unread: channel.head_seq
                 > read_seqs

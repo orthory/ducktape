@@ -470,23 +470,6 @@ impl Client {
         decode_json(response).await
     }
 
-    /// One POST against a `/v1/files/*` write lane with a JSON body — the
-    /// files browser's mutation transport (the node encodes + submits the
-    /// corresponding `FilesMsg`).
-    pub async fn files_post(
-        &self,
-        lane: &str,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let response = self
-            .credentialed(self.http.post(self.url(&format!("v1/files/{lane}"))?))
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| Error::new(format!("RPC files {lane} failed: {error}")))?;
-        decode_json(response).await
-    }
-
     /// Stage one duckfs chunk (`POST /v1/files/stage`, raw bytes ≤ 1 MiB) —
     /// returns the staged chunk's digest.
     pub async fn files_stage(&self, bytes: Vec<u8>) -> Result<String> {

@@ -130,19 +130,6 @@ pub fn raised_style(theme: &iced::Theme) -> iced::widget::container::Style {
     }
 }
 
-pub(crate) fn short_hex(bytes: &[u8]) -> String {
-    let mut output = String::new();
-    for byte in bytes.iter().take(4) {
-        let _ = write!(output, "{byte:02x}");
-    }
-    if bytes.len() > 4 {
-        output.push('…');
-    }
-    output
-}
-
-/// A shortened display label for an id string: its first 8 characters, with an
-/// ellipsis when more follow.
 pub(crate) const fn block_kind_name(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::Page => "Page",

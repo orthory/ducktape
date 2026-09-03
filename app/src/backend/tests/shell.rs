@@ -266,6 +266,7 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
     // asserted a compare no real roster row could satisfy.
     let me = [0xaau8; 32];
     let peer = [0xbbu8; 32];
+    let names = NameDirectory::default();
     let roster = huddle_roster(
         &[
             chat::index::HuddleEntry {
@@ -279,7 +280,7 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
                 joined_at: 20,
             },
         ],
-        Some(&me),
+        ChatReader::new(Some(&me), &names),
     );
     assert_eq!(roster.len(), 2);
     assert!(roster[0].is_you && !roster[0].is_agent);

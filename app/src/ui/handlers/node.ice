@@ -31,6 +31,9 @@ on node_facts_loaded(next)
   node_version = next.version
   node_root_hash = next.root_hash
   network_chain_id = next.chain_id
+  // The title follows the chain the node serves — the network's own name,
+  // the same on every member's screen.
+  network_name = network_label(network_chain_id, connected_rpc)
   node_last_finalized = next.last_finalized_at
   node_checkpoint = next.checkpoint_height
   node_height = next.height
@@ -69,6 +72,9 @@ on node_status_pushed(next)
   node_version = next.version
   node_root_hash = next.root_hash
   network_chain_id = next.chain_id
+  // The title follows the chain the node serves — the network's own name,
+  // the same on every member's screen.
+  network_name = network_label(network_chain_id, connected_rpc)
   node_last_finalized = next.last_finalized_at
   node_checkpoint = next.checkpoint_height
   node_height = next.height
@@ -98,12 +104,9 @@ on settings_loaded(next)
   settings_key_path = next.key_path
   settings_key_state = next.key_state
   settings_user_key = next.user_key
-  // THIS DEVICE'S KEY DECIDES BOTH: which channels are its own DMs, and
-  // whether it is seated in a members-only room. The facts load lands after the
-  // first chat load, so without these the sidebar listed every DM under
-  // CHANNELS and the composer stayed refused until the next delta.
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
-  dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
+  // THIS DEVICE'S KEY DECIDES whether it is seated in a members-only room.
+  // The facts load lands after the first chat load, so without this the
+  // composer stayed refused until the next delta.
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   settings_open_tabs = next.open_tabs
 

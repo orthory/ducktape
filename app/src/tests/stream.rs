@@ -296,15 +296,11 @@ fn a_resync_releases_load_older_only_when_it_moves_the_room() {
 /// the same shape as the caret-retire and room-mover lints above.
 #[test]
 fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
-    // (mirror, the sources whose movement invalidates it). THIS ACCOUNT'S
-    // NUMBER decides which channels are its own DMs (both ends of a DM hash the
-    // same pair of numbers); THIS DEVICE'S KEY decides whether it is seated in
-    // a members-only room.
+    // (mirror, the sources whose movement invalidates it). THE DM DIRECTORY
+    // decides which channels are DMs (each peer carries its channel id);
+    // THIS DEVICE'S KEY decides whether it is seated in a members-only room.
     const MIRRORS: [(&str, &[&str]); 8] = [
-        (
-            "rooms",
-            &["channels", "dm_peers", "account_number", "channel_reads"],
-        ),
+        ("rooms", &["channels", "dm_peers", "channel_reads"]),
         ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
         (
             "block_comment_rows",

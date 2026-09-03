@@ -425,9 +425,9 @@ fn refuse_source(
 /// X11 AND PURE RUST ON PURPOSE. `x11rb` is already in this binary (winit
 /// draws through it), so the desktop costs no new dependency, no C toolchain
 /// and no build-time system library — which the portal/pipewire route would
-/// cost on every machine that builds this app, to buy a Wayland path this app
-/// cannot use anyway: iced is built here with the `x11` feature and no
-/// `wayland`, so the app itself is an X client.
+/// cost on every machine that builds this app. The app itself runs natively
+/// on either display server; a share is an X11-session feature, and a
+/// Wayland session is refused below rather than grabbed.
 // ponytail: the WHOLE root window, so a multi-head desktop shares every head
 // at once — a per-monitor or per-window picker is the obvious next step and
 // wants a picker UI, not a different capture.
