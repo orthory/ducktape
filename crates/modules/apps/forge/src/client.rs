@@ -359,6 +359,7 @@ mod tests {
                 ),
             ]),
             Some(&diff()),
+            &AuthorNames::default(),
         );
         assert_eq!(view.kind, "pr");
         assert_eq!(view.state, "open");
@@ -389,7 +390,7 @@ mod tests {
         detail.body = "see [the plan](duck://page/plan?net=d0cdf950)".into();
         detail.reviews[0].body = "context at https://ducktape.industries/x".into();
         detail.reviews[0].comments[0].body = "also [#58](duck://forge/lab/58)".into();
-        let view = item_view(&detail, None);
+        let view = item_view(&detail, None, &AuthorNames::default());
 
         let links = |blocks: &[ChatBlock]| -> Vec<String> {
             blocks
@@ -420,6 +421,7 @@ mod tests {
                 review(0xbb, ReviewVerdict::Comment, head),
             ]),
             Some(&diff()),
+            &AuthorNames::default(),
         );
         assert_eq!(view.approvals, 1, "the re-review supersedes");
         assert_eq!(view.change_requests, 0);
@@ -431,7 +433,7 @@ mod tests {
         plain.summary.kind = ItemKind::Issue;
         plain.source_branch = None;
         plain.target_branch = None;
-        let view = item_view(&plain, None);
+        let view = item_view(&plain, None, &AuthorNames::default());
         assert_eq!(view.kind, "issue");
         assert!(view.source_branch.is_empty());
         assert!(view.source_oid.is_empty());
