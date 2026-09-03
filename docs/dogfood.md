@@ -10,7 +10,10 @@ commentary, and usage — all in the app.
 - **A running node.** The dev app (`make dev`) runs a single-node workspace
   where your node is the validator — the simplest setup, everything below
   targets it. A multi-node network works too; where it matters ("validator"
-  vs "resident") the steps say so.
+  vs "resident") the steps say so. By default every listener binds
+  `127.0.0.1`; `DEV_LISTEN=0.0.0.0` (or `[::]`) widens the p2p mesh and
+  WireGuard binds so a second machine can join or huddle in — the node's
+  HTTP API stays loopback unless `DEV_HTTP_LISTEN` is also set (#1241).
 - **Host `git` on `PATH`, with worktree support.** The provisioner probes
   once at construction (`git init` + `git worktree list` in a scratch dir,
   `crates/noded/src/agent_provision/forge.rs`); a failed probe makes the forge

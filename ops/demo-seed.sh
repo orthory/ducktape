@@ -36,6 +36,16 @@ ORIGIN="demo"   # external author stamped on seeded ops (chat rejects an empty a
 USERKEY="$DUCK/keys/demo.key"     # the app signs writes with THIS local key
 DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo identity
 
+# DEV_LISTEN widens the p2p mesh + WireGuard bind so a second machine can
+# reach this node (#1241): default stays 127.0.0.1 (localhost-only, today's
+# behavior); DEV_LISTEN=0.0.0.0 (or [::]) binds wide. http_listen is a
+# SEPARATE knob (DEV_HTTP_LISTEN) — a --cred run needs a loopback
+# http_listen, the browser gateway dies on a wide bind (see
+# cred-runs-need-a-loopback-http-listen), so widening it is never implied by
+# DEV_LISTEN.
+DEV_LISTEN="${DEV_LISTEN:-127.0.0.1}"
+DEV_HTTP_LISTEN="${DEV_HTTP_LISTEN:-127.0.0.1}"
+
 log(){ printf '\033[36m[demo-seed]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-seed] %s\033[0m\n' "$*" >&2; exit 1; }
 
@@ -56,6 +66,8 @@ fi
 # ── 2. fresh demo workspace (idempotent) ───────────────────────
 log "creating a fresh '$ID' workspace at $WSDIR"
 rm -rf "$WSDIR"; mkdir -p "$WSDIR"
+# Free-port probe only — always loopback regardless of DEV_LISTEN, since it
+# never binds anything the node itself serves from.
 read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostname:"127.0.0.1",port:0,socket:{data(){}}}));process.stdout.write(l.map(x=>x.port).join(" ")+"\n");l.forEach(x=>x.stop())')
 # A free UDP port for the overlay's WireGuard socket. This MUST be concrete: the
 # reachability plane refuses to start on port 0 ("wireguard_listen needs a
@@ -63,18 +75,33 @@ read -r P1 P2 P3 < <(bun -e 'const l=Array.from({length:3},()=>Bun.listen({hostn
 WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});process.stdout.write(String(s.port));s.close()')"
 [[ "$WGP" =~ ^[0-9]+$ ]] || die "UDP port allocation produced non-numeric output"
 # Gateway serving needs the app's workspace_create posture:
-#   --gateway            binds the isolated browser plane that serves the routes
-#   --wireguard-listen   a CONCRETE UDP port (0.0.0.0 = endpoint-less/roaming,
-#     0.0.0.0:$WGP       like the app), so the overlay comes up instead of being
-#                        skipped on port 0
+#   --listen             p2p mesh bind: DEV_LISTEN (#1241) — a second machine
+#                        needs this wide to dial in for a peer join or huddle
+#   --advertised         the dial-hint address WE announce to peers, not a
+#     127.0.0.1          bind — stays loopback; an operator reaching this demo
+#                        from elsewhere dials its real host:port directly, a
+#                        wrong self-announcement is a peer's problem, not a
+#                        bind refusal, so it is not DEV_LISTEN's job
+#   --http               a --cred run needs http_listen on loopback (the
+#     $DEV_HTTP_LISTEN   isolated browser gateway dies on a wide bind) — a
+#                        SEPARATE knob (DEV_HTTP_LISTEN) from DEV_LISTEN
+#   --rpc                127.0.0.1     local operator rpc — the CLI on THIS
+#                        box only, no peer or huddle plane reads it, stays
+#                        loopback always
+#   --gateway             binds the isolated browser plane that serves the routes;
+#     127.0.0.1:0         stays loopback with http_listen, same #1379 constraint
+#   --wireguard-listen   a CONCRETE UDP port, already bound wide (0.0.0.0 =
+#     0.0.0.0:$WGP       endpoint-less/roaming, like the app) regardless of
+#                        DEV_LISTEN, so the overlay a peer join/huddle needs
+#                        already reaches a second machine
 #   --primary-coordinator a self-contained local demo does NOT phone home to the
 #     none               public rendezvous coordinator; keeps network.toml (which
 #                        the app reboots from) fully local.
 INIT_ERR="$(mktemp)"
 if ! CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
   --modules "$MODULES" \
-  --listen "127.0.0.1:$P1" --advertised "127.0.0.1:$P1" \
-  --http "127.0.0.1:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
+  --listen "$DEV_LISTEN:$P1" --advertised "127.0.0.1:$P1" \
+  --http "$DEV_HTTP_LISTEN:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \
   --wireguard-listen "0.0.0.0:$WGP" 2>"$INIT_ERR" | tail -1)"; then
   sed -n '1,120p' "$INIT_ERR" >&2
@@ -121,10 +148,13 @@ else
 fi
 
 # ── 4. start the node, wait for its http surface ───────────────
-log "starting node (http 127.0.0.1:$P2)…"
+log "starting node (http $DEV_HTTP_LISTEN:$P2)…"
 "$NODE_BIN" node run --config "$WSDIR/node.toml" >"$WSDIR/seed.log" 2>&1 &
 NODE_PID=$!
 trap 'kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null' EXIT
+# This script always talks to the node it just started, from THIS box — a
+# wildcard bind still accepts loopback, so the seeder's own curl calls stay
+# on 127.0.0.1 regardless of DEV_HTTP_LISTEN.
 URL="http://127.0.0.1:$P2"
 for _ in $(seq 1 80); do
   curl -sf "$URL/v1/status" >/dev/null 2>&1 && break
