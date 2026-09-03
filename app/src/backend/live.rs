@@ -704,7 +704,7 @@ pub fn fold_live_chat(
         active_channel_archived = channel.archived;
         active_channel_members_only = channel.members_only;
     }
-    let seated = channel_members.iter().any(|member| member.key == me);
+    let seated = seated_in(&channel_members, &me);
     let post_refusal = if active_channel_archived {
         "channel_archived".into()
     } else if active_channel_members_only && !seated {
@@ -1962,7 +1962,8 @@ pub async fn open_dm(
 }
 
 /// Why the viewer may not post here, as a stable reason token — empty when
-/// she may. A members-only channel she is not seated in refuses her post.
+/// she may. A members-only channel she is not seated in refuses her post; a
+/// seat is hers under any key of her account ([`seated_in`]).
 pub fn post_gate(
     archived: bool,
     members_only: bool,
@@ -1972,7 +1973,7 @@ pub fn post_gate(
     if archived {
         return "channel_archived".into();
     }
-    let seated = members.iter().any(|member| member.key == me);
+    let seated = seated_in(&members, &me);
     if members_only && !seated {
         return "members_only".into();
     }

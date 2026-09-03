@@ -3359,6 +3359,7 @@ dependencies = [
  "cpal",
  "design",
  "dispatch 0.1.0",
+ "duckfs-core",
  "ducktape-home",
  "ducktape-rpc",
  "forge",

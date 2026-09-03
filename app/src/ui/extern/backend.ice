@@ -221,6 +221,7 @@ extern crate::backend
   pure fs_counts_summary(connected:bool, listed:bool, entries:&[FsEntry]) -> str
   pure fs_parent(path:str) -> str
   pure fs_child(path:str, name:str) -> str
+  pure files_write_gate(dir:str, me:str) -> str
   files_mkdir(rpc:str, password:str, path:str) -> bool ! AppError
   files_remove(rpc:str, password:str, path:str) -> bool ! AppError
   files_write_text(rpc:str, password:str, path:str, text:str) -> bool ! AppError

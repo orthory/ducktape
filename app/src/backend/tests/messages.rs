@@ -74,7 +74,30 @@ fn the_post_gate_names_why_a_viewer_cannot_post() {
         post_gate(false, true, members.clone(), "cafe".into()),
         "members_only"
     );
-    assert_eq!(post_gate(false, true, members, "beef".into()), "");
+    assert_eq!(post_gate(false, true, members.clone(), "beef".into()), "");
+
+    // A seat is the ACCOUNT's: the viewer's passkey holds the seat, and her
+    // device key is bound to the same account, so the device may post too.
+    seed_names(NameDirectory::new(BTreeMap::from([
+        (
+            "beef".to_string(),
+            BoundAccount { number: 7, name: "b".into() },
+        ),
+        (
+            "b00f".to_string(),
+            BoundAccount { number: 7, name: "b".into() },
+        ),
+        (
+            "cafe".to_string(),
+            BoundAccount { number: 8, name: "c".into() },
+        ),
+    ])));
+    assert_eq!(post_gate(false, true, members.clone(), "b00f".into()), "");
+    assert_eq!(
+        post_gate(false, true, members, "cafe".into()),
+        "members_only"
+    );
+    seed_names(NameDirectory::default());
 }
 
 /// A SEARCH HIT SAYS WHICH ROOM IT IS IN, ONCE. The hit's `meta` was

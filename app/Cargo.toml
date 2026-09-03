@@ -45,6 +45,10 @@ keystore.workspace = true
 # of holding the key in-process; `node::encode_frame` is the ONE encoder, and a
 # second implementation of a machine wire format is not a thing to write.
 node.workspace = true
+# the duckfs wire bounds an upload must agree with (inline cap, chunk size):
+# a threshold spelled here as a literal is a second copy the module cannot
+# see move.
+duckfs-core.workspace = true
 authpage.workspace = true
 # the ed25519 signer `keystore` hands back and `node::encode_frame` signs with.
 commonware-cryptography.workspace = true

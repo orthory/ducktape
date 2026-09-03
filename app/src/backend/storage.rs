@@ -490,7 +490,12 @@ pub async fn files_upload(
             .map_err(|error| format!("cannot read {dropped}: {error}"))?;
         let rpc = rpc_client(&rpc)?;
         let target = fs_child(dir, name.clone());
-        let content = match bytes.len() as u64 <= 256 * 1024 {
+        // The module's own bounds: what a commit may carry inline, and the
+        // size of one staged chunk.
+        let rides_inline = bytes.len() <= duckfs_core::MAX_INLINE_COMMIT_BYTES;
+        let chunk_size =
+            usize::try_from(duckfs_core::CHUNK_SIZE).expect("a duckfs chunk fits in memory");
+        let content = match rides_inline {
             true => serde_json::json!({ "inline": { "b64": base64_encode(&bytes) } }),
             false => {
                 // A staged chunk is a raw-bytes write charged to the person,
@@ -499,7 +504,7 @@ pub async fn files_upload(
                     .clone()
                     .with_write_auth(data_plane_signer(&rpc, password.clone()).await?);
                 let mut chunks = Vec::new();
-                for chunk in bytes.chunks(1024 * 1024) {
+                for chunk in bytes.chunks(chunk_size) {
                     chunks.push(staging.files_stage(chunk.to_vec()).await?);
                 }
                 serde_json::json!({ "chunks": { "size": bytes.len() as u64, "chunks": chunks } })
@@ -595,6 +600,26 @@ pub fn fs_child(path: String, name: String) -> String {
     let name = name.trim().trim_matches('/');
     let dir = path.trim_end_matches('/');
     format!("{dir}/{name}")
+}
+
+/// Why the viewer may not write an entry under `dir`, in the MODULE's own
+/// words — empty when she may. This is `check_authority`, the rule the files
+/// module runs on every change, asked before the round trip with the owner
+/// spelled the way a signed frame's origin spells it (`ext:<key>`); the app
+/// never grows a second reading of which paths are whose. A device with no
+/// key has nothing to sign with, and the signer says so when it is asked.
+pub fn files_write_gate(dir: String, me: String) -> String {
+    if me.is_empty() {
+        return String::new();
+    }
+    let owner = format!("ext:{me}");
+    let entry = fs_child(dir, "entry".into());
+    let authority = duckfs_core::paths::canonical(&entry)
+        .and_then(|segments| duckfs_core::paths::check_authority(&owner, &segments));
+    match authority {
+        Ok(()) => String::new(),
+        Err(reason) => reason.trim_start_matches("files: ").to_string(),
+    }
 }
 
 /// Minimal base64 (standard alphabet, padded) — the files read lane's wire.

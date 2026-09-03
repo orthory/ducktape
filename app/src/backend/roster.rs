@@ -100,6 +100,28 @@ pub(crate) fn directory_of(accounts: &[AccountView]) -> NameDirectory {
     )
 }
 
+/// A test's directory, seated the way a roster read seats it.
+#[cfg(test)]
+pub(crate) fn seed_names(directory: NameDirectory) {
+    *NAME_DIRECTORY
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory;
+}
+
+/// Whether `me` (a key hex) holds a seat among `members`: their own key, or
+/// any key of the account it is bound to — a member seated with their passkey
+/// is seated on their device too. Reads the directory as last read, the way
+/// the optimistic mint does; a cold directory answers by key alone.
+pub(crate) fn seated_in(members: &[ChatMember], me: &str) -> bool {
+    let names = names();
+    let my_account = names.account_of(me);
+    members.iter().any(|member| {
+        let same_key = member.key == me;
+        let same_account = my_account.is_some() && names.account_of(&member.key) == my_account;
+        same_key || same_account
+    })
+}
+
 /// Refresh the directory and nothing else — what a chat load does before it
 /// renders a row.
 pub(crate) async fn refresh_names(client: &RpcClient) -> Result<(), String> {
