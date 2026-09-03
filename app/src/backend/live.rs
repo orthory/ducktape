@@ -606,6 +606,7 @@ pub fn fold_live_chat(
     active_thread_seq: i64,
     history_view: bool,
     chat_visible: bool,
+    has_older_history: bool,
     unread_boundary: i64,
     mut active_channel_name: String,
     mut active_channel_archived: bool,
@@ -621,6 +622,9 @@ pub fn fold_live_chat(
     thread_message_action: crate::MessageAction,
     thread_edit_draft: String,
 ) -> ChatLiveFold {
+    // Read before the timeline moves into the fold: the floor it ends on is
+    // compared against this to see whether the render window evicted history.
+    let floor_before = oldest_committed_seq(&messages);
     let mut state = ChatFoldState {
         channels,
         messages,
@@ -737,18 +741,26 @@ pub fn fold_live_chat(
             .find(|message| message.seq > unread_boundary)
             .map_or(0, |message| message.seq)
     };
-    let rooms = chat_sidebar_rooms(
-        channels.clone(),
-        dm_peers.clone(),
-        me,
-        channel_reads.clone(),
-    );
+    let rooms = chat_sidebar_rooms(channels.clone(), dm_peers.clone(), channel_reads.clone());
     let dm_rows = chat_sidebar_dms(channels.clone(), dm_peers, channel_reads.clone());
 
-    let has_older_history = messages
-        .iter()
-        .find(|message| !message.pending)
-        .is_some_and(|message| message.seq > 1);
+    // THE SERVER OWNS THIS FLAG; THE FOLD MAY ONLY RAISE IT.
+    //
+    // It used to be recomputed here as "the oldest loaded root has seq > 1",
+    // which is a guess and a wrong one: thread replies consume root sequences
+    // without becoming roots, so a channel's very first message routinely sits
+    // at seq 40 and "Load older messages" stood over the true beginning of every
+    // busy room forever. What a live fold DOES know is whether it pushed the
+    // floor up — `bounded_chat_window` evicts from the oldest edge to hold the
+    // render window — and rows this window dropped are older history by
+    // definition, whatever the page load last said.
+    //
+    // A window that held no committed row has no floor to lose: the first live
+    // arrival in an empty room raises the floor from 0 to its own seq, which is
+    // growth, not eviction.
+    let window_had_a_floor = floor_before > 0;
+    let evicted_the_floor = window_had_a_floor && oldest_committed_seq(&messages) > floor_before;
+    let has_older_history = has_older_history || evicted_the_floor;
     let selection = message_selection_after_window_ref(
         &messages,
         selected_message_seq,
@@ -829,12 +841,18 @@ pub(crate) async fn folded_update(
         "chat" => {
             let current_user = local_user_key().await;
             let origin_kind = stream_origin_kind(&op.origin.kind);
+            // THE CACHED DIRECTORY, NOT A FRESH READ: this is inside the live
+            // decoder fold, where a query would freeze every subscriber for as
+            // long as the node's select loop is busy (issue #1018). It is warm
+            // by the connect that opened this stream.
+            let names = cached_account_names();
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
                 origin_kind,
                 op.origin.id.as_deref(),
                 current_user.as_deref(),
+                &names,
                 op.height,
             );
             let delta = match folded {
@@ -847,8 +865,8 @@ pub(crate) async fn folded_update(
             let delta = match delta {
                 ChatDelta::ChannelRefresh { channel_id } => {
                     let channel = match load_channel_row(rpc, &channel_id).await {
-                        Ok(channel) => channel,
-                        Err(_) => return Some(live_resync("chat", height)),
+                        Ok(Some(channel)) => channel,
+                        Ok(None) | Err(_) => return Some(live_resync("chat", height)),
                     };
                     ChatDelta::ChannelUpdated {
                         channel_id,
@@ -995,10 +1013,17 @@ fn stream_origin_kind(kind: &ducktape_rpc::StreamOriginKind) -> &'static str {
 /// long as the node's select loop is busy writing a checkpoint (issue #1018).
 /// `ChatViewQuery::Channel` reads the same `ChannelInfo` off an MVCC snapshot,
 /// off-loop — identical payload, no checkpoint tax.
-pub(crate) async fn load_channel_row(rpc: &str, channel_id: &str) -> Result<ChatChannel, String> {
+///
+/// An unseen row is `None`, and the caller turns it into a scoped resync rather
+/// than a banner: the op named a channel this node's index cannot answer for
+/// yet, and a reload is the only thing that heals that.
+pub(crate) async fn load_channel_row(
+    rpc: &str,
+    channel_id: &str,
+) -> Result<Option<ChatChannel>, String> {
     let rpc = rpc_client(rpc)?;
-    let (channel, _roster) = load_channel_facts(&rpc, channel_id, None).await?;
-    Ok(channel)
+    let facts = load_channel_facts(&rpc, channel_id, None).await?;
+    Ok(facts.map(|(channel, _roster)| channel))
 }
 
 /// One scoped catch-up load, flag-selected per plane: the chat slices
@@ -1189,15 +1214,35 @@ pub fn resync_planes(load_chat: bool, load_pages: bool) -> String {
 /// (`keep_channels(loaded, upsert_channel_rows(channels, next), channels)`) the
 /// upsert ran on every pages-only refresh and was thrown away one call later.
 /// Same early-return shape as [`resynced_messages`] below.
+///
+/// EXCEPT ACROSS A NETWORK. `chain_moved` says the list on screen was learned
+/// from a chain this node is no longer on — a workspace switch under a console
+/// that never reconnected, because the endpoint did not change — and a fold has
+/// no way to express "that room does not exist here": it only ever adds. So the
+/// one thing that can be true of the previous network's rooms is that they are
+/// gone, and the answer replaces the list outright.
 pub fn keep_channels(
     loaded: bool,
+    chain_moved: bool,
     next: Vec<ChatChannel>,
     current: Vec<ChatChannel>,
 ) -> Vec<ChatChannel> {
     if !loaded {
         return current;
     }
+    if chain_moved {
+        return next;
+    }
     upsert_channel_rows(current, next)
+}
+
+/// The oldest COMMITTED root's seq, or 0 for a window holding none. Pending
+/// sends carry a negative seq and answer for nothing — the same rule
+/// `oldest_committed` states in `load.rs`.
+fn oldest_committed_seq(rows: &[ChatMessage]) -> i64 {
+    rows.iter()
+        .find(|row| !row.pending && row.seq > 0)
+        .map_or(0, |row| row.seq)
 }
 
 /// The committed `seq` range of a timeline window, or `None` when it holds no
@@ -1243,6 +1288,7 @@ fn committed_seq_span(rows: &[ChatMessage]) -> Option<(i64, i64)> {
 /// reader loaded.
 pub fn resynced_messages(
     loaded: bool,
+    chain_moved: bool,
     next: Vec<ChatMessage>,
     current: Vec<ChatMessage>,
     current_channel: String,
@@ -1252,6 +1298,12 @@ pub fn resynced_messages(
     // window on screen IS the answer and the merge below is never paid for.
     if !loaded {
         return current;
+    }
+    // ACROSS A NETWORK NOTHING MERGES — see `keep_channels`. The rows on screen
+    // were read from a chain this node is no longer on; a `seq` that overlaps
+    // one in the new network's room is a coincidence, not continuity.
+    if chain_moved {
+        return next;
     }
     let pages_overlap = match (committed_seq_span(&next), committed_seq_span(&current)) {
         (Some((oldest_canonical, _)), Some((_, newest_held))) => oldest_canonical <= newest_held,
@@ -1630,7 +1682,10 @@ pub async fn load_chat_hit(
         let current_user = local_user_key().await;
         chat.active_thread_seq = root.seq;
         chat.thread_target_seq = number_i64(target_seq);
-        chat.thread_messages = vec![root, chat_message(reply, current_user.as_deref())];
+        chat.thread_messages = vec![
+            root,
+            chat_message(reply, current_user.as_deref(), &account_names(&rpc).await),
+        ];
         Ok(chat)
     }
     .await
@@ -1744,6 +1799,84 @@ pub struct DmPeersData {
     pub peers: Vec<DmPeer>,
 }
 
+/// THE ACCOUNT DIRECTORY EVERY AUTHORED ROW IS NAMED AGAINST, cached for the
+/// process and keyed by the endpoint it was read from.
+///
+/// A chat row carries `user:{hex}` and nothing else — the module stamps a KEY,
+/// because a key is what signed the frame — while the name that key registered
+/// lives in the identity module's own store. Nothing joined the two, so the
+/// timeline printed `user bf431c5d…` at a person the DIRECT list one pane over
+/// was already calling "orthory".
+///
+/// It is a CACHE and not a per-load read for the reason `local_user_key` is
+/// one: this is consulted once per rendered row, on every load and every folded
+/// live delta, and the answer changes only when someone registers or renames an
+/// account. `load_dm_peers` is what refreshes it — that load already pages every
+/// account for its own rows, and the live stream re-runs it on every identity
+/// op (`LiveKind.plane`), so the directory follows a rename without a query of
+/// its own.
+static ACCOUNT_NAMES: tokio::sync::RwLock<Option<(String, AuthorNames)>> =
+    tokio::sync::RwLock::const_new(None);
+
+/// The directory for this endpoint, read from the identity module when the
+/// cache is cold or holds another node's answer. An identity module that cannot
+/// answer yet (a resident still joining) yields an empty directory — hex names,
+/// corrected by the `dm_peers` refresh the first identity op triggers.
+pub(crate) async fn account_names(rpc: &RpcClient) -> AuthorNames {
+    let origin = rpc.origin().to_string();
+    let cached = ACCOUNT_NAMES.read().await.clone();
+    if let Some((cached_origin, names)) = cached
+        && cached_origin == origin
+    {
+        return names;
+    }
+    let Ok(names) = read_account_names(rpc).await else {
+        return AuthorNames::default();
+    };
+    *ACCOUNT_NAMES.write().await = Some((origin, names.clone()));
+    names
+}
+
+/// The cached directory WITHOUT filling it — for the two callers that cannot
+/// wait on a round trip: the synchronous optimistic mint, and the live stream's
+/// decoder fold, where a `/v1/query` freezes every subscriber for as long as the
+/// node's select loop is busy (issue #1018). Cold reads as an empty directory;
+/// the connect's chat load warms it before either can run.
+pub(crate) fn cached_account_names() -> AuthorNames {
+    ACCOUNT_NAMES
+        .try_read()
+        .ok()
+        .and_then(|cached| cached.as_ref().map(|(_origin, names)| names.clone()))
+        .unwrap_or_default()
+}
+
+async fn read_account_names(rpc: &RpcClient) -> Result<AuthorNames, String> {
+    let reply: IdentityReply = rpc
+        .query(
+            "identity",
+            &IdentityQuery::All {
+                from: 0,
+                limit: identity::MAX_QUERY_LIMIT,
+            },
+        )
+        .await?;
+    let IdentityReply::Accounts(accounts) = reply else {
+        return Err("the identity module returned the wrong reply".to_string());
+    };
+    Ok(account_names_of(&accounts))
+}
+
+/// EVERY key of an account answers to that account's name: a person with a
+/// phone and a laptop signs with two keys and is one name in the timeline.
+pub(crate) fn account_names_of(accounts: &[AccountView]) -> AuthorNames {
+    AuthorNames::new(accounts.iter().flat_map(|account| {
+        account
+            .keys
+            .iter()
+            .map(|key| (hex_encode(&key.pubkey), account.name.clone()))
+    }))
+}
+
 /// The people this device can open a DM with, one row per identity account.
 ///
 /// Registered agents are NOT here: a DM is a chat channel seated on public
@@ -1774,6 +1907,12 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };
+        // THE DIRECTORY RIDES THIS LOAD. It is the same page of accounts the
+        // author names are read from, and this load re-runs on every identity op
+        // — so a rename reaches the timeline with no query of its own. See
+        // `ACCOUNT_NAMES`.
+        *ACCOUNT_NAMES.write().await =
+            Some((client.origin().to_string(), account_names_of(&accounts)));
         // self is the account THIS key is a member of (a key holds at most one).
         let is_mine = |account: &AccountView| {
             me.as_ref()
@@ -1840,15 +1979,31 @@ pub fn dm_channel_id(a: String, b: String) -> String {
 /// every landing that assigns `active_channel` from a reply re-derives the peer
 /// through here, and the field cannot disagree with the room again.
 ///
-/// A device with no user key derives no DM id at all, so it holds no DM — the
-/// same answer `chat_sidebar_rooms` gives when `me` is empty.
-pub fn dm_peer_of_channel(peer: String, me: String, channel: String) -> String {
-    let peer_owns_the_room =
-        !peer.is_empty() && !me.is_empty() && dm_channel_id(me, peer.clone()) == channel;
+/// THE DIRECTORY'S OWN ID DECIDES, for the reason `chat_sidebar_rooms` gives:
+/// `DmPeer.channel_id` was derived once, in `load_dm_peers`, from the account
+/// number that load resolved for itself. Re-hashing it here against a separate
+/// `account_number` reading made the header disagree with the sidebar whenever
+/// that reading was late or missing — the peer's own room drew as a `#` channel
+/// under his name in DIRECT.
+pub fn dm_peer_of_channel(peer: String, peers: Vec<DmPeer>, channel: String) -> String {
+    let peer_owns_the_room = peers
+        .iter()
+        .any(|row| row.key == peer && !row.channel_id.is_empty() && row.channel_id == channel);
     match peer_owns_the_room {
         true => peer,
         false => String::new(),
     }
+}
+
+/// The room a DIRECT row opens — the id `load_dm_peers` derived for that peer,
+/// empty when the directory does not name him (or names him with no account
+/// number of ours to pair against).
+pub fn dm_room_of_peer(peers: Vec<DmPeer>, peer: String) -> String {
+    peers
+        .into_iter()
+        .find(|row| row.key == peer)
+        .map(|row| row.channel_id)
+        .unwrap_or_default()
 }
 
 /// THE DM HEADER'S OWN ROW, resolved where `active_dm_peer` is written.

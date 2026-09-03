@@ -83,6 +83,11 @@ pub(crate) const DRAIN_TICK: Duration = Duration::from_millis(100);
 /// facts per drain pass, but the exposition parse is the pricey part and one
 /// per second bounds its cost — and the staleness — at once.
 pub(crate) const OPS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// how often the drain re-checks that this node's workspace directory is still
+/// the one it booted on (`WorkspaceMark`). One `stat` per second is free next
+/// to a block, and a second is far inside the window between a workspace being
+/// deleted and the next journal write panicking somewhere in consensus.
+pub(crate) const WORKSPACE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 /// the submit-relay channel: a resident-standing node ships a frame it
 /// SIGNED (its own identity key is the frame origin — authorship) to one
 /// current validator, which takes consensus custody (`submit_frame`) and

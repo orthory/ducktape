@@ -280,6 +280,7 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
             },
         ],
         Some(&me),
+        &AuthorNames::default(),
     );
     assert_eq!(roster.len(), 2);
     assert!(roster[0].is_you && !roster[0].is_agent);
@@ -593,25 +594,22 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             repo_menu,
         )
     };
-    let target = |tab: ShellTab,
-                  bell: bool,
-                  create: bool,
-                  thread_action: MessageAction,
-                  repo_menu: bool| {
-        escape_target(
-            escape.clone(),
-            tab,
-            false,
-            bell,
-            create,
-            thread_action,
-            MessageAction::Toolbar,
-            false,
-            false,
-            String::new(),
-            repo_menu,
-        )
-    };
+    let target =
+        |tab: ShellTab, bell: bool, create: bool, thread_action: MessageAction, repo_menu: bool| {
+            escape_target(
+                escape.clone(),
+                tab,
+                false,
+                bell,
+                create,
+                thread_action,
+                MessageAction::Toolbar,
+                false,
+                false,
+                String::new(),
+                repo_menu,
+            )
+        };
 
     // A stale chat menu names no layer from another tab — for BOTH readers.
     let stale_thread_menu = |tab: ShellTab| {
@@ -673,7 +671,13 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
     // Window-level layers ride every tab: mounted outside the tab match, they
     // stay on screen across a switch and must keep answering.
     assert_eq!(
-        target(ShellTab::Governance, true, false, MessageAction::Toolbar, false),
+        target(
+            ShellTab::Governance,
+            true,
+            false,
+            MessageAction::Toolbar,
+            false
+        ),
         "bell"
     );
     assert_eq!(

@@ -18,6 +18,18 @@ use sdk::StateRoot;
 /// unbuffered, so `daemon.log` always has the line, and the shell reads its tail
 /// precisely to report a death (`daemon.rs::SpawnFailure::log_tail`).
 macro_rules! fatal {
+    // the same stop, carrying the snake_case `reason` token an operator greps
+    // for. Only the causes a reader is meant to COUNT get one; the rest say it
+    // in the message.
+    ($label:expr, reason = $reason:expr, $($arg:tt)*) => {{
+        tracing::error!(
+            target: "ducktape::node",
+            node = %$label,
+            reason = $reason,
+            "FATAL: {}", format_args!($($arg)*)
+        );
+        std::process::exit(1)
+    }};
     ($label:expr, $($arg:tt)*) => {{
         tracing::error!(
             target: "ducktape::node",
@@ -76,4 +88,76 @@ pub(crate) fn unix_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// The workspace directory this node booted on, pinned by identity rather than
+/// by path: the device and inode `stat` reported at boot.
+///
+/// A path check alone cannot answer "is my workspace still there", because the
+/// node RECREATES it: every journal write does `create_dir_all` on the storage
+/// root under it, so seconds after an `rm -rf` the path exists again — empty,
+/// on a NEW inode, with the chain's history gone. Comparing the inode is what
+/// tells the two apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceMark {
+    device: u64,
+    inode: u64,
+}
+
+impl WorkspaceMark {
+    /// Pin a directory as it is now. `None` when it cannot be stat'd at all —
+    /// the caller then runs unguarded rather than fail-stopping on a boot-time
+    /// filesystem oddity.
+    pub(crate) fn read(dir: &std::path::Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(dir).ok()?;
+        Some(Self {
+            device: meta.dev(),
+            inode: meta.ino(),
+        })
+    }
+
+    /// Is the pinned directory still the one sitting at `dir`? False when the
+    /// path is gone AND when something else — a re-created empty workspace —
+    /// now occupies it.
+    pub(crate) fn still_at(&self, dir: &std::path::Path) -> bool {
+        Self::read(dir) == Some(*self)
+    }
+}
+
+#[cfg(test)]
+mod workspace_mark_tests {
+    use super::WorkspaceMark;
+
+    #[test]
+    fn a_pinned_workspace_is_still_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mark = WorkspaceMark::read(dir.path()).expect("a fresh dir stats");
+        assert!(mark.still_at(dir.path()));
+    }
+
+    #[test]
+    fn a_deleted_workspace_is_gone_even_once_the_path_is_back() {
+        // exactly the shape a running node lands in: the directory is deleted
+        // underneath it, and its own next journal write puts the PATH back.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workspace");
+        std::fs::create_dir(&path).unwrap();
+        let mark = WorkspaceMark::read(&path).expect("a fresh dir stats");
+
+        std::fs::remove_dir_all(&path).unwrap();
+        assert!(!mark.still_at(&path), "a missing path is not the workspace");
+
+        std::fs::create_dir_all(path.join("storage")).unwrap();
+        assert!(
+            !mark.still_at(&path),
+            "a re-created workspace is a different one"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_directory_marks_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(WorkspaceMark::read(&dir.path().join("absent")), None);
+    }
 }

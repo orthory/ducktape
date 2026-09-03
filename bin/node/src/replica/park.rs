@@ -20,7 +20,9 @@ use recovery::{Manifest, Recovery};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::*;
 use crate::drain_actions::{CutoverTrigger, EpochActions};
-use crate::explorer::{boundary_block_row, heal_and_backfill_index, heal_index};
+use crate::explorer::{
+    boundary_block_row, heal_and_backfill_index, heal_index, retry_owed_backfill,
+};
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
 use crate::host_state::{NodeSubstrates, restore_host, sync_all_modules};
 use crate::relay;
@@ -146,6 +148,37 @@ async fn replica_roles(
             std::collections::BTreeSet::new(),
         ),
     }
+}
+
+/// Point the reachability plane at `epoch` with the role this node holds in
+/// (`participants`, `residents`), so its restore/assembly can run. The
+/// freshness clock is the caller's `clock` (the app-height regime the
+/// members' `ViewTick`s run).
+///
+/// NON-BLOCKING by contract — the plane is never a caller's dependency:
+/// `false` says the plane's queue refused the command, and the caller must
+/// leave its epoch latch unadvanced so a later poll re-offers it.
+fn retarget_reach_plane(
+    cmd: &tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
+    epoch: u64,
+    clock: u64,
+    participants: &[Vec<u8>],
+    residents: &[Vec<u8>],
+) -> bool {
+    let keys = |raw: &[Vec<u8>]| -> Vec<ed25519::PublicKey> {
+        raw.iter()
+            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+            .collect()
+    };
+    cmd.try_send(reachability::ReachabilityCommand::Retarget(
+        reachability::MeshEpochEvent {
+            epoch,
+            members: keys(participants),
+            standbys: keys(residents),
+            current_view: clock,
+        },
+    ))
+    .is_ok()
 }
 
 /// the activation cutover's coordinates, lifted OWNED off the orchestrator's
@@ -593,6 +626,12 @@ pub(super) async fn park(
     // gate keeps it. in-memory on purpose: after a restart the first
     // boundary re-fires and every write below is idempotent.
     let mut last_indexed_root: Option<StateRoot> = None;
+    // the index backfills a boot seam could not complete because no source
+    // answered — carried here because the STORE cannot carry it: a refused
+    // walk leaves the module untouched, and the next live block advances every
+    // module watermark over the hole regardless. re-issued from the tip poll
+    // below, on the event that a source answered this node again.
+    let mut backfill_debt = crate::explorer::BackfillDebt::default();
     // ---- REPLICA RESTART: recover by journal replay --------------
     //
     // A resident checkpoint is a real recovery base: replay the journal
@@ -709,6 +748,34 @@ pub(super) async fn park(
             root_hash = %hex(&root),
             "resident: pre-synced boundary {tip} root_hash={}", hex(&root)
         );
+        // #1104: the reachability plane's boot Retarget comes from the
+        // RECOVERED state, not the manifest poll — the poll needs the p2p
+        // mesh, the mesh dials through the tunnels restore() would bring
+        // up, and restore() runs only on the first Retarget; without this
+        // the restarted resident deadlocks in that cycle.
+        //
+        // It fires HERE, ahead of everything below it, because the index
+        // heal below AWAITS a per-module fetch over the very mesh this
+        // command resurrects. On a restarted resident the tunnels are down,
+        // so every one of those fetches burns its full timeout before the
+        // next module's — ordering the plane behind them parks the node in
+        // `joining`, tunnel-less and mesh-less, for the whole doomed sweep.
+        // Nothing in the retarget reads the index or the serve state.
+        //
+        // Same standing gate, freshness clock, and non-blocking discipline
+        // as the poll below: a shed Retarget is retried there (the epoch
+        // latch only advances when the send is taken).
+        if let Some(cmd) = &reach_cmd
+            && resident_standing
+        {
+            let clock = rec.view_base.max(tip);
+            let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
+            let targeted =
+                retarget_reach_plane(cmd, rec.epoch, clock, &rec.participants, &rec.residents);
+            if targeted {
+                last_plane_epoch = Some(rec.epoch);
+            }
+        }
         // THE LAST SEAM BEFORE THIS RESIDENT SERVES, and the only one a
         // restart passes through: the same helper the ascension runs, because
         // a restart over a WIPED index directory lands here holding nothing
@@ -718,7 +785,7 @@ pub(super) async fn park(
         // reachable only here, and only from a source. An unreachable one
         // leaves every floor standing, which is exactly where this line
         // stood before.
-        heal_and_backfill_index(&index, &client, tip, &label).await;
+        backfill_debt.absorb(heal_and_backfill_index(&index, &client, tip, &label).await);
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
@@ -741,43 +808,6 @@ pub(super) async fn park(
             height = tip,
             source = "recovery"
         );
-        // #1104: the reachability plane's boot Retarget comes from the
-        // RECOVERED state, not the manifest poll — the poll needs the p2p
-        // mesh, the mesh dials through the tunnels restore() would bring
-        // up, and restore() runs only on the first Retarget; without this
-        // the restarted resident deadlocks in that cycle. Same standing
-        // gate, freshness clock, and non-blocking discipline as the poll
-        // below: a shed Retarget is retried there (the epoch latch only
-        // advances when the send is taken).
-        if let Some(cmd) = &reach_cmd
-            && resident_standing
-        {
-            let clock = rec.view_base.max(tip);
-            let members: Vec<ed25519::PublicKey> = rec
-                .participants
-                .iter()
-                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                .collect();
-            let standbys: Vec<ed25519::PublicKey> = rec
-                .residents
-                .iter()
-                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                .collect();
-            let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
-            if cmd
-                .try_send(reachability::ReachabilityCommand::Retarget(
-                    reachability::MeshEpochEvent {
-                        epoch: rec.epoch,
-                        members,
-                        standbys,
-                        current_view: clock,
-                    },
-                ))
-                .is_ok()
-            {
-                last_plane_epoch = Some(rec.epoch);
-            }
-        }
     }
     let not_serving = |standing: bool| -> String {
         if standing {
@@ -1893,6 +1923,11 @@ pub(super) async fn park(
             &mut peer_builds,
             &mut warned_builds,
         );
+        // A SOURCE JUST ANSWERED THIS NODE — the one event a refused index
+        // backfill is waiting for. The walk is re-issued here and nowhere
+        // else, so an unreachable source costs this loop nothing but the
+        // poll it was already pacing.
+        retry_owed_backfill(&mut backfill_debt, &index, &client, &label).await;
         // follow the mesh rotation while parked: track the tip's
         // REPLICATED generation window — the identical snapshots every
         // member tracks, so a parked joiner's tracked sets can never
@@ -1949,30 +1984,11 @@ pub(super) async fn park(
             // below only advances when the send is taken.
             let clock = tip.view_base.max(tip.height);
             let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
-            if last_plane_epoch != Some(tip.epoch) {
-                let members: Vec<ed25519::PublicKey> = tip
-                    .participants
-                    .iter()
-                    .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                    .collect();
-                let standbys: Vec<ed25519::PublicKey> = tip
-                    .residents
-                    .iter()
-                    .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                    .collect();
-                if cmd
-                    .try_send(reachability::ReachabilityCommand::Retarget(
-                        reachability::MeshEpochEvent {
-                            epoch: tip.epoch,
-                            members,
-                            standbys,
-                            current_view: clock,
-                        },
-                    ))
-                    .is_ok()
-                {
-                    last_plane_epoch = Some(tip.epoch);
-                }
+            let epoch_is_new_to_the_plane = last_plane_epoch != Some(tip.epoch);
+            if epoch_is_new_to_the_plane
+                && retarget_reach_plane(cmd, tip.epoch, clock, &tip.participants, &tip.residents)
+            {
+                last_plane_epoch = Some(tip.epoch);
             }
         }
         let member_in_tip = tip.participants.iter().any(|k| k == &me_bytes);
@@ -2250,7 +2266,9 @@ pub(super) async fn park(
                                 // into the feed (see
                                 // `heal_and_backfill_index`), and it closes
                                 // at `serving = Some(..)` below.
-                                heal_and_backfill_index(&index, &client, tip, &label).await;
+                                backfill_debt.absorb(
+                                    heal_and_backfill_index(&index, &client, tip, &label).await,
+                                );
                                 if let Err(err) =
                                     index.apply_block_record(tip, boundary_block_row(tip, &root))
                                 {
@@ -2470,7 +2488,9 @@ pub(super) async fn park(
                         // op-row backfill has to run here — at exactly the
                         // boundary `run_promoted` heals against, which makes
                         // that later heal the no-op it should be.
-                        heal_and_backfill_index(&index, &client, boundary.height, &label).await;
+                        backfill_debt.absorb(
+                            heal_and_backfill_index(&index, &client, boundary.height, &label).await,
+                        );
                         break (boundary, host, floor);
                     }
                     PromotionBoundary::Retry => {}

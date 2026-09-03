@@ -132,7 +132,9 @@ use util::hex;
 
 fn main() {
     resource_limits::cap_malloc_arenas();
-    // before any subscriber exists, so the warning is stderr's to carry.
+    // before any subscriber exists — it must precede the first descriptor this
+    // process opens — so stderr carries the failure and the outcome is RECORDED
+    // for `report_open_file_limit` to put in `daemon.log` once the sink is up.
     if let Err(err) = node::resource_limits::raise_open_file_limit() {
         eprintln!("[node] warning: could not raise open-file limit: {err}");
     }
@@ -337,8 +339,54 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     // below error was ever recorded at all.
     let workspace = cfg_path.parent().unwrap_or(std::path::Path::new("."));
     noded::log::init(Some(log_ring.clone()), Some(workspace.join("daemon.log")));
+    report_open_file_limit();
 
     run_node(config::resolve(&cfg_path)?, cfg_path, sync_only, log_ring)
+}
+
+/// Put the startup open-file raise ([`main`]) in `daemon.log`, ONCE, now that
+/// there is a subscriber to carry it.
+///
+/// This is not decoration. The raise runs before any sink exists, so its only
+/// previous record was a stderr line nothing tees — and a raise that silently
+/// left the process on the launchd default (`launchctl limit maxfiles` is
+/// `256 unlimited`) is indistinguishable, from the log, from one that worked.
+/// The node then dies minutes later with an `EMFILE` from whatever opened last,
+/// and nothing in the file says why.
+fn report_open_file_limit() {
+    use node::resource_limits::{MINIMUM_OPEN_FILES, startup_outcome};
+
+    let Some(outcome) = startup_outcome() else {
+        return;
+    };
+    let limit = match outcome {
+        Ok(limit) => limit,
+        Err(error) => {
+            tracing::warn!(
+                target: "ducktape::node",
+                reason = "open_file_limit_unraised",
+                error = %error,
+                "open-file limit left at the inherited default"
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        target: "ducktape::node",
+        soft_limit = limit.soft,
+        hard_limit = limit.hard,
+        raised = limit.raised,
+        "open-file limit"
+    );
+    if !limit.is_sufficient() {
+        tracing::warn!(
+            target: "ducktape::node",
+            reason = "open_file_limit_too_low",
+            soft_limit = limit.soft,
+            needed = MINIMUM_OPEN_FILES,
+            "open-file limit is below what a node needs; expect EMFILE under load"
+        );
+    }
 }
 
 /// the browser gateway serves on a running node (never under `--sync-only`)

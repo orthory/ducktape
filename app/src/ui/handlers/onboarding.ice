@@ -377,6 +377,8 @@ on console_opened(id)
   rooms = []
   dm_rows = []
   messages = []
+  // A new network mounts a fresh timeline at its tail — see `state/chat.ice`.
+  chat_at_tail = true
   node_log_filter = ""
   node_log_timeline = node_log_timeline_reset()
   shell_credentials_generation = shell_credentials_generation + 1

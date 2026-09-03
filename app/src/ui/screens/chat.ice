@@ -149,7 +149,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               open_thread_message_reactions
               open_message_link
 
-component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
+component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
   lifetime retained
   emits
     search_chat_submit()
@@ -650,37 +650,12 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                   SkeletonRow
                   SkeletonRow
                   SkeletonRow
-              if connected && !empty(messages) && history_view
-                box
-                  with
-                    w=fill
-                    h=32.0
-                    pl=10.0
-                    pr=6.0
-                    bg=warning_bg
-                    border=warning_line
-                    border-w=1.0
-                    r=9.0
-                  row
-                    with
-                      w=fill
-                      h=fill
-                      gap=8.0
-                      align=center
-                    text "Viewing history"
-                      with
-                        w=fill
-                        size=12.5
-                        wrap=none
-                        @text-warning
-                    button "Jump to latest" -> emit(choose_channel, active_channel)
-                      with
-                        h=24.0
-                        p=5.0
-                        @ghost_action
-                      active bg=surface text=fg border=warning_line border-w=1.0 r=7.0
-                      hovered bg=warning_bg text=fg
-                      pressed bg=accent text=fg
+              // NO "VIEWING HISTORY" BAND. `history_view` is still the read
+              // cursor's gate (`lifecycle.ice` refuses to mark a room read off a
+              // window around an old message) — it just has no banner any more.
+              // An amber band pushing the conversation down 32px told the reader
+              // something she could already see, and the one control on it, the
+              // way back to now, is a float over the timeline instead.
               // THE EMPTY LOADING STATE RESETS THE STREAM. A room switch clears
               // `messages`, this gate unmounts the old scrollable and its offset,
               // and the arriving root window mounts at the tail.
@@ -1193,6 +1168,37 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                     active bg=transparent text=muted r=6.0
                                     hovered bg=fg/10 text=fg
                                     pressed bg=fg/15
+            // JUMP TO LATEST — A FLOAT AT THE TIMELINE'S BOTTOM EDGE, where
+            // every chat app puts it, and where the reader's eyes already are.
+            // It used to be a button inside an amber "Viewing history" band at
+            // the TOP of the column: the one control that means "take me back to
+            // now" sat as far from now as the pane allows, and only ever
+            // appeared for a search-hit window — a reader who had simply
+            // scrolled up had no way back but the wheel.
+            //
+            // TWO WAYS TO BE AWAY FROM NOW, ONE PILL. `history_view` is a window
+            // around an old message, which is not the tail whatever the scroll
+            // offset says; `at_live_tail` is the offset itself, published by the
+            // stream's own `chat_scrolled` (`near_scroll_tail`). At the tail with
+            // no history window, the pill is not mounted at all.
+            if !empty(messages) && (history_view || !at_live_tail)
+              box
+                with
+                  w=fill
+                  h=fill
+                  pl=18.0
+                  pr=18.0
+                  pb=10.0
+                  align-x=center
+                  align-y=end
+                button "↓  Jump to latest" -> emit(choose_channel, active_channel)
+                  with
+                    h=28.0
+                    p=10.0
+                    @ghost_action
+                  active bg=surface text=muted border=border border-w=1.0 r=14.0
+                  hovered bg=fg/6 text=fg border=fg/14
+                  pressed bg=accent text=fg
             // THE RESULTS FLOAT. This card used to be the column's first
             // child, so a search reflowed the whole conversation down by
             // 148px; as a stack layer it drops over the stream instead and

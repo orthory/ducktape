@@ -1843,13 +1843,13 @@ fn cmd_member_leave(args: SelectorArgs) -> Result<(), Box<dyn std::error::Error>
 ///
 /// `--json` emits the same two facts as `{"in_set": <bool>, "validators": <n>}`.
 ///
-/// this is the read the desktop shell consults before FORGETTING a workspace
-/// (stop + delete): tearing a node down while it is still a current validator of
-/// a set of two-or-more strands its pending removal and halts quorum (a live
-/// network still needs its signature). the shell refuses a forget when
-/// `in-set=true` and `validators>=2`; a lone validator (`validators=1`) or an
-/// already-removed key (`in-set=false`) is safe to forget. requires the node to
-/// be up (it serves this over the same local rpc as `member remove`).
+/// this is the read to take before TEARING A NODE DOWN for good: stopping one
+/// that is still a current validator of a set of two-or-more strands its
+/// pending removal and halts quorum (a live network still needs its
+/// signature). `in-set=true` with `validators>=2` means `member remove` (or
+/// `leave`) first; a lone validator (`validators=1`) or an already-removed key
+/// (`in-set=false`) can simply be stopped. requires the node to be up (it
+/// serves this over the same local rpc as `member remove`).
 fn cmd_member_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>> {
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
