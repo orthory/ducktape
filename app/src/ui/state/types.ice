@@ -50,6 +50,12 @@ enum ForgePhase
 enum HubStep
   loading
   password
+  // The mint's two steps, and the only door out of them is the confirm —
+  // which is also what writes the key file. There is no skip: a key whose 24
+  // words were never written down has no recovery at all, so this app never
+  // creates one.
+  phrase
+  confirm
   wallets
   restore
   networks

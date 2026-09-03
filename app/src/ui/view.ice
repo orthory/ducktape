@@ -34,6 +34,9 @@ view
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
           password_submit -> password_submit _
+          phrase_written_down -> phrase_written_down
+          show_phrase_again -> show_phrase_again
+          confirm_phrase_submit -> confirm_phrase_submit _
           welcome_create_submit -> welcome_create_submit _
           welcome_login_submit -> welcome_login_submit
           welcome_desktop -> welcome_desktop

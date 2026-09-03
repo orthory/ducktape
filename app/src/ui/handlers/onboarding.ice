@@ -81,11 +81,9 @@ on login_skip
   onboarding_error = ""
   hub_step = HubStep.networks
 
-// PASSWORD — the device key is minted here, silently: no name to pick, no
-// phrase to write down. Recovery is a passkey login from another device, so
-// the words the keystore hands back are dropped before anything can show
-// them. The confirm field is checked in the component (`password_problem`);
-// this only fires clean.
+// PASSWORD — the device key is BEGUN here: a name and 24 words, and nothing
+// on disk yet. The password field's confirm is checked in the component
+// (`password_problem`); this only fires clean.
 on password_submit(pw)
   return if mutation_phase != MutationPhase.idle || empty(pw)
   onboarding_error = ""
@@ -93,11 +91,45 @@ on password_submit(pw)
   mutation_phase = MutationPhase.onboarding
   run every create_device_key(password) -> device_key_created _ | login_failed _
 
-// The key exists; the list is refreshed so "signing as …" can name it.
-on device_key_created(_pubkey)
+// The words exist and the key does not. Straight into the ceremony.
+on device_key_created(_name)
   mutation_phase = MutationPhase.idle
+  hub_step = HubStep.phrase
+
+// THE CEREMONY. Written down -> confirm -> the network list. There is no
+// skip: the only way out of these two steps is three correct words, because
+// the confirm is what seals the key — quit here and this device has no
+// identity to have lost. Going back to the phrase is the way past a typo,
+// and once the confirm passes this app never shows the words again.
+on phrase_written_down
+  return if mutation_phase != MutationPhase.idle
+  onboarding_error = ""
+  hub_step = HubStep.confirm
+
+on show_phrase_again
+  return if mutation_phase != MutationPhase.idle
+  onboarding_error = ""
+  hub_step = HubStep.phrase
+
+on confirm_phrase_submit(answer)
+  return if mutation_phase != MutationPhase.idle || empty(trim(answer))
+  onboarding_error = ""
+  mutation_phase = MutationPhase.onboarding
+  run every confirm_recovery_phrase(answer, password) -> phrase_confirmed _ | phrase_confirm_failed _
+
+// The key is sealed and the words are gone from this process. The list is
+// refreshed so "signing as …" can name the wallet that now exists, and the
+// network list is where a device with a key belongs.
+on phrase_confirmed(_pubkey)
+  mutation_phase = MutationPhase.idle
+  onboarding_error = ""
   hub_step = HubStep.networks
   run replace lane=hub_state hub_state() -> hub_refreshed _
+
+// A miss keeps the phrase AND the step: the retry is the point.
+on phrase_confirm_failed(cause)
+  mutation_phase = MutationPhase.idle
+  onboarding_error = cause.message
 
 on go_restore
   return if mutation_phase != MutationPhase.idle

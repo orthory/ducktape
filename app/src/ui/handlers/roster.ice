@@ -45,6 +45,13 @@ on account_rename_failed(cause)
 on account_create_draft_changed(next)
   account_create_draft = next
 
+// FOUNDING FROM THE CONSOLE — the door for a device that passed the welcome
+// step's passkey enrolment by. It runs no recovery ceremony of its own
+// because the key it signs with cannot exist without one: the launch window
+// seals a minted key only after its 24 words are read back
+// (`handlers/onboarding.ice`), and the only other ways to hold one are a
+// restore, which IS 24 words typed in, and `ducktape wallet new`, which
+// prints them.
 on account_create_submit
   return if !connected || account_exists || account_busy || empty(password) || empty(trim(account_create_draft))
   account_busy = true
