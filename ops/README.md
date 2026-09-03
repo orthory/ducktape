@@ -84,6 +84,14 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
   from this checkout and from a copy of the tree at a different absolute path
   and asserts the bytes are identical, so a committed artifact never depends on
   the builder's `/home/...`. Needs the wasm32 target and `wasm-tools`.
+- `make wasm-index-check` — the other reproducibility gate, a Makefile target
+  with no script here: it rebuilds each committed `index.wasm` from its source
+  and cmps it against the bytes in the tree. Also needs the wasm32 target.
+- `make audit` — the third out-of-band gate: `cargo deny check advisories` over
+  the committed `Cargo.lock`, under the repo-root `deny.toml` where every
+  carried advisory names why it is carried and what clears it. Needs `cargo
+  deny` and network, so it is not in the offline `test` gate; run it when the
+  lock moves.
 
 ## Worktree cleanup
 

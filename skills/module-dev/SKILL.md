@@ -130,6 +130,7 @@ make wasm-modules                                         # 3. BEFORE the node p
 cargo check --workspace --all-targets                     # 4. registry parity test gates
 cargo clippy -p <id> --tests --no-deps                    #    topology↔composed-host drift
 make wasm-modules-check                                   # 5. committed copies byte-identical
+make wasm-index-check                                     # 6. index guests match a rebuild (needs wasm32)
 ```
 
 ## Common mistakes

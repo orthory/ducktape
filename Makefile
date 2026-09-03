@@ -10,7 +10,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check labs-gate
+.PHONY: all app dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check wasm-index-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -315,6 +315,37 @@ wasm-modules-check:
 ## apart from the pre-push `test` gate. See ops/wasm-repro-check.sh.
 wasm-repro-check:
 	@bash ops/wasm-repro-check.sh
+
+INDEX_CHECK_DIR := $(CURDIR)/target/wasm-index-check
+
+## the drift gate the committed INDEX guests never had: rebuild each
+## index.wasm from its source and compare it with the committed bytes.
+## `wasm-modules-check` only cmps committed copies against each other, so an
+## index guest could drift arbitrarily far from the sources beside it and stay
+## green, which is exactly what happened (#1363). Needs the wasm32 target, so
+## like `wasm-repro-check` it stands apart from the pre-push `test` gate.
+wasm-index-check:
+	@mkdir -p "$(INDEX_CHECK_DIR)"
+	@for m in $(INDEX_MODULES); do \
+	  id=$$(basename $$m) && \
+	  $(CARGO) run -q -p guest-builder -- --index $$m \
+	    --out "$(INDEX_CHECK_DIR)/$$id.wasm" >/dev/null || exit 1; \
+	  cmp $$m/index.wasm "$(INDEX_CHECK_DIR)/$$id.wasm" || { \
+	    echo "$$m/index.wasm does not match a rebuild of its source. Refresh it:"; \
+	    echo "    $(CARGO) run -p guest-builder -- --index $$m"; \
+	    echo "  and commit the result. (Not \`make wasm-modules\`: that also"; \
+	    echo "  rewrites every component.wasm and would move the genesis hash.)"; exit 1; }; \
+	done
+	@echo "committed index guests match a rebuild on this toolchain"
+
+## the supply-chain tripwire: RustSec advisories and yanked crates against the
+## committed Cargo.lock, under `deny.toml` — where every carried advisory is
+## listed WITH the reason it is carried and what would clear it. Needs
+## `cargo deny` and network, so it is not part of the offline `test` gate; run
+## it when the lock moves. `cargo audit` is not also run: same database, and a
+## second ignore list in `.cargo/audit.toml` is a second place to go stale.
+audit:
+	$(CARGO) deny check advisories
 
 clean:
 	$(CARGO) clean

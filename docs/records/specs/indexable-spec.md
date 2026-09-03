@@ -105,8 +105,9 @@ A mapper is two files in the module crate:
   feature: backs `StateRead` with the engine ABI (`EngineRead`), applies the
   decided writes, and exports the roles via `index_guest::fold!`/`view!`.
   The whole file is ~15 lines; `guest-builder --index` packages it into the
-  committed `index.wasm` (`make wasm-modules` refreshes, `wasm-modules-check`
-  guards presence).
+  committed `index.wasm` (`make wasm-modules` refreshes,
+  `wasm-modules-check` guards presence and `make wasm-index-check` guards the
+  bytes against a rebuild of the source).
 
 Within one op a read never sees that op's own writes (they apply after the
 decision); across ops in one feed batch it sees everything earlier — the

@@ -25,10 +25,11 @@ const BLOCKS_DEFAULT_LIMIT: usize = 256;
 
 // the bundled index-guest artifacts: each module's fluentabi mapper, built by
 // `guest-builder --index` and committed beside its crate (`make wasm-modules`
-// refreshes the set, `wasm-modules-check` guards it). installed into the
-// module's index database at open. every node installs its own mapper from its
-// own bundled artifacts: index code never travels over the wire, so a joiner
-// derives backfilled rows with the mapper IT shipped with.
+// refreshes the set, `wasm-modules-check` guards presence and `make
+// wasm-index-check` guards the bytes against a rebuild of the source).
+// installed into the module's index database at open. every node installs its
+// own mapper from its own bundled artifacts: index code never travels over the
+// wire, so a joiner derives backfilled rows with the mapper IT shipped with.
 const CHAT_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/chat/index.wasm");
 const TASKS_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/tasks/index.wasm");
 const PAGES_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/pages/index.wasm");
