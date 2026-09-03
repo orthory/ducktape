@@ -36,6 +36,13 @@ pub(crate) enum IntroPath {
 pub(crate) type GateOutcomes =
     std::sync::Arc<std::sync::Mutex<HashMap<Vec<u8>, join_gate::IntroReply>>>;
 
+/// The handshake sampler's knowledge, published for the event pump: peer
+/// ULAs whose WireGuard tunnel is carrying traffic at the last sample. The
+/// sampler writes it once per tick; the pump reads it to keep a failed
+/// endpoint RESOLUTION from being reported as an unreachable peer.
+pub(crate) type CarryingPeers =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<std::net::Ipv6Addr>>>;
+
 /// the caller-side halves of the plane's lane-reclaim seam (see
 /// `wire_reachability_plane`'s `lane_reclaim`): each resolves with its half
 /// of the CHANNEL_REACHABILITY pair once the plane exits.
@@ -291,7 +298,12 @@ where
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(256);
     let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityEvent>(256);
 
+    // the sampler (inside the plane's own runtime) writes it; the out pump
+    // (on the node runtime) reads it. one allocation, shared across both.
+    let carrying: CarryingPeers =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let thread_label = label.to_string();
+    let reach_carrying = carrying.clone();
     let reach_signer = signer.clone();
     let reach_coord_cap = coord_cap;
     let reach_gate = gate;
@@ -326,6 +338,7 @@ where
                     cmd_rx,
                     nudge_tx,
                     ev_tx,
+                    reach_carrying,
                 ));
         })
         .expect("spawn reachability thread");
@@ -369,6 +382,8 @@ where
     // so this pump drains the tail and (when armed) hands the sender back.
     {
         let pump_label = label.to_string();
+        let pump_chain_id = chain_id.to_string();
+        let pump_carrying = carrying.clone();
         let book = mesh_book;
         let mut oracle = mesh_oracle;
         let mut tx = reach_p2p_tx;
@@ -481,14 +496,38 @@ where
                             )
                         }
                         reachability::ReachabilityEvent::PeerFailed { peer, reason } => {
-                            // the peer is DARK. media to it will silently go nowhere.
-                            tracing::warn!(
-                                target: "ducktape::reachability",
-                                node = %pump_label,
-                                peer = %hex_bytes(&peer.as_ref()[..4]),
-                                %reason,
-                                "peer unreachable — traffic to it will go nowhere"
-                            )
+                            // the sampler's knowledge decides which of the two
+                            // stories this is. A failed hole-punch toward a peer
+                            // whose tunnel is CARRYING TRAFFIC (the member
+                            // initiated, or the join's observed endpoint is
+                            // grafted on) is a lost optimization, not a dark
+                            // peer — and calling it dark three times an epoch
+                            // sends the operator hunting a healthy tunnel.
+                            let ula = wireguard::ula_v6_member_addr(
+                                &pump_chain_id,
+                                reachability::identity_of(&peer),
+                            );
+                            let carrying = pump_carrying
+                                .lock()
+                                .is_ok_and(|carrying| carrying.contains(&ula));
+                            match carrying {
+                                true => tracing::debug!(
+                                    target: "ducktape::reachability",
+                                    node = %pump_label,
+                                    peer = %hex_bytes(&peer.as_ref()[..4]),
+                                    %reason,
+                                    "peer endpoint resolution failed while its tunnel is \
+                                     carrying traffic — the live path stands"
+                                ),
+                                // the peer is DARK. media to it will silently go nowhere.
+                                false => tracing::warn!(
+                                    target: "ducktape::reachability",
+                                    node = %pump_label,
+                                    peer = %hex_bytes(&peer.as_ref()[..4]),
+                                    %reason,
+                                    "peer unreachable — traffic to it will go nowhere"
+                                ),
+                            }
                         }
                         reachability::ReachabilityEvent::EpochFailed { epoch, reason } => {
                             tracing::error!(
@@ -677,6 +716,8 @@ async fn reachability_plane(
     // a clone of the `commands` sender, for the plane's own nudge ticker.
     nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
     events: tokio::sync::mpsc::Sender<reachability::ReachabilityEvent>,
+    // the handshake sampler's publication seam (see [`CarryingPeers`]).
+    carrying: CarryingPeers,
 ) {
     use std::net::ToSocketAddrs as _;
     let policy = reachability::open_port_policy();
@@ -1156,7 +1197,7 @@ async fn reachability_plane(
         underlay,
     );
     // take the probe BEFORE the effect is moved into the orchestrator.
-    spawn_handshake_sampler(effect.probe_slot(), label.clone());
+    spawn_handshake_sampler(effect.probe_slot(), label.clone(), carrying);
     if let Err(err) = reachability::run(config, effect, resolver, commands, events).await {
         tracing::error!(
             target: "ducktape::reachability",
@@ -1284,7 +1325,16 @@ pub(crate) fn session_verdicts(
 ///
 /// Cost: this rides the EXISTING nudge tick and emits ONLY on a state transition.
 /// Nothing is logged per packet, per handshake, or per tick.
-fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: String) {
+///
+/// `carrying` is the sampler's knowledge published for the event pump: the
+/// set of peer ULAs whose tunnel is actually carrying traffic RIGHT NOW.
+/// A resolution failure for a peer in that set is not "traffic goes
+/// nowhere" — see the `PeerFailed` arm.
+fn spawn_handshake_sampler(
+    probes: overlay_net::userspace::ProbeSlot,
+    label: String,
+    carrying: CarryingPeers,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(NUDGE_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1297,11 +1347,26 @@ fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: Str
             let Some(probe) = probes.get() else {
                 // no backend yet: the overlay has not come up at all. that absence
                 // is already reported by the plane's own bind/apply events; do not
-                // duplicate it here every tick.
+                // duplicate it here every tick. the published set must not go
+                // stale through it, though — with no device nothing is carrying,
+                // and a stale entry would mute a real "peer unreachable".
+                if let Ok(mut carrying) = carrying.lock() {
+                    carrying.clear();
+                }
                 continue;
             };
             let peers = probe.peers();
-            for peer in session_verdicts(&mut last_session, tokio::time::Instant::now(), &peers) {
+            let verdicts = session_verdicts(&mut last_session, tokio::time::Instant::now(), &peers);
+            // publish BEFORE the transition logging: the pump reads this set
+            // to decide whether a peer's failed resolution means anything.
+            if let Ok(mut carrying) = carrying.lock() {
+                *carrying = verdicts
+                    .iter()
+                    .filter(|peer| peer.live)
+                    .map(|peer| peer.ip)
+                    .collect();
+            }
+            for peer in verdicts {
                 match live.insert(peer.ip, peer.live) {
                     Some(was) if was == peer.live => {}
                     // first sight of a peer that is already handshaking, or a peer
