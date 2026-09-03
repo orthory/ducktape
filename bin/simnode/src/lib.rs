@@ -419,9 +419,10 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // and the binary has no HTTP stop path at all (`sim_router` has no shutdown
     // of its own; `SimHandle::wait` waits on exactly `/v1/admin/shutdown`).
     // Minted into `storage`, so a driver reads it back with
-    // `noded::admin::read_operator_token(storage)`. `DUCKTAPE_ADMIN=off` still
-    // removes the surface entirely; a mint failure refuses every admin request
-    // rather than falling back to loopback trust.
+    // `noded::admin::read_operator_token(storage)`, and so does the harness for
+    // its mutating `/v1` writes. `DUCKTAPE_ADMIN=off` still removes the control
+    // surface entirely (the credential is minted regardless); a mint failure
+    // refuses every admin request rather than falling back to loopback trust.
     let handle = handle
         .with_forge_repo(forge_repo.clone())
         .with_index_store(index.clone())

@@ -671,10 +671,7 @@ impl TermError {
             ),
             TermError::AtCapacity => (
                 StatusCode::TOO_MANY_REQUESTS,
-                format!(
-                    "terminal session cap ({}) reached",
-                    agent_service::MAX_TERM_SESSIONS
-                ),
+                format!("terminal session cap ({}) reached", agent_service::MAX_TERM_SESSIONS),
             ),
             TermError::Resolve(detail) => (StatusCode::BAD_REQUEST, detail),
             TermError::Spawn(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail),
@@ -825,8 +822,13 @@ impl TerminalSessions {
     /// drop the link and end every session it was serving. See [`AttachGuard`].
     fn detach(&self) {
         *self.0.link.lock().expect("term link lock poisoned") = None;
-        let live =
-            std::mem::take(&mut *self.0.sessions.lock().expect("term sessions lock poisoned"));
+        let live = std::mem::take(
+            &mut *self
+                .0
+                .sessions
+                .lock()
+                .expect("term sessions lock poisoned"),
+        );
         if !live.is_empty() {
             tracing::warn!(
                 target: "ducktape::term",
@@ -874,7 +876,10 @@ impl TerminalSessions {
                 reason,
                 detail,
             } => self.refused(&session, reason, detail),
-            wire::Event::TermOutput { session, chunk_b64 } => self.output(&session, chunk_b64),
+            wire::Event::TermOutput {
+                session,
+                chunk_b64,
+            } => self.output(&session, chunk_b64),
             wire::Event::TermEnded { session } => self.ended(&session),
         }
     }
@@ -969,10 +974,7 @@ impl TerminalSessions {
         // a session that ends before its create was answered (the child exited
         // instantly) still owes that create a reply.
         if let Some(live) = removed {
-            answer(
-                live.reply,
-                TermError::Spawn("the session ended immediately".into()),
-            );
+            answer(live.reply, TermError::Spawn("the session ended immediately".into()));
         }
     }
 
@@ -1337,15 +1339,10 @@ fn create_route(
         // a named host: a credential is mandatory, and the key must be 32-byte hex.
         Some(node) => {
             if cred.is_none() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "a cross-node session requires --cred",
-                ));
+                return Err((StatusCode::BAD_REQUEST, "a cross-node session requires --cred"));
             }
-            let host = decode_node_key(node).ok_or((
-                StatusCode::BAD_REQUEST,
-                "node must be a 32-byte hex node key",
-            ))?;
+            let host = decode_node_key(node)
+                .ok_or((StatusCode::BAD_REQUEST, "node must be a 32-byte hex node key"))?;
             Ok(CreateRoute::Remote { host })
         }
     }
@@ -1429,9 +1426,7 @@ async fn create_remote(handle: &NodeHandle, host: [u8; 32], body: CreateSessionB
         )
             .into_response();
     };
-    let cred = body
-        .cred
-        .expect("create_route guarantees a cred on the remote path");
+    let cred = body.cred.expect("create_route guarantees a cred on the remote path");
     let (reply, rx) = oneshot::channel();
     let job = crate::term_remote::SessionJob::Create {
         host,
@@ -1536,10 +1531,7 @@ mod tests {
         // `agent pty` client waiting on the topic learns the session is over.
         assert!(!ring.is_ended("silent"), "no entry yet, so not ended");
         ring.mark_ended("silent");
-        assert!(
-            ring.is_ended("silent"),
-            "a no-output session still signals end"
-        );
+        assert!(ring.is_ended("silent"), "a no-output session still signals end");
     }
 
     /// THE CROSS-NODE WEDGE: a peer-attached session's `agent pty` client waits
@@ -1577,10 +1569,7 @@ mod tests {
 
         ring.append_local_only("00000000deadbeef", STANDARD.encode(b"hi"));
         ring.mark_ended_local_only("00000000deadbeef");
-        assert!(
-            ring.is_ended("00000000deadbeef"),
-            "the local ring still ends"
-        );
+        assert!(ring.is_ended("00000000deadbeef"), "the local ring still ends");
         assert!(
             feed.try_recv().is_err(),
             "a node-local session owes its peers nothing"
@@ -1609,8 +1598,8 @@ mod tests {
         assert!(ring.read_after("s0", 0, 8).0.is_empty());
         assert!(
             !ring
-                .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
-                .0
+            .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
+            .0
                 .is_empty()
         );
     }
@@ -1746,8 +1735,8 @@ mod tests {
         assert!(ring.read_after("s0", 0, 8).0.is_empty());
         assert!(
             !ring
-                .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
-                .0
+            .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
+            .0
                 .is_empty()
         );
     }
@@ -1789,11 +1778,7 @@ mod tests {
     /// caller drives everything else (`on_event`) by hand, so each test names
     /// exactly the daemon behaviour it is about.
     fn with_daemon() -> (TerminalSessions, AttachGuard) {
-        let terminals = TerminalSessions::new(
-            TermRing::default(),
-            TermCommandRing::default(),
-            Some(TEST_TOKEN.into()),
-        );
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         let (guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
         let daemon = terminals.clone();
         tokio::spawn(async move {
@@ -1875,11 +1860,7 @@ mod tests {
         // the input-gate accessor is pure: an unknown id (and, by construction,
         // any local session) has no creator node — so a forwarded input frame
         // naming it is refused.
-        let terminals = TerminalSessions::new(
-            TermRing::default(),
-            TermCommandRing::default(),
-            Some(TEST_TOKEN.into()),
-        );
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         assert!(terminals.creator_node("nope").is_none());
     }
 
@@ -1887,11 +1868,7 @@ mod tests {
     fn enqueue_command_on_an_unknown_session_is_a_no_op() {
         // enqueue must warn + no-op, never panic (mirrors the input/resize
         // unknown-session discipline) and record nothing.
-        let terminals = TerminalSessions::new(
-            TermRing::default(),
-            TermCommandRing::default(),
-            Some(TEST_TOKEN.into()),
-        );
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         terminals.enqueue_command("nope", "alice".into(), "ls".into());
         assert!(terminals.0.cmd_ring.read_after("nope", 0, 8).0.is_empty());
     }
@@ -1901,15 +1878,9 @@ mod tests {
         // the `no_sandbox` rung, in its new meaning: the plane is wired (the
         // manager exists, so the route does NOT return "not enabled") but no
         // daemon owns a pty for it.
-        let terminals = TerminalSessions::new(
-            TermRing::default(),
-            TermCommandRing::default(),
-            Some(TEST_TOKEN.into()),
-        );
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         assert!(!terminals.has_sandbox());
-        let refused = terminals
-            .create("claude", SessionMode::Single, SessionSize::default())
-            .await;
+        let refused = terminals.create("claude", SessionMode::Single, SessionSize::default()).await;
         assert!(matches!(refused, Err(TermError::NoSandbox)));
     }
 
@@ -1918,11 +1889,7 @@ mod tests {
         // FIRST ATTACH WINS is a boundary: a local impersonator that could take
         // the link would receive the create commands — lent-credential records
         // included — meant for the real daemon.
-        let terminals = TerminalSessions::new(
-            TermRing::default(),
-            TermCommandRing::default(),
-            Some(TEST_TOKEN.into()),
-        );
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         let first = terminals.attach(TEST_TOKEN);
         assert!(first.is_some());
         assert!(
@@ -1942,10 +1909,7 @@ mod tests {
             .await
             .expect("the daemon answered");
         assert_eq!(created.topic, topic(&created.session_id));
-        assert_eq!(
-            terminals.mode(&created.session_id),
-            Some(SessionMode::Single)
-        );
+        assert_eq!(terminals.mode(&created.session_id), Some(SessionMode::Single));
     }
 
     #[tokio::test]
@@ -1965,8 +1929,7 @@ mod tests {
 
         // no auto-answering daemon here: hold the create unanswered, exactly as
         // a slow pull would, and take the command off the link by hand.
-        let mut pending =
-            Box::pin(terminals.create("claude", SessionMode::Single, SessionSize::default()));
+        let mut pending = Box::pin(terminals.create("claude", SessionMode::Single, SessionSize::default()));
         let command = tokio::select! {
             _ = &mut pending => panic!("a create cannot complete while nothing answers it"),
             command = rx.recv() => command.expect("the create reached the link"),
@@ -1981,9 +1944,7 @@ mod tests {
             session: create.session.clone(),
         });
         assert_eq!(
-            rx.recv()
-                .await
-                .expect("a close must follow an abandoned create"),
+            rx.recv().await.expect("a close must follow an abandoned create"),
             wire::Command::TermClose {
                 session: create.session
             },
@@ -1999,14 +1960,9 @@ mod tests {
             TermCommandRing::default(),
             Some(TEST_TOKEN.into()),
         );
+        assert!(terminals.attach("").is_none(), "an empty token is not a token");
         assert!(
-            terminals.attach("").is_none(),
-            "an empty token is not a token"
-        );
-        assert!(
-            terminals
-                .attach("0123456789abcdef0123456789abcdee")
-                .is_none(),
+            terminals.attach("0123456789abcdef0123456789abcdee").is_none(),
             "a near miss is still a miss"
         );
         assert!(terminals.attach(TEST_TOKEN).is_some());
@@ -2078,9 +2034,7 @@ mod tests {
         assert!(terminals.0.ring.is_ended(&created.session_id));
         assert!(!terminals.has_sandbox());
         assert!(matches!(
-            terminals
-                .create("claude", SessionMode::Single, SessionSize::default())
-                .await,
+            terminals.create("claude", SessionMode::Single, SessionSize::default()).await,
             Err(TermError::NoSandbox)
         ));
     }
@@ -2106,14 +2060,7 @@ mod tests {
             "a solo session must not publish to the peer feed"
         );
         // but it IS in the local ring the ws catch-up serves.
-        assert!(
-            !terminals
-                .0
-                .ring
-                .read_after(&created.session_id, 0, 8)
-                .0
-                .is_empty()
-        );
+        assert!(!terminals.0.ring.read_after(&created.session_id, 0, 8).0.is_empty());
     }
 
     #[tokio::test]
@@ -2158,11 +2105,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_create_returns_the_daemon_reason_and_forgets_the_session() {
-        let terminals = TerminalSessions::new(
-            TermRing::default(),
-            TermCommandRing::default(),
-            Some(TEST_TOKEN.into()),
-        );
+        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
         let (_guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
         let daemon = terminals.clone();
         tokio::spawn(async move {
@@ -2176,9 +2119,7 @@ mod tests {
                 }
             }
         });
-        let refused = terminals
-            .create("claude", SessionMode::Single, SessionSize::default())
-            .await;
+        let refused = terminals.create("claude", SessionMode::Single, SessionSize::default()).await;
         let Err(TermError::Spawn(detail)) = refused else {
             panic!("a spawn failure must surface as Spawn, not another rung");
         };
