@@ -200,8 +200,9 @@ pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str
 ///
 /// # why this is safe exactly here and nowhere else
 ///
-/// both call seams sit on the ONE task that ever writes this node's index, and
-/// they sit BEFORE it resumes folding live blocks. so nothing else commits to
+/// EVERY call seam — the join, the resident's park loop, and both arms of the
+/// validator's boot catch-up — sits on the ONE task that ever writes this
+/// node's index, BEFORE it resumes folding live blocks. so nothing else commits to
 /// these databases while the walk runs, an ascending fetch-and-write makes
 /// COMMIT ORDER EQUAL KEY ORDER, the changes-mode fold trigger the heal just
 /// re-registered folds every row correctly as it lands, and the fold tip
