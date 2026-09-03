@@ -10,24 +10,27 @@
 const TARGET_OPEN_FILES: libc::rlim_t = 65_536;
 
 /// Raise the inherited open-file soft limit toward [`TARGET_OPEN_FILES`],
-/// returning the soft limit in force afterwards. `None` means the limit could
-/// not be read or set — non-fatal: the caller keeps running and the underlying
-/// open-file error still surfaces on its own. The caller reports the outcome,
-/// because a daemon that has no subscriber yet and a GUI that does need
-/// different sinks.
-pub fn raise_open_file_limit() -> Option<u64> {
+/// returning the soft limit in force afterwards. An `Err` carries the OS error
+/// from the `getrlimit`/`setrlimit` that refused, and is non-fatal: the caller
+/// keeps running and the underlying open-file error still surfaces on its own.
+/// The caller reports the outcome, because a daemon that has no subscriber yet
+/// and a GUI that does need different sinks.
+pub fn raise_open_file_limit() -> std::io::Result<u64> {
     #[cfg(unix)]
     {
         raise_open_file_limit_unix()
     }
     #[cfg(not(unix))]
     {
-        None
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no rlimit on this platform",
+        ))
     }
 }
 
 #[cfg(unix)]
-fn raise_open_file_limit_unix() -> Option<u64> {
+fn raise_open_file_limit_unix() -> std::io::Result<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -36,20 +39,20 @@ fn raise_open_file_limit_unix() -> Option<u64> {
     // SAFETY: `limit` is a valid writable rlimit and RLIMIT_NOFILE selects
     // exactly that structure in both calls.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
 
     let desired = desired_soft_limit(limit.rlim_cur, limit.rlim_max, open_max_clamp());
     if desired == limit.rlim_cur {
-        return Some(limit.rlim_cur);
+        return Ok(limit.rlim_cur);
     }
     limit.rlim_cur = desired;
 
     // SAFETY: the hard limit is unchanged and `desired` never exceeds it.
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
-        return None;
+        return Err(std::io::Error::last_os_error());
     }
-    Some(desired)
+    Ok(desired)
 }
 
 /// macOS refuses `setrlimit(RLIMIT_NOFILE)` with EINVAL above `OPEN_MAX`, so a

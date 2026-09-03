@@ -132,8 +132,8 @@ use util::hex;
 fn main() {
     resource_limits::cap_malloc_arenas();
     // before any subscriber exists, so the warning is stderr's to carry.
-    if node::resource_limits::raise_open_file_limit().is_none() {
-        eprintln!("[node] warning: could not raise open-file limit");
+    if let Err(err) = node::resource_limits::raise_open_file_limit() {
+        eprintln!("[node] warning: could not raise open-file limit: {err}");
     }
     #[cfg(target_os = "macos")]
     hold_macos_activity();
