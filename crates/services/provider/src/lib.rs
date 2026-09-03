@@ -1663,8 +1663,9 @@ impl Drop for ContextGuard {
 /// the object facade's PUT/DELETE, `/v1/fs/workspaces`, `/v1/term/sessions`
 /// and `/v1/log-filter` all want either a per-request user signature or this
 /// node's operator credential (`noded::signed_req`), and a run's env is an
-/// allowlist that carries neither. The forge's `git-receive-pack` wants git's
-/// own push certificate, which a guest cannot mint either.
+/// allowlist that carries neither. The forge's `git-receive-pack` takes the
+/// same two proofs in git's own shapes — a `git push --signed` certificate or
+/// that operator credential in a header — and a guest can present neither.
 ///
 /// Narrowing the READS to a scoped lane is the open half of #1317, and this
 /// function is the one place such a lane would replace.
