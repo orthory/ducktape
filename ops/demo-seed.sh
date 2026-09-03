@@ -45,6 +45,11 @@ DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo i
 # DEV_LISTEN.
 DEV_LISTEN="${DEV_LISTEN:-127.0.0.1}"
 DEV_HTTP_LISTEN="${DEV_HTTP_LISTEN:-127.0.0.1}"
+# advertised is the dial-hint peers actually use, so widening `listen` alone
+# leaves a second machine learning a loopback address it cannot dial (#1240
+# half of #1241) — reaching this node from box B needs
+#   DEV_LISTEN=0.0.0.0 DEV_ADVERTISED=<this box's LAN ip>
+DEV_ADVERTISED="${DEV_ADVERTISED:-127.0.0.1}"
 
 log(){ printf '\033[36m[demo-seed]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-seed] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -78,10 +83,12 @@ WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});process.stdout.write(String
 #   --listen             p2p mesh bind: DEV_LISTEN (#1241) — a second machine
 #                        needs this wide to dial in for a peer join or huddle
 #   --advertised         the dial-hint address WE announce to peers, not a
-#     127.0.0.1          bind — stays loopback; an operator reaching this demo
-#                        from elsewhere dials its real host:port directly, a
-#                        wrong self-announcement is a peer's problem, not a
-#                        bind refusal, so it is not DEV_LISTEN's job
+#     $DEV_ADVERTISED    bind — DEV_ADVERTISED (default 127.0.0.1), a
+#                        SEPARATE knob from DEV_LISTEN: a wide `listen` with
+#                        a loopback `advertised` still hands box B a dial
+#                        hint it cannot use, so reaching this node from a
+#                        second machine needs BOTH DEV_LISTEN=0.0.0.0 and
+#                        DEV_ADVERTISED=<this box's LAN ip>
 #   --http               a --cred run needs http_listen on loopback (the
 #     $DEV_HTTP_LISTEN   isolated browser gateway dies on a wide bind) — a
 #                        SEPARATE knob (DEV_HTTP_LISTEN) from DEV_LISTEN
@@ -100,7 +107,7 @@ WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});process.stdout.write(String
 INIT_ERR="$(mktemp)"
 if ! CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
   --modules "$MODULES" \
-  --listen "$DEV_LISTEN:$P1" --advertised "127.0.0.1:$P1" \
+  --listen "$DEV_LISTEN:$P1" --advertised "$DEV_ADVERTISED:$P1" \
   --http "$DEV_HTTP_LISTEN:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \
   --wireguard-listen "0.0.0.0:$WGP" 2>"$INIT_ERR" | tail -1)"; then
