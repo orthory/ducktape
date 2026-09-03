@@ -525,23 +525,6 @@ impl Client {
         Ok(reply.digest)
     }
 
-    /// The node's isolated browser-gateway origin (`GET /v1/gateway/browser`),
-    /// `http://<listen>`. ASKED rather than read from node.toml: the listener
-    /// binds port 0, so the port only exists once the node is up.
-    pub async fn gateway_browser_base(&self) -> Result<String> {
-        let response = self
-            .http
-            .get(self.url("v1/gateway/browser")?)
-            .send()
-            .await
-            .map_err(|error| Error::new(format!("RPC gateway browser failed: {error}")))?;
-        let reply: serde_json::Value = decode_json(response).await?;
-        reply["base"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| Error::new("the node answered no browser-gateway base".to_string()))
-    }
-
     /// Read the peers standing (`GET /v1/peers`), the node's own JSON view.
     pub async fn peers(&self) -> Result<serde_json::Value> {
         let response = self

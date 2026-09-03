@@ -39,11 +39,8 @@ pub struct DuckLink {
     pub page: String,
     /// `channel` / `channel_message`: the channel id.
     pub channel: String,
-    /// `files`: the absolute duckfs path; `forge_blob`: the repo-relative
-    /// path; `gateway`: the route path, "" for the route's own root.
+    /// `files`: the absolute duckfs path; `forge_blob`: the repo-relative path.
     pub path: String,
-    /// `gateway`: the `<label>.<handle>.duck` host the node resolves.
-    pub authority: String,
     /// `forge_blob`: the `@rev`, or "" for the head.
     pub rev: String,
     /// The `?net=` digest — the hex half of the chain id this link belongs
@@ -62,7 +59,6 @@ impl DuckLink {
             page: String::new(),
             channel: String::new(),
             path: String::new(),
-            authority: String::new(),
             rev: String::new(),
             net: String::new(),
         }
@@ -91,7 +87,8 @@ pub fn classify_duck_link(url: String) -> DuckLink {
         Some((authority, tail)) => (authority, format!("/{tail}")),
         None => (rest, String::new()),
     };
-    if authority.is_empty() {
+    let gateway_plane = authority.contains('.');
+    if gateway_plane || authority.is_empty() {
         return DuckLink::unknown();
     }
     let (body, fragment) = tail.split_once('#').unwrap_or((tail.as_str(), ""));
@@ -99,12 +96,6 @@ pub fn classify_duck_link(url: String) -> DuckLink {
     let Some(net) = query_net(query) else {
         return DuckLink::unknown();
     };
-    // The gateway plane is decided FIRST: its authority is a host, not a
-    // module label, and its path is the publisher's to shape (an `@` in it is
-    // a path character, not a rev).
-    if authority.contains('.') {
-        return classify_gateway(authority, address, net);
-    }
     let (path, rev) = address.split_once('@').unwrap_or((address, ""));
     let Some(segments) = clean_segments(path) else {
         return DuckLink::unknown();
@@ -246,25 +237,6 @@ fn clean_segments(path: &str) -> Option<Vec<&str>> {
         .iter()
         .all(|segment| !segment.is_empty() && *segment != "." && *segment != "..");
     clean.then_some(segments)
-}
-
-/// The gateway plane: `duck://<label>.<handle>.duck[/<path>]`, a route some
-/// account published. The authority is the whole address, and resolving it is
-/// the NODE's job — a reserved root (`net.duck`) and an unregistered handle
-/// are its refusals to make, not this table's. A dotted authority that is not
-/// `.duck` names nothing here.
-fn classify_gateway(authority: &str, path: &str, net: String) -> DuckLink {
-    let host = authority.to_ascii_lowercase();
-    let named = host.ends_with(".duck") && host.split('.').all(|label| !label.is_empty());
-    if !named {
-        return DuckLink::unknown();
-    }
-    DuckLink {
-        authority: host,
-        path: path.to_owned(),
-        net,
-        ..DuckLink::of(DuckKind::Gateway)
-    }
 }
 
 /// A 1-based decimal, or `None` (empty, zero, signs, anything else).
@@ -440,124 +412,38 @@ mod tests {
             (DuckKind::Files, "/shared/attachments/u1/doc.pdf")
         );
         assert_eq!(kind("duck://files/shared/skills/x.md"), DuckKind::Unknown);
-        assert_eq!(
-            kind("duck://files/shared/attachments/a/b/c"),
-            DuckKind::Unknown
-        );
-        assert_eq!(
-            kind("duck://files/shared/attachments/../etc/pw"),
-            DuckKind::Unknown
-        );
-        assert_eq!(
-            kind("duck://files/shared/attachments/u1/a.png"),
-            DuckKind::Files
-        );
+        assert_eq!(kind("duck://files/shared/attachments/a/b/c"), DuckKind::Unknown);
+        assert_eq!(kind("duck://files/shared/attachments/../etc/pw"), DuckKind::Unknown);
+        assert_eq!(kind("duck://files/shared/attachments/u1/a.png"), DuckKind::Files);
 
         let repo = classify_duck_link("duck://forge/ducktape".into());
-        assert_eq!(
-            (repo.kind, repo.repo.as_str()),
-            (DuckKind::ForgeRepo, "ducktape")
-        );
+        assert_eq!((repo.kind, repo.repo.as_str()), (DuckKind::ForgeRepo, "ducktape"));
         let item = classify_duck_link("duck://forge/ducktape/58".into());
-        assert_eq!(
-            (item.kind, item.number, item.seq),
-            (DuckKind::ForgeItem, 58, 0)
-        );
+        assert_eq!((item.kind, item.number, item.seq), (DuckKind::ForgeItem, 58, 0));
         let anchored = classify_duck_link("duck://forge/ducktape/58#12".into());
-        assert_eq!(
-            (anchored.kind, anchored.number, anchored.seq),
-            (DuckKind::ForgeItem, 58, 12)
-        );
+        assert_eq!((anchored.kind, anchored.number, anchored.seq), (DuckKind::ForgeItem, 58, 12));
         assert_eq!(kind("duck://forge/ducktape#12"), DuckKind::Unknown);
         assert_eq!(kind("duck://forge/ducktape/0"), DuckKind::Unknown);
         assert_eq!(kind("duck://forge/ducktape/58#0"), DuckKind::Unknown);
         assert_eq!(kind("duck://forge/ducktape/-1"), DuckKind::Unknown);
 
         let channel = classify_duck_link("duck://channel/general".into());
-        assert_eq!(
-            (channel.kind, channel.channel.as_str()),
-            (DuckKind::Channel, "general")
-        );
+        assert_eq!((channel.kind, channel.channel.as_str()), (DuckKind::Channel, "general"));
         let hidden = classify_duck_link("duck://channel/forge:ducktape:58".into());
-        assert_eq!(
-            (hidden.kind, hidden.channel.as_str()),
-            (DuckKind::Channel, "forge:ducktape:58")
-        );
+        assert_eq!((hidden.kind, hidden.channel.as_str()), (DuckKind::Channel, "forge:ducktape:58"));
         let message = classify_duck_link("duck://channel/general#42".into());
         assert_eq!((message.kind, message.seq), (DuckKind::ChannelMessage, 42));
         assert_eq!(kind("duck://channel/general#0"), DuckKind::Unknown);
         assert_eq!(kind("duck://channel/"), DuckKind::Unknown);
 
-        assert_eq!(
-            kind("duck://memory/notes/a.md"),
-            DuckKind::Unknown,
-            "reserved"
-        );
-        assert_eq!(
-            kind("duck://team.duck/index.html"),
-            DuckKind::Gateway,
-            "gateway plane"
-        );
-        assert_eq!(
-            kind("duck://net.duck"),
-            DuckKind::Gateway,
-            "the node refuses reserved roots"
-        );
+        assert_eq!(kind("duck://memory/notes/a.md"), DuckKind::Unknown, "reserved");
+        assert_eq!(kind("duck://team.duck/index.html"), DuckKind::Unknown, "gateway plane");
+        assert_eq!(kind("duck://net.duck"), DuckKind::Unknown, "gateway plane");
         assert_eq!(kind("duck://"), DuckKind::Unknown);
         assert_eq!(kind("mailto:a@b"), DuckKind::Unknown);
-        assert_eq!(
-            kind("./img/a.png"),
-            DuckKind::Unknown,
-            "a relative path is the caller's to resolve"
-        );
+        assert_eq!(kind("./img/a.png"), DuckKind::Unknown, "a relative path is the caller's to resolve");
         assert_eq!(kind("https://example.com/a.png"), DuckKind::Web);
         assert_eq!(kind("http://example.com"), DuckKind::Web);
-    }
-
-    /// The gateway row: a published route's host, and the path under it the
-    /// node hands the publisher verbatim.
-    #[test]
-    fn a_gateway_link_carries_its_authority_and_the_path_under_it() {
-        let page = classify_duck_link("duck://site.team.duck/docs/a.html?net=a1b2c3d4".into());
-        assert_eq!(
-            (
-                page.kind,
-                page.authority.as_str(),
-                page.path.as_str(),
-                page.net.as_str()
-            ),
-            (
-                DuckKind::Gateway,
-                "site.team.duck",
-                "/docs/a.html",
-                "a1b2c3d4"
-            )
-        );
-        let root = classify_duck_link("duck://team.duck".into());
-        assert_eq!(
-            (root.kind, root.authority.as_str(), root.path.as_str()),
-            (DuckKind::Gateway, "team.duck", "")
-        );
-        let slash = classify_duck_link("duck://team.duck/".into());
-        assert_eq!((slash.kind, slash.path.as_str()), (DuckKind::Gateway, "/"));
-        let upper = classify_duck_link("duck://Site.Team.DUCK/a".into());
-        assert_eq!(
-            upper.authority, "site.team.duck",
-            "a host is case-insensitive"
-        );
-        let at = classify_duck_link("duck://team.duck/a@b/c".into());
-        assert_eq!(at.path, "/a@b/c", "an @ in a route path is not a rev");
-        assert_eq!(
-            kind("duck://team.example.com/x"),
-            DuckKind::Unknown,
-            "not a duck host"
-        );
-        assert_eq!(kind("duck://team..duck"), DuckKind::Unknown, "empty label");
-        assert_eq!(
-            kind("duck://team.duck/x?net=nope"),
-            DuckKind::Unknown,
-            "malformed query"
-        );
     }
 
     /// The forge blob row: `/<repo>/blob/<path>[@<rev>]`.
@@ -565,12 +451,7 @@ mod tests {
     fn a_forge_blob_names_a_committed_file_at_a_revision_or_the_head() {
         let head = classify_duck_link("duck://forge/ducktape/blob/docs/logo.png".into());
         assert_eq!(
-            (
-                head.kind,
-                head.repo.as_str(),
-                head.path.as_str(),
-                head.rev.as_str()
-            ),
+            (head.kind, head.repo.as_str(), head.path.as_str(), head.rev.as_str()),
             (DuckKind::ForgeBlob, "ducktape", "docs/logo.png", "")
         );
         assert_eq!(
@@ -588,26 +469,10 @@ mod tests {
         );
         assert_eq!(oid.path, "a/b.png");
         assert_eq!(oid.rev.len(), 40);
-        assert_eq!(
-            kind("duck://forge/ducktape/blob"),
-            DuckKind::Unknown,
-            "no file"
-        );
-        assert_eq!(
-            kind("duck://forge/ducktape/blob/"),
-            DuckKind::Unknown,
-            "no file"
-        );
-        assert_eq!(
-            kind("duck://forge/ducktape/blob/../x"),
-            DuckKind::Unknown,
-            "no dot-segments"
-        );
-        assert_eq!(
-            kind("duck://forge/ducktape/blob/a.png#L3"),
-            DuckKind::Unknown,
-            "no fragment yet"
-        );
+        assert_eq!(kind("duck://forge/ducktape/blob"), DuckKind::Unknown, "no file");
+        assert_eq!(kind("duck://forge/ducktape/blob/"), DuckKind::Unknown, "no file");
+        assert_eq!(kind("duck://forge/ducktape/blob/../x"), DuckKind::Unknown, "no dot-segments");
+        assert_eq!(kind("duck://forge/ducktape/blob/a.png#L3"), DuckKind::Unknown, "no fragment yet");
     }
 
     /// The `?net=` component: parsed off every row, refused when malformed,
@@ -746,10 +611,6 @@ mod tests {
         assert_eq!(forge_focus_kind(0, String::new()), crate::ForgeFocus::Idle);
         assert_eq!(forge_focus_kind(7, String::new()), crate::ForgeFocus::Item);
         assert_eq!(forge_focus_kind(0, "a.png".into()), crate::ForgeFocus::Blob);
-        assert_eq!(
-            forge_focus_kind(7, "a.png".into()),
-            crate::ForgeFocus::Item,
-            "a number wins"
-        );
+        assert_eq!(forge_focus_kind(7, "a.png".into()), crate::ForgeFocus::Item, "a number wins");
     }
 }

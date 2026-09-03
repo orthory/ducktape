@@ -863,52 +863,19 @@ pub async fn open_external_url(url: String) -> Result<bool, AppError> {
         if !is_web {
             return Err("only web links are handed to the system browser".to_string());
         }
-        hand_to_os_browser(&url)
+        let opener = match std::env::consts::OS {
+            "macos" => "open",
+            "windows" => "explorer",
+            _ => "xdg-open",
+        };
+        tokio::process::Command::new(opener)
+            .arg(&url)
+            .spawn()
+            .map_err(|error| format!("could not open the link: {error}"))?;
+        Ok(true)
     }
     .await
     .map_err(app_error)
-}
-
-/// Open a published `.duck` route — the `DuckKind::Gateway` arm of the open
-/// plane. The app has no webview and nothing on this box claims the `duck:`
-/// scheme, so the route is reached through the node's own isolated
-/// browser-gateway origin, whose PATH form carries the authority
-/// (`/.duck/<authority>/<path>`, see `noded`'s `gateway_browser_path`). That
-/// listener binds port 0, so its base is ASKED of the node — a workspace's
-/// `gateway_listen` does not know the port the kernel handed out.
-pub async fn open_gateway_url(
-    rpc: String,
-    authority: String,
-    path: String,
-) -> Result<bool, AppError> {
-    async {
-        if authority.is_empty() {
-            return Ok(false);
-        }
-        let base = rpc_client(&rpc)?
-            .gateway_browser_base()
-            .await
-            .map_err(|error| {
-                format!("gateway_not_listening: this node serves no .duck routes ({error})")
-            })?;
-        hand_to_os_browser(&format!("{base}/.duck/{authority}{path}"))
-    }
-    .await
-    .map_err(app_error)
-}
-
-/// The one place a URL leaves this process for the desktop's opener.
-fn hand_to_os_browser(url: &str) -> Result<bool, String> {
-    let opener = match std::env::consts::OS {
-        "macos" => "open",
-        "windows" => "explorer",
-        _ => "xdg-open",
-    };
-    tokio::process::Command::new(opener)
-        .arg(url)
-        .spawn()
-        .map_err(|error| format!("could not open the link: {error}"))?;
-    Ok(true)
 }
 
 pub(crate) fn comment_thread_id(thread_id: String) -> Result<String, String> {
