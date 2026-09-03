@@ -368,12 +368,14 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
         modules_dir,
         install_log,
     } = opts;
-    // the component bytes every wasm tenant composes from. the default is the
-    // repo's kernel fixtures — the sim is a dev tool that must boot from a bare
-    // checkout, with no bundle install and no managed modules dir.
-    let modules_dir = modules_dir.unwrap_or_else(|| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/kernel/host/tests/fixtures")
-    });
+    // the founding set every wasm tenant (and every index guest) composes
+    // from. the default is the set the build staged beside this executable —
+    // the sim is a dev tool that must boot from a bare checkout, and a bare
+    // checkout that built it has that set.
+    let modules_dir = match modules_dir {
+        Some(dir) => dir,
+        None => workspace_config::modules_dir()?,
+    };
 
     // the status module list and the index tier both extend only under valset
     // keys; the default path stays the exact 15-module set `daemon_e2e` pins
@@ -399,8 +401,13 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
 
     // the durable block index: /v1/blocks and /v1/index/* read it, the sim
     // actor feeds it block-by-block — noded's construction site verbatim, so
-    // the sim runs the SAME bundled wasm index guests as the real daemons.
+    // the sim runs the SAME wasm index guests as the real daemons, from the
+    // same founding set its components came from.
     let index = noded::open_index_store(&storage, &module_ids)?;
+    noded::converge_index_guests(
+        &index,
+        &noded::IndexGuests::from_dir(&modules_dir, &module_ids)?,
+    )?;
 
     // the log ring is a process-GLOBAL subscriber (and stacks a panic hook per
     // call), so wire it ONLY under `install_log` — the binary does; an embedder

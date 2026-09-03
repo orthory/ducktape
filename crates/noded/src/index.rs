@@ -1,7 +1,9 @@
-//! the derived-index tier: shared store construction (bundled wasm index
-//! guests installed per module), boundary stamping, and the `/v1/index/*` +
+//! the derived-index tier: shared store construction (each module's index
+//! guest installed from the network's genesis, or from a founding set for a
+//! daemon that runs no network), boundary stamping, and the `/v1/index/*` +
 //! `/v1/blocks` snapshot read lane.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -23,49 +25,82 @@ const BLOCKS_DEFAULT_LIMIT: usize = 256;
 // passing its own genesis module list.
 // ---------------------------------------------------------------------------
 
-// the bundled index-guest artifacts: each module's fluentabi mapper, built by
-// `guest-builder --index` and committed beside its crate (`make wasm-modules`
-// refreshes the set, `wasm-modules-check` guards presence and `make
-// wasm-index-check` guards the bytes against a rebuild of the source).
-// installed into the module's index database at open. every node installs its
-// own mapper from its own bundled artifacts: index code never travels over the
-// wire, so a joiner derives backfilled rows with the mapper IT shipped with.
-const CHAT_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/chat/index.wasm");
-const TASKS_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/tasks/index.wasm");
-const PAGES_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/pages/index.wasm");
-const INBOX_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/apps/inbox/index.wasm");
-const SAGA_INDEX_WASM: &[u8] = include_bytes!("../../../crates/modules/system/saga/index.wasm");
+/// the index guests a node installs: id → mapper bytes for every module the
+/// topology declares one for. Each module's fluentabi mapper is built by
+/// `guest-builder --index` and committed beside its crate (`make
+/// wasm-modules` refreshes the set); a network's genesis carries the set its
+/// founder built, so every node on that network folds with the same mapper.
+///
+/// Declared-equals-actual either way it is built: a module the topology says
+/// ships a guest that the source lacks is a refusal by name, never a bare
+/// index quietly serving nothing.
+pub struct IndexGuests(BTreeMap<String, Vec<u8>>);
 
-/// the bundled mapper for one module id — `None` for modules that ship no
-/// index guest (their databases still hold the op feed and serve scans).
-fn index_guest_wasm(id: &str) -> Option<&'static [u8]> {
-    match id {
-        "chat" => Some(CHAT_INDEX_WASM),
-        "tasks" => Some(TASKS_INDEX_WASM),
-        "pages" => Some(PAGES_INDEX_WASM),
-        "inbox" => Some(INBOX_INDEX_WASM),
-        "saga" => Some(SAGA_INDEX_WASM),
-        _ => None,
+impl IndexGuests {
+    /// the guests a founding set holds for `module_ids` — the daemons that
+    /// run no network (noded, simnode, the dev shape) install from here.
+    pub fn from_dir<S: AsRef<str>>(dir: &std::path::Path, module_ids: &[S]) -> Result<Self, String> {
+        let mut guests = BTreeMap::new();
+        for id in declared_index_guests(module_ids) {
+            let path = workspace_config::index_guest_path(dir, id);
+            let bytes = std::fs::read(&path).map_err(|err| {
+                format!(
+                    "module {id} ships an index guest but {} is unreadable: {err} \
+                     (run `make wasm-modules`, or `cargo build` to stage the founding set)",
+                    path.display()
+                )
+            })?;
+            guests.insert(id.to_string(), bytes);
+        }
+        Ok(Self(guests))
+    }
+
+    /// the guests a genesis carries for `module_ids` — a node on a network
+    /// installs from its workspace genesis, never from a directory.
+    pub fn from_genesis<S: AsRef<str>>(
+        genesis: &workspace_config::Genesis,
+        module_ids: &[S],
+    ) -> Result<Self, String> {
+        let mut guests = BTreeMap::new();
+        for id in declared_index_guests(module_ids) {
+            let bytes = genesis.index_guest(id).ok_or_else(|| {
+                format!(
+                    "module {id} ships an index guest but the genesis carries none for it — \
+                     this genesis was composed from a different topology"
+                )
+            })?;
+            guests.insert(id.to_string(), bytes.to_vec());
+        }
+        Ok(Self(guests))
+    }
+
+    fn get(&self, id: &str) -> Option<&[u8]> {
+        self.0.get(id).map(Vec::as_slice)
     }
 }
 
-/// open the per-module index store under `<storage>/index`, converging every
-/// module's database onto its bundled index guest. an open failure is
-/// fatal-with-remedy for the caller: the tier is rebuildable, so the fix is
-/// always "delete the directory".
+/// the ids of `module_ids` whose topology spec declares an index guest.
+fn declared_index_guests<S: AsRef<str>>(module_ids: &[S]) -> impl Iterator<Item = &str> {
+    module_ids
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|id| topology::TOPOLOGY.spec(id).is_some_and(|m| m.index_guest))
+}
+
+/// open the per-module index store under `<storage>/index`, deciding nothing
+/// about guests yet: each database keeps serving the guest its last converge
+/// installed until [`converge_index_guests`] runs. The split is what lets a
+/// node bring its index routes up before it holds a genesis (a joiner
+/// fetches its genesis off the mesh after the surfaces start). an open
+/// failure is fatal-with-remedy for the caller: the tier is rebuildable, so
+/// the fix is always "delete the directory".
 pub fn open_index_store<S: AsRef<str>>(
     storage: &std::path::Path,
     module_ids: &[S],
 ) -> Result<Arc<indexer::IndexStore>, String> {
     let index_dir = storage.join("index");
-    let modules: Vec<indexer::IndexModule> = module_ids
-        .iter()
-        .map(|id| indexer::IndexModule {
-            id: id.as_ref(),
-            guest: index_guest_wasm(id.as_ref()),
-        })
-        .collect();
-    indexer::IndexStore::open(&index_dir, &modules)
+    let ids: Vec<&str> = module_ids.iter().map(AsRef::as_ref).collect();
+    indexer::IndexStore::open_bare(&index_dir, &ids)
         .map(Arc::new)
         .map_err(|err| {
             format!(
@@ -73,6 +108,28 @@ pub fn open_index_store<S: AsRef<str>>(
                 index_dir.display()
             )
         })
+}
+
+/// converge every module's database onto its guest in `guests` (or onto no
+/// guest, for a module that ships none): the install half of
+/// [`open_index_store`], run once the guests are known.
+pub fn converge_index_guests(
+    index: &indexer::IndexStore,
+    guests: &IndexGuests,
+) -> Result<(), String> {
+    let modules: Vec<indexer::IndexModule> = index
+        .module_ids()
+        .map(|id| indexer::IndexModule {
+            id,
+            guest: guests.get(id),
+        })
+        .collect();
+    index.converge(&modules).map_err(|err| {
+        format!(
+            "install index guests at {}: {err} (derived tier — delete the directory to rebuild)",
+            index.base().display()
+        )
+    })
 }
 
 /// flatten a dispatch origin into the index's plain origin tag: external

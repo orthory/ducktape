@@ -14,7 +14,21 @@
 //! NOT an error and NOT a fallback to anything: the env var is simply left
 //! unset, `build_identity()` is `None`, and the node reports its build as
 //! `unknown` while serving every service plane normally.
+//!
+//! And stage the FOUNDING SET beside the binaries this library links into.
+//!
+//! A ducktape binary embeds no wasm (`AGENTS.md`, "No Embedded Wasm"): a
+//! network's wasm is its genesis, and the one place bare wasm files are read
+//! is the founding set `node init` composes a genesis from (and the daemons
+//! that run no network compose directly from). `cargo build` is what puts
+//! that set where a freshly built binary looks — `target/<profile>/modules`,
+//! beside the binary (`workspace_config::modules_dir`) — so a built node is
+//! complete without an install step. The set is the checkout's committed
+//! artifacts (`make wasm-modules` refreshes them), one file per artifact the
+//! topology declares: a declared component or index guest the checkout lacks
+//! fails the build here, naming the path, instead of `node init` later.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -28,6 +42,95 @@ fn main() {
 
     if let Some(build) = build_id() {
         println!("cargo:rustc-env=DUCKTAPE_BUILD={build}");
+    }
+
+    stage_founding_set();
+}
+
+/// copy every declared artifact into `<profile dir>/modules`, under the
+/// founding-set names `workspace_config::genesis` reads
+/// (`<id>.component.wasm`, `<id>.index.wasm`, `netstack.component.wasm`).
+///
+/// The profile dir is `OUT_DIR`'s third ancestor
+/// (`target[/<triple>]/<profile>/build/<pkg>-<hash>/out`): cargo exposes no
+/// variable for the directory a binary lands in, and this is the one fixed
+/// relation between a build script's output and that directory.
+fn stage_founding_set() {
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let profile_dir = out_dir
+        .ancestors()
+        .nth(3)
+        .expect("OUT_DIR sits three levels under the profile dir");
+    let dest = profile_dir.join("modules");
+    std::fs::create_dir_all(&dest).expect("create the staged founding set dir");
+    let checkout = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"))
+        .join("../..");
+
+    for spec in topology::TOPOLOGY.modules {
+        if spec.code != topology::Code::Wasm {
+            continue;
+        }
+        let module_dir = module_dir(&checkout, spec.id);
+        stage(
+            &module_dir.join("component.wasm"),
+            &dest.join(format!("{}.component.wasm", spec.id)),
+        );
+        if spec.index_guest {
+            stage(
+                &module_dir.join("index.wasm"),
+                &dest.join(format!("{}.index.wasm", spec.id)),
+            );
+        }
+    }
+    stage(
+        &checkout.join("crates/networking/netstack-machine/component.wasm"),
+        &dest.join("netstack.component.wasm"),
+    );
+}
+
+/// the checkout directory a module's committed artifacts live in: the
+/// product modules under `crates/modules/apps`, the system ones under
+/// `crates/modules/system`. Neither holding the module is a build error
+/// naming both, since the topology declared a module the tree does not carry.
+fn module_dir(checkout: &Path, id: &str) -> PathBuf {
+    let candidates = [
+        checkout.join("crates/modules/apps").join(id),
+        checkout.join("crates/modules/system").join(id),
+    ];
+    candidates
+        .iter()
+        .find(|dir| dir.join("component.wasm").is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "module {id} is in the topology but neither {} nor {} holds a component.wasm \
+                 (run `make wasm-modules`)",
+                candidates[0].display(),
+                candidates[1].display()
+            )
+        })
+}
+
+/// copy `src` to `dest` when the bytes differ, atomically (tmp + rename), and
+/// give `dest` the source's mtime so a staged file never reads as newer than
+/// this run to cargo's rerun check. Both paths are rerun triggers: a changed
+/// artifact re-stages, and so does a deleted staged copy.
+fn stage(src: &Path, dest: &Path) {
+    println!("cargo:rerun-if-changed={}", src.display());
+    println!("cargo:rerun-if-changed={}", dest.display());
+    let bytes = std::fs::read(src)
+        .unwrap_or_else(|e| panic!("read {} (run `make wasm-modules`): {e}", src.display()));
+    let already_staged = std::fs::read(dest).is_ok_and(|have| have == bytes);
+    if already_staged {
+        return;
+    }
+    let tmp = dest.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", tmp.display()));
+    std::fs::rename(&tmp, dest)
+        .unwrap_or_else(|e| panic!("rename {} -> {}: {e}", tmp.display(), dest.display()));
+    let modified = std::fs::metadata(src).and_then(|m| m.modified());
+    if let Ok(modified) = modified {
+        let _ = std::fs::File::open(dest).and_then(|f| f.set_modified(modified));
     }
 }
 

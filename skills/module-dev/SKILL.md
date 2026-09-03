@@ -85,9 +85,10 @@ module crate:
   ~15-line engine shell (`EngineRead`, `apply`, `index_guest::fold!`/`view!`).
 
 `guest-builder --index <module-dir>` writes the committed `index.wasm`; add
-the module to `INDEX_MODULES` in the Makefile and to `index_guest_wasm()` in
-`crates/noded/src/index.rs` (the bundled include_bytes registry). The fold runs
-ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
+the module to `INDEX_MODULES` in the Makefile and declare the guest on its
+topology row (`indexed_store`), which has the build stage `<id>.index.wasm`
+into the founding set and `node init` compose it into the genesis. The fold
+runs ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
 observably (`/v1/index/status` `fold.{module}`), never atomically.
 
 The engine's side of that contract — no backfill at registration, at-least-once
@@ -113,9 +114,9 @@ and `bin/simnode` from `SIM_BASE` (+ `SIM_VALSET` under simnode's
 
 | Where | What to touch |
 |---|---|
-| `crates/topology/src/lib.rs` | a `ModuleSpec` row in `MODULES` (`code`/`backing`/`config`) and the id in the selection(s) it joins. The siblings a module reads are compiled into its guest, not declared here; `host_state` composes genesis/restore/sync from the selection — nothing to mirror there. The component is NOT embedded: `node init` hashes `<id>.component.wasm` out of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `<ducktape home>/modules` — `$DUCKTAPE_HOME` when set, else `~/.ducktape` — filled by `make install-node`) into the descriptor, then copies those bytes into `<workspace>/modules/`. The kernel fixtures dir pins the same bytes. |
+| `crates/topology/src/lib.rs` | a `ModuleSpec` row in `MODULES` (`code`/`backing`/`config`) and the id in the selection(s) it joins. The siblings a module reads are compiled into its guest, not declared here; `host_state` composes genesis/restore/sync from the selection — nothing to mirror there. The component is NOT embedded: noded's build script stages `<id>.component.wasm` (and `<id>.index.wasm` for an `indexed_store` row) into the founding set beside the binary (`target/<profile>/modules`), and `node init` composes that set (`--modules <dir>`, default `$DUCKTAPE_MODULES_DIR`, else the staged set) into `<workspace>/genesis`, pinned by the descriptor. The kernel fixtures dir pins the same component bytes. |
 | `crates/noded/src/compose.rs` | ONLY for a `Code::Native` tenant (an arm in `native`, plus the `Cargo.toml` dep) or a `Backing::Odb` tenant (an arm in `open_odb` opening its disk substrate). A wasm store-backed module needs neither. |
-| the indexer | `open_index_store` opens a database for EVERY id in the selection, so joining or leaving a selection gains or loses one — nothing to touch for a module with no mapper. A module that ships one also needs its arm in `index_guest_wasm()` (`crates/noded/src/index.rs`, `include_bytes!` of the committed `index.wasm`) and its `INDEX_MODULES` entry in the `Makefile`. |
+| the indexer | `open_index_store` opens a database for EVERY id in the selection, so joining or leaving a selection gains or loses one — nothing to touch for a module with no mapper. A module that ships one declares it on its topology row (`indexed_store`) and joins `INDEX_MODULES` in the `Makefile`; the genesis carries the guest and the node converges it into the module's database at hydration (`converge_index_guests`, `crates/noded/src/index.rs`). |
 
 `SIM_BASE` is 15 of production's 19; the four it leaves out — `acl`,
 `governance`, `lifecycle`, `valset` — are exactly what simnode's

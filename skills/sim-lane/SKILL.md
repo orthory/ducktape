@@ -46,10 +46,10 @@ scenarios: `valset_keys` (raw 32-byte ed25519 pubkeys) + `invite_binding`;
 receipts) vs validator (height-only) shape.
 
 `modules_dir` (binary: `--modules <dir>`) is where the genesis reads each
-tenant's `<id>.component.wasm`. Leave it `None`: the default is the repo's
-`crates/kernel/host/tests/fixtures`, resolved from `CARGO_MANIFEST_DIR`, so a
-bare checkout boots with no `make install-node` and no installed module dir
-(`<ducktape home>/modules`, i.e. `$DUCKTAPE_HOME` when set, else `~/.ducktape`).
+tenant's `<id>.component.wasm` and each declared `<id>.index.wasm`. Leave it
+`None`: the default is the founding set the build staged beside the binary
+(`target/<profile>/modules`, or `$DUCKTAPE_MODULES_DIR`), so a bare checkout
+boots with no `make install-node` and nothing installed anywhere.
 The default set is `topology::SIM_BASE` (15 tenants, all wasm components);
 `--with-valset` appends `topology::SIM_VALSET` (acl and governance as
 components, kv/valset/lifecycle native). A sim boot cranelift-compiles the

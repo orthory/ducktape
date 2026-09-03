@@ -1155,12 +1155,6 @@ async fn reachability_plane(
     }
 }
 
-/// The netstack guest: the reachability machine as a `ducktape:netstack`
-/// component, built by guest-builder from the machine crate and committed
-/// beside it (`make wasm-modules`).
-const NETSTACK_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/networking/netstack-machine/component.wasm");
-
 /// Which machine drives the reachability plane. `DUCKTAPE_NETSTACK=guest`
 /// runs the wasm component; unset or `native` runs the machine compiled
 /// into this binary. Any other value is refused loudly and runs native —
@@ -1168,16 +1162,43 @@ const NETSTACK_COMPONENT: &[u8] =
 pub(crate) fn netstack_backend() -> reachability::NetstackBackend {
     let requested = std::env::var("DUCKTAPE_NETSTACK").ok();
     match requested.as_deref() {
-        Some("guest") => reachability::NetstackBackend::Guest {
-            component: NETSTACK_COMPONENT.to_vec(),
-            step_fuel: reachability::NETSTACK_STEP_FUEL,
-        },
+        Some("guest") => netstack_guest_backend(),
         Some("native") | None => reachability::NetstackBackend::Native,
         Some(_) => {
             tracing::warn!(
                 target: "ducktape::reachability",
                 reason = "netstack_backend_unknown",
                 "DUCKTAPE_NETSTACK names no backend; running native"
+            );
+            reachability::NetstackBackend::Native
+        }
+    }
+}
+
+/// The netstack guest: the reachability machine as a `ducktape:netstack`
+/// component, read from the founding set beside this binary
+/// (`netstack.component.wasm`, staged by the build from the machine crate's
+/// committed artifact). Not a genesis artifact: a joiner runs this machine to
+/// reach the mesh BEFORE it holds any genesis. A guest the founding set
+/// cannot supply is refused loudly and runs native, exactly like a backend
+/// name that names nothing — the operator asked for a machine this build
+/// did not stage.
+fn netstack_guest_backend() -> reachability::NetstackBackend {
+    let component = workspace_config::modules_dir().and_then(|dir| {
+        let path = workspace_config::netstack_component_path(&dir);
+        std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
+    });
+    match component {
+        Ok(component) => reachability::NetstackBackend::Guest {
+            component,
+            step_fuel: reachability::NETSTACK_STEP_FUEL,
+        },
+        Err(error) => {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                reason = "netstack_guest_unreadable",
+                error = %error,
+                "DUCKTAPE_NETSTACK=guest but the founding set has no readable netstack guest; running native"
             );
             reachability::NetstackBackend::Native
         }

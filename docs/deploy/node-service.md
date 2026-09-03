@@ -26,7 +26,8 @@ when set, else `~/.ducktape`. The units set
 /var/lib/ducktape/
   workspaces/<chain-id>/     one dir per network (`ducktape node list`)
     node.toml                the operator file: listeners, storage_dir, [sandbox]
-    network.toml             the network descriptor (validators, reach hints)
+    network.toml             the network descriptor (validators, reach hints, the genesis pin)
+    genesis                  the network's wasm (every component + index guest), pinned by network.toml
     identity.key             THIS NODE'S seat key, 0600 — back it up (see backup-and-keys.md)
     wireguard.key            the tunnel keypair (regenerable)
     services.toml            service grants (`ducktape service enable`)
@@ -35,7 +36,7 @@ when set, else `~/.ducktape`. The units set
     daemon.log               `node run`'s tee (append-only)
     <kind>.log               `service run <kind>`'s tee (append-only)
     storage/                 consensus state, blobs, mesh-state.json, airlock-creds/
-  modules/                   <id>.component.wasm — what `node init` founds a network from
+  modules/                   the founding set (`<id>.component.wasm`, `<id>.index.wasm`, the netstack guest): what `node init` composes a genesis from
   executors/                 pinned agent CLIs (`ducktape agent install`)
   keys/                      user wallets + `active` pointer (only if you run wallet verbs as this user)
 ```
@@ -74,7 +75,7 @@ the host); the steps are spelled out here for anyone auditing or adapting them.
 
 ```sh
 # 1. Build and install the CLI system-wide (make install-node puts it in
-#    ~/.cargo/bin and fills ~/.ducktape/modules for the building user).
+#    ~/.cargo/bin and the founding set in ~/.cargo/bin/modules beside it).
 make install-node
 sudo install -m 0755 ~/.cargo/bin/ducktape /usr/local/bin/ducktape
 
@@ -84,9 +85,10 @@ sudo useradd --system --home-dir /var/lib/ducktape --shell /usr/sbin/nologin duc
 sudo usermod -aG kvm ducktape
 sudo install -d -o ducktape -g ducktape -m 0700 /var/lib/ducktape
 
-# 3. The module set the network is founded from.
+# 3. The founding set: what `node init --modules` composes the genesis from,
+#    and where the unit's DUCKTAPE_MODULES_DIR has the netstack guest read.
 sudo install -d -o ducktape -g ducktape /var/lib/ducktape/modules
-sudo cp ~/.ducktape/modules/*.component.wasm /var/lib/ducktape/modules/
+sudo cp ~/.cargo/bin/modules/*.wasm /var/lib/ducktape/modules/
 sudo chown -R ducktape:ducktape /var/lib/ducktape/modules
 
 # 4. Units and log rotation.
@@ -95,9 +97,12 @@ sudo install -m 0644 ops/node/ducktape-node.logrotate /etc/logrotate.d/ducktape-
 sudo systemctl daemon-reload
 
 # 5. Found or join the network AS the service user, so the files land where
-#    the unit will look for them.
-dt node init --name mynet                 # founder
-dt node join '<invite blob>'              # ...or a joiner
+#    the unit will look for them. A member (an identity the founder admitted
+#    before genesis) joins with the founder's `<workspace>/genesis`; a
+#    resident fetches it off the mesh at first boot.
+dt node init --name mynet --modules /var/lib/ducktape/modules   # founder
+dt node join '<invite blob>'                                    # ...or a resident
+dt node join '<invite blob>' --genesis /path/to/founders/genesis # ...or a member
 dt node list                              # the chain id the instance names
 ```
 

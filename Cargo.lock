@@ -9096,6 +9096,7 @@ dependencies = [
  "tokio",
  "topology",
  "tracing",
+ "workspace-config",
 ]
 
 [[package]]
@@ -12083,6 +12084,7 @@ name = "workspace-config"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "commonware-p2p",
@@ -12097,6 +12099,7 @@ dependencies = [
  "sandbox-host",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "toml 0.8.23",
  "tracing",

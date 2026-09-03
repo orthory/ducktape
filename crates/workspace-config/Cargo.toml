@@ -22,6 +22,10 @@ version.workspace = true
 # zero-dependency leaf so every reader of that root agrees about it.
 ducktape-home = { workspace = true }
 base64 = "0.22"
+# the genesis file's record codec — the workspace's one binary artifact.
+borsh = { workspace = true }
+# the genesis pin: sha256 of the file, and of each component it carries.
+sha2 = { workspace = true }
 commonware-codec = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }

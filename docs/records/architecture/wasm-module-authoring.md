@@ -11,10 +11,13 @@ fixtures, in no genesis set. The first wasm port of a native module is
 implementation it replaced (same root, same snapshot encoding) — the template
 every later port followed. It is in no genesis set either: the crate is a test
 tenant the kernel suites construct directly. The node binary embeds
-no component: `node init` hashes every wasm tenant's `<id>.component.wasm` out
-of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `<ducktape home>/modules`,
-filled by `make install-node`) into the network descriptor, then copies those
-same bytes into the workspace's `modules/` dir.
+no component: `node init` composes every wasm tenant's `<id>.component.wasm`
+and every declared `<id>.index.wasm` out of the founding set (`--modules <dir>`,
+default `$DUCKTAPE_MODULES_DIR`, else the `modules/` dir noded's build script
+stages beside the binary) into the workspace `genesis` file, and pins that file
+and every component in the network descriptor. A node hydrates its blob store
+and index from the file at boot; a joiner takes it at `join --genesis` or
+fetches it off the mesh.
 
 ## The model (design-B: host-owned state, guest as pure logic)
 

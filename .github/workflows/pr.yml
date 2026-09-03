@@ -1,8 +1,9 @@
 # The PR gate. Everything in .github/workflows/ before this was push-triggered
 # and path-filtered, so a pull request against `dev` carried no checks at all
 # (#1392). This workflow runs on every PR targeting `dev` and gates on the
-# three things the dev loop already treats as load-bearing: the committed wasm
-# component bytes (`make wasm-modules-check`), the genesis root-hash pin
+# things the dev loop already treats as load-bearing: the committed wasm
+# component bytes (`make wasm-modules-check`) and that no binary embeds any
+# of them (`make wasm-embed-check`), the genesis root-hash pin
 # (`host_state`), and clippy across the workspace.
 name: pr
 
@@ -35,6 +36,7 @@ jobs:
       - run: rustup show
       - run: cargo install wasm-tools --locked
       - run: make wasm-modules-check
+      - run: make wasm-embed-check
 
   genesis-pin:
     runs-on: ubuntu-latest
