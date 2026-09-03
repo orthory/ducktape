@@ -340,3 +340,30 @@ fn ignoring_an_indexed_path_freezes_it_instead_of_deleting_it() {
         "only the new ignore file is added"
     );
 }
+
+// ---- non-regular entries ----------------------------------------------------
+
+/// a socket (or fifo, or device node) is NOT a file: the walk skips it instead
+/// of recording a `File` that `plan` would then `read` — a fifo read blocks
+/// forever, which is the "commit hangs with no output" failure. a unix socket
+/// stands in for the family here because std can create one without libc.
+#[test]
+fn a_socket_in_the_checkout_is_skipped_not_scanned_as_a_file() {
+    use std::os::unix::net::UnixListener;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(root.join("real.txt"), b"content").unwrap();
+    let _sock = UnixListener::bind(root.join("dev.sock")).unwrap();
+
+    let idx = Index::new(PREFIX, "http://node", None);
+    idx.save(root).unwrap();
+
+    let st = status(root).unwrap();
+    assert_eq!(
+        paths(&st.added),
+        vec![dpath("real.txt")],
+        "only the regular file is a change"
+    );
+}

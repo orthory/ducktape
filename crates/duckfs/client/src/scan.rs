@@ -19,7 +19,8 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 /// what an on-disk entry is. only these three kinds materialize; anything else
-/// (fifo, socket, device) is out of scope for a duckfs checkout.
+/// (fifo, socket, device) is out of scope for a duckfs checkout and is skipped
+/// by the walk — never stat'd into a `File` and read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanKind {
     File,
@@ -196,7 +197,10 @@ impl Ignore {
 pub fn scan(root: &Path, prefix: &str) -> Result<Vec<ScanEntry>, ScanError> {
     let ignore = Ignore::load(root)?;
     let mut out = Vec::new();
-    scan_dir(root, root, prefix, &ignore, &mut out)?;
+    // latched: the first skipped fifo/socket/device says so, the rest are quiet.
+    // a per-entry warn on a checkout holding a socket directory is a log bomb.
+    let mut warned_special = false;
+    scan_dir(root, root, prefix, &ignore, &mut warned_special, &mut out)?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
 }
@@ -216,6 +220,7 @@ fn scan_dir(
     dir: &Path,
     prefix: &str,
     ignore: &Ignore,
+    warned_special: &mut bool,
     out: &mut Vec<ScanEntry>,
 ) -> Result<(), ScanError> {
     for entry in fs::read_dir(dir)? {
@@ -275,8 +280,8 @@ fn scan_dir(
                 target: None,
                 empty_dir: empty,
             });
-            scan_dir(root, &path, prefix, ignore, out)?;
-        } else {
+            scan_dir(root, &path, prefix, ignore, warned_special, out)?;
+        } else if ft.is_file() {
             // a regular file: exec is the owner/group/other execute bits (the
             // module tracks one exec bit; any set bit means executable).
             let exec = meta.permissions().mode() & 0o111 != 0;
@@ -290,9 +295,51 @@ fn scan_dir(
                 target: None,
                 empty_dir: false,
             });
+        } else {
+            // a fifo, socket or device node. the model holds files, symlinks and
+            // dirs and nothing else, and this entry is NEVER opened: reading a
+            // fifo with no writer blocks forever, which is how a `commit` over a
+            // build directory that left a `.sock` behind hung with no output and
+            // no log line. skipped, and said once.
+            report_special(&path, &ft, warned_special);
         }
     }
     Ok(())
+}
+
+/// say — ONCE per scan — that a non-regular entry was skipped. the latch is the
+/// point: a hang with no line is the worst outcome, a line per socket is the
+/// second worst.
+fn report_special(path: &Path, ft: &fs::FileType, warned: &mut bool) {
+    if *warned {
+        return;
+    }
+    *warned = true;
+    tracing::warn!(
+        target: "ducktape::files",
+        reason = "unsupported_file_kind",
+        kind = special_kind(ft),
+        path = %path.display(),
+        "skipped a non-regular entry in the checkout; later ones this scan are silent",
+    );
+}
+
+/// name the kind of a non-regular entry for the log line.
+fn special_kind(ft: &fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt as _;
+    if ft.is_fifo() {
+        return "fifo";
+    }
+    if ft.is_socket() {
+        return "socket";
+    }
+    if ft.is_block_device() {
+        return "block_device";
+    }
+    if ft.is_char_device() {
+        return "char_device";
+    }
+    "unknown"
 }
 
 /// `path` relative to the checkout root, as a `/`-joined string — what an

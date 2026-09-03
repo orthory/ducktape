@@ -170,10 +170,26 @@ pub(crate) struct PinArgs {
     pub addr: NodeAddr,
 }
 
+/// `main` installs a subscriber only for `node run`, so a one-shot verb would
+/// drop the engine's events on the floor — and the one that matters most (the
+/// walk skipping a fifo it must never open) would be invisible exactly where a
+/// user is watching. one stderr sink at `warn`, `RUST_LOG` overrides it, and
+/// stdout stays the program output `cat`/`ls` write.
+fn install_log_sink() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .without_time()
+        .try_init();
+}
+
 /// dispatch a parsed verb and map its `CliError` to the process exit code. an
 /// EMPTY error message prints nothing — a dirty `status` and a commit conflict
 /// each wrote their own output and only carry the exit code here.
 pub(crate) fn run(cmd: FsCmd) -> u8 {
+    install_log_sink();
     let outcome = match cmd {
         FsCmd::Ls(a) => read_cmds::ls(a),
         FsCmd::Cat(a) => read_cmds::cat(a),
