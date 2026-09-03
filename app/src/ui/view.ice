@@ -258,6 +258,7 @@ view
               chat_scrolled -> chat_scrolled _ _ _ _
               open_message_link -> open_message_link _
               copy_to_clipboard -> copy_to_clipboard _ _
+              copy_message_link -> copy_message_link _
               add_reaction_at -> add_reaction_at _ _
               remove_reaction_at -> remove_reaction_at _ _
               open_thread_for -> open_thread_for _

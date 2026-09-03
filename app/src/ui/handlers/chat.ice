@@ -867,6 +867,18 @@ on begin_message_edit(seq, body, rev)
   message_edit_draft = body
   task widget focus #workspace-tabs/content/chat/message-edit window=window_target(console_win)
 
+// COPY LINK CLOSES THE MENU IT WAS PRESSED IN. Every other row of the message
+// menu moves `message_action` on its way out; a bare clipboard write would
+// leave the overlay plate standing over the timeline it just addressed. Both
+// menus route here — only one of them is ever open — and the clipboard itself
+// stays the app's single site (`handlers/node.ice`), reached the one way a
+// handler reaches another.
+on copy_message_link(link)
+  message_action = MessageAction.toolbar
+  thread_message_action = MessageAction.toolbar
+  return if empty(link)
+  run every duck_echo_str(link) -> copy_to_clipboard(_, "Message link copied") | external_url_failed _
+
 // A LINK PRESS IS A HAND-OFF TO THE OS, and nothing else: no selection, no
 // draft, no rail. Same route the page renderer's link press takes
 // (`handlers/pages.ice`), and it shares that handler's two result arms.

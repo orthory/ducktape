@@ -168,6 +168,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
     chat_scrolled(f64, f64, f64, f64)
     open_message_link(str)
     copy_to_clipboard(str, str)
+    copy_message_link(str)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
@@ -953,7 +954,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                   // pasted into a workspace on another chain
                                   // it refuses instead of opening that
                                   // chain's message 42.
-                                  button -> emit(copy_to_clipboard, duck_channel_message_link(active_channel, selected_message_seq, network_chain_id), "Message link copied")
+                                  button -> emit(copy_message_link, duck_channel_message_link(active_channel, selected_message_seq, network_chain_id))
                                     with
                                       label="Copy message link"
                                       w=fill
@@ -1817,6 +1818,42 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                         tone="muted"
                                         px=14.0
                                     text "Add reaction"
+                                      with
+                                        size=12.5
+                                        wrap=none
+                                        @text-accent_fg
+                                active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+                                hovered bg=fg/8 text=fg
+                                pressed bg=fg/12 text=fg
+                              // A reply is addressable exactly like a stream
+                              // message — same channel, its own seq — and the
+                              // rail is where a reader stands when they want
+                              // to hand one to somebody.
+                              button -> emit(copy_message_link, duck_channel_message_link(active_channel, thread_selected_seq, network_chain_id))
+                                with
+                                  label="Copy message link"
+                                  w=fill
+                                  h=30.0
+                                  p=0.0
+                                  @ghost_action
+                                box
+                                  with
+                                    w=fill
+                                    h=fill
+                                    pl=9.0
+                                    pr=9.0
+                                    align-y=center
+                                  row
+                                    with
+                                      w=fill
+                                      gap=9.0
+                                      align=center
+                                    Icon
+                                      with
+                                        name="link"
+                                        tone="muted"
+                                        px=14.0
+                                    text "Copy link"
                                       with
                                         size=12.5
                                         wrap=none
