@@ -50,6 +50,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 if [ ! -f "$WSDIR/node.toml" ] || [ ! -f "$WSDIR/network.toml" ] || [ -n "${DEV_RESEED:-}" ]; then
+  # DEV_LISTEN/DEV_HTTP_LISTEN (#1241) are demo-seed.sh's own env-read knobs;
+  # this script has no listener config of its own to widen — it inherits
+  # whichever values are already in the caller's environment.
   bash "$SCRIPT_DIR/demo-seed.sh" || die "seeding the '$ID' localnet failed"
 fi
 
