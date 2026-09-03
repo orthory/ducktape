@@ -1053,9 +1053,13 @@ fn a_container_shaped_disk_substrate_two_blocks_ahead_recovers_cleanly() {
             1,
         )
         .expect("capture");
-        // the checkpoint DOES carry its snapshot bytes (its sync surface says
-        // so) — restore just never installs them for a self-durable tenant.
-        assert!(manifest.snapshot("containerish").is_some());
+        // and it carries NO snapshot bytes for this tenant: restore never
+        // installs them for a self-durable one, so building the container
+        // would be write amplification nothing reads back (#1308 — for forge,
+        // its whole git pack closure, on the select loop). the ROOT is still
+        // captured, and the root is what places the substrate below.
+        assert_eq!(manifest.snapshot("containerish"), None);
+        assert!(manifest.root("containerish").is_some());
         node.sink_mut()
             .write_manifest(&manifest)
             .await
