@@ -167,10 +167,10 @@ is `skills/module-dev/SKILL.md`.
 
 ## Run a node
 
-Install the `ducktape` operator CLI into `~/.cargo/bin` (and the module
-component set into `~/.ducktape/modules`, which `node init` founds a network
-from); on macOS this also builds the Ice `.app`/`.dmg` and installs
-`Ducktape.app` into `~/Applications`:
+Install the `ducktape` operator CLI into `~/.cargo/bin` (and the founding
+set — every module's wasm — into `~/.cargo/bin/modules` beside it, which
+`node init` composes a network's genesis from); on macOS this also builds the
+Ice `.app`/`.dmg` and installs `Ducktape.app` into `~/Applications`:
 
 ```sh
 make install
@@ -189,9 +189,15 @@ ducktape account create --name <you>
 ducktape node status                # height + root hash of the running node
 ```
 
-Genesis reads each module's `<id>.component.wasm` from `$DUCKTAPE_MODULES_DIR`,
-else `<ducktape home>/modules` — `$DUCKTAPE_HOME` when set, else `~/.ducktape`
-(or `--modules <dir>`); an incomplete bundle is refused by name at startup.
+`node init` composes the network's wasm — every module's
+`<id>.component.wasm` and `<id>.index.wasm` — into `<workspace>/genesis` out of
+the founding set `cargo build` stages beside the binary
+(`target/<profile>/modules`; `--modules <dir>` or `$DUCKTAPE_MODULES_DIR`
+overrides it), and pins that file in `network.toml`. An incomplete set is
+refused by file name at `init`. A joiner installs the founder's file with
+`node join --genesis <file>` (a member must; a resident may, and otherwise
+fetches it off the mesh at first boot); the node hydrates its blob store and
+index from the file at boot.
 
 Then, to run agents on it: `ducktape service run compute` offers this host's
 sandbox, `ducktape user cred add claude` logs a provider in, and

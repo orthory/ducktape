@@ -14,7 +14,7 @@ _ducktape() {
     local node_work=(list admit revoke)
     local node_join=(requests state)
     local node_netstack=(swap)
-    local node_flags=(--config -n --network --sync-only --json --yes --out --dir --name --modules --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --block-time-ms --ttl-days --node --key --native --component)
+    local node_flags=(--config -n --network --sync-only --json --yes --out --dir --name --modules --genesis --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --block-time-ms --ttl-days --node --key --native --component)
 
     local user_key=(init restore unlock reveal status)
     local user_cred=(add list remove grant revoke inspect seal)

@@ -29,6 +29,9 @@ host = { workspace = true }
 # a wasm component read from the modules dir and composed through
 # `noded::compose`, so the binary knows module ids, not module structs.
 topology = { workspace = true }
+# the founding set's resolution: the sim composes from the set the build
+# staged beside its executable when no `--modules` names another.
+workspace-config = { workspace = true }
 sdk = { workspace = true }
 # the two module wire codecs the echo oracle speaks: a saga worker request in,
 # a saga follow-up (bid, then result) out over a dispatch WorkSpec.

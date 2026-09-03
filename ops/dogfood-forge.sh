@@ -136,9 +136,9 @@ if ! curl -fsS -m 5 "$BASE_URL/v1/status" >/dev/null 2>&1; then
   # NOTE: no backticks in this string — it is double-quoted, so they would be
   # command substitution, and the die message would RUN whatever it names.
   die "no node responding at $BASE_URL — start a node first \
-(make install-node, once, to fill <home>/modules with the components its \
-genesis composes from; then cargo run -p noded-bin), or set \
-DUCKTAPE_DEV_FORGE_URL to a running node."
+(cargo run -p noded-bin: the build stages the founding set its genesis \
+composes from beside the binary), or set DUCKTAPE_DEV_FORGE_URL to a \
+running node."
 fi
 
 # idempotent remote wiring: add, or re-point if it already exists.

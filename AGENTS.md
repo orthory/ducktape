@@ -40,9 +40,12 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
   module at a block. Bytes compiled into a binary are a second copy of a module
   that only a rebuild can change, and a rebuild changing what a node founds or
   joins with is a silent network change.
-- Every wasm a node runs reaches it as a FILE it reads at runtime, resolved
-  from a directory (`workspace_config::modules_dir()` for the genesis set).
-  Getting the files there is a build or install step, never a compile step.
+- Every wasm a node runs reaches it as a FILE it reads at runtime: a
+  network's from its workspace `genesis` file (`node init` composes it out of
+  the founding set `cargo build` stages beside the binary, resolved by
+  `workspace_config::modules_dir()`; a joiner installs it at `join --genesis`
+  or fetches it off the mesh at first boot). Getting the files there is a
+  build, install, or hydration step, never a compile step.
 - Tests may `include_bytes!` a committed fixture — a test pins bytes on
   purpose. Nothing else may.
 

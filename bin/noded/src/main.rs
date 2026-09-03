@@ -69,11 +69,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // where the wasm tenants' `<id>.component.wasm` bytes come from: `--modules`,
-    // else the managed dir `make install-node` fills. Read and hashed HERE,
-    // before a storage root is created or a listener binds — ONE decision about
-    // whether the bundle is usable, made where its remedy is the operator's
-    // rather than a stack trace from the actor thread. the source (a path and a
-    // hash table) then rides into the actor.
+    // else the founding set the build staged beside this binary. This daemon
+    // runs no network, so it composes straight from that set — a node on a
+    // network composes from its workspace genesis instead. Read and hashed
+    // HERE, before a storage root is created or a listener binds — ONE
+    // decision about whether the set is usable, made where its remedy is the
+    // operator's rather than a stack trace from the actor thread. the source
+    // (a path and a hash table) then rides into the actor.
     let modules_dir = match modules {
         Some(dir) => dir,
         None => workspace_config::modules_dir()?,
@@ -81,9 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wasm_ids = TOPOLOGY.wasm_ids(MODULE_IDS);
     let (code, code_hashes) = DirCodeSource::open(&modules_dir, &wasm_ids).map_err(|err| {
         format!(
-            "{err} — fill `{}` (`make install-node`), or pass \
-             --modules <dir> holding every <id>.component.wasm",
-            modules_dir.display()
+            "{err} — `cargo build` stages the founding set beside the binary; or pass \
+             --modules <dir> holding every <id>.component.wasm and <id>.index.wasm"
         )
     })?;
     let storage = storage.unwrap_or_else(|| {
@@ -98,7 +99,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // <storage>/index/<module>/, with each module's view mapper registered.
     // an open failure is fatal-with-remedy rather than a silent no-index run:
     // the tier is rebuildable, so the fix is always "delete <storage>/index".
+    // this daemon runs no network, so its index guests come from the same
+    // founding set its components do, not from a genesis.
     let index = noded::open_index_store(&storage, MODULE_IDS)?;
+    noded::converge_index_guests(&index, &noded::IndexGuests::from_dir(&modules_dir, MODULE_IDS)?)?;
 
     let log_ring = noded::LogRing::default();
     noded::log::init(Some(log_ring.clone()), Some(storage.join("daemon.log")));

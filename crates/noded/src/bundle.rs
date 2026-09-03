@@ -12,11 +12,10 @@ use wasm_host::WasmModule;
 
 use crate::compose::BoxFut;
 
-/// `<dir>/<id>.component.wasm` — the one component file naming convention
-/// (kernel fixtures, `~/.ducktape/modules`, and every workspace bundle).
-pub fn component_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.component.wasm"))
-}
+/// `<dir>/<id>.component.wasm` — the founding-set naming convention (the
+/// kernel fixtures and the staged set alike), owned by the workspace crate
+/// beside the genesis it composes.
+pub use workspace_config::component_path;
 
 /// sha256 every `<id>.component.wasm` in `dir` for `ids`; a missing file names
 /// its path, because the operator's next move is to look at that directory.

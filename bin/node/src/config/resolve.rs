@@ -149,17 +149,28 @@ pub struct Resolved {
 /// the genesis code set of a network, as a booting node needs it: WHICH
 /// components (by id and content hash) and WHERE their bytes live.
 ///
-/// The hashes are the consensus fact — a node whose bundle hashes differently
-/// is on a different network — and `bundle_dir` is merely the local directory
+/// The hashes are the consensus fact — a node whose genesis hashes
+/// differently is on a different network — and `source` is merely where
 /// those bytes are read from, so the two travel together but only one is
 /// signed for.
 #[derive(Debug)]
 pub struct GenesisModules {
     /// id -> sha256 of the genesis component, for every wasm tenant.
     pub hashes: BTreeMap<String, [u8; 32]>,
-    /// where `<id>.component.wasm` files live: `<workspace>/modules` (network
-    /// shape) or the dev shape's `modules` dir.
-    pub bundle_dir: PathBuf,
+    /// where the bytes come from.
+    pub source: GenesisSource,
+}
+
+/// where a booting node's genesis wasm comes from.
+#[derive(Debug)]
+pub enum GenesisSource {
+    /// the network shape: the workspace genesis file, pinned by the
+    /// descriptor's `genesis` hash. Absent until a joiner's first boot fetches
+    /// it off the mesh; a founder or member holds it from `init`/`join`.
+    Workspace { file: PathBuf, hash: [u8; 32] },
+    /// the dev shape: a founding set directory, whose files ARE the genesis
+    /// code set (hashed at resolve — there is no descriptor).
+    FoundingSet(PathBuf),
 }
 
 // the component bundle's naming and hashing live beside the composer, where
@@ -515,10 +526,14 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     )?;
     let compute_backend = gate_on_compute_grant(service.sandbox.as_ref(), &service.workspace)?;
     // the descriptor IS the genesis code set here: its hashes are already in
-    // the namespace fingerprint, so the bundle beside it only has to match.
+    // the namespace fingerprint, so the genesis file beside it only has to
+    // match — and a joiner that lacks the file fetches it by that pin.
     let genesis = GenesisModules {
         hashes: descriptor.module_hashes()?,
-        bundle_dir: base.join("modules"),
+        source: GenesisSource::Workspace {
+            file: workspace_config::genesis_path(base),
+            hash: descriptor.genesis_hash()?,
+        },
     };
 
     Ok(Resolved {
@@ -850,13 +865,13 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // whatever `<dir>/<id>.component.wasm` hashes to is what this node seeds.
     // LAST, because it is the only check that touches the disk — a config with
     // a typo'd `listen` must be told about the typo, not about the bundle.
-    let bundle_dir = PathBuf::from(&raw.modules);
+    let founding_set = PathBuf::from(&raw.modules);
     let genesis = GenesisModules {
         hashes: hash_bundle(
-            &bundle_dir,
+            &founding_set,
             &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
         )?,
-        bundle_dir,
+        source: GenesisSource::FoundingSet(founding_set),
     };
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
@@ -960,6 +975,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1000,6 +1016,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1035,6 +1052,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         };
         d.add_bootstrap(&founder, "203.0.113.7:41000");
         d.save(&dir.join("network.toml")).expect("save");
@@ -1061,6 +1079,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         };
         d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
@@ -1091,9 +1110,17 @@ mod tests {
         // persist a `coord.cap` delivered over its Admitted gate reply.
         assert_eq!(r.service.workspace, dir);
         // the genesis code set comes STRAIGHT off the descriptor (its hashes
-        // are already in the namespace fingerprint), and its bytes are read
-        // from the bundle beside the config.
-        assert_eq!(r.genesis.bundle_dir, dir.join("modules"));
+        // are already in the namespace fingerprint), and its bytes are the
+        // workspace genesis file's, pinned by the descriptor's hash.
+        assert!(
+            matches!(
+                &r.genesis.source,
+                GenesisSource::Workspace { file, hash }
+                    if *file == dir.join("genesis") && *hash == [0xabu8; 32]
+            ),
+            "{:?}",
+            r.genesis.source
+        );
         assert_eq!(r.genesis.hashes["pages"], [0x11u8; 32]);
         assert_eq!(r.genesis.hashes.len(), fake_modules().len());
     }
@@ -1114,6 +1141,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1220,6 +1248,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         }
         .save(&network_dir.join("network.toml"))
         .expect("save descriptor");
@@ -1282,6 +1311,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1322,7 +1352,11 @@ mod tests {
         )
         .expect("write node.toml");
         let r = resolve(&cfg).expect("resolve dev shape");
-        assert_eq!(r.genesis.bundle_dir, modules);
+        assert!(
+            matches!(&r.genesis.source, GenesisSource::FoundingSet(dir) if *dir == modules),
+            "{:?}",
+            r.genesis.source
+        );
         assert_eq!(
             r.genesis.hashes["pages"],
             <[u8; 32]>::from(sha2::Sha256::digest(b"pages")),
@@ -1371,6 +1405,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: Vec::new(),
+            genesis: "ab".repeat(32),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1765,6 +1800,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1820,6 +1856,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1848,6 +1885,7 @@ mod tests {
             reach: vec![],
             coordination: None,
             modules: fake_modules(),
+            genesis: "ab".repeat(32),
         };
         d.save(&dir.join("network.toml")).expect("save");
 

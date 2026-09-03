@@ -498,8 +498,9 @@ fn detect_platform_sandbox() -> Option<config::SandboxToml> {
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
 /// — found a network: mint the chain-id, write the descriptor + node config,
 /// seed the genesis validator set with this identity, and PIN the genesis wasm
-/// set — every component in `--modules` is hashed into the descriptor and
-/// copied into `<workspace>/modules`. Every flag is optional:
+/// set — every component and index guest in `--modules` is composed into
+/// `<workspace>/genesis`, whose hash (and every component's) is in the
+/// descriptor. Every flag is optional:
 /// the generated config defaults to a WORKING node — overlay advertise, and
 /// every listener at its `config::DEFAULT_*_LISTEN` constant (mesh, HTTP,
 /// RPC, gateway, WireGuard), which is the one place those ports are written
@@ -509,22 +510,31 @@ fn detect_platform_sandbox() -> Option<config::SandboxToml> {
 fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let name = &args.name;
     let explicit_dir = args.dir.is_some();
-    // the genesis wasm set. founding PINS it: every component is hashed into
-    // the descriptor (those hashes are IN the genesis fingerprint, so a node
-    // built against other bytes is a different network) and the same bytes are
-    // seeded into `<workspace>/modules` below.
+    // the genesis wasm set. founding PINS it: the founding set's components
+    // and index guests compose into the genesis file, whose hash and every
+    // component's hash go into the descriptor (both are IN the genesis
+    // fingerprint, so a node holding other bytes is a different network), and
+    // that file is written into the workspace below.
     //
-    // FIRST, before any directory is created: an absent or incomplete bundle is
-    // the one refusal that has nothing to do with the flags, and a founding
-    // that dies after `create_dir_all` leaves an orphan workspace holding a
-    // freshly minted `identity.key` behind on every attempt.
-    let modules_src = match args.modules {
+    // FIRST, before any directory is created: an absent or incomplete founding
+    // set is the one refusal that has nothing to do with the flags, and a
+    // founding that dies after `create_dir_all` leaves an orphan workspace
+    // holding a freshly minted `identity.key` behind on every attempt.
+    let founding_set = match args.modules {
         Some(src) => src,
         None => config::modules_dir()?,
     };
-    let wasm_ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
-    let hashes = config::hash_bundle(&modules_src, &wasm_ids)
-        .map_err(|e| format!("{e} — pass --modules <dir> holding every <id>.component.wasm"))?;
+    let genesis = config::Genesis::compose(
+        &founding_set,
+        &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
+        &topology::TOPOLOGY.index_guest_ids(topology::PRODUCTION),
+    )
+    .map_err(|e| {
+        format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")
+    })?;
+    let genesis_bytes = genesis.encode();
+    let genesis_hash = config::sha256(&genesis_bytes);
+    let hashes = genesis.component_hashes();
     // the workspace dir: `--dir` is the explicit escape hatch; the default is
     // the registry — `~/.ducktape/workspaces/<chain-id>/` — so the network is
     // addressable by `-n <chain-id>` (run/invite/list) from the moment it is
@@ -590,8 +600,10 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         plumbing.sandbox = detect_platform_sandbox();
     }
 
-    // seed the bundle the node boots from: the SAME bytes just hashed.
-    seed_bundle(&dir, &modules_src, hashes.keys())?;
+    // write the genesis the node boots from: the SAME bytes just hashed, and
+    // the file every joiner is handed (a member by `join --genesis`, a
+    // resident by its first boot's fetch).
+    config::install_genesis(&dir, &genesis_hash, &hashes, &genesis_bytes)?;
     let mut modules = Vec::with_capacity(hashes.len());
     for (id, hash) in &hashes {
         // ids come from the topology today, but the descriptor codec's
@@ -611,6 +623,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         reach: Vec::new(),
         coordination: None,
         modules,
+        genesis: hex_bytes(&genesis_hash),
     };
     if let Some(addr) = config::dialable(Some(&plumbing.advertised), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -627,9 +640,11 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     );
     eprintln!("network {chain_id} initialized in {}", dir.display());
     eprintln!(
-        "modules: {} components bundled from {}",
-        descriptor.modules.len(),
-        modules_src.display()
+        "genesis: {} components and {} index guests from {} written to {}",
+        genesis.components.len(),
+        genesis.index_guests.len(),
+        founding_set.display(),
+        config::genesis_path(&dir).display()
     );
     // a registry-default workspace is addressable by chain id; an explicit
     // --dir may live outside the registry, so its hints stay path-based.
@@ -643,68 +658,28 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// copy every component in `ids` from `src` into `<dir>/modules`, under the
-/// names the boot path reads (`<workspace>/modules/<id>.component.wasm`).
-///
-/// `src == <dir>/modules` — the flow init's "delete the file to re-found"
-/// refusal invites — makes source and destination the same file, and
-/// `std::fs::copy(p, p)` returns `Ok(0)` after TRUNCATING it. Those bytes are
-/// already where they belong, so the copy has nothing to do. Both paths exist
-/// by here (the bundle dir was just created, the source was just hashed), so
-/// neither `canonicalize` can fail into a false match.
-fn seed_bundle<'a>(
+/// install the genesis file a joiner was handed (`join --genesis <file>`) into
+/// its workspace, verified against the joined descriptor first: the whole
+/// file by the descriptor's pin, then every component by the descriptor's
+/// hash. A MEMBER boots straight into genesis with no peer to fetch from, so
+/// it needs the file at join; a resident may bring one to skip its first
+/// boot's fetch.
+fn install_joiner_genesis(
     dir: &std::path::Path,
-    src: &std::path::Path,
-    ids: impl IntoIterator<Item = &'a String>,
-) -> std::io::Result<()> {
-    let bundle = dir.join("modules");
-    std::fs::create_dir_all(&bundle)?;
-    let bundle_is_the_source = src.canonicalize().ok() == bundle.canonicalize().ok();
-    if bundle_is_the_source {
-        return Ok(());
-    }
-    for id in ids {
-        std::fs::copy(
-            config::component_path(src, id),
-            config::component_path(&bundle, id),
-        )?;
-    }
-    Ok(())
-}
-
-/// a MEMBER boots straight into genesis, where `genesis_host` refuses a
-/// missing component and there is no peer to fetch one from — so a `join`
-/// that lands this identity in the validator set seeds `<dir>/modules` from
-/// the managed modules dir, every component verified against the descriptor's
-/// hash first. A non-member joiner keeps no bundle: its statesync fetches the
-/// genesis components off the mesh.
-fn bundle_member_genesis(dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
     let descriptor = config::NetworkDescriptor::load(&dir.join("network.toml"))?;
-    let want = descriptor.module_hashes()?;
-    let src = config::modules_dir()?;
-    let remedy = format!(
-        "a member boots from its own genesis bundle: fill {} with `make install-node`, or \
-         point $DUCKTAPE_MODULES_DIR at a directory holding this network's components, \
-         then re-run `join`",
-        src.display()
-    );
-    let ids: Vec<&str> = want.keys().map(String::as_str).collect();
-    let have = config::hash_bundle(&src, &ids).map_err(|e| format!("{e} — {remedy}"))?;
-    for (id, hash) in &want {
-        let is_the_genesis_component = have.get(id) == Some(hash);
-        if !is_the_genesis_component {
-            return Err(format!(
-                "module {id} in {} is not this network's genesis component — {remedy}",
-                src.display()
-            )
-            .into());
-        }
-    }
-    seed_bundle(dir, &src, want.keys())?;
+    let genesis = config::install_genesis(
+        dir,
+        &descriptor.genesis_hash()?,
+        &descriptor.module_hashes()?,
+        bytes,
+    )?;
     eprintln!(
-        "modules: {} components bundled from {}",
-        want.len(),
-        src.display()
+        "genesis: {} components and {} index guests written to {}",
+        genesis.components.len(),
+        genesis.index_guests.len(),
+        config::genesis_path(dir).display()
     );
     Ok(())
 }
@@ -1929,17 +1904,28 @@ fn collect_blob_lines(reader: impl std::io::BufRead) -> std::io::Result<String> 
     Ok(collected)
 }
 
-/// `join [invite blob...] [--dir <dir>] [--listen a] [--advertised a]
-/// [--http a] [--rpc a] [--wireguard-listen a]
+/// `join [invite blob...] [--dir <dir>] [--genesis <file>] [--listen a]
+/// [--advertised a] [--http a] [--rpc a] [--wireguard-listen a]
 /// [--wireguard-advertised host:port] [--invite-listen a]
 /// [--primary-coordinator host:port|none]` — materialize a workspace
 /// from an invite: descriptor + identity (kept across re-joins) + node
 /// config, defaulting into the registry dir named by the invite's chain id.
 /// With no blob argv the blob is read from stdin (interactive paste prompt,
 /// or a pipe). prints this identity for the inviter's pre-genesis `admit`.
+/// `--genesis` is the founder's `<workspace>/genesis`: required for a member
+/// (it boots into genesis with no peer to fetch from), optional for a
+/// resident (its first boot fetches the file off the mesh otherwise).
 /// `--primary-coordinator` is node-local plumbing ONLY — it never touches
 /// the invite or the joined descriptor (the coordinator is always ambient).
 fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
+    // read BEFORE anything lands on disk: a mistyped path is refused with
+    // nothing written, like a bad blob.
+    let genesis_bytes = match &args.genesis {
+        Some(file) => Some(
+            std::fs::read(file).map_err(|e| format!("read genesis {}: {e}", file.display()))?,
+        ),
+        None => None,
+    };
     // argv words are rejoined (a blob pasted unquoted splits on its wrapped
     // spaces); no argv at all reads the blob from stdin. decode strips ALL
     // whitespace, so both paths tolerate a line-wrapped paste verbatim.
@@ -1964,8 +1950,19 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         block_time_ms: net.block_time_ms,
     };
     let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
-    if joined.is_member {
-        bundle_member_genesis(&joined.dir)?;
+    match (&genesis_bytes, joined.is_member) {
+        (Some(bytes), _) => install_joiner_genesis(&joined.dir, bytes)?,
+        (None, true) => {
+            return Err(format!(
+                "this identity is a member, and a member boots from its own genesis — \
+                 re-run `ducktape node join <invite> --genesis <file>` with the founder's \
+                 {} (the workspace in {} keeps its identity across re-joins)",
+                config::GENESIS_FILE,
+                joined.dir.display()
+            )
+            .into());
+        }
+        (None, false) => {}
     }
 
     if let Some(runtime) = &joined.compute_runtime {

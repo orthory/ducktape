@@ -1,6 +1,6 @@
-// this binary founds networks with the real `node init`, which hashes a
-// components directory into the descriptor — the harness owns the one path to
-// the checked-in set (`common::FIXTURES`), so it is not copied here.
+// this binary founds networks with the real `node init`, which composes a
+// founding set into the workspace genesis — the harness owns the one path to
+// the set the build staged (`common::founding_set`), so it is not copied here.
 mod common;
 
 use std::io::BufRead as _;
@@ -191,7 +191,7 @@ fn coordinated_invite_persists_tunnel_bootstrap_without_direct_endpoint() {
             "--name",
             "coordinated-default",
             "--modules",
-            common::FIXTURES,
+            common::founding_set(),
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
         ])
@@ -273,7 +273,7 @@ fn invite_bundles_reachable_member_fronts_from_seeded_mesh_state() {
             "--name",
             "fronts-bundle",
             "--modules",
-            common::FIXTURES,
+            common::founding_set(),
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
         ])
@@ -380,7 +380,7 @@ fn a_dark_coordinator_at_boot_heals_once_it_comes_up() {
             "--name",
             "coordinator-heal",
             "--modules",
-            common::FIXTURES,
+            common::founding_set(),
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
             "--wireguard-listen",
@@ -492,7 +492,7 @@ fn unreachable_coordinator_degrades_the_plane_instead_of_killing_it() {
             "--name",
             "coordinator-degrade",
             "--modules",
-            common::FIXTURES,
+            common::founding_set(),
             "--dir",
             founder.to_str().expect("utf-8 founder dir"),
             "--primary-coordinator",
