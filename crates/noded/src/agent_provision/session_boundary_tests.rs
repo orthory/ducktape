@@ -34,8 +34,8 @@ use std::time::Duration;
 use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg};
 use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
 use commonware_runtime::{Runner as _, Supervisor as _};
-use compute_service::{DeliverFn, DispatchPool, SpawnFn};
 use dispatch::DispatchModule;
+use compute_service::{DeliverFn, DispatchPool, SpawnFn};
 use futures::StreamExt as _;
 use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};
@@ -70,7 +70,11 @@ impl provider_host::Provider for RecordingProvider {
     fn capability(&self) -> &str {
         CAPABILITY
     }
-    async fn run(&self, _prompt: &str, ctx: &provider_host::RunContext) -> Result<String, String> {
+    async fn run(
+        &self,
+        _prompt: &str,
+        ctx: &provider_host::RunContext,
+    ) -> Result<String, String> {
         *self.seen.lock().unwrap() = Some(ctx.clone());
         Ok(r#"{"reply_blocks":[],"actions":[]}"#.to_string())
     }
