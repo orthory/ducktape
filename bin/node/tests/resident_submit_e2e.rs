@@ -228,15 +228,13 @@ fn resident_posts_to_chat_with_its_own_authorship() {
     );
     // the reply carries the governance module's OWN rejection reason verbatim
     // (the drain's DrainedFrame.reason lane): proof the op reached execute and
-    // was deterministically rejected there. governance gates in two steps —
-    // "holds no validator-set standing" when the submitter has no member node
-    // bound at all, "not a current
-    // validator-set member" when it has a node outside the set — and either
-    // one is the deterministic no-authority reject this test pins.
+    // was deterministically rejected there. In validator mode a ballot is
+    // NODE-keyed and the submitter must ITSELF be a member node, with no
+    // identity read at all — so a resident's proposal comes back as exactly one
+    // sentence, and this test pins that sentence rather than a family of them.
     let reason = gov["error"].as_str().unwrap_or_default();
     assert!(
-        reason.contains("holds no validator-set standing")
-            || reason.contains("not a current validator-set member"),
+        reason.contains("submitter is not a validator-set member node"),
         "the op finalized and was deterministically Rejected (not refused at the door): {gov}"
     );
 
