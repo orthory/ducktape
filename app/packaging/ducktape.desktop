@@ -1,0 +1,21 @@
+[Desktop Entry]
+# The Linux half of duck:// scheme registration. `MimeType` is what makes
+# xdg-open (and every browser/chat client that defers to it) hand
+# `duck://forge/ducktape/1?net=<digest>` to this app; `%u` is what puts the URL
+# in argv, where `startup_duck_url` reads it. Installed by `make install-app`,
+# which substitutes @EXEC@ with the installed binary's absolute path — a
+# desktop session does not inherit a shell's PATH.
+#
+# macOS is NOT covered here: it registers a scheme through the bundle's
+# CFBundleURLTypes plus an open-URL event, neither of which a .desktop file
+# reaches.
+Type=Application
+Name=Ducktape
+GenericName=Consensus workspace
+Comment=A local-first consensus workspace for people and agents
+Exec=@EXEC@ %u
+Icon=ducktape
+Terminal=false
+Categories=Network;Development;Office;
+MimeType=x-scheme-handler/duck;
+StartupWMClass=ducktape-app
