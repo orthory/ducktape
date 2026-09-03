@@ -9,8 +9,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    ConsensusOperationalStatus, IndexOperationalStatus, NodeHandle, NodePhase, NodeRole,
-    OperationalStatus, StoreOperationalStatus, SyncOperationalStatus,
+    ConsensusOperationalStatus, IndexOperationalStatus, NetstackSwap, NetstackSwapOutcome,
+    NodeHandle, NodePhase, NodeRole, OperationalStatus, StoreOperationalStatus,
+    SyncOperationalStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -511,6 +512,30 @@ impl NodeMetrics {
         status.storage.stores = stores;
     }
 
+    /// Name the machine the reachability plane runs on — at boot, and again
+    /// after every swap that took. A refused swap does NOT call this: the
+    /// current machine keeps running, so the name must not move.
+    pub fn set_netstack_backend(&self, backend: impl Into<String>) {
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        status.netstack.get_or_insert_with(Default::default).backend = backend.into();
+    }
+
+    /// Record one swap attempt's outcome against the height it landed at.
+    /// `reason` is the plane's refusal string, and is `None` on a swap that
+    /// took.
+    pub fn record_netstack_swap(&self, outcome: NetstackSwapOutcome, reason: Option<String>) {
+        let at_height = u64::try_from(self.block_height.get()).unwrap_or(0);
+        let mut status = self.operations.write().expect("operations lock poisoned");
+        status
+            .netstack
+            .get_or_insert_with(Default::default)
+            .last_swap = Some(NetstackSwap {
+            outcome,
+            reason,
+            at_height,
+        });
+    }
+
     fn record_finalized_now(&self) {
         let now = unix_seconds();
         self.last_finalized_at.set(now as i64);
@@ -625,6 +650,56 @@ pub(crate) async fn metrics(State(handle): State<NodeHandle>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The netstack projection: absent until a plane names a backend, then the
+    /// backend, then one swap outcome stamped with the height it landed at. A
+    /// REFUSED swap is recorded WITHOUT moving `backend` — the running machine
+    /// continues, and a status that said otherwise would send an operator
+    /// chasing a swap that never happened.
+    #[test]
+    fn netstack_projection_records_the_backend_and_the_last_swap() {
+        use commonware_runtime::Runner as _;
+
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let metrics = NodeMetrics::register(&context);
+            assert!(metrics.operational_status().netstack.is_none());
+
+            metrics.set_netstack_backend("native");
+            let netstack = metrics.operational_status().netstack.unwrap();
+            assert_eq!(netstack.backend, "native");
+            assert!(netstack.last_swap.is_none());
+
+            metrics.record_height(7);
+            metrics.set_netstack_backend("guest");
+            metrics.record_netstack_swap(NetstackSwapOutcome::Swapped, None);
+            let netstack = metrics.operational_status().netstack.unwrap();
+            assert_eq!(netstack.backend, "guest");
+            assert_eq!(
+                netstack.last_swap,
+                Some(NetstackSwap {
+                    outcome: NetstackSwapOutcome::Swapped,
+                    reason: None,
+                    at_height: 7,
+                })
+            );
+
+            metrics.record_height(9);
+            metrics.record_netstack_swap(
+                NetstackSwapOutcome::Refused,
+                Some("foreign contract".into()),
+            );
+            let netstack = metrics.operational_status().netstack.unwrap();
+            assert_eq!(netstack.backend, "guest", "a refusal must not move backend");
+            assert_eq!(
+                netstack.last_swap,
+                Some(NetstackSwap {
+                    outcome: NetstackSwapOutcome::Refused,
+                    reason: Some("foreign contract".into()),
+                    at_height: 9,
+                })
+            );
+        });
+    }
 
     #[test]
     fn operational_snapshot_and_scrape_follow_the_same_updates() {

@@ -1,0 +1,67 @@
+# The PR gate. Everything in .github/workflows/ before this was push-triggered
+# and path-filtered, so a pull request against `dev` carried no checks at all
+# (#1392). This workflow runs on every PR targeting `dev` and gates on the
+# three things the dev loop already treats as load-bearing: the committed wasm
+# component bytes (`make wasm-modules-check`), the genesis root-hash pin
+# (`host_state`), and clippy across the workspace.
+name: pr
+
+on:
+  pull_request:
+    branches: [dev]
+
+concurrency:
+  group: pr-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # rustc segfaults under load with the default job count on shared runners
+  # too; keep this in step with the worktree constraint documented for local
+  # agent work (docs/superpowers/plans — Global Constraints).
+  CARGO_BUILD_JOBS: 3
+
+jobs:
+  wasm-modules-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      # ubuntu-latest ships rustup; the checkout's rust-toolchain.toml pins
+      # the exact channel + targets, so this just makes rustup install it.
+      - run: rustup show
+      - run: cargo install wasm-tools --locked
+      - run: make wasm-modules-check
+
+  genesis-pin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup show
+      - run: cargo test --locked -p node-bin host_state
+
+  clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup show
+      # Both exclusions are pre-existing red on `dev` at 04d22f472 (commit
+      # 1c2f270e1, "the machine learns its own reflexive moved"), untouched by
+      # this PR — confirmed via `git diff origin/dev...HEAD` on each crate:
+      #   reachability: executor.rs's `Input` enum trips
+      #     clippy::large_enum_variant (272 vs 40 bytes).
+      #   netstack-scenarios: lib.rs's `restore: fn(...)  -> Box<dyn ...>`
+      #     field trips clippy::type_complexity.
+      # Track each as its own fix rather than gating every PR on it.
+      - run: cargo clippy --locked --workspace --exclude reachability --exclude netstack-scenarios --tests --no-deps -- -D warnings

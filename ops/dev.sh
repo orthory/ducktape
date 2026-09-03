@@ -31,7 +31,7 @@ if [ -z "$NODE_BIN" ]; then
   blog="$(mktemp)"
   cargo build -p node-bin >"$blog" 2>&1 || die "node-bin build failed — see $blog"
   NODE_BIN="$(cargo metadata --no-deps --format-version 1 \
-    | bun -e 'console.log((await Bun.stdin.json()).target_directory)')/debug/ducktape"
+    | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/debug/ducktape"
 fi
 [ -x "$NODE_BIN" ] || die "node binary not executable: $NODE_BIN"
 
@@ -98,7 +98,7 @@ fi
 # from stale pidfiles or fixed startup time.
 service_state(){
   "$NODE_BIN" service list "$1" --workspace "$WSDIR" --json 2>/dev/null |
-    bun -e 'const rows = await Bun.stdin.json(); console.log(rows[0]?.state ?? "")' 2>/dev/null
+    sed -n 's/.*"state":"\([^"]*\)".*/\1/p' | head -1
 }
 
 ensure_service(){

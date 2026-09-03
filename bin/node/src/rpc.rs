@@ -78,6 +78,11 @@ pub(crate) struct RpcStatus {
     pub(crate) height: Option<u64>,
     pub(crate) root_hash: String,
     pub(crate) modules: std::collections::BTreeMap<String, String>,
+    /// which netstack backend the reachability plane runs on and how the last
+    /// swap went — the same projection `/v1/status` carries under
+    /// `operations.netstack`. Absent on a node with no plane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) netstack: Option<noded::NetstackOperationalStatus>,
 }
 
 impl RpcReply {

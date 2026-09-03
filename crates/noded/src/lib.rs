@@ -80,7 +80,9 @@ mod git_http;
 pub use git_http::InfoRefsParams;
 // the node-actor command lane and the router's shared state handle.
 mod handle;
-pub use handle::{NodeCommand, NodeHandle, PeersStanding, StatusCell};
+pub use handle::{
+    NetstackSwapRequest, NetstackSwapper, NodeCommand, NodeHandle, PeersStanding, StatusCell,
+};
 
 mod module_code;
 pub use module_code::{CODE_KIND_MODULE, CodePeerReceipt, CodeStageLane, CodeStageRequest};
@@ -396,6 +398,42 @@ pub struct OperationalStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncOperationalStatus>,
     pub storage: StorageOperationalStatus,
+    /// Which machine the reachability plane runs on, and how the last swap
+    /// went. Absent on a node with no reachability plane at all (no
+    /// `wireguard_listen`) — there is no backend to name there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub netstack: Option<NetstackOperationalStatus>,
+}
+
+/// The netstack plane's operator-visible standing: the backend name
+/// ([`NetstackBackend::name`] on the executor side) and the outcome of the last
+/// swap this process performed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetstackOperationalStatus {
+    /// `native` or `guest` — the machine driving the plane right now.
+    pub backend: String,
+    /// `null` until this process swaps once. A refused swap is recorded here
+    /// AND leaves `backend` unchanged: the running machine continues.
+    pub last_swap: Option<NetstackSwap>,
+}
+
+/// One swap attempt's outcome — the projection half of the
+/// `netstack_backend_swapped` / `netstack_backend_swap_refused` log events.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetstackSwap {
+    pub outcome: NetstackSwapOutcome,
+    /// why a refused swap was refused; absent on a swap that took.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// the local block height when the plane answered.
+    pub at_height: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetstackSwapOutcome {
+    Swapped,
+    Refused,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

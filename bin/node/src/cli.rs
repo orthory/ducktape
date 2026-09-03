@@ -35,6 +35,13 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Work(cmd) => dispatch_work(cmd),
         OpCmd::Sandbox(args) => crate::sandbox_cli::run(args),
         OpCmd::LogFilter(args) => cmd_log_filter(args),
+        OpCmd::Netstack(cmd) => dispatch_netstack(cmd),
+    }
+}
+
+fn dispatch_netstack(cmd: crate::cli_args::NetstackCmd) -> CommandResult {
+    match cmd {
+        crate::cli_args::NetstackCmd::Swap(args) => cmd_netstack_swap(args),
     }
 }
 
@@ -256,6 +263,68 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
     };
     let root_hash = status["root_hash"].as_str().unwrap_or("");
     println!("height={height} root_hash={root_hash}");
+    if let Some(line) = netstack_line(&status["netstack"]) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// the `netstack=` line of `node status`: which machine the reachability plane
+/// runs on, and — once this process has swapped at all — how the last swap
+/// went. `None` on a node with no plane, which prints nothing rather than a
+/// misleading `netstack=none`.
+fn netstack_line(netstack: &serde_json::Value) -> Option<String> {
+    let backend = netstack["backend"].as_str()?;
+    let last_swap = &netstack["last_swap"];
+    let Some(outcome) = last_swap["outcome"].as_str() else {
+        return Some(format!("netstack={backend}"));
+    };
+    let at_height = last_swap["at_height"].as_u64().unwrap_or(0);
+    let reason = match last_swap["reason"].as_str() {
+        Some(reason) => format!(" reason={reason}"),
+        None => String::new(),
+    };
+    Some(format!(
+        "netstack={backend} last_swap={outcome}@{at_height}{reason}"
+    ))
+}
+
+/// `ducktape node netstack swap --native | --component <PATH>` — move a
+/// RUNNING node's reachability plane onto another netstack backend, mid-life.
+///
+/// The operator's trigger, next to the governance-delivered one: roll one node
+/// forward onto a component or back onto native without waiting for a vote. It
+/// presents this node's operator credential (`admin.token`, beside `node.toml`)
+/// the way every other `/v1/admin/*` client verb does — so it needs the
+/// node's WORKSPACE, not just its address. CEILING: under
+/// `DUCKTAPE_ADMIN=public` the namespace wants an owner PoP instead, which this
+/// verb does not mint (the same limit `node module` staging has).
+fn cmd_netstack_swap(args: crate::cli_args::NetstackSwapArgs) -> CommandResult {
+    let cfg_path = args.selector.config_path()?;
+    let workspace = cfg_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let backend = match args.component {
+        Some(path) => serde_json::json!({ "component": path }),
+        None => serde_json::json!("native"),
+    };
+    const PATH: &str = "/v1/admin/netstack/swap";
+    let base = config::http_base_in(&workspace)?;
+    let token = noded::admin::read_operator_token(&workspace)?;
+    let response = reqwest::blocking::Client::new()
+        .post(format!("{base}{PATH}"))
+        .header(noded::admin::ADMIN_TOKEN_HEADER, token)
+        .json(&serde_json::json!({ "backend": backend }))
+        .send()
+        .map_err(|error| crate::node_http::transport_failure(PATH, &error).to_string())?;
+    let status_code = response.status();
+    let text = response.text().unwrap_or_default();
+    if !status_code.is_success() {
+        return Err(format!("netstack swap rejected ({status_code}): {text}").into());
+    }
+    let reply: serde_json::Value = serde_json::from_str(&text)?;
+    println!("netstack={}", reply["backend"].as_str().unwrap_or(""));
     Ok(())
 }
 
@@ -1957,6 +2026,32 @@ mod json_output_tests {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    /// `node status`'s netstack line: nothing at all on a node with no plane,
+    /// the backend alone before the first swap, and the outcome with the height
+    /// it landed at afterwards — a refusal carrying its reason.
+    #[test]
+    fn the_netstack_status_line_reports_only_what_the_node_answered() {
+        assert_eq!(super::netstack_line(&serde_json::Value::Null), None);
+        assert_eq!(
+            super::netstack_line(&serde_json::json!({ "backend": "native", "last_swap": null })),
+            Some("netstack=native".to_string())
+        );
+        assert_eq!(
+            super::netstack_line(&serde_json::json!({
+                "backend": "guest",
+                "last_swap": { "outcome": "swapped", "at_height": 12 },
+            })),
+            Some("netstack=guest last_swap=swapped@12".to_string())
+        );
+        assert_eq!(
+            super::netstack_line(&serde_json::json!({
+                "backend": "native",
+                "last_swap": { "outcome": "refused", "reason": "foreign contract", "at_height": 4 },
+            })),
+            Some("netstack=native last_swap=refused@4 reason=foreign contract".to_string())
+        );
+    }
 
     #[test]
     fn blob_lines_join_a_wrapped_paste_and_stop_at_the_closing_enter() {
