@@ -11,6 +11,31 @@
 //! to `/v1/submit/frame`; its verified signer is the op's origin. `/v1/query`
 //! reads committed module state.
 
+/// ONE blocking client for this process's whole `/v1` lane.
+///
+/// `reqwest::blocking::Client::new()` is neither free nor infallible: each one
+/// spawns its own tokio runtime on its own thread with its own connection pool,
+/// and it PANICS when the build fails. Under `EMFILE` that is how a descriptor
+/// shortage became a dead `announce-watch` thread — the watcher builds three
+/// clients per 10 s tick, so it was the first thing in the process to ask the
+/// kernel for a descriptor it could not have, and it asked through a `.expect`.
+/// One client, built once and reused, also keeps the loopback keep-alive
+/// connection instead of dialing a fresh socket per request.
+///
+/// A failed build is NOT cached: it is transient by nature (that is what EMFILE
+/// is), and a poisoned lane would outlive the shortage that caused it. Two
+/// racing builds are possible and harmless — the loser is dropped.
+fn client() -> Result<&'static reqwest::blocking::Client, String> {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let built = reqwest::blocking::Client::builder()
+        .build()
+        .map_err(|error| format!("could not build the http client: {error}"))?;
+    Ok(CLIENT.get_or_init(|| built))
+}
+
 /// Submit one NODE-AUTHORED module op over `/v1/submit` `{target, payload}` and
 /// return the commit height from the receipt. A non-2xx status carries the
 /// node's rejection string.
@@ -43,7 +68,7 @@ pub(crate) fn submit(
 /// `Origin::External`, which is what lets an account's key act for itself.
 pub(crate) fn submit_frame(base: &str, frame: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
     const PATH: &str = "/v1/submit/frame";
-    let resp = reqwest::blocking::Client::new()
+    let resp = client()?
         .post(format!("{base}{PATH}"))
         .header("content-type", "application/octet-stream")
         .body(frame.to_vec())
@@ -176,7 +201,8 @@ pub(crate) fn transport_failure(path: &str, error: &reqwest::Error) -> ReadFailu
 /// Read one node-local JSON surface over GET (the `/v1` read routes that are
 /// not module queries, e.g. the volatile service catalog).
 pub(crate) fn get_json(base: &str, path: &str) -> Result<serde_json::Value, ReadFailure> {
-    let resp = reqwest::blocking::Client::new()
+    let resp = client()
+        .map_err(ReadFailure::Rejected)?
         .get(format!("{base}{path}"))
         .send()
         .map_err(|error| transport_failure(path, &error))?;
@@ -224,9 +250,7 @@ fn post_with(
     // `user`/`agent`/`cred` verb reaches the node, and a down node used to
     // surface here as a raw `POST http://…: error sending request for url (…)`
     // while `service list` — one function away — said "the node is not running".
-    let mut request = reqwest::blocking::Client::new()
-        .post(format!("{base}{path}"))
-        .json(body);
+    let mut request = client()?.post(format!("{base}{path}")).json(body);
     if let Some(token) = operator_token {
         request = request.header(noded::admin::ADMIN_TOKEN_HEADER, token);
     }
