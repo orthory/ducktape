@@ -473,6 +473,9 @@ test launch_wallets_contract
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
         password_submit -> password_submit _
+        phrase_written_down -> phrase_written_down
+        show_phrase_again -> show_phrase_again
+        confirm_phrase_submit -> confirm_phrase_submit _
         welcome_create_submit -> welcome_create_submit _
         welcome_login_submit -> welcome_login_submit
         welcome_desktop -> welcome_desktop
@@ -569,6 +572,56 @@ test password_screen_read_only_escape_contract
   expect hub_wallet_selected == ""
   expect hub_step == HubStep.networks
 
+// THE PHRASE SCREEN, on a FIXED mnemonic. `phrase_rows_of` is mounted rather
+// than `phrase_rows` on purpose: the live one reads the phrase a real mint is
+// holding, and a capture of THAT would put a live key's only backup into a
+// PNG. All 24 words are drawn, the grid pairs 1↔13 … 12↔24, and the one door
+// out of the screen goes to the confirm.
+test phrase_screen_shows_all_24_words
+  preset ui_launch
+  viewport 480 680
+  mount
+    PhraseScreen #phrase
+      with
+        rows=phrase_rows_of("abandon amount liar amount expire adjust cage candy arch gather drum bullet absurd math era live bid rhythm alien crouch range attend journey unaware")
+        busy=false
+      events
+        phrase_written_down -> phrase_written_down
+  target screen = #phrase/root
+  target go = #phrase/root/phrase-continue
+  expect exists go
+  expect text "abandon" within screen
+  expect text "absurd" within screen
+  expect text "unaware" within screen
+  expect text "after this ceremony, the app never shows it again" within screen
+  capture launch_phrase_light
+  click go
+  expect hub_step == HubStep.confirm
+
+// THE CONFIRM SCREEN. The prompt is the backend's sentence (Ice cannot build
+// one), the field starts empty so the Confirm button starts dead, and the way
+// past a typo is back to the phrase — which is still held until this passes.
+test confirm_screen_asks_three_words_back
+  preset ui_launch
+  viewport 480 680
+  mount
+    ConfirmPhraseScreen #confirm
+      with
+        prompt="Type words 5, 12 and 20 — in that order, separated by spaces."
+        busy=false
+        error=""
+      events
+        confirm_phrase_submit -> confirm_phrase_submit _
+        show_phrase_again -> show_phrase_again
+  target screen = #confirm/root
+  target field = #confirm/root/confirm-words
+  target back = #confirm/root/confirm-back
+  expect exists field
+  expect text "Type words 5, 12 and 20 — in that order, separated by spaces." within screen
+  capture launch_confirm_light
+  click back
+  expect hub_step == HubStep.phrase
+
 test launch_networks_empty_contract
   preset ui_launch
   viewport 480 680
@@ -601,6 +654,9 @@ test launch_networks_empty_contract
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
         password_submit -> password_submit _
+        phrase_written_down -> phrase_written_down
+        show_phrase_again -> show_phrase_again
+        confirm_phrase_submit -> confirm_phrase_submit _
         welcome_create_submit -> welcome_create_submit _
         welcome_login_submit -> welcome_login_submit
         welcome_desktop -> welcome_desktop

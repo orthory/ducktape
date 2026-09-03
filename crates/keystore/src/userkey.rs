@@ -499,8 +499,10 @@ pub fn restore_user_key_at(
     let line = seal_user_key(&seed, password)?;
     write_user_key_new(path, &line)?;
 
-    ed25519::PrivateKey::decode(seed.as_slice())
-        .map_err(|e| format!("restored seed is not a valid ed25519 secret: {e}"))
+    let key = ed25519::PrivateKey::decode(seed.as_slice())
+        .map_err(|e| format!("restored seed is not a valid ed25519 secret: {e}"))?;
+    verify_the_key_reopens(path, password, &key)?;
+    Ok(key)
 }
 
 /// Read the key back and open it, before telling anyone it exists.
