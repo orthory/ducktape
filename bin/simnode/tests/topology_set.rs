@@ -13,7 +13,7 @@ use harness::Sim;
 /// The default 15-module sim genesis root-hash.
 ///
 /// This is the SIM's number and only the sim's: `sim_base` excludes all four of
-/// `acl`, `governance`, `lifecycle` and `valset`, so it is NOT what a node runs
+/// `acl`, `governance`, `modules` and `valset`, so it is NOT what a node runs
 /// and it is NOT the consensus pin. That one is
 /// `bin/node/src/host_state.rs`'s `GENESIS_ROOT_HASH`, over the production
 /// module set — moving THAT is the flag day that matters. This constant guards
@@ -78,7 +78,7 @@ fn default_genesis_composes_topology_sim_base() {
          \n\
          EITHER WAY this is NOT the consensus pin, and updating it proves \
          nothing about production: `sim_base` is 15 modules and excludes \
-         acl/valset/governance/lifecycle. The number a network forks on is \
+         acl/valset/governance/modules. The number a network forks on is \
          GENESIS_ROOT_HASH in bin/node/src/host_state.rs — if that moved too, go \
          read its message instead."
     );
@@ -104,10 +104,10 @@ fn with_valset_genesis_appends_topology_sim_valset_and_wires_the_code_registry()
         "--with-valset appends topology sim_valset after sim_base, in registry order"
     );
 
-    // governance composes as a WASM tenant now, so the lifecycle code registry
+    // governance composes as a WASM tenant now, so the modules code registry
     // it is wired to comes with it: an UpdateModule proposal opens a ballot
     // instead of being refused at the door. the code hash names no component
-    // the network has — lifecycle refuses that at execute, which is a different
+    // the network has — the registry refuses that at execute, which is a different
     // (and later) gate; the claim here is only that a registry exists at all.
     let propose = governance::GovMsg::Propose {
         proposal_id: "u".into(),

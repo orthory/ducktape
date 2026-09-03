@@ -42,7 +42,7 @@ use crate::util::hex;
 /// `None` when the tenant's state is already on its own disk substrate.
 type Snapshot = Option<(Vec<u8>, StateRoot)>;
 
-/// a snapshot source keyed by a lifecycle-registry id (a `String`, not a
+/// a snapshot source keyed by a modules-registry id (a `String`, not a
 /// topology `&'static str`) — what [`adopt_admitted_modules`] installs from.
 type AdmittedSnapshotSource<'a> =
     dyn for<'id> FnMut(&'id str) -> BoxFut<'id, Result<Snapshot, String>> + 'a;
@@ -340,7 +340,7 @@ fn bindings<'a>(
 /// node (a different set, or different component bytes, composes a different
 /// root-hash and the network forks at genesis): the topology's production
 /// selection over the bundle's components, valset seeded with the genesis
-/// validators and lifecycle with the descriptor's code hashes.
+/// validators and the modules registry with the descriptor's code hashes.
 pub(super) async fn genesis_host(
     context: &commonware_runtime::tokio::Context,
     genesis_validators: &[ed25519::PublicKey],
@@ -430,7 +430,7 @@ pub(super) async fn restore_host(
 }
 
 /// an admitted module's checkpoint state. checkpoints are periodic while the
-/// lifecycle store is per-block durable and reopens AHEAD of the checkpoint,
+/// the modules registry store is per-block durable and reopens AHEAD of the checkpoint,
 /// so a registry id the checkpoint never captured is an admission that
 /// activated after it: register the module EMPTY (its whole history is
 /// post-checkpoint and replay rebuilds it — exactly what
@@ -468,9 +468,9 @@ fn manifest_snapshot(manifest: &Manifest, id: &str) -> Result<(Vec<u8>, StateRoo
     Ok((bytes.to_vec(), root))
 }
 
-/// register every module the lifecycle registry admitted post-genesis — an id
+/// register every module the modules registry admitted post-genesis — an id
 /// the topology selection did not compose — on the code the registry
-/// designates for `checkpoint_height` (`lifecycle::code_at`). the registry is
+/// designates for `checkpoint_height` (`modules::code_at`). the registry is
 /// per-block durable and reopens AHEAD of the checkpoint, so its ACTIVE hash
 /// may be a swap the replay has yet to reach; seating the checkpoint's code
 /// lets replay's `realize_module_swaps` move the module forward through the
@@ -483,7 +483,7 @@ async fn adopt_admitted_modules(
     checkpoint_height: u64,
     snapshot: &mut AdmittedSnapshotSource<'_>,
 ) -> Result<(), String> {
-    let Some(registry) = host.lifecycle_module_status().await else {
+    let Some(registry) = host.module_status().await else {
         return Ok(());
     };
     for m in registry {
@@ -492,7 +492,7 @@ async fn adopt_admitted_modules(
             continue;
         }
         // an admission that has not reached its boundary has no code yet.
-        let Some(code_hash) = lifecycle::code_at(&m, checkpoint_height) else {
+        let Some(code_hash) = modules::code_at(&m, checkpoint_height) else {
             continue;
         };
         let bytes = code.fetch(code_hash).await.ok_or_else(|| {
@@ -645,7 +645,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     };
     // snapshot lane: chunked bytes from the captured boundary, install gated
     // on the manifest root (verify-then-adopt inside each module). by value:
-    // an admitted module's id comes off the lifecycle registry, not the
+    // an admitted module's id comes off the modules registry, not the
     // topology.
     let snapshot_of = |module: &str| {
         let client = client.clone();
@@ -809,7 +809,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "9c9868f49dd7e321d377eb9d452ac1c45922c688fad80725c30d71cb25a39c87";
+        "cc4bdf4e5553f501d396a6dff07ebc178b347b4f160cf7e10fd5415a3367f99c";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
@@ -891,7 +891,7 @@ mod tests {
             // module_roots iterates the host's BTreeMap — sorted by id.
             let ids: Vec<String> = host.module_roots().into_iter().map(|(id, _)| id).collect();
             // a module with no code hash is one the binary compiled in rather
-            // than one lifecycle can swap; `ids` is already sorted, so this is.
+            // than one the registry can swap; `ids` is already sorted, so this is.
             let native = ids
                 .iter()
                 .filter(|id| host.module_code_hash(id).is_none())
@@ -901,7 +901,7 @@ mod tests {
         })
     }
 
-    /// a module the lifecycle registry admitted AFTER the last checkpoint has
+    /// a module the modules registry admitted AFTER the last checkpoint has
     /// no snapshot there: restore registers it empty for replay to rebuild
     /// (an `Err` here would refuse every restart between an activation and
     /// the next checkpoint). a captured module still restores its bytes.
@@ -949,10 +949,10 @@ mod tests {
             .unwrap_or_else(|payload| std::panic::resume_unwind(payload));
     }
 
-    /// a lifecycle registry that activated `hello` on `first` at 10 and on
+    /// a modules registry that activated `hello` on `first` at 10 and on
     /// `second` at 50 — the shape a restart finds after a live swap.
-    fn registry_ahead(first: [u8; 32], second: [u8; 32]) -> lifecycle::Lifecycle {
-        use lifecycle::{Lifecycle, LifecycleMsg, encode_msg};
+    fn registry_ahead(first: [u8; 32], second: [u8; 32]) -> modules::Modules {
+        use modules::{Modules, ModulesMsg, encode_msg};
         use sdk::{Module as _, Origin};
         let member = vec![7u8; 32];
         let one_member = {
@@ -971,19 +971,19 @@ mod tests {
                 height,
                 consensus_time: 0,
                 origin,
-                me: "lifecycle".into(),
+                me: "modules".into(),
             })
             .on_query("valset", one_member.clone())
         };
-        let msg = |m: LifecycleMsg| sdk::Msg {
-            target: "lifecycle".into(),
+        let msg = |m: ModulesMsg| sdk::Msg {
+            target: "modules".into(),
             payload: encode_msg(&m),
         };
         let steps = [
             (
                 Origin::System,
                 10,
-                LifecycleMsg::RegisterModule {
+                ModulesMsg::RegisterModule {
                     module_id: "hello".into(),
                     code_hash: first.to_vec(),
                 },
@@ -991,7 +991,7 @@ mod tests {
             (
                 Origin::System,
                 11,
-                LifecycleMsg::ScheduleSwap {
+                ModulesMsg::ScheduleSwap {
                     name: "next".into(),
                     module_id: "hello".into(),
                     activation_height: 50,
@@ -1001,15 +1001,15 @@ mod tests {
             (
                 Origin::External(member),
                 12,
-                LifecycleMsg::SwapReady {
+                ModulesMsg::SwapReady {
                     name: "next".into(),
                     module_id: "hello".into(),
                 },
             ),
-            (Origin::System, 50, LifecycleMsg::Advance),
+            (Origin::System, 50, ModulesMsg::Advance),
         ];
-        let mut registry = Lifecycle::new(
-            "lifecycle",
+        let mut registry = Modules::new(
+            "modules",
             Box::new(sdk_testkit::MemStore::new()),
             "valset",
         );
@@ -1092,7 +1092,7 @@ mod tests {
         assert_eq!(native_by_host, native_by_topology);
         // both sides go empty together if the last native module ever leaves
         // PRODUCTION, so anchor the pin on the ids themselves as well.
-        assert_eq!(native_by_host, ["lifecycle", "valset"]);
+        assert_eq!(native_by_host, ["modules", "valset"]);
     }
 
     /// a workspace genesis seeds every component into the blob store and
@@ -1188,7 +1188,7 @@ mod tests {
     /// It is the only ABSOLUTE one in the tree, and until it existed every claim
     /// that "the root hash did not move" was relative and therefore weak.
     /// `bin/simnode/tests/topology_set.rs` pins the 15-module sim composition —
-    /// which excludes `acl`, `governance`, `lifecycle` and `valset`, and is not
+    /// which excludes `acl`, `governance`, `modules` and `valset`, and is not
     /// what a node runs. (Not a NATIVE composition, as this said for a while:
     /// simnode opens a `DirCodeSource` over the founding set the build staged
     /// beside it and composes through `noded::compose`, so every `SIM_BASE`
@@ -1200,9 +1200,9 @@ mod tests {
     ///
     /// ## the mechanism, because it surprises everyone once
     ///
-    /// What this covers is wider than the module SET. The composer's lifecycle
+    /// What this covers is wider than the module SET. The composer's modules registry
     /// seed commits `sha256(component.wasm)` — the descriptor's hash — for
-    /// every wasm tenant into the lifecycle module's MerkleStore, so each
+    /// every wasm tenant into the modules registry's MerkleStore, so each
     /// guest's CODE DIGEST is consensus state itself. That means a module's
     /// SOURCE is consensus-relevant the moment its component is rebuilt — even
     /// for a change that alters no behaviour, even a comment — and it means

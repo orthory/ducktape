@@ -30,5 +30,9 @@ package-lock.json
 # Session handoff notes — local working state, never committed.
 HANDOFF.md
 
+# Key material a node or wallet writes (identity.key, user.key) never enters
+# the tree, wherever a command was run from.
+*.key
+
 # wrangler local state (ops/auth-page)
 .wrangler/

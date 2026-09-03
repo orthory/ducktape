@@ -899,7 +899,7 @@ pub struct ModuleRow {
     /// The module's own state root, short form.
     pub root: String,
     /// The active component's sha256, short form. Empty when this network runs
-    /// no lifecycle module (the daemon's default set does not).
+    /// no modules registry (the daemon's default set does not).
     pub code_hash: String,
     /// The scheduled swap's target hash, short form; empty when none is armed.
     pub pending_hash: String,
@@ -917,11 +917,11 @@ pub struct ModulesData {
 }
 
 /// The registered module set: `/v1/status` publishes id, root and category for
-/// every module, and the lifecycle module (where a network runs one) adds the
+/// every module, and the modules registry (where a network runs one) adds the
 /// active code hash and any armed swap.
 ///
-/// The lifecycle half is BEST EFFORT on purpose — the daemon's default module
-/// set has no `lifecycle`, and a network without one still has a real,
+/// The registry half is BEST EFFORT on purpose — the daemon's default module
+/// set has no `modules`, and a network without one still has a real,
 /// complete registered set to show.
 pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
     async {
@@ -935,13 +935,13 @@ pub async fn load_modules(rpc: String) -> Result<ModulesData, AppError> {
             .into_iter()
             .map(|module| {
                 let id = module["id"].as_str().unwrap_or_default().to_string();
-                let lifecycle = code.get(&id);
+                let registry = code.get(&id);
                 let pending =
-                    lifecycle.map_or(serde_json::Value::Null, |entry| entry["pending"].clone());
+                    registry.map_or(serde_json::Value::Null, |entry| entry["pending"].clone());
                 ModuleRow {
                     category: module["category"].as_str().unwrap_or_default().to_string(),
                     root: short_digest(module["root"].as_str().unwrap_or_default()),
-                    code_hash: lifecycle
+                    code_hash: registry
                         .map(|entry| {
                             short_digest(&hex_encode(&json_bytes(&entry["active_code_hash"])))
                         })
@@ -977,9 +977,9 @@ mod module_row_tests {
 
     /// the Modules row's readiness flag keys on `ScheduledSwap.ready_at` —
     /// the block the latch closed in, `null` until then. the literal is the
-    /// real `lifecycle::interface::{ModuleCode, ScheduledSwap}` serde field
+    /// real `modules::interface::{ModuleCode, ScheduledSwap}` serde field
     /// set (both `deny_unknown_fields`); this crate cannot decode the typed
-    /// struct (no `lifecycle` dependency), so the field names are pinned here.
+    /// struct (no `modules` dependency), so the field names are pinned here.
     #[test]
     fn a_pending_swap_is_ready_once_ready_at_is_set() {
         let entry = |ready_at: serde_json::Value| {
@@ -1005,11 +1005,11 @@ mod module_row_tests {
     }
 }
 
-/// `LifecycleQuery::ModuleStatus` keyed by module id, empty when this network
-/// runs no lifecycle module.
+/// `ModulesQuery::ModuleStatus` keyed by module id, empty when this network
+/// runs no modules registry.
 async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::Value> {
     let Ok(reply) = client
-        .query::<_, serde_json::Value>("lifecycle", &serde_json::json!("module_status"))
+        .query::<_, serde_json::Value>("modules", &serde_json::json!("module_status"))
         .await
     else {
         return BTreeMap::new();

@@ -1,9 +1,9 @@
-//! the lifecycle proof: the module-code path on one module, one root, one wire.
+//! the modules registry proof: the module-code path on one module, one root, one wire.
 
 use super::*;
 use sdk_testkit::TestCtx;
 
-/// the sole host-routed read lifecycle makes: answers the valset `Validators`
+/// the sole host-routed read the registry makes: answers the valset `Validators`
 /// query with `members`, every other query unsupported.
 fn validators(members: Vec<Vec<u8>>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
     move |req| {
@@ -25,7 +25,7 @@ fn env_at(origin: Origin, height: u64) -> sdk::Env {
         height,
         consensus_time: 0,
         origin,
-        me: "lifecycle".into(),
+        me: "modules".into(),
     }
 }
 
@@ -34,7 +34,7 @@ fn ctx(origin: Origin, height: u64) -> TestCtx {
     TestCtx::with_env(env_at(origin, height)).on_query("valset", validators(vec![member(1)]))
 }
 
-/// lifecycle-domain verb kept as a call-site method so the `.with_members`
+/// registry-domain verb kept as a call-site method so the `.with_members`
 /// sites read unchanged: it re-keys the valset reply.
 trait WithMembers {
     fn with_members(self, members: Vec<Vec<u8>>) -> Self;
@@ -51,12 +51,8 @@ fn member(seed: u8) -> Vec<u8> {
 fn hash(seed: u8) -> Vec<u8> {
     vec![seed; CODE_HASH_LEN]
 }
-fn fresh() -> Lifecycle {
-    Lifecycle::new(
-        "lifecycle",
-        Box::new(sdk_testkit::MemStore::new()),
-        "valset",
-    )
+fn fresh() -> Modules {
+    Modules::new("modules", Box::new(sdk_testkit::MemStore::new()), "valset")
 }
 
 /// the root of a store that never committed anything — the store-backed twin
@@ -64,31 +60,31 @@ fn fresh() -> Lifecycle {
 fn empty_root() -> StateRoot {
     fresh().root()
 }
-fn msg(m: LifecycleMsg) -> Msg {
+fn msg(m: ModulesMsg) -> Msg {
     Msg {
-        target: "lifecycle".into(),
+        target: "modules".into(),
         payload: encode_msg(&m),
     }
 }
-fn run(lc: &mut Lifecycle, ctx: &mut TestCtx, m: &Msg) -> Result<(), Error> {
+fn run(lc: &mut Modules, ctx: &mut TestCtx, m: &Msg) -> Result<(), Error> {
     futures::executor::block_on(lc.execute(ctx, m))
 }
-fn commit(lc: &mut Lifecycle) {
+fn commit(lc: &mut Modules) {
     futures::executor::block_on(lc.commit_block()).unwrap();
 }
 
 fn advance() -> Msg {
-    msg(LifecycleMsg::Advance)
+    msg(ModulesMsg::Advance)
 }
 
 // ---- module-code path helpers -----------------------------------------------
 
-fn register_module(lc: &mut Lifecycle, module_id: &str, code: u8) {
+fn register_module(lc: &mut Modules, module_id: &str, code: u8) {
     let mut sys = ctx(Origin::System, 0);
     run(
         lc,
         &mut sys,
-        &msg(LifecycleMsg::RegisterModule {
+        &msg(ModulesMsg::RegisterModule {
             module_id: module_id.into(),
             code_hash: hash(code),
         }),
@@ -97,7 +93,7 @@ fn register_module(lc: &mut Lifecycle, module_id: &str, code: u8) {
     commit(lc);
 }
 fn schedule_swap(module_id: &str, name: &str, ah: u64, code: u8) -> Msg {
-    msg(LifecycleMsg::ScheduleSwap {
+    msg(ModulesMsg::ScheduleSwap {
         name: name.into(),
         module_id: module_id.into(),
         activation_height: ah,
@@ -105,7 +101,7 @@ fn schedule_swap(module_id: &str, name: &str, ah: u64, code: u8) -> Msg {
     })
 }
 fn schedule_register(module_id: &str, name: &str, ah: u64, code: u8) -> Msg {
-    msg(LifecycleMsg::ScheduleRegister {
+    msg(ModulesMsg::ScheduleRegister {
         name: name.into(),
         module_id: module_id.into(),
         activation_height: ah,
@@ -113,42 +109,42 @@ fn schedule_register(module_id: &str, name: &str, ah: u64, code: u8) -> Msg {
     })
 }
 fn cancel_swap(module_id: &str, name: &str) -> Msg {
-    msg(LifecycleMsg::CancelSwap {
+    msg(ModulesMsg::CancelSwap {
         name: name.into(),
         module_id: module_id.into(),
     })
 }
 fn swap_ready(module_id: &str, name: &str) -> Msg {
-    msg(LifecycleMsg::SwapReady {
+    msg(ModulesMsg::SwapReady {
         name: name.into(),
         module_id: module_id.into(),
     })
 }
 /// drive the full single-member readiness latch for a pending swap.
-fn make_swap_ready(lc: &mut Lifecycle, module_id: &str, name: &str) {
+fn make_swap_ready(lc: &mut Modules, module_id: &str, name: &str) {
     let mut ext = ctx(Origin::External(member(1)), 0);
     run(lc, &mut ext, &swap_ready(module_id, name)).unwrap();
     commit(lc);
 }
-fn module_status(lc: &Lifecycle) -> Vec<ModuleCode> {
+fn module_status(lc: &Modules) -> Vec<ModuleCode> {
     let bytes = futures::executor::block_on(lc.query_with(
         &ctx(Origin::System, 0),
-        &encode_query(&LifecycleQuery::ModuleStatus),
+        &encode_query(&ModulesQuery::ModuleStatus),
     ))
     .unwrap();
     match decode_reply(&bytes).unwrap() {
-        LifecycleReply::ModuleStatus { modules } => modules,
+        ModulesReply::ModuleStatus { modules } => modules,
         other => panic!("expected ModuleStatus, got {other:?}"),
     }
 }
-fn armed_at(lc: &Lifecycle, height: u64) -> Vec<ArmedSwap> {
+fn armed_at(lc: &Modules, height: u64) -> Vec<ArmedSwap> {
     let bytes = futures::executor::block_on(lc.query_with(
         &ctx(Origin::System, 0),
-        &encode_query(&LifecycleQuery::ArmedAt { height }),
+        &encode_query(&ModulesQuery::ArmedAt { height }),
     ))
     .unwrap();
     match decode_reply(&bytes).unwrap() {
-        LifecycleReply::ArmedAt { swaps } => swaps,
+        ModulesReply::ArmedAt { swaps } => swaps,
         other => panic!("expected ArmedAt, got {other:?}"),
     }
 }
@@ -165,7 +161,7 @@ fn register_and_schedule_origin_gate() {
         run(
             &mut lc,
             &mut ext,
-            &msg(LifecycleMsg::RegisterModule {
+            &msg(ModulesMsg::RegisterModule {
                 module_id: "hello".into(),
                 code_hash: hash(1)
             })
@@ -176,7 +172,7 @@ fn register_and_schedule_origin_gate() {
     run(
         &mut lc,
         &mut gov,
-        &msg(LifecycleMsg::RegisterModule {
+        &msg(ModulesMsg::RegisterModule {
             module_id: "hello".into(),
             code_hash: hash(1),
         }),
@@ -220,24 +216,24 @@ fn register_rejects_reregistration_and_bad_hash() {
     let mut sys = ctx(Origin::System, 0);
     assert!(
         run(
-        &mut lc,
-        &mut sys,
-        &msg(LifecycleMsg::RegisterModule {
-            module_id: "hello".into(),
-            code_hash: hash(9)
-        })
-    )
+            &mut lc,
+            &mut sys,
+            &msg(ModulesMsg::RegisterModule {
+                module_id: "hello".into(),
+                code_hash: hash(9)
+            })
+        )
         .is_err()
     );
     assert!(
         run(
-        &mut lc,
-        &mut sys,
-        &msg(LifecycleMsg::RegisterModule {
-            module_id: "other".into(),
-            code_hash: vec![1, 2, 3]
-        })
-    )
+            &mut lc,
+            &mut sys,
+            &msg(ModulesMsg::RegisterModule {
+                module_id: "other".into(),
+                code_hash: vec![1, 2, 3]
+            })
+        )
         .is_err()
     );
 }
@@ -536,7 +532,7 @@ fn every_activation_is_appended_in_block_order() {
     run(
         &mut lc,
         &mut at7,
-        &msg(LifecycleMsg::RegisterModule {
+        &msg(ModulesMsg::RegisterModule {
             module_id: "hello".into(),
             code_hash: hash(1),
         }),

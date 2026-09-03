@@ -28,11 +28,11 @@ borsh = { workspace = true }
 valset = { workspace = true }
 # types-only: a passing ScheduleUpgrade/CancelUpgrade emits the upgrade op, and a
 # passing UpdateModule/CancelModuleUpdate emits the code-swap op, both as
-# follow-ups into the one lifecycle module; governance never registers it.
-lifecycle = { workspace = true }
+# follow-ups into the one modules registry; governance never registers it.
+modules = { workspace = true }
 identity = { workspace = true }
 # the acl sibling's wire types: SetAclPolicy proposals validate and emit its
-# SetPolicy op (the same wire-types-only shape as the valset/lifecycle deps).
+# SetPolicy op (the same wire-types-only shape as the valset/modules deps).
 acl = { workspace = true }
 async-trait = { workspace = true }
 # the invite capability (token + join-proof verification) is governance's own

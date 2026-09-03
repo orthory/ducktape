@@ -133,7 +133,7 @@ pub struct Tracker {
 /// - an EMPTY external id is the pre-consensus probe, never an authenticated
 ///   submitter.
 /// - `Origin::System` has no producer that can reach here: the host stamps it
-///   only on its two once-per-block injections (`lifecycle::Advance` and
+///   only on its two once-per-block injections (`modules::Advance` and
 ///   `dispatch::DeliverPending`), neither of which targets forge. an
 ///   unreachable arm stays refused rather than minting an unowned item.
 pub fn author_from_origin(origin: &Origin) -> Result<AuthorRef, Error> {

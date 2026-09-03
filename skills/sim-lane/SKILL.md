@@ -52,7 +52,7 @@ tenant's `<id>.component.wasm` and each declared `<id>.index.wasm`. Leave it
 boots with no `make install-node` and nothing installed anywhere.
 The default set is `topology::SIM_BASE` (15 tenants, all wasm components);
 `--with-valset` appends `topology::SIM_VALSET` (acl and governance as
-components, kv/valset/lifecycle native). A sim boot cranelift-compiles the
+components, kv/valset/modules native). A sim boot cranelift-compiles the
 set — seconds, and paid per boot, per test. After a host fatal the control
 surface fails closed (every call errs with the reason); the *triggering* call
 may still return Ok — check the next one.

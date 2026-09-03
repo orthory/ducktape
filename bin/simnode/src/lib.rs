@@ -79,7 +79,7 @@
 //! that built the sim boots with nothing installed.
 //!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
-//! separated, and repeatable) appends the kv/valset/acl/governance/lifecycle
+//! separated, and repeatable) appends the kv/valset/acl/governance/modules
 //! system modules AFTER the default 15, seeding the validator set with the given
 //! genesis ed25519 keys exactly like bin/node. `--invite-binding <string>`
 //! (default `"sim"`, meaningful only with `--with-valset`) sets the network

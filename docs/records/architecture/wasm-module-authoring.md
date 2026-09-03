@@ -3,7 +3,10 @@
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.3`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
-the reference modules are `crates/guests/hello-wasm`,
+the reference modules are `crates/guests/noop-wasm` (the smallest compliant
+module: two exports, no state, every op a no-op — the template a new module
+starts from and the admission fixture that touches nothing),
+`crates/guests/hello-wasm` (a counter over host-owned state),
 `crates/guests/hello-wasm-replacement` (its live-update target), and
 `crates/guests/sibling-wasm` (the cross-module-read reference) — kernel test
 fixtures, in no genesis set. The first wasm port of a native module is
@@ -122,7 +125,7 @@ commit it as one change. The check rides the pre-push `make test` gate.
 ## Live update: how new code ships
 
 The consensus commitment to WHICH code a module runs is the code registry
-(`crates/modules/system/lifecycle`): per module, the active 32-byte sha256 of its component
+(`crates/modules/system/modules`): per module, the active 32-byte sha256 of its component
 bytes plus at most one pending height-gated swap. The BYTES travel out-of-band,
 content-addressed on the node blob plane. The flow:
 
@@ -132,10 +135,10 @@ content-addressed on the node blob plane. The flow:
    rather than forks — so distribute first, then schedule).
 3. Drive governance: `GovAction::UpdateModule { name, module_id,
    activation_height, code_hash }` — a member-gated proposal + majority tally;
-   on passing it emits `LifecycleMsg::ScheduleSwap` into the registry. Cancel before
+   on passing it emits `ModulesMsg::ScheduleSwap` into the registry. Cancel before
    the boundary with `GovAction::CancelModuleUpdate`.
 4. At the first applied block at/after `activation_height`, two things happen
-   on every node: the drain's injected lifecycle `Advance` flips the committed
+   on every node: the drain's injected registry `Advance` flips the committed
    active hash (in the root-hash), and the host's out-of-block realization
    (`Host::realize_module_swaps`) verifies `sha256(bytes) == hash` and swaps
    the running component, keeping the host-owned state.

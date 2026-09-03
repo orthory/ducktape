@@ -264,14 +264,7 @@ async fn publish_replica_status(
         Some((height, host)) => (
             height,
             hex(&host.root_hash()),
-            MODULE_IDS
-                .iter()
-                .map(|m| noded::ModuleStatus {
-                    id: (*m).into(),
-                    root: host.module_root(m).map(|r| hex(&r)).unwrap_or_default(),
-                    category: noded::ModuleCategory::of(m),
-                })
-                .collect(),
+            crate::util::module_statuses(host),
         ),
         None => (0, String::new(), Vec::new()),
     };
@@ -969,12 +962,7 @@ pub(super) async fn park(
                             },
                             RpcRequest::Status => match &serving {
                                 Some((height, node_r)) => {
-                                    let mut modules = std::collections::BTreeMap::new();
-                                    for &m in MODULE_IDS {
-                                        if let Some(root) = node_r.host().module_root(m) {
-                                            modules.insert(m.to_string(), hex(&root));
-                                        }
-                                    }
+                                    let modules = crate::util::module_roots_hex(node_r.host());
                                     RpcReply {
                                         status: Some(RpcStatus {
                                             height: Some(*height),

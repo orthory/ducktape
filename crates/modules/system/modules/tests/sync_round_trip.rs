@@ -1,6 +1,6 @@
 //! state-sync round-trip: a joiner reconstructs a byte-identical qmdb root by
 //! pulling a source store's operation range through commonware's qmdb sync,
-//! then wraps a fresh `Lifecycle` around the injected store — the same
+//! then wraps a fresh `Modules` around the injected store — the same
 //! discriminating property the rest of the store-backed family proves, over
 //! the module-entry + roster layout.
 //!
@@ -12,9 +12,9 @@
 //! the source's.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use lifecycle::{
-    CODE_HASH_LEN, Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply, decode_reply,
-    encode_msg, encode_query,
+use modules::{
+    CODE_HASH_LEN, Modules, ModulesMsg, ModulesQuery, ModulesReply, decode_reply, encode_msg,
+    encode_query,
 };
 use sdk::{Env, Error, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
@@ -34,7 +34,7 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         height,
         consensus_time: height,
         origin,
-        me: "lifecycle".into(),
+        me: "modules".into(),
     })
     .on_query("valset", |req| {
         match valset::decode_query(req).map_err(Error::Module)? {
@@ -49,14 +49,14 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
     })
 }
 
-fn msg(m: LifecycleMsg) -> Msg {
+fn msg(m: ModulesMsg) -> Msg {
     Msg {
-        target: "lifecycle".into(),
+        target: "modules".into(),
         payload: encode_msg(&m),
     }
 }
 
-async fn apply_commit(lc: &mut Lifecycle, height: u64, origin: Origin, m: Msg) {
+async fn apply_commit(lc: &mut Modules, height: u64, origin: Origin, m: Msg) {
     let mut c = ctx(height, origin);
     lc.execute(&mut c, &m).await.unwrap();
     lc.commit_block().await.unwrap();
@@ -64,10 +64,10 @@ async fn apply_commit(lc: &mut Lifecycle, height: u64, origin: Origin, m: Msg) {
 
 /// the read matrix compared source-vs-joiner: the full status listing and the
 /// armed set at the boundary.
-async fn replies(lc: &Lifecycle) -> Vec<LifecycleReply> {
+async fn replies(lc: &Modules) -> Vec<ModulesReply> {
     let queries = [
-        encode_query(&LifecycleQuery::ModuleStatus),
-        encode_query(&LifecycleQuery::ArmedAt { height: 100 }),
+        encode_query(&ModulesQuery::ModuleStatus),
+        encode_query(&ModulesQuery::ArmedAt { height: 100 }),
     ];
     let mut out = Vec::new();
     let probe = ctx(0, Origin::System);
@@ -77,8 +77,8 @@ async fn replies(lc: &Lifecycle) -> Vec<LifecycleReply> {
     out
 }
 
-fn lifecycle_over(store: Box<dyn sdk::MerkleStore>) -> Lifecycle {
-    Lifecycle::new("lifecycle", store, "valset")
+fn modules_over(store: Box<dyn sdk::MerkleStore>) -> Modules {
+    Modules::new("modules", store, "valset")
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
         // SOURCE: the genesis seed set commits as one idempotent batch —
         // exactly the production genesis seam.
         let src_store = QmdbStore::init(context.child("src"), "src").await;
-        let mut src = lifecycle_over(Box::new(src_store));
+        let mut src = modules_over(Box::new(src_store));
         src.seed("hello", hash(1)).await.unwrap();
         src.seed("directory", hash(2)).await.unwrap();
         src.finish_seed().await.unwrap();
@@ -95,12 +95,12 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
         assert_ne!(seeded_root, StateRoot::ZERO, "seeds alone move the root");
 
         // schedule + latch + flip: record overwrites through the whole swap
-        // lifecycle (the Advance decide reads committed state).
+        // the registry (the Advance decide reads committed state).
         apply_commit(
             &mut src,
             3,
             Origin::System,
-            msg(LifecycleMsg::ScheduleSwap {
+            msg(ModulesMsg::ScheduleSwap {
                 name: "hello-replacement".into(),
                 module_id: "hello".into(),
                 activation_height: 10,
@@ -112,20 +112,20 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
             &mut src,
             4,
             Origin::External(MEMBER.to_vec()),
-            msg(LifecycleMsg::SwapReady {
+            msg(ModulesMsg::SwapReady {
                 name: "hello-replacement".into(),
                 module_id: "hello".into(),
             }),
         )
         .await;
-        apply_commit(&mut src, 10, Origin::System, msg(LifecycleMsg::Advance)).await;
+        apply_commit(&mut src, 10, Origin::System, msg(ModulesMsg::Advance)).await;
 
         // admit-then-cancel: the roster and record DELETE ride the op log.
         apply_commit(
             &mut src,
             11,
             Origin::System,
-            msg(LifecycleMsg::ScheduleRegister {
+            msg(ModulesMsg::ScheduleRegister {
                 name: "newcomer".into(),
                 module_id: "newmod".into(),
                 activation_height: 30,
@@ -137,7 +137,7 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
             &mut src,
             12,
             Origin::System,
-            msg(LifecycleMsg::CancelSwap {
+            msg(ModulesMsg::CancelSwap {
                 name: "newcomer".into(),
                 module_id: "newmod".into(),
             }),
@@ -168,7 +168,7 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let synced = lifecycle_over(Box::new(store));
+        let synced = modules_over(Box::new(store));
 
         // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner
         // needs at the boundary height.
@@ -183,7 +183,7 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
         // like the source.
         let synced_replies = replies(&synced).await;
         assert_eq!(src_replies, synced_replies, "the read matrix diverged");
-        let LifecycleReply::ModuleStatus { modules } = &synced_replies[0] else {
+        let ModulesReply::ModuleStatus { modules } = &synced_replies[0] else {
             panic!("expected the status listing");
         };
         assert_eq!(modules.len(), 2, "the cancelled admission stayed gone");

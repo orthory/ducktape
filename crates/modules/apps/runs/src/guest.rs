@@ -32,7 +32,7 @@
 //! (`turn_taken`) short-circuits on the staged pending entry before falling
 //! through to dispatch's PERMANENT committed record; there is no
 //! frozen-committed self-read anywhere in its handle paths (contrast
-//! lifecycle's `Advance` and dispatch's read facade, which stay native for
+//! the modules registry's `Advance` and dispatch's read facade, which stay native for
 //! exactly that reason). the ordering-contract surfaces cross the seam
 //! unchanged: the engagement/result/jobs intakes stay NO-FAIL (a bad event
 //! degrades to a breadcrumb `emit_event`, never a trap), the registry hook

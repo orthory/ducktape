@@ -4213,7 +4213,7 @@ dependencies = [
  "guest-adapter",
  "host",
  "identity",
- "lifecycle",
+ "modules",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -4591,7 +4591,7 @@ dependencies = [
  "inbox",
  "keyscheme",
  "kv",
- "lifecycle",
+ "modules",
  "p256",
  "pages",
  "runs",
@@ -5632,21 +5632,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lifecycle"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-runtime",
- "futures",
- "sdk",
- "sdk-testkit",
- "serde",
- "statesync",
- "valset",
-]
-
-[[package]]
 name = "lilt"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5955,6 +5940,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "modules"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "borsh",
+ "commonware-runtime",
+ "futures",
+ "sdk",
+ "sdk-testkit",
+ "serde",
+ "statesync",
+ "valset",
 ]
 
 [[package]]
@@ -6284,8 +6284,8 @@ dependencies = [
  "keystore",
  "kv",
  "libc",
- "lifecycle",
  "media-service",
+ "modules",
  "nat-traversal",
  "nettest",
  "node",
@@ -6356,8 +6356,8 @@ dependencies = [
  "indexer",
  "keyscheme",
  "kv",
- "lifecycle",
  "media-service",
+ "modules",
  "nettest",
  "node",
  "provider-host",
@@ -8153,7 +8153,7 @@ dependencies = [
  "directory",
  "futures",
  "host",
- "lifecycle",
+ "modules",
  "node",
  "sdk",
  "sha2 0.10.9",

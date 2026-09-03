@@ -451,7 +451,7 @@ pub(crate) async fn retry_owed_backfill<C: statesync::SyncClient>(
     client: &C,
     label: &str,
 ) {
-    if debt.owed.is_empty() || index.is_poisoned() {
+    if debt.is_empty() || index.is_poisoned() {
         return;
     }
     debt.attempts += 1;

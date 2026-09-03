@@ -11,7 +11,7 @@ A module is four layers: native crate (the logic) → wasm guest (the packaging)
 **REQUIRED BACKGROUND:** `docs/records/architecture/wasm-module-authoring.md`
 — the guest contract (host-owned state, sibling reads, live update, the
 cutover pattern). This skill is the wiring checklist that record doesn't cover.
-External/third-party authoring rides `ducktape-quack`, not this path.
+A module written outside this tree needs none of it: see "Decide first".
 
 ## Decide first: genesis registration is a root-hash break
 
@@ -41,7 +41,11 @@ state sync, and a module admitted after the last checkpoint restores empty and
 is rebuilt by replay (unit-pinned in `host_state.rs`).
 
 The CLI stages bytes, it never builds them: the component still comes from
-`make wasm-modules` / `guest-builder` (§2).
+`make wasm-modules` / `guest-builder` (§2). A module written outside this
+tree needs none of that: `crates/guests/noop-wasm` is the whole contract —
+a standalone crate against the `ducktape:module` WIT world, built with
+`cargo build --target wasm32-unknown-unknown --release` and `wasm-tools
+component new`, then handed to `module register`.
 Experiments that shouldn't pay the genesis cost live unwired in `crates/labs`.
 
 ## 1. Native crate — `crates/modules/{apps|system}/<id>`
@@ -119,7 +123,7 @@ and `bin/simnode` from `SIM_BASE` (+ `SIM_VALSET` under simnode's
 | the indexer | `open_index_store` opens a database for EVERY id in the selection, so joining or leaving a selection gains or loses one — nothing to touch for a module with no mapper. A module that ships one declares it on its topology row (`indexed_store`) and joins `INDEX_MODULES` in the `Makefile`; the genesis carries the guest and the node converges it into the module's database at hydration (`converge_index_guests`, `crates/noded/src/index.rs`). |
 
 `SIM_BASE` is 15 of production's 19; the four it leaves out — `acl`,
-`governance`, `lifecycle`, `valset` — are exactly what simnode's
+`governance`, `modules`, `valset` — are exactly what simnode's
 `--with-valset` appends (with native `kv`). Decide which selection a new
 module joins: `SIM_BASE` if it should boot by default (testable in sim-lane,
 visible in the app), `SIM_VALSET` if it is governance-shaped.

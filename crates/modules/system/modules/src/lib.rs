@@ -1,4 +1,4 @@
-//! the network lifecycle module: the root-hashed commitment to WHICH code every
+//! the network modules registry: the root-hashed commitment to WHICH code every
 //! hot-swappable module runs.
 //!
 //! it holds, folded into a single `root()`: per hot-swappable module, the
@@ -107,7 +107,7 @@ fn activation(height: u64, code_hash: &[u8]) -> Activation {
     }
 }
 
-pub struct Lifecycle {
+pub struct Modules {
     id: ModuleId,
     /// the valset module the readiness denominator (boundary member set) comes
     /// from, via host-routed queries. genesis wiring — identical on every node.
@@ -118,7 +118,7 @@ pub struct Lifecycle {
     staged: StagedStore,
 }
 
-impl Lifecycle {
+impl Modules {
     /// wrap the host-constructed store under module identity `id`.
     pub fn new(
         id: impl Into<ModuleId>,
@@ -133,7 +133,7 @@ impl Lifecycle {
     }
 
     /// GENESIS seeding: stage a module's initial active code hash BEFORE the
-    /// host registers this instance; [`Lifecycle::finish_seed`] publishes the
+    /// host registers this instance; [`Modules::finish_seed`] publishes the
     /// whole seed set in one batch. deterministic and identical on every node
     /// (a different seed set composes a different genesis root-hash and the
     /// network forks at genesis). never valid after genesis: live changes go
@@ -228,7 +228,7 @@ impl Lifecycle {
     {
         self.staged.stage(
             key,
-            borsh::to_vec(value).expect("lifecycle value is serializable"),
+            borsh::to_vec(value).expect("modules value is serializable"),
         );
     }
 
@@ -244,7 +244,7 @@ impl Lifecycle {
     where
         T: BorshSerialize,
     {
-        let bytes = borsh::to_vec(value).expect("lifecycle value is serializable");
+        let bytes = borsh::to_vec(value).expect("modules value is serializable");
         if bytes.len() > cap {
             return Err(Error::Module(format!(
                 "{what} record too large: {} > {cap} bytes",
@@ -310,7 +310,7 @@ impl Lifecycle {
         match &ctx.env().origin {
             Origin::Module(_) | Origin::System => Ok(()),
             Origin::External(_) => Err(Error::Module(
-                "lifecycle schedule/cancel/register only via governance (module) or system origin"
+                "modules schedule/cancel/register only via governance (module) or system origin"
                     .into(),
             )),
         }
@@ -321,7 +321,7 @@ impl Lifecycle {
         match &ctx.env().origin {
             Origin::System => Ok(()),
             other => Err(Error::Module(format!(
-                "lifecycle Advance is a system boundary tick, got {other:?}"
+                "modules Advance is a system boundary tick, got {other:?}"
             ))),
         }
     }
@@ -488,7 +488,7 @@ impl Lifecycle {
         }
         entry.pending = None;
         // cancelling an ADMISSION (no activation yet: the module never ran)
-        // removes the entry entirely — lifecycle must never claim a codeless
+        // removes the entry entirely — the registry must never claim a codeless
         // module. its roster slot is freed with it.
         if entry.active_code_hash().is_empty() {
             let mut roster = self.roster().await?;
@@ -614,7 +614,7 @@ impl Lifecycle {
 
     // ---- queries ------------------------------------------------------------
 
-    async fn module_status(&self) -> Result<LifecycleReply, Error> {
+    async fn module_status(&self) -> Result<ModulesReply, Error> {
         let mut modules = Vec::new();
         for id in self.roster().await? {
             let e = self.rostered_entry(&id).await?;
@@ -626,10 +626,10 @@ impl Lifecycle {
                 history: e.history,
             });
         }
-        Ok(LifecycleReply::ModuleStatus { modules })
+        Ok(ModulesReply::ModuleStatus { modules })
     }
 
-    async fn armed_at(&self, height: u64) -> Result<LifecycleReply, Error> {
+    async fn armed_at(&self, height: u64) -> Result<ModulesReply, Error> {
         let mut swaps = Vec::new();
         for id in self.roster().await? {
             let e = self.rostered_entry(&id).await?;
@@ -641,12 +641,12 @@ impl Lifecycle {
                 });
             }
         }
-        Ok(LifecycleReply::ArmedAt { swaps })
+        Ok(ModulesReply::ArmedAt { swaps })
     }
 }
 
 #[async_trait::async_trait(?Send)]
-impl Module for Lifecycle {
+impl Module for Modules {
     fn id(&self) -> ModuleId {
         self.id.clone()
     }
@@ -674,11 +674,11 @@ impl Module for Lifecycle {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            LifecycleMsg::RegisterModule {
+            ModulesMsg::RegisterModule {
                 module_id,
                 code_hash,
             } => self.handle_register_module(ctx, module_id, code_hash).await,
-            LifecycleMsg::ScheduleSwap {
+            ModulesMsg::ScheduleSwap {
                 name,
                 module_id,
                 activation_height,
@@ -687,7 +687,7 @@ impl Module for Lifecycle {
                 self.handle_schedule_swap(ctx, name, module_id, activation_height, code_hash)
                     .await
             }
-            LifecycleMsg::ScheduleRegister {
+            ModulesMsg::ScheduleRegister {
                 name,
                 module_id,
                 activation_height,
@@ -696,23 +696,21 @@ impl Module for Lifecycle {
                 self.handle_schedule_register(ctx, name, module_id, activation_height, code_hash)
                     .await
             }
-            LifecycleMsg::CancelSwap { name, module_id } => {
+            ModulesMsg::CancelSwap { name, module_id } => {
                 self.handle_cancel_swap(ctx, name, module_id).await
             }
-            LifecycleMsg::SwapReady { name, module_id } => {
+            ModulesMsg::SwapReady { name, module_id } => {
                 self.handle_swap_ready(ctx, name, module_id).await
             }
-            LifecycleMsg::Advance => self.handle_advance(ctx).await,
+            ModulesMsg::Advance => self.handle_advance(ctx).await,
         }
     }
 
     /// read projection — the module-code projections need no host routing.
     async fn query_with(&self, _ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            LifecycleQuery::ModuleStatus => Ok(encode_reply(&self.module_status().await?)),
-            LifecycleQuery::ArmedAt { height } => {
-                Ok(encode_reply(&self.armed_at(height).await?))
-            }
+            ModulesQuery::ModuleStatus => Ok(encode_reply(&self.module_status().await?)),
+            ModulesQuery::ArmedAt { height } => Ok(encode_reply(&self.armed_at(height).await?)),
         }
     }
 

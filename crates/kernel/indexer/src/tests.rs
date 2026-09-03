@@ -220,7 +220,7 @@ fn scan_pages_with_cursor() {
 
 #[test]
 fn an_undeclared_modules_ops_are_skipped_not_poisoned() {
-    // a module admitted after boot (lifecycle register) has no database
+    // a module admitted after boot (modules register) has no database
     // here: its ops write nothing, every declared module's watermark still
     // advances past the block, and the store keeps taking writes.
     let dir = tempfile::tempdir().unwrap();

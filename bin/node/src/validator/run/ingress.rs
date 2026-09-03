@@ -124,12 +124,7 @@ impl ValidatorRuntime<'_> {
                 Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
             },
             RpcRequest::Status => {
-                let mut modules = std::collections::BTreeMap::new();
-                for &m in MODULE_IDS {
-                    if let Some(root) = node.host().module_root(m) {
-                        modules.insert(m.to_string(), hex(&root));
-                    }
-                }
+                let modules = crate::util::module_roots_hex(node.host());
                 RpcReply {
                     status: Some(RpcStatus {
                         height: node.finalized().map(|f| f.height),

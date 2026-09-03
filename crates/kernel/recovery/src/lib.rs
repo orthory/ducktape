@@ -1812,7 +1812,7 @@ async fn replay_batch(
     // before re-applying or the sealed roots cannot reproduce. the registry
     // is disk-durable and reopens AHEAD of this window — its tip says nothing
     // about which code sealed `height` — so realization keys on the registry's
-    // activation HISTORY at `height` (`lifecycle::code_at`): the identical
+    // activation HISTORY at `height` (`modules::code_at`): the identical
     // swap points the live node realized, walked in either direction.
     // fail-closed on missing/tampered bytes.
     host.realize_module_swaps(height, code_source)

@@ -256,7 +256,7 @@ mod tests {
     fn project_block_row_bytes_are_golden() {
         let blobs = BlobHandle::default();
         let member = dispatch("chat", b"member");
-        let system = dispatch("lifecycle", b"system");
+        let system = dispatch("modules", b"system");
         let frames = vec![
             // multi-member block: applied + rejected members, plus a System
             // dispatch folded into the block's dispatch stream (never a row).
