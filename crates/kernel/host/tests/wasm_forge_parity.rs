@@ -20,7 +20,7 @@ use forge::{
     Forge, ForgeMsg, ForgeOdbBacking, ForgeQuery, RefUpdate, ReviewVerdict, encode_msg,
     encode_query,
 };
-use host::{BlockContext, Host, MemberOutcome};
+use host::{BlockContext, CapturePayloads, Host, MemberOutcome};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};
 use wasm_host::WasmModule;
@@ -32,7 +32,8 @@ const FORGE: &str = "forge";
 /// cohort (`block_durable_ids`), which forge is also in — the whole point of
 /// the recovery fix is that neither answer implies the other.
 fn sync_surface_is_snapshot_bytes(host: &Host) -> bool {
-    let (snapshot, _) = host.capture_current_snapshot(0, || std::time::Duration::ZERO);
+    let (snapshot, _) =
+        host.capture_current_snapshot(0, CapturePayloads::All, || std::time::Duration::ZERO);
     snapshot
         .module(FORGE)
         .expect("forge is registered")
@@ -629,8 +630,10 @@ fn full_matrix_roots_identical_block_by_block() {
     // SNAPSHOT INTERCHANGE: the wasm tenant's container installs into a fresh
     // native module and the native container into a fresh wasm tenant, each
     // landing at the shared root with identical replies.
-    let (n_snap, _) = native.capture_current_snapshot(16, || std::time::Duration::ZERO);
-    let (w_snap, _) = wasm.capture_current_snapshot(16, || std::time::Duration::ZERO);
+    let (n_snap, _) =
+        native.capture_current_snapshot(16, CapturePayloads::All, || std::time::Duration::ZERO);
+    let (w_snap, _) =
+        wasm.capture_current_snapshot(16, CapturePayloads::All, || std::time::Duration::ZERO);
     let root = forge_root(&native);
     let n_bytes = snapshot_bytes(&n_snap.module(FORGE).expect("forge entry").state_sync);
     let w_bytes = snapshot_bytes(&w_snap.module(FORGE).expect("forge entry").state_sync);

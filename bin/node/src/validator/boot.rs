@@ -359,6 +359,16 @@ where
     }
     let probe = probe_peer_frames(context, client, local_height, label).await;
     let CatchUp::Rebootstrap { retained_from } = decide_catch_up(&probe) else {
+        // THE ONE SEAM ON THE VALIDATOR RESTART LANE THAT HOLDS A SOURCE, and
+        // the same helper the resident restart runs (`replica::park`) at the
+        // same point in its own boot: after the replay's fold, before this
+        // node serves anything. A validator that restarts over a wiped or
+        // poisoned index directory lands here holding nothing but the floor
+        // `restore` stamped at the checkpoint, and the op journal is pruned
+        // per checkpoint — so the history below it is reachable only from a
+        // peer, and only here. Every module keeps its floor when no source
+        // holds that history, and the boot never aborts on it (#1309).
+        crate::explorer::heal_and_backfill_index(index, client, local_height, label).await;
         return seat;
     };
     tracing::warn!(
