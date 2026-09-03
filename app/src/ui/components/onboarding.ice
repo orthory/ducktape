@@ -578,8 +578,8 @@ component PasswordScreen(busy:bool, error:str)
 // button (a phrase in the clipboard is a phrase in every paste target), no
 // skip, and no re-show. Off the app, someone who still HAS the key file and
 // its password can read them back with
-// `ducktape user key reveal --key ~/.ducktape/keys/<name>.key` — which is
-// exactly the case this screen exists for the loss of. The rows are
+// `ducktape user key reveal --key $DUCKTAPE_HOME/keys/<name>.key` — which
+// is exactly the case this screen exists for the loss of. The rows are
 // paired 1↔13 … 12↔24 in Rust because Ice cannot index a list, and because
 // twelve rows fit this window and twenty-four do not.
 component PhraseScreen(rows:[PhraseRow], busy:bool)
@@ -594,14 +594,14 @@ component PhraseScreen(rows:[PhraseRow], busy:bool)
         font=display
         @text-primary
     box w=fill pt=6.0
-      text "They are the only backup of this device's key: the sign-in screen's Restore from recovery phrase rebuilds it from them, here or on another machine. Paper or a password manager — never the same disk. The next screen asks for three of them, and the key is saved only once you get them right."
+      text "The only backup of this device's key: Restore from recovery phrase rebuilds it from them, here or on another machine. Paper or a password manager, never the same disk. The next screen asks three of them back — that is what saves the key."
         with
           w=fill
           size=13.0
           line-h=1.5
           @text-caption
     box w=fill pt=18.0
-      col #phrase-grid w=fill gap=6.0
+      col #phrase-grid w=fill gap=5.0
         for pair in rows
           row w=fill gap=8.0
             PhraseCell number=pair.left_number word=pair.left_word
@@ -625,7 +625,7 @@ component PhraseScreen(rows:[PhraseRow], busy:bool)
             font=display
             @text-primary_fg
     box w=fill pt=14.0
-      text "the app never shows this phrase again"
+      text "after this ceremony, the app never shows it again"
         with
           w=fill
           size=10.5

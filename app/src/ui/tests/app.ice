@@ -593,7 +593,7 @@ test phrase_screen_shows_all_24_words
   expect text "abandon" within screen
   expect text "absurd" within screen
   expect text "unaware" within screen
-  expect text "the app never shows this phrase again" within screen
+  expect text "after this ceremony, the app never shows it again" within screen
   capture launch_phrase_light
   click go
   expect hub_step == HubStep.confirm

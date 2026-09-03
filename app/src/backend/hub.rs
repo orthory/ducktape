@@ -561,7 +561,7 @@ pub async fn create_device_key(password: String) -> Result<String, AppError> {
         hold_minted_phrase(
             name.clone(),
             Zeroizing::new(keystore::userkey::mnemonic_of_seed(&seed)),
-        );
+        )?;
         Ok(name)
     }
     .await
@@ -603,19 +603,24 @@ pub struct PhraseRow {
 }
 
 /// Stash a phrase for the ceremony and pick the words it will ask back.
-fn hold_minted_phrase(name: String, words: Zeroizing<String>) {
+///
+/// A phrase too short to ask three distinct words out of is refused rather
+/// than padded: `mnemonic_of_seed` is always 24, so the only way here is a
+/// caller that has stopped handing over a mnemonic, and a prompt that asks
+/// for position 1 three times would hide that instead of showing it.
+fn hold_minted_phrase(name: String, words: Zeroizing<String>) -> Result<(), String> {
     use rand::seq::SliceRandom as _;
     let count = words.split_whitespace().count();
     let mut positions: Vec<usize> = (1..=count).collect();
     positions.shuffle(&mut rand::rngs::OsRng);
-    let mut asked = [
-        positions.first().copied().unwrap_or(1),
-        positions.get(1).copied().unwrap_or(1),
-        positions.get(2).copied().unwrap_or(1),
-    ];
+    let [first, second, third, ..] = positions[..] else {
+        return Err(format!("a recovery phrase is 24 words, not {count}"));
+    };
+    let mut asked = [first, second, third];
     asked.sort_unstable();
     let mut held = MINTED_PHRASE.lock().expect("minted recovery phrase");
     *held = Some(MintedPhrase { name, words, asked });
+    Ok(())
 }
 
 /// The phrase screen's rows, or none when no ceremony is in flight — the
@@ -951,6 +956,10 @@ mod tests {
         hold_minted_phrase(
             "device-test".to_string(),
             Zeroizing::new(TEST_PHRASE.into()),
+        )
+        .expect("a 24-word fixture");
+        assert!(
+            hold_minted_phrase("too-short".to_string(), Zeroizing::new("one two".into())).is_err()
         );
         assert_eq!(phrase_rows().len(), 12);
         let asked = MINTED_PHRASE
