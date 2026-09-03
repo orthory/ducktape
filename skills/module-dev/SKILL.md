@@ -11,7 +11,7 @@ A module is four layers: native crate (the logic) → wasm guest (the packaging)
 **REQUIRED BACKGROUND:** `docs/records/architecture/wasm-module-authoring.md`
 — the guest contract (host-owned state, sibling reads, live update, the
 cutover pattern). This skill is the wiring checklist that record doesn't cover.
-External/third-party authoring rides `ducktape-quack`, not this path.
+A module written outside this tree needs none of it: see "Decide first".
 
 ## Decide first: genesis registration is a root-hash break
 
