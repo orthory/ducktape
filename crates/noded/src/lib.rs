@@ -712,8 +712,8 @@ pub fn router(handle: NodeHandle) -> Router {
     // EVERY mutating route above carries a user signature; the reads do not.
     // `route_layer`, NOT `layer`: a layer would also wrap the fallback, and an
     // unmatched path must 404 rather than be told it needs a signature.
-    // `signed_req::needs_signature` is the whole table — a new mutating route
-    // is added THERE, never gated at its own call site.
+    // `signed_req::lane_of` is the whole table — a new mutating route is added
+    // THERE, never gated at its own call site.
     let public = public.route_layer(axum::middleware::from_fn_with_state(
         handle.clone(),
         signed_req::signed_write_guard,

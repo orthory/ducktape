@@ -262,7 +262,7 @@ pub struct OperatorCredential;
 pub struct SignedBy(pub Vec<u8>);
 
 /// which mutating lane a request path belongs to — the ONE discriminant
-/// [`needs_signature`] branches on. `Open` is everything else: reads, the
+/// [`Lane::mutates`] branches on. `Open` is everything else: reads, the
 /// self-authenticating `/v1/submit/frame`, the volatile service-hello, the
 /// websocket upgrades, and `/v1/admin/*` (which carries its own gate).
 ///
@@ -363,8 +363,11 @@ impl Lane {
     }
 }
 
-/// does this request mutate, and therefore need a credential?
-pub(crate) fn needs_signature(method: &Method, path: &str) -> bool {
+/// does this request mutate, and therefore need a credential? the guard itself
+/// asks [`Lane::mutates`] on the lane it already resolved, so this pairing of
+/// the two is only ever what the tests below assert against.
+#[cfg(test)]
+fn needs_signature(method: &Method, path: &str) -> bool {
     lane_of(path).mutates(method)
 }
 
