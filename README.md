@@ -197,7 +197,8 @@ overrides it), and pins that file in `network.toml`. An incomplete set is
 refused by file name at `init`. A joiner installs the founder's file with
 `node join --genesis <file>` (a member must; a resident may, and otherwise
 fetches it off the mesh at first boot); the node hydrates its blob store and
-index from the file at boot.
+index from the file at boot, and unpacks it as bare files into
+`<workspace>/modules` (the same layout as the founding set).
 
 Then, to run agents on it: `ducktape service run compute` offers this host's
 sandbox, `ducktape user cred add claude` logs a provider in, and
