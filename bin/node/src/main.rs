@@ -131,7 +131,10 @@ use util::hex;
 
 fn main() {
     resource_limits::cap_malloc_arenas();
-    resource_limits::raise_open_file_limit();
+    // before any subscriber exists, so the warning is stderr's to carry.
+    if node::resource_limits::raise_open_file_limit().is_none() {
+        eprintln!("[node] warning: could not raise open-file limit");
+    }
     #[cfg(target_os = "macos")]
     hold_macos_activity();
     // Convert any terminal error into the same stable `FATAL:` marker the node
