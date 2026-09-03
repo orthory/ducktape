@@ -8,7 +8,9 @@
 //! retained, the error surfaces on the trigger). never skip an op silently.
 
 /// the engine SDK types a shell touches directly. everything else routes
-/// through [`ops`], [`EngineRead`], and [`apply`].
+/// through [`ops`], [`EngineRead`], and [`apply`]. `log` is a `debug` event
+/// under the `fluent31::wasm::guest` target on the node's subscriber —
+/// silent until that one target is turned up — never a result channel.
 pub use fluent_guest::{Change, Scan, errno, log};
 
 #[doc(hidden)]

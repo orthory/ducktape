@@ -113,6 +113,15 @@
 - Turn one plane up on a LIVE node rather than restarting it — a restart destroys
   the wedged state you restarted to look at:
   `curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'`
+- The index engine (fluent31) and the index guests running inside it log
+  through the same subscriber, under the engine's crate-path targets
+  (`fluent31::db`, `fluent31::compaction`, `fluent31::trigger`, `fluent31::wasm`),
+  every line naming its store (`db{dir=…}`). Its `info` is lifecycle-level
+  (open, close, flush, compaction, value-log GC, a module or trigger added or
+  removed); its `warn` includes a fold run failing with its backoff, a wasm
+  trap, and a write stall beginning. A guest's `log` calls are `debug` under
+  `fluent31::wasm::guest` and stay silent until that one target is turned up
+  (`fluent31::wasm::guest=debug`, via `RUST_LOG` or the live filter route).
 
 ## Rust Gates
 
