@@ -198,5 +198,5 @@ product, and this design needs none.
 - `crates/networking/reachability/tests/rendezvous_simnat.rs` — the
   production resolver punching over a simulated NAT topology.
 - `bin/node/tests/join_request_e2e.rs` — the TCP-carrier halves of the join.
-- `crates/networking/wireguard/tests/tunnel_e2e.rs` — the signed record and
-  handshake formats, including the fixed mesh-version vector.
+- `crates/networking/wireguard/tests/tunnel_e2e.rs` — the fixed
+  mesh-version vector every node must reproduce.

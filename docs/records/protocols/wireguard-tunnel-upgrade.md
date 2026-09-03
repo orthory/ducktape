@@ -327,9 +327,10 @@ the state-sync request:
 
 Possession of a tunnel never bypasses module/root/kind checks.
 
-## Pinned by tests
+## Required tests
 
-The crate's tests hold every rule above; the load-bearing ones:
+The crate's tests (`tests/upgrade_protocol.rs`, `tests/tunnel_e2e.rs`) must
+cover, and a protocol change must keep covering:
 
 - the endpoint parser rejects wildcard, loopback under the production policy,
   port zero, wrong transport, disallowed ports, DNS names, IPv4-mapped

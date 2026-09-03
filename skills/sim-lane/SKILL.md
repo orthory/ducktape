@@ -40,7 +40,7 @@ let sim = simnode::boot(
 `SimOpts` for embedders: keep `install_log: false` (true stacks a
 process-global tracing subscriber + panic hook — binary only). `auto: true`
 = submits commit inline; `false` = held mode, commits happen on `step()`
-(races as scripts). `echo_oracle` answers dispatch work in-process. Governance
+(races as scripts). `echo_oracle` enables the in-process echo oracle. Governance
 scenarios: `valset_keys` (raw 32-byte ed25519 pubkeys) + `invite_binding`;
 `node_key` fabricates `status.public_key`; `persona` picks daemon (`op_hash`
 receipts) vs validator (height-only) shape.
