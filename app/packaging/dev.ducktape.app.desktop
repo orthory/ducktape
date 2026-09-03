@@ -9,6 +9,15 @@
 # macOS is NOT covered here: it registers a scheme through the bundle's
 # CFBundleURLTypes plus an open-URL event, neither of which a .desktop file
 # reaches.
+#
+# The file's name and `StartupWMClass` are both `dev.ducktape.app`, the id each
+# window declares in its `platform linux / app-id` block (`app/src/ui/app.ice`)
+# — that block is the ONLY source of the X11 WM_CLASS / Wayland app_id a window
+# reports, and the binary's name is not it. Measured, not assumed: with the
+# blocks the window reports `WM_CLASS = "dev.ducktape.app", "dev.ducktape.app"`
+# under `xprop`; without them, two empty strings. Let the three drift apart and
+# the running window associates with no installed entry — no icon, no pinned-app
+# identity, and nothing anywhere that says so.
 Type=Application
 Name=Ducktape
 GenericName=Consensus workspace
@@ -18,4 +27,4 @@ Icon=ducktape
 Terminal=false
 Categories=Network;Development;Office;
 MimeType=x-scheme-handler/duck;
-StartupWMClass=ducktape-app
+StartupWMClass=dev.ducktape.app

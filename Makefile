@@ -82,13 +82,6 @@ coordinator:
 coordinator-smoke:
 	$(CARGO) test -p coordinator-bin
 
-ifneq ($(UNAME_S),Darwin)
-## where the Linux desktop entry and its icon land — the XDG per-user roots,
-## so `make install-app` needs no root.
-DESKTOP_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/applications
-ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/hicolor/scalable/apps
-endif
-
 ifeq ($(UNAME_S),Darwin)
 # Build cargo-ice from the same ducktape-ui rev as the app. A global cargo-ice
 # can parse a different language than the compiler in app/Cargo.toml.
@@ -125,6 +118,11 @@ install-app: app
 	cp -R target/ice-bundle/Ducktape.app "$(APP_DEST)/"
 	@echo "installed $(APP_DEST)/Ducktape.app"
 else
+## where the Linux desktop entry and its icon land — the XDG per-user roots,
+## so `make install-app` needs no root.
+DESKTOP_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/applications
+ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/hicolor/scalable/apps
+
 ## install the ducktape operator CLI and the desktop app without requiring root
 install: install-node install-app
 
@@ -137,14 +135,16 @@ app:
 ## `xdg-open 'duck://forge/ducktape/1?net=<digest>'` reach the app, and its
 ## `%u` is what puts the URL in argv where the app reads it. `Exec=` is
 ## rewritten to an absolute path: a desktop session inherits no shell PATH.
+## The entry is installed under the app id the window reports, so the running
+## window associates with it (icon, pinned-app identity).
 install-app: app
 	mkdir -p "$(BIN_DEST)" "$(DESKTOP_DEST)" "$(ICON_DEST)"
 	install -m 0755 target/release/ducktape-app "$(BIN_DEST)/ducktape-app"
 	install -m 0644 app/assets/icon.svg "$(ICON_DEST)/ducktape.svg"
-	sed 's|@EXEC@|$(BIN_DEST)/ducktape-app|' app/packaging/ducktape.desktop \
-		> "$(DESKTOP_DEST)/ducktape.desktop"
+	sed 's|@EXEC@|$(BIN_DEST)/ducktape-app|' app/packaging/dev.ducktape.app.desktop \
+		> "$(DESKTOP_DEST)/dev.ducktape.app.desktop"
 	-update-desktop-database "$(DESKTOP_DEST)"
-	@echo "installed $(BIN_DEST)/ducktape-app + $(DESKTOP_DEST)/ducktape.desktop"
+	@echo "installed $(BIN_DEST)/ducktape-app + $(DESKTOP_DEST)/dev.ducktape.app.desktop"
 endif
 
 # where install-node WRITES the module components, spelled exactly as
