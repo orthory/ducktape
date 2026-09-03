@@ -7,6 +7,12 @@
 //! replicated content — and so is every `.git` (a checkout holding a git repo is
 //! the dogfooding shape; its object store is never the user's content).
 //!
+//! the walk is also the ONE place an OS filename becomes a consensus path, so it
+//! is where NFC normalization happens: macOS hands back decomposed (NFD) names
+//! and `duckfs_core::paths::canonical` refuses anything not already NFC. core
+//! only ever rejects — a validator must never rewrite consensus data — so the
+//! rewrite lives here, at the single entry, in [`duckfs_join`].
+//!
 //! everything else the user excludes goes in [`IGNORE_FILE`] at the checkout
 //! root, gitignore-shaped. there is NO built-in default list: a default that
 //! silently drops files is worse than the change ceiling it dodges, so the file
@@ -17,6 +23,8 @@
 use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+
+use unicode_normalization::UnicodeNormalization as _;
 
 /// what an on-disk entry is. only these three kinds materialize; anything else
 /// (fifo, socket, device) is out of scope for a duckfs checkout and is skipped
@@ -61,6 +69,14 @@ pub enum ScanError {
         pattern: String,
         reason: String,
     },
+    /// two on-disk names normalize to the same consensus path (a composed and a
+    /// decomposed spelling of the same characters, side by side). refused, never
+    /// resolved: picking one silently would drop the other file's content.
+    #[error(
+        "duckfs: two entries normalize to the same path {path:?}; rename one \
+         (they differ only in unicode composition)"
+    )]
+    NormalizedCollision { path: String },
 }
 
 impl From<std::io::Error> for ScanError {
@@ -216,17 +232,40 @@ pub fn scan(root: &Path, prefix: &str) -> Result<Vec<ScanEntry>, ScanError> {
     let mut warned_special = false;
     scan_dir(root, root, prefix, &ignore, &mut warned_special, &mut out)?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
+    // normalization can map two distinct on-disk names onto one path; sorted,
+    // such a pair is adjacent. one path must mean one entry, so this is an error.
+    if let Some(pair) = out.windows(2).find(|w| w[0].path == w[1].path) {
+        return Err(ScanError::NormalizedCollision {
+            path: pair[0].path.clone(),
+        });
+    }
     Ok(out)
 }
 
 /// the disk path for a duckfs path under this checkout: strip the prefix and
-/// re-root. shared with `status` so a rehash reads the right file.
+/// re-root. shared with `status`, `plan`, `commit` and `checkout`, so a rehash
+/// reads (and a checkout writes) the right file.
+///
+/// the duckfs path is NFC, but the byte-exact filesystems (ext4, and APFS since
+/// it stopped normalizing) can carry the NFD spelling the scan normalized away,
+/// and there the NFC join names nothing. so a non-ASCII path that does not exist
+/// falls back to its NFD form when THAT exists. every caller routes through here,
+/// which is why the fallback is here and not in any one of them.
 pub fn disk_path(root: &Path, prefix: &str, duckfs_path: &str) -> PathBuf {
     let rel = duckfs_path
         .strip_prefix(prefix)
         .unwrap_or(duckfs_path)
         .trim_start_matches('/');
-    root.join(rel)
+    let composed = root.join(rel);
+    let cannot_differ = rel.is_ascii();
+    if cannot_differ || composed.symlink_metadata().is_ok() {
+        return composed;
+    }
+    let decomposed = root.join(rel.nfd().collect::<String>());
+    if decomposed.symlink_metadata().is_ok() {
+        return decomposed;
+    }
+    composed
 }
 
 fn scan_dir(
@@ -361,7 +400,12 @@ fn relative(root: &Path, path: &Path) -> Result<String, ScanError> {
         .ok_or_else(|| ScanError::NonUtf8(path.display().to_string()))
 }
 
-/// join the duckfs `prefix` with the on-disk path relative to the checkout root.
+/// join the duckfs `prefix` with the on-disk path relative to the checkout root,
+/// NFC-normalized: this is the one crossing from an OS filename to a consensus
+/// path, and `duckfs_core::paths::canonical` refuses anything else. NFC is
+/// idempotent, so an already-composed name (and the prefix) passes through
+/// unchanged; a name still invalid after normalization is refused downstream by
+/// the same core error as before.
 fn duckfs_join(root: &Path, path: &Path, prefix: &str) -> Result<String, ScanError> {
     let rel = path
         .strip_prefix(root)
@@ -375,7 +419,7 @@ fn duckfs_join(root: &Path, path: &Path, prefix: &str) -> Result<String, ScanErr
         joined.push('/');
         joined.push_str(seg);
     }
-    Ok(joined)
+    Ok(joined.nfc().collect())
 }
 
 #[cfg(test)]
@@ -437,6 +481,49 @@ mod tests {
         let ig = rules("target/\n");
         assert!(ig.ignored_path("target/debug/app", false));
         assert!(!ig.ignored_path("src/target.rs", false));
+    }
+
+    const NFC: &str = "caf\u{00e9}.txt"; // é precomposed
+    const NFD: &str = "cafe\u{0301}.txt"; // e + combining acute
+
+    /// a decomposed on-disk name scans as its composed path — the form
+    /// `duckfs_core::paths::canonical` accepts — and `disk_path` still finds the
+    /// decomposed file on a byte-exact filesystem.
+    #[test]
+    fn a_decomposed_name_scans_to_its_composed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(NFD), b"x").unwrap();
+
+        let scanned = scan(dir.path(), "/shared/ws").expect("scan");
+        assert_eq!(
+            scanned.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            vec![format!("/shared/ws/{NFC}")],
+            "the scanned path is NFC, whatever the disk spells"
+        );
+        let disk = disk_path(dir.path(), "/shared/ws", &scanned[0].path);
+        assert_eq!(
+            fs::read(&disk).expect("the composed path still reads the file"),
+            b"x"
+        );
+    }
+
+    /// both spellings side by side collide on one consensus path: an error, never
+    /// a silent pick (one of the two files' content would just vanish).
+    #[test]
+    fn both_spellings_in_one_tree_are_a_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(NFC), b"composed").unwrap();
+        fs::write(dir.path().join(NFD), b"decomposed").unwrap();
+        // a normalization-insensitive filesystem (macOS) just wrote one file
+        // twice; there is no collision to report there.
+        let both_landed = fs::read_dir(dir.path()).unwrap().count() == 2;
+        if !both_landed {
+            return;
+        }
+        let Err(ScanError::NormalizedCollision { path }) = scan(dir.path(), "/shared/ws") else {
+            panic!("two spellings of one name must be refused, not resolved");
+        };
+        assert_eq!(path, format!("/shared/ws/{NFC}"));
     }
 
     /// a malformed pattern fails loudly, naming its line — never a silently

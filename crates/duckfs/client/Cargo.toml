@@ -23,6 +23,10 @@ glob = "0.3"
 # one latched warn: the walk skipping an entry it must never open (a fifo read
 # blocks forever). `ducktape fs` installs the sink for it.
 tracing = { workspace = true }
+# the scan is where an OS filename becomes a consensus path, so it is where NFD
+# (what macOS hands back) becomes the NFC that `duckfs_core::paths::canonical`
+# demands. core only ever rejects — normalizing there would rewrite consensus data.
+unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 # the mock NodeApi stands a REAL native `files::Files` on a tempdir, so the tests

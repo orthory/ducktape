@@ -9,7 +9,9 @@
 //! surfaces a structured [`ConflictReport`] — never a silent merge.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use duckfs_core::{Change, MAX_PAGE, MAX_SYNC_IDS, SnapshotInfo, to_hex};
 
@@ -124,7 +126,15 @@ pub fn commit_with(
     // the submit is covered by submit's re-stage-and-retry.
     ensure_staged(api, &planned.blobs)?;
 
-    let (receipt, rebased) = submit_with_rebase(api, &index, message, &planned, opts.auto_rebase)?;
+    let (receipt, rebased) = submit_with_rebase(
+        api,
+        &index,
+        message,
+        &planned,
+        opts.auto_rebase,
+        dir,
+        &dirty,
+    )?;
 
     let snapshot = resolve_snapshot(
         api,
@@ -145,14 +155,16 @@ pub fn commit_with(
 /// the upstream change set is disjoint from ours — never a silent merge. an
 /// overlapping conflict, an exhausted rebase budget, or a diff that itself rejects
 /// (oversized/unresolvable) all fail safe with a structured [`ConflictReport`]. a
-/// GC'd base (`"files: base snapshot not resolvable"`) reports a re-checkout
-/// remedy without attempting a rebase.
+/// GC'd base (`"files: base snapshot not resolvable"`) stashes the working copy
+/// and reports a re-checkout remedy without attempting a rebase.
 fn submit_with_rebase(
     api: &dyn NodeApi,
     index: &Index,
     message: &str,
     planned: &Plan,
     auto_rebase: bool,
+    dir: &Path,
+    dirty: &Status,
 ) -> Result<(CommitReceipt, bool), CommitError> {
     let ours = change_paths(&planned.changes);
     let mut base = index.base_snapshot.clone();
@@ -163,16 +175,17 @@ fn submit_with_rebase(
             Ok(receipt) => return Ok((receipt, rebased)),
             Err(CommitError::Rejected(m)) if m.contains(BASE_NOT_RESOLVABLE) => {
                 // the base fell out of the 1024-window: no rebase can recover it,
-                // the client must re-checkout onto the current head.
+                // the client must re-checkout onto the current head. a re-checkout
+                // overwrites the working copy, so the local work is copied aside
+                // FIRST — a remedy that silently destroys uncommitted work is not
+                // a remedy.
                 return Err(CommitError::Conflict(Box::new(ConflictReport {
                     base: index.base_snapshot.clone(),
                     head: api.refs().ok().and_then(|r| r.head),
                     ours: sorted(&ours),
                     theirs: Vec::new(),
                     clashing: Vec::new(),
-                    remedy: "the base snapshot has been garbage-collected out of the \
-                             history window; re-checkout to rebase onto the current head"
-                        .into(),
+                    remedy: gc_d_base_remedy(dir, &index.prefix, dirty),
                 })));
             }
             Err(CommitError::Rejected(m)) if m.contains(CONFLICT_PREFIX) => {
@@ -236,6 +249,60 @@ fn submit_with_rebase(
                  commit again"
             .into(),
     })))
+}
+
+/// the GC'd-base remedy, after copying the local changes aside. a stash that
+/// FAILED says so in the same string — never a remedy that reads as if the work
+/// were safe when it is not.
+fn gc_d_base_remedy(dir: &Path, prefix: &str, dirty: &Status) -> String {
+    const CAUSE: &str = "the base snapshot has been garbage-collected out of the history window";
+    match stash_local_changes(dir, prefix, dirty) {
+        Ok(stash) => format!(
+            "{CAUSE}; your uncommitted changes were copied to {}; re-checkout to rebase \
+             onto the current head, then copy them back",
+            stash.display()
+        ),
+        Err(e) => format!(
+            "{CAUSE}; re-checkout to rebase onto the current head — but COPY YOUR WORK \
+             ASIDE FIRST: stashing it automatically failed ({e})"
+        ),
+    }
+}
+
+/// copy every locally-changed path into `<checkout>/.duckfs/stash/<unix ts>/`,
+/// relative layout preserved, and answer that directory. `.duckfs` is skipped by
+/// the walk, so a stash is never itself content, and a second stash gets its own
+/// timestamped directory rather than overwriting the first. removals copy
+/// nothing — the bytes are already gone from the working copy.
+fn stash_local_changes(dir: &Path, prefix: &str, dirty: &Status) -> std::io::Result<PathBuf> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let stash = dir.join(".duckfs").join("stash").join(now.to_string());
+    fs::create_dir_all(&stash)?;
+    for entry in dirty.added.iter().chain(&dirty.modified) {
+        let src = disk_path(dir, prefix, &entry.path);
+        let Ok(rel) = src.strip_prefix(dir) else {
+            continue;
+        };
+        let dst = stash.join(rel);
+        fs::create_dir_all(dst.parent().unwrap_or(&stash))?;
+        match entry.kind {
+            ScanKind::File => {
+                fs::copy(&src, &dst)?;
+            }
+            ScanKind::Symlink => {
+                let Some(target) = &entry.target else {
+                    continue;
+                };
+                std::os::unix::fs::symlink(target, &dst)?;
+            }
+            // only an EMPTY dir is ever an entry; its shape is all there is to keep.
+            ScanKind::Dir => fs::create_dir_all(&dst)?,
+        }
+    }
+    Ok(stash)
 }
 
 /// build an overlap conflict report (used when there is no base/head to diff, or
