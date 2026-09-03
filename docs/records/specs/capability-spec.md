@@ -157,10 +157,14 @@ prompt = "stdin"
 # SILENT this long dies. a quiet-by-design CLI (claude -p prints one result at
 # the end) gets exactly this many seconds of silence, so budget for its
 # longest silent stretch. a continuously-chatty child is still bounded at
-# 6x this value (the host hard cap; the saga's consensus deadline bounds the
-# run's outcome regardless). $DUCKTAPE_PROVIDER_TIMEOUT_SECS overrides every
-# spec's idle budget at once (ops knob for slow hosts).
+# `hard_timeout_factor` x this value (the host hard cap; the saga's consensus
+# deadline bounds the run's outcome regardless).
+# $DUCKTAPE_PROVIDER_TIMEOUT_SECS overrides every spec's idle budget at once
+# (ops knob for slow hosts).
 timeout_secs = 300
+# the host hard cap as a multiple of the idle budget (1..=1000, default 36):
+# even a child that never goes quiet is killed at `timeout_secs x this`.
+hard_timeout_factor = 36
 
 [output]
 # which NAMED parser extracts the assistant's final text from stdout:
@@ -217,7 +221,8 @@ being silently ignored.
 |---|---|---|---|
 | `args` | string array | no (default `[]`) | passed verbatim to exec; fully literal, no placeholders |
 | `prompt` | string | yes | must be `"stdin"` in v1 |
-| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at 36x regardless |
+| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at `hard_timeout_factor`x regardless |
+| `hard_timeout_factor` | integer | no (default `36`) | 1..=1000; the host hard cap, as a multiple of the idle budget — a chatty-forever child is killed at `timeout_secs x` this |
 
 ### `[output]`
 
@@ -367,7 +372,8 @@ Each entry:
 | `suffix` | string | yes | `<model>_<effort>`, each side `[a-z0-9.-]+` (so exactly one `_`) |
 | `args` | string array | yes | the variant's **full** argv — verbatim, complete, never merged with or derived from the parent's args |
 
-A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`, `output`
+A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`,
+`hard_timeout_factor`, `output`
 (and `description`) from the parent spec;
 `args` is its own, whole, and literal. There is no field merging and no
 placeholder substitution — the "argv is literal" invariant holds per tag.

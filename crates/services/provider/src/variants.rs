@@ -4,7 +4,8 @@
 //! a variant is pure sugar over the documented "finer tag with its own spec"
 //! pattern: each entry registers an ADDITIONAL spec under the composed tag
 //! `{parent_tag}_{suffix}`, inheriting `bin`/`env`/`prompt`/`output`/
-//! `timeout_secs`/`isolation`/`context` (and `description`) from the parent,
+//! `timeout_secs`/`hard_timeout_factor`/`isolation`/`context` (and
+//! `description`) from the parent,
 //! with the variant's own FULL argv. there is no
 //! merging, no placeholder, no substitution — the
 //! "argv is literal" invariant holds per tag, exactly as if the operator had
@@ -85,6 +86,7 @@ pub(crate) fn expand(
             env: base.env.clone(),
             args: variant.args.clone(),
             timeout_secs: base.timeout_secs,
+            hard_timeout_factor: base.hard_timeout_factor,
             output: base.output,
             // HOW the executor authenticates — its broker and its config home —
             // is a property of the CLI, not of the model or the effort a variant
@@ -141,6 +143,7 @@ env = "MOCK_PROV_BIN"
 args = ["run", "--default"]
 prompt = "stdin"
 timeout_secs = 120
+hard_timeout_factor = 12
 [output]
 format = "text"
 {extra}
@@ -179,6 +182,7 @@ args = ["run", "--model", "m1", "--effort", "high"]
         assert_eq!(v.env.as_deref(), Some("MOCK_PROV_BIN"), "env inherited");
         assert_eq!(v.description, "a provider family", "description inherited");
         assert_eq!(v.timeout_secs, 120, "timeout inherited");
+        assert_eq!(v.hard_timeout_factor, 12, "hard timeout factor inherited");
         assert_eq!(v.output, OutputFormat::Text, "output inherited");
     }
 
