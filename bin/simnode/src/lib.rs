@@ -75,7 +75,8 @@
 //! genesis composition: the sim runs the SAME composer bin/node does
 //! (`noded::compose::compose` over a `topology` selection), so every wasm tenant
 //! is the REAL guest component — read from `--modules <dir>`, defaulting to the
-//! repo's kernel fixtures so a bare checkout boots with nothing installed.
+//! founding set the build staged beside this executable, so a bare checkout
+//! that built the sim boots with nothing installed.
 //!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
 //! separated, and repeatable) appends the kv/valset/acl/governance/lifecycle

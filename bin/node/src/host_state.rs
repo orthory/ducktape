@@ -1185,9 +1185,10 @@ mod tests {
     /// `bin/simnode/tests/topology_set.rs` pins the 15-module sim composition —
     /// which excludes `acl`, `governance`, `lifecycle` and `valset`, and is not
     /// what a node runs. (Not a NATIVE composition, as this said for a while:
-    /// simnode opens a `DirCodeSource` over the host fixtures and composes
-    /// through `noded::compose`, so every `SIM_BASE` id loads as a wasm
-    /// component — which is why a rebuilt fixture moves that root.) And `git
+    /// simnode opens a `DirCodeSource` over the founding set the build staged
+    /// beside it and composes through `noded::compose`, so every `SIM_BASE`
+    /// id loads as a wasm component — which is why a rebuilt component moves
+    /// that root.) And `git
     /// diff crates/modules/` on a committed tree is EMPTY BY CONSTRUCTION, so
     /// quoting it proves nothing at all. Neither would have noticed a module's
     /// bytes changing.
