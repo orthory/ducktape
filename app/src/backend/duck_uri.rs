@@ -132,8 +132,12 @@ fn query_net(query: &str) -> Option<String> {
 
 /// The chain id's hash half — `mint_chain_id` spells a chain id
 /// `<name>#<8 hex>` and only the hex rides a URI. "" for an unnamed chain.
+///
+/// Split from the RIGHT: `node init --name` validates nothing, so a network
+/// named `my#net` mints the chain id `my#net#a1b2c3d4`, and only the LAST `#`
+/// is the minted separator.
 fn chain_digest(chain_id: &str) -> &str {
-    chain_id.split_once('#').map(|(_, hex)| hex).unwrap_or("")
+    chain_id.rsplit_once('#').map(|(_, hex)| hex).unwrap_or("")
 }
 
 /// How many hex characters `mint_chain_id` puts after the `#`.
@@ -208,7 +212,7 @@ pub fn duck_forge_repo_link(repo: String, chain_id: String) -> String {
 /// The `duck://` URL the OS launched this process with, or "" for a plain
 /// start. `xdg-open 'duck://forge/ducktape/1?net=…'` runs the `Exec=` line of
 /// the desktop entry that claims `x-scheme-handler/duck`
-/// (`app/packaging/ducktape.desktop`), which passes the URL as `%u`.
+/// (`app/packaging/dev.ducktape.app.desktop`), which passes the URL as `%u`.
 ///
 /// Read once into state and PARKED, never opened here: the link addresses
 /// objects in a network this process has not connected to yet, and the open
@@ -520,6 +524,11 @@ mod tests {
         assert_eq!(
             duck_page_link("p1".into(), "mynet#d0cdf950".into()),
             "duck://page/p1?net=d0cdf950"
+        );
+        assert_eq!(
+            duck_page_link("p1".into(), "my#net#d0cdf950".into()),
+            "duck://page/p1?net=d0cdf950",
+            "a name may carry a #; the minted separator is the last one"
         );
         assert_eq!(
             duck_channel_message_link("general".into(), 42, "mynet#d0cdf950".into()),
