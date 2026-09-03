@@ -190,6 +190,71 @@ pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str
     }
 }
 
+/// the walks a boot seam could not complete because NO SOURCE ANSWERED, and
+/// how many times they have been re-issued.
+///
+/// This has to live in memory. A refused walk deliberately leaves the store
+/// exactly as it found it, and the store cannot remember the hole for us: the
+/// next live block advances EVERY module's watermark
+/// ([`indexer::IndexStore::apply_block`]), so "the watermark trails the
+/// boundary" stops being true the moment this node folds again. The loop that
+/// owns the index carries the debt instead, and re-issues it on the event that
+/// a source answered.
+#[derive(Default)]
+pub(crate) struct BackfillDebt {
+    owed: std::collections::BTreeMap<String, OwedWalk>,
+    attempts: u32,
+}
+
+/// exactly the arguments to re-issue one refused walk.
+#[derive(Clone, Copy)]
+struct OwedWalk {
+    /// the ceiling: every row above it is this node's own live fold.
+    boundary: u64,
+    /// where the walk resumes — `None` pulls the whole history below the
+    /// boundary.
+    after: Option<(u64, u32)>,
+}
+
+/// how many retries pass between two `info` lines while a source stays
+/// unreachable. the retry rides the tip poll, so a line per attempt would
+/// evict the whole log ring in minutes — and the `attempts` counter IS the
+/// diagnosis.
+const RETRY_LOG_EVERY: u32 = 30;
+
+impl BackfillDebt {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.owed.is_empty()
+    }
+
+    /// remember one refused walk. a module already owed widens to the UNION of
+    /// the two holes — the lower resume point, the higher ceiling — because a
+    /// later seam cuts its walk against the watermark live folds have since
+    /// pushed past the earlier one.
+    fn owe(&mut self, module: &str, walk: OwedWalk) {
+        let widened = match self.owed.get(module) {
+            Some(held) => OwedWalk {
+                boundary: held.boundary.max(walk.boundary),
+                after: match (held.after, walk.after) {
+                    (Some(held), Some(new)) => Some(held.min(new)),
+                    // `None` is the whole history below the boundary: wider
+                    // than any resume point by construction.
+                    _ => None,
+                },
+            },
+            None => walk,
+        };
+        self.owed.insert(module.to_string(), widened);
+    }
+
+    /// fold a later seam's debt into this one.
+    pub(crate) fn absorb(&mut self, other: BackfillDebt) {
+        for (module, walk) in other.owed {
+            self.owe(&module, walk);
+        }
+    }
+}
+
 /// bring every module whose feed trails `boundary` — or begins at a floor —
 /// up to it from the sync source, inline at the seam, before this node serves
 /// anything (indexable spec §7). a module that already holds a feed RESUMES
@@ -215,15 +280,22 @@ pub(crate) fn heal_index(index: &indexer::IndexStore, boundary: u64, label: &str
 /// otherwise have seen the empty one the heal's wipe just left, and the floor
 /// does not drop until the fold has consumed everything.
 ///
-/// per-module failure — network, a source that cannot cover the range, a page
-/// that fails structural validation — leaves that module's stamped floor
-/// standing, which is today's honest behavior. the join NEVER aborts on it.
+/// # A REFUSAL DESTROYS NOTHING AND IS NEVER FORGOTTEN
+///
+/// A source that does not answer has said nothing about what this module
+/// holds, so a refused walk stamps nothing, wipes nothing, and lowers no
+/// floor: the module keeps every row its own fold produced. The walk comes
+/// back in the returned [`BackfillDebt`] instead, for [`retry_owed_backfill`]
+/// to re-issue the moment a source answers this node again. (Stamping on a
+/// refusal cost a live resident its channel rows: the stamp WIPES the feed and
+/// every view folded from it, at exactly the moment the node knew least.)
 pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     index: &indexer::IndexStore,
     client: &C,
     boundary: u64,
     label: &str,
-) {
+) -> BackfillDebt {
+    let mut debt = BackfillDebt::default();
     let stale = match noded::stale_modules(index, boundary) {
         Ok(stale) => stale,
         Err(err) => {
@@ -235,7 +307,7 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
                 error = %err,
                 "index heal failed; wipe <storage>/index to rebuild"
             );
-            return;
+            return debt;
         }
     };
     // A MODULE THAT IS NOT STALE CAN STILL BE MISSING EVERYTHING BELOW ITS
@@ -265,16 +337,17 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     }
     let mut backfilled: Vec<Backfilled> = Vec::new();
     for module in &stale {
-        if let Some(done) = heal_module(index, client, module, boundary, label).await {
-            backfilled.push(done);
-            continue;
+        match heal_module(index, client, module, boundary, label).await {
+            Walk::Filled(done) => backfilled.push(done),
+            Walk::Owed(walk) => debt.owe(module, walk),
+            Walk::Settled => {}
         }
         // A REFUSED MODULE IS ROUTINE; A POISONED STORE IS NOT. A write
         // failure poisons the whole IndexStore, so every later `apply_block`
         // on this node dies too and the derived tier is finished until an
-        // operator rebuilds it — the per-module "keeps its boundary floor"
-        // warn would badly understate that. stop asking: the remaining
-        // modules can only fail the same way, N identical warns deep.
+        // operator rebuilds it — the per-module "keeps what it holds" warn
+        // would badly understate that. stop asking: the remaining modules can
+        // only fail the same way, N identical warns deep.
         if index.is_poisoned() {
             tracing::error!(
                 target: "ducktape::modules",
@@ -285,13 +358,14 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
                 "index backfill poisoned the store; every later fold fails — \
                  wipe <storage>/index to rebuild"
             );
-            return;
+            return debt;
         }
     }
     for (module, floor) in &floored {
-        if let Some(done) = close_floor(index, client, module, *floor, boundary, label).await {
-            backfilled.push(done);
-            continue;
+        match close_floor(index, client, module, *floor, boundary, label).await {
+            Walk::Filled(done) => backfilled.push(done),
+            Walk::Owed(walk) => debt.owe(module, walk),
+            Walk::Settled => {}
         }
         if index.is_poisoned() {
             tracing::error!(
@@ -303,11 +377,11 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
                 "index backfill poisoned the store; every later fold fails — \
                  wipe <storage>/index to rebuild"
             );
-            return;
+            return debt;
         }
     }
     if backfilled.is_empty() {
-        return;
+        return debt;
     }
     // ONE drain for the whole set: the trigger runner folds on a background
     // thread, and the floor must not drop until the rows it vouches for are
@@ -332,43 +406,154 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
             reason = "backfill_fold_stuck",
             "index backfill folded incompletely; boundary floors stand"
         );
-        return;
+        return debt;
     }
-    for Backfilled {
-        module,
-        source_floor,
-        last_row,
-    } in backfilled
-    {
+    for done in &backfilled {
         // the fold has to have CONSUMED what we wrote before the floor may
         // claim it. a module with no folding guest never has a tip, and none
         // is expected of it — but only a status read that SUCCEEDS says so; a
         // failed one is not evidence of anything, so it still has to show a
         // tip.
-        let folds = !matches!(index.fold_status(&module), Ok(None));
-        let tip_covers_rows = last_row
-            .is_none_or(|last| matches!(index.fold_tip(&module), Ok(Some(tip)) if tip >= last));
+        let folds = !matches!(index.fold_status(&done.module), Ok(None));
+        let tip_covers_rows = done.last_row.is_none_or(
+            |last| matches!(index.fold_tip(&done.module), Ok(Some(tip)) if tip >= last),
+        );
         let derived = !folds || tip_covers_rows;
         if !derived {
             tracing::warn!(
                 target: "ducktape::statesync",
                 node = %label,
-                module = %module,
+                module = %done.module,
                 reason = "backfill_tip_behind",
                 "index backfill rows are not folded; boundary floor stands"
             );
             continue;
         }
-        if let Err(err) = index.set_backfill_floor(&module, source_floor) {
+        lower_floor(index, done, label);
+    }
+    debt
+}
+
+/// re-issue the walks a refused seam still owes — driven by the event that a
+/// source ANSWERED this node (the resident's tip poll), never by a clock.
+///
+/// The boot seam's correctness argument — no live folds, so commit order is
+/// key order — does NOT hold here: this runs while the node serves, so the
+/// rows land below what the fold has already consumed and out of the order the
+/// changes trigger needs. The read model is therefore re-derived from the
+/// whole feed afterwards, the same closing move [`close_floor`] makes and for
+/// the same reason, and only then may a floor drop. What DOES still hold is
+/// the other half: this and the live fold run on the one task that writes this
+/// index, so nothing else commits while the walk runs.
+pub(crate) async fn retry_owed_backfill<C: statesync::SyncClient>(
+    debt: &mut BackfillDebt,
+    index: &indexer::IndexStore,
+    client: &C,
+    label: &str,
+) {
+    if debt.owed.is_empty() || index.is_poisoned() {
+        return;
+    }
+    debt.attempts += 1;
+    let attempts = debt.attempts;
+    // a forever-retry loop names itself once, then every Nth time.
+    let loud = attempts == 1 || attempts.is_multiple_of(RETRY_LOG_EVERY);
+    for (module, walk) in std::mem::take(&mut debt.owed) {
+        let walked =
+            backfill_module(index, client, &module, walk.boundary, walk.after, label).await;
+        let wrote = match &walked {
+            Ok(done) => Wrote(done.last_row),
+            Err(refused) => refused.wrote,
+        };
+        let read_model_agrees = repair_read_model(index, &module, wrote, label);
+        match walked {
+            Err(refused) => {
+                if loud {
+                    warn_refused(&refused, &module, walk.boundary, attempts, label);
+                }
+                debt.owe(&module, walk);
+            }
+            // a floor may not drop over a read model that disagrees with the
+            // feed under it: the rows are there, the views are not.
+            Ok(_) if !read_model_agrees => debt.owe(&module, walk),
+            Ok(done) => {
+                lower_floor(index, &done, label);
+                tracing::info!(
+                    target: "ducktape::statesync",
+                    event = "index_backfill_retry_settled",
+                    node = %label,
+                    module = %module,
+                    height = walk.boundary,
+                    attempts,
+                    "index backfill settled for {module} after {attempts} attempts"
+                );
+            }
+        }
+    }
+}
+
+/// re-derive a module's read model when a walk wrote rows UNDER what the fold
+/// already consumed — out of key order by construction, so the derived
+/// keyspace describes a feed that no longer exists until this runs. `true`
+/// when the read model agrees with the feed: nothing was written, or the
+/// replay succeeded.
+fn repair_read_model(
+    index: &indexer::IndexStore,
+    module: &str,
+    Wrote(rows): Wrote,
+    label: &str,
+) -> bool {
+    if rows.is_none() {
+        return true;
+    }
+    let Err(err) = index.refold(module) else {
+        return true;
+    };
+    tracing::warn!(
+        target: "ducktape::statesync",
+        node = %label,
+        module,
+        error = %err,
+        reason = "backfill_refold_failed",
+        "index backfill could not rebuild the read model; the floor stands"
+    );
+    false
+}
+
+/// lower a module's floor to the one the walk's source vouched for. NEVER
+/// raise it: a source's own history may begin above this node's feed, and a
+/// module with no floor at all already claims genesis.
+fn lower_floor(index: &indexer::IndexStore, done: &Backfilled, label: &str) {
+    let held = match index.backfill_height(&done.module) {
+        Ok(held) => held,
+        Err(err) => {
             tracing::warn!(
                 target: "ducktape::statesync",
                 node = %label,
-                module = %module,
+                module = %done.module,
                 error = %err,
-                reason = "backfill_floor_refused",
-                "index backfill floor not lowered"
+                reason = "backfill_floor_unreadable",
+                "index floor unreadable; it stays where it is"
             );
+            return;
         }
+    };
+    let Some(floor) = held else {
+        return; // nothing to lower: this feed already claims genesis.
+    };
+    let drops = done.source_floor.is_none_or(|source| source < floor);
+    if !drops {
+        return;
+    }
+    if let Err(err) = index.set_backfill_floor(&done.module, done.source_floor) {
+        tracing::warn!(
+            target: "ducktape::statesync",
+            node = %label,
+            module = %done.module,
+            error = %err,
+            reason = "backfill_floor_refused",
+            "index backfill floor not lowered"
+        );
     }
 }
 
@@ -379,6 +564,19 @@ struct Backfilled {
     module: String,
     source_floor: Option<u64>,
     last_row: Option<(u64, u32)>,
+}
+
+/// what one module's turn at a seam left behind.
+enum Walk {
+    /// the rows landed; the floor may drop once the fold has consumed them.
+    Filled(Backfilled),
+    /// NO SOURCE ANSWERED. the module keeps everything it held — nothing
+    /// stamped, nothing wiped, no floor moved — and this walk is owed again.
+    Owed(OwedWalk),
+    /// nothing more is owed for this module: a source answered and holds no
+    /// history this node lacks, or the store refused a write (the caller's
+    /// poison check speaks to that).
+    Settled,
 }
 
 /// the op-row seq no real row carries: a watermark vouches for whole HEIGHTS,
@@ -402,14 +600,53 @@ async fn heal_module<C: statesync::SyncClient>(
     module: &str,
     boundary: u64,
     label: &str,
-) -> Option<Backfilled> {
-    if let Some(resumed) = resume_module(index, client, module, boundary, label).await {
-        return Some(resumed);
+) -> Walk {
+    match resume_module(index, client, module, boundary, label).await {
+        Resume::Filled(done) => Walk::Filled(done),
+        // A REFUSAL IS NOT A REASON TO WIPE. The source said nothing about
+        // what this module holds, and the stamp below would destroy the feed
+        // and every view folded from it to make room for rows nobody is
+        // sending.
+        Resume::Refused(held) => Walk::Owed(OwedWalk {
+            boundary,
+            after: Some((held, AFTER_EVERY_SEQ)),
+        }),
+        Resume::Uncomposable => stamp_and_fill(index, client, module, boundary, label).await,
     }
-    stamp_module(index, module, boundary, label)?;
-    backfill_module(index, client, module, boundary, None, label)
-        .await
-        .ok()
+}
+
+/// the module whose feed cannot compose with a delta: WIPE it to the boundary
+/// and pull the whole history below from the source.
+///
+/// the source is asked first, and the stamp does not happen until it answers.
+/// a wipe is the one irreversible move at this seam — the rows it deletes are
+/// reachable only from a source — so it is never spent on a walk that has no
+/// answering source to finish it.
+async fn stamp_and_fill<C: statesync::SyncClient>(
+    index: &indexer::IndexStore,
+    client: &C,
+    module: &str,
+    boundary: u64,
+    label: &str,
+) -> Walk {
+    let whole_history = OwedWalk {
+        boundary,
+        after: None,
+    };
+    let source_answered = ask_source_floor(client, module, boundary).await.is_some();
+    if !source_answered {
+        return Walk::Owed(whole_history);
+    }
+    if stamp_module(index, module, boundary, label).is_none() {
+        return Walk::Settled;
+    }
+    match backfill_module(index, client, module, boundary, None, label).await {
+        Ok(done) => Walk::Filled(done),
+        Err(refused) => {
+            warn_refused(&refused, module, boundary, 1, label);
+            Walk::Owed(whole_history)
+        }
+    }
 }
 
 /// close a module's FLOOR: pull the history below it, when a source holds any.
@@ -439,9 +676,18 @@ async fn close_floor<C: statesync::SyncClient>(
     floor: u64,
     boundary: u64,
     label: &str,
-) -> Option<Backfilled> {
-    if !source_reaches_below(client, module, floor, boundary).await {
-        return None;
+) -> Walk {
+    let below_the_floor = OwedWalk {
+        boundary: floor,
+        after: None,
+    };
+    let Some(source_floor) = ask_source_floor(client, module, boundary).await else {
+        // an unanswered probe says nothing about this source's history.
+        return Walk::Owed(below_the_floor);
+    };
+    let source_holds_more = source_floor.is_none_or(|source| source < floor);
+    if !source_holds_more {
+        return Walk::Settled;
     }
     tracing::info!(
         target: "ducktape::statesync",
@@ -454,38 +700,37 @@ async fn close_floor<C: statesync::SyncClient>(
     // the ceiling is the FLOOR, not the boundary: everything above it is
     // already in this node's feed, and re-fetching it would only re-fold rows
     // the views already carry.
-    let closed = backfill_module(index, client, module, floor, None, label).await;
-    if matches!(closed, Err(Wrote(None))) {
-        // the source promised and then refused before writing a row. the read
-        // model is exactly as it was, and replaying the whole feed to prove it
-        // would cost every boot this seam runs — it gates `serving`.
-        return None;
+    let walked = backfill_module(index, client, module, floor, None, label).await;
+    let wrote = match &walked {
+        Ok(done) => Wrote(done.last_row),
+        Err(refused) => refused.wrote,
+    };
+    // the rows landed UNDER a feed the fold has already consumed past: only a
+    // replay of the whole feed in key order puts the read model back in
+    // agreement with it. a walk that wrote nothing left it agreeing already.
+    if !repair_read_model(index, module, wrote, label) {
+        return Walk::Owed(below_the_floor);
     }
-    if let Err(err) = index.refold(module) {
-        tracing::warn!(
-            target: "ducktape::statesync",
-            node = %label,
-            module,
-            error = %err,
-            reason = "backfill_refold_failed",
-            "index backfill could not rebuild the read model; the floor stands"
-        );
-        return None;
+    match walked {
+        Ok(done) => Walk::Filled(done),
+        Err(refused) => {
+            warn_refused(&refused, module, floor, 1, label);
+            Walk::Owed(below_the_floor)
+        }
     }
-    closed.ok()
 }
 
-/// does the source hold op rows BELOW `floor`? every index-op reply carries
-/// the source's own floor, so asking from a cursor PAST the boundary answers
-/// it with an empty page — the cheapest honest question, and a boot seam
-/// cannot afford a dearer one. a refusal answers `false`: an unreachable or
-/// unwilling source is never a reason to wipe a module's views.
-async fn source_reaches_below<C: statesync::SyncClient>(
+/// what floor does the source's own op history begin at — and did it answer at
+/// all? every index-op reply carries that floor, so asking from a cursor PAST
+/// the boundary answers it with an empty page — the cheapest honest question,
+/// and a boot seam cannot afford a dearer one. `None` is the refusal: an
+/// unreachable source is never a reason to wipe a module's views, nor evidence
+/// that it holds nothing.
+async fn ask_source_floor<C: statesync::SyncClient>(
     client: &C,
     module: &str,
-    floor: u64,
     boundary: u64,
-) -> bool {
+) -> Option<Option<u64>> {
     let asked = client
         .request(statesync::SyncRequest::IndexOps {
             boundary,
@@ -493,10 +738,10 @@ async fn source_reaches_below<C: statesync::SyncClient>(
             after: Some((boundary, AFTER_EVERY_SEQ)),
         })
         .await;
-    let Ok(statesync::SyncResponse::IndexOps { source_floor, .. }) = asked else {
-        return false;
-    };
-    source_floor.is_none_or(|source| source < floor)
+    match asked {
+        Ok(statesync::SyncResponse::IndexOps { source_floor, .. }) => Some(source_floor),
+        _ => None,
+    }
 }
 
 /// stamp ONE module at the boundary: its feed and views begin there, visibly
@@ -533,17 +778,28 @@ fn stamp_module(
     }
 }
 
+/// what a resume attempt decided.
+enum Resume {
+    /// the delta landed on top of the feed this module already held.
+    Filled(Backfilled),
+    /// the source did not answer, carrying the watermark a retry resumes from
+    /// — which the STORE will not remember, since live folds push every
+    /// watermark to the tip whether the rows arrived or not.
+    Refused(u64),
+    /// the feed cannot compose with a delta: it is empty, unreadable, or the
+    /// source's own history starts inside the range this node is missing.
+    Uncomposable,
+}
+
 /// pull only what this module is MISSING: the rows above its own watermark,
-/// written onto the feed it already holds. `None` refuses the resume — the
-/// caller falls back to the stamp — and never leaves a claim standing: the
-/// partial rows a refused walk wrote are wiped by that stamp.
+/// written onto the feed it already holds.
 async fn resume_module<C: statesync::SyncClient>(
     index: &indexer::IndexStore,
     client: &C,
     module: &str,
     boundary: u64,
     label: &str,
-) -> Option<Backfilled> {
+) -> Resume {
     let held = match index.applied_height(module) {
         Ok(held) => held,
         Err(err) => {
@@ -555,13 +811,13 @@ async fn resume_module<C: statesync::SyncClient>(
                 reason = "backfill_watermark_unreadable",
                 "index watermark unreadable; stamping at the boundary instead of resuming"
             );
-            return None;
+            return Resume::Uncomposable;
         }
     };
     if held == 0 {
-        return None; // an empty feed has nothing to resume from.
+        return Resume::Uncomposable; // an empty feed has nothing to resume from.
     }
-    let done = backfill_module(
+    let done = match backfill_module(
         index,
         client,
         module,
@@ -570,7 +826,13 @@ async fn resume_module<C: statesync::SyncClient>(
         label,
     )
     .await
-    .ok()?;
+    {
+        Ok(done) => done,
+        Err(refused) => {
+            warn_refused(&refused, module, boundary, 1, label);
+            return Resume::Refused(held);
+        }
+    };
     // THE SOURCE MUST REACH THE RESUME POINT. a source floor ABOVE this
     // node's watermark means the source's own history starts inside the range
     // this node is missing, so the delta would leave a HOLE between them —
@@ -586,7 +848,7 @@ async fn resume_module<C: statesync::SyncClient>(
             reason = "backfill_resume_uncovered",
             "index backfill cannot resume from this source; stamping at the boundary"
         );
-        return None;
+        return Resume::Uncomposable;
     }
     // the feed now reaches the boundary, so the watermark says so. the FLOOR
     // does not move: this node kept every row it already had, and nothing
@@ -600,7 +862,7 @@ async fn resume_module<C: statesync::SyncClient>(
             reason = "backfill_watermark_refused",
             "index backfill could not advance the feed watermark"
         );
-        return None;
+        return Resume::Uncomposable;
     }
     let held_floor = match index.backfill_height(module) {
         Ok(floor) => floor,
@@ -613,10 +875,10 @@ async fn resume_module<C: statesync::SyncClient>(
                 reason = "backfill_floor_unreadable",
                 "index floor unreadable after a resumed walk; stamping at the boundary instead"
             );
-            return None;
+            return Resume::Uncomposable;
         }
     };
-    Some(Backfilled {
+    Resume::Filled(Backfilled {
         source_floor: held_floor,
         ..done
     })
@@ -625,12 +887,37 @@ async fn resume_module<C: statesync::SyncClient>(
 /// what a REFUSED walk still left in the feed: the last row it wrote, `None`
 /// when it wrote nothing at all. the caller's "is there anything to clean up
 /// after" — a walk that never wrote cannot have disturbed anything.
+#[derive(Clone, Copy)]
 struct Wrote(Option<(u64, u32)>);
+
+/// a walk that could not finish: what it had written when it stopped, and why.
+/// REPORTED BY THE CALLER, which alone knows whether this is the first ask or
+/// the hundredth retry of one — an unconditional warn in a forever-retry loop
+/// evicts the very evidence it is about.
+struct Refusal {
+    wrote: Wrote,
+    reason: &'static str,
+    error: String,
+}
+
+/// name one refused walk, with the attempt counter that IS the diagnosis.
+fn warn_refused(refused: &Refusal, module: &str, boundary: u64, attempts: u32, label: &str) {
+    tracing::warn!(
+        target: "ducktape::statesync",
+        node = %label,
+        module = %module,
+        height = boundary,
+        attempts,
+        error = %refused.error,
+        reason = refused.reason,
+        "index backfill refused; the module keeps what it holds and the walk is owed again"
+    );
+}
 
 /// walk one module's op rows below `boundary` off the source and write them,
 /// resuming strictly after `after` when the caller already holds a feed.
-/// `Err` when the module keeps its floor, warned once with a stable reason
-/// token, carrying how far the walk got.
+/// `Err` carries how far the walk got and why it stopped; the CALLER decides
+/// whether this refusal is worth a line.
 async fn backfill_module<C: statesync::SyncClient>(
     index: &indexer::IndexStore,
     client: &C,
@@ -638,7 +925,7 @@ async fn backfill_module<C: statesync::SyncClient>(
     boundary: u64,
     after: Option<(u64, u32)>,
     label: &str,
-) -> Result<Backfilled, Wrote> {
+) -> Result<Backfilled, Refusal> {
     let mut rows = 0usize;
     let mut bytes = 0usize;
     let mut last: Option<(u64, u32)> = None;
@@ -680,16 +967,11 @@ async fn backfill_module<C: statesync::SyncClient>(
             } else {
                 "backfill_fetch_failed"
             };
-            tracing::warn!(
-                target: "ducktape::statesync",
-                node = %label,
-                module = %module,
-                height = boundary,
-                error = %err,
+            return Err(Refusal {
+                wrote: Wrote(last),
                 reason,
-                "index backfill refused; the module keeps its boundary floor"
-            );
-            return Err(Wrote(last));
+                error: err.to_string(),
+            });
         }
     };
     tracing::info!(
@@ -729,6 +1011,10 @@ mod tests {
         /// how many asks this source answers before it starts refusing — the
         /// source that drops mid-walk.
         answers: usize,
+        /// is the mesh to this source up? the window this bug lives in: a
+        /// restarted node whose source is unreachable for the first minutes,
+        /// and reachable after.
+        reachable: Arc<std::sync::atomic::AtomicBool>,
     }
 
     /// what the source was asked for / handed out, shared with the test.
@@ -741,7 +1027,13 @@ mod tests {
                 asked: Arc::new(Mutex::new(Vec::new())),
                 served: Arc::new(Mutex::new(Vec::new())),
                 answers: usize::MAX,
+                reachable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             }
+        }
+        /// the mesh to this source is down / back up.
+        fn set_reachable(&self, up: bool) {
+            self.reachable
+                .store(up, std::sync::atomic::Ordering::Relaxed);
         }
         /// the same source, dropping after `answers` asks.
         fn answering(mut self, answers: usize) -> Self {
@@ -772,7 +1064,8 @@ mod tests {
                         asked.push(after);
                         asked.len()
                     };
-                    let read = if asks > self.answers {
+                    let unreachable = !self.reachable.load(std::sync::atomic::Ordering::Relaxed);
+                    let read = if unreachable || asks > self.answers {
                         Err("source dropped mid-walk".to_string())
                     } else {
                         crate::validator::run::sync::read_index_ops(
@@ -1127,5 +1420,159 @@ mod tests {
             None,
             "the source covered the range from genesis, so nothing is missing"
         );
+    }
+
+    /// A REFUSED WALK STAMPS NOTHING AND KEEPS EVERY ROW THE FOLD PRODUCED.
+    /// This is the bug that lost a live resident its oldest channel: the node
+    /// restarted with the mesh to its source still down, the resume's first
+    /// page timed out, and the seam answered a source that had said NOTHING by
+    /// WIPING the module — feed, views and all — and stamping it as backfilled
+    /// at the boundary. The rows were reachable only from that source, so they
+    /// were gone for good, and the channel vanished from the app while sitting
+    /// intact on chain.
+    #[tokio::test]
+    async fn a_refused_walk_stamps_nothing_and_keeps_what_it_folded() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        // MAPPED: the rows this test is about are the DERIVED ones — the
+        // channel the app lists, not the op row under it.
+        let joiner = mapped_store(joiner_dir.path());
+        for height in 1..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        for height in 1..=8 {
+            joiner.apply_block(&block(height)).expect("joiner folds");
+        }
+        joiner.wait_folds_drained().expect("the joiner's own fold");
+
+        // the mesh is down: every ask times out.
+        let client = SourceNode::new(source);
+        client.set_reachable(false);
+        let debt = heal_and_backfill_index(&joiner, &client, 10, "resident").await;
+
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            None,
+            "a source that answered nothing is no reason to stamp a floor"
+        );
+        assert_eq!(
+            op_rows(&joiner),
+            (1..=8).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "every op row the local fold produced survives the refusal"
+        );
+        assert_eq!(
+            joiner
+                .scan("chat", b"seen/", None, 100)
+                .expect("scan")
+                .entries
+                .len(),
+            8,
+            "and so does every view row folded from them"
+        );
+        assert!(
+            !debt.is_empty(),
+            "the walk nobody answered is owed, not forgotten"
+        );
+    }
+
+    /// AND THE SOURCE COMING BACK CLOSES WHAT THE REFUSAL LEFT OPEN. The
+    /// retry rides the tip poll — a source ANSWERING is the event — and lands
+    /// while the node serves, so the rows arrive under a feed the fold has
+    /// already consumed past and the read model is re-derived from the whole
+    /// of it before the floor may move.
+    #[tokio::test]
+    async fn a_source_that_comes_back_settles_the_walk_it_refused() {
+        const FLOOR: u64 = 5;
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = mapped_store(joiner_dir.path());
+        for height in 1..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        // the restart-over-a-wiped-index shape: stamped at the checkpoint, the
+        // journal suffix folded back on top, nothing below the floor.
+        joiner.mark_backfilled("chat", FLOOR).expect("stamp");
+        for height in (FLOOR + 1)..=10 {
+            joiner.apply_block(&block(height)).expect("replay folds");
+        }
+        joiner
+            .wait_folds_drained()
+            .expect("the replayed suffix folds");
+
+        let client = SourceNode::new(source);
+        client.set_reachable(false);
+        let mut debt = heal_and_backfill_index(&joiner, &client, 10, "resident").await;
+        assert!(!debt.is_empty(), "the boot seam owes this module a walk");
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            Some(FLOOR),
+            "the floor stands exactly where the boot seam found it"
+        );
+
+        // the mesh comes up; the next tip poll re-issues the walk.
+        client.set_reachable(true);
+        retry_owed_backfill(&mut debt, &joiner, &client, "resident").await;
+
+        assert!(debt.is_empty(), "a settled walk is owed no longer");
+        assert_eq!(
+            op_rows(&joiner),
+            (1..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "the history below the floor reaches the feed"
+        );
+        assert_eq!(
+            joiner
+                .scan("chat", b"seen/", None, 100)
+                .expect("scan")
+                .entries
+                .len(),
+            10,
+            "the read model is re-derived over the whole feed, not just the tail"
+        );
+        assert_eq!(
+            joiner.fold_tip("chat").expect("tip"),
+            Some((10, 0)),
+            "and the tip vouches for the feed, not for the last row backfilled"
+        );
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            None,
+            "only now does the floor drop: the feed reaches genesis"
+        );
+    }
+
+    /// A RETRY THAT IS REFUSED AGAIN STAYS OWED, and costs the store nothing.
+    /// The retry pump is driven by a source answering, so a source that
+    /// answers the tip poll and then drops mid-walk must leave the module
+    /// exactly where the boot seam did — and still owed.
+    #[tokio::test]
+    async fn a_retry_nobody_answers_stays_owed() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = store(joiner_dir.path());
+        for height in 1..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        for height in 1..=8 {
+            joiner.apply_block(&block(height)).expect("joiner folds");
+        }
+        let client = SourceNode::new(source);
+        client.set_reachable(false);
+        let mut debt = heal_and_backfill_index(&joiner, &client, 10, "resident").await;
+
+        retry_owed_backfill(&mut debt, &joiner, &client, "resident").await;
+
+        assert!(
+            !debt.is_empty(),
+            "still nobody answered, so it is still owed"
+        );
+        assert_eq!(
+            op_rows(&joiner),
+            (1..=8).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "and the feed is untouched by the asking"
+        );
+        assert_eq!(joiner.backfill_height("chat").expect("floor"), None);
     }
 }

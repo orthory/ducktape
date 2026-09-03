@@ -20,7 +20,9 @@ use recovery::{Manifest, Recovery};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::*;
 use crate::drain_actions::{CutoverTrigger, EpochActions};
-use crate::explorer::{boundary_block_row, heal_and_backfill_index, heal_index};
+use crate::explorer::{
+    boundary_block_row, heal_and_backfill_index, heal_index, retry_owed_backfill,
+};
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
 use crate::host_state::{NodeSubstrates, restore_host, sync_all_modules};
 use crate::relay;
@@ -624,6 +626,12 @@ pub(super) async fn park(
     // gate keeps it. in-memory on purpose: after a restart the first
     // boundary re-fires and every write below is idempotent.
     let mut last_indexed_root: Option<StateRoot> = None;
+    // the index backfills a boot seam could not complete because no source
+    // answered — carried here because the STORE cannot carry it: a refused
+    // walk leaves the module untouched, and the next live block advances every
+    // module watermark over the hole regardless. re-issued from the tip poll
+    // below, on the event that a source answered this node again.
+    let mut backfill_debt = crate::explorer::BackfillDebt::default();
     // ---- REPLICA RESTART: recover by journal replay --------------
     //
     // A resident checkpoint is a real recovery base: replay the journal
@@ -777,7 +785,7 @@ pub(super) async fn park(
         // reachable only here, and only from a source. An unreachable one
         // leaves every floor standing, which is exactly where this line
         // stood before.
-        heal_and_backfill_index(&index, &client, tip, &label).await;
+        backfill_debt.absorb(heal_and_backfill_index(&index, &client, tip, &label).await);
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
@@ -1915,6 +1923,11 @@ pub(super) async fn park(
             &mut peer_builds,
             &mut warned_builds,
         );
+        // A SOURCE JUST ANSWERED THIS NODE — the one event a refused index
+        // backfill is waiting for. The walk is re-issued here and nowhere
+        // else, so an unreachable source costs this loop nothing but the
+        // poll it was already pacing.
+        retry_owed_backfill(&mut backfill_debt, &index, &client, &label).await;
         // follow the mesh rotation while parked: track the tip's
         // REPLICATED generation window — the identical snapshots every
         // member tracks, so a parked joiner's tracked sets can never
@@ -2253,7 +2266,9 @@ pub(super) async fn park(
                                 // into the feed (see
                                 // `heal_and_backfill_index`), and it closes
                                 // at `serving = Some(..)` below.
-                                heal_and_backfill_index(&index, &client, tip, &label).await;
+                                backfill_debt.absorb(
+                                    heal_and_backfill_index(&index, &client, tip, &label).await,
+                                );
                                 if let Err(err) =
                                     index.apply_block_record(tip, boundary_block_row(tip, &root))
                                 {
@@ -2473,7 +2488,9 @@ pub(super) async fn park(
                         // op-row backfill has to run here — at exactly the
                         // boundary `run_promoted` heals against, which makes
                         // that later heal the no-op it should be.
-                        heal_and_backfill_index(&index, &client, boundary.height, &label).await;
+                        backfill_debt.absorb(
+                            heal_and_backfill_index(&index, &client, boundary.height, &label).await,
+                        );
                         break (boundary, host, floor);
                     }
                     PromotionBoundary::Retry => {}
