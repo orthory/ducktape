@@ -11,12 +11,12 @@ _ducktape() {
 
     local families="node user account wallet gateway fs service agent module mcp help --help -h --version -V"
 
-    local node_verbs="run key init invite admit join list status peers resident member work sandbox help"
+    local node_verbs="run key init invite admit join list status peers resident member work sandbox log-filter help"
     local node_resident="accept remove"
     local node_member="promote remove leave status"
     local node_work="list admit revoke"
     local node_join="requests state"
-    local node_flags="--config -n --network --sync-only --json --yes --out --dir --name --modules --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --ttl-days"
+    local node_flags="--config -n --network --sync-only --json --yes --out --dir --name --modules --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --ttl-days --node --key"
 
     local user_key="init restore unlock reveal status"
     local user_cred="add list remove grant revoke inspect seal"
@@ -30,7 +30,7 @@ _ducktape() {
     local gateway_verbs="bind unbind list help"
     local gateway_flags="--workspace -n --network --label --port"
     local fs_verbs="ls cat stat history diff checkout status commit pin help"
-    local fs_flags="-n --network --json --node --message --no-rebase --snapshot --limit --prefix"
+    local fs_flags="-n --network --json --node --message --no-rebase --snapshot --limit --prefix --path --key"
     local service_verbs="run list enable disable status help"
     local service_flags="--config --workspace -n --network --json --yes -y --enable --no-enable"
     # every service verb takes a KIND now, `list`/`status` included.
@@ -52,7 +52,7 @@ _ducktape() {
                 member)   COMPREPLY=( $(compgen -W "$node_member $node_flags" -- "$cur") ) ;;
                 work)     COMPREPLY=( $(compgen -W "$node_work $node_flags" -- "$cur") ) ;;
                 join)     COMPREPLY=( $(compgen -W "$node_join $node_flags" -- "$cur") ) ;;
-                run|key|init|invite|admit|list|status|peers|sandbox)
+                run|key|init|invite|admit|list|status|peers|sandbox|log-filter)
                           COMPREPLY=( $(compgen -W "$node_flags" -- "$cur") ) ;;
                 *)        COMPREPLY=( $(compgen -W "$node_verbs" -- "$cur") ) ;;
             esac
