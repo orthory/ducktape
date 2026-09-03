@@ -20,6 +20,22 @@ fn http(port: u16, method: &str, path: &str, content_type: &str, body: &[u8]) ->
     nettest::http_bytes(port, method, path, content_type, body)
 }
 
+/// the same exchange carrying this node's operator credential — what a LOCAL
+/// daemon presents, and the only way to reach the daemon-origin lane now that
+/// an uncredentialed mutation is refused before the handler runs.
+fn http_as_daemon(
+    h: &Harness,
+    port: u16,
+    method: &str,
+    path: &str,
+    content_type: &str,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let (name, value) = h.write_header();
+    nettest::try_http_bytes_with(port, method, path, content_type, &[(name, value)], body)
+        .expect("app-surface request")
+}
+
 /// the commit payload exactly as the TS transport serializes it.
 fn commit_payload(path: &str, message: &str, bytes: &[u8]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
@@ -94,7 +110,8 @@ fn signed_commit_lands_with_the_signer_as_author_and_home_authority() {
             }
         }],
     });
-    let (status, body) = http(
+    let (status, body) = http_as_daemon(
+        &h,
         port,
         "POST",
         "/v1/files/commit",
