@@ -753,6 +753,13 @@ fn control_outcome(lane: ControlLane, verb: ControlVerb, run_id: &str, height: u
 /// The DIRECTORY comes from the shared addressing ladder
 /// ([`NodeAddr::workspace`]), so "which node" is answered once for both the url
 /// this CLI dials and the files behind it.
+fn workspace_secret(addr: &NodeAddr) -> Result<String, Box<dyn std::error::Error>> {
+    let workspace = addr
+        .workspace()
+        .map_err(|why| format!("attaching a pty needs this node's workspace: {why}"))?;
+    noded::services::read_link_token(&workspace).map_err(Into::into)
+}
+
 /// this boot's operator credential for the node being addressed — the second
 /// thing behind that same 0600 directory, and what a MUTATING `/v1` route wants
 /// from a caller acting as the node's operator rather than as an account.
@@ -762,13 +769,6 @@ fn control_outcome(lane: ControlLane, verb: ControlVerb, run_id: &str, height: u
 fn workspace_operator(addr: &NodeAddr) -> Option<String> {
     let workspace = addr.workspace().ok()?;
     noded::admin::read_operator_token(&workspace).ok()
-}
-
-fn workspace_secret(addr: &NodeAddr) -> Result<String, Box<dyn std::error::Error>> {
-    let workspace = addr
-        .workspace()
-        .map_err(|why| format!("attaching a pty needs this node's workspace: {why}"))?;
-    noded::services::read_link_token(&workspace).map_err(Into::into)
 }
 
 /// This node's own 32-byte mesh key, from `/v1/status`'s `public_key`.

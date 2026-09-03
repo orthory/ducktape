@@ -99,11 +99,12 @@ pub const DATA_HEADERS: PopHeaders = PopHeaders {
 /// window for both namespaces: two would only ever drift apart.
 pub const FRESHNESS_SECS: u64 = 30;
 
-/// the largest body this gate will read to hash. the widest gated route is the
-/// object facade's PUT (`files_http::MAX_OBJECT_BYTES`), whose handler buffers
-/// the same bytes anyway — so hashing here adds no new peak. anything larger is
-/// refused before the per-route cap would have seen it.
-const MAX_SIGNED_BODY_BYTES: usize = crate::MAX_OBJECT_BYTES;
+/// axum's own default body cap, which is what every gated route that sets no
+/// `DefaultBodyLimit` of its own already enforces — the json lanes
+/// (`/v1/submit`, `/v1/invite`, the workspace RPC, the term routes) and the
+/// filter string. Spelled here because the middleware runs OUTSIDE the route's
+/// layers and so cannot read the limit they install.
+const DEFAULT_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// wall-clock seconds since the Unix epoch (saturating before 1970).
 pub(crate) fn now_secs() -> u64 {
@@ -322,19 +323,49 @@ fn lane_of(path: &str) -> Lane {
     }
 }
 
-/// does this request mutate, and therefore need a credential? one discriminant,
-/// one match — a new route that mutates is added to [`lane_of`]'s table, never
-/// to a scattered `if` at a call site.
-pub(crate) fn needs_signature(method: &Method, path: &str) -> bool {
-    let posts = *method == Method::POST;
-    let removes = *method == Method::DELETE;
-    let replaces = *method == Method::PUT;
-    match lane_of(path) {
-        Lane::Workspace => posts || removes,
-        Lane::Object => replaces || removes,
-        Lane::Files | Lane::Term | Lane::Fixed => posts,
-        Lane::Open => false,
+impl Lane {
+    /// does this method MUTATE on this lane? one discriminant, one match — a
+    /// new route that mutates is added to [`lane_of`]'s table, never to a
+    /// scattered `if` at a call site.
+    fn mutates(self, method: &Method) -> bool {
+        let posts = *method == Method::POST;
+        let removes = *method == Method::DELETE;
+        let replaces = *method == Method::PUT;
+        match self {
+            Lane::Workspace => posts || removes,
+            Lane::Object => replaces || removes,
+            Lane::Files | Lane::Term | Lane::Fixed => posts,
+            Lane::Open => false,
+        }
     }
+
+    /// the largest body this gate will read in order to hash it.
+    ///
+    /// PER LANE, and it has to be: the cap is reached by an UNAUTHENTICATED
+    /// caller — the buffering happens before the signature is checked, which is
+    /// the only order a body digest can be verified in. One shared 64 MiB
+    /// ceiling would therefore let anyone who can dial the port make the node
+    /// hold 64 MiB for a `/v1/files/stage` whose own route rejects anything
+    /// over a 1 MiB chunk. Each lane names the ceiling its route already
+    /// enforces, so hashing adds no new peak on any of them.
+    fn max_body(self) -> usize {
+        match self {
+            // the S3 facade's PUT — one whole object.
+            Lane::Object => crate::MAX_OBJECT_BYTES,
+            // the widest write on the `/v1/files/` prefix is the blob receipt;
+            // a staged chunk (1 MiB) and the json commits sit under it.
+            Lane::Files => crate::MAX_BLOB_BODY_BYTES,
+            // json bodies and the log-filter string. `Open` never reaches here
+            // (the guard returns before asking), and takes the small cap so a
+            // table that ever disagreed fails closed rather than wide.
+            Lane::Workspace | Lane::Term | Lane::Fixed | Lane::Open => DEFAULT_JSON_BODY_BYTES,
+        }
+    }
+}
+
+/// does this request mutate, and therefore need a credential?
+pub(crate) fn needs_signature(method: &Method, path: &str) -> bool {
+    lane_of(path).mutates(method)
 }
 
 /// the plane a refusal is logged on. a files/duckfs mutation belongs to
@@ -452,7 +483,8 @@ pub(crate) async fn signed_write_guard(
     if is_operator {
         req.extensions_mut().insert(OperatorCredential);
     }
-    if !needs_signature(&method, &path) {
+    let lane = lane_of(&path);
+    if !lane.mutates(&method) {
         return next.run(req).await;
     }
     // admitted without touching the body: nothing is signed over it on this
@@ -468,7 +500,7 @@ pub(crate) async fn signed_write_guard(
         .unwrap_or_else(|| path.clone());
     let headers = req.headers().clone();
     let (parts, body) = req.into_parts();
-    let body = match axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES).await {
+    let body = match axum::body::to_bytes(body, lane.max_body()).await {
         Ok(bytes) => bytes,
         // `to_bytes` collapses "over the cap" and "the stream broke" into one
         // error, and the cap is the likelier of the two by far.
@@ -764,6 +796,20 @@ mod tests {
                 "{method} {path} must stay open"
             );
         }
+    }
+
+    /// the hashing cap is reached by an UNAUTHENTICATED caller, so no lane may
+    /// inherit a wider one than its own route accepts — a shared 64 MiB ceiling
+    /// would let anyone make the node hold 64 MiB for a 1 MiB chunk route.
+    #[test]
+    fn no_lane_buffers_more_than_its_own_route_accepts() {
+        let cap = |path: &str| lane_of(path).max_body();
+        assert_eq!(cap("/v1/files/object/shared/a.bin"), crate::MAX_OBJECT_BYTES);
+        assert_eq!(cap("/v1/files/stage"), crate::MAX_BLOB_BODY_BYTES);
+        assert_eq!(cap("/v1/submit"), DEFAULT_JSON_BODY_BYTES);
+        assert_eq!(cap("/v1/fs/workspaces"), DEFAULT_JSON_BODY_BYTES);
+        assert_eq!(cap("/v1/term/sessions"), DEFAULT_JSON_BODY_BYTES);
+        assert!(cap("/v1/files/stage") < cap("/v1/files/object/shared/a.bin"));
     }
 
     #[test]

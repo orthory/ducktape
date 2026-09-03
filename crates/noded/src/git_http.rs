@@ -506,6 +506,16 @@ fn push_cert_nonce(handle: &NodeHandle, repo: &str) -> Option<String> {
 /// receive-pack (push) and upload-pack (fetch) are served — the v0 banner we
 /// send makes git speak the classic protocol for the follow-up POST even when it
 /// probed with `Git-Protocol: version=2`.
+///
+/// AUTH: a READ, for BOTH services, and it has to be. The receive-pack
+/// advertisement is what a client fetches to learn the head it is fast-forwarding
+/// from and the `push-cert` nonce it must sign over — so requiring a credential
+/// HERE would make `git push --signed` impossible for exactly the person whose
+/// certificate is the credential [`git_receive_pack`] wants. It gives nothing
+/// away either: the nonce is a pure function of chain id and repo name
+/// ([`push_cert_nonce`]) and mints no state, and the refs it lists are the same
+/// refs the open upload-pack advertisement hands any clone. The proof is
+/// demanded where the mutation is — on the receive-pack POST.
 pub(crate) async fn git_info_refs(
     State(handle): State<NodeHandle>,
     Path(repo): Path<String>,

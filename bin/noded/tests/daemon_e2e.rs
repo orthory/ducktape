@@ -91,8 +91,6 @@ impl Daemon {
         daemon
     }
 
-    /// POST the graceful-exit route with this daemon's operator credential —
-    /// the ONLY thing that may drive it.
     /// a duckfs transport whose writes this daemon admits.
     fn files(&self) -> duckfs_client::http::HttpNode {
         let token = self.admin_token.clone();
@@ -102,6 +100,8 @@ impl Daemon {
             }))
     }
 
+    /// POST the graceful-exit route with this daemon's operator credential —
+    /// the ONLY thing that may drive it.
     fn admin_shutdown(&self) -> Option<u16> {
         nettest::http_status_with(
             self.port,

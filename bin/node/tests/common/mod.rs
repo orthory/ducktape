@@ -1654,9 +1654,9 @@ impl Cluster {
         format!("http://127.0.0.1:{}", self.http_ports[idx])
     }
 
-    /// every running node's log tail — the panic payload that makes a stalled
-    /// mesh diagnosable from a CI failure alone.
-    /// Every log this cluster owns: each node's, AND each service daemon's.
+    /// Every log this cluster owns: each node's, AND each service daemon's —
+    /// the panic payload that makes a stalled mesh diagnosable from a CI
+    /// failure alone.
     ///
     /// The daemons are not decoration. A dispatch/agent e2e fails on a
     /// PREDICATE the node's own log cannot explain — "no provider announced its
