@@ -33,6 +33,10 @@ pub fn optimistic_message(
         body,
         message_id,
         rpc::cached_user_key().as_deref(),
+        // THE SYNCHRONOUS READ: an Ice extern cannot await, and the mint must
+        // paint this frame. The directory is warm by any send — see
+        // `cached_account_names`.
+        &cached_account_names(),
     ))
 }
 
@@ -49,6 +53,10 @@ pub fn optimistic_thread_message(
         body,
         message_id,
         rpc::cached_user_key().as_deref(),
+        // THE SYNCHRONOUS READ: an Ice extern cannot await, and the mint must
+        // paint this frame. The directory is warm by any send — see
+        // `cached_account_names`.
+        &cached_account_names(),
     ))
 }
 
@@ -228,12 +236,13 @@ pub struct HuddleParticipant {
 pub(crate) fn huddle_roster(
     members: &[chat::index::HuddleEntry],
     me: Option<&[u8]>,
+    names: &AuthorNames,
 ) -> Vec<HuddleParticipant> {
     let mine = me.map(hex_encode);
     members
         .iter()
         .map(|member| {
-            let label = author_name(&format!("user:{}", member.user));
+            let label = author_name(&format!("user:{}", member.user), names);
             HuddleParticipant {
                 initials: initials_of(&label),
                 // The module refuses non-User authors ("only external users
@@ -285,7 +294,11 @@ pub(crate) async fn huddle_fanout_nodes(
 ) -> Result<Vec<String>, String> {
     let client = rpc_client(rpc)?;
     let me = local_user_key().await;
-    let (_channel, roster) = load_channel_facts(&client, channel_id, me.as_deref()).await?;
+    // A huddle in a room this node cannot see has no fan-out set — an empty
+    // one, not a failure: the poll re-reads on its own cadence and picks the
+    // roster up as soon as the index answers for the room.
+    let facts = load_channel_facts(&client, channel_id, me.as_deref()).await?;
+    let roster = facts.map_or_else(Vec::new, |(_channel, roster)| roster);
     Ok(huddle_recipient_nodes(roster))
 }
 
@@ -441,10 +454,11 @@ pub async fn load_thread_page(
         let thread = query_thread_page(&rpc, &channel_id, root_seq, after_reply_seq).await?;
         let next_reply_seq = number_i64(thread.next_reply_seq.unwrap_or(0));
         let current_user = local_user_key().await;
+        let names = account_names(&rpc).await;
         let messages = thread
             .replies
             .into_iter()
-            .map(|row| chat_message(row, current_user.as_deref()))
+            .map(|row| chat_message(row, current_user.as_deref(), &names))
             .collect();
         Ok(ThreadPageData {
             generation,
@@ -655,6 +669,7 @@ pub async fn search_chat(
     let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
+        let names = account_names(&rpc).await;
         // a `#tag` query filters by the exact hashtag (the index's tag
         // postings); anything else is full-text search.
         let query = match text.strip_prefix('#') {
@@ -693,7 +708,7 @@ pub async fn search_chat(
                     channel_id: hit.channel_id,
                     seq: number_i64(hit.seq),
                     root_seq: number_i64(hit.thread.unwrap_or(hit.seq)),
-                    author: author_display(&hit.author, current_user.as_deref()),
+                    author: author_display(&hit.author, current_user.as_deref(), &names),
                     text: hit.text,
                 })
                 .collect(),
@@ -739,10 +754,11 @@ pub async fn load_page_threads(
         let rpc = rpc_client(&rpc)?;
         let blocks = load_page_blocks(&rpc, &page_id).await?;
         let block_ids: Vec<String> = blocks.into_iter().map(|block| block.id).collect();
+        let names = account_names(&rpc).await;
         let threads: Vec<PageCommentThread> = query_page_thread_rows(&rpc, &page_id, &block_ids)
             .await?
             .into_iter()
-            .map(page_comment_thread)
+            .map(|thread| page_comment_thread(thread, &names))
             .collect();
         let total = count_i64(threads.len());
         Ok(BlockThreadListData {

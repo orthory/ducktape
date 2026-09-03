@@ -378,20 +378,28 @@ fn shell_uses_canonical_glass_and_opaque_content() {
     // StatusCard and the tooltip frame stays transparent, so the `pr` gutter
     // can hold the card off the wall on the bell card's line.
     assert!(bar.contains("tooltip position=bottom gap=13.5 p=0.0 delay=90 style=transparent"));
-    // Per-frame extern bans. These two walk the disk (workspace tomls) or
-    // deep-clone the whole timeline through the extern ABI, so the view reads
-    // their STATE MIRRORS (`network_name`, `has_older_history`) instead. If
-    // either name returns to a view or screen file, the per-frame tax is back.
+    // A per-frame extern ban: `network_label` walks the disk (workspace tomls),
+    // so the view reads its STATE MIRROR (`network_name`) instead. If the name
+    // returns to a view or screen file, the per-frame tax is back.
     assert!(!SCREENS.contains("network_label("));
     assert!(!inlined(include_str!("../ui/view.ice")).contains("network_label("));
-    assert!(!SCREENS.contains("history_has_older("));
-    assert!(!inlined(include_str!("../ui/view.ice")).contains("history_has_older("));
     assert!(bar.contains("box pr=13.0\n              StatusCard "));
     assert!(shell.contains(
         "box #root w=284.0 pl=14.0 pr=14.0 pt=13.0 pb=13.0 bg=surface border=border border-w=1.0 r=13.0 shadow=shadow_modal shadow-y=16.0 shadow-blur=40.0"
     ));
     assert!(SCREENS.contains("box w=236.0 h=fill bg=sidebar clip=true"));
     assert!(SCREENS.contains("box w=230.0 h=fill bg=sidebar clip=true"));
+
+    // THE WAY BACK TO NOW IS A FLOAT, NOT A BAND. There is no amber "Viewing
+    // history" strip: it pushed the conversation down 32px to say something the
+    // reader could already see, and it carried the one control that means "take
+    // me back to now" as far from now as the pane allows. The pill is a stack
+    // layer at the timeline's bottom edge, shown when the reader is away from
+    // the tail — a history window OR her own scroll.
+    assert!(!SCREENS.contains("text \"Viewing history\""));
+    assert!(SCREENS.contains("if !empty(messages) && (history_view || !at_live_tail)"));
+    assert!(SCREENS.contains("button \"↓  Jump to latest\""));
+    assert!(SCREENS.contains("emit(choose_channel, active_channel)"));
 
     // The endpoint field is GONE from Settings — the launch window's picker
     // owns which network; Settings keeps only Reconnect / Switch network.

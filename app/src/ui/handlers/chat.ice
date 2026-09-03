@@ -57,7 +57,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // the "did my click land?" void #1059 removed from the pickers, still live on
   // the one navigation whose entire purpose is to jump somewhere else.
   active_channel = channel_id
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next_channel.name
   active_channel_archived = next_channel.archived
@@ -77,6 +77,9 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   let post_gate_known = !active_channel_members_only
   post_refusal = keep_str(post_gate_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
   has_older_history = false
+  // A fresh window mounts at the tail (`messages = []` above unmounts the old
+  // scrollable and its offset), so the "Jump to latest" float starts down.
+  chat_at_tail = true
   unread_marker_seq = 0
   palette_open = false
   shell_tab = ShellTab.chat
@@ -154,6 +157,9 @@ on choose_channel(id)
   let post_gate_known = !active_channel_members_only
   post_refusal = keep_str(post_gate_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
   has_older_history = false
+  // A fresh window mounts at the tail (`messages = []` above unmounts the old
+  // scrollable and its offset), so the "Jump to latest" float starts down.
+  chat_at_tail = true
   // THE FLAG BELONGS TO THE REQUEST, AND THE REQUEST BELONGS TO THE ROOM YOU
   // LEFT. Invalidating `history` above ends both before the new room paints.
   history_loading = false
@@ -215,15 +221,16 @@ on choose_dm(peer_key)
   // `active_channel` on the room she left is how the peer's face came up beside
   // that room's "Archived" badge, its "· 7 added" count and its composer
   // refusal for the several blocks a DM open takes.
-  let dm_room = dm_channel_id(account_number, active_dm_peer)
-  // WITH NO USER KEY BOUND, `dm_room` IS A PHANTOM — `dm_channel_id` hashes ""
-  // against the peer and answers an id no channel in the list carries, while
-  // the node resolves the real one from its OWN key. That degrades to exactly
-  // the behaviour this line replaced and no further: the indexed room lookup
-  // is still out, the header keeps its previous name (`channel_switch_facts` falls back to
-  // `current`), no sidebar row highlights, and `chat_updated` lands the real
-  // room a round trip later. The DM header still draws, because it reads
-  // `active_dm_peer`, which is the payload.
+  let dm_room = dm_room_of_peer(dm_peers, active_dm_peer)
+  // THE DIRECTORY'S OWN ID, not a second hash of `account_number` — the same
+  // single derivation `chat_sidebar_rooms` and `dm_peer_of_channel` read, so a
+  // room cannot be a DM in one of the three and a `#` channel in the others.
+  // WITH NO ACCOUNT RESOLVED the directory carries no id and `dm_room` is "",
+  // which degrades exactly as far as the phantom id it replaced and no further:
+  // the indexed room lookup finds nothing, the header keeps its previous name
+  // (`channel_switch_facts` falls back to `current`), no sidebar row highlights,
+  // and `chat_updated` lands the real room a round trip later. The DM header
+  // still draws, because it reads `active_dm_peer`, which is the payload.
   // A DM open is a live tail, never a history window — see `history_view`.
   history_view = false
   // FREEZE THE DIVIDER WHILE `active_channel` STILL NAMES THE ROOM SHE LEAVES,
@@ -239,6 +246,9 @@ on choose_dm(peer_key)
   channel_members = []
   post_refusal = ""
   has_older_history = false
+  // A fresh window mounts at the tail (`messages = []` above unmounts the old
+  // scrollable and its offset), so the "Jump to latest" float starts down.
+  chat_at_tail = true
   unread_marker_seq = 0
   // Same lane cancellation as `choose_channel`.
   history_loading = false
@@ -448,9 +458,10 @@ on composer_submitted(kind, pending_body, pending_id)
           selected_message_rev = selection.rev
           message_action = selection.action
           message_edit_draft = selection.draft
-          has_older_history = history_has_older(messages)
           unread_marker_seq = first_unread_seq(messages, unread_boundary)
           error = ""
+          // The snap below IS the jump, so the float goes down with it.
+          chat_at_tail = true
           // Sending is a jump to now: the minted row lands at the tail, and a
           // reader who had scrolled up would otherwise get her own send below the
           // fold — an optimistic insert she cannot see is no confirmation at all.
@@ -524,17 +535,18 @@ on chat_updated(next)
   // renamed or archived — and nothing re-pages the list to heal it.
   channels = upsert_channel_rows(channels, next.channels)
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = next.has_older_history || history_has_older(messages)
+  // Server truth alone — see `workspace_connected` in `lifecycle.ice`.
+  has_older_history = next.has_older_history
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // A LANDING ANSWERS FOR THE PEER TOO. The DM header suppresses the `#` and
   // the channel name, so a peer that outlives the room it named leaves the room
   // on screen unnamed under someone else's face — see `dm_peer_of_channel`.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -588,7 +600,8 @@ on chat_hit_loaded(next)
   // Same fold as `chat_updated`, same loader, same reason.
   channels = upsert_channel_rows(channels, next.channels)
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = next.has_older_history || history_has_older(messages)
+  // Server truth alone — see `workspace_connected` in `lifecycle.ice`.
+  has_older_history = next.has_older_history
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   // AND NO READ MARK, which is the one line this handler must NOT copy from
@@ -602,12 +615,12 @@ on chat_hit_loaded(next)
   // through `choose_channel` -> `chat_updated`, which marks the room read when
   // she actually reaches the tail. The sidebar mirrors still refresh: the
   // `channels` fold above moved, even though the cursor did not.
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // Same landing answer as `chat_updated`: a hit in another room retires the
   // peer, a hit inside the DM keeps him.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -690,18 +703,19 @@ on channel_created(next)
   history_view = false
   channels = upsert_channel_rows(channels, next.channels)
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  has_older_history = next.has_older_history || history_has_older(messages)
+  // Server truth alone — see `workspace_connected` in `lifecycle.ice`.
+  has_older_history = next.has_older_history
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A CREATE IS A ROOM SWITCH — the line below lands her IN the new channel,
   // and the composer she was typing into stays keyed to the room she left
   // (ducktape-ui#697).
   active_channel = next.active_channel
   // Creating lands you in the new room, which is nobody's DM.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, dm_peers, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
@@ -1034,17 +1048,25 @@ on thread_page_failed(cause)
 // the scrollback and is usually in by the time she reaches it. The button stays
 // as the explicit fallback and every other term below is its guard verbatim.
 //
-// `has_older_history` rather than `history_has_older(messages)`: this fires per
-// scroll step, and the extern takes the timeline BY VALUE. The mirror in state
-// is written by every handler that moves `messages` for exactly this reason.
+// `has_older_history` IS the reading — the index's own `has_more`, carried by
+// every load that moves `messages` and raised by the live fold only when the
+// render window evicted rows off its oldest edge. Nothing re-derives it from
+// the timeline in hand: root sequences have holes, so no local guess can tell
+// the true beginning of a channel from the middle of one.
 on chat_scrolled(_absolute_x, _absolute_y, _relative_x, relative_y)
+  // ABOVE THE GUARD, because this is not the prefetch's business: the same
+  // offset that says "she is near the top" also says whether she is at the tail,
+  // and the "Jump to latest" float is the only reading of it. Written below the
+  // early return it would freeze at whatever it held when the reader left the
+  // last tenth of the scrollback — the pill stuck on, or never appearing.
+  chat_at_tail = near_scroll_tail(relative_y)
   return if !near_scroll_top(relative_y) || history_loading || loading || mutation_phase != MutationPhase.idle || empty(active_channel) || !has_older_history
   history_loading = true
   error = ""
   run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages)) -> history_loaded _ | history_failed _
 
 on load_more_history
-  return if history_loading || loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(messages) || !history_has_older(messages)
+  return if history_loading || loading || mutation_phase != MutationPhase.idle || empty(active_channel) || empty(messages) || !has_older_history
   history_loading = true
   error = ""
   run replace lane=history load_older_messages(connected_rpc, active_channel, oldest_message_seq(messages)) -> history_loaded _ | history_failed _
@@ -1068,7 +1090,9 @@ on history_loaded(next)
   // Older pages shift the bounded render window. The archive is still behind
   // the cursor; this flag keeps live-tail deltas out and exposes Jump to latest.
   history_view = true
-  has_older_history = next.has_more || history_has_older(messages)
+  // The older page's own `has_more` is the whole answer: it is the index
+  // saying whether anything precedes the page it just handed back.
+  has_older_history = next.has_more
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   error = ""
 

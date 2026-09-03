@@ -55,6 +55,19 @@ state
   chat_search_query = ""
   history_view = false
   has_older_history = false
+  // IS THE READER LOOKING AT NOW? The stream is bottom-anchored, so its offset
+  // counts from the tail and `chat_scrolled` publishes this on every real scroll
+  // step (`near_scroll_tail`). It gates the "Jump to latest" float, and it is
+  // TRUE by default because every route that mounts a fresh timeline mounts it
+  // at the tail — a room switch, a landing, a send.
+  chat_at_tail = true
+  // THE CHAIN THE ROOMS ON SCREEN WERE LEARNED FROM. A workspace switch does
+  // not change the endpoint, so a console can live right through one with no
+  // reconnect at all — and every resync fold only ever ADDS rows. Compared
+  // against `network_chain_id` (the node's own pushed status), this is what
+  // tells the resync that the list it is folding into belongs to a network
+  // this node has left. Empty until the first landing names one.
+  chat_chain_id = ""
 
   // Direct-message roster and the resolved peer for the active channel.
   dm_peers:[DmPeer] = []

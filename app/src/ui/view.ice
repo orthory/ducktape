@@ -225,6 +225,7 @@ view
               messages
               has_older_history
               history_view
+              at_live_tail=chat_at_tail
               history_loading
               unread_boundary
               unread_marker_seq
