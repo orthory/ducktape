@@ -71,8 +71,10 @@ fn message_action_toolbar_stays_compact_and_accessible() {
     assert!(components.contains("\"human\"\n        PersonAvatar initials plate=30.0 ink=11.0"));
     assert!(components.contains("\"agent\"\n        AgentAvatar initials plate=30.0 ink=11.0"));
     assert!(!components.contains("avatar_style"));
-    // Rich bodies render structured blocks, not one flattened string.
-    assert!(components.contains("for block in message.blocks"));
+    // Rich bodies render structured blocks, not one flattened string — through
+    // the one renderer every body in the app shares.
+    assert!(components.contains("RichBody blocks=message.blocks size=13.5"));
+    assert!(components.contains("for block in blocks"));
     assert!(components.contains("if block.kind == \"code\""));
     assert!(components.contains("flex w=fill wrap=wrap"));
     // The hover toolbar uses the shared popover depth role instead of
@@ -1280,7 +1282,10 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
 
     // ONE LINE MEASURE. Unbounded, the body ran ~130 characters at the default
     // window and ~320 maximized — past every readability bound there is.
-    assert!(components.contains("col w=fill max-w=760.0 gap=5.0"));
+    assert!(components.contains(
+        "col w=fill max-w=760.0\n    RichBody blocks=message.blocks size=13.5"
+    ));
+    assert!(components.contains("col w=fill gap=5.0\n    for block in blocks"));
 
     // GROUPING RHYTHM: 11px inside an author run, 25px across one (11 + the
     // 14px spacer). The spacer sits OUTSIDE the hover capsule, so the gap
@@ -1421,8 +1426,12 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         //    proposal's quorum dots, the nav bar. Bounded by the row that
         //    contains them, and the chat ones already sit inside the stream's
         //    own `lazy`, so they are built once per row change, not per frame.
-        ("components/chat.ice", "for block in message.blocks"),
+        // `RichBody` is the one markdown renderer: a chat row, a forge body
+        // and a review comment each hand it ONE body's blocks.
+        ("components/chat.ice", "for block in blocks"),
         ("components/chat.ice", "for reaction in message.reactions"),
+        // One review's inline comments, bounded by the review that holds them.
+        ("components/forge.ice", "for comment in review.comments"),
         (
             "components/kit.ice",
             "for seat in quorum_dots(proposal.approvals, proposal.required_yes)",

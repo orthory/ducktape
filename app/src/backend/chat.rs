@@ -229,17 +229,20 @@ pub(crate) fn huddle_roster(
     members: &[chat::index::HuddleEntry],
     reader: ChatReader<'_>,
 ) -> Vec<HuddleParticipant> {
-    let mine = reader.key.map(hex_encode);
     members
         .iter()
         .map(|member| {
-            let label = author_display(&format!("user:{}", member.user), reader.names);
+            let handle = format!("user:{}", member.user);
+            let label = author_display(&handle, reader.names);
             HuddleParticipant {
                 initials: initials_of(&label),
                 // The module refuses non-User authors ("only external users
                 // may join a huddle"), so every roster row is a person.
                 is_agent: false,
-                is_you: mine.as_deref() == Some(member.user.as_str()),
+                // The reader's ACCOUNT, not one key: a seat taken with the
+                // person's passkey or wallet is still their own seat, and a
+                // roster that could not recognise it wiped itself on load.
+                is_you: reader.is_me(&handle),
                 joined_at: number_i64(member.joined_at),
                 key: member.user.clone(),
                 node: member.node.clone(),

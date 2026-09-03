@@ -79,17 +79,22 @@ pub(crate) async fn read_accounts(client: &RpcClient) -> Result<Vec<AccountView>
     Ok(accounts)
 }
 
-/// The directory an account list binds: every key of an account carries the
-/// account's name.
+/// The directory an account list binds: every key of an account resolves to
+/// that account — its number and its name.
 pub(crate) fn directory_of(accounts: &[AccountView]) -> NameDirectory {
     NameDirectory::new(
         accounts
             .iter()
             .flat_map(|account| {
-                account
-                    .keys
-                    .iter()
-                    .map(move |key| (hex_encode(&key.pubkey), account.name.clone()))
+                account.keys.iter().map(move |key| {
+                    (
+                        hex_encode(&key.pubkey),
+                        BoundAccount {
+                            number: account.number,
+                            name: account.name.clone(),
+                        },
+                    )
+                })
             })
             .collect(),
     )

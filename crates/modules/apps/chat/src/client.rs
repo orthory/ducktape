@@ -61,16 +61,24 @@ pub struct ChatMember {
     pub label: String,
 }
 
-/// The network's name directory: the account name bound to each user key,
-/// keyed by the key's hex. Every surface that names a key names the account
-/// holding it; a key the directory does not know is named by its handle.
+/// The account a user key is bound to: its number (the identity, which the
+/// DM derivation and every "same person" test hang on) and its display name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundAccount {
+    pub number: u64,
+    pub name: String,
+}
+
+/// The network's name directory: the account bound to each user key, keyed
+/// by the key's hex. Every surface that names a key names the account holding
+/// it; a key the directory does not know is named by its handle.
 ///
 /// Names are display text, NOT identity — two accounts may share one — so
-/// nothing here compares names; the directory only answers "what is this key
-/// called".
+/// nothing here compares names; "the same person" is the account NUMBER, and
+/// a person's passkey, wallet and device key all resolve to one.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct NameDirectory {
-    names: BTreeMap<String, String>,
+    accounts: BTreeMap<String, BoundAccount>,
 }
 
 /// The directory a reader with no network in frame renders through: every
@@ -78,25 +86,30 @@ pub struct NameDirectory {
 static NOBODY_KNOWN: NameDirectory = NameDirectory::empty();
 
 impl NameDirectory {
-    pub fn new(names: BTreeMap<String, String>) -> Self {
-        Self { names }
+    pub fn new(accounts: BTreeMap<String, BoundAccount>) -> Self {
+        Self { accounts }
     }
 
     /// A directory that knows no one — the cold state before a network has
     /// been read.
     pub const fn empty() -> Self {
         Self {
-            names: BTreeMap::new(),
+            accounts: BTreeMap::new(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.accounts.is_empty()
     }
 
     /// The account name bound to a user key (hex), if any.
     pub fn name_of(&self, key_hex: &str) -> Option<&str> {
-        self.names.get(key_hex).map(String::as_str)
+        self.accounts.get(key_hex).map(|account| account.name.as_str())
+    }
+
+    /// The account number a user key (hex) is bound to, if any.
+    pub fn account_of(&self, key_hex: &str) -> Option<u64> {
+        self.accounts.get(key_hex).map(|account| account.number)
     }
 
     /// A member's label: the bound name, else the shortened key.
@@ -135,9 +148,22 @@ impl<'a> ChatReader<'a> {
         self.key.map(|key| format!("user:{}", hex_encode(key)))
     }
 
-    /// True when `handle` is the reader's own rendered handle.
-    fn is_me(&self, handle: &str) -> bool {
-        self.handle().as_deref() == Some(handle)
+    /// True when `handle` is the reader: the reader's own key, or another
+    /// key of the reader's ACCOUNT — a passkey or wallet the same person
+    /// signed with is still them.
+    pub fn is_me(&self, handle: &str) -> bool {
+        let Some(mine) = self.key.map(hex_encode) else {
+            return false;
+        };
+        let Some(("user", theirs)) = handle.split_once(':') else {
+            return false;
+        };
+        let same_key = theirs == mine;
+        let same_account = match (self.names.account_of(&mine), self.names.account_of(theirs)) {
+            (Some(my_account), Some(their_account)) => my_account == their_account,
+            _ => false,
+        };
+        same_key || same_account
     }
 }
 
@@ -2089,9 +2115,11 @@ mod tests {
         let mine = format!("user:{}", hex_encode(&me));
         let theirs = format!("user:{}", hex_encode(&[0xcd; 32]));
         let unbound = format!("user:{}", hex_encode(&[0xef; 32]));
+        let my_passkey = format!("user:{}", hex_encode(&[0x11; 32]));
         let names = NameDirectory::new(BTreeMap::from([
-            (hex_encode(&me), "alice".to_string()),
-            (hex_encode(&[0xcd; 32]), "bob".to_string()),
+            (hex_encode(&me), BoundAccount { number: 1, name: "alice".into() }),
+            (hex_encode(&[0x11; 32]), BoundAccount { number: 1, name: "alice".into() }),
+            (hex_encode(&[0xcd; 32]), BoundAccount { number: 2, name: "bob".into() }),
         ]));
 
         // The reader's own writing carries their account name, like anyone's.
@@ -2113,11 +2141,16 @@ mod tests {
             short_label(&hex_encode(&[0xef; 32]))
         );
 
-        // `by me` still hangs on the reader's KEY, never on a name.
+        // `by me` hangs on the reader's ACCOUNT, never on a name: the key
+        // itself, or another key the same account holds.
         let reader = ChatReader::new(Some(&me), &names);
         assert!(reacted_by_reader(std::slice::from_ref(&mine), reader));
+        assert!(reacted_by_reader(std::slice::from_ref(&my_passkey), reader));
         assert!(!reacted_by_reader(std::slice::from_ref(&theirs), reader));
         assert!(!reacted_by_reader(&[mine], ChatReader::nobody()));
+        // Two keys the directory does not know are two people.
+        let cold = ChatReader::new(Some(&me), ChatReader::nobody().names);
+        assert!(!reacted_by_reader(&[my_passkey], cold));
     }
 
     #[test]

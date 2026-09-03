@@ -13,6 +13,7 @@ use sdk::{Event, Msg, StateRoot};
 
 pub mod log_file;
 pub mod resource_limits;
+pub mod signed_req;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

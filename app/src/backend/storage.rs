@@ -493,9 +493,14 @@ pub async fn files_upload(
         let content = match bytes.len() as u64 <= 256 * 1024 {
             true => serde_json::json!({ "inline": { "b64": base64_encode(&bytes) } }),
             false => {
+                // A staged chunk is a raw-bytes write charged to the person,
+                // so each one is signed the way the commit below is.
+                let staging = rpc
+                    .clone()
+                    .with_write_auth(data_plane_signer(&rpc, password.clone()).await?);
                 let mut chunks = Vec::new();
                 for chunk in bytes.chunks(1024 * 1024) {
-                    chunks.push(rpc.files_stage(chunk.to_vec()).await?);
+                    chunks.push(staging.files_stage(chunk.to_vec()).await?);
                 }
                 serde_json::json!({ "chunks": { "size": bytes.len() as u64, "chunks": chunks } })
             }

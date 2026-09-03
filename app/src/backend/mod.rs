@@ -24,8 +24,9 @@ use zeroize::Zeroizing;
 // row types, the composer parsing, the optimistic merges, and the op-delta
 // splices. re-exported here because the Ice externs resolve `crate::backend`.
 pub use ::chat::client::{
-    CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember, ChatMessage,
-    ChatReaction, ChatReader, ChatSpan, NameDirectory, append_thread_page, author_display,
+    BoundAccount, CHAT_HOT_WINDOW_LIMIT, ChatBlock, ChatChannel, ChatDelta, ChatMember,
+    ChatMessage, ChatReaction, ChatReader, ChatSpan, NameDirectory, append_thread_page,
+    author_display,
     author_name, bounded_chat_window,
     bounded_thread_window, chat_message, contains_pending_message, mark_message_groups,
     merge_landing_messages, merge_message_send_result, merge_pending_messages,

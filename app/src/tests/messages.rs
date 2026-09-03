@@ -430,10 +430,12 @@ fn the_message_line_is_one_rich_text_paragraph() {
     // ONE paragraph, expanded by the widget's own `for` — no wrapping flex of
     // per-token `text` widgets, and no per-token link button.
     assert!(rich_line.contains(
-        "rich-text w=fill size=13.5 line-h=1.55 wrap=word-or-glyph color=accent_fg \
+        "rich-text w=fill size=size line-h=1.55 wrap=word-or-glyph color=accent_fg \
          -> emit(open_message_link, _)"
     ));
     assert!(rich_line.contains("for span in block.spans"));
+    // The prose scale is the BODY's to set: a chat row reads at 13.5.
+    assert!(components.contains("RichBody blocks=message.blocks size=13.5"));
     assert!(
         !rich_line.contains("flex") && !rich_line.contains("button"),
         "a token widget beside the paragraph is the #1071 workaround back"
