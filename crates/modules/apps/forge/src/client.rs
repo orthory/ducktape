@@ -9,7 +9,7 @@
 use crate::interface::PrDiff;
 use crate::tracker_iface::{ItemDetail, ItemState, ItemSummary, ReviewVerdict};
 use crate::{ForgeMsg, decode_msg};
-use chat::client::{author_handle, author_name};
+use chat::client::{ChatBlock, author_handle, author_name, paragraph_blocks};
 
 /// One tracker listing row.
 #[derive(Clone, Debug, Hash, PartialEq, Default)]
@@ -51,6 +51,8 @@ pub fn item_rows(items: &[ItemSummary]) -> Vec<ItemRow> {
 pub struct ReviewCommentRow {
     pub anchor: String,
     pub body: String,
+    /// the body through the chat tokenizer — see [`body_blocks`].
+    pub blocks: Vec<ChatBlock>,
 }
 
 /// One submitted review, rendered.
@@ -63,6 +65,8 @@ pub struct ReviewRow {
     /// `approve` | `request_changes` | `comment` (the wire's snake_case).
     pub verdict: String,
     pub body: String,
+    /// the body through the chat tokenizer — see [`body_blocks`].
+    pub blocks: Vec<ChatBlock>,
     /// the short source-head oid the review pinned.
     pub commit: String,
     /// the source branch moved past `commit` — early-GitHub "outdated".
@@ -83,6 +87,8 @@ pub struct ItemView {
     pub state: String,
     pub title: String,
     pub body: String,
+    /// the body through the chat tokenizer — see [`body_blocks`].
+    pub blocks: Vec<ChatBlock>,
     pub author: String,
     pub author_name: String,
     /// the block height the item was opened at.
@@ -121,6 +127,17 @@ pub struct ForgeRefresh {
     pub refs_moved: bool,
 }
 
+/// One prose body through the CHAT tokenizer — the same grammar a chat row
+/// is rendered with, so a `duck://` ref, a `[label](url)` and a bare
+/// `https://` in an issue, a PR description or a review comment become the
+/// same `Mark::Link` span the app opens through its one open plane. Forge
+/// prose is markdown wherever it is typed; it does not get a second dialect
+/// just because it was typed on this surface. No roster here, so a `@handle`
+/// stays plain ink (a forge body is not addressed to a channel).
+fn body_blocks(body: &str) -> Vec<ChatBlock> {
+    paragraph_blocks(body)
+}
+
 /// Build the item pane's view model from the committed detail + its pinned
 /// diff (PRs with a locally-computable patch; `None` for issues and for
 /// diff-query misses).
@@ -136,6 +153,7 @@ pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>) -> ItemView {
                 author_name: author_name(&handle),
                 author: handle,
                 verdict: verdict_key(review.verdict).into(),
+                blocks: body_blocks(&review.body),
                 body: review.body.clone(),
                 commit: short_oid(&review.commit_oid),
                 outdated: !source_oid.is_empty() && review.commit_oid != source_oid,
@@ -153,6 +171,7 @@ pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>) -> ItemView {
                                 crate::tracker_iface::DiffSide::New => "new",
                             }
                         ),
+                        blocks: body_blocks(&comment.body),
                         body: comment.body.clone(),
                     })
                     .collect(),
@@ -165,6 +184,7 @@ pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>) -> ItemView {
         kind: kind_key(detail.summary.kind).into(),
         state: state_key(detail.summary.state).into(),
         title: detail.summary.title.clone(),
+        blocks: body_blocks(&detail.body),
         body: detail.body.clone(),
         author_name: author_name(&author),
         author,
@@ -226,7 +246,10 @@ fn tally(reviews: &[ReviewRow]) -> (i64, i64) {
         if review.verdict == "comment" {
             continue;
         }
-        match latest.iter_mut().find(|(author, _)| *author == review.author) {
+        match latest
+            .iter_mut()
+            .find(|(author, _)| *author == review.author)
+        {
             Some(slot) => slot.1 = &review.verdict,
             None => latest.push((&review.author, &review.verdict)),
         }
@@ -329,7 +352,11 @@ mod tests {
         let view = item_view(
             &detail(vec![
                 review(0xaa, ReviewVerdict::Approve, current),
-                review(0xbb, ReviewVerdict::RequestChanges, "0000000000000000000000000000000000000000"),
+                review(
+                    0xbb,
+                    ReviewVerdict::RequestChanges,
+                    "0000000000000000000000000000000000000000",
+                ),
             ]),
             Some(&diff()),
         );
@@ -340,10 +367,47 @@ mod tests {
         assert_eq!(view.source_oid, current);
         assert_eq!(view.reviews.len(), 2);
         assert!(!view.reviews[0].outdated, "review at the head is current");
-        assert!(view.reviews[1].outdated, "review behind the head is outdated");
+        assert!(
+            view.reviews[1].outdated,
+            "review behind the head is outdated"
+        );
         assert_eq!(view.reviews[0].comments[0].anchor, "main.rs:1 (new)");
         assert_eq!(view.approvals, 1);
         assert_eq!(view.change_requests, 1);
+    }
+
+    /// Every forge prose surface — the item body, a review body, a review
+    /// comment — carries link spans, so the app opens what a body points at
+    /// instead of drawing it as dead ink.
+    #[test]
+    fn every_forge_body_tokenizes_its_links() {
+        let mut detail = detail(vec![review(
+            0xaa,
+            ReviewVerdict::Approve,
+            "1993a2e33fbf0f44a03fdddd213710957cffddf1",
+        )]);
+        detail.body = "see [the plan](duck://page/plan?net=d0cdf950)".into();
+        detail.reviews[0].body = "context at https://ducktape.industries/x".into();
+        detail.reviews[0].comments[0].body = "also [#58](duck://forge/lab/58)".into();
+        let view = item_view(&detail, None);
+
+        let links = |blocks: &[ChatBlock]| -> Vec<String> {
+            blocks
+                .iter()
+                .flat_map(|block| block.spans.iter())
+                .filter(|span| !span.link.is_empty())
+                .map(|span| span.link.clone())
+                .collect()
+        };
+        assert_eq!(links(&view.blocks), ["duck://page/plan?net=d0cdf950"]);
+        assert_eq!(
+            links(&view.reviews[0].blocks),
+            ["https://ducktape.industries/x"]
+        );
+        assert_eq!(
+            links(&view.reviews[0].comments[0].blocks),
+            ["duck://forge/lab/58"]
+        );
     }
 
     #[test]

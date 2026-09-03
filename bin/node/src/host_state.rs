@@ -174,7 +174,7 @@ fn disk_substrates(
 
 /// the per-network genesis values: the descriptor's code hashes (EXACTLY the
 /// production wasm set — the composer refuses any drift by name) plus the
-/// network bindings the store-backed tenants seed as their `__config` record.
+/// network bindings the network-bound tenants seed as their `__config` record.
 fn bindings<'a>(
     net: &NetworkBindings<'a>,
     validators: &'a [Vec<u8>],
@@ -664,11 +664,12 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "5afc6b438a907ca197256911f1bc79908d1bf3f96028a84f3de4a4a87a26c92d";
+        "9c9868f49dd7e321d377eb9d452ac1c45922c688fad80725c30d71cb25a39c87";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
-    /// because they are NOT: each rides its module's store as a genesis
-    /// `__config` record (the composer's `seed_store_config`), so a real
+    /// because they are NOT: each rides its module's genesis `__config`
+    /// record (the composer's `seed_store_config` for a store-backed tenant,
+    /// the `initial_state` install for a Map-backed one), so a real
     /// network's invite namespace and chain id put it on its own root by
     /// design. Pinning a hash only says anything against fixed ones.
     const PIN_BINDINGS: NetworkBindings<'static> = NetworkBindings {

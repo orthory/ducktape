@@ -216,13 +216,13 @@ component ChatMemberRow(member:ChatMember, disabled:bool)
 // already knows, and ONLY the link arm draws that rule: it marks a
 // destination, not an emphasis. Both keep brand ink; the plate versus the
 // rule is what tells a human from a destination.
-component RichLine(block:ChatBlock)
+component RichLine(block:ChatBlock, size:f64)
   emits
     open_message_link(str)
   rich-text -> emit(open_message_link, _)
     with
       w=fill
-      size=13.5
+      size=size
       line-h=1.55
       wrap=word-or-glyph
       color=accent_fg
@@ -249,8 +249,25 @@ component MessageBody(message:ChatMessage)
     with
       w=fill
       max-w=760.0
+    RichBody blocks=message.blocks size=13.5
+      forward
+        open_message_link
+
+// ONE MARKDOWN RENDERER FOR THE WHOLE APP. A body is a body: chat rows, forge
+// issue/PR descriptions and review comments all run the same tokenizer
+// (`chat::client::paragraph_blocks`) and land here, so a `duck://` ref, a
+// `[label](url)` and a bare `https://` are openable wherever prose is shown —
+// through the ONE open plane, never a second renderer with its own idea of
+// what a link is. `size` is the prose scale; a code fence keeps its own
+// monospace scale, which does not track the surrounding prose.
+component RichBody(blocks:[ChatBlock], size:f64)
+  emits
+    open_message_link(str)
+  col
+    with
+      w=fill
       gap=5.0
-    for block in message.blocks
+    for block in blocks
       if block.kind == "divider"
         Separator
       // A code fence is a QUIET slab: the near-surface tint + hairline reads
@@ -302,7 +319,7 @@ component MessageBody(message:ChatMessage)
               pt=2.0
               pb=2.0
             if block.rich
-              RichLine block=block
+              RichLine block=block size=size
                 forward
                   open_message_link
             // QUIETER THAN THE PROSE QUOTING IT, at the SAME leading the rich
@@ -314,7 +331,7 @@ component MessageBody(message:ChatMessage)
               text block.text
                 with
                   w=fill
-                  size=13.5
+                  size=size
                   line-h=1.55
                   wrap=word-or-glyph
                   @text-muted
@@ -327,14 +344,14 @@ component MessageBody(message:ChatMessage)
             space w=1.0 h=1.0
       if block.kind == "paragraph"
         if block.rich
-          RichLine block=block
+          RichLine block=block size=size
             forward
               open_message_link
         if !block.rich
           text block.text
             with
               w=fill
-              size=13.5
+              size=size
               line-h=1.55
               wrap=word-or-glyph
               @text-accent_fg

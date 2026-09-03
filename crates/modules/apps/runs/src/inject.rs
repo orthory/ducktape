@@ -196,10 +196,13 @@ fn classify_duck_url(url: &str, out: &mut DuckRefs) {
 /// order: each page's preorder subtree depth-first to markdown, an
 /// unresolvable page as a one-line marker, the whole section capped at
 /// [`PAGE_CONTEXT_BYTES`]. pure — same input, same bytes.
-pub(crate) fn render_pages_section(pages: &[(String, Option<Vec<Block>>)]) -> String {
+pub(crate) fn render_pages_section(
+    pages: &[(String, Option<Vec<Block>>)],
+    net_query: &str,
+) -> String {
     let rendered: Vec<String> = pages
         .iter()
-        .map(|(page_id, blocks)| render_page(page_id, blocks.as_deref()))
+        .map(|(page_id, blocks)| render_page(page_id, blocks.as_deref(), net_query))
         .collect();
     crate::truncate_on_boundary(
         &format!("Referenced pages:\n\n{}", rendered.join("\n\n")),
@@ -212,22 +215,20 @@ pub(crate) fn render_pages_section(pages: &[(String, Option<Vec<Block>>)]) -> St
 /// preorder subtree as one markdown line (nesting indents by tree depth; the
 /// parent of any block precedes it in preorder, so depth resolves in one
 /// pass). an unresolvable page is its one-line marker.
-fn render_page(page_id: &str, blocks: Option<&[Block]>) -> String {
+fn render_page(page_id: &str, blocks: Option<&[Block]>, net_query: &str) -> String {
     let Some((root, rest)) = blocks.and_then(|b| b.split_first()) else {
         return format!("[page {page_id} — not found]");
     };
     // the header IS the live ref: an agent echoing it produces a working chip
     // (the retired `[[page:]]` syntax would not).
     //
-    // it carries NO `?net=`, and every link the product mints elsewhere does.
-    // a module runs the same component bytes on every network, so the only
-    // way one learns its chain id is the genesis config (`topology::
-    // CONFIG_CHAIN_ID`, as `gateway` and `identity` take it) — wiring that
-    // into `runs` moves a production module's genesis state, so it is its own
-    // change. until then a run's produced link is the hand-typed case: it
-    // resolves against whichever network the reader is connected to, which is
-    // the one the run executed on in every path that exists today.
-    let mut out = format!("[{}](duck://page/{page_id})", root.text);
+    // it names its network in `?net=` like every other link the product mints
+    // — the module reads the chain id out of its genesis `__config` record
+    // (`topology::CONFIG_CHAIN_ID`), the only way a fixed component learns
+    // which network it is running on. an unwired chain id (dev tools, tests)
+    // renders the bare hand-typed form, which resolves against whichever
+    // network the reader is connected to.
+    let mut out = format!("[{}](duck://page/{page_id}{net_query})", root.text);
     let mut depth = BTreeMap::from([(root.id.as_str(), 0usize)]);
     for block in rest {
         let d = block
@@ -269,9 +270,9 @@ fn render_page(page_id: &str, blocks: Option<&[Block]>) -> String {
     out
 }
 
-fn page_render_reaches_budget(page_id: &str, blocks: &[Block]) -> bool {
+fn page_render_reaches_budget(page_id: &str, blocks: &[Block], net_query: &str) -> bool {
     let section_header_bytes = "Referenced pages:\n\n".len();
-    section_header_bytes.saturating_add(render_page(page_id, Some(blocks)).len())
+    section_header_bytes.saturating_add(render_page(page_id, Some(blocks), net_query).len())
         >= PAGE_CONTEXT_BYTES
 }
 
@@ -397,10 +398,11 @@ impl RunsModule {
         if refs.is_empty() {
             return None;
         }
+        let net_query = self.net_query();
         let mut resolved = Vec::new();
         for page_id in refs {
             if *remaining_queries == 0 {
-                let section = render_pages_section(&resolved);
+                let section = render_pages_section(&resolved, &net_query);
                 return Some(mark_page_section_truncated(section));
             }
             match self
@@ -410,16 +412,17 @@ impl RunsModule {
                 PageBlocksRead::Complete(blocks) => resolved.push((page_id, blocks)),
                 PageBlocksRead::Partial(blocks) => {
                     resolved.push((page_id, Some(blocks)));
-                    let section = render_pages_section(&resolved);
+                    let section = render_pages_section(&resolved, &net_query);
                     return Some(mark_page_section_truncated(section));
                 }
             }
-            let context_is_full = render_pages_section(&resolved).len() >= PAGE_CONTEXT_BYTES;
+            let context_is_full =
+                render_pages_section(&resolved, &net_query).len() >= PAGE_CONTEXT_BYTES;
             if context_is_full {
                 break;
             }
         }
-        Some(render_pages_section(&resolved))
+        Some(render_pages_section(&resolved, &net_query))
     }
 
     /// One committed page in preorder, assembled from bounded Pages replies.
@@ -496,7 +499,7 @@ impl RunsModule {
                 return partial_blocks(blocks);
             }
             let page_is_complete = page.next_after.is_none();
-            let render_is_full = page_render_reaches_budget(page_id, &blocks);
+            let render_is_full = page_render_reaches_budget(page_id, &blocks, &self.net_query());
             if page_is_complete || render_is_full {
                 return PageBlocksRead::Complete(Some(blocks));
             }
@@ -600,6 +603,9 @@ fn decode_attachment(bytes: &[u8]) -> Attachment {
 mod tests {
     use super::*;
     use crate::forge_source::{ForgeItem, ForgeItemKind, ForgeItemState};
+
+    /// the `?net=` of a network whose chain id is `<name>#d0cdf950`.
+    const TEST_NET: &str = "?net=d0cdf950";
 
     fn issue(body: &str) -> ForgeItem {
         ForgeItem {
@@ -829,10 +835,10 @@ mod tests {
 
     #[test]
     fn a_page_renders_headings_todos_lists_code_and_nesting_from_preorder() {
-        let section = render_pages_section(&[("plan".into(), Some(preorder_page()))]);
+        let section = render_pages_section(&[("plan".into(), Some(preorder_page()))], TEST_NET);
         assert!(section.starts_with("Referenced pages:"), "{section}");
         assert!(
-            section.contains("[Project Plan](duck://page/plan)"),
+            section.contains("[Project Plan](duck://page/plan?net=d0cdf950)"),
             "{section}"
         );
         assert!(section.contains("\nthe intro\n"), "{section}");
@@ -859,13 +865,16 @@ mod tests {
 
     #[test]
     fn a_missing_page_renders_the_one_line_marker() {
-        let section = render_pages_section(&[
-            ("plan".into(), Some(preorder_page())),
-            ("gone".into(), None),
-        ]);
+        let section = render_pages_section(
+            &[
+                ("plan".into(), Some(preorder_page())),
+                ("gone".into(), None),
+            ],
+            TEST_NET,
+        );
         assert!(section.contains("[page gone — not found]"), "{section}");
         // an empty reply Vec is as unresolvable as None.
-        let empty = render_pages_section(&[("void".into(), Some(Vec::new()))]);
+        let empty = render_pages_section(&[("void".into(), Some(Vec::new()))], TEST_NET);
         assert!(empty.contains("[page void — not found]"), "{empty}");
     }
 
@@ -880,7 +889,7 @@ mod tests {
                 &"x".repeat(128 * 1024),
             ),
         ];
-        let section = render_pages_section(&[("big".into(), Some(big))]);
+        let section = render_pages_section(&[("big".into(), Some(big))], TEST_NET);
         assert_eq!(section.len(), PAGE_CONTEXT_BYTES);
         assert!(
             section.ends_with(PAGE_TRUNCATION_MARKER),
@@ -900,7 +909,7 @@ mod tests {
                 &"é".repeat(64 * 1024),
             ),
         ];
-        let section = render_pages_section(&[("big".into(), Some(big))]);
+        let section = render_pages_section(&[("big".into(), Some(big))], TEST_NET);
         assert!(section.len() <= PAGE_CONTEXT_BYTES);
         assert!(section.len() > PAGE_CONTEXT_BYTES - 4);
         assert!(section.ends_with(PAGE_TRUNCATION_MARKER));
@@ -914,9 +923,40 @@ mod tests {
                 ("gone".to_string(), None),
             ]
         };
-        let a = render_pages_section(&pages());
-        let b = render_pages_section(&pages());
+        let a = render_pages_section(&pages(), TEST_NET);
+        let b = render_pages_section(&pages(), TEST_NET);
         assert_eq!(a.as_bytes(), b.as_bytes());
+    }
+
+    /// A page link the injector renders NAMES ITS NETWORK, from the chain id
+    /// the guest reads out of genesis config — so an agent echoing the header
+    /// into chat posts a link a reader on another network is REFUSED, instead
+    /// of one that silently resolves against their own store.
+    #[test]
+    fn a_rendered_page_link_carries_the_network_it_was_rendered_on() {
+        let on_a_network = RunsModule::new(
+            "runs", "chat", "saga", "tagging", "dispatch", "agent", None, None,
+        )
+        .with_chain_id("dognet#d0cdf950");
+        assert_eq!(on_a_network.net_query(), TEST_NET);
+        let section = render_pages_section(
+            &[("plan".into(), Some(preorder_page()))],
+            &on_a_network.net_query(),
+        );
+        assert!(
+            section.contains("[Project Plan](duck://page/plan?net=d0cdf950)"),
+            "{section}"
+        );
+        // an unwired chain id (dev tools, tests) renders the hand-typed form.
+        let nowhere = RunsModule::new(
+            "runs", "chat", "saga", "tagging", "dispatch", "agent", None, None,
+        );
+        assert_eq!(nowhere.net_query(), "");
+        let bare = render_pages_section(
+            &[("plan".into(), Some(preorder_page()))],
+            &nowhere.net_query(),
+        );
+        assert!(bare.contains("[Project Plan](duck://page/plan)"), "{bare}");
     }
 
     #[test]

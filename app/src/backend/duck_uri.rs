@@ -22,6 +22,10 @@
 //! `classify_duck_link` cannot make on its own.
 
 pub(crate) use crate::DuckKind;
+// THE `?net=` FORMAT IS SPELLED ONCE, in the crate that also tokenizes a
+// `duck://` run out of prose — the app and the in-consensus producer
+// (`runs::inject`) are both readers of that one definition.
+use ::chat::client::{chain_digest, duck_net_query as net_query, is_chain_digest};
 
 /// One classified link. Only the fields its `kind` names are meaningful;
 /// the rest are empty / zero.
@@ -123,25 +127,8 @@ fn query_net(query: &str) -> Option<String> {
         return Some(String::new());
     }
     let digest = query.strip_prefix("net=")?;
-    let minted = digest.len() == CHAIN_DIGEST_HEX
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    minted.then(|| digest.to_owned())
+    is_chain_digest(digest).then(|| digest.to_owned())
 }
-
-/// The chain id's hash half — `mint_chain_id` spells a chain id
-/// `<name>#<8 hex>` and only the hex rides a URI. "" for an unnamed chain.
-///
-/// Split from the RIGHT: `node init --name` validates nothing, so a network
-/// named `my#net` mints the chain id `my#net#a1b2c3d4`, and only the LAST `#`
-/// is the minted separator.
-fn chain_digest(chain_id: &str) -> &str {
-    chain_id.rsplit_once('#').map(|(_, hex)| hex).unwrap_or("")
-}
-
-/// How many hex characters `mint_chain_id` puts after the `#`.
-const CHAIN_DIGEST_HEX: usize = 8;
 
 /// The open plane's entry: the grammar, plus the one check the grammar cannot
 /// make on its own. A link that names a network OTHER than the connected one
@@ -171,16 +158,6 @@ pub fn foreign_network_error(link_net: String, connected_chain_id: String) -> St
     format!("this link belongs to network {link_net} — this app is on {here}")
 }
 
-/// The `?net=` a produced link carries, or "" when the app has no chain id
-/// yet. Every builder below goes through here, so a produced link cannot
-/// silently lose the half that makes the refusal possible.
-fn net_query(chain_id: &str) -> String {
-    let digest = chain_digest(chain_id);
-    match digest.is_empty() {
-        true => String::new(),
-        false => format!("?net={digest}"),
-    }
-}
 
 /// `duck://page/<id>?net=…` — the only handle on a page, whose id is a uuid.
 pub fn duck_page_link(page: String, chain_id: String) -> String {

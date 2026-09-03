@@ -362,7 +362,10 @@ fn page_reads_keep_accumulated_blocks_when_a_later_page_fails() {
         .fail_page_queries_after(1);
 
     let blocks = block_on(m.page_blocks(&ctx, "pages", "plan")).expect("first page survives");
-    let rendered = crate::inject::render_pages_section(&[("plan".into(), Some(blocks.clone()))]);
+    let rendered = crate::inject::render_pages_section(
+        &[("plan".into(), Some(blocks.clone()))],
+        &m.net_query(),
+    );
 
     assert_eq!(blocks.len(), usize::from(pages::MAX_PAGE_QUERY_LIMIT) + 1);
     assert_eq!(ctx.page_query_count(), 2);
@@ -381,7 +384,10 @@ fn page_reads_mark_the_reference_query_ceiling_as_truncated() {
     let ctx = CaptureCtx::new().with_page("plan", page_with_block_count(total, ""));
 
     let blocks = block_on(m.page_blocks(&ctx, "pages", "plan")).expect("partial page survives");
-    let rendered = crate::inject::render_pages_section(&[("plan".into(), Some(blocks.clone()))]);
+    let rendered = crate::inject::render_pages_section(
+        &[("plan".into(), Some(blocks.clone()))],
+        &m.net_query(),
+    );
 
     assert_eq!(blocks.len(), page_limit * query_limit + 1);
     assert_eq!(ctx.page_query_count(), query_limit);
@@ -455,7 +461,10 @@ fn page_reads_stop_when_the_render_budget_is_full() {
     let ctx = CaptureCtx::new().with_page("plan", page_with_block_count(total, &text));
 
     let blocks = block_on(m.page_blocks(&ctx, "pages", "plan")).expect("page exists");
-    let rendered = crate::inject::render_pages_section(&[("plan".into(), Some(blocks.clone()))]);
+    let rendered = crate::inject::render_pages_section(
+        &[("plan".into(), Some(blocks.clone()))],
+        &m.net_query(),
+    );
 
     assert_eq!(blocks.len(), page_limit);
     assert_eq!(ctx.page_query_count(), 1);

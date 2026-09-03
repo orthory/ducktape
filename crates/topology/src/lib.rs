@@ -100,7 +100,8 @@ impl ModuleTopology {
 /// tokens/join proofs against it).
 pub const CONFIG_INVITE: &str = "invite";
 /// genesis-config key: the identity chain id (identity/gateway scope their
-/// certificates and `.duck` routes to it).
+/// certificates and `.duck` routes to it; `runs` stamps the `?net=` half of
+/// every `duck://` link it renders into an agent's context with it).
 pub const CONFIG_CHAIN_ID: &str = "chain_id";
 
 const CHAIN_ID: &[&str] = &[CONFIG_CHAIN_ID];
@@ -129,7 +130,7 @@ const MODULES: &[ModuleSpec] = &[
     ModuleSpec { id: "kv", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
     ModuleSpec { id: "lifecycle", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
     store("pages", NONE),
-    ModuleSpec { id: "runs", config: NONE, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
+    ModuleSpec { id: "runs", config: CHAIN_ID, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
     store("saga", NONE),
     store("tagging", NONE),
     store("tasks", NONE),
@@ -309,8 +310,8 @@ mod tests {
         }
     }
 
-    /// The network-bound modules are exactly identity/gateway (chain id) and
-    /// governance (invite) — the `NetworkBindings` schema, pinned so a new
+    /// The network-bound modules are exactly identity/gateway/runs (chain id)
+    /// and governance (invite) — the `NetworkBindings` schema, pinned so a new
     /// network-bound module must register its keys here.
     #[test]
     fn network_bound_modules_are_pinned() {
@@ -319,9 +320,10 @@ mod tests {
             .filter(|m| !m.config.is_empty())
             .map(|m| m.id)
             .collect();
-        assert_eq!(bound, ["gateway", "governance", "identity"].into_iter().collect());
+        assert_eq!(bound, ["gateway", "governance", "identity", "runs"].into_iter().collect());
         assert_eq!(TOPOLOGY.config("identity"), CHAIN_ID);
         assert_eq!(TOPOLOGY.config("gateway"), CHAIN_ID);
+        assert_eq!(TOPOLOGY.config("runs"), CHAIN_ID);
         assert_eq!(TOPOLOGY.config("governance"), INVITE);
         assert_eq!(TOPOLOGY.config("chat"), NONE);
     }

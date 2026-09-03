@@ -408,7 +408,10 @@ impl RunsModule {
         let blocks = self
             .page_blocks_for_execute(ctx, pages, &page_id, budget)
             .await;
-        portable.context = Some(inject::render_pages_section(&[(page_id, blocks)]));
+        portable.context = Some(inject::render_pages_section(
+            &[(page_id, blocks)],
+            &self.net_query(),
+        ));
         let payload = envelope::render_page_comment_payload(
             agent,
             run_id,
