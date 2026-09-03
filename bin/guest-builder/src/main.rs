@@ -498,6 +498,14 @@ fn remap_flags(module_dir: &Path, scratch: &Path) -> String {
 
 fn build(scratch: &Path, rustflags: &str) -> Result<(), String> {
     let status = Command::new(cargo())
+        // deliberately NOT `--locked`, though [`synthesize`] seeds the lock:
+        // the scratch graph is a strict SUBSET of the host workspace's (one
+        // cdylib over one module, no app/node/test deps), so cargo must prune
+        // ~1000 entries out of the seeded lock, and a prune is a lock update
+        // `--locked` refuses outright ("cannot update the lock file ...
+        // because --locked was passed"). Seeding already carries the
+        // reproducibility: cargo reuses a locked version wherever the entry
+        // survives the prune, so nothing re-resolves against the live registry.
         .args(["build", "--target", "wasm32-unknown-unknown", "--release"])
         .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
         // the encoded form wins over the plain one, but an inherited

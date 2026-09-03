@@ -87,6 +87,10 @@ const SPEC_VERSION: u64 = 1;
 /// at spawn; anything over an hour is a hang, not a job.
 const TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 1..=3600;
 
+/// bounds for `[invoke].hard_timeout_factor` — a zero factor would kill every
+/// child at spawn; past 1000 idle windows the ceiling stops bounding anything.
+const HARD_TIMEOUT_FACTOR_RANGE: std::ops::RangeInclusive<u32> = 1..=1000;
+
 /// a validated capability spec — the parsed, checked form of one TOML file.
 /// construction goes through [`CapabilitySpec::parse`] only, so holding one
 /// is proof the invariants documented on each field hold.
@@ -115,6 +119,14 @@ pub struct CapabilitySpec {
     /// per-job wall-clock budget; the child is killed at the deadline.
     /// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` overrides ALL specs at once.
     pub timeout_secs: u64,
+    /// the hard ceiling on one child's lifetime, as a multiple of its idle
+    /// timeout: `timeout_secs` bounds SILENCE (any output refreshes it — long
+    /// agentic runs that keep streaming are never killed mid-work), and
+    /// `idle × this` bounds even a continuously-chatty child, guarding the
+    /// host's own resources. the RUN's committed outcome is bounded by the
+    /// saga's consensus deadline regardless — this factor only decides how
+    /// long this host keeps paying for one child.
+    pub hard_timeout_factor: u32,
     /// which named stdout parser extracts the assistant's final text.
     pub output: OutputFormat,
     /// optional `[isolation]` — the auth path: a host-owned broker
@@ -423,10 +435,16 @@ struct RawInvoke {
     prompt: String,
     #[serde(default = "default_timeout")]
     timeout_secs: u64,
+    #[serde(default = "default_hard_timeout_factor")]
+    hard_timeout_factor: u32,
 }
 
 fn default_timeout() -> u64 {
     300
+}
+
+fn default_hard_timeout_factor() -> u32 {
+    36
 }
 
 #[derive(Deserialize)]
@@ -556,6 +574,13 @@ impl CapabilitySpec {
                 raw.invoke.timeout_secs
             ));
         }
+        if !HARD_TIMEOUT_FACTOR_RANGE.contains(&raw.invoke.hard_timeout_factor) {
+            return Err(format!(
+                "{origin}: invoke.hard_timeout_factor must be within \
+                 {HARD_TIMEOUT_FACTOR_RANGE:?}, got {}",
+                raw.invoke.hard_timeout_factor
+            ));
+        }
         let output = match raw.output.format.as_str() {
             "jsonl-events" => OutputFormat::JsonlEvents,
             "json-result" => OutputFormat::JsonResult,
@@ -580,6 +605,7 @@ impl CapabilitySpec {
                 env: raw.detect.env,
                 args: raw.invoke.args,
                 timeout_secs: raw.invoke.timeout_secs,
+                hard_timeout_factor: raw.invoke.hard_timeout_factor,
                 output,
                 isolation,
                 context,
@@ -783,6 +809,26 @@ format = "text"
 
         let bad_timeout = base.replace(r#"prompt = "stdin""#, "prompt = \"stdin\"\ntimeout_secs = 0");
         assert!(CapabilitySpec::parse(&bad_timeout, "t").unwrap_err().contains("timeout_secs"));
+
+        // the hard ceiling rides the same table: absent = 36, out of range = refused.
+        assert_eq!(
+            CapabilitySpec::parse(&base, "t").unwrap().hard_timeout_factor,
+            36,
+            "absent hard_timeout_factor defaults"
+        );
+        let tuned = base.replace(
+            r#"prompt = "stdin""#,
+            "prompt = \"stdin\"\nhard_timeout_factor = 12",
+        );
+        assert_eq!(CapabilitySpec::parse(&tuned, "t").unwrap().hard_timeout_factor, 12);
+        for bad in ["0", "1001"] {
+            let broken = base.replace(
+                r#"prompt = "stdin""#,
+                &format!("prompt = \"stdin\"\nhard_timeout_factor = {bad}"),
+            );
+            let err = CapabilitySpec::parse(&broken, "t").unwrap_err();
+            assert!(err.contains("hard_timeout_factor"), "wanted the field named in {err:?}");
+        }
     }
 
     #[test]

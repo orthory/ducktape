@@ -57,15 +57,6 @@ use rand::RngCore as _;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-/// the hard ceiling on one child's lifetime, as a multiple of its idle
-/// timeout: `spec.timeout_secs` bounds SILENCE (any output refreshes it —
-/// long agentic runs that keep streaming are never killed mid-work), and
-/// `idle × this` bounds even a continuously-chatty child, guarding the
-/// host's own resources. the RUN's committed outcome is bounded by the
-/// saga's consensus deadline regardless — this factor only decides
-/// how long this host keeps paying for one child.
-const HARD_TIMEOUT_FACTOR: u32 = 36;
-
 /// how long a cancelled child process group gets to handle SIGTERM before the
 /// host escalates to SIGKILL. A microVM needs no such budget — the VMM is a
 /// child of this process and `kill_on_drop` takes the whole guest with it.
@@ -509,8 +500,11 @@ pub(crate) struct CliProvider {
     workdir: PathBuf,
     /// the IDLE window, not a wall clock: any child output refreshes it, so
     /// a streaming agentic run outlives it freely; only silence this long
-    /// kills the child. `idle × HARD_TIMEOUT_FACTOR` is the absolute cap.
+    /// kills the child. `idle × hard_timeout_factor` is the absolute cap.
     timeout: Duration,
+    /// the spec's `[invoke].hard_timeout_factor`: `timeout × this` is the wall
+    /// clock at which even a continuously-chatty child is killed.
+    hard_timeout_factor: u32,
     /// optional live per-line output sink. `None` means no output lines are
     /// forwarded; stdout/stderr are still accumulated for the existing parse
     /// and error contracts.
@@ -566,11 +560,13 @@ impl CliProvider {
             std::process::id()
         ));
         let timeout = Duration::from_secs(spec.timeout_secs);
+        let hard_timeout_factor = spec.hard_timeout_factor;
         Self {
             spec,
             bin,
             workdir,
             timeout,
+            hard_timeout_factor,
             output_sink: None,
             backend,
             agent_volume: None,
@@ -2459,7 +2455,7 @@ impl CliProvider {
                 .map(|invocation| &invocation.endpoint),
         };
         let idle = self.timeout;
-        let hard = tokio::time::Instant::now() + idle.saturating_mul(HARD_TIMEOUT_FACTOR);
+        let hard = tokio::time::Instant::now() + idle.saturating_mul(self.hard_timeout_factor);
         if let Some(invocation) = &broker_invocation {
             invocation.arm(hard);
         }
@@ -2550,7 +2546,7 @@ impl CliProvider {
         // child dies at the window. a CLI that is quiet by design (claude -p
         // prints one result object at the end) keeps exactly the old
         // semantics: its silence budget is the spec's timeout. the hard
-        // ceiling ([`HARD_TIMEOUT_FACTOR`] × idle) guards this host's
+        // ceiling (the spec's `hard_timeout_factor` × idle) guards this host's
         // resources against a chatty-forever child; the RUN's outcome is
         // bounded by the saga's consensus deadline regardless.
         let mut explicit_deadline = broker_invocation
@@ -2680,9 +2676,10 @@ impl CliProvider {
                     return Err(if now >= hard {
                         format!(
                             "{} timed out: still running at the hard cap of {:?} \
-                             ({HARD_TIMEOUT_FACTOR}x the idle window; child killed)",
+                             ({}x the idle window; child killed)",
                             self.bin.display(),
-                            idle.saturating_mul(HARD_TIMEOUT_FACTOR)
+                            idle.saturating_mul(self.hard_timeout_factor),
+                            self.hard_timeout_factor
                         )
                     } else {
                         format!(
@@ -3026,7 +3023,7 @@ fn excerpt(s: &str) -> String {
 /// per spec: the `detect.env` override wins (broken override = loud warning +
 /// absent capability), else the first executable `detect.bin` on `PATH`.
 /// `DUCKTAPE_PROVIDER_TIMEOUT_SECS` overrides every spec's IDLE timeout at
-/// once (refreshed by child output; see [`HARD_TIMEOUT_FACTOR`]).
+/// once (refreshed by child output; the spec's `hard_timeout_factor` caps it).
 /// what discovery finds is exactly what the node announces.
 ///
 /// `output_sink` installs a live tail on every discovered CLI provider.
@@ -4906,7 +4903,7 @@ printf '{"type":"turn.completed"}\n'"#,
     #[tokio::test]
     async fn a_chatty_forever_cli_is_killed_at_the_hard_cap() {
         // the ceiling behind the refresh: a child that streams forever is
-        // still bounded — idle × HARD_TIMEOUT_FACTOR ends it.
+        // still bounded — idle × the spec's hard_timeout_factor ends it.
         let dir = scratch("chatty");
         let bin = fake_cli(
             &dir,
@@ -4921,7 +4918,8 @@ printf '{"type":"turn.completed"}\n'"#,
         assert!(
             start.elapsed() >= Duration::from_millis(1500)
                 && start.elapsed() < Duration::from_secs(5),
-            "killed at ~idle × {HARD_TIMEOUT_FACTOR}, not the idle window: {:?}",
+            "killed at ~idle × {}, not the idle window: {:?}",
+            p.hard_timeout_factor,
             start.elapsed()
         );
     }

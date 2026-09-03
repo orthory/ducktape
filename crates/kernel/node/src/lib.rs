@@ -12,6 +12,7 @@ use host::{BlockContext, Host, MemberOutcome};
 use sdk::{Event, Msg, StateRoot};
 
 pub mod log_file;
+pub mod resource_limits;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

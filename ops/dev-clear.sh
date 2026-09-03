@@ -21,6 +21,11 @@ WSDIR="$DUCK/workspaces/$ID"
 log(){ printf '\033[36m[dev-clear]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[dev-clear] %s\033[0m\n' "$*" >&2; exit 1; }
 
+# One string field out of the node's flat `{"error":…,"reason":…}` refusal body.
+# `reason` is a snake_case token, so `[^"]*` is exact for it; the `error`
+# sentence would truncate at an escaped quote, which is fine for a log line.
+json_string(){ sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+
 # Candidate discovery is a `pgrep -f` sweep for the workspace path: nothing
 # writes a pidfile, so the sweep is what finds a node left by a seed or an older
 # dev loop. Admission is deliberately narrow: mentioning this workspace in an
@@ -79,12 +84,23 @@ if [ -n "$(node_pids)" ]; then
   elif [ ! -r "$WSDIR/admin.token" ]; then
     log "no readable admin token — using the PID sweep"
   else
-    CODE="$(curl -s -o /dev/null -w '%{http_code}' -m 2 \
+    # Capture the BODY as well as the status: the node NAMES its own refusal
+    # there (`{"error":…,"reason":…}`, crates/noded/src/admin.rs), and throwing
+    # it away is what made a refusal indistinguishable from a stop. The token is
+    # printed verbatim — one invented here greps to nothing.
+    RESPONSE="$(curl -s -m 2 -w '\n%{http_code}' \
       -X POST "http://$LISTEN/v1/admin/shutdown" \
       -H "x-ducktape-admin-token: $(<"$WSDIR/admin.token")" 2>/dev/null)"
+    CODE="${RESPONSE##*$'\n'}"
+    BODY="${RESPONSE%$'\n'*}"
+    REASON="$(printf '%s' "$BODY" | json_string reason)"
+    SENTENCE="$(printf '%s' "$BODY" | json_string error)"
+    # A route the node never mounted 404s with an empty body and an unreachable
+    # port answers 000 with none — then the status is the whole diagnosis.
+    DETAIL="${REASON:+reason=$REASON}${SENTENCE:+${REASON:+ }$SENTENCE}"
     case "$CODE" in
       2*) log "node accepted graceful shutdown" ;;
-      *) log "graceful shutdown did not succeed (http ${CODE:-none}) — using the PID sweep" ;;
+      *) log "graceful shutdown refused (http ${CODE:-none})${DETAIL:+: $DETAIL} — using the PID sweep" ;;
     esac
     for _ in $(seq 1 20); do [ -z "$(node_pids)" ] && break; sleep 0.1; done
   fi

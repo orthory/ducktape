@@ -1,48 +1,71 @@
-# Coordinator Deployment Recipe (`relay.ducktape.industries`)
+# Coordinator (`relay.ducktape.industries`)
 
-How to run `bin/coordinator` as `relay.ducktape.industries`: an **untrusted,
-non-validator reachability helper** that lets two NAT'd validators find each
-other and hole-punch a direct path. Its optional TCP lane carries only sealed
-first-contact admission datagrams when UDP setup is exhausted; it never carries
-the established overlay or peer data. This runbook, the coordinator code, and
-the regression tests are the maintained source of record for the trust model
-and operating contract.
+How to run `bin/coordinator`: an **untrusted, non-validator reachability
+helper** that lets two NAT'd members find each other and hole-punch a direct
+WireGuard path, plus a TCP lane that relays exactly one thing — a joiner's
+sealed first-contact intro — when every UDP path to an inviter is exhausted.
+It never carries the established overlay or peer data. The node-side plane it
+serves is `docs/records/architecture/reachability.md`; the deploy artifacts
+are `ops/coordinator/`.
 
-> **Scope honesty.** Everything on this page **works today**: `bin/coordinator`
-> runs as-is and its `--listen` invocation is regression-proven by
-> `bin/coordinator/tests/deploy_smoke.rs`. On the other end, the node-side
-> reachability plane is wired behind `wireguard_listen`: `bin/node` constructs a
-> `reachability::NatResolver` (reflexive discovery, `register`, hole-punch
-> against the configured coordinators) only when `wireguard_listen` is
-> configured. v1 `Coordinated` hints are consumed as reachability routes.
-> The TCP/443 relay lane is the **joiner's first-contact fallback**: when every
-> UDP path to an inviter is exhausted, the joiner re-races its sealed intro
-> through `<coordinator host>:443`, an address it derives from its ambient
-> coordinator and never from the invite (`bin/node/src/replica/wiring.rs`,
-> `coordinator_relays`). Nothing after first contact rides a relay — the
-> established WireGuard tunnel and every per-use plane on it are still
-> NAT-dependent. The cross-machine procedure is
-> [the runbook](cross-machine-zero-exposure-runbook.md).
+## What it is
 
-## Why this is safe (untrusted by design)
+`coordinator --listen <addr> --relay-listen <addr|none> --workers <1|4>`
+(defaults: UDP `0.0.0.0:3478`, TCP `0.0.0.0:443`, one worker). It is
+stateless. The UDP control socket provides two services:
+
+- **Rendezvous** — peers `register` their key and `lookup` each other; a
+  `Lookup` fans a `PunchSync` to both sides so they simultaneous-open.
+- **STUN reflexive** — answers a `BindRequest` with the peer's observed
+  public `ip:port` so it can learn its own NAT-mapped address.
+
+The TCP listener is a bounded fallback for the sealed first-contact intro
+only. It resolves a member through the same live advert book, forwards one
+opaque datagram, and returns the member's opaque reply. It is not a
+WireGuard-over-TCP or general peer-data relay. Keep it on: a joiner assumes it
+at `<coordinator host>:443` and is never told otherwise, so `--relay-listen
+none` is a deliberate "members behind a non-punching NAT cannot join through
+this coordinator" decision, not a footprint trim.
+
+Registrations have a lifetime: a `register`/`readvertise` mapping expires
+`REGISTRATION_TTL_SECS` after the last accepted advert; an expired key
+resolves to `None` and receives no `PunchSync` (its NAT pinhole is long dead
+anyway). Live nodes hold their mapping with a keepalive `Readvertise` every
+`RENDEZVOUS_KEEPALIVE`, which doubles as the NAT-pinhole keepalive. The book
+heals itself across coordinator restarts — the same keepalives re-register
+everyone within one interval (their nonces are wall-clock-seeded, so a
+rebooted node supersedes its own stale mapping instead of being rejected as a
+replay).
+
+Everything it answers derives from the **observed source** of the datagram, so
+a wildcard `--listen 0.0.0.0:3478` bind is fully functional on a single-IP
+host. **Multi-homed caveat:** on a box with more than one routable IP, bind the
+concrete public IP peers dial. Replies from a wildcard-bound UDP socket egress
+with the kernel's route-chosen source address, and `NatClient` (correctly)
+discards any reply that does not come from the exact address it dialed — so a
+coordinator answering from the "wrong" IP looks healthy while every client
+times out.
+
+No disk. No secret. On bind it prints `coordinator listening on <addr>` and,
+when enabled, `coordinator relay listening on tcp/<addr>` to stderr, then
+serves.
+
+## Why it is safe to run untrusted
 
 The two planes this coordinator sits beside are both authenticated and
-end-to-end encrypted **without** the coordinator:
+end-to-end encrypted **without** it:
 
 - The **control mesh** is commonware `authenticated::discovery`: a dialer dials
   an address and expects a specific `ed25519` public key; the handshake
   authenticates that key regardless of what network path delivered the bytes
-  (same property that makes the Phase-1 [sentry](sentry-deployment.md) safe).
-- The **data tunnel** is validator↔validator **WireGuard**, keyed and encrypted
-  between the two validators' own keys.
+  (the same property that makes a [sentry](sentry-deployment.md) safe).
+- The **data tunnel** is member↔member **WireGuard**, keyed and encrypted
+  between the two members' own keys.
 
-So the coordinator sits beside those planes as a rendezvous point. What a
-compromised or malicious coordinator **cannot** do is the load-bearing
+What a compromised or malicious coordinator **cannot** do is the load-bearing
 guarantee: it **holds no key, and cannot decrypt, impersonate, forge, serve
-state, or join consensus** — WireGuard's end-to-end encryption and the
-`authenticated::discovery` dial-expects-key handshake hold regardless of what
-path delivers the bytes. Therefore it is safe to run as **throwaway infra with
-no key on the box**. The hardening in
+state, or join consensus**. Therefore it is safe to run as **throwaway infra
+with no key on the box**. The hardening in
 `ops/coordinator/ducktape-coordinator.service` makes that structural: if a
 reviewer can find a place a secret *would* live on this host, the recipe is
 wrong.
@@ -69,48 +92,6 @@ wrong.
 > one's leverage. Do not treat a stranger's coordinator as neutral: it cannot
 > steal your keys or your data, but it can watch and throttle the connections
 > that depend on it.
-
-## What it is
-
-`coordinator --listen <addr> --relay-listen <addr|none> --workers <1|4>`
-(defaults: UDP `0.0.0.0:3478`, TCP `0.0.0.0:443`, one worker). It is stateless.
-The UDP control socket provides two services:
-
-- **Rendezvous** — peers `register` their key and `lookup` each other; a
-  `Lookup` fans a `PunchSync` to both sides so they simultaneous-open.
-- **STUN reflexive** — answers a `BindRequest` with the peer's observed
-  public `ip:port` so it can learn its own NAT-mapped address.
-
-The optional TCP listener is a bounded fallback for the sealed first-contact
-intro only. It resolves a member through the same live advert book, forwards
-one opaque datagram, and returns the member's opaque reply. It is not a
-WireGuard-over-TCP or general peer-data relay. Keep it on: a joiner assumes
-it at `<coordinator host>:443` and is never told otherwise, so
-`--relay-listen none` is a deliberate "members behind a non-punching NAT
-cannot join through this coordinator" decision, not a footprint trim.
-
-Registrations have a lifetime: a `register`/`readvertise` mapping expires
-`REGISTRATION_TTL_SECS` (120 s) after the last accepted advert; an expired key
-resolves to `None` and receives no `PunchSync` (its NAT pinhole is long dead
-anyway). Live nodes hold their mapping with a 25 s keepalive `Readvertise`
-(`reachability::RENDEZVOUS_KEEPALIVE`), which doubles as the NAT-pinhole
-keepalive. The book heals itself across coordinator restarts — the same
-keepalives re-register everyone within one interval (their nonces are
-wall-clock-seeded, so a rebooted node supersedes its own stale mapping instead
-of being rejected as a replay).
-
-Everything it answers derives from the **observed source** of the datagram, so
-a wildcard `--listen 0.0.0.0:3478` bind is fully functional on a single-IP
-host. **Multi-homed caveat:** on a box with more than one routable IP, bind the
-concrete public IP peers dial. Replies from a wildcard-bound UDP socket egress
-with the kernel's route-chosen source address, and `NatClient` (correctly)
-discards any reply that does not come from the exact address it dialed — so a
-coordinator answering from the "wrong" IP looks healthy while every client
-times out.
-
-No disk. No secret. On bind it prints `coordinator listening on <addr>` and,
-when enabled, `coordinator relay listening on tcp/<addr>` to stderr, then
-serves.
 
 ## Auth modes
 
@@ -141,17 +122,28 @@ The systemd and container recipes select `--workers 4` and set
 `MALLOC_ARENA_MAX=1` to avoid glibc reserving a large virtual arena per worker.
 Use `--workers 1` on a single-vCPU or minimum-footprint host.
 
-## Metrics, cross-host load, flood, and soak
+## Logs and metrics
+
+The bind announcements and the metrics rows are bare parseable lines on
+stderr; everything else is `tracing` on the `ducktape::reachability` plane
+with a `reason` on every refusal, relay session, advert eviction and
+unresolved lookup. `RUST_LOG` ADDS to the `info` floor, so
+`RUST_LOG=ducktape::reachability=debug` turns the plane up without turning
+anything else off.
 
 The server emits one parseable `coordinator_metrics` line every
 `--metrics-interval` seconds (default 10; `0` disables it). Counters are
 cumulative. `cpu_pct` is process CPU across all coordinator threads, so four
 fully busy auth workers can approach 400%. `rss_mib` and the
 `inflight`/`inflight_max`/`saturated` fields make bounded overload and recovery
-visible without opening a metrics socket.
+visible without opening a metrics socket, and every row carries
+`relay=on|off`.
+
+### Cross-host load, flood, and soak
 
 Build both executables, put `coordinator` on the server host and
-`coordinator-load` on a different host, then run the baseline:
+`coordinator-load` (`bin/coordinator/src/bin/coordinator-load.rs`) on a
+different host, then run the baseline:
 
 ```sh
 cargo build --release -p coordinator-bin --bins
@@ -172,15 +164,14 @@ done
 The default output is a compact comparison table with end-to-end p99, drops,
 request/flood rates, and load-host CPU; use `--output log` for stable
 `key=value` ingestion. The matching grouped server metrics rows supply
-coordinator CPU/RSS and show whether the 260-request bounded window saturated.
-Each valid client reuses one signed, response-correlated request, refreshes its
-timestamp every 20 seconds, and rotates the correlation key after a timeout.
-That keeps late replies out of later latency samples without making load-host
-signing throughput the benchmark's ceiling.
-Latency uses fixed 0.1 ms buckets up to the configured timeout, so a 24-hour
-run keeps constant memory instead of retaining every sample.
+coordinator CPU/RSS and show whether the bounded window saturated. Each valid
+client reuses one signed, response-correlated request, refreshes its timestamp
+periodically, and rotates the correlation key after a timeout, so late replies
+stay out of later latency samples without making load-host signing throughput
+the benchmark's ceiling. Latency uses fixed 0.1 ms buckets up to the
+configured timeout, so a 24-hour run keeps constant memory.
 
-Run a real invalid-signature flood while retaining a valid probe, followed by a
+An invalid-signature flood while retaining a valid probe, followed by a
 valid-only recovery phase:
 
 ```sh
@@ -189,25 +180,24 @@ valid-only recovery phase:
 ```
 
 Invalid packets use a fresh claimed public key but a different signing key and
-refresh their timestamp every 10 seconds, so they exercise Ed25519 rejection
-rather than the cheaper stale-request check. Recovery passes only if at least
-one valid response arrives after the flood stops; on the server,
-`rejected` rises during the flood and `inflight` returns to zero afterward.
+refresh their timestamp, so they exercise Ed25519 rejection rather than the
+cheaper stale-request check. Recovery passes only if at least one valid
+response arrives after the flood stops; on the server, `rejected` rises during
+the flood and `inflight` returns to zero afterward.
 
-The same bounded-memory probe is the 24-hour soak; interval rows keep the run
-observable without retaining every latency sample:
+The same bounded-memory probe is the 24-hour soak:
 
 ```sh
 ./coordinator-load --target SERVER_IP:3478 --duration 86400 --clients 16 \
   --rate 1000 --timeout-ms 1000 --report-interval 60 | tee coordinator-soak.log
 ```
 
-Keep the corresponding server metrics log. A useful soak artifact therefore
-contains minute p99/drop rows plus CPU, RSS, saturation, send-error, and recovery
+Keep the corresponding server metrics log: a useful soak artifact contains
+minute p99/drop rows plus CPU, RSS, saturation, send-error, and recovery
 evidence from the server. Omit `--rate` only when the soak host can sustain an
 unlimited run without disturbing colocated services. Do not add `NodeKey`
-sharding unless this cross-host profile shows the ordered state actor—not
-signature verification or UDP drops—has become the measured bottleneck.
+sharding unless this cross-host profile shows the ordered state actor — not
+signature verification or UDP drops — has become the measured bottleneck.
 
 ## Deploy A — systemd (bare VPS)
 
@@ -252,10 +242,10 @@ replaced at will.
 
 A relay bind failure does **not** stop the unit: the coordinator keeps
 serving UDP, logs `relay_lane_disabled` at ERROR on boot (with the fix in the
-message), and every `coordinator_metrics` row thereafter says `relay=off`. Joiners derive
-their fallback as `<this host>:443` regardless, so treat `relay=off` on a
-public coordinator as an outage for every member behind a NAT that cannot
-hole-punch.
+message), and every `coordinator_metrics` row thereafter says `relay=off`.
+Joiners derive their fallback as `<this host>:443` regardless, so treat
+`relay=off` on a public coordinator as an outage for every member behind a NAT
+that cannot hole-punch.
 
 ## Deploy B — Docker / OCI
 
@@ -289,9 +279,8 @@ The image is multi-stage: a `rust:1.96-bookworm` build stage compiles exactly
 `-p coordinator-bin`, and the runtime stage is
 `gcr.io/distroless/cc-debian12:nonroot` — glibc + libgcc for the
 dynamically-linked binary, **no shell, no package manager**, running as the
-built-in non-root uid `65532`. The `docker run` flags above are not optional
-decoration — they mirror the systemd unit's posture and are the container-side
-equivalent of its single-capability set and read-only root:
+built-in non-root uid `65532`. The `docker run` flags mirror the systemd
+unit's posture and are not optional decoration:
 
 - `--cap-drop=ALL` — the container needs **no** Linux capability. The unit
   holds `CAP_NET_BIND_SERVICE` for exactly one reason, binding the relay lane
@@ -304,13 +293,11 @@ equivalent of its single-capability set and read-only root:
   comes back after a crash or reboot. Drop it (and add `--rm`) only for a
   throwaway smoke run.
 
-Keep these: the whole premise is that a compromised coordinator has nothing to
-steal and nowhere to write. Publish exactly the two ports (not
-`--network host`). The `-p 443:8443/tcp` map is load-bearing: a joiner
-derives the relay as `<coordinator host>:443` and is never told otherwise, so
-a container without it (or run with `--relay-listen none`) is the `relay=off`
-outage the systemd section describes — every member behind a non-punching
-NAT is locked out.
+Publish exactly the two ports (not `--network host`). The `-p 443:8443/tcp`
+map is load-bearing: a joiner derives the relay as `<coordinator host>:443`
+and is never told otherwise, so a container without it (or run with
+`--relay-listen none`) is the `relay=off` outage the systemd section describes
+— every member behind a non-punching NAT is locked out.
 
 ## DNS + firewall
 
@@ -320,10 +307,10 @@ NAT is locked out.
 
 ## Redundancy — the coordinator is not load-bearing
 
-Run **multiple** coordinators. A v1 invite carries a `Vec` of reach hints and
-`NatClient::discover_reflexive_failover` walks them, so a single
-coordinator outage is not fatal to entry. A tunnel punched to a peer's **own**
-address (a direct signed endpoint, or a reflexive that stayed valid) survives a
+Run **multiple** coordinators. An invite carries a `Vec` of reach hints and
+`NatClient::discover_reflexive_failover` walks them, so a single coordinator
+outage is not fatal to entry. A tunnel punched to a peer's **own** address (a
+direct signed endpoint, or a reflexive that stayed valid) survives a
 coordinator restart entirely — only *new* rendezvous depends on a live
 coordinator. The one caveat is the relay case above: if a **malicious**
 coordinator made itself a peer's underlay endpoint, that tunnel rides *it*, so
@@ -331,21 +318,55 @@ that tunnel does depend on it (and it can drop it) — which is exactly why you
 run coordinators you trust and prefer direct signed endpoints. This is still a
 sharp contrast with an in-path [sentry](sentry-deployment.md), which is
 *always* in the data path and a single point of failure for the validator it
-fronts: an honest out-of-path coordinator is where the "established connections
-survive; only new ones depend on it" framing holds.
+fronts.
+
+## Two NAT'd validators — the zero-exposure procedure
+
+Two validators behind **real, distinct NATs**, neither exposing an inbound
+port, plus this coordinator on a public VPS:
+
+```
+   Validator A ──┐                          ┌── Validator B
+   (NAT, no      │      Coordinator         │   (NAT, no
+    inbound)     └────▶ relay.ducktape.industries ◀──────┘    inbound)
+                        (public VPS)
+     A and B dial OUT to the coordinator, then hole-punch a direct
+     A<->B WireGuard tunnel and drop the coordinator out of the path.
+```
+
+1. **Deploy the coordinator** per Deploy A or B; confirm it binds UDP `:3478`
+   (`ss -lunp 'sport = :3478'`) and answers a live `BindRequest`
+   (`bin/coordinator/tests/deploy_smoke.rs` is the same check as a test).
+2. **A founds the network**: `ducktape node init --name <net>` and
+   `ducktape node run`. Each node reaches the coordinator from its own
+   workspace configuration (`primary_coordinator_or_default`, the public
+   coordinator by default); no invite ever carries a coordinator address.
+3. **A mints an invite**: `ducktape node invite`. The signed, single-use blob
+   is the admission decision and the VPN credential in one; what it bundles
+   is in `docs/records/architecture/reachability.md`.
+4. **B joins**: `ducktape node join <blob>` then `ducktape node run`. B races
+   first contact across every path the blob offers — the inviter's own
+   endpoint and its reachable members, directly where an endpoint is known
+   and through this coordinator where one is not — and redeems its standing
+   on the first path that answers. To seat B in the quorum a member runs
+   `ducktape node member promote <B-pubkey>`; admission and reachability are
+   independent decisions.
+5. **State sync and consensus ride the punched tunnel.** Whether the tunnel
+   comes up depends on the two NATs admitting a direct punched path: the
+   tunnel has no relay fallback, so a pair that cannot punch fails honestly
+   instead of routing peer traffic through the coordinator. A symmetric ↔
+   symmetric pair with no routable endpoint needs a different entry path (a
+   forwarded UDP port on either side suffices).
+
+The library-level proof of the punch is
+`crates/networking/reachability/tests/rendezvous_simnat.rs`, which drives the
+production resolver over a simulated NAT topology.
 
 ## What this recipe does NOT do
 
-The coordinator deployed here is live and correct, and the node-side
-reachability plane (behind `wireguard_listen`) drives it: `bin/node`
-constructs a `NatResolver` that discovers its reflexive, `register`s, and
-hole-punches against the configured coordinators, and v1 `Coordinated` invite
-hints route into that path instead of being dialed as mesh peers.
-
-What this page does **not** promise is universal zero-exposure connectivity.
-The TCP/443 lane relays exactly one thing — the joiner's sealed first-contact
-intro — so a member behind a NAT that cannot punch can *redeem an invite*
-through it and then has no tunnel: no statesync, no huddle, no gateway, no
-agent telemetry. Every per-use plane rides the WireGuard overlay, and the
-overlay has no relay by design. The cross-machine procedure is
-[`cross-machine-zero-exposure-runbook.md`](cross-machine-zero-exposure-runbook.md).
+This page does not promise universal zero-exposure connectivity. The TCP/443
+lane relays exactly one thing — the joiner's sealed first-contact intro — so a
+member behind a NAT that cannot punch can *redeem an invite* through it and
+then has no tunnel: no statesync, no huddle, no gateway, no agent telemetry.
+Every per-use plane rides the WireGuard overlay, and the overlay has no relay
+by design.

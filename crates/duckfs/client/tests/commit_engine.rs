@@ -1,7 +1,7 @@
 //! the commit engine over the module-backed mock: the checkout→edit→commit→
 //! re-checkout round-trip, HasChunks-probed dedup + resume (stage-call counters),
-//! and the atomicity guards (MAX_CHANGES_PER_COMMIT, local NFD names) that fail
-//! before any submit.
+//! the MAX_CHANGES_PER_COMMIT guard that fails before any submit, and the NFD
+//! filename the scan composes instead of refusing.
 
 mod support;
 
@@ -10,6 +10,7 @@ use std::fs;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use duckfs_client::api::NodeApi as _;
 use duckfs_client::checkout::checkout;
 use duckfs_client::commit::{CommitError, CommitOptions, commit, commit_with};
 use duckfs_client::index::Index;
@@ -217,27 +218,23 @@ fn over_the_change_cap_fails_before_any_submit() {
 }
 
 #[test]
-fn a_local_nfd_filename_fails_before_any_submit() {
+fn a_local_nfd_filename_commits_under_its_composed_path() {
     let node = ModuleNode::new();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     checkout(&node, root, PREFIX, None).expect("checkout");
 
-    // "café" in NFD (e + combining acute) — a non-canonical name the module would
-    // reject; the plan catches it locally first.
+    // "café" in NFD (e + combining acute) — what macOS hands back. the scan
+    // composes it, so the module sees the NFC path its canonicalizer demands
+    // instead of refusing a file the user can neither see nor rename.
     fs::write(root.join("cafe\u{301}.txt"), b"x").unwrap();
 
-    let err = commit(&node, root, "nfd").unwrap_err();
+    commit(&node, root, "nfd").expect("the composed name commits");
+    let composed = format!("{PREFIX}/caf\u{e9}.txt");
     assert!(
-        matches!(err, CommitError::Plan(_)),
-        "a plan-time rejection: {err}"
+        node.stat(&composed, None).expect("stat").is_some(),
+        "the entry landed under its NFC path"
     );
-    assert!(
-        err.to_string().contains("cafe"),
-        "names the offending path: {err}"
-    );
-    assert_eq!(node.commit_calls.get(), 0, "nothing submitted");
-    assert_eq!(node.stage_calls.get(), 0, "nothing staged");
 }
 
 // ---- the pathspec (what the change-cap refusal tells you to run) -------------

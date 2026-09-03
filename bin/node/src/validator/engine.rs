@@ -64,7 +64,8 @@ impl<'a> EpochSpawner<'a> {
             fatal!(
                 self.label,
                 "epoch {epoch} exhausts the pre-registered channel bank \
-                 ({EPOCH_CHANNEL_BANK}) — rebuild with a wider bank"
+                 ({EPOCH_CHANNEL_BANK}) — restart; boot re-banks from the \
+                 checkpoint epoch"
             );
         };
         // bundle this epoch's mesh channel slot + the oracle behind the mesh

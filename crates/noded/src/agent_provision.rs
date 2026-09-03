@@ -68,7 +68,13 @@ pub(crate) async fn test_link(handle: crate::NodeHandle) -> NodeLink {
     // the provisioner WRITES duckfs, and every mutating route now wants a
     // credential — so the fake node carries one and the link presents it,
     // exactly as a real daemon reads it out of the node's workspace.
-    let operator_token = crate::services::new_secret();
+    //
+    // the workspace is KEPT (not a scoped `TempDir`): the link re-reads
+    // `admin.token` per attach, so a dir dropped at the end of this function
+    // would leave every later request uncredentialed.
+    let workspace = tempfile::tempdir().expect("a test workspace").keep();
+    let operator_token = crate::admin::mint_operator_token(&workspace)
+        .expect("mint the test node's operator credential");
     let handle = handle.with_admin(crate::AdminConfig {
         operator_token: Some(operator_token.clone()),
         ..crate::AdminConfig::default()
@@ -80,7 +86,7 @@ pub(crate) async fn test_link(handle: crate::NodeHandle) -> NodeLink {
         )
         .await;
     });
-    let link = NodeLink::new(format!("http://{address}")).with_operator_token(operator_token);
+    let link = NodeLink::new(format!("http://{address}")).with_workspace_credential(&workspace);
     match forge_repo {
         Some(base) => link.with_forge_repo(base),
         None => link,

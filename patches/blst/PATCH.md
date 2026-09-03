@@ -18,9 +18,7 @@ backend). With this patch, guest builds are pure Rust on every platform.
 Fail-safe: the Rust bindings still declare the extern C symbols, so if a
 guest ever genuinely calls into blst, wasm-ld fails loudly on the missing
 definitions. That is the moment to decide between a host-function import on
-the module world and compiling real blst to wasm — see
-`handoff-blst-host-fn.md` (analysis) while it lives in the tree, or the
-commonware feature-gating upstream issue if one exists by then.
+the module world and compiling real blst to wasm.
 
 Native (non-wasm) targets are untouched: the full C/assembly tree is kept so
 a host-target `cargo check` of a guest workspace still builds real blst.

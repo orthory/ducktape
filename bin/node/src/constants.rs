@@ -112,10 +112,17 @@ pub(crate) const RESIDENT_FALLBACK_POLL: Duration = Duration::from_secs(12);
 /// how many epochs of engine channels are PRE-REGISTERED. mesh channels
 /// can only be registered before `network.start()`, and every epoch's respawned
 /// engine needs FRESH channels (an aborted old engine must never collide with
-/// its successor) — so a bank is reserved up front. exhausting it is a
-/// fail-stop: restart the mesh with a wider bank (a config/build constant, not
-/// consensus state).
-pub(crate) const EPOCH_CHANNEL_BANK: u64 = 16;
+/// its successor) — so a bank is reserved up front. the bank bounds membership
+/// changes per process RUN, not per network lifetime: a restart re-banks from
+/// the checkpoint epoch, and the systemd unit's `Restart=always`
+/// (`ops/node/ducktape-node@.service`) is the recovery for the fail-stop exit.
+///
+/// the cost is registrations held open for the life of the process: five per
+/// slot on a validator (`validator/wiring.rs`, vote/certificate/resolver/
+/// payload/fetch), five per slot again for the parked replica bank
+/// (`replica/wiring.rs`) and for the sync-only joiner's blackholes
+/// (`boot/sync_only.rs`) — so 64 slots is 320 channels per role.
+pub(crate) const EPOCH_CHANNEL_BANK: u64 = 64;
 /// finalized views between OBSERVING a membership change and CUTTING OVER —
 /// the grace window in which every honest node sees the same change and arms
 /// the same deterministic discard ceiling. small for the demo network; a

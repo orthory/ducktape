@@ -68,13 +68,13 @@ pub(super) struct ForgeLane {
     push_base: String,
     /// the committer identity on every run commit (the node, never the agent).
     committer_name: String,
-    /// this node's operator credential, which is what the loopback push
-    /// presents: `git-receive-pack` refuses a push carrying neither git's own
-    /// certificate nor this (#1292), and a run has no SSH signing key to make
-    /// a certificate with — the NODE is the pusher here, which is exactly what
-    /// this credential says. `None` on a link that could not read the node's
-    /// workspace; the push then comes back as the node's own 401.
-    operator_token: Option<String>,
+    /// the link the push credential is read from, per push and never latched
+    /// (the node re-mints `admin.token` every boot, and this lane outlives a
+    /// node restart): `git-receive-pack` refuses a push carrying neither git's
+    /// own certificate nor that credential (#1292), and a run has no SSH
+    /// signing key to make a certificate with — the NODE is the pusher here,
+    /// which is exactly what the credential says.
+    node: NodeLink,
 }
 
 impl ForgeLane {
@@ -108,7 +108,7 @@ impl ForgeLane {
             repo_base,
             push_base,
             committer_name,
-            operator_token: node.operator_token().map(str::to_string),
+            node: node.clone(),
         })
     }
 }
@@ -334,7 +334,7 @@ pub(super) async fn provision(
     validate_coords(repo, commit, branch)?;
     let repo_dir = lane.repo_base.join(repo);
     let push_url = format!("{}/{repo}", lane.push_base);
-    let push_credential = lane.operator_token.clone();
+    let push_credential = lane.node.operator_token();
 
     let blocking = ProvisionArgs {
         repo_dir,

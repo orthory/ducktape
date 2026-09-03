@@ -1,20 +1,58 @@
-# docs
+# Documentation index
 
-What lives here, and only this:
+One line per document, grouped by the question it answers, so an agent or an
+operator loads the one file that answers it instead of the tree. The rule for
+what lives here is `AGENTS.md` § "Docs Are Not a Record": `docs/` holds what
+an operator executes and the few references code or a skill cites by path.
+Nothing here is a plan, a status page, or a decision record, and a document
+nothing cites is deleted, not archived.
 
-- `deploy/` — operator runbooks still executed by hand: the coordinator, sentry
-  fronts, the cross-machine zero-exposure procedure, the reachability
-  integration map, unified invite fronts.
-- `dogfood.md` — the dogfood ceremony: ducktape develops ducktape.
-- `sandbox-macos.md` — the vz sandbox stack on macOS.
-- `records/` — the references code or a skill cites by path:
-  `specs/capability-spec.md` (provider), `specs/indexable-spec.md` (indexer),
-  `protocols/wireguard-tunnel-upgrade.md` (wireguard crate),
-  `architecture/agent-collaboration-design.md` (runs, saga),
-  `architecture/wasm-module-authoring.md` (the module-dev skill), plus two
-  dated research notes under `research/`.
+## Start here
 
-There is no docs site, no decision-record system, and no plan/spec archive.
-`docs/superpowers/` is gitignored working scratch for the brainstorming and
-planning skills. A document nothing cites is deleted, not archived; the rule
-is `AGENTS.md` § "Docs Are Not a Record".
+| Question | Read |
+| --- | --- |
+| What is this, how is the tree laid out, how do I build, test and run it | [`../README.md`](../README.md) |
+| What rules bind an assistant working in this repo | [`../AGENTS.md`](../AGENTS.md) |
+
+## Operate a node
+
+| Question | Read |
+| --- | --- |
+| Keep a node and its service daemons up under systemd; ports; logs; why three validators tolerate nothing | [`deploy/node-service.md`](deploy/node-service.md) |
+| Which files are secrets, which are irreplaceable, what to copy, what a restore looks like | [`deploy/backup-and-keys.md`](deploy/backup-and-keys.md) |
+| Run the untrusted coordinator (rendezvous + first-contact relay); stand up two NAT'd validators | [`deploy/coordinator.md`](deploy/coordinator.md) |
+| Front a validator with a sentry so it exposes no inbound port | [`deploy/sentry-deployment.md`](deploy/sentry-deployment.md) |
+| Run the dogfooding loop: this repo in its own forge, an agent working it | [`dogfood.md`](dogfood.md) |
+| Bring the microVM sandbox up on macOS (the vz shim) | [`sandbox-macos.md`](sandbox-macos.md) |
+| Which operator scripts, units and harnesses live under `ops/` | [`../ops/README.md`](../ops/README.md) |
+| The coordinator's deploy artifacts (unit, env file, Dockerfile) | [`../ops/coordinator/README.md`](../ops/coordinator/README.md) |
+| The hosted WebAuthn auth page, its request/result shapes and its relay | [`../ops/auth-page/README.md`](../ops/auth-page/README.md) |
+| Run the desktop app; which node it dials and which key it signs with | [`../app/README.md`](../app/README.md) |
+| Lend a credential to a sandbox through airlock, self-hosted or from an enclave | [`../crates/airlock/README.md`](../crates/airlock/README.md) |
+
+## References code cites by path
+
+| Question | Read | Cited by |
+| --- | --- | --- |
+| The capability spec TOML that describes an executor | [`records/specs/capability-spec.md`](records/specs/capability-spec.md) | `crates/services/provider` |
+| The per-module index guest contract: fold rules, view rules, backfill | [`records/specs/indexable-spec.md`](records/specs/indexable-spec.md) | `crates/kernel/indexer`, the module-dev skill |
+| The WireGuard tunnel upgrade protocol: records, mesh version, handshake, overlay addressing | [`records/protocols/wireguard-tunnel-upgrade.md`](records/protocols/wireguard-tunnel-upgrade.md) | `crates/networking/wireguard` |
+| The reachability plane: control mesh beside data tunnel, the tunnel-first invite and its fronts, cold restart, rendezvous | [`records/architecture/reachability.md`](records/architecture/reachability.md) | `crates/networking/reachability` |
+| The ordering contract agents get and the module architecture that keeps it | [`records/architecture/agent-collaboration-design.md`](records/architecture/agent-collaboration-design.md) | `runs`, `saga` |
+| Writing, building and live-updating a wasm module | [`records/architecture/wasm-module-authoring.md`](records/architecture/wasm-module-authoring.md) | the module-dev skill |
+
+## Agent runbooks (`skills/`)
+
+| When | Skill |
+| --- | --- |
+| Verifying a running node, a cluster, the app, or a huddle | [`../skills/qa/SKILL.md`](../skills/qa/SKILL.md) |
+| A Rust test needs a deterministic in-process node | [`../skills/sim-lane/SKILL.md`](../skills/sim-lane/SKILL.md) |
+| Creating, porting, or registering a consensus module | [`../skills/module-dev/SKILL.md`](../skills/module-dev/SKILL.md) |
+
+## Vendored patches
+
+Each directory under `patches/` carries a note stating what the patch changes
+and when it can be dropped: `PATCH.md` for `block` and `blst` (their
+`README.md` is the upstream crate's own), `README.md` for `cosmic-text`.
+
+`docs/superpowers/` is gitignored planning scratch; nothing under it ships.

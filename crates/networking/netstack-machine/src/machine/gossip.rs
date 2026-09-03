@@ -311,6 +311,65 @@ impl Driver {
         }
     }
 
+    /// THIS node's own reflexive mapping moved (a mid-epoch NAT rebind).
+    /// Every peer holds a tunnel aimed at the dead mapping and nothing in
+    /// the protocol makes them look again — an endpoint-less node is
+    /// resolved by rendezvous exactly once, when the record it locked was
+    /// admitted. So the machine gives them a NEW LIFE to admit: the same
+    /// record under a fresh nonce, which lands on each peer as the post-lock
+    /// re-advertisement ([`Self::on_member_readvertisement`]) and re-runs
+    /// the by-identity rendezvous against the coordinator the host has
+    /// already re-registered with. The standing goes `Live` so every nudge
+    /// keeps re-offering the fresh life until each peer has re-tunneled it.
+    ///
+    /// Only an APPLIED mesh needs this. An epoch still assembling resolves
+    /// every peer AFTER the rebind — the coordinator the host just
+    /// re-registered with is what it asks — so the fresh mapping is what
+    /// that assembly would have picked up anyway; and re-signing under an
+    /// advert already signed over the old record would strand this node on
+    /// a mesh version no peer can reach.
+    pub(crate) fn on_reflexive_changed(
+        &mut self,
+        epoch: Option<&mut EpochState>,
+        endpoint: SocketAddr,
+    ) {
+        let Some(state) = epoch else {
+            tracing::debug!(
+                target: "ducktape::reachability",
+                %endpoint,
+                "reflexive move ignored: this plane has no epoch"
+            );
+            return;
+        };
+        let tunnels_are_live = matches!(state.phase, Phase::Applied { .. });
+        if !tunnels_are_live {
+            tracing::debug!(
+                target: "ducktape::reachability",
+                %endpoint, epoch = state.epoch,
+                "reflexive move ignored: this epoch has applied no tunnels yet"
+            );
+            return;
+        }
+        let mut record = state.own_record.record.clone();
+        record.nonce = state.next_nonce();
+        let signed = wireguard::SignedEndpointRecord::sign(record, &*self.signer);
+        state.readvertise_own(signed.clone());
+        tracing::info!(
+            target: "ducktape::reachability",
+            %endpoint, epoch = state.epoch, nonce = signed.record.nonce,
+            "own reflexive moved — re-advertising this node's record to the mesh"
+        );
+        let own = ReachabilityMsg::Record(signed);
+        for peer in state.peers.clone() {
+            self.send_msg(state, peer, &own);
+        }
+        // the pre-warm layer holds tunnels toward this node too: a standby
+        // left on the dead mapping is a promotion that starts dark.
+        for standby in state.standbys.clone() {
+            self.send_msg(state, standby, &own);
+        }
+    }
+
     pub(crate) fn on_advert(
         &mut self,
         state: &mut EpochState,

@@ -154,8 +154,8 @@ zeroize = { workspace = true }
 # internals ride the same filter: RUST_LOG=commonware_p2p=debug.
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Raise the node's inherited open-file soft limit before opening module stores.
-libc = "0.2"
+# Cap glibc's malloc arenas before any thread spawns (src/resource_limits.rs).
+libc = { workspace = true }
 # the `agent install` checklist (src/executors.rs). default-features off: the
 # editor/password/history extras are prompts this binary does not have, and
 # each carries its own dependency. What is left is 4 crates, `console` being

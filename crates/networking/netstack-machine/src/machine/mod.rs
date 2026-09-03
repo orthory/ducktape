@@ -275,6 +275,9 @@ impl Machine {
             Event::SendResolverDatagram { endpoint, bytes } => {
                 self.driver.send_resolver_datagram(endpoint, bytes)
             }
+            Event::ReflexiveChanged { endpoint } => self
+                .driver
+                .on_reflexive_changed(self.epoch.as_mut(), endpoint),
             Event::Resolved { req, outcome } => self.on_resolved(req, outcome),
             Event::RendezvousResolved { req, outcome } => self.on_rendezvous_resolved(req, outcome),
             Event::DatagramReplied { req, outcome } => {
