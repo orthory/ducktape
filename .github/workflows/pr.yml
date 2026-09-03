@@ -27,14 +27,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        # rust-toolchain.toml pins the exact channel + targets; this action
-        # only needs to put rustup itself on PATH.
-        with:
-          toolchain: none
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
+      # ubuntu-latest ships rustup; the checkout's rust-toolchain.toml pins
+      # the exact channel + targets, so this just makes rustup install it.
+      - run: rustup show
       - run: cargo install wasm-tools --locked
       - run: make wasm-modules-check
 
@@ -43,12 +41,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: none
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
+      - run: rustup show
       - run: cargo test --locked -p node-bin host_state
 
   clippy:
@@ -56,10 +52,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: none
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
+      - run: rustup show
       - run: cargo clippy --locked --workspace --tests --no-deps -- -D warnings
