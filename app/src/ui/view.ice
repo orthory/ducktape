@@ -628,21 +628,51 @@ view
               align-x=end
               align-y=end
               pr=16.0
-              pb=16.0
+              pb=huddle_dock_inset(shell_tab)
             col
-              // The pill says "you are still in a call elsewhere". It hides while
-              // the huddle has its own window, and where the live pill in the
-              // channel header already says so — the Chat tab, looking at the
-              // huddle's own channel. On every OTHER screen it must show even
-              // when that channel is the selected one, which the missing
-              // `shell_tab` term used to suppress.
-              if huddle_joined && !huddle_popped && (shell_tab != ShellTab.chat || huddle_channel != active_channel)
+              // THE HUDDLE, ON EVERY TAB AND EVERY CHANNEL. There is exactly
+              // one kind of term missing from these two conditions and it is
+              // missing on purpose: nothing here reads WHERE you are. A call
+              // you are in does not stop being live because you opened Pages
+              // or clicked another room, and the media session under it never
+              // thought it did — it is subscribed on `huddle_joined`
+              // (handlers/lifecycle.ice) and nothing else. What used to happen
+              // instead — a pill on some screens, and nothing at all while the
+              // popped window sat behind the console — WAS the defect: the
+              // huddle was still running and the app had stopped saying so.
+              //
+              // Three states, two arms and a window: expanded here, folded to
+              // the pill below, or popped into its own OS window, where
+              // `huddle_popped` blanks both arms and the window draws the
+              // panel. That is also what keeps exactly ONE video surface alive
+              // at a time — see `HuddleDock`.
+              if huddle_joined && !huddle_popped && !huddle_dock_collapsed
+                HuddleDock
+                  with
+                    channel=huddle_channel_name
+                    elapsed=mmss(huddle_now - huddle_joined_at)
+                    rows=huddle_rows
+                    status=call_status
+                    muted=call_muted
+                    camera=call_camera
+                    sharing=call_sharing
+                    stage=huddle_stage
+                    video_live=call_video_live
+                  events
+                    collapse_huddle_dock -> collapse_huddle_dock
+                    pop_huddle -> pop_huddle
+                    huddle_go_channel -> huddle_go_channel
+                    leave_huddle_here -> leave_huddle_here
+                    toggle_call_mute -> toggle_call_mute
+                    toggle_call_camera -> toggle_call_camera
+                    toggle_call_screen -> toggle_call_screen
+              if huddle_joined && !huddle_popped && huddle_dock_collapsed
                 HuddleDockedPill
                   with
                     channel=huddle_channel_name
                     elapsed=mmss(huddle_now - huddle_joined_at)
                   events
-                    pop_huddle -> pop_huddle
+                    expand_huddle_dock -> expand_huddle_dock
         palette:
           OverlayLayer draft<->channel_draft query<->palette_draft #overlays
             with

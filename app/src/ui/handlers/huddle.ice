@@ -62,6 +62,17 @@ on toggle_call_screen
   call_video_live = call_video_live_after(call_peers, call_camera, call_sharing)
   huddle_stage = huddle_stage_peer(call_peers, call_sharing)
 
+// COLLAPSING IS NOT LEAVING, AND IT IS NOT POPPING. Two named events rather
+// than one toggle, because each surface means exactly one of them: the dock's
+// chevron folds the card away, the pill it folds into gives it back. Neither
+// touches the call — `huddle_joined` and the media session subscribed on it
+// are none of this flag's business.
+on collapse_huddle_dock
+  huddle_dock_collapsed = true
+
+on expand_huddle_dock
+  huddle_dock_collapsed = false
+
 // POPPING OPENS A REAL WINDOW, and the window's existence IS the popped
 // state — there is no `huddle_popped` bool to keep in step with it. Docking
 // closes it; so does the OS close button, which lands in `window_was_closed`
@@ -145,6 +156,9 @@ on leave_huddle_here
 // everything standing, which is why nothing here is done optimistically.
 on huddle_left(_result)
   huddle_joined = false
+  // The next huddle starts showing: a collapse was a choice about THIS call,
+  // and this call is over.
+  huddle_dock_collapsed = false
   huddle_roster = []
   huddle_rows = []
   huddle_channel = ""

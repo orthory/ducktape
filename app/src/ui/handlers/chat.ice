@@ -400,17 +400,21 @@ on join_huddle_submit
   error = ""
   run every join_huddle(connected_rpc, password, active_channel) -> huddle_joined_ack _ | mutation_failed _
 
-// THE JOIN OPENS THE HUDDLE, because the huddle window is where the huddle IS:
-// every face, every shared screen, the mic and camera controls and Leave live
-// in it, and the header pill it docks into can show none of them. Joining and
-// then being shown a pill is how someone sits in a call watching nothing
-// happen, which is exactly what "I joined and there was no video" is. The
-// guard is `pop_huddle`'s own: a window already up is not opened twice.
+// THE JOIN LANDS IN THE DOCK, AND OPENS NO WINDOW. Every face, every shared
+// screen, the media controls and Leave live in the in-window dock now
+// (`HuddleDock`, mounted in view.ice's window-level huddle slot), which rides
+// every tab and every channel — so a join has somewhere to be SEEN without
+// spawning a second OS window that falls behind the console the moment you
+// click anything in it. That is what this ack used to do, and it is why a
+// huddle looked like it had disappeared on the first channel or module
+// switch. Popping out is still here and is now what it always should have
+// been: an explicit click on the dock's own popout button (`pop_huddle`).
 on huddle_joined_ack(_result)
   mutation_phase = MutationPhase.idle
   error = ""
-  return if huddle_win != none
-  task window open huddle -> huddle_opened _
+  // A join is a huddle to look at. Whatever the last one was folded to, this
+  // one draws itself.
+  huddle_dock_collapsed = false
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
 // HUDDLE'S channel rather than the one on screen — the same button serves the

@@ -827,6 +827,28 @@ fn duration_parts(seconds: i64) -> (i64, &'static str) {
 // artifact's clock is divergence, not a gap — see height_ago/height_label_short.
 
 /// Elapsed `mm:ss` for the huddle pills and panel.
+/// How far above the window's bottom edge the huddle dock floats.
+///
+/// THE COMPOSER IS THE ONE THING UNDER IT. On Chat the message box sits on the
+/// room's bottom edge and its Send button is at the right end of it — exactly
+/// where a bottom-right dock lands — so the dock steps over the composer at its
+/// resting height. Every other module ends its content at the window wall, and
+/// there the inset is the same 16 the pill always used.
+///
+/// A draft grown to several lines passes BEHIND the card: the composer grows
+/// upward from a fixed base, and a dock that tracked it would move under the
+/// pointer on every keystroke. Fold the dock to its pill for a long draft.
+pub fn huddle_dock_inset(tab: crate::ShellTab) -> f64 {
+    const CLEAR_OF_THE_COMPOSER: f64 = 116.0;
+    const WINDOW_EDGE: f64 = 16.0;
+    let over_the_composer = tab == crate::ShellTab::Chat;
+    if over_the_composer {
+        CLEAR_OF_THE_COMPOSER
+    } else {
+        WINDOW_EDGE
+    }
+}
+
 pub fn mmss(seconds: i64) -> String {
     let seconds = seconds.max(0);
     format!("{:02}:{:02}", seconds / 60, seconds % 60)

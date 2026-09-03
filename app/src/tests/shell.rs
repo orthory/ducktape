@@ -593,13 +593,20 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
     );
 }
 
-/// THE JOIN OPENS THE HUDDLE. Every face, every shared screen and every media
-/// control lives in the huddle window; the header pill it docks into shows
-/// none of them. A join routed back to the generic `chat_acked` leaves someone
-/// sitting in a live call watching a static pill, which is indistinguishable
-/// from a huddle that does not work — so the route is pinned here.
+/// THE JOIN LANDS IN THE DOCK, AND OPENS NO WINDOW. Every face, every shared
+/// screen and every media control lives in the in-window dock; a join routed
+/// back to the generic `chat_acked` would leave someone sitting in a live call
+/// watching a static pill, which is indistinguishable from a huddle that does
+/// not work — so the route is pinned here.
+///
+/// The ack used to open the popped huddle window, and that is the defect this
+/// now pins the inverse of: the second OS window fell behind the console the
+/// moment anything in the console was clicked, and the console said nothing
+/// about the call at all. Popping out is an explicit click on the dock now, so
+/// an `open huddle` task reappearing in this ack is a regression, not a
+/// convenience.
 #[test]
-fn joining_a_huddle_opens_the_window_that_shows_it() {
+fn joining_a_huddle_lands_in_the_in_window_dock() {
     let handler = inlined(include_str!("../ui/handlers/chat.ice"));
     assert!(
         handler
@@ -611,10 +618,127 @@ fn joining_a_huddle_opens_the_window_that_shows_it() {
         .expect("the join ack handler exists")
         .1;
     let ack = ack.split_once("\non ").map_or(ack, |split| split.0);
-    assert!(ack.contains("task window open huddle"));
     assert!(
-        ack.contains("return if huddle_win != none"),
-        "a window already up is not opened twice"
+        !ack.contains("task window open huddle"),
+        "the join lands in the dock — the popped window is an explicit choice"
+    );
+    assert!(
+        ack.contains("huddle_dock_collapsed = false"),
+        "a join is a huddle to look at, whatever the last one was folded to"
+    );
+    let huddle = inlined(include_str!("../ui/handlers/huddle.ice"));
+    let popped = huddle
+        .split_once("on pop_huddle")
+        .expect("popping out still exists")
+        .1;
+    assert!(
+        popped.contains("task window open huddle"),
+        "popping out is what opens the window now"
+    );
+}
+
+/// THE HUDDLE IS SHOWN WHEREVER YOU ARE, AND DRAWN ONCE.
+///
+/// A call you are in does not stop being live because you opened Pages or
+/// clicked another room — the media session is subscribed on `huddle_joined`
+/// and nothing else (handlers/lifecycle.ice). The UI used to disagree: the
+/// docked pill carried a `shell_tab`/`active_channel` term, the panel lived in
+/// a second OS window, and between them a live huddle could be invisible on
+/// the screen you were actually looking at. So the dock's visibility rule may
+/// not read WHERE you are at all, and this is the guard that says so — it
+/// fails on the next `shell_tab ==` term anybody adds to either arm.
+///
+/// It also pins the other half: the dock and the panel each mount the
+/// `extern call_video_*` widgets, and each of those runs its own 4 ms repaint
+/// clock while a tile is live (video.rs). Two of them up at once would be two
+/// clocks for one call, so the two mounts must be mutually exclusive — the
+/// dock under `!huddle_popped`, the panel only inside the window whose
+/// existence IS `huddle_popped` (state/derived.ice).
+#[test]
+fn the_huddle_dock_rides_every_tab_and_keeps_one_video_surface() {
+    let view = inlined(include_str!("../ui/view.ice"));
+
+    // 1. THE TWO ARMS of the window-level huddle slot, as authored.
+    let slot = view
+        .split_once("\n        huddle:\n")
+        .expect("the window-level huddle slot")
+        .1;
+    let slot = slot
+        .split_once("\n        palette:\n")
+        .map_or(slot, |split| split.0);
+    let arms: Vec<&str> = slot
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("if "))
+        .collect();
+    assert_eq!(
+        arms,
+        [
+            "if huddle_joined && !huddle_popped && !huddle_dock_collapsed",
+            "if huddle_joined && !huddle_popped && huddle_dock_collapsed",
+        ],
+        "the dock is expanded or folded to its pill, and nothing else gates it"
+    );
+    for arm in &arms {
+        for elsewhere in ["shell_tab", "active_channel", "huddle_channel "] {
+            assert!(
+                !arm.contains(elsewhere),
+                "the huddle rides every tab and every channel: {arm:?} reads {elsewhere}"
+            );
+        }
+    }
+    // `inlined` folds each mount's `with` block onto its own line, so a mount
+    // is the head of a line — which is also what keeps `HuddleDock` from
+    // matching inside `HuddleDockedPill`.
+    let mounts: Vec<&str> = slot
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|head| head.starts_with("Huddle"))
+        .collect();
+    assert_eq!(
+        mounts,
+        ["HuddleDock", "HuddleDockedPill"],
+        "the expanded card and the folded pill, and nothing else in this slot"
+    );
+
+    // 2. THE PANEL IS THE WINDOW'S, and only the window's.
+    let panel_at = view
+        .find("      HuddlePanel #huddle")
+        .expect("the popped panel is mounted");
+    let guard = view[..panel_at]
+        .lines()
+        .rev()
+        .find(|line| line.trim().starts_with("if "))
+        .expect("the panel is guarded");
+    assert_eq!(
+        guard.trim(),
+        "if huddle_win == some(window)",
+        "the panel draws inside the huddle window and nowhere else"
+    );
+    let derived = inlined(include_str!("../ui/state/derived.ice"));
+    assert!(
+        derived.contains("huddle_popped = huddle_win != none"),
+        "`!huddle_popped` on the dock is what makes the two mounts exclusive"
+    );
+
+    // 3. AND THE VIDEO WIDGETS LIVE IN EXACTLY THOSE TWO COMPONENTS.
+    let components = inlined(include_str!("../ui/components/huddle.ice"));
+    let mut mounting: Vec<&str> = Vec::new();
+    let mut component = "";
+    for line in components.lines() {
+        if let Some(rest) = line.strip_prefix("component ") {
+            component = rest.split('(').next().unwrap_or(rest);
+        }
+        if line.trim().starts_with("extern call_video_") {
+            mounting.push(component);
+        }
+    }
+    mounting.sort_unstable();
+    mounting.dedup();
+    assert_eq!(
+        mounting,
+        ["HuddleDock", "HuddlePanel"],
+        "a third video surface is a third repaint clock on one call"
     );
 }
 

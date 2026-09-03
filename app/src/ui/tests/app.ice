@@ -1614,9 +1614,45 @@ test the_huddle_controls_survive_the_narrowest_panel
         toggle_call_camera -> toggle_call_camera
         toggle_call_screen -> toggle_call_screen
   target panel = #huddle/root
-  target share = #huddle/root/share-stop
-  target leave = #huddle/root/leave
+  target share = #huddle/root/controls/root/share-stop
+  target leave = #huddle/root/controls/root/leave
   expect call_sharing
   expect leave.x + leave.width <= panel.x + panel.width
   expect share.width ~= 32.0
   capture huddle_sharing_light
+
+// THE SAME CALL, IN THE CONSOLE WINDOW. The dock is what a join lands in now,
+// so it is drawn over whatever module you are on — and the thing that goes
+// wrong with a floating card is the control that falls off its right edge.
+// The card is a fixed 312 (it floats over a room that has to stay readable
+// under it), which is NARROWER than the popped panel's own minimum, so the
+// control band it shares with the panel is checked here at that width too.
+test the_huddle_dock_keeps_leave_inside_its_card
+  preset ui_huddle_sharing
+  viewport 900 640
+  mount
+    HuddleDock #dock
+      with
+        channel=huddle_channel_name
+        elapsed="01:20"
+        rows=huddle_rows
+        status=call_status
+        muted=call_muted
+        camera=call_camera
+        sharing=call_sharing
+        stage=huddle_stage
+        video_live=call_video_live
+      events
+        collapse_huddle_dock -> collapse_huddle_dock
+        pop_huddle -> pop_huddle
+        huddle_go_channel -> huddle_go_channel
+        leave_huddle_here -> leave_huddle_here
+        toggle_call_mute -> toggle_call_mute
+        toggle_call_camera -> toggle_call_camera
+        toggle_call_screen -> toggle_call_screen
+  target card = #dock/root
+  target share = #dock/root/controls/root/share-stop
+  target leave = #dock/root/controls/root/leave
+  expect card.width ~= 312.0
+  expect leave.x + leave.width <= card.x + card.width
+  expect share.width ~= 32.0
