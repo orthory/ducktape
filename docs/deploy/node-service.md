@@ -68,6 +68,10 @@ alias dt='sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/du
 
 ## Install
 
+`ops/node/install.sh --workspace <name> (--init | --join <invite>)` runs
+steps 1-5 below end to end (`--dry-run` prints the commands without touching
+the host); the steps are spelled out here for anyone auditing or adapting them.
+
 ```sh
 # 1. Build and install the CLI system-wide (make install-node puts it in
 #    ~/.cargo/bin and fills ~/.ducktape/modules for the building user).
