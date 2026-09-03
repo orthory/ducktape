@@ -198,6 +198,20 @@ fn over_the_change_cap_fails_before_any_submit() {
         "names the cap: {msg}"
     );
     assert!(msg.contains("4097"), "names the count: {msg}");
+    // the refusal must name things that EXIST — it used to send the user off to
+    // "split the work into separate commits" with no verb that could.
+    assert!(
+        msg.contains("--path"),
+        "names the pathspec that splits the work: {msg}"
+    );
+    assert!(
+        msg.contains(".duckfsignore"),
+        "names the ignore file that shrinks the walk: {msg}"
+    );
+    assert!(
+        msg.contains("consensus-wire bound"),
+        "says the cap is not a client setting: {msg}"
+    );
     assert_eq!(node.commit_calls.get(), 0, "nothing submitted");
     assert_eq!(node.stage_calls.get(), 0, "nothing staged");
 }
