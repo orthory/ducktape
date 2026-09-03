@@ -91,6 +91,13 @@ the module to `INDEX_MODULES` in the Makefile and to `index_guest_wasm()` in
 ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
 observably (`/v1/index/status` `fold.{module}`), never atomically.
 
+The engine's side of that contract — no backfill at registration, at-least-once
+invocation with exactly-once effects, a row above the inline cap arriving
+key-only, a failing fold holding its queue with backoff — is fluent31's own
+`SKILL.md` ("Priors that do not transfer"), at the rev the root `Cargo.toml`
+pins; read it before writing a mapper. A guest's `log` output is a `debug`
+event under `fluent31::wasm::guest` — turn that one target up to see it.
+
 ## 3. Registration — `module register`, or (for genesis) the topology + three bins
 
 Post-genesis is the whole of this section for most modules: `ducktape module

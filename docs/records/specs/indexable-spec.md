@@ -49,7 +49,9 @@ The tier is two loops, coupled only through each module's database:
   batch per module per block. No domain logic; this is the whole host side.
 - **the fold** (the module's index guest): a fluent31 **changes-mode
   trigger** (`"fold"`) on the `op/` range delivers every committed op row to
-  the guest's `on_apply` — exactly once, in commit order, value inline. The
+  the guest's `on_apply` — exactly once, in commit order, the row inline up to
+  the engine's inline cap (64 KiB). A larger row arrives key-only and the
+  shell re-reads it from state, which is exact: op rows are immutable. The
   guest folds it into derived keys inside its own transaction: its writes and
   the event's consumption commit together (at-least-once invocation,
   exactly-once effects). Trigger-made writes never re-trigger; loops are
