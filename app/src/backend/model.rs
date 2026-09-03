@@ -344,6 +344,24 @@ pub fn upsert_channel_rows(
     channels
 }
 
+/// HAS THE CONSOLE'S CHANNEL LIST OUTLIVED ITS NETWORK?
+///
+/// `held` is the chain the list on screen was learned from; `live` is the chain
+/// the node's own pushed status document is naming NOW. A workspace switch does
+/// not change the endpoint — the node comes back on the same loopback port — so
+/// the console can live right through one: the websocket drops, reconnects, and
+/// resyncs, and no `connect` ever re-runs to install the new network's list
+/// outright. Everything the resync does is a FOLD, which only ever adds, so the
+/// sidebar went on drawing the previous workspace's `#general` in a network that
+/// has no such room, clickable, with nothing behind it.
+///
+/// An empty reading on either side is not a move: it is a console that has not
+/// been told which chain it is on yet, and dropping the list on that would blank
+/// the sidebar on every cold boot.
+pub fn chain_moved(held: String, live: String) -> bool {
+    !held.is_empty() && !live.is_empty() && held != live
+}
+
 /// Everything a room click projects from the channel list, computed in one
 /// ownership crossing. The old shape cloned and scanned the whole workspace
 /// four times before the load task could even start.
@@ -390,6 +408,20 @@ pub fn channel_switch_facts(
 /// viewport at all in that case, so it is a belt, not the braces.
 pub fn near_scroll_top(relative_offset: f64) -> bool {
     relative_offset >= 0.9
+}
+
+/// Is the reader AT the live tail — the other end of the same offset.
+///
+/// 0.0 is the end the stream is anchored to, so a small band around it counts
+/// as "now": the last row is on screen and the next arrival scrolls itself into
+/// view.
+///
+/// A NaN offset (content that fits, which iced reports as `0/0`) must read as AT
+/// THE TAIL — a conversation too short to scroll is entirely on screen — and NaN
+/// compares false against everything, so the band is written as the comparison
+/// that must SUCCEED to be at the tail, with NaN taken by the explicit arm.
+pub fn near_scroll_tail(relative_offset: f64) -> bool {
+    relative_offset.is_nan() || relative_offset <= 0.02
 }
 
 /// THE COMPOSER'S INSTANCE KEY (ducktape-ui#697). One retained
@@ -477,29 +509,33 @@ pub struct ChatSidebarRow {
 }
 
 /// The CHANNELS section, prepared when its source state moves.
+///
+/// A DM IS EXCLUDED BY THE DIRECTORY'S OWN ID, not by a second derivation of
+/// it. This used to re-hash `dm_channel_id(account_number, peer.key)` per row,
+/// which answers NOTHING while `account_number` is empty — an account load that
+/// lost its race with the console (a freshly joined resident spends minutes
+/// with a node that cannot answer for identity yet) put every DM in the room
+/// list, `#` glyph, "Members only" badge, Huddle button and all, beside the same
+/// person's DIRECT row. `DmPeer.channel_id` is the id `load_dm_peers` already
+/// derived from the account number IT resolved, and `chat_sidebar_dms` reads
+/// that same field — so the two sections cannot disagree about what a DM is.
 pub fn chat_sidebar_rooms(
     channels: Vec<ChatChannel>,
     peers: Vec<DmPeer>,
-    me: String,
     reads: Vec<ChannelRead>,
 ) -> Vec<ChatSidebarRow> {
     let read_seqs: BTreeMap<&str, i64> = reads
         .iter()
         .map(|read| (read.channel.as_str(), read.seq))
         .collect();
-    let dm_ids: BTreeSet<String> = peers
+    let dm_ids: BTreeSet<&str> = peers
         .iter()
-        .filter_map(|peer| {
-            if me.is_empty() {
-                None
-            } else {
-                Some(dm_channel_id(me.clone(), peer.key.clone()))
-            }
-        })
+        .map(|peer| peer.channel_id.as_str())
+        .filter(|id| !id.is_empty())
         .collect();
     channels
         .into_iter()
-        .filter(|channel| !dm_ids.contains(&channel.id))
+        .filter(|channel| !dm_ids.contains(channel.id.as_str()))
         .map(|channel| ChatSidebarRow {
             unread: channel.head_seq
                 > read_seqs

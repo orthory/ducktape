@@ -1001,10 +1001,10 @@ fn a_send_that_fails_after_she_moved_rooms_still_reaches_her() {
 /// A PENDING ROW HAS NO SEQ, SO IT CANNOT ANSWER FOR THE TOP OF THE TIMELINE.
 ///
 /// `optimistic_message` mints a descending negative seq, which sorts ahead of
-/// every real message. Sorting it numerically into a prepended page put an in-flight send
-/// at the top of months-old scrollback, and then `history_has_older` read
-/// `-1 > 1` and hid "Load older" outright — the pending send locked the reader
-/// out of her own history until it settled.
+/// every real message. Sorting it numerically into a prepended page put an
+/// in-flight send at the top of months-old scrollback, and `oldest_message_seq`
+/// then handed the loader that `-1` as its cursor — the pending send locked the
+/// reader out of her own history until it settled.
 #[test]
 fn a_pending_send_survives_a_history_page_without_poisoning_it() {
     let (mut app, _) = Ducktape::__boot();

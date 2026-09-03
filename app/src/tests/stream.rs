@@ -175,6 +175,9 @@ fn a_history_page_prepends_only_into_the_channel_that_asked_for_it() {
     app.mutation_phase = MutationPhase::Idle;
     app.active_channel = "a".into();
     app.messages = vec![message(10, "a-ten", false)];
+    // The index said there is more; nothing derives that from `seq > 1` any
+    // more, because root sequences have holes.
+    app.has_older_history = true;
     let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
     assert!(app.history_loading);
 
@@ -230,6 +233,7 @@ fn a_history_page_prepends_only_into_the_channel_that_asked_for_it() {
         app.mutation_phase = MutationPhase::Idle;
         app.active_channel = "a".into();
         app.messages = vec![message(10, "a-ten", false)];
+        app.has_older_history = true;
         // `create_channel_submit` refuses an empty draft; the rest ignore it.
         app.channel_draft = "new-room".into();
         let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
@@ -260,6 +264,7 @@ fn a_resync_releases_load_older_only_when_it_moves_the_room() {
         app.mutation_phase = MutationPhase::Idle;
         app.active_channel = "a".into();
         app.messages = vec![message(10, "a-ten", false)];
+        app.has_older_history = true;
         let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
         assert!(app.history_loading);
 
@@ -296,15 +301,13 @@ fn a_resync_releases_load_older_only_when_it_moves_the_room() {
 /// the same shape as the caret-retire and room-mover lints above.
 #[test]
 fn every_writer_of_a_mirrored_view_reading_refreshes_its_mirror() {
-    // (mirror, the sources whose movement invalidates it). THIS ACCOUNT'S
-    // NUMBER decides which channels are its own DMs (both ends of a DM hash the
-    // same pair of numbers); THIS DEVICE'S KEY decides whether it is seated in
-    // a members-only room.
+    // (mirror, the sources whose movement invalidates it). THE DM DIRECTORY
+    // decides which channels are DMs — `load_dm_peers` stamps each row's
+    // `channel_id` from the account number it resolved itself, and `account_number`
+    // is Settings' reading alone; THIS DEVICE'S KEY decides whether it is seated
+    // in a members-only room.
     const MIRRORS: [(&str, &[&str]); 8] = [
-        (
-            "rooms",
-            &["channels", "dm_peers", "account_number", "channel_reads"],
-        ),
+        ("rooms", &["channels", "dm_peers", "channel_reads"]),
         ("dm_rows", &["channels", "dm_peers", "channel_reads"]),
         (
             "block_comment_rows",
@@ -407,8 +410,12 @@ fn history_windows_offer_a_jump_back_to_latest() {
     )));
     assert!(!app.history_view);
 
+    // The way back is a float over the timeline's bottom edge now, not a
+    // button inside an amber band at the top of the column — and it is shown
+    // for a reader who simply scrolled up, not only for a history window.
     let chat = inlined(include_str!("../ui/screens/chat.ice"));
-    assert!(chat.contains("button \"Jump to latest\""));
+    assert!(chat.contains("if !empty(messages) && (history_view || !at_live_tail)"));
+    assert!(chat.contains("button \"↓  Jump to latest\""));
     assert!(chat.contains("-> emit(choose_channel, active_channel)"));
 }
 
@@ -501,6 +508,7 @@ fn a_chat_resync_keeps_the_pages_the_reader_paged_in() {
             message(51, "and its next", false),
         ],
     )));
+    app.has_older_history = true;
     let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
     let _ = app.__update(__DucktapeMessage::HistoryLoaded(backend::HistoryPageData {
         channel_id: "general".into(),
@@ -1070,4 +1078,200 @@ fn approaching_the_top_of_the_scrollback_prefetches_the_older_page() {
     // And it does not fan out: the in-flight page holds the next steps off.
     let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 950.0, 0.0, 0.98));
     assert!(app.history_loading);
+}
+
+/// "LOAD OLDER MESSAGES" OVER A CHANNEL WITH NOTHING OLDER.
+///
+/// The button's flag used to be re-derived from the timeline in hand — "the
+/// oldest loaded root has a seq greater than 1" — in six handlers and again in
+/// the live fold. Root sequences have HOLES: a thread reply consumes a sequence
+/// without ever becoming a root, so a channel whose FIRST message sits at seq 40
+/// answered that guess `true` forever. The reader clicked, the node answered an
+/// empty page, and the button came straight back.
+///
+/// The index's own `has_more` is the authority now, and the only thing allowed
+/// to raise it locally is the one fact a client knows and the server does not:
+/// the render window evicting rows off its oldest edge.
+#[test]
+fn a_channel_at_its_true_beginning_offers_no_older_page() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "a".into();
+
+    // The window the node answered with: the channel begins at seq 40 (the
+    // sequences below it burned by thread replies) and the index says there is
+    // nothing before it.
+    let landing = backend::ChatData {
+        generation: 1,
+        channels: Vec::new(),
+        messages: vec![message(40, "the first message in this room", false)],
+        has_older_history: false,
+        active_channel: "a".into(),
+        active_channel_name: "a".into(),
+        active_channel_archived: false,
+        active_channel_members_only: false,
+        huddle_roster: Vec::new(),
+        channel_members: Vec::new(),
+        selected_message_seq: 0,
+        selected_message_rev: 0,
+        selected_message_body: String::new(),
+        active_thread_seq: 0,
+        thread_target_seq: 0,
+        thread_messages: Vec::new(),
+        thread_has_more: false,
+    };
+    app.chat_generation = 1;
+    let _ = app.__update(__DucktapeMessage::ChatUpdated(landing));
+    assert!(
+        !app.has_older_history,
+        "seq 40 is this channel's first message — there is no older page"
+    );
+
+    // A live arrival is not history either.
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "a",
+        message(44, "and a new one", false),
+    )));
+    assert!(
+        !app.has_older_history,
+        "a message arriving at the tail says nothing about the floor"
+    );
+
+    // And the guard agrees with the button: nothing to page means nothing runs.
+    let _ = app.__update(__DucktapeMessage::LoadMoreHistory);
+    assert!(!app.history_loading);
+}
+
+/// THE FLOOR THE RENDER WINDOW ATE IS OLDER HISTORY. `bounded_chat_window`
+/// evicts from the oldest edge to hold the hot window, so a room busy enough to
+/// overflow it while the reader watches DOES gain a page to go back to — and
+/// that is the one raise the fold is allowed to make on its own.
+#[test]
+fn a_window_that_evicts_its_oldest_row_regains_the_older_page() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    app.active_channel = "a".into();
+    let limit = i64::try_from(backend::CHAT_HOT_WINDOW_LIMIT).expect("the window limit fits");
+    app.messages = (1..=limit).map(|seq| message(seq, "held", false)).collect();
+    app.has_older_history = false;
+
+    let _ = app.__update(__DucktapeMessage::LiveUpdated(posted_delta(
+        "a",
+        message(limit + 1, "one too many", false),
+    )));
+
+    assert_eq!(
+        backend::oldest_message_seq(app.messages.clone()),
+        2,
+        "the window dropped its oldest row to take the arrival"
+    );
+    assert!(
+        app.has_older_history,
+        "the row it dropped is older history the reader can still page back to"
+    );
+}
+
+/// "JUMP TO LATEST" IS A FLOAT AT THE BOTTOM OF THE TIMELINE, and the offset it
+/// reads is the same one the older-page prefetch reads: the stream is
+/// bottom-anchored, so 0.0 IS now and 1.0 is the top of the scrollback.
+#[test]
+fn the_jump_to_latest_float_follows_the_readers_own_scroll() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.active_channel = "a".into();
+    app.messages = vec![message(40, "the tail", false)];
+
+    assert!(app.chat_at_tail, "a fresh timeline mounts at the tail");
+
+    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 900.0, 0.0, 0.4));
+    assert!(!app.chat_at_tail, "she is reading back through the room");
+
+    // Content that FITS reports 0/0. A conversation with nothing to scroll is
+    // entirely on screen, so it is AT the tail — the float must not appear.
+    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 0.0, 0.0, f64::NAN));
+    assert!(app.chat_at_tail);
+
+    let _ = app.__update(__DucktapeMessage::ChatScrolled(0.0, 900.0, 0.0, 0.4));
+    assert!(!app.chat_at_tail);
+    // The way back is the room picker aimed at the room already on screen, and
+    // it lands her at the tail.
+    let _ = app.__update(__DucktapeMessage::ChooseChannel("a".into()));
+    assert!(app.chat_at_tail);
+    assert!(
+        !app.history_view,
+        "and the window it ends is the history one"
+    );
+}
+
+/// THE PREVIOUS NETWORK'S ROOMS DO NOT SURVIVE INTO THIS ONE.
+///
+/// A workspace switch does not change the endpoint — the node comes back on the
+/// same loopback port — so the console can live right through one: the websocket
+/// drops, reconnects, and resyncs, and no `connect` ever re-runs to install the
+/// new network's channel list outright. Every fold in the resync only ever ADDS
+/// rows, so the sidebar kept every room the reader had ever seen: she joined a
+/// network with one DM in it and went on seeing the `#general` of the workspace
+/// she had just forgotten, clickable, with nothing behind it.
+///
+/// The signal costs nothing: the node pushes its own status document, which
+/// names the chain, and `chat_chain_id` records the chain the rows on screen
+/// were learned from.
+#[test]
+fn a_resync_across_a_chain_drops_the_previous_networks_rooms() {
+    let room = |id: &str, head_seq: i64| backend::ChatChannel {
+        id: id.into(),
+        name: id.into(),
+        archived: false,
+        members_only: false,
+        huddle_count: 0,
+        head_seq,
+    };
+    let resync = |app: &Ducktape, channels: Vec<backend::ChatChannel>| {
+        let mut refresh =
+            live_refresh(app.hydration_generation, "dm-1", Vec::new(), "", Vec::new());
+        refresh.channels = channels;
+        __DucktapeMessage::LiveResynced(refresh)
+    };
+
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.loading = false;
+    // The console is holding the network she left, and the node is now serving
+    // the one she joined.
+    app.chat_chain_id = "ducktape-industries#c7cf82df".into();
+    app.network_chain_id = "ducktape-industries#549d70e8".into();
+    app.channels = vec![room("general", 40), room("random", 3)];
+
+    let _ = app.__update(resync(&app, vec![room("dm-1", 6)]));
+
+    let held: Vec<&str> = app.channels.iter().map(|row| row.id.as_str()).collect();
+    assert_eq!(
+        held,
+        vec!["dm-1"],
+        "a room the network she left had is gone, not folded forward"
+    );
+    assert_eq!(
+        app.chat_chain_id, app.network_chain_id,
+        "and the list on screen now belongs to the chain that answered for it"
+    );
+
+    // ON THE SAME CHAIN THE FOLD IS BACK, and it is load-bearing: this read left
+    // the node several queries ago, so a room created while it was in flight
+    // must survive it and a head a delta moved must not walk back.
+    app.channels.push(room("brand-new", 1));
+    app.channels[0].head_seq = 9;
+    let _ = app.__update(resync(&app, vec![room("dm-1", 6)]));
+    assert!(
+        app.channels.iter().any(|row| row.id == "brand-new"),
+        "the room created mid-resync is still in the sidebar"
+    );
+    assert_eq!(
+        backend::channel_head_seq(app.channels.clone(), "dm-1".into()),
+        9,
+        "and the head the delta moved does not walk back to the snapshot"
+    );
 }

@@ -9,7 +9,7 @@
 use crate::interface::PrDiff;
 use crate::tracker_iface::{ItemDetail, ItemState, ItemSummary, ReviewVerdict};
 use crate::{ForgeMsg, decode_msg};
-use chat::client::{ChatBlock, author_handle, author_name, paragraph_blocks};
+use chat::client::{AuthorNames, ChatBlock, author_handle, author_name, paragraph_blocks};
 
 /// One tracker listing row.
 #[derive(Clone, Debug, Hash, PartialEq, Default)]
@@ -27,7 +27,7 @@ pub struct ItemRow {
 
 /// Listing rows from the committed summaries: the wire lists ascending by
 /// number, the tracker renders newest first.
-pub fn item_rows(items: &[ItemSummary]) -> Vec<ItemRow> {
+pub fn item_rows(items: &[ItemSummary], names: &AuthorNames) -> Vec<ItemRow> {
     items
         .iter()
         .rev()
@@ -38,7 +38,7 @@ pub fn item_rows(items: &[ItemSummary]) -> Vec<ItemRow> {
                 kind: kind_key(item.kind).into(),
                 state: state_key(item.state).into(),
                 title: item.title.clone(),
-                author_name: author_name(&handle),
+                author_name: author_name(&handle, names),
                 author: handle,
             }
         })
@@ -141,7 +141,7 @@ fn body_blocks(body: &str) -> Vec<ChatBlock> {
 /// Build the item pane's view model from the committed detail + its pinned
 /// diff (PRs with a locally-computable patch; `None` for issues and for
 /// diff-query misses).
-pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>) -> ItemView {
+pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>, names: &AuthorNames) -> ItemView {
     let source_oid = diff.map(|d| d.source_oid.clone()).unwrap_or_default();
     let author = author_handle(&detail.summary.author);
     let reviews: Vec<ReviewRow> = detail
@@ -150,7 +150,7 @@ pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>) -> ItemView {
         .map(|review| {
             let handle = author_handle(&review.author);
             ReviewRow {
-                author_name: author_name(&handle),
+                author_name: author_name(&handle, names),
                 author: handle,
                 verdict: verdict_key(review.verdict).into(),
                 blocks: body_blocks(&review.body),
@@ -186,7 +186,7 @@ pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>) -> ItemView {
         title: detail.summary.title.clone(),
         blocks: body_blocks(&detail.body),
         body: detail.body.clone(),
-        author_name: author_name(&author),
+        author_name: author_name(&author, names),
         author,
         created_at: i64::try_from(detail.summary.created_at).unwrap_or(i64::MAX),
         channel_id: detail.channel_id.clone(),
