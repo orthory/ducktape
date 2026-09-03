@@ -45,8 +45,8 @@
 //! `meta/height` vouches for the FEED and bumps on every block, the fold tip
 //! vouches for the DERIVED ROWS and only moves when ops arrive. guest code
 //! itself lives in the engine's own reserved 0x00 keyspace — invisible to
-//! scans and wiped by nothing this crate does; every node installs its own
-//! from the bundled artifacts at open.
+//! scans and wiped by nothing this crate does; every node converges its own
+//! into each database from the guests its genesis carries ([`IndexStore::converge`]).
 //!
 //! alongside the per-module databases the store keeps ONE internal blocks
 //! database (`<base>/_blocks/`, never a module): `blk/{height:016x}` holds the
@@ -272,12 +272,32 @@ pub struct FoldStatus {
 }
 
 /// one module's open database plus its guest's declared roles.
+///
+/// the roles are what the LAST converge established — read back from the
+/// marker at open, so a database keeps serving the guest it holds until
+/// [`IndexStore::converge`] decides otherwise — and updated in place by that
+/// converge, which is why they are atomics on a shared handle.
 struct ModuleIndex {
     db: Arc<Db>,
     /// the guest exports `on_apply` — a fold trigger is registered.
-    has_fold: bool,
+    has_fold: AtomicBool,
     /// the guest exports `query` — [`IndexStore::view`] routes to it.
-    has_view: bool,
+    has_view: AtomicBool,
+}
+
+impl ModuleIndex {
+    fn folds(&self) -> bool {
+        self.has_fold.load(Ordering::Acquire)
+    }
+
+    fn views(&self) -> bool {
+        self.has_view.load(Ordering::Acquire)
+    }
+
+    fn set_roles(&self, has_fold: bool, has_view: bool) {
+        self.has_fold.store(has_fold, Ordering::Release);
+        self.has_view.store(has_view, Ordering::Release);
+    }
 }
 
 /// the per-module index store: one fluent31 database per registered module,
@@ -300,15 +320,27 @@ pub struct IndexStore {
 
 impl IndexStore {
     /// open (creating if missing) one database per module under `base` and
-    /// converge each onto its declared index guest: install (or replace) the
-    /// mapper bytes, register the fold trigger when the guest folds, tear
-    /// both down when a module no longer ships a guest.
+    /// converge each onto its declared index guest — [`Self::open_bare`]
+    /// then [`Self::converge`], for a caller that holds its guests at open.
+    pub fn open(base: impl AsRef<Path>, modules: &[IndexModule]) -> Result<Self> {
+        let ids: Vec<&str> = modules.iter().map(|m| m.id).collect();
+        let store = Self::open_bare(base, &ids)?;
+        store.converge(modules)?;
+        Ok(store)
+    }
+
+    /// open (creating if missing) one database per module under `base`,
+    /// deciding NOTHING about guests: each database keeps serving whatever
+    /// guest its last converge installed (roles read back from the marker),
+    /// until [`Self::converge`] runs. This is the open for a node whose
+    /// guests arrive later than its surfaces — a joiner's genesis is fetched
+    /// off the mesh after the index routes are already up.
     ///
     /// only the declared module ids (plus `_blocks`) are opened. a
     /// `<base>/_staging` directory left by an older build is INERT GARBAGE —
     /// the shipped-index lane that wrote it is gone, nothing adopts or
     /// enumerates it, and it is safe to delete by hand.
-    pub fn open(base: impl AsRef<Path>, modules: &[IndexModule]) -> Result<Self> {
+    pub fn open_bare(base: impl AsRef<Path>, module_ids: &[&str]) -> Result<Self> {
         let base = base.as_ref().to_path_buf();
         let opts = Options {
             sync: SyncMode::Periodic { every: SYNC_EVERY },
@@ -318,15 +350,15 @@ impl IndexStore {
             ..Options::default()
         };
         let mut open = BTreeMap::new();
-        for spec in modules {
-            let db = Arc::new(Db::open(base.join(spec.id), opts.clone())?);
-            let (has_fold, has_view) = converge_guest(&db, spec)?;
+        for id in module_ids {
+            let db = Arc::new(Db::open(base.join(id), opts.clone())?);
+            let (has_fold, has_view) = installed_roles(&db)?;
             open.insert(
-                spec.id.to_string(),
+                (*id).to_string(),
                 ModuleIndex {
                     db,
-                    has_fold,
-                    has_view,
+                    has_fold: AtomicBool::new(has_fold),
+                    has_view: AtomicBool::new(has_view),
                 },
             );
         }
@@ -347,6 +379,20 @@ impl IndexStore {
             "index store opened"
         );
         Ok(store)
+    }
+
+    /// converge every named module's database onto its declared index guest:
+    /// install (or replace) the mapper bytes, register the fold trigger when
+    /// the guest folds, tear both down when a module ships no guest. A module
+    /// this store did not open is a refusal by name. Idempotent-and-free on a
+    /// database already holding these bytes (the marker says so).
+    pub fn converge(&self, modules: &[IndexModule]) -> Result<()> {
+        for spec in modules {
+            let m = self.module(spec.id)?;
+            let (has_fold, has_view) = converge_guest(&m.db, spec)?;
+            m.set_roles(has_fold, has_view);
+        }
+        Ok(())
     }
 
     pub fn base(&self) -> &Path {
@@ -446,7 +492,7 @@ impl IndexStore {
     /// "the view is stale" signal — surfaced, never guessed.
     pub fn fold_status(&self, module: &str) -> Result<Option<FoldStatus>> {
         let m = self.module(module)?;
-        if !m.has_fold {
+        if !m.folds() {
             return Ok(None);
         }
         let triggers = m.db.list_triggers()?;
@@ -532,7 +578,7 @@ impl IndexStore {
     /// backlog still pending — the views cannot catch up.
     pub fn wait_folds_drained(&self) -> Result<()> {
         for (id, m) in &self.modules {
-            if !m.has_fold {
+            if !m.folds() {
                 continue;
             }
             drain_fold(&m.db, id)?;
@@ -605,7 +651,7 @@ impl IndexStore {
         }
         let m = self.module(module)?;
         let out = (|| -> Result<()> {
-            if m.has_fold {
+            if m.folds() {
                 m.db.delete_trigger(FOLD_TRIGGER)?;
             }
             let mut drop_mark = WriteBatch::new();
@@ -616,7 +662,7 @@ impl IndexStore {
             stamp.put(META_HEIGHT, height.to_be_bytes());
             stamp.put(META_BACKFILL, height.to_be_bytes());
             m.db.write(stamp)?;
-            if m.has_fold {
+            if m.folds() {
                 create_fold_trigger(&m.db)?;
             }
             Ok(())
@@ -710,7 +756,7 @@ impl IndexStore {
             return Err(Error::Poisoned);
         }
         let m = self.module(module)?;
-        if !m.has_fold {
+        if !m.folds() {
             return Ok(());
         }
         let out = (|| -> Result<()> {
@@ -792,7 +838,7 @@ impl IndexStore {
     /// stale but consistent.
     pub fn view(&self, module: &str, req: &[u8]) -> Result<Vec<u8>> {
         let m = self.module(module)?;
-        if !m.has_view {
+        if !m.views() {
             return Err(Error::ViewUnsupported);
         }
         m.db.query(GUEST_NAME, req).map_err(view_error)
@@ -873,6 +919,17 @@ struct GuestMarker {
 /// and the cost is bounded by the feed the database holds, so this stays until
 /// a measured boot regression asks for a `shape` field in [`GuestMarker`] to
 /// narrow which changes refold.
+/// the roles of the guest a database currently holds — what its last
+/// converge wrote in the marker — or none for a database no guest was ever
+/// installed into (or whose marker an interrupted converge never wrote: that
+/// database re-converges whole at the next [`IndexStore::converge`]).
+fn installed_roles(db: &Db) -> Result<(bool, bool)> {
+    let marker = db
+        .get(META_GUEST.as_bytes())?
+        .and_then(|bytes| borsh::from_slice::<GuestMarker>(&bytes).ok());
+    Ok(marker.map_or((false, false), |m| (m.has_fold, m.has_view)))
+}
+
 fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     let marker = db
         .get(META_GUEST.as_bytes())?

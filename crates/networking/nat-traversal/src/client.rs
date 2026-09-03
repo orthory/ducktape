@@ -238,10 +238,15 @@ impl NatClient {
         // conflict with repointing `self.coord` on success.
         let coords = self.coords.clone();
         for (i, c) in coords.iter().copied().enumerate() {
-            self.sock
-                .send_to(&self.authed(Msg::BindRequest { from: self.key }), c)
-                .await?;
+            // the send is INSIDE the per-coordinator attempt: a socket-level
+            // refusal of one hint (a family the underlay cannot address — a
+            // NAT64-synthesised v6 coordinator on the real-IPv4 socket is
+            // EINVAL) falls through to the next hint exactly like a timeout,
+            // instead of aborting the whole discovery on the first hint.
             let attempt = async {
+                self.sock
+                    .send_to(&self.authed(Msg::BindRequest { from: self.key }), c)
+                    .await?;
                 let mut buf = [0u8; 64];
                 loop {
                     let (n, from) = self.sock.recv_from(&mut buf).await?;
@@ -1260,6 +1265,39 @@ mod tests {
         assert_eq!(
             idx, 1,
             "the dead primary is skipped; the live secondary answers"
+        );
+        assert_eq!(reflexive.port(), client.local_addr().await.unwrap().port());
+    }
+
+    #[tokio::test]
+    async fn unaddressable_primary_falls_through_to_live_secondary() {
+        // A live coordinator (the secondary), on the same family as the client.
+        let live = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live.local_addr().unwrap();
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(live),
+            crate::auth::AuthPolicy::Public,
+        ));
+
+        // An UNADDRESSABLE primary: a V6 destination on the client's V4
+        // socket. The OS refuses the send outright (EINVAL on macOS,
+        // EAFNOSUPPORT/EINVAL elsewhere) — no timeout ever elapses. This is
+        // the shape a NAT64 network hands a real-IPv4 underlay: getaddrinfo
+        // synthesises `64:ff9b::a.b.c.d` for a V4-only coordinator.
+        let unaddressable: SocketAddr = "[::1]:3478".parse().unwrap();
+
+        let (_, mut client) = public_client(1, vec![unaddressable, live_addr]).await;
+        let (idx, reflexive) = timeout(
+            Duration::from_secs(2),
+            client.discover_reflexive_failover(Duration::from_millis(150)),
+        )
+        .await
+        .expect("failover must be bounded, never stuck")
+        .expect("a refused send on one hint must not abort discovery");
+
+        assert_eq!(
+            idx, 1,
+            "the unaddressable primary is skipped; the live secondary answers"
         );
         assert_eq!(reflexive.port(), client.local_addr().await.unwrap().port());
     }

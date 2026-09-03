@@ -10,7 +10,7 @@ use host::Host;
 use recovery::{Manifest, Recovery};
 
 use crate::explorer::{IndexFold, heal_index};
-use crate::host_state::{NetworkBindings, genesis_host, restore_host};
+use crate::host_state::{NetworkBindings, NodeSubstrates, genesis_host, restore_host};
 use crate::sync::catchup::advance_next_seq_from_frames;
 use crate::util::{fatal, hex};
 
@@ -51,19 +51,28 @@ pub(super) async fn restore(
                  partitions: they are what prevents this key from double-voting)"
                 );
             }
-            let host = genesis_host(
+            let host = match genesis_host(
                 context,
-                forge_repo,
-                duckfs_dir,
                 validators,
                 NetworkBindings {
                     invite: namespace,
                     identity_chain_id,
                 },
-                blobs.clone(),
+                NodeSubstrates {
+                    forge_repo,
+                    duckfs_dir,
+                    blobs: blobs.clone(),
+                    index,
+                },
                 genesis,
             )
-            .await;
+            .await
+            {
+                Ok(host) => host,
+                Err(e) => {
+                    fatal!(label, "genesis: {e}");
+                }
+            };
             let pos = recovery.oplog_pos().await;
             let genesis_participants: Vec<Vec<u8>> =
                 validators.iter().map(|k| k.as_ref().to_vec()).collect();
@@ -92,10 +101,13 @@ pub(super) async fn restore(
         Some(manifest) => {
             let restored = restore_host(
                 context,
-                forge_repo,
-                duckfs_dir,
                 &manifest,
-                blobs.clone(),
+                NodeSubstrates {
+                    forge_repo,
+                    duckfs_dir,
+                    blobs: blobs.clone(),
+                    index,
+                },
                 genesis,
             )
             .await;
@@ -473,10 +485,11 @@ where
         context,
         client,
         &boundary,
-        crate::host_state::SyncSubstrates {
+        NodeSubstrates {
             forge_repo,
             duckfs_dir,
             blobs: blobs.clone(),
+            index,
         },
         0,
         genesis,

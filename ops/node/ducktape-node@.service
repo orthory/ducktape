@@ -28,11 +28,14 @@ Wants=network-online.target
 User=ducktape
 Group=ducktape
 # /var/lib/ducktape, created and chowned by systemd; DUCKTAPE_HOME points the
-# registry, the module set and the executor dir at it.
+# registry and the executor dir at it. The founding set the installer copied
+# there is what `node init` founds from and where the netstack guest is read
+# at boot; a network's own wasm is its workspace `genesis` file.
 StateDirectory=ducktape
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/ducktape
 Environment=DUCKTAPE_HOME=/var/lib/ducktape
+Environment=DUCKTAPE_MODULES_DIR=/var/lib/ducktape/modules
 # Optional: RUST_LOG, extra flags in DUCKTAPE_NODE_ARGS. The file is not
 # required.
 EnvironmentFile=-/etc/ducktape/node.env

@@ -38,7 +38,8 @@ recovery = { workspace = true }
 sdk = { workspace = true }
 statesync = { workspace = true }
 # the production module set: system infrastructure + every product module.
-# (acl composes as a wasm tenant; its crate is embedded via component.wasm.)
+# (acl composes as a wasm tenant: its component rides in the genesis, and the
+# crate is linked only for its native types.)
 valset = { workspace = true }
 governance = { workspace = true }
 # the resident-accept verb drives governance ops through the local rpc.

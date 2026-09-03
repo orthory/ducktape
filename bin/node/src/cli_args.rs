@@ -547,8 +547,9 @@ pub struct InitArgs {
     /// found the network here instead of the registry default
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
-    /// directory of `<id>.component.wasm` files to found the network's genesis
-    /// wasm set from (default: $DUCKTAPE_MODULES_DIR, else <ducktape home>/modules)
+    /// the founding set to compose the genesis from: a directory holding every
+    /// `<id>.component.wasm` and `<id>.index.wasm` (default: $DUCKTAPE_MODULES_DIR,
+    /// else the set the build staged beside this binary)
     #[arg(long, value_name = "DIR")]
     pub modules: Option<PathBuf>,
     #[command(flatten)]
@@ -593,6 +594,12 @@ pub struct JoinCmd {
     /// materialize here instead of the registry dir named by the chain id
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
+    /// the network's genesis file (the founder's `<workspace>/genesis`). A
+    /// pre-genesis member boots straight into genesis, so it must hold the
+    /// file before it starts; any other joiner fetches it off the mesh at
+    /// first boot and needs no flag
+    #[arg(long, value_name = "FILE")]
+    pub genesis: Option<PathBuf>,
     #[command(flatten)]
     pub plumbing: PlumbingArgs,
 }

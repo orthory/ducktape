@@ -3,9 +3,9 @@
 //! `-n/--network <chain-id>` selector find it. pure-CLI: no node is booted,
 //! no socket is bound — `DUCKTAPE_HOME` points every run at a temp registry.
 
-// `node init` hashes a directory of `<id>.component.wasm` into the descriptor,
-// so a CLI test that founds a network needs one: the harness owns THE path to
-// the checked-in set (`common::FIXTURES`).
+// `node init` composes a founding set into the workspace genesis. Nothing
+// here names one: the `ducktape` binary under test finds the set `cargo build`
+// staged beside itself, which is exactly what an operator's build does.
 mod common;
 
 use std::path::Path;
@@ -16,7 +16,6 @@ fn ducktape(home: &Path, args: &[&str]) -> std::process::Output {
         .arg("node")
         .args(args)
         .env("DUCKTAPE_HOME", home)
-        .env("DUCKTAPE_MODULES_DIR", common::FIXTURES)
         .output()
         .expect("run ducktape")
 }
@@ -82,7 +81,6 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::pat
     let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["node", "init", "--name", name, "--primary-coordinator", "none"])
         .env("DUCKTAPE_HOME", home)
-        .env("DUCKTAPE_MODULES_DIR", common::FIXTURES)
         .env("PATH", path_dir)
         .output()
         .expect("run ducktape");
@@ -199,7 +197,6 @@ fn ducktape_raw(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(args)
         .env("DUCKTAPE_HOME", home)
-        .env("DUCKTAPE_MODULES_DIR", common::FIXTURES)
         .output()
         .expect("run ducktape")
 }
@@ -265,12 +262,13 @@ fn one_registered_workspace_needs_no_selector_in_any_family() {
 }
 
 /// `--modules <dir>` is how a founder pins its genesis wasm set: every
-/// component in the directory is hashed INTO the descriptor and copied into
-/// `<workspace>/modules`, the bundle the node seeds its blobstore from at boot.
-/// The copy and the hash must be the same bytes, or the node refuses its own
-/// workspace on the next start.
+/// component and index guest in the directory is composed into
+/// `<workspace>/genesis`, the file the node hydrates its blobstore and index
+/// from at boot, and the descriptor pins that file by its hash and every
+/// component by its own. File and pins must be the same bytes, or the node
+/// refuses its own workspace on the next start.
 #[test]
-fn init_writes_module_hashes_and_the_bundle() {
+fn init_writes_module_hashes_and_the_genesis() {
     use sha2::Digest as _;
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("ws");
@@ -278,7 +276,7 @@ fn init_writes_module_hashes_and_the_bundle() {
         .args(["node", "init", "--name", "bundled", "--primary-coordinator", "none", "--dir"])
         .arg(&ws)
         .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
-        .arg(common::FIXTURES)
+        .arg(common::founding_set())
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -287,51 +285,49 @@ fn init_writes_module_hashes_and_the_bundle() {
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
     want.sort_unstable();
     assert_eq!(ids, want);
+    let file = ws.join("genesis");
+    let bytes = std::fs::read(&file).expect("init writes the genesis file");
+    assert_eq!(
+        workspace_config::hex_bytes(&sha2::Sha256::digest(&bytes)),
+        d.genesis,
+        "the descriptor pins the whole file"
+    );
+    let genesis = workspace_config::Genesis::decode(&bytes).expect("decodes");
+    let hashes = genesis.component_hashes();
     for m in &d.modules {
-        let component = ws.join("modules").join(format!("{}.component.wasm", m.id));
-        let bytes = std::fs::read(&component).expect("the bundle carries every hashed component");
-        assert_eq!(workspace_config::hex_bytes(&sha2::Sha256::digest(&bytes)), m.code_hash);
-    }
-}
-
-/// re-founding a workspace from ITS OWN bundle — the flow the "delete the file
-/// to re-found from scratch" refusal invites — points `--modules` at the very
-/// directory `init` seeds. `std::fs::copy(p, p)` returns `Ok(0)` and TRUNCATES
-/// on Linux, so a blind copy would zero every component AFTER hashing it: init
-/// reports success and the node refuses its first boot against bytes that no
-/// longer exist. Bytes, not existence, is what this asserts.
-#[test]
-fn re_founding_from_its_own_bundle_keeps_the_components() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ws = tmp.path().join("ws");
-    let found = |modules: &Path| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
-            .args(["node", "init", "--name", "refound", "--primary-coordinator", "none", "--dir"])
-            .arg(&ws)
-            .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
-            .arg(modules)
-            .output()
-            .expect("run ducktape")
-    };
-    let out = found(Path::new(common::FIXTURES));
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-
-    let bundle = ws.join("modules");
-    std::fs::remove_file(ws.join("network.toml")).expect("un-found the network");
-    let out = found(&bundle);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-
-    let d = workspace_config::NetworkDescriptor::load(&ws.join("network.toml")).unwrap();
-    assert!(!d.modules.is_empty());
-    for m in &d.modules {
-        let name = format!("{}.component.wasm", m.id);
         assert_eq!(
-            std::fs::read(bundle.join(&name)).expect("read the re-founded component"),
-            std::fs::read(Path::new(common::FIXTURES).join(&name))
-                .expect("read the fixture component"),
-            "{name} did not survive a re-found from its own bundle"
+            workspace_config::hex_bytes(&hashes[&m.id]),
+            m.code_hash,
+            "{}: the descriptor pins the component the genesis carries",
+            m.id
         );
     }
+    let guests: Vec<&str> = genesis.index_guests.iter().map(|a| a.id.as_str()).collect();
+    let mut want = topology::TOPOLOGY.index_guest_ids(topology::PRODUCTION);
+    want.sort_unstable();
+    assert_eq!(guests, want, "every declared index guest rides in the genesis");
+}
+
+/// with no `--modules` and no `$DUCKTAPE_MODULES_DIR`, `init` founds from the
+/// set `cargo build` staged beside the binary — the operator's plain build is
+/// enough to found a network.
+#[test]
+fn init_founds_from_the_set_the_build_staged_beside_the_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "init", "--name", "staged", "--primary-coordinator", "none", "--dir"])
+        .arg(&ws)
+        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1"])
+        .env_remove("DUCKTAPE_MODULES_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let genesis = workspace_config::Genesis::load(&ws.join("genesis")).expect("the genesis file");
+    let ids: Vec<&str> = genesis.components.iter().map(|a| a.id.as_str()).collect();
+    let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    want.sort_unstable();
+    assert_eq!(ids, want);
 }
 
 fn assert_ok(out: &std::process::Output, what: &str) {
@@ -390,17 +386,25 @@ fn found_and_admit(tmp: &Path) -> (std::path::PathBuf, String) {
 }
 
 /// a pre-genesis co-validator: `admit`ted by the founder, it `join`s as a
-/// MEMBER and boots straight into genesis — where a missing component is a
-/// refusal and there is no peer to fetch one from. So a member join seeds
-/// `<joiner>/modules` from the managed dir (`DUCKTAPE_MODULES_DIR` here), the
-/// same bytes the descriptor hashes; a non-member join writes no bundle.
+/// MEMBER and boots straight into genesis — where a missing genesis is a
+/// refusal and there is no peer to fetch it from. So a member join takes the
+/// founder's genesis file (`--genesis`) and installs it, byte for byte, in
+/// its own workspace.
 #[test]
-fn a_member_join_bundles_the_genesis_components() {
+fn a_member_join_installs_the_founders_genesis() {
     let tmp = tempfile::tempdir().unwrap();
     let (joiner, blob) = found_and_admit(tmp.path());
+    let founders = tmp.path().join("founder").join("genesis");
     let out = ducktape(
         tmp.path(),
-        &["join", &blob, "--dir", joiner.to_str().unwrap()],
+        &[
+            "join",
+            &blob,
+            "--dir",
+            joiner.to_str().unwrap(),
+            "--genesis",
+            founders.to_str().unwrap(),
+        ],
     );
     assert_ok(&out, "join");
     assert!(
@@ -408,65 +412,67 @@ fn a_member_join_bundles_the_genesis_components() {
         "the admitted key joins as a member:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let d = workspace_config::NetworkDescriptor::load(&joiner.join("network.toml")).unwrap();
-    assert!(!d.modules.is_empty());
-    for m in &d.modules {
-        let name = format!("{}.component.wasm", m.id);
-        assert_eq!(
-            std::fs::read(joiner.join("modules").join(&name)).expect("the member's bundle"),
-            std::fs::read(Path::new(common::FIXTURES).join(&name)).expect("the fixture"),
-            "{name} in the member's bundle is not the founder's component"
-        );
-    }
+    assert_eq!(
+        std::fs::read(joiner.join("genesis")).expect("the member's genesis"),
+        std::fs::read(&founders).expect("the founder's genesis"),
+        "the member's genesis is the founder's, byte for byte"
+    );
 }
 
-/// a managed dir whose component is NOT the one the founder hashed is refused
-/// by module name at `join` — not by a genesis root mismatch at first boot.
+/// a member join without the founder's genesis is refused naming the flag —
+/// the workspace stays (its identity is what the founder admitted), and the
+/// re-run with `--genesis` completes it.
 #[test]
-fn a_member_join_refuses_a_component_that_is_not_the_genesis_one() {
+fn a_member_join_without_the_genesis_is_refused_naming_the_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let (joiner, blob) = found_and_admit(tmp.path());
-    let tampered = tmp.path().join("tampered");
-    std::fs::create_dir_all(&tampered).unwrap();
-    let d =
-        workspace_config::NetworkDescriptor::load(&tmp.path().join("founder").join("network.toml"))
-            .unwrap();
-    for m in &d.modules {
-        let name = format!("{}.component.wasm", m.id);
-        std::fs::copy(
-            Path::new(common::FIXTURES).join(&name),
-            tampered.join(&name),
-        )
-        .unwrap();
-    }
-    let victim = &d.modules[0].id;
-    let victim_file = tampered.join(format!("{victim}.component.wasm"));
-    let mut bytes = std::fs::read(&victim_file).unwrap();
-    bytes.push(0);
-    std::fs::write(&victim_file, bytes).unwrap();
+    let out = ducktape(
+        tmp.path(),
+        &["join", &blob, "--dir", joiner.to_str().unwrap()],
+    );
+    assert!(!out.status.success(), "a member needs its genesis at join");
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("--genesis"), "the refusal names the flag: {err}");
+    assert!(
+        !joiner.join("genesis").exists(),
+        "a refused join installs no genesis"
+    );
+}
 
-    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
-        .args(["node", "join", &blob, "--dir", joiner.to_str().unwrap()])
-        .env("DUCKTAPE_HOME", tmp.path())
-        .env("DUCKTAPE_MODULES_DIR", &tampered)
-        .output()
-        .expect("run ducktape");
+/// a genesis file that is NOT the one the founder hashed is refused by the
+/// descriptor's pin at `join` — not by a genesis root mismatch at first boot.
+#[test]
+fn a_member_join_refuses_a_genesis_that_is_not_the_networks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (joiner, blob) = found_and_admit(tmp.path());
+    let tampered = tmp.path().join("tampered-genesis");
+    let mut bytes = std::fs::read(tmp.path().join("founder").join("genesis")).unwrap();
+    bytes.push(0);
+    std::fs::write(&tampered, bytes).unwrap();
+
+    let out = ducktape(
+        tmp.path(),
+        &[
+            "join",
+            &blob,
+            "--dir",
+            joiner.to_str().unwrap(),
+            "--genesis",
+            tampered.to_str().unwrap(),
+        ],
+    );
     assert!(
         !out.status.success(),
-        "a tampered component must refuse the join"
+        "a tampered genesis must refuse the join"
     );
     let err = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
-        err.contains(&format!("module {victim}")),
-        "the refusal names the module: {err}"
+        err.contains("not the network's genesis"),
+        "the refusal names the pin: {err}"
     );
     assert!(
-        err.contains("install-node"),
-        "the refusal names the remedy: {err}"
-    );
-    assert!(
-        !joiner.join("modules").exists(),
-        "a refused join seeds no bundle"
+        !joiner.join("genesis").exists(),
+        "a refused join installs no genesis"
     );
 }
 

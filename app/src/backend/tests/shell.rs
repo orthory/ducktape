@@ -857,6 +857,7 @@ fn workspace_facts_come_from_the_crate_that_wrote_them() {
         reach: vec![],
         coordination: None,
         modules: vec![],
+        genesis: String::new(),
     }
     .save(&dir.join("network.toml"))
     .unwrap();

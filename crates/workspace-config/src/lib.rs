@@ -35,11 +35,13 @@ use serde::{Deserialize, Serialize};
 // The submodules are public as well as flat-re-exported: `config/resolve.rs`
 // back in bin/node reaches several of them by path (`node_toml::RawNodeToml`),
 // and it is the one caller that wants the raw, pre-resolution shapes.
+pub mod genesis;
 pub mod identity;
 pub mod invite;
 pub mod join;
 pub mod node_toml;
 
+pub use genesis::*;
 pub use identity::*;
 pub use invite::*;
 pub use join::*;
@@ -74,13 +76,43 @@ pub fn executor_dir() -> Result<PathBuf, String> {
     Ok(ducktape_home()?.join("executors"))
 }
 
-/// where `make install-node` puts the module components a founder seeds its
-/// network from: `$DUCKTAPE_MODULES_DIR`, else `<ducktape_home>/modules`.
+/// where the FOUNDING SET is read from — the directory of
+/// `<id>.component.wasm`, `<id>.index.wasm` and `netstack.component.wasm`
+/// files `node init` composes a genesis from, and the daemons that run no
+/// network (noded, simnode, the dev shape) compose directly from:
+/// `$DUCKTAPE_MODULES_DIR`, else the set the build staged beside this
+/// executable ([`staged_modules_dir`]).
+///
+/// This is the only place bare wasm files are read. A network's own wasm
+/// lives in its workspace genesis, never under the ducktape home: two
+/// networks carry two sets, and no directory outside a workspace decides
+/// what its network runs.
 pub fn modules_dir() -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os("DUCKTAPE_MODULES_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    Ok(ducktape_home()?.join("modules"))
+    let exe = std::env::current_exe().map_err(|e| format!("current executable: {e}"))?;
+    staged_modules_dir(&exe).ok_or_else(|| {
+        format!(
+            "no founding set beside {} — `cargo build` stages one (target/<profile>/modules), \
+             `make install-node` installs one beside the binary, or set $DUCKTAPE_MODULES_DIR",
+            exe.display()
+        )
+    })
+}
+
+/// the founding set the build staged beside `exe`: `<exe dir>/modules` (a
+/// `cargo build` binary in `target/<profile>/`, or an installed one), else
+/// `<exe dir>/../modules` (a test executable cargo runs from
+/// `target/<profile>/deps/`). `None` when neither directory exists.
+pub fn staged_modules_dir(exe: &Path) -> Option<PathBuf> {
+    let exe_dir = exe.parent()?;
+    let beside = exe_dir.join("modules");
+    if beside.is_dir() {
+        return Some(beside);
+    }
+    let beside_parent = exe_dir.parent()?.join("modules");
+    beside_parent.is_dir().then_some(beside_parent)
 }
 
 /// default recovery checkpoint cadence: small enough that boot replay stays
@@ -151,10 +183,17 @@ pub struct NetworkDescriptor {
     /// NOT part of `genesis_namespace` (validator identity only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordination: Option<String>,
+    /// sha256 (hex) of the network's genesis file — the whole of it, every
+    /// component and index guest. IN the genesis fingerprint: the network IS
+    /// its genesis, so a joiner holding any other file cannot even handshake.
+    /// `node init` writes the file beside this descriptor; a joiner installs
+    /// it (`install_genesis`) only after the bytes hash to this.
+    pub genesis: String,
     /// the genesis wasm set: `(id, sha256 hex)` per wasm tenant, sorted by id.
     /// IN the genesis fingerprint — a node built against different components
-    /// is a different network, never a block-0 fork. the bytes travel
-    /// out-of-band (the workspace bundle, the blob plane).
+    /// is a different network, never a block-0 fork. the bytes are the
+    /// genesis file's; this table is what the code registry seeds at block
+    /// zero and what every component is checked against by name.
     ///
     /// KEEP THIS LAST: toml serializes an array-of-tables after every scalar,
     /// so a scalar declared below it would be written INSIDE the final
@@ -179,6 +218,7 @@ impl NetworkDescriptor {
             m.code_hash = m.code_hash.trim().to_ascii_lowercase();
         }
         d.modules.sort_by(|a, b| a.id.cmp(&b.id));
+        d.genesis = d.genesis.trim().to_ascii_lowercase();
         Ok(d)
     }
 
@@ -251,11 +291,24 @@ impl NetworkDescriptor {
             hasher.update(b"=");
             hasher.update(m.code_hash.trim().to_ascii_lowercase().as_bytes());
         }
+        hasher.update(b"\ngenesis=");
+        hasher.update(self.genesis.trim().to_ascii_lowercase().as_bytes());
         let digest = hasher.finalize();
         // 128 bits: a 32-bit suffix is grindable (~2^32 hashes finds an
         // admitted key that leaves the fingerprint unchanged, resurrecting
         // the silent stale-descriptor fork this exists to prevent).
         format!("{}@{}", self.chain_id, hex_bytes(&digest.as_ref()[..16]))
+    }
+
+    /// the genesis file's pin as raw bytes; a descriptor whose `genesis` is
+    /// not 32 hex bytes names the network, because nothing can be founded or
+    /// joined from it.
+    pub fn genesis_hash(&self) -> Result<[u8; 32], String> {
+        let bytes =
+            unhex(&self.genesis).map_err(|e| format!("network {} genesis: {e}", self.chain_id))?;
+        bytes
+            .try_into()
+            .map_err(|_| format!("network {} genesis is not a 32-byte sha256", self.chain_id))
     }
 
     /// the genesis code hashes, decoded: `id -> sha256`. a hash that is not 32
@@ -1054,6 +1107,7 @@ mod tests {
                 bootstrap: vec![],
                 reach: vec![],
                 coordination: None,
+                genesis: String::new(),
                 modules: Vec::new(),
             }
             .save(&dir.join("network.toml"))
@@ -1075,6 +1129,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         // default (field unset) -> Private
@@ -1125,6 +1180,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
 
@@ -1223,6 +1279,7 @@ mod tests {
                 bootstrap: vec![],
                 reach: vec![],
                 coordination: None,
+                genesis: String::new(),
                 modules: Vec::new(),
             };
             d.save(&dir.join("network.toml")).expect("save");
@@ -1254,6 +1311,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         }
         .save(&dir.join("network.toml"))
@@ -1326,6 +1384,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         d.admit(&a);
@@ -1346,6 +1405,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         assert!(
@@ -1364,6 +1424,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         let founder_only = d.genesis_namespace();
@@ -1407,6 +1468,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: modules_fixture(),
         };
         let base = d.genesis_namespace();
@@ -1421,8 +1483,11 @@ mod tests {
 
     #[test]
     fn descriptor_without_modules_does_not_parse() {
-        let text = "chain_id = \"net#00000000\"\nvalidators = []\n";
-        let err = NetworkDescriptor::from_toml(text).unwrap_err();
+        let text = format!(
+            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n",
+            "ab".repeat(32)
+        );
+        let err = NetworkDescriptor::from_toml(&text).unwrap_err();
         assert!(err.contains("modules"), "{err}");
     }
 
@@ -1434,6 +1499,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: modules_fixture(),
         };
         let map = d.module_hashes().unwrap();
@@ -1483,6 +1549,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         // empty dir: anything goes.
@@ -1519,6 +1586,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         assert!(
@@ -1537,6 +1605,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: modules_fixture_sorted(),
         };
         // a hand-edited twin: uppercase, whitespace, different order — in the
@@ -1550,6 +1619,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: format!("  {}  ", "ab".repeat(32).to_ascii_uppercase()),
             modules: vec![
                 ModuleCode {
                     id: "pages".into(),
@@ -1600,8 +1670,9 @@ mod tests {
         // or a newline could make two distinct module sets fold to one
         // namespace. every entry point refuses it, naming the id.
         let toml = format!(
-            "chain_id = \"canon#00000000\"\nvalidators = []\n\n\
+            "chain_id = \"canon#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\n\
              [[modules]]\nid = \"a=b\"\ncode_hash = \"{}\"\n",
+            "ab".repeat(32),
             "11".repeat(32)
         );
         let err = NetworkDescriptor::from_toml(&toml).unwrap_err();
@@ -1613,6 +1684,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: vec![ModuleCode {
                 id: "x\ny".into(),
                 code_hash: "11".repeat(32),
@@ -1640,6 +1712,7 @@ mod tests {
             ],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         let entries = d.bootstrap_entries().expect("well-formed hints parse");
@@ -1708,6 +1781,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         // an existing network.toml without a [reach] array still parses (serde default),
@@ -1730,6 +1804,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         d.add_bootstrap(&a, "127.0.0.1:52200");
@@ -1754,6 +1829,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         d.add_reach(&ReachHint {
@@ -1788,6 +1864,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         d.add_reach(&ReachHint {
@@ -1841,6 +1918,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         d.add_bootstrap(&me, "203.0.113.7:52200");
@@ -1903,6 +1981,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         d.add_bootstrap(&me, "203.0.113.7:52200");
@@ -1954,6 +2033,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         let ns0 = base.genesis_namespace();
@@ -1991,6 +2071,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         // a coordinated hint routes through the coordinator, but the identity
@@ -2027,6 +2108,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: String::new(),
             modules: Vec::new(),
         };
         // a bootstrap hint alone synthesises a Direct reach ingress...

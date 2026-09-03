@@ -689,6 +689,19 @@ async fn reachability_plane(
             .ok()
             .and_then(|mut addrs| addrs.next()),
     };
+    // the underlay (coordinator rendezvous, the tunnel endpoint peers dial)
+    // is a real IPv4 socket, so its ingresses resolve to the IPv4 candidate,
+    // not the first one: on an IPv6-only network with NAT64 (macOS CLAT46),
+    // getaddrinfo synthesises `64:ff9b::a.b.c.d` for a V4-only host and can
+    // list it FIRST — a V6 destination the V4 socket refuses with EINVAL, for
+    // life, since a hostname resolves once here.
+    let resolve_underlay_ingress = |ingress: &Ingress| match ingress {
+        Ingress::Socket(addr) => underlay_addr(std::iter::once(*addr)),
+        Ingress::Dns { host, port } => (host.as_str(), *port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(underlay_addr),
+    };
     let Some(control_addr) = resolve_ingress(&advertised) else {
         // the plane never starts and the node runs on forever with NO overlay:
         // no tunnels, no hub, every huddle failing with a string that names none
@@ -743,7 +756,7 @@ async fn reachability_plane(
         // advertise split (change 3): resolved ONCE here, same discipline as
         // `advertised` above, independent of whether `wireguard_listen` is
         // itself unspecified.
-        Some(ingress) => match resolve_ingress(ingress) {
+        Some(ingress) => match resolve_underlay_ingress(ingress) {
             Some(addr) => match wireguard::Endpoint::new(
                 addr.ip(),
                 addr.port(),
@@ -778,7 +791,7 @@ async fn reachability_plane(
     };
     let mut coords: Vec<std::net::SocketAddr> = Vec::new();
     for ingress in &coordinators {
-        match resolve_ingress(ingress) {
+        match resolve_underlay_ingress(ingress) {
             Some(addr) if !coords.contains(&addr) => coords.push(addr),
             Some(_) => {}
             None => tracing::warn!(
@@ -786,7 +799,7 @@ async fn reachability_plane(
                 node = %label,
                 coordinator = ?ingress,
                 reason = "coordinator_unresolvable",
-                "coordinator skipped"
+                "coordinator skipped — no IPv4 address for the IPv4 underlay"
             ),
         }
     }
@@ -1155,12 +1168,6 @@ async fn reachability_plane(
     }
 }
 
-/// The netstack guest: the reachability machine as a `ducktape:netstack`
-/// component, built by guest-builder from the machine crate and committed
-/// beside it (`make wasm-modules`).
-const NETSTACK_COMPONENT: &[u8] =
-    include_bytes!("../../../crates/networking/netstack-machine/component.wasm");
-
 /// Which machine drives the reachability plane. `DUCKTAPE_NETSTACK=guest`
 /// runs the wasm component; unset or `native` runs the machine compiled
 /// into this binary. Any other value is refused loudly and runs native —
@@ -1168,16 +1175,43 @@ const NETSTACK_COMPONENT: &[u8] =
 pub(crate) fn netstack_backend() -> reachability::NetstackBackend {
     let requested = std::env::var("DUCKTAPE_NETSTACK").ok();
     match requested.as_deref() {
-        Some("guest") => reachability::NetstackBackend::Guest {
-            component: NETSTACK_COMPONENT.to_vec(),
-            step_fuel: reachability::NETSTACK_STEP_FUEL,
-        },
+        Some("guest") => netstack_guest_backend(),
         Some("native") | None => reachability::NetstackBackend::Native,
         Some(_) => {
             tracing::warn!(
                 target: "ducktape::reachability",
                 reason = "netstack_backend_unknown",
                 "DUCKTAPE_NETSTACK names no backend; running native"
+            );
+            reachability::NetstackBackend::Native
+        }
+    }
+}
+
+/// The netstack guest: the reachability machine as a `ducktape:netstack`
+/// component, read from the founding set beside this binary
+/// (`netstack.component.wasm`, staged by the build from the machine crate's
+/// committed artifact). Not a genesis artifact: a joiner runs this machine to
+/// reach the mesh BEFORE it holds any genesis. A guest the founding set
+/// cannot supply is refused loudly and runs native, exactly like a backend
+/// name that names nothing — the operator asked for a machine this build
+/// did not stage.
+fn netstack_guest_backend() -> reachability::NetstackBackend {
+    let component = workspace_config::modules_dir().and_then(|dir| {
+        let path = workspace_config::netstack_component_path(&dir);
+        std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
+    });
+    match component {
+        Ok(component) => reachability::NetstackBackend::Guest {
+            component,
+            step_fuel: reachability::NETSTACK_STEP_FUEL,
+        },
+        Err(error) => {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                reason = "netstack_guest_unreadable",
+                error = %error,
+                "DUCKTAPE_NETSTACK=guest but the founding set has no readable netstack guest; running native"
             );
             reachability::NetstackBackend::Native
         }
@@ -1298,4 +1332,14 @@ fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: Str
             last_session.retain(|ip, _| peers.iter().any(|(seen, _)| seen == ip));
         }
     });
+}
+
+/// the address an IPv4 underlay socket can send to, out of a resolution
+/// result: the first IPv4 candidate. `None` when the host has no IPv4 at all
+/// — the socket could not reach it anyway, and saying so beats an EINVAL on
+/// every send.
+pub(crate) fn underlay_addr(
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Option<std::net::SocketAddr> {
+    addrs.into_iter().find(std::net::SocketAddr::is_ipv4)
 }

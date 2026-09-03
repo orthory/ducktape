@@ -165,10 +165,11 @@ twice on the Mac before suspecting the app.
 A running daemon (`cargo run -p noded-bin -- --modules <dir>`, or a workspace
 node seeded by `make demo-seed`) serves the full `/v1` surface at
 `http://127.0.0.1:8844` by default. Its genesis composes every tenant from
-`<dir>/<id>.component.wasm`; without `--modules` it reads
-`<ducktape home>/modules` — `$DUCKTAPE_HOME` when set, else `~/.ducktape`
-(what `make install-node` fills) and refuses to boot,
-naming the first component it could not find, if that bundle is incomplete. Query it directly, or drive its module surface with the
+`<dir>/<id>.component.wasm` and converges every `<dir>/<id>.index.wasm`;
+without `--modules` it reads the founding set the build staged beside the
+binary (`target/<profile>/modules`, or `$DUCKTAPE_MODULES_DIR`) and refuses
+to boot, naming the first file it could not find, if that set is incomplete.
+Query it directly, or drive its module surface with the
 `ops/agent-system` operator CLI (raw query/submit, agent list/pause/resume).
 Do not expose capability-bearing URL paths, keys, passwords, or recovery
 phrases in reports.

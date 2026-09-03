@@ -9,8 +9,12 @@
 #
 # Usage:
 #   ops/node/install.sh --workspace <name> --init [-- <node init args...>]
-#   ops/node/install.sh --workspace <name> --join <invite>
+#   ops/node/install.sh --workspace <name> --join <invite> [--genesis <file>]
 #   ops/node/install.sh --dry-run --workspace <name> --init
+#
+# `--genesis <file>` is the founder's `<workspace>/genesis`: a member (an
+# identity the founder `admit`ted before genesis) boots from its own copy, so
+# its join needs the file; a resident fetches it off the mesh at first boot.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +27,7 @@ DRY_RUN=0
 WORKSPACE=""
 MODE=""       # "init" or "join"
 INVITE=""
+GENESIS=""
 INIT_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -31,6 +36,7 @@ while [ $# -gt 0 ]; do
     --workspace) WORKSPACE="${2:?--workspace needs a value}"; shift 2 ;;
     --init) MODE="init"; shift ;;
     --join) MODE="join"; INVITE="${2:?--join needs an invite blob}"; shift 2 ;;
+    --genesis) GENESIS="${2:?--genesis needs a file}"; shift 2 ;;
     --) shift; INIT_ARGS=("$@"); break ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -56,13 +62,14 @@ if [ "$DRY_RUN" = 0 ]; then
 fi
 
 DUCK_HOME=/var/lib/ducktape
-MODULES_SRC="${DUCKTAPE_MODULES_DIR:-${DUCKTAPE_HOME:-$HOME/.ducktape}/modules}"
+# the founding set `make install-node` stages beside the installed binary
+# (what `workspace_config::modules_dir()` resolves for that binary).
+CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+MODULES_SRC="${DUCKTAPE_MODULES_DIR:-$CARGO_BIN/modules}"
 
-log "1/6 building and installing the ducktape CLI (cargo install --path bin/node --locked)"
-run bash -c "cd '$REPO_ROOT' && cargo install --path bin/node --locked"
-run mkdir -p "$MODULES_SRC"
-CARGO_BIN_DUCKTAPE="${CARGO_HOME:-$HOME/.cargo}/bin/ducktape"
-sudo_run install -m 0755 "$CARGO_BIN_DUCKTAPE" /usr/local/bin/ducktape
+log "1/6 building and installing the ducktape CLI and its founding set (make install-node)"
+run bash -c "cd '$REPO_ROOT' && make install-node"
+sudo_run install -m 0755 "$CARGO_BIN/ducktape" /usr/local/bin/ducktape
 
 log "2/6 dedicated user + state dir"
 if [ "$DRY_RUN" = 1 ] || ! id ducktape >/dev/null 2>&1; then
@@ -71,15 +78,18 @@ fi
 sudo_run usermod -aG kvm ducktape
 sudo_run install -d -o ducktape -g ducktape -m 0700 "$DUCK_HOME"
 
-log "3/6 module set"
+# the founding set the service user founds from (`node init --modules`) and
+# reads the netstack guest out of at boot (the unit's DUCKTAPE_MODULES_DIR):
+# every <id>.component.wasm, every <id>.index.wasm, netstack.component.wasm.
+log "3/6 founding set"
 sudo_run install -d -o ducktape -g ducktape "$DUCK_HOME/modules"
 if [ "$DRY_RUN" = 1 ]; then
-  run bash -c "sudo cp '$MODULES_SRC'/*.component.wasm '$DUCK_HOME/modules/'"
+  run bash -c "sudo cp '$MODULES_SRC'/*.wasm '$DUCK_HOME/modules/'"
 else
   shopt -s nullglob
-  wasm_files=("$MODULES_SRC"/*.component.wasm)
+  wasm_files=("$MODULES_SRC"/*.wasm)
   shopt -u nullglob
-  [ "${#wasm_files[@]}" -gt 0 ] || die "no component.wasm files in $MODULES_SRC (cargo install --path bin/node should have populated it)"
+  [ "${#wasm_files[@]}" -gt 0 ] || die "no .wasm files in $MODULES_SRC (make install-node should have staged them)"
   sudo cp "${wasm_files[@]}" "$DUCK_HOME/modules/"
 fi
 sudo_run chown -R ducktape:ducktape "$DUCK_HOME/modules"
@@ -92,8 +102,13 @@ sudo_run systemctl daemon-reload
 log "5/6 founding or joining the network as the service user"
 DT=(sudo -u ducktape env "DUCKTAPE_HOME=$DUCK_HOME" /usr/local/bin/ducktape)
 case "$MODE" in
-  init) run "${DT[@]}" node init --name "$WORKSPACE" "${INIT_ARGS[@]}" ;;
-  join) run "${DT[@]}" node join "$INVITE" ;;
+  init) run "${DT[@]}" node init --name "$WORKSPACE" --modules "$DUCK_HOME/modules" "${INIT_ARGS[@]}" ;;
+  join)
+    if [ -n "$GENESIS" ]; then
+      run "${DT[@]}" node join "$INVITE" --genesis "$GENESIS"
+    else
+      run "${DT[@]}" node join "$INVITE"
+    fi ;;
 esac
 
 log "6/6 enable and start"

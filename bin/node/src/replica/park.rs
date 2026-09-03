@@ -22,7 +22,7 @@ use crate::constants::*;
 use crate::drain_actions::{CutoverTrigger, EpochActions};
 use crate::explorer::{boundary_block_row, heal_and_backfill_index, heal_index};
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
-use crate::host_state::{SyncSubstrates, restore_host, sync_all_modules};
+use crate::host_state::{NodeSubstrates, restore_host, sync_all_modules};
 use crate::relay;
 use crate::relay_runtime;
 use crate::replica;
@@ -614,10 +614,13 @@ pub(super) async fn park(
     if let Some(ckpt) = resident_checkpoint {
         let restored = restore_host(
             &context,
-            &forge_repo,
-            &duckfs_dir,
             ckpt,
-            blobs.clone(),
+            NodeSubstrates {
+                forge_repo: &forge_repo,
+                duckfs_dir: &duckfs_dir,
+                blobs: blobs.clone(),
+                index: &index,
+            },
             genesis,
         )
         .await;
@@ -2081,10 +2084,11 @@ pub(super) async fn park(
                         &context,
                         &client,
                         &m,
-                        SyncSubstrates {
+                        NodeSubstrates {
                             forge_repo: &forge_repo,
                             duckfs_dir: &duckfs_dir,
                             blobs: blobs.clone(),
+                            index: &index,
                         },
                         attempt,
                         genesis,
@@ -2389,10 +2393,11 @@ pub(super) async fn park(
             &context,
             &client,
             &m,
-            SyncSubstrates {
+            NodeSubstrates {
                 forge_repo: &forge_repo,
                 duckfs_dir: &duckfs_dir,
                 blobs: blobs.clone(),
+                index: &index,
             },
             attempt,
             genesis,

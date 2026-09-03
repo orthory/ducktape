@@ -562,9 +562,10 @@ fn resolve_intro_dest(
     endpoint_addr: SocketAddr,
 ) -> Result<SocketAddr, String> {
     match &candidate.intro {
+        // the intro rides the IPv4 underlay: pick the IPv4 candidate (NAT64
+        // networks synthesise a V6 the socket cannot address).
         Some(advertised) => match advertised.to_socket_addrs() {
-            Ok(mut addrs) => addrs
-                .next()
+            Ok(addrs) => crate::reachability_plane::underlay_addr(addrs)
                 .ok_or_else(|| format!("advertised intro endpoint {advertised:?} did not resolve")),
             Err(e) => Err(format!(
                 "advertised intro endpoint {advertised:?} unusable ({e})"
@@ -593,8 +594,10 @@ async fn direct_attempt(
     label: String,
     iters: u32,
 ) -> AttemptResult {
+    // the tunnel endpoint rides the IPv4 underlay: the IPv4 candidate, not
+    // the first (a NAT64 network lists a synthesised V6 the socket refuses).
     let endpoint_addr = match endpoint.to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
+        Ok(addrs) => match crate::reachability_plane::underlay_addr(addrs) {
             Some(addr) => addr,
             None => {
                 return AttemptResult::Failed(format!(

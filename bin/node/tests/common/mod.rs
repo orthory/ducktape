@@ -33,13 +33,30 @@ use std::time::{Duration, Instant};
 /// that exercise a live code swap.
 pub mod module_verbs;
 
-/// the checked-in `<id>.component.wasm` set every founding e2e names: a network
-/// has no embedded wasm, so `node init` hashes THIS directory into the
-/// descriptor and the dev shape derives its genesis code set from it.
+/// the kernel's checked-in `<id>.component.wasm` fixtures: the code-swap
+/// suites stage `hello` / `hello-replacement` out of here. The production
+/// components in it pin the same bytes [`founding_set`] holds.
 pub const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../crates/kernel/host/tests/fixtures"
 );
+
+/// the founding set `cargo build` staged beside this test executable
+/// (`target/<profile>/modules`): every `<id>.component.wasm`, every
+/// `<id>.index.wasm`, and the netstack guest. A network has no embedded
+/// wasm, so `node init` composes its genesis out of THIS directory and the
+/// dev shape derives its genesis code set from it — the same resolution the
+/// `ducktape` binary under test performs beside itself.
+pub fn founding_set() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        workspace_config::modules_dir()
+            .expect("cargo build stages the founding set beside the test executable")
+            .to_str()
+            .expect("utf-8 founding set path")
+            .to_string()
+    })
+}
 
 /// the beat every harness node runs at (node.toml `block_time_ms`). the suites
 /// wait on block counts — checkpoints, epochs, finalization — so their
@@ -526,10 +543,11 @@ impl NetworkShapeCluster {
                 "--primary-coordinator",
                 "none",
                 // the genesis wasm set lives on disk, not in the binary: found
-                // from the checked-in components rather than the operator's
-                // ~/.ducktape/modules, which a test box need not have.
+                // from the set the build staged beside the binary, named
+                // explicitly so an operator's $DUCKTAPE_MODULES_DIR cannot
+                // redirect a test.
                 "--modules",
-                FIXTURES,
+                founding_set(),
                 "--dir",
                 self.founder_dir.to_str().expect("utf-8 founder dir"),
                 "--listen",
@@ -1046,7 +1064,7 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
-        cfg.push_str(&format!("modules = {FIXTURES:?}\n"));
+        cfg.push_str(&format!("modules = {:?}\n", founding_set()));
         cfg.push_str(&self.peer_addrs_toml());
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
@@ -1361,7 +1379,7 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
-        cfg.push_str(&format!("modules = {FIXTURES:?}\n"));
+        cfg.push_str(&format!("modules = {:?}\n", founding_set()));
         cfg.push_str(&self.peer_addrs_toml());
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",

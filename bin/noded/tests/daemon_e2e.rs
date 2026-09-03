@@ -57,14 +57,15 @@ impl Daemon {
             .arg(format!("127.0.0.1:{port}"))
             .arg("--storage")
             .arg(storage)
-            // the daemon composes its wasm tenants from a modules dir; this
-            // suite points at the repo's kernel fixtures so it needs no
-            // `make install-node` bundle in `~/.ducktape/modules`.
+            // the daemon composes its wasm tenants and index guests from a
+            // founding set; this suite names the one the build staged beside
+            // the test executable, so an operator's $DUCKTAPE_MODULES_DIR
+            // cannot redirect it.
             .arg("--modules")
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../crates/kernel/host/tests/fixtures"
-            ))
+            .arg(
+                workspace_config::modules_dir()
+                    .expect("cargo build stages the founding set beside the test executable"),
+            )
             .stdout(Stdio::null())
             // startup failures (port stolen in the free_port window, bad
             // storage) land on stderr — keep it visible or they read as an
@@ -426,8 +427,8 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
 #[test]
 fn an_incomplete_modules_dir_is_refused_before_boot() {
     let storage = tempfile::TempDir::new().expect("storage dir");
-    // a directory that EXISTS and holds no components: the half-installed
-    // bundle (`make install-node` interrupted, a hand-assembled --modules).
+    // a directory that EXISTS and holds no components: a hand-assembled
+    // --modules, or a staged set a `make wasm-modules` left half-refreshed.
     let modules = tempfile::TempDir::new().expect("modules dir");
 
     let out = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"))
@@ -452,7 +453,7 @@ fn an_incomplete_modules_dir_is_refused_before_boot() {
         "refusal names the component it could not read: {stderr}"
     );
     assert!(
-        stderr.contains("make install-node"),
+        stderr.contains("`cargo build` stages the founding set"),
         "refusal carries the remedy: {stderr}"
     );
 }

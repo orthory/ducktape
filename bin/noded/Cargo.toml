@@ -21,8 +21,8 @@ topology = { workspace = true }
 sdk = { workspace = true }
 node = { workspace = true }
 indexer = { workspace = true }
-# where `make install-node` puts the components the genesis composes from —
-# the default `--modules` dir.
+# resolves the founding set the build staged beside the binary — the default
+# `--modules` dir the genesis composes from.
 workspace-config = { workspace = true }
 # the two module wire codecs the debug echo worker speaks: a saga worker
 # request in, a saga follow-up (bid, then result) out over a dispatch WorkSpec.

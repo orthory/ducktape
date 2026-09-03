@@ -60,6 +60,12 @@ pub struct ModuleSpec {
     /// the guest's query lane is COMMITTED-ONLY regardless of caller
     /// (`WasmModule::with_committed_queries`). dispatch only.
     pub committed_queries: bool,
+    /// the module ships an index guest (`src/index_guest.rs`, the fluentabi
+    /// mapper the derived-index tier installs into the module's database).
+    /// A genesis carries one `<id>.index.wasm` per module declared here, and
+    /// a founding set must hold one for each — a declared guest with no
+    /// artifact is a refusal, never a bare index.
+    pub index_guest: bool,
 }
 
 /// The module composition topology: the id universe (with per-module shape +
@@ -94,6 +100,15 @@ impl ModuleTopology {
             .filter(|id| self.spec(id).is_some_and(|m| m.code == Code::Wasm))
             .collect()
     }
+
+    /// the ids of `selection` that ship an index guest, in selection order.
+    pub fn index_guest_ids(&self, selection: &[&'static str]) -> Vec<&'static str> {
+        selection
+            .iter()
+            .copied()
+            .filter(|id| self.spec(id).is_some_and(|m| m.index_guest))
+            .collect()
+    }
 }
 
 /// genesis-config key: the per-network invite namespace (governance verifies
@@ -109,7 +124,19 @@ const INVITE: &[&str] = &[CONFIG_INVITE];
 const NONE: &[&str] = &[];
 
 const fn store(id: &'static str, config: &'static [&'static str]) -> ModuleSpec {
-    ModuleSpec { id, config, code: Code::Wasm, backing: Backing::Store, committed_queries: false }
+    ModuleSpec {
+        id,
+        config,
+        code: Code::Wasm,
+        backing: Backing::Store,
+        committed_queries: false,
+        index_guest: false,
+    }
+}
+
+/// a store-backed wasm module that also ships an index guest.
+const fn indexed_store(id: &'static str, config: &'static [&'static str]) -> ModuleSpec {
+    ModuleSpec { index_guest: true, ..store(id, config) }
 }
 
 /// The module id universe with per-module shape + config. Alphabetical by id
@@ -119,22 +146,22 @@ const MODULES: &[ModuleSpec] = &[
     store("agent", NONE),
     store("automations", NONE),
     store("capability", NONE),
-    store("chat", NONE),
-    ModuleSpec { id: "dispatch", config: NONE, code: Code::Wasm, backing: Backing::Store, committed_queries: true },
-    ModuleSpec { id: "files", config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
-    ModuleSpec { id: "forge", config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false },
+    indexed_store("chat", NONE),
+    ModuleSpec { id: "dispatch", config: NONE, code: Code::Wasm, backing: Backing::Store, committed_queries: true, index_guest: false },
+    ModuleSpec { id: "files", config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false, index_guest: false },
+    ModuleSpec { id: "forge", config: NONE, code: Code::Wasm, backing: Backing::Odb, committed_queries: false, index_guest: false },
     store("gateway", CHAIN_ID),
     store("governance", INVITE),
     store("identity", CHAIN_ID),
-    store("inbox", NONE),
-    ModuleSpec { id: "kv", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
-    ModuleSpec { id: "lifecycle", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
-    store("pages", NONE),
-    ModuleSpec { id: "runs", config: CHAIN_ID, code: Code::Wasm, backing: Backing::Map, committed_queries: false },
-    store("saga", NONE),
+    indexed_store("inbox", NONE),
+    ModuleSpec { id: "kv", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false, index_guest: false },
+    ModuleSpec { id: "lifecycle", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false, index_guest: false },
+    indexed_store("pages", NONE),
+    ModuleSpec { id: "runs", config: CHAIN_ID, code: Code::Wasm, backing: Backing::Map, committed_queries: false, index_guest: false },
+    indexed_store("saga", NONE),
     store("tagging", NONE),
-    store("tasks", NONE),
-    ModuleSpec { id: "valset", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false },
+    indexed_store("tasks", NONE),
+    ModuleSpec { id: "valset", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false, index_guest: false },
 ];
 
 /// node's production genesis set (19), in status-report order — every node runs
@@ -347,6 +374,20 @@ mod tests {
         assert_eq!(sorted(&map), ["runs"]);
         let committed: Vec<&str> = MODULES.iter().filter(|m| m.committed_queries).map(|m| m.id).collect();
         assert_eq!(committed, ["dispatch"]);
+    }
+
+    /// The index-guest declaration is a founding fact: a genesis carries one
+    /// mapper per module declared here and a founding set must hold each.
+    #[test]
+    fn index_guest_declaration_pins_to_todays_mappers() {
+        let declared: Vec<&str> = MODULES.iter().filter(|m| m.index_guest).map(|m| m.id).collect();
+        assert_eq!(sorted(&declared), ["chat", "inbox", "pages", "saga", "tasks"]);
+        assert_eq!(
+            TOPOLOGY.index_guest_ids(PRODUCTION),
+            ["pages", "chat", "saga", "tasks", "inbox"],
+            "selection order, declared ids only"
+        );
+        assert!(TOPOLOGY.index_guest_ids(SIM_VALSET).is_empty());
     }
 
     #[test]

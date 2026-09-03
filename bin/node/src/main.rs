@@ -688,6 +688,7 @@ fn run_node(
                 storage_for_sync,
                 namespace,
                 blobs,
+                &index,
                 &genesis,
                 voice_requests,
             )

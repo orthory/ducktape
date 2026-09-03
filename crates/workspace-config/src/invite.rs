@@ -544,6 +544,10 @@ fn pack_invite(
         put_str_u8(&mut out, id)?;
         out.extend_from_slice(hash);
     }
+    // the genesis file's pin — the third half of `genesis_namespace`, and
+    // what a joiner checks the fetched (or handed-out) genesis against
+    // before installing a byte of it.
+    out.extend_from_slice(&d.genesis_hash()?);
 
     let hints = d.reach_hints()?;
     out.push(
@@ -668,6 +672,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         });
     }
     modules.sort_by(|a, b| a.id.cmp(&b.id));
+    let genesis = hex_bytes(r.take(32)?);
 
     let hcount = r.u8()? as usize;
     let mut reach = Vec::with_capacity(hcount);
@@ -780,6 +785,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
             bootstrap: Vec::new(),
             reach,
             coordination,
+            genesis,
             modules,
         },
         token,
@@ -864,6 +870,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
         d.apply_primary_coordinator(&issuer.public_key(), "relay.ducktape.industries:3478")
@@ -922,9 +929,12 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: test_modules(),
         };
         let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("roundtrip");
+        // the genesis pin rides too: a joiner checks the file it gets against it.
+        assert_eq!(invite.descriptor.genesis, d.genesis);
         // ids and hashes survive, id-sorted on both sides.
         assert_eq!(
             invite.descriptor.modules,
@@ -953,6 +963,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: vec![ModuleCode {
                 id: "pages".into(),
                 code_hash: "11".repeat(16), // 32 hex chars — half a sha256.
@@ -973,6 +984,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: vec![ModuleCode {
                 id: "pages".into(),
                 code_hash: "11".repeat(32),
@@ -1002,6 +1014,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: test_modules(),
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
@@ -1063,6 +1076,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
@@ -1093,6 +1107,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
         d.add_bootstrap(&me, "127.0.0.1:52200");
@@ -1141,6 +1156,7 @@ mod tests {
             // a `None` source resolves to Private, so it decodes as an EXPLICIT
             // "private" (semantically identical — see `coordination()`).
             coordination: Some("private".into()),
+            genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
         let wg = InviteWireGuard {
@@ -1164,6 +1180,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: Some("private".into()),
+            genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
         let token = mint_invite_token(&issuer, d.genesis_namespace().as_bytes(), u64::MAX);
@@ -1193,6 +1210,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: Some("private".into()),
+            genesis: "ab".repeat(32),
             modules: Vec::new(),
         }
     }
@@ -1343,6 +1361,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
         // the token carries its OWN expiry now (no separate blob param).
@@ -1387,6 +1406,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
         for (mode, expect) in [
@@ -1418,6 +1438,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            genesis: "ab".repeat(32),
             modules: Vec::new(),
         }
     }

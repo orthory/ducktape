@@ -16,7 +16,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-repro-check wasm-index-check labs-gate audit
+.PHONY: all app dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-index-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -151,24 +151,22 @@ install-app: app
 	@echo "installed $(BIN_DEST)/ducktape-app + $(DESKTOP_DEST)/dev.ducktape.app.desktop"
 endif
 
-# where install-node WRITES the module components, spelled exactly as
-# workspace_config::modules_dir() READS them: $DUCKTAPE_MODULES_DIR, else
-# <ducktape home>/modules, where the home is $DUCKTAPE_HOME when set and
-# ~/.ducktape otherwise. A writer that stopped at $HOME put the components
-# where a node under an override never looks — one expression, so the two
-# halves cannot drift apart again.
-MODULES_DEST = $${DUCKTAPE_MODULES_DIR:-$${DUCKTAPE_HOME:-$$HOME/.ducktape}/modules}
+# where `cargo install` puts the binary, and so where the installed binary
+# looks for its founding set: workspace_config::modules_dir() reads
+# $DUCKTAPE_MODULES_DIR, else `modules/` beside the executable.
+CARGO_BIN = $${CARGO_HOME:-$$HOME/.cargo}/bin
 
-## the binary embeds no wasm: `node init` founds a network from a directory of
-## <id>.component.wasm, so installing the node also installs that set.
+## the binary embeds no wasm: `node init` composes a network's genesis out of
+## the founding set (`<id>.component.wasm`, `<id>.index.wasm`, the netstack
+## guest) that noded's build script stages beside every build's binary
+## (target/<profile>/modules), so installing the node installs that set
+## beside the installed binary. `--target-dir target` keeps the install build
+## in the checkout's target dir, which is where the staged set lands.
 install-node:
-	$(CARGO) install --path bin/node --locked
-	mkdir -p "$(MODULES_DEST)"
-	@for m in $(BUILDER_MODULES); do \
-	  id=$$(basename $$m) && \
-	  cp $$m/component.wasm "$(MODULES_DEST)/$$id.component.wasm" || exit 1; \
-	done
-	@echo "installed module components into $(MODULES_DEST)"
+	$(CARGO) install --path bin/node --locked --target-dir target
+	rm -rf "$(CARGO_BIN)/modules"
+	cp -r target/release/modules "$(CARGO_BIN)/modules"
+	@echo "installed the founding set into $(CARGO_BIN)/modules"
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
 install-coordinator:
@@ -197,7 +195,7 @@ install-coordinator:
 # is still a bug worth fixing in the harnesses — see #887.
 TEST_TMPDIR := $(CURDIR)/target/test-tmp
 
-test: wasm-modules-check
+test: wasm-modules-check wasm-embed-check
 # The reclaim may not fail the gate: a first run has nothing to clean.
 	-rm -rf "$(TEST_TMPDIR)" 2>/dev/null
 	mkdir -p "$(TEST_TMPDIR)"
@@ -224,8 +222,9 @@ test: wasm-modules-check
 	$(CARGO) build $(LOCKED) -p noded-bin -p simnode -p ducktape-app
 
 ## rebuild every wasm guest module into its componentized artifact and refresh
-## EVERY committed copy in one sweep (the canonical node-embedded artifact +
-## the kernel test fixtures), so the copies can never drift apart. requires
+## EVERY committed copy in one sweep (the canonical artifact in the module's
+## own directory, which the build stages into the founding set, + the kernel
+## test fixtures), so the copies can never drift apart. requires
 ## wasm-tools (cargo install wasm-tools); the wasm32-unknown-unknown target
 ## comes from the pinned rust-toolchain.toml. component bytes are toolchain-
 ## dependent: a rebuild on a different rustc may legitimately differ from the
@@ -255,9 +254,11 @@ BUILDER_MODULES := \
 
 # Modules that additionally ship an INDEX guest (src/index_guest.rs behind the
 # `index-guest` feature): guest-builder --index writes the canonical
-# index.wasm (core wasm, no componentize) into the module directory, which
-# noded embeds via include_bytes!. The reference testmap mapper is the
-# indexer crate's test fixture and rides the same sweep.
+# index.wasm (core wasm, no componentize) into the module directory; the
+# build stages it into the founding set as `<id>.index.wasm` and a genesis
+# carries it (the topology's `index_guest` flag declares which modules have
+# one). The reference testmap mapper is the indexer crate's test fixture and
+# rides the same sweep.
 INDEX_MODULES := \
   crates/modules/apps/chat crates/modules/apps/tasks crates/modules/apps/pages \
   crates/modules/apps/inbox crates/modules/system/saga \
@@ -266,8 +267,9 @@ INDEX_MODULES := \
 # The netstack guest: the reachability machine as a `ducktape:netstack`
 # component (crates/networking/netstack-machine/src/guest.rs behind the same
 # `guest` feature convention). Not a consensus module, so no kernel fixture
-# copy: bin/node embeds the artifact from the crate directory and the
-# netstack-wasm scenario lane reads it from there.
+# copy and no place in a genesis: the build stages it into the founding set
+# as `netstack.component.wasm`, bin/node reads it from there at boot, and
+# the netstack-wasm scenario lane reads it from the crate directory.
 NETSTACK_GUEST := crates/networking/netstack-machine
 
 wasm-modules:
@@ -341,6 +343,22 @@ wasm-modules-check:
 
 ## the reproducibility gate: one guest built from TWO different checkout paths
 ## must be byte-identical, and carry no host path. Needs the wasm32 target and
+## the binary embeds no wasm (AGENTS.md, "No Embedded Wasm"): an
+## include_bytes!/include_str! of a `.wasm` is allowed only in a test — a file
+## under a `tests/` directory or named `tests.rs`, or below the file's first
+## `#[cfg(test)]`. Pure text, no toolchain: it runs in the PR gate beside
+## `wasm-modules-check`.
+wasm-embed-check:
+	@bad=0; \
+	for f in $$(git ls-files '*.rs' | grep -v -e '/tests/' -e '/tests\.rs$$'); do \
+	  awk -v file="$$f" \
+	    '/#\[cfg\(test\)\]/ { exit } \
+	     /include_(bytes|str)!\(.*\.wasm"/ { print file ":" NR ": " $$0; found = 1 } \
+	     END { exit found }' "$$f" || bad=1; \
+	done; \
+	[ "$$bad" = 0 ] || { echo "a non-test source embeds a .wasm — the binary is not the module set (AGENTS.md)"; exit 1; }; \
+	echo "wasm-embed-check: no non-test include of a .wasm"
+
 ## wasm-tools (which `wasm-modules-check` deliberately does not), so it stands
 ## apart from the pre-push `test` gate. See ops/wasm-repro-check.sh.
 wasm-repro-check:
