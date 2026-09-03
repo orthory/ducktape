@@ -42,6 +42,7 @@ use futures::StreamExt as _;
 
 use crate::config::Front;
 use crate::join_gate;
+use crate::reachability_plane::resolve_underlay_host;
 
 /// how long each attempt paces a retry / waits for an ack.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -562,19 +563,22 @@ fn resolve_intro_dest(
     endpoint_addr: SocketAddr,
 ) -> Result<SocketAddr, String> {
     match &candidate.intro {
-        Some(advertised) => match advertised.to_socket_addrs() {
-            Ok(mut addrs) => addrs
-                .next()
-                .ok_or_else(|| format!("advertised intro endpoint {advertised:?} did not resolve")),
-            Err(e) => Err(format!(
-                "advertised intro endpoint {advertised:?} unusable ({e})"
-            )),
-        },
+        Some(advertised) => resolve_endpoint(advertised)
+            .ok_or_else(|| format!("advertised intro endpoint {advertised:?} did not resolve")),
         None => Ok(SocketAddr::new(
             endpoint_addr.ip(),
             endpoint_addr.port().saturating_add(1),
         )),
     }
+}
+
+/// Resolve a `host:port` string for the UDP intro socket (a real IPv4 socket,
+/// like the underlay — see `reachability_plane::resolve_underlay_host`): the
+/// first IPv4 answer, or `None` when the string neither parses nor resolves.
+fn resolve_endpoint(endpoint: &str) -> Option<SocketAddr> {
+    let (host, port) = endpoint.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    resolve_underlay_host(host, port.parse().ok()?)
 }
 
 /// DIRECT: install the join-window peer at its underlay endpoint, then run the
@@ -593,18 +597,8 @@ async fn direct_attempt(
     label: String,
     iters: u32,
 ) -> AttemptResult {
-    let endpoint_addr = match endpoint.to_socket_addrs() {
-        Ok(mut addrs) => match addrs.next() {
-            Some(addr) => addr,
-            None => {
-                return AttemptResult::Failed(format!(
-                    "front endpoint {endpoint:?} did not resolve"
-                ));
-            }
-        },
-        Err(e) => {
-            return AttemptResult::Failed(format!("front endpoint {endpoint:?} unusable ({e})"));
-        }
+    let Some(endpoint_addr) = resolve_endpoint(&endpoint) else {
+        return AttemptResult::Failed(format!("front endpoint {endpoint:?} did not resolve"));
     };
 
     // (a) merge the peer onto the interface so this side can initiate.

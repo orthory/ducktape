@@ -624,16 +624,12 @@ async fn reachability_plane(
     nudges: tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
     events: tokio::sync::mpsc::Sender<reachability::ReachabilityEvent>,
 ) {
-    use std::net::ToSocketAddrs as _;
     let policy = reachability::open_port_policy();
     // the plane's records carry IP literals only (the endpoint parser
     // rejects DNS); a hostname ingress resolves ONCE at plane start.
     let resolve_ingress = |ingress: &Ingress| match ingress {
         Ingress::Socket(addr) => Some(*addr),
-        Ingress::Dns { host, port } => (host.as_str(), *port)
-            .to_socket_addrs()
-            .ok()
-            .and_then(|mut addrs| addrs.next()),
+        Ingress::Dns { host, port } => resolve_underlay_host(host.as_str(), *port),
     };
     let Some(control_addr) = resolve_ingress(&advertised) else {
         // the plane never starts and the node runs on forever with NO overlay:
@@ -1222,4 +1218,37 @@ fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: Str
             last_session.retain(|ip, _| peers.iter().any(|(seen, _)| seen == ip));
         }
     });
+}
+
+/// Resolve a hostname to the address the UNDERLAY can dial: the first IPv4
+/// answer. The underlay socket is a real AF_INET socket (see
+/// `overlay_net::userspace::UnderlaySocket::bind`), so a V6 answer is
+/// unsendable from it — on macOS `sendto` rejects it with EINVAL, and a
+/// NAT64 resolver (a phone hotspot, an IPv6-only ISP) synthesizes an AAAA
+/// for an A-only name and lists it FIRST. Taking the first answer of any
+/// family there left the coordinator unreachable for the life of the
+/// process. A name with no A record is unresolvable for the underlay.
+pub(crate) fn resolve_underlay_host(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs as _;
+    (host, port).to_socket_addrs().ok().and_then(first_ipv4)
+}
+
+/// See [`resolve_underlay_host`]; the pure half.
+fn first_ipv4(
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Option<std::net::SocketAddr> {
+    addrs.into_iter().find(std::net::SocketAddr::is_ipv4)
+}
+
+#[cfg(test)]
+mod underlay_resolve_tests {
+    use std::net::SocketAddr;
+
+    #[test]
+    fn a_synthesized_v6_answer_listed_first_never_wins_over_v4() {
+        let v6: SocketAddr = "[64:ff9b::334f:42b8]:3478".parse().unwrap();
+        let v4: SocketAddr = "51.79.66.184:3478".parse().unwrap();
+        assert_eq!(super::first_ipv4([v6, v4]), Some(v4));
+        assert_eq!(super::first_ipv4([v6]), None);
+    }
 }
