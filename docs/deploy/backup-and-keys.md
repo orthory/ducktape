@@ -31,10 +31,16 @@ Nothing under `~/.cargo`, `/tmp/dt-vm-*` or `$XDG_RUNTIME_DIR` needs copying.
 
 ### The 24 words
 
-`ducktape wallet import <name>` reproduces `keys/<name>.key` from the mnemonic,
-byte for byte — stdin takes the mnemonic line first, then a password line
-(`bin/node/src/wallet_cli.rs`). That is what the words are for; there is
-nothing else to back up about a user key.
+`ducktape wallet import <name>` rebuilds the **key inside** `keys/<name>.key`
+from the mnemonic, byte for byte — stdin takes the mnemonic line first, then a
+password line (`bin/node/src/wallet_cli.rs`). The **file** is not reproduced
+and never will be: every seal draws a fresh argon2 salt and nonce
+(`seal_user_key`) under whatever password you hand it, so the ciphertext
+differs on every restore. Check a restore by the pubkey `wallet import`
+prints, never by comparing file hashes: it is the identity, and it comes back
+identical under a *different* password
+(`crates/keystore/src/wallet.rs`, `create_import_activate_round_trip`). That
+is what the words are for; there is nothing else to back up about a user key.
 
 You are handed them exactly **once**. `ducktape wallet new` prints them, and
 the desktop app's first run shows all 24 and asks three of them back at random
@@ -42,8 +48,8 @@ positions — getting those right is what writes the key file, so an abandoned
 ceremony leaves no key behind. Neither surface will show them a second time.
 
 While you still hold the key file *and* its password, `ducktape user key
-reveal --key keys/<name>.key` reads the words back out of it. That is the only
-reveal there is, and it is no help once the disk is gone.
+reveal --key $DUCKTAPE_HOME/keys/<name>.key` reads the words back out of it.
+That is the only reveal there is, and it is no help once the disk is gone.
 
 Chat, DMs and members-only channels are **replicated in the clear** to every
 member's node (the chat module gates posting, not reading, and holds no
