@@ -2,7 +2,9 @@
 #
 # `make node` / `make coordinator` build the runnable product surfaces (the
 # networked node daemon and the untrusted UDP coordinator). `make install`
-# installs the `ducktape` operator CLI and, on macOS, Ducktape.app. `make test`
+# installs the `ducktape` operator CLI and the desktop app — Ducktape.app on
+# macOS, the binary plus its `x-scheme-handler/duck` desktop entry on Linux.
+# `make test`
 # is the full local verification gate — run it before every push.
 
 CARGO ?= cargo
@@ -116,12 +118,33 @@ install-app: app
 	cp -R target/ice-bundle/Ducktape.app "$(APP_DEST)/"
 	@echo "installed $(APP_DEST)/Ducktape.app"
 else
-## install the ducktape operator CLI into ~/.cargo/bin
-install: install-node
+## where the Linux desktop entry and its icon land — the XDG per-user roots,
+## so `make install-app` needs no root.
+DESKTOP_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/applications
+ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/hicolor/scalable/apps
 
-install-app:
-	@echo "install-app is currently supported on macOS" >&2
-	@exit 2
+## install the ducktape operator CLI and the desktop app without requiring root
+install: install-node install-app
+
+## build the desktop app binary
+app:
+	$(CARGO) build --release -p ducktape-app
+
+## install the desktop app and REGISTER THE duck:// SCHEME with the desktop.
+## The `.desktop` entry's `MimeType=x-scheme-handler/duck` is what makes
+## `xdg-open 'duck://forge/ducktape/1?net=<digest>'` reach the app, and its
+## `%u` is what puts the URL in argv where the app reads it. `Exec=` is
+## rewritten to an absolute path: a desktop session inherits no shell PATH.
+## The entry is installed under the app id the window reports, so the running
+## window associates with it (icon, pinned-app identity).
+install-app: app
+	mkdir -p "$(BIN_DEST)" "$(DESKTOP_DEST)" "$(ICON_DEST)"
+	install -m 0755 target/release/ducktape-app "$(BIN_DEST)/ducktape-app"
+	install -m 0644 app/assets/icon.svg "$(ICON_DEST)/ducktape.svg"
+	sed 's|@EXEC@|$(BIN_DEST)/ducktape-app|' app/packaging/dev.ducktape.app.desktop \
+		> "$(DESKTOP_DEST)/dev.ducktape.app.desktop"
+	-update-desktop-database "$(DESKTOP_DEST)"
+	@echo "installed $(BIN_DEST)/ducktape-app + $(DESKTOP_DEST)/dev.ducktape.app.desktop"
 endif
 
 # where install-node WRITES the module components, spelled exactly as

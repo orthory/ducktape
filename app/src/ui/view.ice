@@ -195,6 +195,7 @@ view
             with
               endpoint=connected_rpc
               network_name
+              network_chain_id
               status
               block_height
               search_phase=chat_search_phase
@@ -256,6 +257,8 @@ view
               load_more_history -> load_more_history
               chat_scrolled -> chat_scrolled _ _ _ _
               open_message_link -> open_message_link _
+              copy_to_clipboard -> copy_to_clipboard _ _
+              copy_message_link -> copy_message_link _
               add_reaction_at -> add_reaction_at _ _
               remove_reaction_at -> remove_reaction_at _ _
               open_thread_for -> open_thread_for _
@@ -330,6 +333,7 @@ view
         pages:
           PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft page_editor<->page_editor block_comment_draft<->block_comment_draft #pages
             with
+              network_chain_id
               pages
               page_create_open
               loading
@@ -386,6 +390,7 @@ view
               load_more_block_comments -> load_more_block_comments
               post_block_comment_submit -> post_block_comment_submit
               resolve_thread_submit -> resolve_thread_submit _
+              copy_to_clipboard -> copy_to_clipboard _ _
 
         files:
           FilesScreen new_name<->fs_new_name draft<->fs_editor
@@ -446,6 +451,7 @@ view
             with
               org=network_name
               about=account_bio
+              network_chain_id
               connected_rpc
               tier=member_tier(members_rows)
               repos=forge_repos
@@ -503,6 +509,7 @@ view
               forge_comment_drop -> forge_comment_drop _
               note_composer_event -> forge_composer_event _
               open_message_link -> open_message_link _
+              copy_to_clipboard -> copy_to_clipboard _ _
         governance:
           GovernanceScreen #governance
             with

@@ -1509,8 +1509,9 @@ fn push_paragraph_block(
 }
 
 /// Scan a single line of text for inline marks, emitting marked `Span`s. Marks do
-/// not nest; the first matching delimiter wins. Bare `http(s)://` runs become
-/// `Link`s.
+/// not nest; the first matching delimiter wins. Bare `http(s)://` and `duck://`
+/// runs become `Link`s, as does a `[label](url)` reference — one span whose
+/// text is the label and whose mark carries the target.
 fn inline_spans(text: &str, members: &[ChatMember]) -> Vec<Span> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<Span> = Vec::new();
@@ -1518,6 +1519,7 @@ fn inline_spans(text: &str, members: &[ChatMember]) -> Vec<Span> {
     let mut index = 0;
     while index < chars.len() {
         let url = url_len(&chars, index);
+        let reference = reference_at(&chars, index);
         let bold = fenced(&chars, index, "**").or_else(|| fenced(&chars, index, "__"));
         let italic = fenced(&chars, index, "*").or_else(|| fenced(&chars, index, "_"));
         if let Some((member, len)) = mention_at(&chars, index, members) {
@@ -1526,6 +1528,13 @@ fn inline_spans(text: &str, members: &[ChatMember]) -> Vec<Span> {
             spans.push(Span {
                 text: handle,
                 marks: vec![Mark::Mention(AuthorRef::User(member_key_bytes(&member)))],
+            });
+            index += len;
+        } else if let Some((label, target, len)) = reference {
+            flush_plain(&mut plain, &mut spans);
+            spans.push(Span {
+                text: label,
+                marks: vec![Mark::Link(target)],
             });
             index += len;
         } else if let Some(len) = url {
@@ -1569,17 +1578,73 @@ fn flush_plain(plain: &mut String, spans: &mut Vec<Span>) {
 }
 
 /// If `chars[at..]` opens a bare link, its length in chars; else `None`.
+///
+/// `duck://` is a link scheme here exactly as `http(s)://` is: the app
+/// classifies a pressed link through its own module table
+/// (`backend/duck_uri.rs`) and refuses what it cannot open, so the tokenizer
+/// marks the run and decides nothing about where it points.
 fn url_len(chars: &[char], at: usize) -> Option<usize> {
     let rest: String = chars[at..].iter().collect();
-    let starts_link = rest.starts_with("http://") || rest.starts_with("https://");
+    let starts_link = LINK_SCHEMES.iter().any(|scheme| rest.starts_with(scheme));
     if !starts_link {
         return None;
     }
-    let len = chars[at..]
+    let mut len = chars[at..]
         .iter()
         .take_while(|c| !c.is_whitespace())
         .count();
+    // A run stops at whitespace, but the `)` that closes `[x](duck://page/p1)`
+    // or `(see https://x)` belongs to the prose around the address, not to it.
+    while dangling_close(&chars[at..at + len]) {
+        len -= 1;
+    }
     (len > 0).then_some(len)
+}
+
+/// Does this run end in a `)` that opens nowhere inside it? A balanced one
+/// (`…/wiki/Foo_(bar)`) is part of the address and stays.
+fn dangling_close(run: &[char]) -> bool {
+    let closed = run.last() == Some(&')');
+    let opens = run.iter().filter(|c| **c == '(').count();
+    let closes = run.iter().filter(|c| **c == ')').count();
+    closed && closes > opens
+}
+
+/// The schemes a bare run and a `[label](url)` target may carry. Anything
+/// else stays plain text.
+const LINK_SCHEMES: [&str; 3] = ["http://", "https://", "duck://"];
+
+/// If `chars[at..]` opens a `[label](url)` reference — the form agents already
+/// emit for `duck://` refs (`runs::inject`) — the label, the target, and the
+/// total consumed length. The label is one line with no nested brackets and
+/// the target is one whitespace-free run in a known scheme; anything else is
+/// not a reference and stays the plain text it was typed as.
+fn reference_at(chars: &[char], at: usize) -> Option<(String, String, usize)> {
+    if chars[at] != '[' {
+        return None;
+    }
+    let label_end = chars[at + 1..]
+        .iter()
+        .position(|c| *c == ']' || *c == '[')?
+        + at
+        + 1;
+    let labelled = chars[label_end] == ']' && chars.get(label_end + 1) == Some(&'(');
+    if !labelled {
+        return None;
+    }
+    let url_start = label_end + 2;
+    let url_end = chars[url_start..]
+        .iter()
+        .position(|c| *c == ')' || c.is_whitespace())?
+        + url_start;
+    let closed = chars[url_end] == ')';
+    if !closed {
+        return None;
+    }
+    let label: String = chars[at + 1..label_end].iter().collect();
+    let target: String = chars[url_start..url_end].iter().collect();
+    let linkable = !label.is_empty() && LINK_SCHEMES.iter().any(|s| target.starts_with(s));
+    linkable.then(|| (label, target, url_end + 1 - at))
 }
 
 /// If `chars[at..]` opens an `@mention` of a channel member — `@` plus four
@@ -2040,6 +2105,76 @@ mod tests {
         assert_eq!(plain.len(), 1);
         assert!(!plain[0].rich);
         assert_eq!(plain[0].text, "just text here");
+    }
+
+    /// A `duck://` address is a link, in both forms a member or an agent
+    /// actually types one: the reference form the run injector emits
+    /// (`runs::inject`) and the bare run. Without these the app's open plane
+    /// is unreachable from chat — the protocol's whole last mile.
+    #[test]
+    fn a_duck_reference_and_a_bare_duck_url_both_become_one_link_span() {
+        let Block::Paragraph(spans) = &parse_message("[x](duck://page/p1)")[0] else {
+            panic!("a paragraph");
+        };
+        assert_eq!(spans.len(), 1, "label and target are one span: {spans:?}");
+        assert_eq!(spans[0].text, "x");
+        assert_eq!(spans[0].marks, vec![Mark::Link("duck://page/p1".into())]);
+
+        let Block::Paragraph(bare) = &parse_message("duck://forge/r/1")[0] else {
+            panic!("a paragraph");
+        };
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].text, "duck://forge/r/1");
+        assert_eq!(bare[0].marks, vec![Mark::Link("duck://forge/r/1".into())]);
+
+        // a produced link carries its network, and the query rides along
+        let Block::Paragraph(net) = &parse_message("see [58](duck://forge/d/58?net=d0cdf950)")[0]
+        else {
+            panic!("a paragraph");
+        };
+        assert_eq!(net[0].text, "see ");
+        assert_eq!(net[1].text, "58");
+        assert_eq!(
+            net[1].marks,
+            vec![Mark::Link("duck://forge/d/58?net=d0cdf950".into())]
+        );
+
+        // not references, and not links either: an unknown scheme in the
+        // target, and a bracket that opens no reference at all.
+        for typed in ["[x](mailto:a@b)", "a [bracketed] word"] {
+            let Block::Paragraph(spans) = &parse_message(typed)[0] else {
+                panic!("a paragraph");
+            };
+            assert!(
+                !spans
+                    .iter()
+                    .any(|span| matches!(span.marks.first(), Some(Mark::Link(_)))),
+                "{typed} carries no link"
+            );
+            assert_eq!(
+                span_text(spans),
+                typed,
+                "{typed} stays the text it was typed as"
+            );
+        }
+
+        // an empty label is no reference — the bare target inside is still a
+        // link, labelled by itself, and the prose's `)` is not part of it.
+        let Block::Paragraph(unlabelled) = &parse_message("[](duck://page/p1)")[0] else {
+            panic!("a paragraph");
+        };
+        let link = unlabelled
+            .iter()
+            .find(|span| matches!(span.marks.first(), Some(Mark::Link(_))))
+            .expect("a link span");
+        assert_eq!(link.text, "duck://page/p1");
+        assert_eq!(span_text(unlabelled), "[](duck://page/p1)", "no text lost");
+
+        // a `)` the address itself opened stays in it.
+        let Block::Paragraph(balanced) = &parse_message("https://x/Foo_(bar)")[0] else {
+            panic!("a paragraph");
+        };
+        assert_eq!(balanced[0].text, "https://x/Foo_(bar)");
     }
 
     /// `⇧↵` PUTS A NEWLINE IN THE BUFFER AND THE COMPOSER SAYS SO.

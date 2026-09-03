@@ -165,6 +165,11 @@ pub(crate) fn parse_duck_refs(sources: &[&str]) -> DuckRefs {
 /// path is exactly `<dir>/<name>` (non-empty, non-dot) under the attachments
 /// root. Anything else is dropped.
 fn classify_duck_url(url: &str, out: &mut DuckRefs) {
+    // `?net=<digest>` names the network a produced link belongs to. A run
+    // resolves refs against the chain it is executing on and no other, so the
+    // component is dropped here — but it must be dropped rather than folded
+    // into the id, or a pasted produced link resolves to nothing.
+    let url = url.split_once('?').map(|(head, _)| head).unwrap_or(url);
     if let Some(id) = url.strip_prefix("duck://page/") {
         if !id.is_empty() && !id.contains('/') && !out.pages.iter().any(|p| p == id) {
             out.pages.push(id.to_string());
@@ -213,6 +218,15 @@ fn render_page(page_id: &str, blocks: Option<&[Block]>) -> String {
     };
     // the header IS the live ref: an agent echoing it produces a working chip
     // (the retired `[[page:]]` syntax would not).
+    //
+    // it carries NO `?net=`, and every link the product mints elsewhere does.
+    // a module runs the same component bytes on every network, so the only
+    // way one learns its chain id is the genesis config (`topology::
+    // CONFIG_CHAIN_ID`, as `gateway` and `identity` take it) — wiring that
+    // into `runs` moves a production module's genesis state, so it is its own
+    // change. until then a run's produced link is the hand-typed case: it
+    // resolves against whichever network the reader is connected to, which is
+    // the one the run executed on in every path that exists today.
     let mut out = format!("[{}](duck://page/{page_id})", root.text);
     let mut depth = BTreeMap::from([(root.id.as_str(), 0usize)]);
     for block in rest {
@@ -734,6 +748,20 @@ mod tests {
         ]);
         assert_eq!(refs.pages, vec!["plan", "spec", "notes"]);
         assert!(refs.files.is_empty());
+    }
+
+    /// A produced link names its network (`?net=<digest>`). The run resolves
+    /// against the chain it runs on, so the component is dropped — never
+    /// folded into the id, which would make every copied link resolve to
+    /// nothing.
+    #[test]
+    fn a_ref_that_names_its_network_resolves_to_the_bare_id() {
+        let refs = parse_duck_refs(&[
+            "[Plan](duck://page/plan?net=d0cdf950)",
+            "[Shot](duck://files/shared/attachments/u1/s.png?net=d0cdf950)",
+        ]);
+        assert_eq!(refs.pages, vec!["plan"]);
+        assert_eq!(refs.files, vec!["/shared/attachments/u1/s.png"]);
     }
 
     #[test]

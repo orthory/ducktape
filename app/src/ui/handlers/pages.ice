@@ -579,13 +579,16 @@ on page_edited(event)
   block_comments_open = block_comments_open || page_rail_open
   block_comments_target = keep_str(page_rail_open, active_page, block_comments_target)
   block_comment_threads_loading = block_comment_threads_loading || page_rail_open
-  // A link press never touched the buffer — it is a hand-off to the OS. The
-  // two runs are exclusive by event kind; each backend treats an empty
-  // argument as "not my turn" and answers without side effects.
+  // A link press goes through the ONE open plane (`open_message_link`), not
+  // straight to the OS: a page cites `duck://` addresses as readily as a chat
+  // message does, and only that plane knows the module table and the
+  // network scope. It never touched the buffer either way. The two runs are
+  // exclusive by event kind; each backend treats an empty argument as "not my
+  // turn" and answers without side effects.
   let page_link = page_link_of(event)
   return if empty(page_link) && !page_rail_open
   parallel
-    run every open_external_url(page_link) -> external_url_opened _ | external_url_failed _
+    run every duck_echo_str(page_link) -> open_message_link _ | external_url_failed _
     run replace lane=block_threads load_page_threads(connected_rpc, keep_str(page_rail_open, active_page, ""), block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on external_url_opened(_opened)

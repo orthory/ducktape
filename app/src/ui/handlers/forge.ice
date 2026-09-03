@@ -64,7 +64,7 @@ on forge_repo_loaded(next)
       let rev = forge_focus_rev
       forge_focus_path = ""
       forge_focus_rev = ""
-      slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, path, rev) at forge_repo
+      slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, network_chain_id, path, rev) at forge_repo
 
 on forge_repo_failed(cause)
   return if cause.generation != forge_generation

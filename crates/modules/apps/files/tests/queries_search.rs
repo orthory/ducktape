@@ -412,7 +412,7 @@ fn seed_grep_resume(f: &mut files::Files) {
 }
 
 #[test]
-fn grep_finds_needle_at_line_with_exact_evidence_uri() {
+fn grep_finds_needle_at_line_with_exact_evidence_locator() {
     let d = tempfile::tempdir().unwrap();
     let mut f = open_files(&d);
     seed_grep_resume(&mut f);
@@ -427,9 +427,9 @@ fn grep_finds_needle_at_line_with_exact_evidence_uri() {
     assert_eq!(hits[0].line, 1, "1-based line number");
     assert_eq!(hits[0].text, "needle here");
     assert_eq!(
-        hits[0].uri,
-        format!("duck://files/shared/gb/0needle@{snap}#L1"),
-        "byte-exact evidence uri"
+        hits[0].locator,
+        format!("/shared/gb/0needle@{snap}#L1"),
+        "byte-exact evidence locator"
     );
     assert_eq!(hits[1].path, "/shared/gb/2needle");
     assert_eq!(hits[1].line, 1);
@@ -623,14 +623,11 @@ fn grep_snapshot_addressed_finds_a_needle_in_a_deleted_file() {
     let (at_head, _) = grep(&f, "needle", "/shared/sg", None, None, MAX_PAGE);
     assert!(at_head.is_empty(), "secret is deleted at head");
 
-    // snapshot-addressed at S1 the file is present → hit, with S1 in the uri.
+    // snapshot-addressed at S1 the file is present → hit, with S1 in the locator.
     let (at_s1, _) = grep(&f, "needle", "/shared/sg", Some(&s1), None, MAX_PAGE);
     assert_eq!(at_s1.len(), 1);
     assert_eq!(at_s1[0].path, "/shared/sg/secret");
-    assert_eq!(
-        at_s1[0].uri,
-        format!("duck://files/shared/sg/secret@{s1}#L1")
-    );
+    assert_eq!(at_s1[0].locator, format!("/shared/sg/secret@{s1}#L1"));
 }
 
 // ============================================================================

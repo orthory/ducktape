@@ -17,7 +17,7 @@ enum ForgeTreePhase
   ready
   failed
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, linked_note:ChatMessage?, connected:bool, loading:bool, dark:bool)
+component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, linked_note:ChatMessage?, connected:bool, loading:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -34,6 +34,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
     forge_comment_drop(str)
     note_composer_event(ComposerEvent)
     open_message_link(str)
+    copy_to_clipboard(str, str)
   col w=fill h=fill
     // NOT CONNECTED IS NOT EMPTY, and the arm sits ABOVE both seats because
     // both of them read. `connected` already disabled every act here, while the
@@ -171,6 +172,13 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     h=28.0
                     p=6.0
                     @secondary_action
+              // The repo's own address. Its NAME is typeable; the `?net=`
+              // digest that says which network's `ducktape` this is, is not.
+              button "Copy repo link" -> emit(copy_to_clipboard, duck_forge_repo_link(open_repo, network_chain_id), "Repo link copied")
+                with
+                  h=28.0
+                  p=6.0
+                  @secondary_action
               button "All repos" -> emit(forge_close_repo)
                 with
                   h=28.0
@@ -306,6 +314,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     connected_rpc
                     connected
                     repo=open_repo
+                    network_chain_id
                     dark
                   forward
                     open_message_link
@@ -375,6 +384,30 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                   PrStatePill state=forge_item_state
                 if forge_item_kind != "pr"
                   StatusBadge label=forge_item_state
+                // The item's own address, for a chat message or a commit
+                // trailer. It names the network it belongs to, so the same
+                // repo name on another one cannot answer for it.
+                button -> emit(copy_to_clipboard, duck_forge_item_link(open_repo, forge_item_number, network_chain_id), "Item link copied")
+                  with
+                    label="Copy item link"
+                    w=26.0
+                    h=26.0
+                    p=0.0
+                    @icon_action
+                  box
+                    with
+                      w=fill
+                      h=fill
+                      align-x=center
+                      align-y=center
+                    Icon
+                      with
+                        name="link"
+                        tone="label"
+                        px=13.0
+                  active bg=transparent text=muted r=7.0
+                  hovered bg=fg/10 text=fg
+                  pressed bg=fg/15
               row
                 with
                   w=fill
@@ -807,7 +840,7 @@ component LinkedNote(note:ChatMessage)
             forward
               open_message_link
 
-component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:bool)
+component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, network_chain_id:str, dark:bool)
   emits
     open_message_link(str)
   lifetime mounted
@@ -830,6 +863,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     focus_rpc = ""
     focus_online = false
     focus_repo = ""
+    focus_net = ""
     focus_path = ""
     failed_note = ""
     opened_dir = ""
@@ -855,7 +889,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     return if empty(focus_path)
     let path = focus_path
     focus_path = ""
-    run every duck_echo_str(path) -> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _) | file_failed _
+    run every duck_echo_str(path) -> open_file(focus_rpc, focus_online, focus_repo, focus_net, tree_rev, tree_path, _) | file_failed _
   on tree_failed(cause)
     tree_phase = ForgeTreePhase.failed
   // A `duck://forge/<repo>/blob/<path>[@<rev>]` deep link. The reader's
@@ -864,11 +898,12 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
   // directory (pinned to `@rev` when the link names one, else wherever the
   // tree already is), and `tree_loaded` opens the file under that tree.
   // One path whether or not a tree had landed yet.
-  on focus_file(rpc, online, repo_now, path, rev)
+  on focus_file(rpc, online, repo_now, net, path, rev)
     return if !online || empty(repo_now)
     focus_rpc = rpc
     focus_online = online
     focus_repo = repo_now
+    focus_net = net
     focus_path = path
     tree_path = forge_parent(path)
     tree_rev = keep_str(!empty(rev), rev, tree_rev)
@@ -876,7 +911,10 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     tree_truncated = false
     tree_phase = ForgeTreePhase.loading
     run replace lane=tree forge_tree(rpc, repo_now, tree_rev, tree_path) -> tree_loaded _ | tree_failed _
-  on open_file(rpc, online, repo_now, rev, dir, path)
+  // `net` is the connected chain id, carried down to the blob's reader: a
+  // Markdown blob's inline pictures are duck:// addresses too, and one naming
+  // another network must not draw THIS network's blob of the same name.
+  on open_file(rpc, online, repo_now, net, rev, dir, path)
     return if !online || empty(repo_now)
     opened_dir = dir
     opened_rev = rev
@@ -889,7 +927,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     file_picture = false
     failed_note = ""
     phase = ForgeFilePhase.loading
-    run replace lane=blob forge_blob(rpc, repo_now, rev, path) -> file_loaded _ | file_failed _
+    run replace lane=blob forge_blob(rpc, repo_now, rev, path, net) -> file_loaded _ | file_failed _
   on file_loaded(next)
     return if next.path != file_path
     file_text = next.text
@@ -1024,7 +1062,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
                     hovered bg=rail_hover text=fg
                     pressed bg=elevated text=fg
                 if entry.kind != "dir"
-                  button -> open_file(connected_rpc, connected, repo, tree_rev, tree_path, entry.path)
+                  button -> open_file(connected_rpc, connected, repo, network_chain_id, tree_rev, tree_path, entry.path)
                     with
                       label="Open file"
                       description=entry.path
