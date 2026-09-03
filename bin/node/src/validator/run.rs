@@ -145,6 +145,8 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) status: noded::StatusCell,
     pub(super) status_public_key: String,
     pub(super) coordination: crate::config::Coordination,
+    /// where a SIGUSR1 task dump lands (`<workspace>/tasks.txt`).
+    pub(super) workspace: std::path::PathBuf,
 }
 
 struct ValidatorRuntime<'a> {
@@ -180,6 +182,7 @@ struct ValidatorRuntime<'a> {
     status: noded::StatusCell,
     status_public_key: String,
     coordination: crate::config::Coordination,
+    workspace: std::path::PathBuf,
     /// the earliest instant the NEXT `refresh_operations` may run — the
     /// exposition parse is the pricey part of a status publish, so it is
     /// paced here instead of riding every drained boundary.
@@ -281,6 +284,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         status,
         status_public_key,
         coordination,
+        workspace,
     } = state;
     let mut rpc_ingress = rpc_ingress;
 
@@ -424,6 +428,36 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
             None
         }
     };
+    // the diagnostic task dump (#1386): SIGUSR1 never checkpoints or exits —
+    // it just writes tokio's taskdump to `<workspace>/tasks.txt` so a wedged
+    // node can say which task it is parked on. only where tokio's unstable
+    // taskdump API exists; elsewhere the handler is not installed at all.
+    #[cfg(all(
+        tokio_unstable,
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    let mut sigusr1 =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    target: "ducktape::node",
+                    node = %label,
+                    signal = "SIGUSR1",
+                    error = %e,
+                    reason = "signal_handler_install_failed",
+                    "task dump on SIGUSR1 disabled"
+                );
+                None
+            }
+        };
+    #[cfg(not(all(
+        tokio_unstable,
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )))]
+    crate::task_dump::log_unsupported(&label);
 
     // the finalization delivery wake: the engine's reporter pings it the
     // moment a finalized block becomes drainable, and the loop below drains
@@ -464,6 +498,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         status,
         status_public_key,
         coordination,
+        workspace,
         next_ops_refresh: context.current(),
         expected,
         applied,
@@ -520,11 +555,49 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         .fuse();
         futures::pin_mut!(signalled);
 
+        // the SIGUSR1 task dump: a separate arm from `signalled` above —
+        // unlike SIGTERM/SIGINT it never checkpoints or exits, so it must
+        // not share `on_signal`'s terminal path.
+        #[cfg(all(
+            tokio_unstable,
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        let dumped = async {
+            match sigusr1.as_mut() {
+                Some(u) => {
+                    u.recv().await;
+                }
+                None => futures::future::pending::<()>().await,
+            }
+        }
+        .fuse();
+        #[cfg(all(
+            tokio_unstable,
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        futures::pin_mut!(dumped);
+        #[cfg(not(all(
+            tokio_unstable,
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        let mut dumped = futures::future::pending::<()>().fuse();
+
         // Keep selection order in one place: signal and the absolute drain
         // deadline must outrank every ingress lane.
         let next_drain = runtime.next_drain;
         futures::select_biased! {
             _ = signalled => runtime.on_signal().await,
+            _ = dumped => {
+                #[cfg(all(
+                    tokio_unstable,
+                    target_os = "linux",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                ))]
+                crate::task_dump::dump_tasks(&runtime.workspace, &runtime.label).await;
+            }
             _ = context.sleep_until(next_drain).fuse() => runtime.on_drain().await,
             wake = delivery_wake.recv().fuse() => {
                 // a finalized block is drainable NOW — drain event-driven
