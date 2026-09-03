@@ -28,6 +28,62 @@ pub struct Status {
     pub clean: bool,
 }
 
+impl Status {
+    /// keep only the changes at or under one of `specs` — the `ducktape fs`
+    /// pathspec. a spec is a path relative to the checkout root (`src/lib.rs`,
+    /// `.`) or an absolute duckfs path (`/shared/ws/src`); an EMPTY list selects
+    /// everything. this is what makes the `MAX_CHANGES_PER_COMMIT` refusal
+    /// actionable: a tree past the wire cap is committed a subtree at a time,
+    /// each commit still one atomic unit.
+    pub fn select(&self, specs: &[String], prefix: &str) -> Status {
+        if specs.is_empty() {
+            return self.clone();
+        }
+        let selected: Vec<String> = specs.iter().map(|s| duckfs_spec(s, prefix)).collect();
+        let keep = |path: &String| {
+            selected
+                .iter()
+                .any(|sel| path == sel || path.starts_with(&format!("{sel}/")))
+        };
+        let added: Vec<ScanEntry> = self
+            .added
+            .iter()
+            .filter(|e| keep(&e.path))
+            .cloned()
+            .collect();
+        let modified: Vec<ScanEntry> = self
+            .modified
+            .iter()
+            .filter(|e| keep(&e.path))
+            .cloned()
+            .collect();
+        let removed: Vec<String> = self.removed.iter().filter(|p| keep(p)).cloned().collect();
+        let clean = added.is_empty() && modified.is_empty() && removed.is_empty();
+        Status {
+            added,
+            modified,
+            removed,
+            clean,
+        }
+    }
+}
+
+/// a pathspec as an absolute duckfs path: an absolute spec is taken as written,
+/// anything else is relative to the checkout root (and `.` is the whole tree).
+fn duckfs_spec(spec: &str, prefix: &str) -> String {
+    let root = prefix.trim_end_matches('/');
+    let trimmed = spec.trim_end_matches('/');
+    if trimmed.starts_with('/') {
+        return trimmed.to_string();
+    }
+    let rel = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    let is_whole_tree = rel.is_empty() || rel == ".";
+    if is_whole_tree {
+        return root.to_string();
+    }
+    format!("{root}/{rel}")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StatusError {
     #[error(transparent)]

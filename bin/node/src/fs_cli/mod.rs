@@ -131,6 +131,10 @@ pub(crate) struct CheckoutArgs {
 pub(crate) struct StatusArgs {
     /// the checkout directory (default: the current directory)
     pub dir: Option<String>,
+    /// report only changes at or under this path (repeatable). a path is
+    /// relative to the checkout, or an absolute duckfs path
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -140,6 +144,15 @@ pub(crate) struct CommitArgs {
     /// the commit message
     #[arg(long, value_name = "MESSAGE")]
     pub message: String,
+    /// commit only the changes at or under this path (repeatable) — the way a
+    /// tree past MAX_CHANGES_PER_COMMIT is committed, a subtree at a time. a
+    /// path is relative to the checkout, or an absolute duckfs path.
+    ///
+    /// a FLAG, not a positional: `commit` already takes the checkout dir
+    /// positionally, and `ducktape fs commit src/` reading as "the checkout is
+    /// src/" is the kind of ambiguity that eats a commit
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
     /// fail on a conflict instead of auto-rebasing onto the current head
     #[arg(long)]
     pub no_rebase: bool,
