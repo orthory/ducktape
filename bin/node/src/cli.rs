@@ -34,7 +34,49 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Member(cmd) => dispatch_member(cmd),
         OpCmd::Work(cmd) => dispatch_work(cmd),
         OpCmd::Sandbox(args) => crate::sandbox_cli::run(args),
+        OpCmd::LogFilter(args) => cmd_log_filter(args),
     }
+}
+
+/// `ducktape node log-filter <FILTER>` — retune a RUNNING node's tracing
+/// filter, signed.
+///
+/// This verb exists because `POST /v1/log-filter` mutates the process and so
+/// requires a user signature (`noded::signed_req`), which `curl` cannot mint.
+/// The node key the signature is bound to comes from the node ITSELF
+/// (`/v1/status`), not from a local workspace, so `--node <url>` works against
+/// a node this host holds no config for.
+fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
+    let ctx = crate::cred_cli::VerbCtx {
+        addr: args.addr,
+        key: args.key,
+    };
+    let base = ctx.http_base()?;
+    let status =
+        crate::node_http::get_json(&base, "/v1/status").map_err(|failure| failure.to_string())?;
+    let node_key = unhex(status["public_key"].as_str().unwrap_or_default())?;
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let signer = crate::userkey_cli::load_user_signer(&ctx.key_path()?, &mut stdin)?;
+
+    const PATH: &str = "/v1/log-filter";
+    let body = args.filter.into_bytes();
+    let mut request = reqwest::blocking::Client::new()
+        .post(format!("{base}{PATH}"))
+        .body(body.clone());
+    for (name, value) in noded::signed_req::request_headers(&signer, "POST", PATH, &node_key, &body)
+    {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .map_err(|error| crate::node_http::transport_failure(PATH, &error).to_string())?;
+    let status_code = response.status();
+    let text = response.text().unwrap_or_default();
+    if !status_code.is_success() {
+        return Err(format!("{PATH} rejected ({status_code}): {text}").into());
+    }
+    println!("{text}");
+    Ok(())
 }
 
 fn dispatch_work(cmd: WorkCmd) -> CommandResult {

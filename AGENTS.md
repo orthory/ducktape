@@ -112,7 +112,10 @@
   countable.
 - Turn one plane up on a LIVE node rather than restarting it — a restart destroys
   the wedged state you restarted to look at:
-  `curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'`
+  `ducktape node log-filter 'info,ducktape::join=debug' -n <chain-id>`
+  (the route MUTATES the process — a `trace` filter fills the disk — so it takes
+  a user-signed request; the verb signs with the active wallet key, `curl`
+  cannot.)
 
 ## Rust Gates
 
