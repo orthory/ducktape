@@ -13,7 +13,7 @@ use futures::{FutureExt as _, StreamExt as _};
 
 use recovery::Manifest;
 
-use crate::constants::DRAIN_TICK;
+use crate::constants::{DRAIN_TICK, WORKSPACE_CHECK_INTERVAL};
 use crate::reachability_plane::GateOutcomes;
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
@@ -184,15 +184,8 @@ struct ValidatorRuntime<'a> {
     status: noded::StatusCell,
     status_public_key: String,
     coordination: crate::config::Coordination,
-    /// read only by the SIGUSR1 task-dump arm, which exists on Linux alone.
-    #[cfg_attr(
-        not(all(
-            tokio_unstable,
-            target_os = "linux",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        )),
-        allow(dead_code)
-    )]
+    /// where a SIGUSR1 task dump lands, and the directory the drain's
+    /// workspace guard re-stats.
     workspace: std::path::PathBuf,
     /// the earliest instant the NEXT `refresh_operations` may run — the
     /// exposition parse is the pricey part of a status publish, so it is
@@ -254,6 +247,12 @@ struct ValidatorRuntime<'a> {
     fetch_done_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
     fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<[u8; 32]>,
     next_drain: std::time::SystemTime,
+    /// the workspace directory as it was at boot, and the next instant the
+    /// drain re-checks it is still there — the fail-stop for a workspace
+    /// deleted underneath a running node. `None` when boot could not stat it:
+    /// the node then runs unguarded rather than dying over a stat.
+    workspace_mark: Option<crate::util::WorkspaceMark>,
+    next_workspace_check: std::time::SystemTime,
 }
 
 pub(super) async fn run(state: ValidatorLoopState<'_>) {
@@ -477,6 +476,10 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     let (delivery_wake_tx, mut delivery_wake) = tokio::sync::mpsc::unbounded_channel::<()>();
     node.orderer().set_delivery_wake(delivery_wake_tx.clone());
 
+    // pinned BEFORE the directory moves into the runtime: the identity of the
+    // workspace this node is serving, so the drain can tell "still mine" from
+    // "deleted, and my own journal write put the path back".
+    let workspace_mark = crate::util::WorkspaceMark::read(&workspace);
     let mut runtime = ValidatorRuntime {
         context,
         node,
@@ -540,6 +543,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         fetch_done_tx,
         fetch_done_rx,
         next_drain: context.current() + DRAIN_TICK,
+        workspace_mark,
+        next_workspace_check: context.current() + WORKSPACE_CHECK_INTERVAL,
     };
     // the startup snapshot: the RECOVERED boundary serves on /v1/status the
     // moment the loop exists, not after the first drain.
