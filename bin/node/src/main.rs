@@ -617,6 +617,32 @@ fn run_node(
             }
             Ok(blob)
         });
+        // the netstack plane's operator trigger and its status field. Both
+        // exist only where a reachability plane will: `wireguard_listen` is
+        // exactly the condition every role's wiring branches on, so a node
+        // without one names no backend rather than naming a plane it never
+        // started.
+        if wireguard_listen.is_some() {
+            metrics.set_netstack_backend(reachability_plane::netstack_backend().name());
+            let swap_metrics = metrics.clone();
+            status.wire_netstack_swapper(move |request| {
+                let metrics = swap_metrics.clone();
+                Box::pin(async move {
+                    let outcome = reachability_plane::swap_netstack(request).await;
+                    match &outcome {
+                        Ok(backend) => {
+                            metrics.set_netstack_backend(backend.clone());
+                            metrics.record_netstack_swap(noded::NetstackSwapOutcome::Swapped, None);
+                        }
+                        Err(reason) => metrics.record_netstack_swap(
+                            noded::NetstackSwapOutcome::Refused,
+                            Some(reason.clone()),
+                        ),
+                    }
+                    outcome
+                })
+            });
+        }
         status.publish(noded::NodeStatus {
             version: build_version(),
             public_key: status_public_key.clone(),

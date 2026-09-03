@@ -90,6 +90,7 @@
 
 use std::net::SocketAddr;
 
+use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
@@ -644,6 +645,7 @@ pub fn admin_router(handle: NodeHandle) -> Router<NodeHandle> {
         .route("/v1/admin/ping", get(ping))
         .route("/v1/admin/shutdown", post(crate::shutdown))
         .route("/v1/admin/logs/tail", get(logs_tail))
+        .route("/v1/admin/netstack/swap", post(netstack_swap))
         // upgrade staging: ingest + fan a wasm artifact out to members. the body
         // cap is EXPLICIT (see `MAX_MODULE_ARTIFACT_BYTES`) — without a layer
         // axum's implicit 2 MiB default applies, and the largest real artifact
@@ -668,6 +670,80 @@ pub fn admin_router(handle: NodeHandle) -> Router<NodeHandle> {
 /// 200) is exactly "admin namespace reachable" for the app's control predicate.
 async fn ping() -> Response {
     Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+/// POST /v1/admin/netstack/swap — move the reachability plane onto another
+/// netstack backend, mid-life, without a retarget or a tunnel flap.
+///
+/// The OPERATOR's trigger: one node rolled forward onto a component, or back
+/// onto native, without waiting for governance. Body is
+/// `{"backend": "native"}` or `{"backend": {"component": "<path on the node's
+/// disk>"}}` — the path is read by the NODE, so a caller off-box never ships
+/// bytes through this route.
+///
+/// A refused swap is a 409 and the running machine CONTINUES untouched (the
+/// executor's contract); nothing here retries, because a component built
+/// against another contract will be refused by name every time.
+async fn netstack_swap(State(handle): State<NodeHandle>, body: Bytes) -> Response {
+    let request = match serde_json::from_slice::<SwapBody>(&body) {
+        Ok(body) => body.backend,
+        Err(error) => {
+            return swap_refusal(
+                StatusCode::BAD_REQUEST,
+                "netstack_swap_body_invalid",
+                &error.to_string(),
+            );
+        }
+    };
+    let Some(outcome) = handle.status.swap_netstack(request).await else {
+        return swap_refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "netstack_plane_absent",
+            "this node runs no reachability plane, so it has no netstack backend to swap",
+        );
+    };
+    match outcome {
+        Ok(backend) => Json(serde_json::json!({ "backend": backend })).into_response(),
+        Err(reason) => swap_refusal(StatusCode::CONFLICT, "netstack_swap_refused", &reason),
+    }
+}
+
+/// the swap route's body. `deny_unknown_fields` so a misspelled key is a 400
+/// rather than a silently ignored request that swapped nothing.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SwapBody {
+    backend: crate::NetstackSwapRequest,
+}
+
+/// one refusal in [`refuse`]'s shape: a stable snake_case `reason` plus the
+/// detail. The detail here is the PLANE's own string, which is why it is not
+/// the reason token.
+///
+/// Level splits the way [`refuse`] splits it: 4xx is per-request and any
+/// operator retry loop mints one, so it is `debug`; the 503 says this node
+/// cannot serve the route at all, which is a standing fault worth a `warn`.
+/// The plane logs `netstack_backend_swap_refused` itself either way.
+fn swap_refusal(status: StatusCode, reason: &'static str, detail: &str) -> Response {
+    match status.is_server_error() {
+        true => tracing::warn!(
+            target: "ducktape::reachability",
+            reason,
+            status = status.as_u16(),
+            "netstack swap cannot be served on this node"
+        ),
+        false => tracing::debug!(
+            target: "ducktape::reachability",
+            reason,
+            status = status.as_u16(),
+            "netstack swap refused"
+        ),
+    }
+    (
+        status,
+        Json(serde_json::json!({ "error": detail, "reason": reason })),
+    )
+        .into_response()
 }
 
 /// how many ring lines a tail returns by default / at most.

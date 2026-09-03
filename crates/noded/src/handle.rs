@@ -116,7 +116,31 @@ struct StatusCellInner {
     /// files. Unwired (simnode, an embedder with no workspace), `/v1/invite`
     /// answers 503 — the same shape as an unwired exposition.
     invite_minter: std::sync::OnceLock<Arc<InviteMinter>>,
+    /// the netstack backend swapper — wired once at boot by an embedder that
+    /// owns a reachability plane. Unwired (simnode, the embedded daemon, a
+    /// node with no `wireguard_listen`), `POST /v1/admin/netstack/swap`
+    /// answers 503: there is no plane to swap.
+    netstack_swapper: std::sync::OnceLock<Arc<NetstackSwapper>>,
 }
+
+/// Which machine the operator wants the reachability plane on. The component
+/// path is read on the NODE, not by the caller: the route takes a path on the
+/// node's own disk, exactly like `module-code` staging.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum NetstackSwapRequest {
+    /// `"native"` — the machine compiled into the node binary.
+    Native,
+    /// `{"component": "<path>"}` — a `ducktape:netstack` component on disk.
+    Component(PathBuf),
+}
+
+/// Swap the reachability plane's backend, answering the new backend's name or
+/// the plane's refusal reason. A refusal leaves the running machine untouched —
+/// that contract is the executor's, and nothing here retries.
+pub type NetstackSwapper = dyn Fn(NetstackSwapRequest) -> futures::future::BoxFuture<'static, Result<String, String>>
+    + Send
+    + Sync;
 
 /// Mint one bearer invite valid for `ttl_days`, answering the paste blob.
 pub type InviteMinter = dyn Fn(u64) -> Result<String, String> + Send + Sync;
@@ -199,6 +223,33 @@ impl StatusCell {
     /// blocking thread.
     pub fn mint_invite(&self, ttl_days: u64) -> Option<Result<String, String>> {
         self.inner.invite_minter.get().map(|mint| mint(ttl_days))
+    }
+
+    /// wire the netstack backend swapper. once per process; a second wiring is
+    /// a programming error.
+    pub fn wire_netstack_swapper(
+        &self,
+        swap: impl Fn(
+            NetstackSwapRequest,
+        ) -> futures::future::BoxFuture<'static, Result<String, String>>
+        + Send
+        + Sync
+        + 'static,
+    ) {
+        if self.inner.netstack_swapper.set(Arc::new(swap)).is_err() {
+            panic!("status cell netstack swapper wired twice");
+        }
+    }
+
+    /// Swap the plane's backend: the new backend's name, the plane's refusal,
+    /// or `None` when no swapper is wired (no reachability plane on this node
+    /// — the route answers 503).
+    pub async fn swap_netstack(
+        &self,
+        request: NetstackSwapRequest,
+    ) -> Option<Result<String, String>> {
+        let swap = Arc::clone(self.inner.netstack_swapper.get()?);
+        Some(swap(request).await)
     }
 
     /// the current status: the last-published boundary facts, with live

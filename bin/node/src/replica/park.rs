@@ -947,6 +947,7 @@ pub(super) async fn park(
                                             height: Some(*height),
                                             root_hash: hex(&node_r.host().root_hash()),
                                             modules,
+                                            netstack: metrics.operational_status().netstack,
                                         }),
                                         ..RpcReply::ok()
                                     }
