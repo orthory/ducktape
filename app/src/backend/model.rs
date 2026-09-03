@@ -792,22 +792,30 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
     static CLIENTS: std::sync::Mutex<std::collections::BTreeMap<String, RpcClient>> =
         std::sync::Mutex::new(std::collections::BTreeMap::new());
     let mut clients = CLIENTS.lock().expect("rpc client cache");
-    if let Some(client) = clients.get(&configured) {
-        return Ok(client.clone());
-    }
-    let client = RpcClient::new(&configured).map_err(String::from)?;
+    let client = match clients.get(&configured) {
+        Some(client) => client.clone(),
+        None => {
+            let client = RpcClient::new(&configured).map_err(String::from)?;
+            clients.insert(configured, client.clone());
+            client
+        }
+    };
     // The node's own operator credential, when this device holds the node's
     // workspace: every MUTATING `/v1` route (a files commit, an invite mint, a
     // frameless submit) refuses a caller that presents neither it nor a
     // per-request user signature. The app already reads this same directory for
     // the service-link token, and a node with no local workspace here is a
     // REMOTE one — read-only from this device, which the node's own 401 says.
-    let client = match operator_token_for(client.origin()) {
+    //
+    // Read per call and NEVER latched into the cached client: the node re-mints
+    // this secret on every boot, so a client that kept the one it was built
+    // with would 401 every write from the first node restart until the app
+    // itself restarted. The cache exists for the connection pool, not the
+    // credential.
+    Ok(match operator_token_for(client.origin()) {
         Some(token) => client.with_operator_token(token),
         None => client,
-    };
-    clients.insert(configured, client.clone());
-    Ok(client)
+    })
 }
 
 /// The `admin.token` of the node serving `origin`, if this device has its
