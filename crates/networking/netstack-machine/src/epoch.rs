@@ -535,6 +535,18 @@ impl EpochState {
         self.phase.view()
     }
 
+    /// Take a NEW LIFE within the epoch: `signed` (a higher nonce over the
+    /// same epoch tuple) replaces this node's record everywhere the epoch
+    /// holds one, and the standing goes [`OwnRecordStanding::Live`] so
+    /// every nudge re-offers it until each peer re-tunnels this node. The
+    /// applied view keeps the version the peers locked — a mid-epoch life
+    /// re-points tunnels in place and never re-versions the mesh.
+    pub(crate) fn readvertise_own(&mut self, signed: SignedEndpointRecord) {
+        self.records.insert(self.me(), signed.clone());
+        self.own_record = signed;
+        self.own_standing = OwnRecordStanding::Live;
+    }
+
     /// The verified view a live handshake runs over. A handshake entry, and
     /// a request answered rather than parked, exist only from the handshake
     /// phase on — so the view is present by construction.

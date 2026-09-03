@@ -447,6 +447,23 @@ pub enum Event {
         endpoint: SocketAddr,
         bytes: Vec<u8>,
     },
+    /// This node's OWN coordinator-observed reflexive mapping moved: the
+    /// NAT rebound under a live epoch. The host sends this only when the
+    /// address actually differs from the last one it observed, so the
+    /// machine treats every one as a real rebind — it re-signs its record
+    /// under a fresh nonce and re-advertises, which is what makes each peer
+    /// run the post-lock re-advertisement path and rendezvous this node's
+    /// new mapping by identity. `endpoint` is the observation itself; the
+    /// record's advertised endpoint is the host's configuration and does
+    /// not move with it (an endpoint-less node advertises no address at
+    /// all — the coordinator IS its address book).
+    ReflexiveChanged {
+        #[borsh(schema(with_funcs(
+            declaration = "socket_addr::declaration",
+            definitions = "socket_addr::definitions"
+        )))]
+        endpoint: SocketAddr,
+    },
     /// Outcome of an [`Effect::ResolveStart`].
     Resolved {
         req: ReqId,

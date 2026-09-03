@@ -839,21 +839,43 @@ async fn reachability_plane(
     // Establishment is asynchronous: narrate its transitions — one loud line
     // if the coordinator is dark at boot (so a self-healing plane is never
     // mistaken for a silently degraded one), then the reflexive when it
-    // lands, however late.
+    // lands, however late. The watch does not end at the first `Ready`: the
+    // keepalive re-probes the coordinator, so a MID-EPOCH NAT rebind lands
+    // here as a fresh `Ready` at a new address, and the plane learns its own
+    // mapping moved from this one place (peers otherwise keep dialing the
+    // dead mapping until this member's next life).
     if let Some(mut status) = resolver.status() {
         let status_label = label.clone();
+        // weak: the plane exits when every command sender drops, and a
+        // strong clone parked in this task would hold its channel open.
+        let reflexive_cmds = nudges.clone().downgrade();
+        let mut observed: Option<std::net::SocketAddr> = None;
         tokio::spawn(async move {
             loop {
                 let current = *status.borrow_and_update();
                 match current {
                     reachability::RendezvousStatus::Ready { reflexive } => {
+                        let moved = observed
+                            .replace(reflexive)
+                            .is_some_and(|last| last != reflexive);
                         tracing::info!(
                             target: "ducktape::reachability",
                             node = %status_label,
                             %reflexive,
+                            moved,
                             "coordinator-observed reflexive"
                         );
-                        return;
+                        if moved {
+                            let Some(cmds) = reflexive_cmds.upgrade() else {
+                                return;
+                            };
+                            let cmd = reachability::ReachabilityCommand::ReflexiveChanged {
+                                endpoint: reflexive,
+                            };
+                            if cmds.send(cmd).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                     reachability::RendezvousStatus::Unavailable { attempts: 1 } => {
                         tracing::warn!(

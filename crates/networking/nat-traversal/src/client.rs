@@ -299,6 +299,23 @@ impl NatClient {
         Ok(())
     }
 
+    /// Ask the coordinator what it observes this node's reflexive to be, and
+    /// return immediately: the `BindResponse` comes back through
+    /// [`Self::recv_socket_event`] like any other coordinator datagram. The
+    /// send-only twin of [`Self::discover_reflexive`] (as [`Self::send_lookup`]
+    /// is of [`Self::lookup`]), for a caller whose receive side belongs to a
+    /// single dispatching pump — the standing re-probe that notices a NAT
+    /// rebind is exactly that shape.
+    pub async fn send_bind_request(&self) -> std::io::Result<()> {
+        self.sock
+            .send_to(
+                &self.authed(Msg::BindRequest { from: self.key }),
+                self.coord,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Ask the coordinator to resolve `peer`'s reflexive address via the real
     /// Lookup/LookupResponse rendezvous path (never the peer's socket
     /// directly).

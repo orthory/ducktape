@@ -231,6 +231,47 @@ pub fn nat_rebind_readvertises(backend: Backend) {
     net.finish();
 }
 
+/// The same rebind, LIVE: the endpoint-less member's mapping moves while it
+/// keeps running — no restart, no lost state, so nothing in the protocol
+/// would ever look again. The host's own observation
+/// (`Event::ReflexiveChanged`) is the only notice, and it makes the member
+/// re-sign its record within the epoch: each peer runs the post-lock
+/// re-advertisement path, rendezvouses it by identity again, and re-points
+/// the tunnel at the NEW mapping in place. The member never adopts anything
+/// — its view is the one it verified.
+pub fn nat_rebind_live_readvertises(backend: Backend) {
+    let mut net = nated_mesh("nat_rebind_live_readvertises", backend);
+    net.retarget_all(1, &members(3), &[], 1);
+    net.run();
+    net.nudges(2);
+    net.run();
+    assert_converged(&net, &members(3), 1, 2);
+
+    // the coordinator now answers with n2's new mapping — which is exactly
+    // what n2's own host observed to fire the event below.
+    for resolver in [0, 2] {
+        net.resolve_answer(
+            resolver,
+            1,
+            Some(Answer::ok(Resolution::Punched(addr(20, 40021)))),
+        );
+        net.rendezvous_answer(resolver, 1, Some(Answer::ok(addr(20, 40021))));
+    }
+    net.reflexive_changed(1, addr(20, 40021));
+    net.run();
+    net.nudges(2);
+    net.run();
+
+    assert!(readvertised(&net, 0, 1) && readvertised(&net, 2, 1));
+    assert!(
+        !net.saw(1, |e| matches!(e, ReachabilityEvent::MeshAdopted { .. })),
+        "a live rebind re-signs inside the epoch this node itself verified"
+    );
+    assert_eq!(applies(&net, 1), 1, "the rebound member applied once");
+    assert_no_peer_failure(&net, &members(3));
+    net.finish();
+}
+
 // --------------------------------------------------------------- 5. cutover
 
 /// A cutover over the SAME member set reconfigures the live interface in
