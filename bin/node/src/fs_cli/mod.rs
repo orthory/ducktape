@@ -131,6 +131,10 @@ pub(crate) struct CheckoutArgs {
 pub(crate) struct StatusArgs {
     /// the checkout directory (default: the current directory)
     pub dir: Option<String>,
+    /// report only changes at or under this path (repeatable). a path is
+    /// relative to the checkout, or an absolute duckfs path
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -140,6 +144,15 @@ pub(crate) struct CommitArgs {
     /// the commit message
     #[arg(long, value_name = "MESSAGE")]
     pub message: String,
+    /// commit only the changes at or under this path (repeatable) — the way a
+    /// tree past MAX_CHANGES_PER_COMMIT is committed, a subtree at a time. a
+    /// path is relative to the checkout, or an absolute duckfs path.
+    ///
+    /// a FLAG, not a positional: `commit` already takes the checkout dir
+    /// positionally, and `ducktape fs commit src/` reading as "the checkout is
+    /// src/" is the kind of ambiguity that eats a commit
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
     /// fail on a conflict instead of auto-rebasing onto the current head
     #[arg(long)]
     pub no_rebase: bool,
@@ -157,10 +170,26 @@ pub(crate) struct PinArgs {
     pub addr: NodeAddr,
 }
 
+/// `main` installs a subscriber only for `node run`, so a one-shot verb would
+/// drop the engine's events on the floor — and the one that matters most (the
+/// walk skipping a fifo it must never open) would be invisible exactly where a
+/// user is watching. one stderr sink at `warn`, `RUST_LOG` overrides it, and
+/// stdout stays the program output `cat`/`ls` write.
+fn install_log_sink() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .without_time()
+        .try_init();
+}
+
 /// dispatch a parsed verb and map its `CliError` to the process exit code. an
 /// EMPTY error message prints nothing — a dirty `status` and a commit conflict
 /// each wrote their own output and only carry the exit code here.
 pub(crate) fn run(cmd: FsCmd) -> u8 {
+    install_log_sink();
     let outcome = match cmd {
         FsCmd::Ls(a) => read_cmds::ls(a),
         FsCmd::Cat(a) => read_cmds::cat(a),

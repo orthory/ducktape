@@ -46,6 +46,9 @@ pub enum CommitError {
     Index(#[from] IndexError),
     #[error("duckfs: nothing to commit (the working copy is clean)")]
     Nothing,
+    /// the working copy is dirty but the pathspec selected none of it.
+    #[error("duckfs: nothing to commit under the given path(s) (the changes are elsewhere)")]
+    NothingSelected,
     /// an overlapping (or unrebasable) conflict — no silent merge. carries the
     /// structured report the CLI/RPC surface. boxed to keep the common `Ok` /
     /// small-`Err` `Result` cheap (clippy `result_large_err`).
@@ -73,14 +76,21 @@ impl From<ApiError> for CommitError {
 /// commit knobs. `auto_rebase` (the CLI default) rebases disjoint upstream work
 /// before reporting a conflict; the CLI's `--no-rebase` turns it off, so the
 /// FIRST CAS conflict surfaces as a report instead of silently rebasing.
+/// `paths` is the pathspec (`--path`): the commit carries only the changes at or
+/// under those paths, and every other change stays dirty in the index for the
+/// next one.
 #[derive(Debug, Clone)]
 pub struct CommitOptions {
     pub auto_rebase: bool,
+    pub paths: Vec<String>,
 }
 
 impl Default for CommitOptions {
     fn default() -> Self {
-        CommitOptions { auto_rebase: true }
+        CommitOptions {
+            auto_rebase: true,
+            paths: Vec::new(),
+        }
     }
 }
 
@@ -99,11 +109,16 @@ pub fn commit_with(
     opts: &CommitOptions,
 ) -> Result<CommitSummary, CommitError> {
     let index = Index::load(dir)?;
-    let st = status(dir).map_err(|e| CommitError::Io(e.to_string()))?;
-    if st.clean {
+    let dirty = status(dir).map_err(|e| CommitError::Io(e.to_string()))?;
+    if dirty.clean {
         return Err(CommitError::Nothing);
     }
-    let planned = plan(&st, dir, &index.prefix)?;
+    // the pathspec picks what THIS commit carries; the rest stays dirty.
+    let selected = dirty.select(&opts.paths, &index.prefix);
+    if selected.clean {
+        return Err(CommitError::NothingSelected);
+    }
+    let planned = plan(&selected, dir, &index.prefix)?;
 
     // stage the chunks the cluster lacks; a chunk that expires between here and
     // the submit is covered by submit's re-stage-and-retry.
@@ -117,7 +132,7 @@ pub fn commit_with(
         &change_paths(&planned.changes),
         &index.prefix,
     )?;
-    rebuild_index(&index, &st, dir, &snapshot)?;
+    rebuild_index(&index, &dirty, &selected, dir, &snapshot)?;
     Ok(CommitSummary {
         snapshot,
         height: receipt.height,
@@ -371,21 +386,49 @@ fn resolve_snapshot(
     }
 }
 
-/// rewrite the index after a successful commit: the working copy IS the new base.
-/// unchanged files keep their recorded object id (no re-hash of a big untouched
-/// file); changed/new files and every symlink are recomputed; mtimes are
-/// refreshed from a fresh scan, and the index is saved last so status reads clean.
-fn rebuild_index(old: &Index, st: &Status, dir: &Path, snapshot: &str) -> Result<(), CommitError> {
+/// rewrite the index after a successful commit: the committed part of the
+/// working copy IS the new base. unchanged files keep their recorded object id
+/// (no re-hash of a big untouched file); committed files and every symlink are
+/// recomputed; mtimes are refreshed from a fresh scan, and the index is saved
+/// last so status reads clean.
+///
+/// `dirty` is the whole working-copy delta, `committed` the part the pathspec
+/// selected. a change in the first and not the second keeps its OLD record
+/// verbatim — recording it against disk would tell the next `status` that a
+/// change nobody committed is already upstream, silently losing it.
+fn rebuild_index(
+    old: &Index,
+    dirty: &Status,
+    committed: &Status,
+    dir: &Path,
+    snapshot: &str,
+) -> Result<(), CommitError> {
     let scanned = scan(dir, &old.prefix).map_err(|e| CommitError::Io(e.to_string()))?;
-    let changed: BTreeSet<&str> = st
+    let changed: BTreeSet<&str> = committed
         .added
         .iter()
-        .chain(st.modified.iter())
+        .chain(committed.modified.iter())
         .map(|e| e.path.as_str())
+        .collect();
+    let deferred: BTreeSet<&str> = dirty
+        .added
+        .iter()
+        .chain(dirty.modified.iter())
+        .map(|e| e.path.as_str())
+        .filter(|path| !changed.contains(path))
         .collect();
 
     let mut index = Index::new(&old.prefix, old.node.clone(), Some(snapshot.to_string()));
     for entry in &scanned {
+        // a change this commit did not carry: keep the base record so the next
+        // status still reports it (a deferred ADDITION has none — leaving it out
+        // is exactly what keeps it "added").
+        if deferred.contains(entry.path.as_str()) {
+            if let Some(recorded) = old.entries.get(&entry.path) {
+                index.entries.insert(entry.path.clone(), recorded.clone());
+            }
+            continue;
+        }
         match entry.kind {
             ScanKind::File => {
                 // unchanged file → reuse the recorded object + meta (its bytes did
@@ -449,6 +492,20 @@ fn rebuild_index(old: &Index, st: &Status, dir: &Path, snapshot: &str) -> Result
             }
         }
     }
+
+    // a DELETION the pathspec left out: the scan cannot carry it (the path is
+    // gone from disk), so re-record it here or the next status would see the
+    // deletion as already committed.
+    let committed_removals: BTreeSet<&str> = committed.removed.iter().map(String::as_str).collect();
+    for path in &dirty.removed {
+        if committed_removals.contains(path.as_str()) {
+            continue;
+        }
+        if let Some(recorded) = old.entries.get(path) {
+            index.entries.insert(path.clone(), recorded.clone());
+        }
+    }
+
     index.save(dir)?;
     Ok(())
 }
@@ -569,7 +626,10 @@ mod tests {
         // the FIRST committer (changed /shared/x => snap_a) must resolve snap_a,
         // NOT the newest-first snap_b that height alone would pick.
         let got = resolve_snapshot(&api, 5, &paths(&["/shared/x"]), "/shared").unwrap();
-        assert_eq!(got, SNAP_A, "resolve the commit whose diff matches our paths");
+        assert_eq!(
+            got, SNAP_A,
+            "resolve the commit whose diff matches our paths"
+        );
         // the SECOND committer (changed /shared/y => snap_b) resolves snap_b.
         let got = resolve_snapshot(&api, 5, &paths(&["/shared/y"]), "/shared").unwrap();
         assert_eq!(got, SNAP_B);
