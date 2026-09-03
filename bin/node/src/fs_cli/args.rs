@@ -96,6 +96,38 @@ mod tests {
         assert_eq!(a.message, "m");
     }
 
+    /// `--path` is repeatable and does not collide with the `[dir]` positional —
+    /// the pathspec the `MAX_CHANGES_PER_COMMIT` refusal tells the user to run.
+    #[test]
+    fn commit_takes_a_repeatable_pathspec() {
+        let FsCmd::Commit(a) = parse(&[
+            "commit",
+            "wt",
+            "--message",
+            "m",
+            "--path",
+            "src",
+            "--path",
+            "docs/x.md",
+        ])
+        .unwrap() else {
+            panic!("expected commit");
+        };
+        assert_eq!(a.dir.as_deref(), Some("wt"));
+        assert_eq!(a.paths, vec!["src".to_string(), "docs/x.md".to_string()]);
+    }
+
+    /// `status` takes the same pathspec, so a user can see what it selects
+    /// before committing it.
+    #[test]
+    fn status_takes_the_same_pathspec() {
+        let FsCmd::Status(a) = parse(&["status", "--path", "src"]).unwrap() else {
+            panic!("expected status");
+        };
+        assert!(a.dir.is_none());
+        assert_eq!(a.paths, vec!["src".to_string()]);
+    }
+
     /// `-n` is the short alias for `--network` and does not eat the positional.
     #[test]
     fn dash_n_maps_to_network_and_leaves_path() {
