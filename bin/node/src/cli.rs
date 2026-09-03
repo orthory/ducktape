@@ -276,6 +276,15 @@ fn peer_line(
     if let Some(role) = &peer.role {
         line.push_str(&format!(" role={role}"));
     }
+    // always rendered, `unknown` included: a column that vanished when the
+    // stamp was missing would read as "same build as ours", which is exactly
+    // the silence the skew diagnostic exists to break.
+    line.push_str(&format!(
+        " build={}",
+        peer.build
+            .as_deref()
+            .unwrap_or(noded::services::UNKNOWN_BUILD)
+    ));
     match peer.connected_since_ms {
         Some(since) => {
             let for_secs = second.sampled_at_ms.saturating_sub(since) / 1000;
@@ -2063,6 +2072,7 @@ mod tests {
             connected: true,
             connected_since_ms: Some(1_000),
             role: Some("validator".into()),
+            build: Some("test-build".into()),
             msgs_sent: sent,
             msgs_received: 0,
             statesync: Some(noded::peers::StatesyncServeView {
@@ -2092,7 +2102,7 @@ mod tests {
         assert_eq!(
             with_baseline,
             format!(
-                "peer={} role=validator connected=11s msgs_tx=150 msgs_rx=0 \
+                "peer={} role=validator build=test-build connected=11s msgs_tx=150 msgs_rx=0 \
                  tx/s=25.0 rx/s=0.0 sync_bytes=3000 sync_B/s=1000 sync_height=230 \
                  sync_boundary=230 sync_idle=4s sync_last=tip_coords",
                 "ab".repeat(32)
@@ -2104,6 +2114,15 @@ mod tests {
         assert!(
             !without_baseline.contains("sync_B/s="),
             "{without_baseline}"
+        );
+
+        // a peer that never named a build says so — the column never goes
+        // missing, because an absent column reads as agreement.
+        let mut unstamped = second.peers[0].clone();
+        unstamped.build = None;
+        assert!(
+            peer_line(&unstamped, None, &first, &second).contains("build=unknown"),
+            "an unreported stamp renders as unknown"
         );
     }
 

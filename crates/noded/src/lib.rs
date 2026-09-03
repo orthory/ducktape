@@ -868,7 +868,8 @@ async fn peers(State(handle): State<NodeHandle>) -> Response {
         standing.height,
         standing.epoch,
     )
-    .with_roles(&standing.validators, &standing.residents);
+    .with_roles(&standing.validators, &standing.residents)
+    .with_builds(&standing.builds);
     Json(view).into_response()
 }
 

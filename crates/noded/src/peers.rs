@@ -28,6 +28,13 @@
 //! `/v1/status` round-trip. these are the sampler's coordinates, not the
 //! peers': the mesh gossips no per-peer head, so a peer-reported height only
 //! ever appears via the statesync serve fields above.
+//!
+//! two fields are stamped ON by the lane that owns the sample rather than
+//! parsed out of the exposition, because the exposition carries neither:
+//! `role` (the committed valset standing — [`PeersView::with_roles`]) and
+//! `build` (the stamp a peer reported about ITSELF on the statesync detection
+//! lane — [`PeersView::with_builds`]). both are absent where the lane knows
+//! nothing, and absent means UNKNOWN.
 
 use std::collections::BTreeMap;
 
@@ -63,6 +70,15 @@ pub struct PeerView {
     /// the answering lane knows it; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// the peer's BUILD STAMP as the peer itself reported it — the same
+    /// string it renders in `/v1/status .version`. absent when the peer never
+    /// told us (nothing gossips a stamp; only the statesync detection lane
+    /// carries one, so this is set for peers this node polls) or when the
+    /// peer could not identify its own build. absent means UNKNOWN, never
+    /// "same as ours": nothing on this surface refuses, disconnects or gates
+    /// on a stamp, and an unknown stamp is not a mismatch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     /// cumulative mesh messages sent to the peer, all channels.
     pub msgs_sent: u64,
     /// cumulative mesh messages received from the peer, all channels.
@@ -115,6 +131,17 @@ impl PeersView {
                 None
             };
             peer.role = standing.map(str::to_string);
+        }
+        self
+    }
+
+    /// stamp learned build identities onto the sampled peers: `builds` maps a
+    /// peer's key hex — the same hex [`PeersView::with_roles`] keys on — to
+    /// the stamp that peer reported about itself. a peer with no entry keeps
+    /// `None`, which reads as unknown.
+    pub fn with_builds(mut self, builds: &BTreeMap<String, String>) -> Self {
+        for peer in &mut self.peers {
+            peer.build = builds.get(&peer.peer).cloned();
         }
         self
     }
@@ -176,6 +203,7 @@ impl PeerAccum {
             connected: self.connected_since_ms.is_some(),
             connected_since_ms: self.connected_since_ms,
             role: None,
+            build: None,
             msgs_sent: self.msgs_sent,
             msgs_received: self.msgs_received,
             statesync,
@@ -281,6 +309,7 @@ ducktape_statesync_serve_last_request{peer="e653",kind="tip_coords"} 1
                 connected: true,
                 connected_since_ms: Some(1784737525068),
                 role: None,
+                build: None,
                 msgs_sent: 5091,
                 msgs_received: 258,
                 statesync: Some(StatesyncServeView {
@@ -322,6 +351,23 @@ ducktape_statesync_serve_last_request{peer="e653",kind="tip_coords"} 1
         assert_eq!(view.peers.len(), 1);
         assert_eq!(view.peers[0].peer, "bb");
         assert_eq!(view.peers[0].statesync, None);
+    }
+
+    /// a learned stamp lands on its own peer and nowhere else: a peer nobody
+    /// polled keeps `None`, which the surface reads as unknown rather than
+    /// "agrees with us".
+    #[test]
+    fn only_a_peer_that_reported_a_stamp_carries_one() {
+        let view = peers_from_exposition(
+            "network_tracker_directory_connected{peer=\"aa\"} 1\n\
+             network_tracker_directory_connected{peer=\"bb\"} 2\n",
+            0,
+            0,
+            None,
+        )
+        .with_builds(&BTreeMap::from([("aa".to_string(), "abc1234".to_string())]));
+        assert_eq!(view.peers[0].build.as_deref(), Some("abc1234"));
+        assert_eq!(view.peers[1].build, None);
     }
 
     /// the json shape is snake_case with absent options omitted (`epoch`

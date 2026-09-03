@@ -263,6 +263,7 @@ mod tests {
             has_floor: true,
             generation: 0,
             mesh_window: Vec::new(),
+            build: None,
         });
         monitor.record("aa", SyncRequest::TipCoords.kind_name(), &coords, 256);
 
@@ -288,6 +289,7 @@ mod tests {
             has_floor: true,
             generation: 0,
             mesh_window: Vec::new(),
+            build: None,
         });
         monitor.record("bb", SyncRequest::TipCoords.kind_name(), &coords, 128);
         let reports = monitor.snapshot();

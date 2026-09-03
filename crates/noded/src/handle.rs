@@ -61,6 +61,11 @@ pub struct PeersStanding {
     pub residents: std::collections::BTreeSet<String>,
     pub height: u64,
     pub epoch: Option<u64>,
+    /// peer key hex -> the build stamp that peer reported about ITSELF, for
+    /// the lanes that have heard one. empty on a lane that has heard none —
+    /// the mesh gossips no stamp, so this is only ever what a lane learned
+    /// from a peer it polled ([`crate::peers::PeerView::build`]).
+    pub builds: std::collections::BTreeMap<String, String>,
 }
 
 /// the observability snapshot cell: the actor that owns the host PUBLISHES

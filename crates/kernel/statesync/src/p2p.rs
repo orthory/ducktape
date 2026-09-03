@@ -34,8 +34,8 @@ use commonware_runtime::{Clock, IoBuf, Spawner};
 use futures::channel::oneshot;
 
 use crate::{
-    SyncClient, SyncError, SyncRequest, SyncResponse, decode_response, decode_rpc, encode_request,
-    encode_rpc,
+    SyncClient, SyncError, SyncRequest, SyncResponse, TipCoords, decode_response, decode_rpc,
+    encode_request, encode_rpc,
 };
 
 /// the reaper's sweep interval. a request survives at most two sweeps, so the
@@ -310,8 +310,30 @@ where
 {
     /// The candidate selected for the next request. Operational surfaces use
     /// this after a successful request so source rotation stays visible.
+    ///
+    /// NEVER attribute an answer to it: the cursor is an `Arc` shared with
+    /// every clone of this client, and any lane holding a clone (the forge
+    /// pack sweeper's forever loop, a blob fetch) rotates it the moment its
+    /// own request fails — so a read taken after an await can name a peer
+    /// that answered nothing. A caller that puts a peer's NAME on what the
+    /// answer said must take the name from its own request
+    /// ([`P2pSyncClient::fetch_tip_coords`]).
     pub fn current_source(&self) -> S::PublicKey {
         self.sources.current().1
+    }
+
+    /// the tip's coordinates AND the peer this client asked for them — the
+    /// detection lane's fetch, for a caller that ATTRIBUTES the answer (a
+    /// build stamp on the peers surface, a named skew) rather than only
+    /// consuming it. see [`P2pSyncClient::current_source`] for why the
+    /// attribution rides the request instead.
+    pub async fn fetch_tip_coords(&self) -> Result<(TipCoords, S::PublicKey), SyncError> {
+        let (response, from) = self.send_request(SyncRequest::TipCoords).await?;
+        match response {
+            SyncResponse::TipCoords(coords) => Ok((coords, from)),
+            SyncResponse::Error(e) => Err(SyncError::Server(e)),
+            other => Err(SyncError::UnexpectedResponse(other.kind_name())),
+        }
     }
 
     /// advance the serving cursor one candidate. the transport rotates on
@@ -324,6 +346,60 @@ where
     }
 }
 
+impl<S> P2pSyncClient<S>
+where
+    S: Sender,
+{
+    /// one request/response round trip, reporting the peer it was ADDRESSED
+    /// to beside the answer. the whole transport body lives here;
+    /// [`SyncClient::request`] is this with the peer dropped.
+    async fn send_request(
+        &self,
+        req: SyncRequest,
+    ) -> Result<(SyncResponse, S::PublicKey), SyncError> {
+        let mut sender = self.sender.clone();
+        let sources = &self.sources;
+        let shared = &self.shared;
+        let (at, server) = sources.current();
+        let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = shared.pending.lock().expect("pending poisoned");
+            pending.insert(
+                id,
+                PendingEntry {
+                    reply: tx,
+                    filed_at_tick: shared.tick.load(Ordering::Relaxed),
+                },
+            );
+        }
+        let frame = encode_rpc(&self.requester, &self.proof, id, &encode_request(&req));
+        let attempted = sender.send(Recipients::One(server.clone()), IoBuf::from(frame), false);
+        if attempted.is_empty() {
+            // the source is offline/unreachable right now — fail fast
+            // instead of waiting out the reaper, and rotate.
+            shared.pending.lock().expect("pending poisoned").remove(&id);
+            sources.advance_past(at);
+            return Err(SyncError::Transport(
+                "sync source unreachable (send attempted no recipients)".into(),
+            ));
+        }
+        // resolves when the response routes back — or errs when the reaper
+        // drops the slot (dropped send / dead server), rotating so the
+        // caller's retry lands on the next candidate.
+        let bytes = match rx.await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                sources.advance_past(at);
+                return Err(SyncError::Transport(format!(
+                    "request {id} timed out (send dropped by the mesh or source dead)"
+                )));
+            }
+        };
+        Ok((decode_response(&bytes)?, server))
+    }
+}
+
 impl<S> SyncClient for P2pSyncClient<S>
 where
     S: Sender,
@@ -332,50 +408,10 @@ where
         &self,
         req: SyncRequest,
     ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
-        let mut sender = self.sender.clone();
-        let sources = Arc::clone(&self.sources);
-        let shared = Arc::clone(&self.shared);
-        let requester = self.requester;
-        let proof = self.proof;
-        async move {
-            let (at, server) = sources.current();
-            let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut pending = shared.pending.lock().expect("pending poisoned");
-                pending.insert(
-                    id,
-                    PendingEntry {
-                        reply: tx,
-                        filed_at_tick: shared.tick.load(Ordering::Relaxed),
-                    },
-                );
-            }
-            let frame = encode_rpc(&requester, &proof, id, &encode_request(&req));
-            let attempted = sender.send(Recipients::One(server), IoBuf::from(frame), false);
-            if attempted.is_empty() {
-                // the source is offline/unreachable right now — fail fast
-                // instead of waiting out the reaper, and rotate.
-                shared.pending.lock().expect("pending poisoned").remove(&id);
-                sources.advance_past(at);
-                return Err(SyncError::Transport(
-                    "sync source unreachable (send attempted no recipients)".into(),
-                ));
-            }
-            // resolves when the response routes back — or errs when the reaper
-            // drops the slot (dropped send / dead server), rotating so the
-            // caller's retry lands on the next candidate.
-            let bytes = match rx.await {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    sources.advance_past(at);
-                    return Err(SyncError::Transport(format!(
-                        "request {id} timed out (send dropped by the mesh or source dead)"
-                    )));
-                }
-            };
-            Ok(decode_response(&bytes)?)
-        }
+        // owned so the future stays `'static`, exactly as it was when this
+        // body lived here.
+        let this = self.clone();
+        async move { this.send_request(req).await.map(|(response, _)| response) }
     }
 }
 

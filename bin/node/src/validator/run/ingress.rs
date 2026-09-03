@@ -58,6 +58,11 @@ impl ValidatorRuntime<'_> {
                 residents: hex_set(read_valset_residents(self.node.host()).await),
                 height: self.node.finalized().map(|f| f.height).unwrap_or(0),
                 epoch: Some(self.orchestrator.epoch()),
+                // a validator SERVES the detection lane and polls nobody, so
+                // it hears no peer's build stamp and reports every peer's as
+                // unknown. the poller — a parked or folding resident — is the
+                // side that learns one, and the side that warns.
+                builds: Default::default(),
             });
             self.next_ops_refresh = self.context.current() + OPS_REFRESH_INTERVAL;
         }

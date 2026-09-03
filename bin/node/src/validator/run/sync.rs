@@ -205,6 +205,13 @@ impl ValidatorRuntime<'_> {
                                 .is_some_and(|fc| fc.height == f.height),
                             generation,
                             mesh_window,
+                            // the detection lane's only DIAGNOSTIC: this
+                            // node's build stamp, so a poller can name a
+                            // skew instead of watching roots drift in
+                            // silence. `None` for a build that cannot
+                            // identify itself — a silence, not a claim —
+                            // and nothing on either side gates on it.
+                            build: noded::services::build_identity().map(str::to_string),
                         })
                     }
                 };
