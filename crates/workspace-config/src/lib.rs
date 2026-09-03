@@ -87,6 +87,10 @@ pub fn modules_dir() -> Result<PathBuf, String> {
 /// cheap, large enough that snapshotting the in-memory cohort is amortized.
 pub const DEFAULT_CHECKPOINT_BLOCKS: u64 = 32;
 
+/// default idle block cadence, in milliseconds: one block a second. every
+/// consensus timer is a fixed multiple of it (`consensus::Cadence`).
+pub const DEFAULT_BLOCK_TIME_MS: u64 = 1_000;
+
 // hex codecs for keys, roots, and pasted blobs — the shared home is
 // duckfs-core (`to_hex`/`unhex`); these re-exports keep the long-standing
 // `config::hex_bytes`/`config::unhex` call sites working unchanged.
@@ -1262,7 +1266,7 @@ mod tests {
              gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
              wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
              wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
-             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
+             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\nblock_time_ms = 1000\n"
         );
         std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
         dir

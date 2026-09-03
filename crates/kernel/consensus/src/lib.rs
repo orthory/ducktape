@@ -456,24 +456,63 @@ impl ConsensusHandle {
 /// stored. generic over the public key `P` so `Context<Digest, P>` lines up with
 /// whatever scheme the engine runs.
 /// the IDLE block cadence: the target interval between finalized blocks while
-/// nothing is happening. an idle chain ticks exactly one nop block per
-/// `BLOCK_TIME`; the node's heartbeat AND this automaton's idle view hold both
-/// pace off this one value, so an idle chain never outpaces it. a BUSY chain
-/// has NO interval knob at all: the node flushes pending ops the moment
-/// nothing of its own is in flight, so the block rate is set by the network's
-/// own agreement speed — ops arriving during one block's consensus round
-/// aggregate into the next block, which is what keeps the 1-tx-1-block regime
-/// dead without a timer. raising it slows the idle height tick 1:1.
-pub const BLOCK_TIME: std::time::Duration = std::time::Duration::from_secs(1);
-/// how long a leader holds an otherwise-idle view open before declining —
-/// keeping a solo validator (no quorum to wait on) from spinning
-/// nullifications, and the height they stamp, at CPU speed. equal to
-/// [`BLOCK_TIME`], and it MUST be >= the idle beat interval so the beat lands
-/// inside the window and the view advances by a single finalized block per
-/// beat, never a nullify + a finalize. the hold is EVENT-DRIVEN: the pending
-/// queue's enqueue signal wakes it, so a fresh submission (or the beat's nop)
-/// is proposed the instant it lands — this deadline only paces the DECLINE.
-const IDLE_BLOCK_TIME: std::time::Duration = BLOCK_TIME;
+/// nothing is happening, and the unit every view timer is a multiple of.
+///
+/// an idle chain ticks exactly one nop block per `block_time`; the node's
+/// heartbeat AND this automaton's idle view hold both pace off this one value,
+/// so an idle chain never outpaces it. a BUSY chain has NO interval knob at
+/// all: the node flushes pending ops the moment nothing of its own is in
+/// flight, so the block rate is set by the network's own agreement speed — ops
+/// arriving during one block's consensus round aggregate into the next block,
+/// which is what keeps the 1-tx-1-block regime dead without a timer. raising it
+/// slows the idle height tick 1:1.
+///
+/// the cadence is per-node policy (node.toml `block_time_ms`), not part of
+/// agreement: every timer below is a fixed multiple of the beat, so a node on
+/// a faster beat keeps the one relation that matters — the node's heartbeat
+/// never outpaces the hold it lands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cadence {
+    pub block_time: std::time::Duration,
+}
+
+impl Cadence {
+    pub const fn from_millis(block_time_ms: u64) -> Self {
+        Self {
+            block_time: std::time::Duration::from_millis(block_time_ms),
+        }
+    }
+
+    /// how long a leader holds an otherwise-idle view open before declining —
+    /// keeping a solo validator (no quorum to wait on) from spinning
+    /// nullifications, and the height they stamp, at CPU speed. equal to the
+    /// beat, and it MUST be >= the idle beat interval so the beat lands inside
+    /// the window and the view advances by a single finalized block per beat,
+    /// never a nullify + a finalize. the hold is EVENT-DRIVEN: the pending
+    /// queue's enqueue signal wakes it, so a fresh submission (or the beat's
+    /// nop) is proposed the instant it lands — this deadline only paces the
+    /// DECLINE.
+    pub fn idle_hold(self) -> std::time::Duration {
+        self.block_time
+    }
+
+    /// how long a view waits on its leader's proposal before nullifying: one
+    /// beat. an idle leader declines by then on its own (`idle_hold`), so this
+    /// bounds a leader that is absent or slow, never one that is merely idle.
+    pub fn leader_timeout(self) -> std::time::Duration {
+        self.block_time
+    }
+
+    /// how long a view waits on certification of a proposal it holds.
+    pub fn certification_timeout(self) -> std::time::Duration {
+        self.block_time * 2
+    }
+
+    /// how often a view re-broadcasts its timeout while it waits.
+    pub fn timeout_retry(self) -> std::time::Duration {
+        self.block_time * 10
+    }
+}
 
 /// this node's pending-proposal queue plus its enqueue signal, one shared
 /// allocation: [`ConsensusHandle::submit`] pushes (and signals), the
@@ -526,10 +565,11 @@ pub struct ConsensusAutomaton<P, C> {
     /// the SAME per-process store the paired handle `put`s into and the reporter
     /// `get`s from — `verify` gates a vote on holding the proposed payload here.
     store: ContentStore,
-    /// runtime clock, used only to pace idle proposals (see [`IDLE_BLOCK_TIME`]).
+    /// runtime clock, used only to pace idle proposals (see [`Cadence::idle_hold`]).
     /// `Arc`-wrapped so the automaton stays cheaply `Clone` (the engine clones
     /// it) WITHOUT demanding `C: Clone` — commonware's runtime `Context` is not.
     clock: Arc<C>,
+    cadence: Cadence,
     _marker: std::marker::PhantomData<fn() -> P>,
 }
 
@@ -541,17 +581,19 @@ impl<P, C> Clone for ConsensusAutomaton<P, C> {
             pending: Arc::clone(&self.pending),
             store: self.store.clone(),
             clock: Arc::clone(&self.clock),
+            cadence: self.cadence,
             _marker: std::marker::PhantomData,
         }
     }
 }
 
 impl<P, C> ConsensusAutomaton<P, C> {
-    pub fn new(store: ContentStore, clock: C) -> Self {
+    pub fn new(store: ContentStore, clock: C, cadence: Cadence) -> Self {
         Self {
             pending: Arc::new(PendingProposals::default()),
             store,
             clock: Arc::new(clock),
+            cadence,
             _marker: std::marker::PhantomData,
         }
     }
@@ -610,7 +652,7 @@ where
         // empty at the deadline → drop `tx` (the engine reads that as "can't
         // propose" and nullifies), pacing an idle solo chain to ~1 block per
         // block-time.
-        let deadline = self.clock.sleep(IDLE_BLOCK_TIME);
+        let deadline = self.clock.sleep(self.cadence.idle_hold());
         futures::pin_mut!(deadline);
         loop {
             // arm the enqueue signal BEFORE peeking: a push landing between
@@ -1460,6 +1502,7 @@ impl SimplexOrderer {
         genesis: Digest,
         floor: Option<Finalization<S, Digest>>,
         store: ContentStore,
+        cadence: Cadence,
         relay: R,
         payload_drain: Option<commonware_runtime::Handle<()>>,
         inbox: FinalizedInbox,
@@ -1514,6 +1557,7 @@ impl SimplexOrderer {
         let automaton = ConsensusAutomaton::<ed25519::PublicKey, _>::new(
             store.clone(),
             context.child("automaton"),
+            cadence,
         );
         let handle = automaton.handle(store.clone());
         let (mailbox, fetch_handle) = fetch.unzip();
@@ -1547,9 +1591,9 @@ impl SimplexOrderer {
                 Some(finalization) => Floor::Finalized(finalization),
                 None => Floor::Genesis(genesis),
             },
-            leader_timeout: Duration::from_secs(1),
-            certification_timeout: Duration::from_secs(2),
-            timeout_retry: Duration::from_secs(10),
+            leader_timeout: cadence.leader_timeout(),
+            certification_timeout: cadence.certification_timeout(),
+            timeout_retry: cadence.timeout_retry(),
             fetch_timeout: Duration::from_secs(1),
             activity_timeout: ViewDelta::new(10),
             skip_timeout: ViewDelta::new(5),
@@ -1588,6 +1632,7 @@ impl SimplexOrderer {
         epoch: commonware_consensus::types::Epoch,
         genesis: Digest,
         store: ContentStore,
+        cadence: Cadence,
         vote: (VS, VR),
         certificate: (CS, CR),
         resolver: (RS, RR),
@@ -1624,6 +1669,7 @@ impl SimplexOrderer {
             genesis,
             None,
             store,
+            cadence,
             relay,
             None,
             FinalizedInbox::new(),
@@ -1672,6 +1718,7 @@ impl SimplexOrderer {
         genesis: Digest,
         floor: Option<Finalization<S, Digest>>,
         store: ContentStore,
+        cadence: Cadence,
         vote: (VS, VR),
         certificate: (CS, CR),
         resolver: (RS, RR),
@@ -1754,6 +1801,7 @@ impl SimplexOrderer {
             genesis,
             floor,
             store,
+            cadence,
             relay,
             Some(drain_handle),
             inbox,
@@ -1782,6 +1830,7 @@ impl SimplexOrderer {
         genesis: Digest,
         floor: Option<Finalization<S, Digest>>,
         store: ContentStore,
+        cadence: Cadence,
         starve: bool,
     ) -> Self
     where
@@ -1818,6 +1867,7 @@ impl SimplexOrderer {
             genesis,
             floor,
             store,
+            cadence,
             vote,
             certificate,
             resolver,
@@ -2163,9 +2213,17 @@ impl node::Orderer for FollowerOrderer {
 mod tests {
     use super::*;
 
+    /// the beat the unit tests run their automaton at.
+    const CADENCE: Cadence = Cadence::from_millis(1_000);
+
     #[test]
-    fn default_block_time_is_one_second() {
-        assert_eq!(BLOCK_TIME, std::time::Duration::from_secs(1));
+    fn every_view_timer_is_a_fixed_multiple_of_the_beat() {
+        let cadence = Cadence::from_millis(250);
+        let beat = std::time::Duration::from_millis(250);
+        assert_eq!(cadence.idle_hold(), beat);
+        assert_eq!(cadence.leader_timeout(), beat);
+        assert_eq!(cadence.certification_timeout(), beat * 2);
+        assert_eq!(cadence.timeout_retry(), beat * 10);
     }
 
     #[test]
@@ -2471,6 +2529,7 @@ mod tests {
         let automaton = ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey, ()>::new(
             store.clone(),
             (),
+            CADENCE,
         );
         let handle = automaton.handle(store);
 
@@ -2508,6 +2567,7 @@ mod tests {
                 ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey, _>::new(
                     store.clone(),
                     context,
+                    CADENCE,
                 );
             automaton.enqueue(digest);
 
@@ -2554,6 +2614,7 @@ mod tests {
                 ConsensusAutomaton::<commonware_cryptography::ed25519::PublicKey, _>::new(
                     store.clone(),
                     context,
+                    CADENCE,
                 );
             let leader = PrivateKey::from_seed(0).public_key();
             let ctx = |payload| Context {

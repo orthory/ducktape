@@ -10,14 +10,13 @@ mod common;
 
 use std::time::Duration;
 
-use common::{NetworkShapeCluster, poll_until, serial};
+use common::NetworkShapeCluster;
 use valset::{ValsetQuery, ValsetReply};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 
 #[test]
 fn a_tokened_join_redeems_itself_into_a_full_node() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     cluster.init_founder("join-request");
@@ -41,7 +40,8 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
     // the redemption lands in consensus state: the friend holds RESIDENT
     // standing (a full node), while the quorum still seats only the founder.
     let expected = vec![common::unhex(&friend_key)];
-    poll_until(
+    cluster.await_committed(
+        0,
         "the redemption to grant resident standing",
         CONVERGE,
         || {
@@ -91,7 +91,6 @@ fn a_tokened_join_redeems_itself_into_a_full_node() {
 
 #[test]
 fn a_spent_invite_is_refused_loudly_on_both_ends() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     cluster.init_founder("spent-invite");
@@ -105,7 +104,8 @@ fn a_spent_invite_is_refused_loudly_on_both_ends() {
     cluster.spawn(1);
     cluster.wait_marker(0, "gate: redemption submitted for", Duration::from_secs(90));
     let expected = vec![common::unhex(&friend_key)];
-    poll_until(
+    cluster.await_committed(
+        0,
         "the redemption to grant resident standing",
         CONVERGE,
         || {

@@ -326,10 +326,9 @@ pub fn missing_tool(bin: &str) -> Option<String> {
 }
 
 /// poll `probe` every 300ms until it returns `Some`, or panic with `what` past
-/// `timeout`. the standard "submitted — now wait for it to finalize and become
-/// readable" shape for driving an EXTERNAL process's committed state over http.
-/// NOT for in-process synchronization — synchronize those on the system's own
-/// events (a channel message, a drained frame), never a coarse wall-clock poll.
+/// `timeout` — the coarse wait for a harness whose process offers no event to
+/// ride. The node cluster harness has one (the block feed behind
+/// `await_committed`) and never uses this; the daemon e2e still does.
 pub fn poll_until<T>(what: &str, timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + timeout;
     loop {

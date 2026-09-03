@@ -55,7 +55,7 @@ use std::time::Duration;
 use agent::{ACTION_CHAT_POST, AgentMsg, ResourceCaps};
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, Span};
-use common::{Cluster, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
 use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 
 const CONVERGE: Duration = Duration::from_secs(180);
@@ -291,7 +291,8 @@ fn find_message(
 /// the anchor seq of a just-posted mention — NEVER hardcoded: forge posts
 /// system lines into item channels on state changes, so seqs are discovered.
 fn seq_of(cluster: &Cluster, idx: usize, channel: &str, message_id: &str) -> u64 {
-    poll_until(
+    cluster.await_committed(
+        idx,
         &format!("mention {message_id} to finalize"),
         FINALIZE,
         || find_message(cluster, idx, channel, message_id).map(|(seq, _)| seq),
@@ -299,7 +300,7 @@ fn seq_of(cluster: &Cluster, idx: usize, channel: &str, message_id: &str) -> u64
 }
 
 fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) -> String {
-    poll_until("the agent reply to post", ROUND_TRIP, || {
+    cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
         find_message(cluster, idx, channel, &format!("agent/{run_id}")).map(|(_, text)| text)
     })
 }
@@ -450,7 +451,6 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     {
         return;
     }
-    let _serial = serial();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
     let provider = DogfoodProvider::stage(fixtures.path());
     let runs_root = fixtures.path().join("agent-runs");
@@ -483,7 +483,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     boot(&mut cluster);
 
     // node 1 is the tag's ONLY provider, so every lease lands there.
-    poll_until("the provider to announce", FINALIZE, || {
+    cluster.await_committed(0, "the provider to announce", FINALIZE, || {
         (providers(&cluster, 0, &provider.tag)? == vec![Cluster::identity(1)]).then_some(())
     });
 
@@ -502,7 +502,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
         &["push", "origin", "HEAD:dev"],
     );
     // committed on the EXECUTING node before any run pins it.
-    poll_until("the seed push to finalize on node 1", CONVERGE, || {
+    cluster.await_committed(1, "the seed push to finalize on node 1", CONVERGE, || {
         (branch_tip(&cluster, 1, "dev")? == dev_tip).then_some(())
     });
 
@@ -516,7 +516,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
             body: "mention the duck, get a PR".into(),
         }),
     );
-    let issue = poll_until("the issue to finalize", FINALIZE, || {
+    let issue = cluster.await_committed(0, "the issue to finalize", FINALIZE, || {
         tracker_item(&cluster, 0, 1)
     });
     assert_eq!(issue.summary.kind, forge::ItemKind::Issue);
@@ -553,7 +553,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
             }),
         );
         let channel = channel.to_string();
-        poll_until("the channel watch to commit", FINALIZE, || {
+        cluster.await_committed(0, "the channel watch to commit", FINALIZE, || {
             let reply = cluster.query(0, "runs", &runs::encode_query(&RunsQuery::Watches))?;
             match runs::decode_reply(&reply) {
                 Ok(RunsReply::Watches(w)) => {
@@ -579,24 +579,16 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
         "run 1 replies in the issue channel"
     );
 
-    let run1_oid = {
-        let deadline = std::time::Instant::now() + FINALIZE;
-        loop {
-            if let Some(oid) = branch_tip(&cluster, 0, WORK_BRANCH) {
-                break oid;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "branch {WORK_BRANCH} never born;\n{}",
-                cluster.all_log_tails(80)
-            );
-            std::thread::sleep(Duration::from_millis(300));
-        }
-    };
+    let run1_oid = cluster.await_committed(
+        0,
+        &format!("branch {WORK_BRANCH} to be born"),
+        FINALIZE,
+        || branch_tip(&cluster, 0, WORK_BRANCH),
+    );
     assert_ne!(run1_oid, dev_tip, "the run pushed a NEW commit");
 
     // the PR: opened by the sink, titled from verified bound issue metadata.
-    let pr_number = poll_until("the PR to open", FINALIZE, || {
+    let pr_number = cluster.await_committed(0, "the PR to open", FINALIZE, || {
         tracker_items(&cluster, 0)
             .iter()
             .find(|i| i.kind == forge::ItemKind::Pr)
@@ -614,7 +606,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     assert_eq!(pr_channel, format!("forge:{REPO}:{pr_number}"));
 
     // the delivered-runs ring carries the receipt: branch@commit + PR number.
-    let record = poll_until("run 1 in the delivered-runs ring", FINALIZE, || {
+    let record = cluster.await_committed(0, "run 1 in the delivered-runs ring", FINALIZE, || {
         run_record(&cluster, 0, &run_1)
     });
     assert_eq!(record.outcome, RunOutcome::Delivered);
@@ -640,7 +632,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
         "run 2 replies in the PR channel"
     );
 
-    let run2_oid = poll_until("the branch tip to advance", FINALIZE, || {
+    let run2_oid = cluster.await_committed(0, "the branch tip to advance", FINALIZE, || {
         branch_tip(&cluster, 0, WORK_BRANCH).filter(|tip| *tip != run1_oid)
     });
     // parent chain, proven from a node that executed nothing: run2 → run1 →
@@ -689,7 +681,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
         1,
         "the duplicate guard opened NO second PR"
     );
-    let record = poll_until("run 2 in the delivered-runs ring", FINALIZE, || {
+    let record = cluster.await_committed(0, "run 2 in the delivered-runs ring", FINALIZE, || {
         run_record(&cluster, 0, &run_2)
     });
     assert_eq!(record.outcome, RunOutcome::Delivered);

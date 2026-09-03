@@ -23,7 +23,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{NetworkShapeCluster, serial};
+use common::NetworkShapeCluster;
 
 /// standing + follow-arm pre-sync is several blocks of slack.
 const CONVERGE: Duration = Duration::from_secs(180);
@@ -33,7 +33,6 @@ const SETTLE: Duration = Duration::from_secs(20);
 
 #[test]
 fn a_parked_resident_tracks_the_window_and_never_churns_the_mesh() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
     // capture the resident's mesh layer: tracker rejections are
     // `commonware_p2p ... warn` lines.

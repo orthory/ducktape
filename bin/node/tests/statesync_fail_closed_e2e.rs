@@ -24,12 +24,11 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Cluster, poll_until};
+use common::Cluster;
 use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 #[test]
 fn a_non_standing_peer_is_refused_statesync() {
-    let _guard = common::serial();
     // node 0 is the sole validator; node 1 is a mesh PEER (in `peer_seeds`, so
     // the founder's descriptor mesh authorizes its transport) that is NOT in the
     // validator set and holds no resident grant — i.e. no committed standing.
@@ -48,7 +47,8 @@ fn a_non_standing_peer_is_refused_statesync() {
             title: "chain-state".into(),
         }),
     );
-    poll_until(
+    cluster.await_committed(
+        0,
         "the founder's write to finalize",
         Duration::from_secs(30),
         || {

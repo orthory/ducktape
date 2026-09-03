@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use common::{Cluster, poll_until, serial};
+use common::Cluster;
 use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
@@ -120,7 +120,6 @@ fn spawn_sentry(target: SocketAddr) -> (SocketAddr, Arc<AtomicU64>) {
 
 #[test]
 fn joiner_enters_through_a_sentry() {
-    let _serial = serial();
     // a network of ONE, fronted by a transparent TCP sentry. node 0 is mesh +
     // quorum all by itself; it advertises only the sentry, and its real listen
     // port is never handed to any peer.
@@ -203,24 +202,32 @@ fn joiner_enters_through_a_sentry() {
     // independent liveness.) an op submitted via the FOUNDER must become
     // readable via the FRIEND...
     cluster.submit(0, "tasks", &task_create("from-founder", "hello"));
-    let value = poll_until("founder's op to read on the friend", FINALIZE, || {
-        task_title(&cluster, joiner, "from-founder")
-    });
+    let value = cluster.await_committed(
+        joiner,
+        "founder's op to read on the friend",
+        FINALIZE,
+        || task_title(&cluster, joiner, "from-founder"),
+    );
     assert_eq!(value, "hello");
 
     // ...and an op submitted via the FRIEND must read on the founder.
     cluster.submit(joiner, "tasks", &task_create("from-friend", "hi back"));
-    let value = poll_until("friend's op to read on the founder", FINALIZE, || {
+    let value = cluster.await_committed(0, "friend's op to read on the founder", FINALIZE, || {
         task_title(&cluster, 0, "from-friend")
     });
     assert_eq!(value, "hi back");
 
     // no fork: identical status root-hashes once both sides quiesce (the founder
-    // stayed alive throughout — 2-of-2 quorum must not tear down mid-read).
-    std::thread::sleep(Duration::from_secs(2));
-    assert_eq!(
-        cluster.status(0)["root_hash"],
-        cluster.status(joiner)["root_hash"],
-        "founder and promoted friend disagree on state"
+    // stayed alive throughout — 2-of-2 quorum must not tear down mid-read). a
+    // real fork never reconciles, so it fails this wait's budget.
+    cluster.await_committed(
+        0,
+        "founder and promoted friend to agree on state",
+        FINALIZE,
+        || {
+            let founder = cluster.status(0)["root_hash"].clone();
+            let agreed = !founder.is_null() && founder == cluster.status(joiner)["root_hash"];
+            agreed.then_some(())
+        },
     );
 }

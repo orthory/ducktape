@@ -26,7 +26,7 @@ mod common;
 use std::time::Duration;
 
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, PostPolicy};
-use common::{Cluster, poll_until, serial};
+use common::Cluster;
 use governance::{GovAction, GovMsg, GovQuery, GovReply, ProposalStatus};
 use tasks::{TaskMsg, TaskQuery, TaskReply};
 
@@ -112,7 +112,6 @@ fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
 
 #[test]
 fn cluster_lifecycle() {
-    let _serial = serial();
     // mesh of 4 (node 3 is the future joiner), consensus subset of 3.
     let mut cluster = Cluster::new(&[0, 1, 2, 3], &[0, 1, 2]);
 
@@ -143,12 +142,17 @@ fn cluster_lifecycle() {
     // (the harness-documented pattern) — poll until every validator reports
     // the same status root-hash. a real fork never reconciles, so it fails
     // this poll's budget; sampling skew settles within a block or two.
-    poll_until("status root-hashes to agree across validators", FINALIZE, || {
-        let hashes: Vec<serde_json::Value> = (0..3)
-            .map(|i| cluster.status(i)["root_hash"].clone())
-            .collect();
-        (!hashes[0].is_null() && hashes[0] == hashes[1] && hashes[0] == hashes[2]).then_some(())
-    });
+    cluster.await_committed(
+        0,
+        "status root-hashes to agree across validators",
+        FINALIZE,
+        || {
+            let hashes: Vec<serde_json::Value> = (0..3)
+                .map(|i| cluster.status(i)["root_hash"].clone())
+                .collect();
+            (!hashes[0].is_null() && hashes[0] == hashes[1] && hashes[0] == hashes[2]).then_some(())
+        },
+    );
 
     // 4. ops actually applied: every node's own sampled hash moved off its
     // (agreed) genesis hash.
@@ -168,9 +172,10 @@ fn cluster_lifecycle() {
         }),
     );
     cluster.submit(0, "chat", &chat_post("general", "m1", "hello ducktape"));
-    let (text, author) = poll_until("chat post to finalize on node 1", FINALIZE, || {
-        read_message(&cluster, 1, "general", "m1")
-    });
+    let (text, author) =
+        cluster.await_committed(1, "chat post to finalize on node 1", FINALIZE, || {
+            read_message(&cluster, 1, "general", "m1")
+        });
     assert_eq!(text, "hello ducktape");
     // authorship is derived from the VERIFIED frame origin — node 0 signed it.
     assert_eq!(author, AuthorRef::User(Cluster::identity(0)));
@@ -189,7 +194,7 @@ fn cluster_lifecycle() {
             voting_period: 600_000, // consensus-time ms; far past test end
         }),
     );
-    poll_until("proposal to open on node 1", FINALIZE, || {
+    cluster.await_committed(1, "proposal to open on node 1", FINALIZE, || {
         proposal_status(&cluster, 1, "admit-node3").filter(|(s, _)| *s == ProposalStatus::Open)
     });
     let vote = governance::encode_msg(&GovMsg::Vote {
@@ -198,7 +203,7 @@ fn cluster_lifecycle() {
     });
     cluster.submit(0, "governance", &vote);
     cluster.submit(1, "governance", &vote);
-    poll_until("both ballots to land", FINALIZE, || {
+    cluster.await_committed(1, "both ballots to land", FINALIZE, || {
         proposal_status(&cluster, 1, "admit-node3").filter(|(_, votes)| *votes == 2)
     });
     cluster.submit(
@@ -208,7 +213,7 @@ fn cluster_lifecycle() {
             proposal_id: "admit-node3".into(),
         }),
     );
-    poll_until("proposal to settle as Passed", FINALIZE, || {
+    cluster.await_committed(0, "proposal to settle as Passed", FINALIZE, || {
         proposal_status(&cluster, 0, "admit-node3").filter(|(s, _)| *s == ProposalStatus::Passed)
     });
 
@@ -224,7 +229,7 @@ fn cluster_lifecycle() {
     // content store by design.
     let mut filler = 0u32;
     let mut last_filler = std::time::Instant::now() - Duration::from_secs(1);
-    poll_until("the admission cutover to cross", CONVERGE, || {
+    cluster.await_committed(0, "the admission cutover to cross", CONVERGE, || {
         if last_filler.elapsed() >= Duration::from_secs(1) {
             last_filler = std::time::Instant::now();
             filler += 1;
@@ -255,9 +260,10 @@ fn cluster_lifecycle() {
     // 8. the epoch-1 engines must still finalize: post through the respawned
     // net via node 0, read on node 2.
     cluster.submit(0, "chat", &chat_post("general", "m2", "epoch one lives"));
-    let (text, _) = poll_until("post-cutover chat post on node 2", FINALIZE, || {
-        read_message(&cluster, 2, "general", "m2")
-    });
+    let (text, _) =
+        cluster.await_committed(2, "post-cutover chat post on node 2", FINALIZE, || {
+            read_message(&cluster, 2, "general", "m2")
+        });
     assert_eq!(text, "epoch one lives");
 
     // 8b. app integration on the NETWORKED node: the validator serves the
@@ -279,9 +285,10 @@ fn cluster_lifecycle() {
         "held submit must reply with the finalized block: {block}"
     );
     for reader in [1, 2] {
-        let value = poll_until("app-surface op readable via rpc", FINALIZE, || {
-            task_title(&cluster, reader, "via-app-surface")
-        });
+        let value =
+            cluster.await_committed(reader, "app-surface op readable via rpc", FINALIZE, || {
+                task_title(&cluster, reader, "via-app-surface")
+            });
         assert_eq!(value, "held", "node {reader} read a wrong value");
     }
 
@@ -423,18 +430,18 @@ fn cluster_lifecycle() {
         "blob lane serves the committed payload bytes back"
     );
 
-    // 9. quiesce, then the boundary every joiner must rebuild: identical
-    // status root-hashes across validators — and the app surface reports the
-    // same hash as the rpc (one state, two wires). both node-2 reads happen
-    // AFTER the quiesce with nothing left in flight, so a mismatch means the
-    // two wires project different host state, not a straggling block.
-    std::thread::sleep(Duration::from_secs(2));
+    // 9. quiesce (every validator agreeing on its status root-hash), then the
+    // boundary every joiner must rebuild: the app surface reports the same
+    // hash as the rpc (one state, two wires). both node-2 reads happen AFTER
+    // the agreement with nothing left in flight, so a mismatch means the two
+    // wires project different host state, not a straggling block.
+    cluster.await_committed(0, "post-rpc status root-hashes to agree", FINALIZE, || {
+        let hashes: Vec<serde_json::Value> = (0..3)
+            .map(|i| cluster.status(i)["root_hash"].clone())
+            .collect();
+        (!hashes[0].is_null() && hashes[0] == hashes[1] && hashes[0] == hashes[2]).then_some(())
+    });
     let status0 = cluster.status(0);
-    let status1 = cluster.status(1);
-    assert_eq!(
-        status0["root_hash"], status1["root_hash"],
-        "post-rpc status root-hashes disagree"
-    );
     let (code, http_status) = cluster.http(2, "GET", "/v1/status", None);
     assert_eq!(code, 200, "app-surface status failed");
     let http_hash = http_status["root_hash"].as_str().unwrap_or_default();
@@ -528,7 +535,6 @@ fn cluster_lifecycle() {
 
 #[test]
 fn quorum_tolerates_one_fault() {
-    let _serial = serial();
     // 4 running validators: quorum(4) = 3, so ONE crash keeps liveness.
     let mut cluster = Cluster::new(&[0, 1, 2, 3], &[0, 1, 2, 3]);
     cluster.spawn(0);
@@ -551,7 +557,7 @@ fn quorum_tolerates_one_fault() {
         }),
     );
     for reader in [1, 2] {
-        let value = poll_until("post-fault op to finalize", CONVERGE, || {
+        let value = cluster.await_committed(reader, "post-fault op to finalize", CONVERGE, || {
             task_title(&cluster, reader, "after-fault")
         });
         assert_eq!(value, "alive", "node {reader} read a wrong value");
@@ -593,7 +599,6 @@ fn wireguard_configs_reserve_explicit_disjoint_invite_ports() {
 /// the real userspace backend on its own distinct UDP port.
 #[test]
 fn reachability_plane_converges_mesh_on_boot() {
-    let _serial = serial();
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
     cluster.spawn(0);

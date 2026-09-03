@@ -579,6 +579,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         net.invite_listen.as_deref(),
         net.primary_coordinator.as_deref(),
         net.wireguard_advertised.as_deref(),
+        net.block_time_ms,
     )?;
     // a FRESH workspace detects the platform runtime and writes the table (it
     // describes HOW runs are isolated, and grants nothing); an existing
@@ -1261,30 +1262,119 @@ fn read_proposal(addr: &str, id: &str) -> Result<Option<governance::ProposalView
 /// target's rules are.
 pub(super) const TALLY_SETTLE_TIMEOUT: &str = "timed out waiting for the tally to settle";
 
-/// poll a proposal until `pred` accepts its view, ~30s budget (ops finalize
-/// within a few pump ticks; the budget covers a mesh still forming quorum).
-/// `timed_out` is the whole failure sentence.
-fn poll_proposal(
-    addr: &str,
+/// the running node a ceremony drives. reads and writes go over its operator
+/// rpc; its http surface stages bytes and, over ws, announces every block
+/// wake — the moment committed state may have changed, and the only clock a
+/// ceremony waits on.
+pub(super) struct DrivenNode {
+    rpc: String,
+    http_base: String,
+}
+
+impl DrivenNode {
+    /// both surfaces of the node `resolved` describes; `verb` names the
+    /// ceremony in the refusal when the config leaves one unset.
+    pub(super) fn of(resolved: &config::Resolved, verb: &str) -> Result<Self, String> {
+        let rpc = resolved.rpc_listen.clone().ok_or_else(|| {
+            format!("{verb} drives the node's local rpc — set `rpc_listen` in node.toml")
+        })?;
+        let http_listen = resolved.service.http_listen.as_deref().ok_or_else(|| {
+            format!("{verb} waits on the node's block feed — set `http_listen` in node.toml")
+        })?;
+        Ok(Self {
+            rpc,
+            http_base: config::http_base_of(http_listen),
+        })
+    }
+
+    pub(super) fn rpc(&self) -> &str {
+        &self.rpc
+    }
+
+    pub(super) fn http_base(&self) -> &str {
+        &self.http_base
+    }
+
+    /// attach to the node's block wakes — BEFORE the read they guard, so a
+    /// block landing between the two is buffered on the socket, never missed.
+    fn block_wakes(&self, budget: std::time::Duration) -> Result<BlockWakes, String> {
+        use tokio_tungstenite::tungstenite::stream::MaybeTlsStream;
+        let url = crate::agent_cli::ws_url(&self.http_base);
+        let (socket, _response) = tokio_tungstenite::tungstenite::connect(&url)
+            .map_err(|e| format!("attach to the node's block feed: {e}"))?;
+        // the failure path's bound, not a poll interval: the node heartbeats
+        // on an interval as well as per block, so a live node never lets it
+        // expire.
+        if let MaybeTlsStream::Plain(tcp) = socket.get_ref() {
+            tcp.set_read_timeout(Some(budget))
+                .map_err(|e| format!("bound the node's block feed: {e}"))?;
+        }
+        Ok(BlockWakes { socket })
+    }
+}
+
+/// one node's block wakes, in order.
+struct BlockWakes {
+    socket: tokio_tungstenite::tungstenite::WebSocket<
+        tokio_tungstenite::tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
+    >,
+}
+
+impl BlockWakes {
+    /// block until the node reports its next block wake.
+    fn next(&mut self) -> Result<(), String> {
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            let frame = self
+                .socket
+                .read()
+                .map_err(|e| format!("the node's block feed closed: {e}"))?;
+            // an unsubscribed connection carries heartbeats and nothing else,
+            // but a control frame still has to be stepped over.
+            let Message::Text(text) = frame else { continue };
+            let woke = serde_json::from_str::<serde_json::Value>(&text)
+                .is_ok_and(|frame| frame["type"] == "heartbeat");
+            if woke {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// how long a ceremony waits on one proposal transition before naming the
+/// failure: ops finalize within a few blocks; the budget covers a mesh still
+/// forming quorum.
+const PROPOSAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// re-read a proposal on every block wake until `pred` accepts its view.
+/// `timed_out` is the whole failure sentence once [`PROPOSAL_BUDGET`] passes.
+///
+/// the wake is the only clock here on purpose: a validator this ceremony
+/// removes halts a fixed few views after the change commits, and a read that
+/// rides the settling block's wake lands inside that margin at any block
+/// time, where a wall-clock poll need not.
+fn await_proposal(
+    node: &DrivenNode,
     id: &str,
     timed_out: &str,
     mut pred: impl FnMut(&Option<governance::ProposalView>) -> bool,
 ) -> Result<Option<governance::ProposalView>, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + PROPOSAL_BUDGET;
+    let mut wakes = node.block_wakes(PROPOSAL_BUDGET)?;
     loop {
-        let view = read_proposal(addr, id)?;
+        let view = read_proposal(node.rpc(), id)?;
         if pred(&view) {
             return Ok(view);
         }
         if std::time::Instant::now() >= deadline {
             return Err(timed_out.to_string());
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        wakes.next()?;
     }
 }
 
 fn cast_yes_once(
-    addr: &str,
+    node: &DrivenNode,
     proposal_id: &str,
     opened: governance::ProposalView,
     signer: &GovSigner,
@@ -1305,14 +1395,14 @@ fn cast_yes_once(
         return Ok(opened);
     }
     signer.submit(
-        addr,
+        node.rpc(),
         &GovMsg::Vote {
             proposal_id: proposal_id.into(),
             approve: true,
         },
     )?;
-    let proposal = poll_proposal(
-        addr,
+    let proposal = await_proposal(
+        node,
         proposal_id,
         "timed out waiting for this ballot to finalize",
         |p| {
@@ -1363,7 +1453,7 @@ pub(super) fn open_proposal_matching<'a>(
 /// (RemoveResident) — and the module verbs `module update`/`module register`
 /// (UpdateModule/RegisterModule).
 pub(super) fn drive_proposal_ceremony(
-    rpc_addr: &str,
+    node: &DrivenNode,
     signer: &GovSigner,
     pubkey_hex: &str,
     verb: &str,
@@ -1381,7 +1471,7 @@ pub(super) fn drive_proposal_ceremony(
     use governance::{GovMsg, ProposalStatus};
     use governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
-        rpc_addr,
+        node.rpc(),
         "governance",
         &encode_query(&GovQuery::Proposals),
     )?)? {
@@ -1400,7 +1490,7 @@ pub(super) fn drive_proposal_ceremony(
                 .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
                 .expect("the id space is unbounded");
             signer.submit(
-                rpc_addr,
+                node.rpc(),
                 &GovMsg::Propose {
                     proposal_id: id.clone(),
                     action: wanted,
@@ -1410,8 +1500,8 @@ pub(super) fn drive_proposal_ceremony(
                     voting_period: 1_000_000,
                 },
             )?;
-            poll_proposal(
-                rpc_addr,
+            await_proposal(
+                node,
                 &id,
                 "timed out waiting for the proposal to finalize",
                 |p| p.is_some(),
@@ -1421,13 +1511,13 @@ pub(super) fn drive_proposal_ceremony(
         }
     };
 
-    let opened = read_proposal(rpc_addr, &proposal_id)?
+    let opened = read_proposal(node.rpc(), &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
-    let after_vote = cast_yes_once(rpc_addr, &proposal_id, opened, signer)?;
+    let after_vote = cast_yes_once(node, &proposal_id, opened, signer)?;
 
     // Execute only when the proposal's frozen rule says the yes power is
     // irreversible. A shortfall is the normal intermediate state, not an error.
-    let members = read_members(rpc_addr)?;
+    let members = read_members(node.rpc())?;
     let (yes, required, ready) = proposal_progress(&after_vote, &members);
     if after_vote.status == ProposalStatus::Open && !ready {
         eprintln!(
@@ -1440,13 +1530,13 @@ pub(super) fn drive_proposal_ceremony(
     }
     if after_vote.status == ProposalStatus::Open {
         signer.submit(
-            rpc_addr,
+            node.rpc(),
             &GovMsg::Execute {
                 proposal_id: proposal_id.clone(),
             },
         )?;
     }
-    let settled = poll_proposal(rpc_addr, &proposal_id, TALLY_SETTLE_TIMEOUT, |p| {
+    let settled = await_proposal(node, &proposal_id, TALLY_SETTLE_TIMEOUT, |p| {
         p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
     })?
     .expect("the poll only accepts a present proposal");
@@ -1473,18 +1563,15 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
     // Full config resolution derives the same node identity the daemon signs
     // with; governance resolves it to an account when shares are active.
     let resolved = config::resolve(&cfg_path)?;
-    let rpc_addr = resolved
-        .rpc_listen
-        .clone()
-        .ok_or("resident accept drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
+    let node = DrivenNode::of(&resolved, "resident accept")?;
+    let signer = gov_signer(node.rpc(), &cfg_path, &resolved)?;
 
-    let members = read_members(&rpc_addr)?;
+    let members = read_members(node.rpc())?;
     if members.contains(&key_bytes) {
         eprintln!("{pubkey_hex} is already a validator — nothing to do");
         return Ok(());
     }
-    if read_residents(&rpc_addr)?.contains(&key_bytes) {
+    if read_residents(node.rpc())?.contains(&key_bytes) {
         eprintln!(
             "{pubkey_hex} already holds resident standing — promote with \
              `ducktape node member promote {pubkey_hex}` once it is synced"
@@ -1497,7 +1584,7 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         move |a: &GovAction| *a == wanted
     };
     match drive_proposal_ceremony(
-        &rpc_addr,
+        &node,
         &signer,
         pubkey_hex,
         "node resident accept",
@@ -1532,13 +1619,10 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let key_bytes = key.as_ref().to_vec();
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
-    let rpc_addr = resolved
-        .rpc_listen
-        .clone()
-        .ok_or("promote drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
+    let node = DrivenNode::of(&resolved, "promote")?;
+    let signer = gov_signer(node.rpc(), &cfg_path, &resolved)?;
 
-    let members = read_members(&rpc_addr)?;
+    let members = read_members(node.rpc())?;
     if members.contains(&key_bytes) {
         eprintln!("{pubkey_hex} is already a validator — nothing to do");
         return Ok(());
@@ -1549,7 +1633,7 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
         move |a: &GovAction| *a == wanted
     };
     match drive_proposal_ceremony(
-        &rpc_addr,
+        &node,
         &signer,
         pubkey_hex,
         "node member promote",
@@ -1590,13 +1674,10 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
     // Full config resolution derives the same node identity the daemon signs
     // with; governance resolves it to an account when shares are active.
     let resolved = config::resolve(&cfg_path)?;
-    let rpc_addr = resolved
-        .rpc_listen
-        .clone()
-        .ok_or("resident remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
+    let node = DrivenNode::of(&resolved, "resident remove")?;
+    let signer = gov_signer(node.rpc(), &cfg_path, &resolved)?;
 
-    let members = read_members(&rpc_addr)?;
+    let members = read_members(node.rpc())?;
     if members.contains(&key_bytes) {
         eprintln!(
             "{pubkey_hex} is a seated validator, not a resident — remove it with \
@@ -1604,7 +1685,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
         );
         return Ok(());
     }
-    if !read_residents(&rpc_addr)?.contains(&key_bytes) {
+    if !read_residents(node.rpc())?.contains(&key_bytes) {
         eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
         return Ok(());
     }
@@ -1614,7 +1695,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
         move |a: &GovAction| *a == wanted
     };
     match drive_proposal_ceremony(
-        &rpc_addr,
+        &node,
         &signer,
         pubkey_hex,
         "node resident remove",
@@ -1654,13 +1735,10 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
     // Full config resolution derives the same node identity the daemon signs
     // with; governance resolves it to an account when shares are active.
     let resolved = config::resolve(&cfg_path)?;
-    let rpc_addr = resolved
-        .rpc_listen
-        .clone()
-        .ok_or("member remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
+    let node = DrivenNode::of(&resolved, "member remove")?;
+    let signer = gov_signer(node.rpc(), &cfg_path, &resolved)?;
 
-    let members = read_members(&rpc_addr)?;
+    let members = read_members(node.rpc())?;
     // Inverted admission guard: nothing to remove if the key is not a member.
     if !members.contains(&key_bytes) {
         eprintln!("{pubkey_hex} is not a validator — nothing to do");
@@ -1671,7 +1749,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
     // gets a fresh suffix).
     use governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
-        &rpc_addr,
+        node.rpc(),
         "governance",
         &encode_query(&GovQuery::Proposals),
     )?)? {
@@ -1696,7 +1774,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
                 .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
                 .expect("the id space is unbounded");
             signer.submit(
-                &rpc_addr,
+                node.rpc(),
                 &GovMsg::Propose {
                     proposal_id: id.clone(),
                     action: wanted,
@@ -1705,8 +1783,8 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
                     voting_period: 1_000_000,
                 },
             )?;
-            poll_proposal(
-                &rpc_addr,
+            await_proposal(
+                &node,
                 &id,
                 "timed out waiting for the proposal to finalize",
                 |p| p.is_some(),
@@ -1716,12 +1794,12 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         }
     };
 
-    let opened = read_proposal(&rpc_addr, &proposal_id)?
+    let opened = read_proposal(node.rpc(), &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
-    let after_vote = cast_yes_once(&rpc_addr, &proposal_id, opened, &signer)?;
+    let after_vote = cast_yes_once(&node, &proposal_id, opened, &signer)?;
 
     // Execute only once the proposal's own frozen voting rule is satisfied.
-    let members = read_members(&rpc_addr)?;
+    let members = read_members(node.rpc())?;
     let (yes, required, ready) = proposal_progress(&after_vote, &members);
     if after_vote.status == ProposalStatus::Open && !ready {
         eprintln!(
@@ -1732,13 +1810,13 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
     }
     if after_vote.status == ProposalStatus::Open {
         signer.submit(
-            &rpc_addr,
+            node.rpc(),
             &GovMsg::Execute {
                 proposal_id: proposal_id.clone(),
             },
         )?;
     }
-    let settled = poll_proposal(&rpc_addr, &proposal_id, TALLY_SETTLE_TIMEOUT, |p| {
+    let settled = await_proposal(&node, &proposal_id, TALLY_SETTLE_TIMEOUT, |p| {
         p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
     })?
     .expect("the poll only accepts a present proposal");
@@ -1883,6 +1961,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         wireguard_listen: net.wireguard_listen.clone(),
         wireguard_advertised: net.wireguard_advertised.clone(),
         invite_listen: net.invite_listen.clone(),
+        block_time_ms: net.block_time_ms,
     };
     let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
     if joined.is_member {

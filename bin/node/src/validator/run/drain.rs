@@ -948,7 +948,7 @@ impl ValidatorRuntime<'_> {
     //   ops pending while nothing of ours is in flight. the network's own
     //   agreement speed is the pacer; this heartbeat arm plays no part in
     //   busy pacing.
-    // - IDLE — this arm: an empty window beats one nop per `BLOCK_TIME`.
+    // - IDLE — this arm: an empty window beats one nop per block time.
     //   finalized views only advance with a proposed frame, so an idle
     //   network would freeze (its height never ticks and a pending cutover,
     //   which crosses only when finalized views REACH it, would park
@@ -960,12 +960,12 @@ impl ValidatorRuntime<'_> {
     // pushed while real ops wait (or while a batch still awaits finalization)
     // only piles behind them — a flapping quorum peer would stack idle
     // blocks. a due beat that finds the chain non-quiet RESTAMPS the grid
-    // instead, so the nop returns one full `BLOCK_TIME` after the chain goes
+    // instead, so the nop returns one full block time after the chain goes
     // quiet, never the instant a stall clears.
     async fn pump_heartbeat(&mut self) {
         let now = self.context.current();
         let heartbeat_due =
-            now.duration_since(self.last_flush).unwrap_or_default() >= consensus::BLOCK_TIME;
+            now.duration_since(self.last_flush).unwrap_or_default() >= self.cadence.block_time;
         let ops_pending = self.node.pending_batch_len() > 0;
         let orderer_idle = self.node.orderer().pending_len() == 0;
         match heartbeat_action(
@@ -1278,11 +1278,11 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             last_crank,
+            cadence,
             ..
         } = self;
         let now = context.current();
-        let crank_due =
-            now.duration_since(*last_crank).unwrap_or_default() >= consensus::BLOCK_TIME;
+        let crank_due = now.duration_since(*last_crank).unwrap_or_default() >= cadence.block_time;
         if crank_due
             && let Some(finalized_height) = node.finalized().map(|f| f.height)
             && let Some(expiry) = saga_next_expiry(node.host()).await
@@ -1337,11 +1337,11 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             last_nudge,
+            cadence,
             ..
         } = self;
         let now = context.current();
-        let nudge_due =
-            now.duration_since(*last_nudge).unwrap_or_default() >= consensus::BLOCK_TIME;
+        let nudge_due = now.duration_since(*last_nudge).unwrap_or_default() >= cadence.block_time;
         if nudge_due && dispatch_pending_deliveries(node.host()).await > 0 {
             *last_nudge = now;
             let seq = *next_seq;
@@ -1383,7 +1383,7 @@ enum HeartbeatAction {
     Idle,
     /// the beat is due but the chain is not quiet — ops are pending (the
     /// eager path owns them) or a batch is still in flight. restart the beat
-    /// grid without flushing, so the nop returns one full `BLOCK_TIME` after
+    /// grid without flushing, so the nop returns one full block time after
     /// the chain goes quiet.
     Restamp,
     /// the beat is due on a quiet chain: submit one nop, then flush it.
@@ -1518,7 +1518,7 @@ mod block_cadence_tests {
     #[test]
     fn due_beat_on_a_non_quiet_chain_restamps_without_a_nop() {
         // ops pending (the eager path owns them) or a batch in flight: no
-        // nop — restart the grid so the nop returns one full BLOCK_TIME
+        // nop — restart the grid so the nop returns one full block time
         // after the chain goes quiet.
         assert_eq!(
             heartbeat_action(false, true, true, true),

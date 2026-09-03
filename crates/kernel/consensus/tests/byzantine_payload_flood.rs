@@ -41,7 +41,10 @@ use commonware_runtime::{
 };
 use commonware_utils::{NZU32, NZUsize};
 
-use consensus::{ContentStore, Digest, SimplexOrderer, digest_of};
+use consensus::{Cadence, ContentStore, Digest, SimplexOrderer, digest_of};
+
+/// the beat the sim runs at — simulated time, so its size is not wall-clock.
+const CADENCE: Cadence = Cadence::from_millis(1_000);
 use directory::Directory;
 use directory::{DirMsg, encode_msg};
 use host::Host;
@@ -231,6 +234,7 @@ async fn run_relay(mut context: deterministic::Context, flood: bool) {
             genesis_floor,
             None,
             store,
+            CADENCE,
             vote,
             certificate,
             resolver,

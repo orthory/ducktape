@@ -55,6 +55,8 @@ pub(crate) struct BootEnv {
     pub(crate) chain_id: String,
     pub(crate) mesh_state_file: PathBuf,
     pub(crate) checkpoint_blocks: u64,
+    /// the idle block cadence, and the view timers scaled from it.
+    pub(crate) cadence: consensus::Cadence,
     pub(crate) dev_demo: bool,
     /// the operator's `[sandbox]` table — HOW a run is isolated on this host.
     /// `None` = consensus-only: no terminal plane, no runs. The node itself no
@@ -111,6 +113,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         invite_listen,
         dev_demo,
         checkpoint_blocks,
+        cadence,
         invite_token,
         invite_wireguard,
         invite_fronts,
@@ -375,6 +378,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         chain_id,
         mesh_state_file,
         checkpoint_blocks,
+        cadence,
         dev_demo,
         sandbox,
         compute_backend,

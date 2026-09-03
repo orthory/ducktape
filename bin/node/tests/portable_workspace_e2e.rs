@@ -35,7 +35,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
-use common::{Cluster, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
 use duckfs_core::{
     Change, Content, FilesMsg, FilesQuery, FilesReply, decode_reply as files_decode_reply,
     encode_msg as files_encode_msg, encode_query as files_encode_query,
@@ -350,7 +350,7 @@ fn mention(cluster: &Cluster, idx: usize, message_id: &str) {
 }
 
 fn wait_for_reply(cluster: &Cluster, idx: usize, run_id: &str) -> String {
-    poll_until("the agent reply to post", ROUND_TRIP, || {
+    cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
         let reply = cluster.query(
             idx,
             "chat",
@@ -455,7 +455,6 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     {
         return;
     }
-    let _serial = serial();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
     let provider = PortableProvider::stage(fixtures.path());
     // the operator-facing root override: one shared base, per-node storage
@@ -497,7 +496,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     boot(&mut cluster);
 
     // node 1 is the tag's ONLY provider, so every lease lands there.
-    poll_until("the provider to announce", FINALIZE, || {
+    cluster.await_committed(0, "the provider to announce", FINALIZE, || {
         (providers(&cluster, 0, &provider.tag)? == vec![Cluster::identity(1)]).then_some(())
     });
 
@@ -520,7 +519,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
             }],
         }),
     );
-    poll_until("the skill seed to commit", FINALIZE, || {
+    cluster.await_committed(0, "the skill seed to commit", FINALIZE, || {
         (stat_size(&cluster, 0, &format!("{SKILL_PREFIX}/{SKILL_FILE}"))?
             == SKILL_BODY.len() as u64)
             .then_some(())
@@ -574,7 +573,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
             policy: TurnPolicy::Mention,
         }),
     );
-    poll_until("the channel watch to commit", FINALIZE, || {
+    cluster.await_committed(0, "the channel watch to commit", FINALIZE, || {
         let reply = cluster.query(0, "runs", &runs::encode_query(&RunsQuery::Watches))?;
         match runs::decode_reply(&reply) {
             Ok(RunsReply::Watches(w)) => w.iter().any(|v| v.channel_id == CHANNEL).then_some(()),
@@ -593,10 +592,15 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     // W6 evidence: the script content-checked the skill file under the
     // advertised DUCKTAPE_RUN_SKILLS root before answering. It reaches the host
     // as committed state, so wait for the run's commit rather than the reply.
-    let roots = poll_until("run 1's skill-mount evidence to commit", FINALIZE, || {
-        let roots = evidence_lines(&cluster, 0, EVIDENCE_SKILLS);
-        (!roots.is_empty()).then_some(roots)
-    });
+    let roots = cluster.await_committed(
+        0,
+        "run 1's skill-mount evidence to commit",
+        FINALIZE,
+        || {
+            let roots = evidence_lines(&cluster, 0, EVIDENCE_SKILLS);
+            (!roots.is_empty()).then_some(roots)
+        },
+    );
     assert_eq!(roots.len(), 1, "run 1 saw its skill ro mount: {roots:?}");
 
     // THE SOUL, as the model saw it. the persona is no longer a blob resolved
@@ -631,7 +635,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
 
     // the artifact is COMMITTED duckfs state, readable on a node that never
     // executed anything (the whole point of the portable workspace).
-    poll_until("the artifact to reach committed state", FINALIZE, || {
+    cluster.await_committed(0, "the artifact to reach committed state", FINALIZE, || {
         (artifact_stat(&cluster, 0)? == ARTIFACT_BODY.len() as u64).then_some(())
     });
     assert_eq!(
@@ -660,7 +664,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
     mention(&cluster, 0, "m2");
     let run_2 = runs::run_id_for(CHANNEL, 3, AGENT_ID);
     assert_eq!(wait_for_reply(&cluster, 2, &run_2), "portable run done");
-    poll_until("run 2's chain evidence to commit", FINALIZE, || {
+    cluster.await_committed(0, "run 2's chain evidence to commit", FINALIZE, || {
         (evidence_lines(&cluster, 0, EVIDENCE_CHAIN).len() == 1).then_some(())
     });
 
@@ -693,7 +697,7 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
             "the mount honors DUCKTAPE_AGENT_RUNS_ROOT: {}",
             dir.display()
         );
-        poll_until("the run dir to be cleaned up (W5)", FINALIZE, || {
+        cluster.await_committed(0, "the run dir to be cleaned up (W5)", FINALIZE, || {
             (!dir.exists()).then_some(())
         });
     }
@@ -736,15 +740,19 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
             "the skill root is a sibling of the rw mount, never inside it: {}",
             dir.display()
         );
-        poll_until("the skill ro root to be cleaned up (W5)", FINALIZE, || {
-            (!dir.exists()).then_some(())
-        });
+        cluster.await_committed(
+            0,
+            "the skill ro root to be cleaned up (W5)",
+            FINALIZE,
+            || (!dir.exists()).then_some(()),
+        );
     }
 
     // no correlation debris: every delivered run prunes its pending entry.
     // eventual — the reply was observed on node 2, and node 0 may still be a
     // block behind the delivery that prunes.
-    poll_until(
+    cluster.await_committed(
+        0,
         "delivered runs to prune their pending entries",
         FINALIZE,
         || {

@@ -1,6 +1,6 @@
 //! process-level harness for the real-socket node e2e: spawns REAL
 //! `ducktape` binaries (via `CARGO_BIN_EXE_ducktape`) with generated
-//! toml configs, captures their stdout to files, polls for the node's
+//! toml configs, drains their output into a feed it waits on for the node's
 //! greppable markers, and speaks the json-lines rpc — the rust replacement for
 //! what `demo-2node.sh` used to orchestrate in bash.
 //!
@@ -24,8 +24,9 @@
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// the `ducktape module …` verbs as an e2e drives them, shared by the suites
@@ -39,6 +40,13 @@ pub const FIXTURES: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../crates/kernel/host/tests/fixtures"
 );
+
+/// the beat every harness node runs at (node.toml `block_time_ms`). the suites
+/// wait on block counts — checkpoints, epochs, finalization — so their
+/// wall-clock scales 1:1 with it, and every simplex timer scales with it too:
+/// the number is a policy choice for the whole lane, not a tuning of any one
+/// wait.
+pub const TEST_BLOCK_TIME_MS: u64 = 100;
 
 /// A cluster's storage root, named so an ABANDONED one can be found and swept.
 ///
@@ -102,22 +110,85 @@ fn pid_is_alive(pid: i32) -> bool {
 
 use commonware_cryptography::{Signer as _, ed25519};
 
-/// the socket suite is heavyweight (4 OS processes each): serialize the tests
-/// in this binary so two clusters never compete for one CI core budget.
-static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-pub fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 static CLUSTER_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// a running node process. killed (and reaped) on drop so an assertion
-/// failure never leaks a validator into the host system.
+/// a process this harness spawned — a node, a compute daemon, a service — with
+/// its output in hand.
+///
+/// stdout and stderr share ONE pipe. a reader thread drains it into the feed
+/// every wait rides AND into the log file on disk (what a post-mortem opens).
+/// a line arriving, or the pipe closing behind an exit, is the event a wait
+/// wakes on; a deadline only names the failure. killed (and reaped) on drop so
+/// an assertion failure never leaks a validator into the host system.
 pub struct NodeProc {
     pub id: u64,
     child: Child,
     pub log: PathBuf,
+    feed: Arc<OutputFeed>,
+}
+
+impl NodeProc {
+    /// spawn `cmd` as process `id`, its output draining into `log` and the feed.
+    fn spawn(id: u64, log: PathBuf, mut cmd: Command, what: &str) -> Self {
+        let (reader, writer) = std::io::pipe().expect("pipe for the process output");
+        let stderr = writer.try_clone().expect("clone the pipe's write end");
+        let child = cmd
+            .stdout(writer)
+            .stderr(stderr)
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
+        // the Command holds the write ends until it is dropped, and the reader's
+        // EOF is the exit event — release ours before anyone waits on it.
+        drop(cmd);
+        let file =
+            std::fs::File::create(&log).unwrap_or_else(|e| panic!("create {}: {e}", log.display()));
+        let feed = Arc::new(OutputFeed::default());
+        std::thread::Builder::new()
+            .name(format!("output-{what}-{id}"))
+            .spawn({
+                let feed = Arc::clone(&feed);
+                move || drain_output(reader, file, &feed)
+            })
+            .expect("spawn the output reader");
+        Self {
+            id,
+            child,
+            log,
+            feed,
+        }
+    }
+
+    /// the rest of the first line containing `marker`.
+    fn wait_marker(&self, marker: &str, deadline: Instant) -> Result<String, Unanswered> {
+        self.feed
+            .wait(deadline, |unseen| find_marker(unseen, marker))
+    }
+
+    /// which of `markers` a line carried first.
+    fn wait_any_marker(&self, markers: &[&str], deadline: Instant) -> Result<(), Unanswered> {
+        self.feed.wait(deadline, |unseen| {
+            markers
+                .iter()
+                .any(|marker| find_marker(unseen, marker).is_some())
+                .then_some(())
+        })
+    }
+
+    /// block until the process closes its output — it exited — then reap it.
+    fn wait_exit(&mut self, deadline: Instant) -> Result<std::process::ExitStatus, Unanswered> {
+        self.feed.wait_closed(deadline)?;
+        Ok(self.child.wait().expect("reap the exited process"))
+    }
+
+    /// everything the process has written so far.
+    fn text(&self) -> String {
+        self.feed.text()
+    }
+
+    /// the last `lines` lines the process wrote.
+    fn tail(&self, lines: usize) -> String {
+        log_tail(&self.text(), lines)
+    }
 }
 
 impl Drop for NodeProc {
@@ -125,6 +196,120 @@ impl Drop for NodeProc {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// one process's output: everything it wrote so far, and whether it still can.
+#[derive(Default)]
+struct Output {
+    text: String,
+    closed: bool,
+}
+
+/// the seam every wait in this harness rides: a line landing, or the output
+/// closing, wakes whoever is waiting.
+#[derive(Default)]
+struct OutputFeed {
+    output: Mutex<Output>,
+    changed: Condvar,
+}
+
+/// why a wait on a feed came back without its answer.
+#[derive(Clone, Copy, Debug)]
+enum Unanswered {
+    /// the process closed its output: it exited.
+    Exited,
+    /// the deadline passed with the output still open.
+    TimedOut,
+}
+
+impl Unanswered {
+    fn verb(self) -> &'static str {
+        match self {
+            Unanswered::Exited => "exited",
+            Unanswered::TimedOut => "timed out",
+        }
+    }
+}
+
+impl OutputFeed {
+    fn append(&self, line: &str) {
+        let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        output.text.push_str(line);
+        self.changed.notify_all();
+    }
+
+    fn close(&self) {
+        let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        output.closed = true;
+        self.changed.notify_all();
+    }
+
+    fn text(&self) -> String {
+        self.output
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .text
+            .clone()
+    }
+
+    /// block until `probe` answers on the lines it has not yet been offered,
+    /// the output closes, or `deadline` passes. every line is offered to the
+    /// probe exactly once (appends are whole lines), so a marker scan stays
+    /// linear over the whole run no matter how often it wakes.
+    fn wait<T>(
+        &self,
+        deadline: Instant,
+        mut probe: impl FnMut(&str) -> Option<T>,
+    ) -> Result<T, Unanswered> {
+        let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        let mut offered = 0;
+        loop {
+            let answer = probe(&output.text[offered..]);
+            offered = output.text.len();
+            if let Some(answer) = answer {
+                return Ok(answer);
+            }
+            if output.closed {
+                return Err(Unanswered::Exited);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Unanswered::TimedOut);
+            }
+            (output, _) = self
+                .changed
+                .wait_timeout(output, deadline - now)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// block until the output closes, or `deadline` passes.
+    fn wait_closed(&self, deadline: Instant) -> Result<(), Unanswered> {
+        match self.wait(deadline, |_| None::<std::convert::Infallible>) {
+            Ok(never) => match never {},
+            Err(Unanswered::Exited) => Ok(()),
+            Err(Unanswered::TimedOut) => Err(Unanswered::TimedOut),
+        }
+    }
+}
+
+/// the reader thread's whole life: every line the process writes lands in the
+/// log file and the feed, and the pipe's EOF closes the feed.
+fn drain_output(reader: std::io::PipeReader, mut file: std::fs::File, feed: &OutputFeed) {
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_until(b'\n', &mut line) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        let _ = file.write_all(&line);
+        feed.append(&String::from_utf8_lossy(&line));
+    }
+    feed.close();
 }
 
 /// one e2e cluster: the shared config (mesh membership, ports, namespace,
@@ -355,6 +540,8 @@ impl NetworkShapeCluster {
                 &format!("127.0.0.1:{}", self.http_ports[0]),
                 "--rpc",
                 &format!("127.0.0.1:{}", self.rpc_ports[0]),
+                "--block-time-ms",
+                &TEST_BLOCK_TIME_MS.to_string(),
             ])
             .args(["--wireguard-listen", &wg_listen])
             .output()
@@ -462,6 +649,8 @@ impl NetworkShapeCluster {
                 // LIVE public coordinator from inside the test.
                 "--primary-coordinator",
                 "none",
+                "--block-time-ms",
+                &TEST_BLOCK_TIME_MS.to_string(),
             ])
             .output()
             .expect("run join")
@@ -493,23 +682,13 @@ impl NetworkShapeCluster {
             _ => panic!("unknown network-shape node idx {idx}"),
         };
         let log = self.dir.path().join(format!("{label}.log"));
-        let out = std::fs::File::create(&log).expect("create node log");
-        let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
-            .arg("node")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("node")
             .arg("run")
             .arg("--config")
             .arg(&cfg)
-            .envs(self.env[idx].iter().map(|(k, v)| (k.clone(), v.clone())))
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .spawn()
-            .expect("spawn network-shape node");
-        self.nodes[idx] = Some(NodeProc {
-            id: idx as u64,
-            child,
-            log,
-        });
+            .envs(self.env[idx].iter().map(|(k, v)| (k.clone(), v.clone())));
+        self.nodes[idx] = Some(NodeProc::spawn(idx as u64, log, cmd, label));
     }
 
     /// keep node `idx`'s `<kind>` hello alive — a service daemon's ENTIRE
@@ -552,18 +731,15 @@ impl NetworkShapeCluster {
         };
         let body = serde_json::to_value(&hello).expect("a hello serializes");
         let port = self.http_ports[idx];
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            match nettest::try_http_json(port, "POST", "/v1/services/hello", Some(&body)) {
-                Ok((200, _)) => break,
-                other => assert!(
-                    Instant::now() < deadline,
-                    "node idx {idx} never accepted a {kind:?} hello ({other:?});\n{}",
-                    self.all_log_tails(60),
-                ),
-            }
-            std::thread::sleep(Duration::from_millis(300));
-        }
+        // a hello lands once the node has published its mesh identity — the
+        // fact the real daemon waits on before its own first POST.
+        self.wait_marker(idx, "mesh identity published", Duration::from_secs(60));
+        let reply = nettest::try_http_json(port, "POST", "/v1/services/hello", Some(&body));
+        assert!(
+            matches!(reply, Ok((200, _))),
+            "node idx {idx} refused a {kind:?} hello ({reply:?});\n{}",
+            self.all_log_tails(60),
+        );
         // detached like the daemon's own heartbeat thread: it outlives this
         // call, ignores a post to a node that has gone away, and dies with the
         // test process.
@@ -604,21 +780,15 @@ impl NetworkShapeCluster {
         loop {
             // the listener is up before the pump — connecting retries for
             // every cmd (nothing has been sent yet, so retrying is safe).
-            let connect_deadline = Instant::now() + Duration::from_secs(30);
-            let stream = loop {
-                match TcpStream::connect(("127.0.0.1", port)) {
-                    Ok(s) => break s,
-                    Err(e) => {
-                        assert!(
-                            Instant::now() < connect_deadline,
-                            "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
-                            self.all_log_tails(40)
-                        );
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
-                }
-            };
-            let mut stream = stream;
+            // the node logs its rpc listener the moment the port is bound, and
+            // nothing answers before that — the line is the connect event.
+            self.wait_marker(idx, "rpc listening on", Duration::from_secs(30));
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|e| {
+                panic!(
+                    "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
+                    self.all_log_tails(40)
+                )
+            });
             stream
                 .set_read_timeout(Some(Duration::from_secs(if retryable { 15 } else { 60 })))
                 .expect("rpc read timeout");
@@ -728,24 +898,16 @@ impl NetworkShapeCluster {
         self.run_membership_verb("member promote", pubkey_hex)
     }
 
-    pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let node = self.nodes[idx].as_mut().expect("node is running");
-            let text = std::fs::read_to_string(&node.log).unwrap_or_default();
-            if let Some(rest) = find_marker(&text, marker) {
-                return rest;
-            }
-            let exited = node.child.try_wait().expect("poll node").is_some();
-            if exited || Instant::now() >= deadline {
-                let verb = if exited { "exited" } else { "timed out" };
+    pub fn wait_marker(&self, idx: usize, marker: &str, timeout: Duration) -> String {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.wait_marker(marker, Instant::now() + timeout)
+            .unwrap_or_else(|why| {
                 panic!(
-                    "network-shape node idx {idx} {verb} without printing {marker:?};\n{}",
+                    "network-shape node idx {idx} {} without printing {marker:?};\n{}",
+                    why.verb(),
                     self.all_log_tails(60),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(300));
-        }
+                )
+            })
     }
 
     /// wait until node `idx` has COMMITTED STANDING as a member. the join protocol has
@@ -753,25 +915,16 @@ impl NetworkShapeCluster {
     /// direct first contact prints "standing is committed" (replica/wiring),
     /// the announce-redeem park path prints "resident: standing granted".
     /// Waiting on either is the semantic event the resident tests gate on.
-    pub fn wait_admitted(&mut self, idx: usize, timeout: Duration) {
+    pub fn wait_admitted(&self, idx: usize, timeout: Duration) {
         let markers = ["standing is committed", "resident: standing granted"];
-        let deadline = Instant::now() + timeout;
-        loop {
-            let node = self.nodes[idx].as_mut().expect("node is running");
-            let text = std::fs::read_to_string(&node.log).unwrap_or_default();
-            if markers.iter().any(|m| find_marker(&text, m).is_some()) {
-                return;
-            }
-            let exited = node.child.try_wait().expect("poll node").is_some();
-            if exited || Instant::now() >= deadline {
-                let verb = if exited { "exited" } else { "timed out" };
-                panic!(
-                    "network-shape node idx {idx} {verb} without printing any of \
-                     {markers:?};\n{}",
-                    self.all_log_tails(60),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(300));
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        if let Err(why) = node.wait_any_marker(&markers, Instant::now() + timeout) {
+            panic!(
+                "network-shape node idx {idx} {} without printing any of \
+                 {markers:?};\n{}",
+                why.verb(),
+                self.all_log_tails(60),
+            );
         }
     }
 
@@ -779,19 +932,30 @@ impl NetworkShapeCluster {
     /// and reap it — the [`Cluster::wait_exit`] mirror.
     pub fn wait_exit(&mut self, idx: usize, timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        loop {
-            let node = self.nodes[idx].as_mut().expect("node is running");
-            if node.child.try_wait().expect("poll node").is_some() {
-                self.nodes[idx] = None;
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "network-shape node idx {idx} did not exit within {timeout:?};\n{}",
-                self.all_log_tails(40)
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let exited = self.nodes[idx]
+            .as_mut()
+            .expect("node is running")
+            .wait_exit(deadline);
+        assert!(
+            exited.is_ok(),
+            "network-shape node idx {idx} did not exit within {timeout:?};\n{}",
+            self.all_log_tails(40)
+        );
+        self.nodes[idx] = None;
+    }
+
+    /// Wait until `probe` answers, re-evaluating it on node `idx`'s block wake
+    /// — the shape-cluster twin of [`Cluster::await_committed`].
+    pub fn await_committed<T>(
+        &self,
+        idx: usize,
+        what: &str,
+        timeout: Duration,
+        probe: impl FnMut() -> Option<T>,
+    ) -> T {
+        await_committed_on(self.http_ports[idx], idx, what, timeout, probe, || {
+            self.all_log_tails(60)
+        })
     }
 
     fn all_log_tails(&self, lines: usize) -> String {
@@ -800,10 +964,9 @@ impl NetworkShapeCluster {
             .enumerate()
             .filter_map(|(idx, n)| {
                 n.as_ref().map(|n| {
-                    let text = std::fs::read_to_string(&n.log).unwrap_or_default();
                     format!(
                         "--- network-shape node idx {idx} log tail ---\n{}",
-                        log_tail(&text, lines)
+                        n.tail(lines)
                     )
                 })
             })
@@ -897,6 +1060,7 @@ impl Cluster {
             "http_listen = \"127.0.0.1:{}\"\n",
             self.http_ports[idx]
         ));
+        cfg.push_str(&format!("block_time_ms = {TEST_BLOCK_TIME_MS}\n"));
         if self.wireguard {
             cfg.push_str(&format!(
                 "wireguard_listen = \"127.0.0.1:{}\"\n",
@@ -976,19 +1140,13 @@ impl Cluster {
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("node{id}.log"));
-        let out = std::fs::File::create(&log).expect("create node log");
-        let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
-            .arg("node")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("node")
             .arg("run")
             .arg("--config")
             .arg(&cfg)
-            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .spawn()
-            .expect("spawn ducktape");
-        self.nodes[idx] = Some(NodeProc { id, child, log });
+            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        self.nodes[idx] = Some(NodeProc::spawn(id, log, cmd, "node"));
         self.spawn_compute(idx);
     }
 
@@ -1022,10 +1180,8 @@ impl Cluster {
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("compute{id}.log"));
-        let out = std::fs::File::create(&log).expect("create compute log");
-        let err = out.try_clone().expect("clone compute log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
-            .arg("service")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("service")
             .arg("run")
             .arg("compute")
             .arg("--config")
@@ -1033,12 +1189,8 @@ impl Cluster {
             // the grant is already on disk (`write_service_grants`), so the
             // daemon must never try to mint one — there is no tty here.
             .arg("--no-enable")
-            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .spawn()
-            .expect("spawn compute daemon");
-        self.daemons[idx] = Some(NodeProc { id, child, log });
+            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        self.daemons[idx] = Some(NodeProc::spawn(id, log, cmd, "compute"));
     }
 
     /// Grant node `idx` a service of `kind` and run its daemon beside the node
@@ -1071,10 +1223,8 @@ impl Cluster {
         self.service_kinds[idx].push(kind.to_string());
         self.write_service_grants(idx);
         let log = self.dir.path().join(format!("{kind}{id}.log"));
-        let out = std::fs::File::create(&log).expect("create service log");
-        let err = out.try_clone().expect("clone service log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
-            .arg("service")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("service")
             .arg("run")
             .arg(kind)
             .arg("--config")
@@ -1082,52 +1232,38 @@ impl Cluster {
             // the grant is already on disk, so the daemon must never try to
             // mint one — there is no tty here.
             .arg("--no-enable")
-            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .spawn()
-            .expect("spawn service daemon");
+            .envs(self.env[idx].iter().map(|(k, v)| (k.as_str(), v.as_str())));
         self.services[idx].push(ServiceProc {
             kind: kind.to_string(),
-            proc: NodeProc { id, child, log },
+            proc: NodeProc::spawn(id, log, cmd, kind),
         });
     }
 
-    /// poll the log of node `idx`'s `kind` service daemon until a line contains
+    /// wait until node `idx`'s `kind` service daemon prints a line containing
     /// `marker`. Fails fast if the daemon exits without printing it — the twin
     /// of [`Self::wait_marker`], for the process on the other side of the link.
     pub fn wait_service_marker(
-        &mut self,
+        &self,
         idx: usize,
         kind: &str,
         marker: &str,
         timeout: Duration,
     ) -> String {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let service = self.services[idx]
-                .iter_mut()
-                .find(|service| service.kind == kind)
-                .unwrap_or_else(|| panic!("no {kind} daemon runs beside node idx {idx}"));
-            let text = std::fs::read_to_string(&service.proc.log).unwrap_or_default();
-            if let Some(rest) = find_marker(&text, marker) {
-                return rest;
-            }
-            let exited = service
-                .proc
-                .child
-                .try_wait()
-                .expect("poll service")
-                .is_some();
-            if exited || Instant::now() >= deadline {
-                let verb = if exited { "exited" } else { "timed out" };
+        let service = self.services[idx]
+            .iter()
+            .find(|service| service.kind == kind)
+            .unwrap_or_else(|| panic!("no {kind} daemon runs beside node idx {idx}"));
+        service
+            .proc
+            .wait_marker(marker, Instant::now() + timeout)
+            .unwrap_or_else(|why| {
                 panic!(
-                    "{kind} daemon beside node idx {idx} {verb} without printing {marker:?};\n{}\n{text}",
+                    "{kind} daemon beside node idx {idx} {} without printing {marker:?};\n{}\n{}",
+                    why.verb(),
                     self.all_log_tails(60),
-                );
-            }
-            std::thread::sleep(Duration::from_millis(300));
-        }
+                    service.proc.text(),
+                )
+            })
     }
 
     /// kill the node at `idx` (crash-fault injection) and reap it.
@@ -1237,6 +1373,7 @@ impl Cluster {
         ));
         cfg.push_str(&format!("rpc_listen = \"127.0.0.1:{}\"\n", ports[1]));
         cfg.push_str(&format!("http_listen = \"127.0.0.1:{}\"\n", ports[2]));
+        cfg.push_str(&format!("block_time_ms = {TEST_BLOCK_TIME_MS}\n"));
         if self.wireguard {
             cfg.push_str(&format!("wireguard_listen = \"127.0.0.1:{}\"\n", ports[0]));
             cfg.push_str(&format!("invite_listen = \"127.0.0.1:{}\"\n", ports[3]));
@@ -1252,17 +1389,9 @@ impl Cluster {
         std::fs::write(&path, cfg).expect("write joiner config");
 
         let log = self.dir.path().join(format!("node{id}.log"));
-        let out = std::fs::File::create(&log).expect("create joiner log");
-        let err = out.try_clone().expect("clone joiner log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
-            .arg("node")
-            .arg("run")
-            .arg("--config")
-            .arg(&path)
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .spawn()
-            .expect("spawn joiner node");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("node").arg("run").arg("--config").arg(&path);
+        let joiner = NodeProc::spawn(id, log, cmd, "joiner");
 
         self.peer_ids.push(id);
         self.p2p_ports.push(ports[0]);
@@ -1273,7 +1402,7 @@ impl Cluster {
         // so a later `config_path(joiner_idx)` / `spawn` never panics.
         self.advertised.push(None);
         self.env.push(Vec::new());
-        self.nodes.push(Some(NodeProc { id, child, log }));
+        self.nodes.push(Some(joiner));
         self.peer_ids.len() - 1
     }
 
@@ -1298,19 +1427,16 @@ impl Cluster {
     /// reap it — the counterpart of [`Self::kill`] for restart tests.
     pub fn wait_exit(&mut self, idx: usize, timeout: Duration) {
         let deadline = Instant::now() + timeout;
-        loop {
-            let node = self.nodes[idx].as_mut().expect("node is running");
-            if node.child.try_wait().expect("poll node").is_some() {
-                self.nodes[idx] = None;
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "node idx {idx} did not exit within {timeout:?};\n{}",
-                self.all_log_tails(40)
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        let exited = self.nodes[idx]
+            .as_mut()
+            .expect("node is running")
+            .wait_exit(deadline);
+        assert!(
+            exited.is_ok(),
+            "node idx {idx} did not exit within {timeout:?};\n{}",
+            self.all_log_tails(40)
+        );
+        self.nodes[idx] = None;
     }
 
     /// run the node at `idx` with `--sync-only` to completion and return
@@ -1325,34 +1451,21 @@ impl Cluster {
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("node{id}-sync.log"));
-        let out = std::fs::File::create(&log).expect("create joiner log");
-        let err = out.try_clone().expect("clone joiner log handle");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
-            .arg("node")
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        cmd.arg("node")
             .arg("run")
             .arg("--config")
             .arg(&cfg)
-            .arg("--sync-only")
-            .stdout(Stdio::from(out))
-            .stderr(Stdio::from(err))
-            .spawn()
-            .expect("spawn sync-only joiner");
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            match child.try_wait().expect("poll joiner") {
-                Some(status) => break Some(status),
-                None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break None;
-                }
-                None => std::thread::sleep(Duration::from_millis(200)),
-            }
-        };
-        let text = std::fs::read_to_string(&log).unwrap_or_default();
-        match status {
-            Some(s) => (s.success(), text),
-            None => (false, format!("JOINER TIMED OUT after {timeout:?}\n{text}")),
+            .arg("--sync-only");
+        // dropped on the way out: a joiner still running past its deadline is
+        // killed and reaped like any other harness process.
+        let mut joiner = NodeProc::spawn(id, log, cmd, "sync-only joiner");
+        match joiner.wait_exit(Instant::now() + timeout) {
+            Ok(status) => (status.success(), joiner.text()),
+            Err(_) => (
+                false,
+                format!("JOINER TIMED OUT after {timeout:?}\n{}", joiner.text()),
+            ),
         }
     }
 
@@ -1365,25 +1478,22 @@ impl Cluster {
         find_marker(&text, marker)
     }
 
-    /// poll node `idx`'s log until a line contains `marker`, returning the
+    /// wait until node `idx` prints a line containing `marker`, returning the
     /// rest of that line. fails fast if the process exits without printing it.
-    pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
-        // (in-seam refactor: the loop body is shared with the compute-daemon
-        // twin below, so it moved to `await_marker` verbatim.)
-        match await_marker(
-            self.nodes[idx].as_mut().expect("node is running"),
-            marker,
-            timeout,
-        ) {
-            Ok(rest) => rest,
-            Err(why) => panic!(
-                "node {why} without printing {marker:?};\n{}",
-                self.all_log_tails(60)
-            ),
-        }
+    pub fn wait_marker(&self, idx: usize, marker: &str, timeout: Duration) -> String {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.wait_marker(marker, Instant::now() + timeout)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "node #{} {} without printing {marker:?};\n{}",
+                    node.id,
+                    why.verb(),
+                    self.all_log_tails(60)
+                )
+            })
     }
 
-    /// poll node `idx`'s COMPUTE DAEMON log until a line contains `marker`.
+    /// wait until node `idx`'s COMPUTE DAEMON prints a line containing `marker`.
     ///
     /// The compute plane is a SEPARATE PROCESS with its own failure domain, and
     /// without this the suite has no eye on it at all: a daemon that exits at
@@ -1394,19 +1504,21 @@ impl Cluster {
     /// while the daemon's one-line FATAL sits unread in a log nothing prints.
     /// That is exactly how a compute plane that could not claim ANY work reached
     /// review, so gating on the daemon's own lifecycle marker is the fix.
-    pub fn wait_compute_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
+    pub fn wait_compute_marker(&self, idx: usize, marker: &str, timeout: Duration) -> String {
         let daemon = self.daemons[idx]
-            .as_mut()
+            .as_ref()
             .expect("node has a compute daemon (set `compute_grant` before spawn)");
-        let log = daemon.log.clone();
-        match await_marker(daemon, marker, timeout) {
-            Ok(rest) => rest,
-            Err(why) => panic!(
-                "compute daemon {why} without printing {marker:?};\n\
-                 --- compute daemon log ---\n{}",
-                log_tail(&std::fs::read_to_string(&log).unwrap_or_default(), 60),
-            ),
-        }
+        daemon
+            .wait_marker(marker, Instant::now() + timeout)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "compute daemon #{} {} without printing {marker:?};\n\
+                     --- compute daemon log ---\n{}",
+                    daemon.id,
+                    why.verb(),
+                    daemon.tail(60),
+                )
+            })
     }
 
     /// Wait until `probe` answers, re-evaluating it on node `idx`'s heartbeat.
@@ -1425,43 +1537,16 @@ impl Cluster {
         idx: usize,
         what: &str,
         timeout: Duration,
-        mut probe: impl FnMut() -> Option<T>,
+        probe: impl FnMut() -> Option<T>,
     ) -> T {
-        // committed state may already satisfy it — never wait on a block that
-        // has nothing left to deliver (and the chain may be idle-quiet).
-        if let Some(value) = probe() {
-            return value;
-        }
-        let mut blocks = self.block_feed(idx, timeout);
-        loop {
-            if let Err(why) = blocks.next_block() {
-                panic!(
-                    "timed out after {timeout:?} waiting for {what} \
-                     (via node idx {idx}): {why};\n{}",
-                    self.all_log_tails(60)
-                );
-            }
-            if let Some(value) = probe() {
-                return value;
-            }
-        }
+        await_committed_on(self.http_ports[idx], idx, what, timeout, probe, || {
+            self.all_log_tails(60)
+        })
     }
 
     /// Attach to node `idx`'s block-wake feed (see [`BlockFeed`]).
     pub fn block_feed(&self, idx: usize, timeout: Duration) -> BlockFeed {
-        let url = format!("ws://127.0.0.1:{}/v1/ws", self.http_ports[idx]);
-        let (socket, _response) = tokio_tungstenite::tungstenite::connect(&url)
-            .unwrap_or_else(|e| panic!("attach to node idx {idx} block feed: {e}"));
-        // the failure path's bound, not a poll interval — see [`BlockFeed`].
-        if let tokio_tungstenite::tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_ref()
-        {
-            tcp.set_read_timeout(Some(timeout))
-                .expect("bound the block feed's failure path");
-        }
-        BlockFeed {
-            socket,
-            deadline: Instant::now() + timeout,
-        }
+        block_feed_on(self.http_ports[idx], idx, timeout)
     }
 
     /// one json-lines rpc round-trip against node `idx`, with connect retries
@@ -1476,21 +1561,15 @@ impl Cluster {
         loop {
             // the listener is up before the pump — connecting retries for
             // every cmd (nothing has been sent yet, so retrying is safe).
-            let connect_deadline = Instant::now() + Duration::from_secs(30);
-            let stream = loop {
-                match TcpStream::connect(("127.0.0.1", port)) {
-                    Ok(s) => break s,
-                    Err(e) => {
-                        assert!(
-                            Instant::now() < connect_deadline,
-                            "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
-                            self.all_log_tails(40)
-                        );
-                        std::thread::sleep(Duration::from_millis(200));
-                    }
-                }
-            };
-            let mut stream = stream;
+            // the node logs its rpc listener the moment the port is bound, and
+            // nothing answers before that — the line is the connect event.
+            self.wait_marker(idx, "rpc listening on", Duration::from_secs(30));
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|e| {
+                panic!(
+                    "rpc connect to node idx {idx} (port {port}) failed: {e};\n{}",
+                    self.all_log_tails(40)
+                )
+            });
             stream
                 .set_read_timeout(Some(Duration::from_secs(if retryable { 15 } else { 60 })))
                 .expect("rpc read timeout");
@@ -1665,25 +1744,24 @@ impl Cluster {
     /// removes as the panic unwinds, so a tail that skips them throws away the
     /// only copy.
     pub fn all_log_tails(&self, lines: usize) -> String {
-        let nodes = self.nodes.iter().flatten().map(|n| {
-            let text = std::fs::read_to_string(&n.log).unwrap_or_default();
-            format!("--- node #{} log tail ---\n{}", n.id, log_tail(&text, lines))
-        });
+        let nodes = self
+            .nodes
+            .iter()
+            .flatten()
+            .map(|n| format!("--- node #{} log tail ---\n{}", n.id, n.tail(lines)));
         let riding = self.daemons.iter().flatten().map(|d| {
-            let text = std::fs::read_to_string(&d.log).unwrap_or_default();
             format!(
                 "--- node #{} compute daemon log tail ---\n{}",
                 d.id,
-                log_tail(&text, lines)
+                d.tail(lines)
             )
         });
         let explicit = self.services.iter().flatten().map(|s| {
-            let text = std::fs::read_to_string(&s.proc.log).unwrap_or_default();
             format!(
                 "--- node #{} {} daemon log tail ---\n{}",
                 s.proc.id,
                 s.kind,
-                log_tail(&text, lines)
+                s.proc.tail(lines)
             )
         });
         nodes
@@ -1839,32 +1917,55 @@ pub fn skip_unless_sandboxed(test: &str) -> Option<()> {
     nettest::skip_without(test, unsandboxable_host())
 }
 
-#[allow(unused_imports)] // a shared prelude: not every e2e binary polls
-pub use nettest::poll_until;
-
 // `n` distinct free localhost ports, collision-safe (holds every listener at
 // once — sequential bind-drop could hand the same port back twice).
 use nettest::alloc_ports;
 
-/// Watch one child process's log for `marker`, returning the rest of the line.
-///
-/// `Err` carries only the reason phrase (`"#3 exited"`, `"timed out"`) so each
-/// caller can attach the log tails that make ITS failure diagnosable.
-fn await_marker(proc: &mut NodeProc, marker: &str, timeout: Duration) -> Result<String, String> {
-    let deadline = Instant::now() + timeout;
+/// Wait until `probe` answers, re-evaluating it on each block wake from the
+/// node whose app surface listens on `http_port` — the one body behind both
+/// clusters' `await_committed`. `tails` renders the diagnosis on failure.
+fn await_committed_on<T>(
+    http_port: u16,
+    idx: usize,
+    what: &str,
+    timeout: Duration,
+    mut probe: impl FnMut() -> Option<T>,
+    tails: impl Fn() -> String,
+) -> T {
+    // committed state may already satisfy it — never wait on a block that
+    // has nothing left to deliver (and the chain may be idle-quiet).
+    if let Some(value) = probe() {
+        return value;
+    }
+    let mut blocks = block_feed_on(http_port, idx, timeout);
     loop {
-        let text = std::fs::read_to_string(&proc.log).unwrap_or_default();
-        if let Some(rest) = find_marker(&text, marker) {
-            return Ok(rest);
+        if let Err(why) = blocks.next_block() {
+            panic!(
+                "timed out after {timeout:?} waiting for {what} \
+                 (via node idx {idx}): {why};\n{}",
+                tails()
+            );
         }
-        let exited = proc.child.try_wait().expect("poll child").is_some();
-        if exited {
-            return Err(format!("#{} exited", proc.id));
+        if let Some(value) = probe() {
+            return value;
         }
-        if Instant::now() >= deadline {
-            return Err(format!("#{} timed out", proc.id));
-        }
-        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// Attach to the block-wake feed of the node whose app surface listens on
+/// `http_port` (see [`BlockFeed`]).
+fn block_feed_on(http_port: u16, idx: usize, timeout: Duration) -> BlockFeed {
+    let url = format!("ws://127.0.0.1:{http_port}/v1/ws");
+    let (socket, _response) = tokio_tungstenite::tungstenite::connect(&url)
+        .unwrap_or_else(|e| panic!("attach to node idx {idx} block feed: {e}"));
+    // the failure path's bound, not a poll interval — see [`BlockFeed`].
+    if let tokio_tungstenite::tungstenite::stream::MaybeTlsStream::Plain(tcp) = socket.get_ref() {
+        tcp.set_read_timeout(Some(timeout))
+            .expect("bound the block feed's failure path");
+    }
+    BlockFeed {
+        socket,
+        deadline: Instant::now() + timeout,
     }
 }
 
@@ -1897,7 +1998,7 @@ pub struct BlockFeed {
 
 impl BlockFeed {
     /// Block until the node reports its next block wake.
-    fn next_block(&mut self) -> Result<(), String> {
+    pub fn next_block(&mut self) -> Result<(), String> {
         use tokio_tungstenite::tungstenite::Message;
         loop {
             if Instant::now() >= self.deadline {
@@ -2057,12 +2158,14 @@ pub fn create_account(
         &identity::encode_msg(&identity::testkit::create(name)),
     );
     let key = user.public_key().as_ref().to_vec();
-    poll_until(
-        &format!("account {name:?} to found"),
-        USER_LANE_FINALIZE,
-        || account_of_key(cluster, idx, &key),
-    )
-    .number
+    cluster
+        .await_committed(
+            idx,
+            &format!("account {name:?} to found"),
+            USER_LANE_FINALIZE,
+            || account_of_key(cluster, idx, &key),
+        )
+        .number
 }
 
 /// admit `new_key` into `member`'s account through node `idx`: `member`
@@ -2076,9 +2179,12 @@ pub fn add_key(
     new_key: &ed25519::PrivateKey,
 ) -> identity::AccountView {
     let joining = new_key.public_key().as_ref().to_vec();
-    let generation = poll_until("the joining key's generation", USER_LANE_FINALIZE, || {
-        key_gen(cluster, idx, &joining)
-    });
+    let generation = cluster.await_committed(
+        idx,
+        "the joining key's generation",
+        USER_LANE_FINALIZE,
+        || key_gen(cluster, idx, &joining),
+    );
     submit_frame(
         cluster,
         idx,
@@ -2092,7 +2198,10 @@ pub fn add_key(
             None,
         )),
     );
-    poll_until("the joining key to resolve", USER_LANE_FINALIZE, || {
-        account_of_key(cluster, idx, &joining)
-    })
+    cluster.await_committed(
+        idx,
+        "the joining key to resolve",
+        USER_LANE_FINALIZE,
+        || account_of_key(cluster, idx, &joining),
+    )
 }

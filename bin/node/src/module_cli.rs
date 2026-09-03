@@ -171,15 +171,9 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         .map_err(|e| format!("read {}: {e}", args.component.display()))?;
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
-    let rpc_addr = resolved.rpc_listen.clone().ok_or(format!(
-        "{} drives the node's local rpc — set `rpc_listen` in node.toml",
-        verb.name()
-    ))?;
-    let http_listen = resolved.service.http_listen.as_deref().ok_or(format!(
-        "{} stages over the node's http surface — set `http_listen` in node.toml",
-        verb.name()
-    ))?;
-    let http_base = config::http_base_of(http_listen);
+    let node = crate::cli::DrivenNode::of(&resolved, verb.name())?;
+    let rpc_addr = node.rpc();
+    let http_base = node.http_base();
     let code_hash: [u8; 32] = {
         use sha2::Digest as _;
         sha2::Sha256::digest(&bytes).into()
@@ -188,7 +182,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     // 1. the registry's static rules, before anything is staged or proposed:
     //    each would reject governance's execute in-kernel and leave a
     //    proposal open for its whole voting period.
-    let precheck = registry_precheck(verb, &read_module_status(&rpc_addr)?, &args.id, &code_hash)?;
+    let precheck = registry_precheck(verb, &read_module_status(rpc_addr)?, &args.id, &code_hash)?;
     match precheck {
         Precheck::Proceed => {}
         // a member running the verb after the deciding ballot (or after the
@@ -208,7 +202,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     // 2. stage + fan-out; 3. every member holds the bytes or nothing is proposed
     // the token lives in the node's workspace — its `storage_dir` in the dev
     // shape, which is NOT the config file's directory.
-    let reply = stage_component(&http_base, &resolved.service.workspace, &bytes)?;
+    let reply = stage_component(http_base, &resolved.service.workspace, &bytes)?;
     digest_matches(&reply, &bytes)?;
     eprintln!(
         "staged {} ({} bytes), {} peer receipt(s)",
@@ -221,16 +215,16 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     // member allowed no receipt is THIS NODE's key — not the governance
     // signer's, which under share governance is an account key.
     let me_hex = hex_bytes(resolved.signer.public_key().as_ref());
-    let members = crate::cli::read_members(&rpc_addr)?;
+    let members = crate::cli::read_members(rpc_addr)?;
     refuse_on_missing_receipts(&reply, &members, &me_hex)?;
-    let signer = crate::cli::gov_signer(&rpc_addr, &cfg_path, &resolved)?;
+    let signer = crate::cli::gov_signer(rpc_addr, &cfg_path, &resolved)?;
     let pubkey_hex = signer_pubkey_hex(&signer);
 
     // 4. activation = this node's height + N (each member computes its own).
     //    an `--after` that wraps would land UNDER the floor in release, where
     //    the matcher's debug assert is compiled out: the verb would mint a
     //    proposal the registry refuses at execute.
-    let height = current_height(&rpc_addr)?;
+    let height = current_height(rpc_addr)?;
     let activation_height = height
         .checked_add(args.after)
         .ok_or("--after overflows the chain height")?;
@@ -241,7 +235,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     //    decidable
     let matches = matches_module_action(verb, &args.id, &code_hash, floor);
     let ceremony = crate::cli::drive_proposal_ceremony(
-        &rpc_addr,
+        &node,
         &signer,
         &pubkey_hex,
         verb.name(),
@@ -251,12 +245,12 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     );
     let outcome = match ceremony {
         Ok(outcome) => outcome,
-        Err(error) => return Err(ceremony_failed(&rpc_addr, &args.id, &code_hash, error)),
+        Err(error) => return Err(ceremony_failed(rpc_addr, &args.id, &code_hash, error)),
     };
     match outcome {
         CeremonyOutcome::AwaitingBallots => Ok(()),
         CeremonyOutcome::Passed => {
-            confirm_scheduled(&rpc_addr, &args.id, &code_hash, activation_height)
+            confirm_scheduled(rpc_addr, &args.id, &code_hash, activation_height)
         }
     }
 }
