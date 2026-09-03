@@ -1656,18 +1656,39 @@ impl Cluster {
 
     /// every running node's log tail — the panic payload that makes a stalled
     /// mesh diagnosable from a CI failure alone.
+    /// Every log this cluster owns: each node's, AND each service daemon's.
+    ///
+    /// The daemons are not decoration. A dispatch/agent e2e fails on a
+    /// PREDICATE the node's own log cannot explain — "no provider announced its
+    /// tags", "nobody bid" — because the decision was the daemon's and the node
+    /// only ever saw its silence. Those logs live in a `TempDir` that Drop
+    /// removes as the panic unwinds, so a tail that skips them throws away the
+    /// only copy.
     pub fn all_log_tails(&self, lines: usize) -> String {
-        self.nodes
-            .iter()
-            .flatten()
-            .map(|n| {
-                let text = std::fs::read_to_string(&n.log).unwrap_or_default();
-                format!(
-                    "--- node #{} log tail ---\n{}",
-                    n.id,
-                    log_tail(&text, lines)
-                )
-            })
+        let nodes = self.nodes.iter().flatten().map(|n| {
+            let text = std::fs::read_to_string(&n.log).unwrap_or_default();
+            format!("--- node #{} log tail ---\n{}", n.id, log_tail(&text, lines))
+        });
+        let riding = self.daemons.iter().flatten().map(|d| {
+            let text = std::fs::read_to_string(&d.log).unwrap_or_default();
+            format!(
+                "--- node #{} compute daemon log tail ---\n{}",
+                d.id,
+                log_tail(&text, lines)
+            )
+        });
+        let explicit = self.services.iter().flatten().map(|s| {
+            let text = std::fs::read_to_string(&s.proc.log).unwrap_or_default();
+            format!(
+                "--- node #{} {} daemon log tail ---\n{}",
+                s.proc.id,
+                s.kind,
+                log_tail(&text, lines)
+            )
+        });
+        nodes
+            .chain(riding)
+            .chain(explicit)
             .collect::<Vec<_>>()
             .join("\n")
     }
