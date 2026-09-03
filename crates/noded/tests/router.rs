@@ -936,6 +936,100 @@ async fn a_non_loopback_peer_is_refused_under_loopback_exposure() {
     );
 }
 
+/// The operator trigger for the mid-life netstack backend swap: what the route
+/// answers with no plane behind it, with one that takes the swap, with one that
+/// refuses it, and on a body it cannot parse.
+///
+/// A refusal is a 409 and the RUNNING machine continues — the executor's
+/// contract — so the route must surface the plane's reason rather than retry.
+#[tokio::test]
+async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
+    // no swapper wired: the node runs no reachability plane, and the route says
+    // so instead of pretending a backend exists.
+    let (handle, cmd_rx) = operator_handle();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(post(
+            "/v1/admin/netstack/swap",
+            serde_json::json!({ "backend": "native" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body_json(response).await["reason"], "netstack_plane_absent");
+
+    // a wired plane that takes the swap answers the new backend's name; the
+    // request the route decoded reaches the plane intact.
+    let (handle, cmd_rx) = operator_handle();
+    spawn_fake_actor(cmd_rx, None);
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    handle.status_cell().wire_netstack_swapper(move |request| {
+        recorded.lock().unwrap().push(request.clone());
+        Box::pin(async move {
+            match request {
+                noded::NetstackSwapRequest::Native => Ok("native".to_string()),
+                // the frozen snapshot contract refuses a component built
+                // against another contract BY NAME, before a byte is decoded.
+                noded::NetstackSwapRequest::Component(_) => {
+                    Err("foreign contract: ducktape:netstack@0.2.0".to_string())
+                }
+            }
+        })
+    });
+    let router = noded::router(handle);
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/v1/admin/netstack/swap",
+            serde_json::json!({ "backend": "native" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_json(response).await["backend"], "native");
+
+    // a refused swap: 409, the plane's own reason in `error`, and the stable
+    // token in `reason`.
+    let response = router
+        .clone()
+        .oneshot(post(
+            "/v1/admin/netstack/swap",
+            serde_json::json!({ "backend": { "component": "/srv/netstack.wasm" } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_json(response).await;
+    assert_eq!(body["reason"], "netstack_swap_refused");
+    assert!(
+        body["error"].as_str().unwrap().contains("foreign contract"),
+        "the plane's refusal must reach the operator: {body}"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            noded::NetstackSwapRequest::Native,
+            noded::NetstackSwapRequest::Component("/srv/netstack.wasm".into()),
+        ],
+    );
+
+    // a misspelled key must be a 400, never a request that silently swapped
+    // nothing.
+    let response = router
+        .oneshot(post(
+            "/v1/admin/netstack/swap",
+            serde_json::json!({ "backends": "native" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(response).await["reason"],
+        "netstack_swap_body_invalid"
+    );
+}
+
 /// THE regression this gate exists for: a LOOPBACK process with no operator
 /// credential — a service daemon, a stray script, anything that can dial the
 /// port — must not be able to stop the node or stage module wasm. The operator,
@@ -952,6 +1046,9 @@ async fn a_loopback_caller_without_the_operator_credential_cannot_drive_admin() 
         ("POST", "/v1/admin/shutdown"),
         ("POST", "/v1/admin/module-code/stage"),
         ("GET", "/v1/admin/logs/tail"),
+        // the netstack swap moves the whole reachability plane onto another
+        // machine: as much node control as shutdown is.
+        ("POST", "/v1/admin/netstack/swap"),
     ] {
         let (handle, cmd_rx) = operator_handle();
         spawn_fake_actor(cmd_rx, None);

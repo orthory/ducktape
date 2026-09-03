@@ -94,6 +94,7 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             join_requests,
+            metrics,
             ..
         } = self;
 
@@ -134,6 +135,7 @@ impl ValidatorRuntime<'_> {
                         height: node.finalized().map(|f| f.height),
                         root_hash: hex(&node.root_hash()),
                         modules,
+                        netstack: metrics.operational_status().netstack,
                     }),
                     ..RpcReply::ok()
                 }
