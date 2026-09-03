@@ -689,6 +689,19 @@ async fn reachability_plane(
             .ok()
             .and_then(|mut addrs| addrs.next()),
     };
+    // the underlay (coordinator rendezvous, the tunnel endpoint peers dial)
+    // is a real IPv4 socket, so its ingresses resolve to the IPv4 candidate,
+    // not the first one: on an IPv6-only network with NAT64 (macOS CLAT46),
+    // getaddrinfo synthesises `64:ff9b::a.b.c.d` for a V4-only host and can
+    // list it FIRST — a V6 destination the V4 socket refuses with EINVAL, for
+    // life, since a hostname resolves once here.
+    let resolve_underlay_ingress = |ingress: &Ingress| match ingress {
+        Ingress::Socket(addr) => underlay_addr(std::iter::once(*addr)),
+        Ingress::Dns { host, port } => (host.as_str(), *port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(underlay_addr),
+    };
     let Some(control_addr) = resolve_ingress(&advertised) else {
         // the plane never starts and the node runs on forever with NO overlay:
         // no tunnels, no hub, every huddle failing with a string that names none
@@ -743,7 +756,7 @@ async fn reachability_plane(
         // advertise split (change 3): resolved ONCE here, same discipline as
         // `advertised` above, independent of whether `wireguard_listen` is
         // itself unspecified.
-        Some(ingress) => match resolve_ingress(ingress) {
+        Some(ingress) => match resolve_underlay_ingress(ingress) {
             Some(addr) => match wireguard::Endpoint::new(
                 addr.ip(),
                 addr.port(),
@@ -778,7 +791,7 @@ async fn reachability_plane(
     };
     let mut coords: Vec<std::net::SocketAddr> = Vec::new();
     for ingress in &coordinators {
-        match resolve_ingress(ingress) {
+        match resolve_underlay_ingress(ingress) {
             Some(addr) if !coords.contains(&addr) => coords.push(addr),
             Some(_) => {}
             None => tracing::warn!(
@@ -786,7 +799,7 @@ async fn reachability_plane(
                 node = %label,
                 coordinator = ?ingress,
                 reason = "coordinator_unresolvable",
-                "coordinator skipped"
+                "coordinator skipped — no IPv4 address for the IPv4 underlay"
             ),
         }
     }
@@ -1319,4 +1332,14 @@ fn spawn_handshake_sampler(probes: overlay_net::userspace::ProbeSlot, label: Str
             last_session.retain(|ip, _| peers.iter().any(|(seen, _)| seen == ip));
         }
     });
+}
+
+/// the address an IPv4 underlay socket can send to, out of a resolution
+/// result: the first IPv4 candidate. `None` when the host has no IPv4 at all
+/// — the socket could not reach it anyway, and saying so beats an EINVAL on
+/// every send.
+pub(crate) fn underlay_addr(
+    addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Option<std::net::SocketAddr> {
+    addrs.into_iter().find(std::net::SocketAddr::is_ipv4)
 }

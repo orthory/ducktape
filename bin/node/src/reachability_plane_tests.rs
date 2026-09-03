@@ -404,3 +404,38 @@ fn an_idle_session_lapse_is_not_a_dark_peer() {
         "never handshaked, so there is no lapse to measure"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `underlay_addr`: the IPv4 underlay's pick out of a hostname resolution.
+// ---------------------------------------------------------------------------
+
+use crate::reachability_plane::underlay_addr;
+
+fn addr(s: &str) -> std::net::SocketAddr {
+    s.parse().unwrap()
+}
+
+/// the NAT64 shape (macOS CLAT46 on an IPv6-only network): getaddrinfo lists
+/// the synthesised `64:ff9b::` candidate FIRST, the real IPv4 record behind
+/// it. the real-IPv4 underlay socket refuses the V6 with EINVAL, so the pick
+/// must be the V4.
+#[test]
+fn nat64_synthesised_v6_first_still_picks_the_v4() {
+    let picked = underlay_addr([
+        addr("[64:ff9b::334f:42b8]:3478"),
+        addr("51.79.66.184:3478"),
+    ]);
+    assert_eq!(picked, Some(addr("51.79.66.184:3478")));
+}
+
+#[test]
+fn the_first_v4_wins_among_several() {
+    let picked = underlay_addr([addr("203.0.113.1:3478"), addr("203.0.113.2:3478")]);
+    assert_eq!(picked, Some(addr("203.0.113.1:3478")));
+}
+
+#[test]
+fn a_v6_only_host_is_unreachable_for_the_v4_underlay() {
+    assert_eq!(underlay_addr([addr("[2001:db8::1]:3478")]), None);
+    assert_eq!(underlay_addr([]), None);
+}
