@@ -1,20 +1,14 @@
 ---
 name: qa
-description: Verify a running Ducktape node and cluster — the node's /v1 surface, module transaction round-trips, the real-socket cluster e2e, and the desktop app's own unit lane. The agent-driven desktop QA (iced-agent bridge, headless fleet, recipe lanes) is retired; app/ itself is live and tested with cargo test -p ducktape-app.
+description: Verify a running Ducktape node and cluster — the node's /v1 surface, module transaction round-trips, the real-socket cluster e2e, the desktop app's own unit lane, and the live huddle lane. The app has no headless driving lane; its suites run with cargo test -p ducktape-app.
 ---
 
 # Node QA
 
-The AGENT-DRIVEN desktop QA — the iced-agent bridge, the `ops/iced-fleet`
-headless fleet, and the `qa/recipes/*.json` recipe lanes — is retired, along
-with the `app/src-iced` and `app/src-tauri` shells and the TypeScript those
-lanes drove.
-
-**`app/` itself was rewritten in place, not removed.** `ducktape-app` is a live
-workspace member (`Cargo.toml`), a native Iced client with its UI in
+`ducktape-app` (`app/`) is a native Iced client with its UI in
 `app/src/ui/*.ice` and its own `#[cfg(test)]` suites. It has no headless
 driving lane; its unit tests run like any other crate and belong in every QA
-pass. What is gone is the way we USED to drive it, not the app.
+pass.
 
 ## What to run
 
@@ -27,9 +21,8 @@ cargo test -p ducktape-app                   # the desktop app's own suites
 make test                                    # full local gate: wasm drift + workspace + sim
 ```
 
-`cargo test -p ducktape-app` is not optional and not covered by the node lanes
-above: this list omitted it for as long as this skill claimed `app/` had been
-removed, and every QA pass that followed the list silently skipped the crate.
+`cargo test -p ducktape-app` is part of every QA pass; the node lanes above do
+not cover it.
 
 ### The huddle: three lanes, and only the last one is the whole thing
 

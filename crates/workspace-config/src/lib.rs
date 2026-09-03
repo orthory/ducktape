@@ -948,22 +948,27 @@ pub fn http_base_in(dir: &Path) -> Result<String, String> {
     Ok(http_base_of(&raw.http_listen))
 }
 
-/// `http://<host:port>` for a node.toml `http_listen`, rewriting a wildcard
-/// bind to the SAME family's loopback: a wildcard means "every interface", and
-/// a co-located CLI reaches the node over loopback. `0.0.0.0` → `127.0.0.1`,
-/// but `[::]` → `[::1]`, NOT 127.0.0.1 — a bindv6only `[::]` listener refuses
-/// v4 loopback dials (mirrors `agent_provision::node_http_base`).
+/// `http://<loopback>:<port>` for a node.toml `http_listen`. ALWAYS loopback,
+/// whatever the operator bound: every caller of this is a same-box process
+/// dialing its OWN node, and the node's write gate admits a credentialed
+/// caller only from a loopback peer (`noded::signed_req::operator_credential_matches`
+/// ends in `on_box && token_matches`). Dialing a concrete bind address
+/// (`http_listen = "10.0.0.5:8844"`) therefore arrives non-loopback and the
+/// node refuses its own daemons.
+///
+/// The FAMILY is kept: a bracketed IPv6 literal maps to `[::1]`, not
+/// `127.0.0.1` — a bindv6only listener refuses v4 loopback dials.
 pub fn http_base_of(http_listen: &str) -> String {
     let Some((host, port)) = http_listen.rsplit_once(':') else {
         return format!("http://{http_listen}");
     };
-    let loopback = match host {
-        "0.0.0.0" => Some("127.0.0.1"),
-        "[::]" => Some("[::1]"),
-        _ => None,
+    let is_ipv6_literal = host.starts_with('[');
+    let loopback = if is_ipv6_literal {
+        "[::1]"
+    } else {
+        "127.0.0.1"
     };
-    let host = loopback.unwrap_or(host);
-    format!("http://{host}:{port}")
+    format!("http://{loopback}:{port}")
 }
 
 /// enumerate the workspace registry: `(chain_id, node.toml path)` per
@@ -1293,13 +1298,18 @@ mod tests {
     }
 
     #[test]
-    fn http_base_substitutes_wildcard_hosts_only() {
+    fn http_base_is_always_loopback_in_the_bound_family() {
         assert_eq!(http_base_of("0.0.0.0:8844"), "http://127.0.0.1:8844");
         // a bindv6only `[::]` refuses v4 loopback dials → v6 loopback, not 127.0.0.1
         assert_eq!(http_base_of("[::]:8844"), "http://[::1]:8844");
         assert_eq!(http_base_of("127.0.0.1:8844"), "http://127.0.0.1:8844");
         assert_eq!(http_base_of("[::1]:8844"), "http://[::1]:8844");
-        assert_eq!(http_base_of("192.168.1.5:80"), "http://192.168.1.5:80");
+        // a CONCRETE bind is still dialed over loopback: the node's write gate
+        // admits only loopback peers, so 10.0.0.5 would make it refuse its own
+        // daemons.
+        assert_eq!(http_base_of("10.0.0.5:8844"), "http://127.0.0.1:8844");
+        assert_eq!(http_base_of("192.168.1.5:80"), "http://127.0.0.1:80");
+        assert_eq!(http_base_of("[2001:db8::5]:8844"), "http://[::1]:8844");
     }
 
     #[test]

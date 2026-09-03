@@ -205,6 +205,11 @@ pub enum ReachabilityCommand {
     },
     /// The consensus view advanced (drives expiry checks between cutovers).
     ViewTick(u64),
+    /// This node's own coordinator-observed reflexive mapping moved (see
+    /// [`Event::ReflexiveChanged`]). Sent ONLY on a real change — the
+    /// resolver's status watch is the observation, and the plane treats
+    /// every one of these as a NAT rebind worth a fresh record.
+    ReflexiveChanged { endpoint: SocketAddr },
     /// Periodic controller kick: re-offer whatever this node is still
     /// waiting on (see [`Event::Nudge`] for the full contract).
     Nudge,
@@ -654,6 +659,9 @@ impl<E: WireGuardEffect> Host<E> {
                 step(Event::Deliver { from, bytes }, false)
             }
             ReachabilityCommand::ViewTick(view) => step(Event::ViewTick(view), false),
+            ReachabilityCommand::ReflexiveChanged { endpoint } => {
+                step(Event::ReflexiveChanged { endpoint }, false)
+            }
             ReachabilityCommand::Nudge => step(Event::Nudge, false),
             ReachabilityCommand::SwapBackend { backend, reply } => {
                 Ok(Input::Swap { backend, reply })

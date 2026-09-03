@@ -8,6 +8,10 @@
 # is the full local verification gate — run it before every push.
 
 CARGO ?= cargo
+# every build/test recipe resolves against the COMMITTED lock: a guest's wasm
+# bytes are pinned by GENESIS_ROOT_HASH, so a silent re-resolution between two
+# operators moves the genesis hash with no source change.
+LOCKED ?= --locked
 APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
@@ -16,7 +20,7 @@ UNAME_S := $(shell uname -s)
 
 ## build every workspace crate (the default target)
 all:
-	$(CARGO) build --workspace
+	$(CARGO) build $(LOCKED) --workspace
 
 ## the app dev loop: seed the "demo" localnet if it does not exist yet
 ## (DEV_RESEED=1 forces a fresh seed), start its node when it is not already
@@ -68,19 +72,19 @@ dogfood-forge:
 ## (its own Cargo.lock) so its revm/alloy dep tree never taxes workspace gates;
 ## this target is how CI/devs still keep it compiling.
 labs-gate:
-	$(CARGO) check --manifest-path crates/labs/Cargo.toml
+	$(CARGO) check $(LOCKED) --manifest-path crates/labs/Cargo.toml
 
 ## release build of the networked node (the app-facing daemon surface)
 node:
-	$(CARGO) build --release -p node-bin
+	$(CARGO) build $(LOCKED) --release -p node-bin
 
 ## release build of the untrusted UDP coordinator
 coordinator:
-	$(CARGO) build --release -p coordinator-bin
+	$(CARGO) build $(LOCKED) --release -p coordinator-bin
 
 ## coordinator-only verification gate: CLI/policy tests + live UDP smoke
 coordinator-smoke:
-	$(CARGO) test -p coordinator-bin
+	$(CARGO) test $(LOCKED) -p coordinator-bin
 
 ifeq ($(UNAME_S),Darwin)
 # Build cargo-ice from the same ducktape-ui rev as the app. A global cargo-ice
@@ -128,7 +132,7 @@ install: install-node install-app
 
 ## build the desktop app binary
 app:
-	$(CARGO) build --release -p ducktape-app
+	$(CARGO) build $(LOCKED) --release -p ducktape-app
 
 ## install the desktop app and REGISTER THE duck:// SCHEME with the desktop.
 ## The `.desktop` entry's `MimeType=x-scheme-handler/duck` is what makes
@@ -168,7 +172,7 @@ install-node:
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
 install-coordinator:
-	$(CARGO) build --release -p coordinator-bin
+	$(CARGO) build $(LOCKED) --release -p coordinator-bin
 	mkdir -p "$(BIN_DEST)"
 	install -m 755 target/release/coordinator "$(BIN_DEST)/ducktape-coordinator"
 
@@ -197,7 +201,7 @@ test: wasm-modules-check
 # The reclaim may not fail the gate: a first run has nothing to clean.
 	-rm -rf "$(TEST_TMPDIR)" 2>/dev/null
 	mkdir -p "$(TEST_TMPDIR)"
-	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test --workspace
+	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test $(LOCKED) --workspace
 # the auth page's pure helpers (fragment parsing, DER→raw, SPKI→SEC1) — the
 # browser half of `crates/authpage`'s contract, dependency-free under node.
 	node ops/auth-page/test.mjs
@@ -211,13 +215,13 @@ test: wasm-modules-check
 # after_launch_cwd_is_deleted` re-execs the test binary, and doing that under 32
 # live libtest threads made unrelated tests fail ~4 runs in 11 with integrity
 # errors. Serial + its own invocation is the isolation. See #887.
-	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test -p node-bin --bin ducktape -- --ignored --test-threads=1
-	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test -p consensus --features sim
+	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test $(LOCKED) -p node-bin --bin ducktape -- --ignored --test-threads=1
+	TMPDIR="$(TEST_TMPDIR)" $(CARGO) test $(LOCKED) -p consensus --features sim
 # ducktape-app rides this line for a reason: `cargo test` builds the TEST
 # target, which links dev-dependencies, so a product path reaching for a
 # dev-only crate compiles under every test lane and breaks only the BINARY.
 # That is not hypothetical — it shipped and sat on dev for 81 commits.
-	$(CARGO) build -p noded-bin -p simnode -p ducktape-app
+	$(CARGO) build $(LOCKED) -p noded-bin -p simnode -p ducktape-app
 
 ## rebuild every wasm guest module into its componentized artifact and refresh
 ## EVERY committed copy in one sweep (the canonical node-embedded artifact +
@@ -269,18 +273,21 @@ NETSTACK_GUEST := crates/networking/netstack-machine
 wasm-modules:
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
-	  $(CARGO) run -q -p guest-builder -- $$m && \
+	  $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m && \
 	  cp $$m/component.wasm \
 	    crates/kernel/host/tests/fixtures/$$id.component.wasm || exit 1; \
 	done
 	@for m in $(INDEX_MODULES); do \
-	  $(CARGO) run -q -p guest-builder -- --index $$m || exit 1; \
+	  $(CARGO) run -q $(LOCKED) -p guest-builder -- --index $$m || exit 1; \
 	done
-	$(CARGO) run -q -p guest-builder -- $(NETSTACK_GUEST)
+	$(CARGO) run -q $(LOCKED) -p guest-builder -- $(NETSTACK_GUEST)
 	# hello mirrors its component into BOTH fixture homes; sibling/object write
 	# straight to the wasm-host fixture with no guest copy; hello-replacement
 	# builds the replacement crate directly into the host fixture. Each shape is
-	# unique — kept explicit.
+	# unique — kept explicit. No $(LOCKED) below: these four are STANDALONE
+	# workspaces with no committed lock, and their components are kernel test
+	# fixtures — nothing the genesis hash pins. Committing their locks is what
+	# would earn them the flag.
 	cd crates/guests/hello-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
@@ -351,7 +358,7 @@ wasm-index-check:
 	@mkdir -p "$(INDEX_CHECK_DIR)"
 	@for m in $(INDEX_MODULES); do \
 	  id=$$(basename $$m) && \
-	  $(CARGO) run -q -p guest-builder -- --index $$m \
+	  $(CARGO) run -q $(LOCKED) -p guest-builder -- --index $$m \
 	    --out "$(INDEX_CHECK_DIR)/$$id.wasm" >/dev/null || exit 1; \
 	  cmp $$m/index.wasm "$(INDEX_CHECK_DIR)/$$id.wasm" || { \
 	    echo "$$m/index.wasm does not match a rebuild of its source. Refresh it:"; \

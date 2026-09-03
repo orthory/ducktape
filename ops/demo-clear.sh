@@ -28,6 +28,11 @@ REG="$DUCK/registry.json"
 log(){ printf '\033[36m[demo-clear]\033[0m %s\n' "$*"; }
 die(){ printf '\033[31m[demo-clear] %s\033[0m\n' "$*" >&2; exit 1; }
 
+# One string field out of the node's flat `{"error":…,"reason":…}` refusal body.
+# `reason` is a snake_case token, so `[^"]*` is exact for it; the `error`
+# sentence would truncate at an escaped quote, which is fine for a log line.
+json_string(){ sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+
 command -v bun >/dev/null || die "bun is required"
 
 # pids of LIVE processes verifiably serving THIS workspace: a `pgrep -f` sweep
@@ -103,15 +108,10 @@ else
   # new one"). A route the node never mounted (admin disabled) 404s with an empty
   # body, and an unreachable port answers 000 with none — then the status is the
   # whole diagnosis and the line carries neither.
-  DETAIL="$(printf '%s' "${RESPONSE%$'\n'*}" | bun -e '
-    try {
-      const body = await Bun.stdin.json();
-      const said = [];
-      if (body.reason) said.push("reason=" + body.reason);
-      if (body.error) said.push(body.error);
-      console.log(said.join(": "));
-    } catch {}
-  ' 2>/dev/null)"
+  BODY="${RESPONSE%$'\n'*}"
+  REASON="$(printf '%s' "$BODY" | json_string reason)"
+  SENTENCE="$(printf '%s' "$BODY" | json_string error)"
+  DETAIL="${REASON:+reason=$REASON}${SENTENCE:+${REASON:+ }$SENTENCE}"
   case "$CODE" in
     2*) : ;;
     *) log "graceful shutdown did not succeed (http ${CODE:-none}${DETAIL:+, $DETAIL}) — using the pid sweep" ;;
