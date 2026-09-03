@@ -46,14 +46,16 @@ const MUST_SPEAK: &[&str] = &["microvm.rs", "workspace_image.rs"];
 /// touches the guest binary.
 const SHARED_WITH_GUEST_INIT: &[&str] = &["guest_manifest.rs", "guest_proto.rs", "guest_paths.rs"];
 
-/// the whole crate's `info` budget: the daemon-boot probe, and nothing else.
+/// the whole crate's `info` budget: the daemon-boot probe and the executor
+/// image (re)build, and nothing else. Both are per-{boot} facts — the image is
+/// rebuilt only when the executors directory changed since the last build.
 ///
 /// A run is per-{run}, not per-{boot}: promoting one of its lines to `info` for
 /// visibility puts it in a 4096-line ring that a busy node evicts in minutes,
 /// destroying the context around the failure it was added to explain. The run's
 /// single `info` lives on the daemon side, where the capability tag and run key
 /// exist to make it worth the slot.
-const INFO_BUDGET: usize = 1;
+const INFO_BUDGET: usize = 2;
 
 struct Event {
     file: PathBuf,
@@ -210,7 +212,7 @@ fn the_crate_spends_exactly_its_info_budget() {
     assert_eq!(
         spent.len(),
         INFO_BUDGET,
-        "the sandbox crate's `info` budget is {INFO_BUDGET} (the daemon-boot probe). \
+        "the sandbox crate's `info` budget is {INFO_BUDGET} (the daemon-boot probe and the executor image build). \
          Per-run and per-frame lines belong at debug/trace — an info that fires per run \
          evicts the ring it was added to explain:\n{}",
         spent.join("\n"),

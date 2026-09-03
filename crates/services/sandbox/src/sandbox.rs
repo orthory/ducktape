@@ -154,7 +154,7 @@ impl SandboxBackend {
     pub fn probe(&self) -> Result<PathBuf, String> {
         let found = self.probe_adapter()?;
         self.probe_images()?;
-        // Once per DAEMON BOOT — the crate's whole `info` budget, and the only
+        // Once per DAEMON BOOT — one of the crate's two `info` slots, and the only
         // line that separates "this daemon probed green" from "this daemon
         // never reached the probe". The FAILURE arms stay as the returned Err:
         // the compute daemon dies on it and the operator reads it from main, so
