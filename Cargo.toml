@@ -212,6 +212,8 @@ tracing = "0.1"
 arrayvec = "0.7"
 crossbeam-channel = "0.5"
 lru = "0.18"
+# rlimit/mallopt syscalls: the open-file raise every binary makes at startup.
+libc = "0.2"
 smallvec = "1"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
