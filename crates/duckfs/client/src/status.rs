@@ -16,7 +16,7 @@ use duckfs_core::to_hex;
 
 use crate::chunk::{chunk_ids, file_object_id};
 use crate::index::{EntryKind, Index, IndexEntry, IndexError};
-use crate::scan::{ScanEntry, ScanError, ScanKind, disk_path, scan};
+use crate::scan::{Ignore, ScanEntry, ScanError, ScanKind, disk_path, scan};
 
 /// the working-copy delta: files/symlinks/empty-dirs added or modified relative
 /// to the index base, and index paths removed from disk. `clean` iff all empty.
@@ -85,10 +85,17 @@ pub fn status(root: &Path) -> Result<Status, StatusError> {
     // removed: any recorded path no longer on disk. a recorded empty dir that
     // became non-empty is still "seen" (the non-empty dir scanned), so it is not
     // spuriously removed — its new children show up as added instead.
+    //
+    // an INDEXED path the ignore file now excludes is NOT one of these: the walk
+    // pruned it, so it is absent for a reason that is not deletion. it freezes at
+    // its recorded state instead — writing `target/` into `.duckfsignore` after
+    // committing it must never turn into a 100k-path deletion commit.
+    let ignore = Ignore::load(root)?;
     let removed: Vec<String> = index
         .entries
         .keys()
         .filter(|path| !seen.contains(*path))
+        .filter(|path| !is_ignored(&ignore, path, &index))
         .cloned()
         .collect();
 
@@ -99,6 +106,20 @@ pub fn status(root: &Path) -> Result<Status, StatusError> {
         removed,
         clean,
     })
+}
+
+/// does the ignore file exclude this INDEXED duckfs path? the rules are written
+/// against the checkout-relative path, so the index `prefix` comes off first.
+fn is_ignored(ignore: &Ignore, path: &str, index: &Index) -> bool {
+    let rel = path
+        .strip_prefix(&index.prefix)
+        .unwrap_or(path)
+        .trim_start_matches('/');
+    let is_dir = index
+        .entries
+        .get(path)
+        .is_some_and(|e| e.kind == EntryKind::Dir);
+    ignore.ignored_path(rel, is_dir)
 }
 
 /// is a tracked file/symlink modified relative to `recorded`? cheap checks first

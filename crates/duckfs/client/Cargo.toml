@@ -16,6 +16,10 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
+# `.duckfsignore` pattern matching. glob is already in the tree (a transitive
+# dep) and `matches_with(require_literal_separator)` IS gitignore's `*`-stops-at-
+# a-slash rule — a hand-rolled matcher would be the same semantics, badly.
+glob = "0.3"
 
 [dev-dependencies]
 # the mock NodeApi stands a REAL native `files::Files` on a tempdir, so the tests

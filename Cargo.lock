@@ -3223,6 +3223,7 @@ dependencies = [
  "duckfs-core",
  "files",
  "futures",
+ "glob",
  "reqwest 0.12.28",
  "sdk",
  "sdk-testkit",

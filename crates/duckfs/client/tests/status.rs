@@ -260,3 +260,83 @@ fn genuinely_new_empty_dir_is_still_added() {
         "a new empty dir must still plan a Mkdir"
     );
 }
+
+// ---- .duckfsignore ----------------------------------------------------------
+
+/// the whole point of the ignore file: a build directory is PRUNED, so its
+/// contents never become changes (and never get walked). `.git` needs no rule.
+#[test]
+fn an_ignored_directory_is_pruned_from_the_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::write(root.join(".duckfsignore"), "target/\n*.log\n!keep.log\n").unwrap();
+    fs::write(root.join("src.rs"), b"fn main() {}").unwrap();
+    fs::write(root.join("drop.log"), b"noise").unwrap();
+    fs::write(root.join("keep.log"), b"wanted").unwrap();
+    fs::create_dir_all(root.join("target/debug/deps")).unwrap();
+    fs::write(root.join("target/debug/deps/big.o"), b"junk").unwrap();
+    fs::create_dir_all(root.join(".git/objects")).unwrap();
+    fs::write(root.join(".git/objects/x"), b"git").unwrap();
+
+    let idx = Index::new(PREFIX, "http://node", None);
+    idx.save(root).unwrap();
+
+    let st = status(root).unwrap();
+    let added = paths(&st.added);
+    assert!(
+        added.contains(&dpath("src.rs")),
+        "content is added: {added:?}"
+    );
+    assert!(
+        added.contains(&dpath("keep.log")),
+        "a `!` rule re-includes: {added:?}"
+    );
+    assert!(
+        added.contains(&dpath(".duckfsignore")),
+        "the ignore file itself is content: {added:?}"
+    );
+    for unwanted in [
+        "target",
+        "target/debug",
+        "target/debug/deps/big.o",
+        "drop.log",
+        ".git",
+    ] {
+        assert!(
+            !added.contains(&dpath(unwanted)),
+            "{unwanted} must be pruned: {added:?}"
+        );
+    }
+}
+
+/// ignoring a path that is ALREADY committed freezes it — it must never be
+/// reported removed, which would commit a deletion of the whole tracked subtree.
+#[test]
+fn ignoring_an_indexed_path_freezes_it_instead_of_deleting_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir(root.join("target")).unwrap();
+    fs::write(root.join("target/out.bin"), b"built").unwrap();
+    fs::write(root.join("src.rs"), b"fn main() {}").unwrap();
+    let mut idx = Index::new(PREFIX, "http://node", None);
+    record_file(&mut idx, root, "target/out.bin", false);
+    record_file(&mut idx, root, "src.rs", false);
+    idx.save(root).unwrap();
+
+    // the rule arrives AFTER the file was committed.
+    fs::write(root.join(".duckfsignore"), "target/\n").unwrap();
+
+    let st = status(root).unwrap();
+    assert!(
+        st.removed.is_empty(),
+        "an indexed-but-now-ignored path is frozen, not deleted: {:?}",
+        st.removed
+    );
+    assert_eq!(
+        paths(&st.added),
+        vec![dpath(".duckfsignore")],
+        "only the new ignore file is added"
+    );
+}
