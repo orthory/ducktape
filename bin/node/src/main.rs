@@ -96,7 +96,6 @@ mod rpc;
 mod sandbox_cli;
 mod services;
 mod sync;
-mod task_dump;
 mod term_plane;
 mod tty;
 mod userkey_cli;
@@ -833,7 +832,6 @@ fn run_node(
                 bulk_pacer,
                 plane_monitor,
                 sync_monitor,
-                workspace.clone(),
             )
             .await;
             return;
