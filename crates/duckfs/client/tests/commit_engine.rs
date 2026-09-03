@@ -11,7 +11,7 @@ use std::fs;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use duckfs_client::checkout::checkout;
-use duckfs_client::commit::{CommitError, commit};
+use duckfs_client::commit::{CommitError, CommitOptions, commit, commit_with};
 use duckfs_client::index::Index;
 use duckfs_core::{CHUNK_SIZE, Change, Content};
 use support::ModuleNode;
@@ -198,6 +198,20 @@ fn over_the_change_cap_fails_before_any_submit() {
         "names the cap: {msg}"
     );
     assert!(msg.contains("4097"), "names the count: {msg}");
+    // the refusal must name things that EXIST — it used to send the user off to
+    // "split the work into separate commits" with no verb that could.
+    assert!(
+        msg.contains("--path"),
+        "names the pathspec that splits the work: {msg}"
+    );
+    assert!(
+        msg.contains(".duckfsignore"),
+        "names the ignore file that shrinks the walk: {msg}"
+    );
+    assert!(
+        msg.contains("consensus-wire bound"),
+        "says the cap is not a client setting: {msg}"
+    );
     assert_eq!(node.commit_calls.get(), 0, "nothing submitted");
     assert_eq!(node.stage_calls.get(), 0, "nothing staged");
 }
@@ -224,4 +238,119 @@ fn a_local_nfd_filename_fails_before_any_submit() {
     );
     assert_eq!(node.commit_calls.get(), 0, "nothing submitted");
     assert_eq!(node.stage_calls.get(), 0, "nothing staged");
+}
+
+// ---- the pathspec (what the change-cap refusal tells you to run) -------------
+
+/// `--path` commits a subtree and leaves every other change DIRTY — the split
+/// the `MAX_CHANGES_PER_COMMIT` message names. the deferred changes must survive
+/// the index rewrite: an addition stays added, an edit stays modified, a
+/// deletion stays deleted.
+#[test]
+fn a_pathspec_commits_one_subtree_and_leaves_the_rest_dirty() {
+    let node = ModuleNode::new();
+    node.seed_commit(
+        None,
+        "seed",
+        vec![
+            put_inline(&format!("{PREFIX}/src/keep.rs"), b"fn a() {}"),
+            put_inline(&format!("{PREFIX}/docs/old.md"), b"old"),
+            put_inline(&format!("{PREFIX}/docs/gone.md"), b"delete me"),
+        ],
+    )
+    .expect("seed");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    checkout(&node, root, PREFIX, None).expect("checkout");
+
+    // one change in each of the four shapes, across two subtrees.
+    fs::write(root.join("src/keep.rs"), b"fn b() {}").unwrap();
+    fs::write(root.join("src/new.rs"), b"fn c() {}").unwrap();
+    fs::write(root.join("docs/old.md"), b"edited").unwrap();
+    fs::remove_file(root.join("docs/gone.md")).unwrap();
+
+    let opts = CommitOptions {
+        paths: vec!["src".into()],
+        ..Default::default()
+    };
+    commit_with(&node, root, "just src", &opts).expect("commit");
+
+    // src landed upstream...
+    let dir2 = tempfile::tempdir().unwrap();
+    checkout(&node, dir2.path(), PREFIX, None).expect("re-checkout");
+    assert_eq!(
+        fs::read(dir2.path().join("src/keep.rs")).unwrap(),
+        b"fn b() {}"
+    );
+    assert_eq!(
+        fs::read(dir2.path().join("src/new.rs")).unwrap(),
+        b"fn c() {}"
+    );
+    assert_eq!(
+        fs::read(dir2.path().join("docs/old.md")).unwrap(),
+        b"old",
+        "the unselected edit did NOT land"
+    );
+    assert!(
+        dir2.path().join("docs/gone.md").exists(),
+        "the unselected deletion did NOT land"
+    );
+
+    // ...and docs is still dirty in the working copy, exactly as it was.
+    let st = duckfs_client::status::status(root).unwrap();
+    assert_eq!(
+        st.modified
+            .iter()
+            .map(|e| e.path.clone())
+            .collect::<Vec<_>>(),
+        vec![format!("{PREFIX}/docs/old.md")],
+        "the deferred edit is still modified"
+    );
+    assert_eq!(
+        st.removed,
+        vec![format!("{PREFIX}/docs/gone.md")],
+        "the deferred deletion is still removed"
+    );
+    assert!(
+        st.added.is_empty(),
+        "src/new.rs was committed: {:?}",
+        st.added
+    );
+
+    // and the second commit picks up exactly the leftovers.
+    commit_with(&node, root, "the rest", &CommitOptions::default()).expect("commit the rest");
+    assert!(
+        duckfs_client::status::status(root).unwrap().clean,
+        "clean once the leftovers land"
+    );
+    let dir3 = tempfile::tempdir().unwrap();
+    checkout(&node, dir3.path(), PREFIX, None).expect("re-checkout");
+    assert_eq!(
+        fs::read(dir3.path().join("docs/old.md")).unwrap(),
+        b"edited"
+    );
+    assert!(!dir3.path().join("docs/gone.md").exists());
+}
+
+/// a pathspec that selects none of the changes is a named refusal, not a
+/// "nothing to commit" that reads as "the tree is clean".
+#[test]
+fn a_pathspec_that_selects_nothing_says_so() {
+    let node = ModuleNode::new();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    checkout(&node, root, PREFIX, None).expect("checkout");
+    fs::write(root.join("a.txt"), b"x").unwrap();
+
+    let opts = CommitOptions {
+        paths: vec!["elsewhere".into()],
+        ..Default::default()
+    };
+    let err = commit_with(&node, root, "none", &opts).unwrap_err();
+    assert!(
+        matches!(err, CommitError::NothingSelected),
+        "a pathspec miss is its own error: {err}"
+    );
+    assert_eq!(node.commit_calls.get(), 0, "nothing submitted");
 }

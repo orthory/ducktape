@@ -1,4 +1,4 @@
-//! the userspace arm of data-plane's socket seam — ADR phase 2: a
+//! the userspace arm of data-plane's socket seam: a
 //! [`SocketFactory`] whose sockets terminate in the [`VirtualStack`] instead
 //! of the kernel, so `OverlaySockets` (statesync's per-use plane, and every
 //! future plane) rides the in-process tunnel with no change in the plane or
@@ -122,6 +122,12 @@ impl RebindingVirtualDatagramSocket {
 impl DatagramSocket for RebindingVirtualDatagramSocket {
     fn send_to<'a>(&'a self, buf: &'a [u8], dest: SocketAddr) -> BoxFuture<'a, io::Result<usize>> {
         Box::pin(async move {
+            // poll windows this one send has waited through on the SAME
+            // generation. the wait is unbounded by contract (a full but live
+            // UDP queue is ordinary backpressure), so a send that keeps
+            // stalling is reported at a bounded cadence — the first stalled
+            // window and every 30th after — rather than never.
+            let mut stalled: u64 = 0;
             loop {
                 // A sender sees an actually-down interface immediately, as
                 // the OS/TUN arm does. Only an operation caught across a live
@@ -130,10 +136,19 @@ impl DatagramSocket for RebindingVirtualDatagramSocket {
                 match timeout(REBIND_POLL, socket.send_to(buf, dest)).await {
                     Ok(result) => return result,
                     Err(_) if !self.generation_is_current(&generation) => continue,
-                    // A full but live UDP queue retains normal backpressure;
                     // the poll timeout exists only to observe generation
                     // changes, not to impose a new transport deadline.
-                    Err(_) => continue,
+                    Err(_) => {
+                        stalled += 1;
+                        if stalled == 1 || stalled.is_multiple_of(30) {
+                            tracing::warn!(
+                                target: "ducktape::dataplane",
+                                reason = "datagram_send_stalled",
+                                attempts = stalled,
+                                "overlay datagram send has not completed"
+                            );
+                        }
+                    }
                 }
             }
         })

@@ -25,15 +25,15 @@ clap = { workspace = true }
 anstyle = "1.0"
 anstream = "1.0"
 host = { workspace = true }
+# the module composition catalog this composer draws its genesis selection from.
+topology = { workspace = true }
 node = { workspace = true }
 consensus = { workspace = true }
 recovery = { workspace = true }
 sdk = { workspace = true }
 statesync = { workspace = true }
-kv = { workspace = true }
-directory = { workspace = true }
 # the production module set: system infrastructure + every product module.
-acl = { workspace = true }
+# (acl composes as a wasm tenant; its crate is embedded via component.wasm.)
 valset = { workspace = true }
 governance = { workspace = true }
 # the resident-accept verb drives governance ops through the local rpc.
@@ -54,9 +54,13 @@ compute-service = { workspace = true }
 forge = { workspace = true }
 pages = { workspace = true }
 chat = { workspace = true }
+# the huddle media planes the voice hub runs: Opus engine, video wire, call-socket framing.
+media-service = { workspace = true }
 tasks = { workspace = true }
 identity = { workspace = true }
-duckdns = { workspace = true }
+# the passkey enrollment challenge — the same bytes `KeyScheme::Secp256r1` verifies.
+keyscheme = { workspace = true }
+authpage = { workspace = true }
 gateway = { workspace = true }
 # the airlock contract: `server` supplies the GrantCheck type the lender daemon
 # injects (src/airlock.rs), `client` + `verify` the enclave-facing credential
@@ -66,8 +70,6 @@ airlock = { path = "../../crates/airlock", features = ["client", "server", "veri
 # the lender's disk-backed credential store: opened by the `service run airlock`
 # daemon, and written by `user cred add`.
 airlock-service = { workspace = true }
-automations = { workspace = true }
-inbox = { workspace = true }
 files = { workspace = true }
 # duckfs reusable core and disk scratch helpers; the `files` crate above remains
 # the consensus module adapter.
@@ -75,11 +77,19 @@ duckfs-core = { workspace = true }
 # the `ducktape fs` verb family drives the checkout/commit engine + HttpNode.
 duckfs-client = { workspace = true }
 duckfs-disk = { workspace = true }
+# the device keystore the `wallet`/`user key` verbs drive. A library rather
+# than modules of this binary because the desktop app links the same code —
+# it used to reach it by spawning this binary instead.
+keystore = { workspace = true }
+# a workspace on disk (identity, network.toml, node.toml, the invite codec)
+# and the join ceremony. `config/resolve.rs` — turning those files into a
+# runnable daemon — is what stayed in this binary.
+workspace-config = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
-# the staged node-driven WireGuard plane: the reachability orchestrator runs
+# the staged node-driven WireGuard plane: the reachability executor runs
 # on its own plain-tokio thread (mirroring the app-surface split) behind the
 # `wireguard_listen` node.toml key; the wireguard crate supplies the
 # endpoint types and the phase-A fake effect it drives.
@@ -87,19 +97,18 @@ reachability = { workspace = true }
 # the coordinator-auth credential types: `coord.cap` is the private-mode
 # admission token a node persists beside its descriptor (minted by a genesis
 # validator via `mint_coord_cap`, presented on each rendezvous request).
-nat-traversal = { workspace = true }
+nat-traversal = { workspace = true, features = ["runtime"] }
 wireguard = { workspace = true }
 # the voice hub's transport seam: huddle media rides data-plane datagrams over
 # the per-service overlay sockets (src/voice_plane.rs binds them); the mesh arm
-# it replaced is retired — see docs/adr/2026-07-07-per-use-data-plane.mdx.
+# it replaced is retired.
 data-plane = { workspace = true }
-# the overlay routing seam (ADR 2026-07-07-userspace-overlay-net): the mesh's
+# the userspace overlay routing seam: the mesh's
 # runtime context is wrapped so dial/bind route overlay ULAs by address.
 overlay-net = { workspace = true }
 futures = "0.3"
 bytes = "1"
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 # the airlock client/verify surface is anyhow-typed and reports measurements as
 # hex; both already ride in on the airlock dependency above.
 anyhow = "1"
@@ -108,7 +117,7 @@ hex = "0.4"
 base64 = "0.22"
 # the http/ws app surface, shared with the embedded daemon: NodeCommand lane,
 # axum router, and serve() — this binary only owns the pump-side of the lane.
-noded = { path = "../noded" }
+noded = { path = "../../crates/noded" }
 # the derived read-model tier: bin/node reuses noded's store construction and
 # /v1/index/* + /v1/blocks lanes, folds each sealed block (ops + explorer row)
 # in its drain/replay, and re-derives views from verified state at
@@ -124,7 +133,6 @@ commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
 commonware-p2p = { workspace = true }
 commonware-consensus = { workspace = true }
-commonware-storage = { workspace = true }
 commonware-utils = { workspace = true }
 commonware-codec = { workspace = true }
 
@@ -148,6 +156,11 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Raise the node's inherited open-file soft limit before opening module stores.
 libc = "0.2"
+# the `agent install` checklist (src/executors.rs). default-features off: the
+# editor/password/history extras are prompts this binary does not have, and
+# each carries its own dependency. What is left is 4 crates, `console` being
+# the terminal one clap's own graph already pulls.
+dialoguer = { version = "0.12.0", default-features = false }
 
 # App Nap opt-out (see main.rs `hold_macos_activity`): a desktop-spawned node
 # lives in the GUI app's coalition and would otherwise be timer-coalesced the
@@ -162,13 +175,24 @@ objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 [dev-dependencies]
 # the shared raw-http/port/poll harness helpers (was: a per-suite copy each).
 nettest = { path = "../../crates/testing/nettest" }
+# the network_joiner_full statesync proof composes the reference modules too —
+# a joiner must rebuild EVERY module shape, example ones included. (The test
+# moved here from bin/demo when that walkthrough crate was deleted.)
+greeter = { workspace = true }
+kv = { workspace = true }
+# `directory` left the production genesis set; the example crate survives only
+# as a test tenant (the cfg(test) query codec in main.rs, network_joiner_full).
+directory = { workspace = true }
 # the fs/mcp e2e harnesses drive noded's in-proc daemon testkit (was: each
 # hand-mirrored the NodeCommand actor). dev-only feature keeps it
 # out of the production `ducktape` binary build.
-noded = { path = "../noded", features = ["testkit"] }
+noded = { path = "../../crates/noded", features = ["testkit"] }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).
 # dev-only feature keeps it out of the production binary build.
 identity = { workspace = true, features = ["testkit"] }
+# the passkey/wallet signers the `account login` and auth-page tests fake a
+# browser ceremony with.
+keyscheme = { workspace = true, features = ["testkit"] }
 # the git-history/packfile builder. the forge e2e needs REAL objects in the
 # node's store for a PR diff to be computable, and consensus has no
 # commit-building op — this is how production gets them too (a stock git push).
@@ -192,9 +216,9 @@ axum = "0.8"
 data-plane = { workspace = true, features = ["sim"] }
 # voice::overlay_e2e stands two userspace WireGuard overlay stacks up on
 # loopback (the crates/networking/overlay-net/tests/loopback_pair harness shape) to
-# prove huddle media crosses the REAL overlay headless — this supplies the WG
-# interface config types; the boringtun crypto rides overlay-net (a dep above).
-defguard_wireguard_rs = { workspace = true }
+# prove huddle media crosses the REAL overlay headless — this derives the
+# fixture WireGuard keypairs; the tunnel crypto rides overlay-net (a dep above).
+x25519-dalek = { workspace = true }
 # replica::tests assembles real finalization certificates (sign -> assemble)
 # to exercise the cert-lane decode + fold planner.
 commonware-parallel = { workspace = true }

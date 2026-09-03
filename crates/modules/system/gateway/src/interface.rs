@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use duckdns::{DuckDnsName, HandleRegistration, ResolvedAccount};
 use sdk::codec::{push_bytes, push_opt_str};
-use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
 
 /// Commonware signing namespace for every gateway route mutation.
@@ -11,13 +11,20 @@ pub const GATEWAY_ROUTE_NS: &[u8] = b"ducktape-gateway-route-v1";
 /// operation tag in each preimage keeps a set/remove/grant/revoke signature from
 /// being replayed as another operation.
 pub const GATEWAY_CREDENTIAL_NS: &[u8] = b"ducktape-gateway-credential-v1";
+/// Signing namespace for a caller's proof of possession on a proxied request
+/// (see [`caller_pop_preimage`]); verified by the serving node, never stored.
+pub const GATEWAY_CALLER_NS: &[u8] = b"ducktape-gateway-caller-v1";
 pub const MAX_CREDENTIAL_NAME_BYTES: usize = 64;
 pub const MAX_CREDENTIAL_GRANTS: usize = 64;
 pub const SEAL_PK_BYTES: usize = 32;
 pub const MAX_CHAIN_ID_BYTES: usize = 256;
-pub const MAX_ACCOUNT_ID_BYTES: usize = 128;
 pub const NODE_KEY_BYTES: usize = 32;
-pub const ED25519_SIGNATURE_BYTES: usize = 64;
+/// The largest public key any [`identity::KeyScheme`] carries (SEC1
+/// uncompressed).
+pub const MAX_SIGNER_KEY_BYTES: usize = 65;
+/// Bound on a scheme-owned proof: a WebAuthn assertion envelope is a few
+/// hundred bytes; an Ed25519/secp256k1 signature is 64/65.
+pub const MAX_SIGNATURE_BYTES: usize = 2048;
 pub const MAX_ROUTE_LABEL_BYTES: usize = 63;
 pub const MAX_ROUTES_PER_ACCOUNT: usize = 64;
 pub const MAX_AUDIENCE_ACCOUNTS: usize = 32;
@@ -33,7 +40,19 @@ pub const SHA256_HEX_BYTES: usize = 64;
 
 /// The account apex (`None`) or one DNS-shaped label below it. The account is
 /// carried separately so a route name can never cross authority boundaries.
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+)]
 #[serde(deny_unknown_fields)]
 pub struct RouteName {
     pub label: Option<String>,
@@ -63,8 +82,20 @@ impl RouteName {
     }
 }
 
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    BorshSerialize,
+    BorshDeserialize,
+    Serialize,
+    Deserialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteMethod {
     Get,
     Head,
@@ -92,17 +123,18 @@ impl RouteMethod {
 }
 
 /// A globally signed audience. Transport peers still have to be admitted by
-/// the current network set; this policy then resolves their authenticated node
-/// key through Identity before a request reaches the local upstream.
+/// the current network set; this policy then judges the caller's ACCOUNT —
+/// the one its user proof of possession resolves to through Identity, or none
+/// — before a request reaches the local upstream.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteAudience {
-    /// Only a node currently bound to the owning account.
+    /// Only a caller proven to be the owning account.
     Owner,
-    /// Any admitted network node currently bound to an Identity account.
+    /// Any admitted mesh peer, with or without a proven account.
     Network,
-    /// Only the sorted, explicit account list. The owner is not implicit.
-    Accounts { account_ids: Vec<Vec<u8>> },
+    /// Only the sorted, explicit account-number list. The owner is not implicit.
+    Accounts { account_ids: Vec<u64> },
 }
 
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -158,11 +190,11 @@ pub struct RouteDefinition {
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteStatement {
-    /// Signed into the preimage; publishers stamp `1` today.
-    pub version: u8,
     pub chain_id: String,
-    pub account_id: Vec<u8>,
+    pub account_id: u64,
     pub name: RouteName,
+    /// The 32-byte key of the node that serves this route. The signing
+    /// account vouches for it; no node is bound to an account anywhere.
     pub publisher_node: Vec<u8>,
     pub revision: u64,
     pub route: Option<RouteDefinition>,
@@ -171,7 +203,10 @@ pub struct RouteStatement {
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MemberAuthorization {
+    /// A current member key of the statement's account; its stored
+    /// [`identity::KeyScheme`] decides how `signature` is verified.
     pub signer: Vec<u8>,
+    /// The scheme-owned proof bytes over the statement's preimage.
     pub signature: Vec<u8>,
 }
 
@@ -199,8 +234,10 @@ pub struct RouteSummary {
 /// never secret material. Grants are managed exclusively through the
 /// owner-signed [`GatewayMsg::GrantCredential`]/[`GatewayMsg::RevokeCredential`]
 /// ops, so they are never carried unsigned on [`GatewayMsg::SetCredential`].
-#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(
+    BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialKind {
     Claude,
     Codex,
@@ -219,11 +256,11 @@ impl CredentialKind {
 #[serde(deny_unknown_fields)]
 pub struct CredentialRecord {
     pub name: String,
-    pub owner_account: Vec<u8>,
+    pub owner_account: u64,
     pub publisher_node: Vec<u8>,
     pub kind: CredentialKind,
     pub seal_pk: [u8; 32],
-    pub grants: BTreeSet<Vec<u8>>,
+    pub grants: BTreeSet<u64>,
 }
 
 /// The owner-signed registration statement. `record.grants` MUST be empty — the
@@ -240,7 +277,7 @@ pub struct SetCredentialStatement {
 #[serde(deny_unknown_fields)]
 pub struct RemoveCredentialStatement {
     pub chain_id: String,
-    pub owner_account: Vec<u8>,
+    pub owner_account: u64,
     pub name: String,
 }
 
@@ -250,15 +287,15 @@ pub struct RemoveCredentialStatement {
 #[serde(deny_unknown_fields)]
 pub struct CredentialGrantStatement {
     pub chain_id: String,
-    pub owner_account: Vec<u8>,
+    pub owner_account: u64,
     pub name: String,
-    pub account: Vec<u8>,
+    pub account: u64,
 }
 
 /// True when `account` is the owner or a granted account of `record`.
-pub fn credential_use_allowed(record: &CredentialRecord, account: &[u8]) -> bool {
+pub fn credential_use_allowed(record: &CredentialRecord, account: u64) -> bool {
     let is_owner = record.owner_account == account;
-    let is_grantee = record.grants.contains(account);
+    let is_grantee = record.grants.contains(&account);
     is_owner || is_grantee
 }
 
@@ -288,7 +325,7 @@ pub fn validate_set_credential_statement(statement: &SetCredentialStatement) -> 
     validate_chain_id(&statement.chain_id)?;
     let record = &statement.record;
     validate_credential_name(&record.name)?;
-    validate_account_id(&record.owner_account)?;
+    validate_account_number(record.owner_account)?;
     if record.publisher_node.len() != NODE_KEY_BYTES {
         return Err(format!(
             "gateway: publisher node must be {NODE_KEY_BYTES} bytes"
@@ -306,7 +343,7 @@ pub fn set_credential_preimage(statement: &SetCredentialStatement) -> Result<Vec
     let record = &statement.record;
     let mut out = vec![1u8];
     push_bytes(&mut out, statement.chain_id.as_bytes());
-    push_bytes(&mut out, &record.owner_account);
+    out.extend_from_slice(&record.owner_account.to_le_bytes());
     push_bytes(&mut out, record.name.as_bytes());
     out.push(record.kind.tag());
     out.extend_from_slice(&record.seal_pk);
@@ -320,10 +357,10 @@ pub fn remove_credential_preimage(
 ) -> Result<Vec<u8>, String> {
     validate_chain_id(&statement.chain_id)?;
     validate_credential_name(&statement.name)?;
-    validate_account_id(&statement.owner_account)?;
+    validate_account_number(statement.owner_account)?;
     let mut out = vec![2u8];
     push_bytes(&mut out, statement.chain_id.as_bytes());
-    push_bytes(&mut out, &statement.owner_account);
+    out.extend_from_slice(&statement.owner_account.to_le_bytes());
     push_bytes(&mut out, statement.name.as_bytes());
     Ok(out)
 }
@@ -341,14 +378,37 @@ pub fn revoke_credential_preimage(statement: &CredentialGrantStatement) -> Resul
 fn grant_op_preimage(op: u8, statement: &CredentialGrantStatement) -> Result<Vec<u8>, String> {
     validate_chain_id(&statement.chain_id)?;
     validate_credential_name(&statement.name)?;
-    validate_account_id(&statement.owner_account)?;
-    validate_account_id(&statement.account)?;
+    validate_account_number(statement.owner_account)?;
+    validate_account_number(statement.account)?;
     let mut out = vec![op];
     push_bytes(&mut out, statement.chain_id.as_bytes());
-    push_bytes(&mut out, &statement.owner_account);
+    out.extend_from_slice(&statement.owner_account.to_le_bytes());
     push_bytes(&mut out, statement.name.as_bytes());
-    push_bytes(&mut out, &statement.account);
+    out.extend_from_slice(&statement.account.to_le_bytes());
     Ok(out)
+}
+
+/// The bytes a caller's user key signs under [`GATEWAY_CALLER_NS`] to prove
+/// possession on ONE proxied request: the serving node, the route's account,
+/// the route name, the HTTP method, the origin-form path and a caller
+/// timestamp (the serving side bounds its skew). Every field is framed, so no
+/// two requests share a preimage.
+pub fn caller_pop_preimage(
+    publisher_node: &[u8],
+    account_id: u64,
+    route: &RouteName,
+    method: RouteMethod,
+    path: &str,
+    ts: u64,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_bytes(&mut out, publisher_node);
+    out.extend_from_slice(&account_id.to_le_bytes());
+    push_opt_str(&mut out, route.label.as_deref());
+    push_bytes(&mut out, method.as_http_str().as_bytes());
+    push_bytes(&mut out, path.as_bytes());
+    out.extend_from_slice(&ts.to_le_bytes());
+    out
 }
 
 /// The single message surface of the merged gateway module: the `.duck` handle
@@ -359,7 +419,7 @@ fn grant_op_preimage(op: u8, statement: &CredentialGrantStatement) -> Result<Vec
 // out would only add indirection on a cold path.
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayMsg {
     /// Declaratively replace the authenticated account's optional `.duck`
     /// handle. `None` unregisters it without changing Identity.
@@ -390,32 +450,41 @@ pub enum GatewayMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayQuery {
-    /// Resolve one `.duck` name to the stable AccountId it aliases. Node
-    /// selection is deliberately absent — resolution stops at the AccountId.
-    Resolve { name: DuckDnsName },
+    /// Resolve one `.duck` name to the account number it aliases. Node
+    /// selection is deliberately absent — resolution stops at the account.
+    Resolve {
+        name: DuckDnsName,
+    },
     /// The optional-handle registration listing, paginated.
-    Registrations { from: u64, limit: u64 },
+    Registrations {
+        from: u64,
+        limit: u64,
+    },
     Get {
-        account_id: Vec<u8>,
+        account_id: u64,
         name: RouteName,
     },
     /// Every currently published route owned by one account, in canonical
     /// [`RouteName`] order. Tombstones remain queryable through `Get` so a
     /// publisher can continue the revision stream, but are not management
     /// surface entries.
-    List { account_id: Vec<u8> },
+    List {
+        account_id: u64,
+    },
     /// Resolve one credential name to its record, or `None`.
-    Credential { name: String },
+    Credential {
+        name: String,
+    },
     /// Every registered credential record, in canonical name order.
     Credentials {},
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GatewayReply {
-    /// The stable AccountId a `.duck` name resolves to, or `None`.
+    /// The account number a `.duck` name resolves to, or `None`.
     Resolved(Option<ResolvedAccount>),
     Registrations(Vec<HandleRegistration>),
     /// Boxed only to keep the Rust reply enum bounded after adding the compact
@@ -456,7 +525,7 @@ pub fn validate_route_statement(statement: &RouteStatement) -> Result<(), String
             "gateway: chain id must be 1..={MAX_CHAIN_ID_BYTES} bytes"
         ));
     }
-    validate_account_id(&statement.account_id)?;
+    validate_account_number(statement.account_id)?;
     statement.name.validate()?;
     if statement.publisher_node.len() != NODE_KEY_BYTES {
         return Err(format!(
@@ -481,13 +550,19 @@ pub fn validate_route_statement(statement: &RouteStatement) -> Result<(), String
     Ok(())
 }
 
+/// Shape bounds only: which scheme the signer is, and whether the proof
+/// verifies, is decided against the signer's stored Identity key.
 pub fn validate_authorization(authorization: &MemberAuthorization) -> Result<(), String> {
-    if authorization.signer.len() != NODE_KEY_BYTES {
-        return Err("gateway: signer must be a 32-byte Ed25519 key".into());
-    }
-    if authorization.signature.len() != ED25519_SIGNATURE_BYTES {
+    let signer_fits = (1..=MAX_SIGNER_KEY_BYTES).contains(&authorization.signer.len());
+    if !signer_fits {
         return Err(format!(
-            "gateway: signature must be {ED25519_SIGNATURE_BYTES} bytes"
+            "gateway: signer must be 1..={MAX_SIGNER_KEY_BYTES} bytes"
+        ));
+    }
+    let signature_fits = (1..=MAX_SIGNATURE_BYTES).contains(&authorization.signature.len());
+    if !signature_fits {
+        return Err(format!(
+            "gateway: signature must be 1..={MAX_SIGNATURE_BYTES} bytes"
         ));
     }
     Ok(())
@@ -510,11 +585,10 @@ pub fn validate_route_label(label: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn validate_account_id(account_id: &[u8]) -> Result<(), String> {
-    if account_id.is_empty() || account_id.len() > MAX_ACCOUNT_ID_BYTES {
-        return Err(format!(
-            "gateway: account id must be 1..={MAX_ACCOUNT_ID_BYTES} bytes"
-        ));
+/// Identity numbers accounts from 1; `0` is never an account.
+pub fn validate_account_number(number: u64) -> Result<(), String> {
+    if number == 0 {
+        return Err("gateway: account number must be non-zero".into());
     }
     Ok(())
 }
@@ -578,10 +652,10 @@ pub fn validate_policy(policy: &RoutePolicy) -> Result<(), String> {
                     "gateway: explicit audience needs 1..={MAX_AUDIENCE_ACCOUNTS} accounts"
                 ));
             }
-            let mut previous: Option<&[u8]> = None;
-            for account in account_ids {
-                validate_account_id(account)?;
-                if previous.is_some_and(|old| old >= account.as_slice()) {
+            let mut previous: Option<u64> = None;
+            for &account in account_ids {
+                validate_account_number(account)?;
+                if previous.is_some_and(|old| old >= account) {
                     return Err(
                         "gateway: audience accounts must be strictly sorted and unique".into(),
                     );
@@ -604,9 +678,8 @@ pub fn is_canonical_sha256(value: &str) -> bool {
 pub fn route_signing_preimage(statement: &RouteStatement) -> Result<Vec<u8>, String> {
     validate_route_statement(statement)?;
     let mut out = Vec::new();
-    out.push(statement.version);
     push_bytes(&mut out, statement.chain_id.as_bytes());
-    push_bytes(&mut out, &statement.account_id);
+    out.extend_from_slice(&statement.account_id.to_le_bytes());
     push_opt_str(&mut out, statement.name.label.as_deref());
     push_bytes(&mut out, &statement.publisher_node);
     out.extend_from_slice(&statement.revision.to_le_bytes());
@@ -634,7 +707,7 @@ fn encode_policy(out: &mut Vec<u8>, policy: &RoutePolicy) {
             out.push(3);
             out.extend_from_slice(&(account_ids.len() as u64).to_le_bytes());
             for account in account_ids {
-                push_bytes(out, account);
+                out.extend_from_slice(&account.to_le_bytes());
             }
         }
     }

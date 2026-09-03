@@ -25,6 +25,22 @@ pub struct KindCount {
     pub count: i64,
 }
 
+/// DOES THE ANSWER A SEARCH WAS SENT FOR STILL SPEAK FOR WHAT IS IN THE BOX?
+///
+/// All three search surfaces are ENTER-TO-SUBMIT and two-way bound with no
+/// `change=` route, so a keystroke writes the draft and runs no handler at
+/// all: nothing but this comparison can retire an answer as the reader types
+/// on. `query` is the string a search was actually SENT for and is empty when
+/// no answer is standing; `searching` covers the round trip the submit opened,
+/// during which no answer exists yet.
+///
+/// It replaces three hand-synced conjunct arms — pages, chat and the explorer
+/// each carried their own copy, and a fourth surface would have grown a
+/// fourth.
+pub fn search_answer_stands(query: &str, draft: &str, searching: bool) -> bool {
+    !searching && !query.is_empty() && draft.trim() == query
+}
+
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct PaletteSearchData {
     pub chat_hits: Vec<ChatSearchHit>,

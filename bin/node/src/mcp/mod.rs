@@ -116,7 +116,7 @@ fn initialize() -> Value {
         "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
         // where the "how to work in Ducktape" guide lives — it ships with the
         // binary, so it can never describe a tool this binary does not have.
-        "instructions": guide::GUIDE,
+        "instructions": guide::GUIDE.as_str(),
     })
 }
 
@@ -135,7 +135,10 @@ fn call(run: &identity::Run, params: &Value) -> Value {
     let Some(tool) = tools::find(name) else {
         return tool_failure(format!("{name:?} is not a tool this server offers"));
     };
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     match (tool.handler)(run, &args) {
         Ok(value) => tool_result(&value),
         Err(e) => tool_failure(e.to_string()),

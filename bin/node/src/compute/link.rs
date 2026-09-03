@@ -58,6 +58,11 @@ pub(crate) async fn attach(
                 }
                 failures = 0;
                 pump(socket, &hint, &mut lines).await;
+                // a dropped link redials on the same pace as a failed dial:
+                // pump can return immediately (the node restarting mid-accept),
+                // and an unpaced success path dials at connect latency — the
+                // storm that exhausted macOS's ephemeral port range.
+                tokio::time::sleep(REDIAL).await;
             }
             Err(error) => {
                 failures += 1;
@@ -77,13 +82,12 @@ pub(crate) async fn attach(
 
 /// One connection's lifetime: hints out of it, output lines into it. Returns
 /// when the socket closes, so the caller redials.
-async fn pump<S>(
-    socket: S,
-    hint: &Notify,
-    lines: &mut mpsc::Receiver<OutputLine>,
-) where
-    S: futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
-        + futures::Stream<
+async fn pump<S>(socket: S, hint: &Notify, lines: &mut mpsc::Receiver<OutputLine>)
+where
+    S: futures::Sink<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + futures::Stream<
             Item = Result<
                 tokio_tungstenite::tungstenite::Message,
                 tokio_tungstenite::tungstenite::Error,
@@ -95,25 +99,17 @@ async fn pump<S>(
     loop {
         tokio::select! {
             frame = rx.next() => {
-                let Some(Ok(Message::Text(text))) = frame else {
-                    // a close, an error, or a frame shape we do not read:
-                    // anything but a live text frame ends this connection.
-                    let closed = !matches!(frame, Some(Ok(_)));
-                    if closed { return; }
-                    continue;
-                };
-                // the ONLY frame this daemon reads. Everything else on the hub
-                // is for subscribers, and this connection subscribes to nothing.
-                let is_hint = serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|value| value["type"].as_str().map(|kind| kind == "heartbeat"))
-                    .unwrap_or(false);
-                if is_hint {
-                    hint.notify_one();
+                if !read_frame(frame, hint) {
+                    return;
                 }
             }
             line = lines.recv() => {
-                let Some(line) = line else { return };
+                // a closed lane ends the LANE, not the link: nothing holds a
+                // sink (zero discovered providers drops every sender), but the
+                // hint feed is still this daemon's work intake. Returning here
+                // made every successful dial drop instantly — an unpaced
+                // redial storm.
+                let Some(line) = line else { break };
                 let stream = if line.stderr { "stderr" } else { "stdout" };
                 let frame = serde_json::json!({
                     "op": "run_output",
@@ -127,5 +123,78 @@ async fn pump<S>(
                 }
             }
         }
+    }
+    // the output lane is closed for the daemon's lifetime; hints in, nothing
+    // out, until the socket itself ends.
+    while read_frame(rx.next().await, hint) {}
+}
+
+/// One server frame: forward a heartbeat hint, ignore everything else — the
+/// hub's other frames are for subscribers, and this connection subscribes to
+/// nothing. False when the socket is finished (a close or an error).
+fn read_frame(
+    frame: Option<
+        Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+    >,
+    hint: &Notify,
+) -> bool {
+    use tokio_tungstenite::tungstenite::Message;
+    let Some(Ok(Message::Text(text))) = frame else {
+        // a frame shape we do not read is a live socket; a close or an error
+        // is not.
+        return matches!(frame, Some(Ok(_)));
+    };
+    let is_hint = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|value| value["type"].as_str().map(|kind| kind == "heartbeat"))
+        .unwrap_or(false);
+    if is_hint {
+        hint.notify_one();
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    /// the macOS bring-up storm: zero discovered providers drop every
+    /// `OutputLine` sender before the link is even up, and a pump that treated
+    /// the closed lane as a dead socket turned every successful dial into an
+    /// instant drop — an unpaced redial loop that exhausted the ephemeral port
+    /// range. The lane's end must leave the hint feed running until the socket
+    /// itself closes.
+    #[tokio::test]
+    async fn a_closed_output_lane_keeps_the_link_alive() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let client = WebSocketStream::from_raw_socket(client_io, Role::Client, None).await;
+        let mut server = WebSocketStream::from_raw_socket(server_io, Role::Server, None).await;
+
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<OutputLine>(4);
+        drop(line_tx);
+        let hint = std::sync::Arc::new(Notify::new());
+        let mut pumping = tokio::spawn({
+            let hint = hint.clone();
+            async move { pump(client, &hint, &mut line_rx).await }
+        });
+
+        // the lane was closed before the first frame; a heartbeat must still
+        // come through as a hint.
+        server
+            .send(Message::Text(r#"{"type":"heartbeat","height":1}"#.into()))
+            .await
+            .expect("the server writes into a live socket");
+        tokio::select! {
+            () = hint.notified() => {}
+            end = &mut pumping => panic!("pump ended on a closed output lane: {end:?}"),
+        }
+
+        // the socket closing is what ends the pump.
+        server.close(None).await.expect("the server closes its side");
+        drop(server);
+        pumping.await.expect("pump returns when the socket ends");
     }
 }

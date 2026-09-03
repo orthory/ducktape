@@ -5,14 +5,16 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use provider_host::SandboxBackend;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
+use provider_host::{SandboxBackend, Vmm};
 
-use super::identity::load_identity;
-use super::node_toml::{DevSeedToml, NodeToml, SandboxToml};
-use super::{
-    Coordination, Front, InviteToken, NetworkDescriptor, ReachDial, SCHEME_ED25519,
+use workspace_config::identity::load_identity;
+use workspace_config::node_toml::{
+    DevSeedToml, NodeToml, RawNodeToml, SandboxToml, load_raw_node_toml,
+};
+use workspace_config::{
+    Coordination, DEFAULT_CHECKPOINT_BLOCKS, Front, InviteToken, NetworkDescriptor, ReachDial,
     StoredInviteWireGuard, dialable, hex_bytes, ingress_of, load_coord_cap, load_invite_fronts,
     load_invite_token, load_invite_wireguard,
 };
@@ -84,8 +86,8 @@ pub struct Resolved {
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
     /// the invite token a `join` stored beside the descriptor, if any — what a
-    /// parked joiner announces over the lobby channel. always `None` for the
-    /// dev shape and for manual (token-less) joins.
+    /// parked joiner announces in its first-contact intro. always `None` for
+    /// the dev shape and for manual (token-less) joins.
     pub invite_token: Option<InviteToken>,
     /// the inviter's WireGuard bootstrap a `join` stored, if any — the tunnel
     /// the joining node brings up BEFORE any p2p. always `None` for the dev
@@ -118,9 +120,10 @@ pub struct Resolved {
     /// boot, the `primary_coordinator` discipline. `None` = derive the relay
     /// from the ambient coordinator (its host at TCP/443).
     pub coordinator_relay: Option<String>,
-    /// the WireGuard endpoint this node advertises, resolved once
-    /// (`NodeToml::wireguard_advertised`); `None` = derive it from
-    /// `wireguard_listen` exactly like today (see `reachability_plane.rs`).
+    /// the WireGuard endpoint this node advertises in its signed mesh record,
+    /// decided ONCE here (`resolved_wireguard_advertised`) — the same answer
+    /// the invite blob hands out; `None` = no dialable underlay host, the
+    /// plane runs endpoint-less and roams.
     pub wireguard_advertised: Option<Ingress>,
     /// the COMPUTE SERVICE's backend — `Some` only when both halves agree:
     /// the operator's `[sandbox]` table says HOW runs are isolated on this
@@ -133,7 +136,34 @@ pub struct Resolved {
     /// whose operator wants pty sessions does not have to grant it a compute
     /// service. Decided once here so no boot site re-derives the predicate.
     pub compute_backend: Option<SandboxBackend>,
+    /// the genesis wasm set and where its bytes are: what this node seeds its
+    /// code registry from at block zero, and the directory it reads those
+    /// components out of. Both shapes carry it — the network shape from its
+    /// descriptor (the hashes are IN the genesis fingerprint), the dev shape
+    /// derived from the files themselves.
+    pub genesis: GenesisModules,
 }
+
+/// the genesis code set of a network, as a booting node needs it: WHICH
+/// components (by id and content hash) and WHERE their bytes live.
+///
+/// The hashes are the consensus fact — a node whose bundle hashes differently
+/// is on a different network — and `bundle_dir` is merely the local directory
+/// those bytes are read from, so the two travel together but only one is
+/// signed for.
+#[derive(Debug)]
+pub struct GenesisModules {
+    /// id -> sha256 of the genesis component, for every wasm tenant.
+    pub hashes: BTreeMap<String, [u8; 32]>,
+    /// where `<id>.component.wasm` files live: `<workspace>/modules` (network
+    /// shape) or the dev shape's `modules` dir.
+    pub bundle_dir: PathBuf,
+}
+
+// the component bundle's naming and hashing live beside the composer, where
+// the daemons that also read a bundle dir can reach them; `config::*` keeps
+// re-exporting both for `bin/node`'s own call sites.
+pub use noded::bundle::{component_path, hash_bundle};
 
 /// Everything a SERVICE DAEMON legitimately needs from its node's workspace —
 /// and, being a member of [`Resolved`], everything the NODE knows about the
@@ -164,8 +194,8 @@ pub struct ServiceConfig {
     /// `coord.cap` delivered over its sealed `IntroReply::Admitted` ack via
     /// `save_coord_cap`.
     pub workspace: PathBuf,
-    /// the node's state root; per-service podman roots and provider state hang
-    /// off it too.
+    /// the node's state root; per-service roots and provider state hang off it
+    /// too.
     pub storage_dir: PathBuf,
     /// this network's chain id — the descriptor's own `chain_id` field (network
     /// shape) or the raw configured namespace (dev shape, which has no
@@ -202,8 +232,8 @@ pub struct ServiceConfig {
 /// workspace whose `identity.key` is absent or unreadable still resolves, which
 /// is exactly the property `the_service_path_never_reads_the_node_key` pins.
 pub fn resolve_service(cfg_path: &Path) -> Result<ServiceConfig, String> {
-    match super::node_toml::load_raw_node_toml(cfg_path)? {
-        (super::node_toml::RawNodeToml::Network(raw), _) => {
+    match load_raw_node_toml(cfg_path)? {
+        (RawNodeToml::Network(raw), _) => {
             let base = absolute_runtime_path(cfg_path.parent().unwrap_or_else(|| Path::new(".")))?;
             // the descriptor is read for its chain id alone — the validator set,
             // the reach hints and the genesis fingerprint are consensus facts a
@@ -214,7 +244,7 @@ pub fn resolve_service(cfg_path: &Path) -> Result<ServiceConfig, String> {
             let descriptor = load_valid_descriptor(&base.join(&raw.network))?;
             service_network_shape(&base, &raw, &descriptor)
         }
-        (super::node_toml::RawNodeToml::DevSeed(raw), _) => service_dev_shape(&raw),
+        (RawNodeToml::DevSeed(raw), _) => service_dev_shape(&raw),
     }
 }
 
@@ -227,14 +257,14 @@ pub fn resolve_service(cfg_path: &Path) -> Result<ServiceConfig, String> {
 /// wearing a different hat.
 fn load_valid_descriptor(path: &Path) -> Result<NetworkDescriptor, String> {
     let descriptor = NetworkDescriptor::load(path)?;
-    if descriptor.scheme != SCHEME_ED25519 {
-        return Err(format!(
-            "network {} uses scheme {:?}; this build runs {SCHEME_ED25519:?}",
-            descriptor.chain_id, descriptor.scheme
-        ));
-    }
     if descriptor.validator_keys()?.is_empty() {
         return Err(format!("network {} has no validators", descriptor.chain_id));
+    }
+    if descriptor.modules.is_empty() {
+        return Err(format!(
+            "network {} has no modules — re-found it with `node init --modules <dir>`",
+            descriptor.chain_id
+        ));
     }
     Ok(descriptor)
 }
@@ -275,13 +305,6 @@ fn service_dev_shape(raw: &DevSeedToml) -> Result<ServiceConfig, String> {
     })
 }
 
-/// the podman provider image default — what `[sandbox]` generation writes
-/// into a fresh table's `image`, and the commented example's value.
-pub const DEFAULT_PODMAN_IMAGE: &str = "docker.io/library/node:22-slim";
-/// the tart provider image default — what `[sandbox]` generation writes on
-/// macOS. resolution never guesses an image: the table always carries one.
-pub const DEFAULT_TART_IMAGE: &str = "ghcr.io/cirruslabs/macos-sonoma-base:latest";
-
 /// Gate the resolved sandbox backend on the user's compute grant.
 ///
 /// Two independent facts, and the compute service needs both: the `[sandbox]`
@@ -309,19 +332,19 @@ fn gate_on_compute_grant(
 }
 
 /// resolve the operator's `[sandbox]` table into the compute plane: `None`
-/// (no table) = consensus-only node, no backend and no capacity; `"podman"`
-/// → `Podman` with the probed host totals, per-key overrides winning;
-/// `"tart"` → `Tart` (ephemeral macOS VMs, same capacity model); any other
-/// runtime — "direct" included, there is no bare spawn — is a loud config
-/// error naming the audited adapters.
+/// (no table) = consensus-only node, no backend and no capacity;
+/// `"firecracker"` (Linux) or `"vz"` (macOS) → the microVM backend with the
+/// probed host totals, per-key overrides winning; any other runtime —
+/// "podman", "tart" and "direct" included, there is no container backend and
+/// no bare spawn — is a loud config error naming the audited adapters.
 fn resolve_sandbox(
     sandbox: Option<&SandboxToml>,
 ) -> Result<(Option<SandboxBackend>, BTreeMap<String, u64>), String> {
     let Some(sandbox) = sandbox else {
         return Ok((None, BTreeMap::new()));
     };
-    // podman and tart share the capacity derivation: probed totals with the
-    // operator's per-key overrides (`0` = probe) winning. the map is validated
+    // capacity derivation: probed totals with the operator's per-key overrides
+    // (`0` = probe) winning. the map is validated
     // through THE consensus rule (capability::validate_resources) before it
     // leaves this boundary: a zero override would otherwise pass boot, get
     // announced, and be rejected by the module — wedging the announcer's
@@ -345,43 +368,36 @@ fn resolve_sandbox(
         }
         Ok(capacity)
     };
-    let image = sandbox.image.clone();
-    match sandbox.runtime.as_str() {
-        "podman" => {
-            // NO socket here. There is no node-wide podman any more: each
-            // service daemon starts its own under `<storage>/services/<kind>`,
-            // so the only honest thing this layer can say is "podman, this
-            // image". `services::podman_backend` roots it for a kind, and it is
-            // the ONLY place that does — an unrooted socket is an empty path
-            // that fails loudly rather than silently dialing someone else's.
-            Ok((
-                Some(SandboxBackend::Podman {
-                    image,
-                    socket: PathBuf::new(),
-                }),
-                probed()?,
-            ))
+    let vmm = match sandbox.runtime.as_str() {
+        "firecracker" => Vmm::Firecracker,
+        "vz" => Vmm::Vz,
+        other => {
+            return Err(format!(
+                "sandbox runtime: {other:?} is not \"firecracker\" (Linux) or \"vz\" (macOS) \
+                 — provider runs never execute bare on the host"
+            ));
         }
-        "tart" => {
-            let capacity = probed()?;
-            if capacity.get("cores").copied().unwrap_or(0) < provider_host::TART_MIN_CORES {
-                return Err(format!(
-                    "sandbox capacity: Tart requires at least {} cores",
-                    provider_host::TART_MIN_CORES
-                ));
-            }
-            Ok((Some(SandboxBackend::Tart { image }), capacity))
-        }
-        other => Err(format!(
-            "sandbox runtime: {other:?} is not \"podman\" or \"tart\" \
-             (provider runs never execute bare on the host)"
-        )),
-    }
+    };
+    // The guest images are the whole backend: one kernel and one read-only
+    // rootfs, shared by every run on this node. Both are resolved to absolute
+    // paths here so a relative one in node.toml fails at config time rather
+    // than at the first boot, where it would read as "the guest never dialled
+    // back".
+    let kernel = absolute_runtime_path(&sandbox.kernel)?;
+    let rootfs = absolute_runtime_path(&sandbox.rootfs)?;
+    // The agent CLIs are NOT a table key: they are per-machine, installed by
+    // `ducktape agent install`, and every node on this host lends the same set.
+    let executors = workspace_config::executor_dir()?;
+    Ok((
+        Some(SandboxBackend::MicroVm {
+            vmm,
+            kernel,
+            rootfs,
+            executors,
+        }),
+        probed()?,
+    ))
 }
-
-/// default recovery checkpoint cadence: small enough that boot replay stays
-/// cheap, large enough that snapshotting the in-memory cohort is amortized.
-pub const DEFAULT_CHECKPOINT_BLOCKS: u64 = 32;
 
 fn absolute_runtime_path(path: &Path) -> Result<PathBuf, String> {
     if path.is_absolute() {
@@ -412,12 +428,12 @@ fn dev_storage_dir(raw: &DevSeedToml) -> Result<PathBuf, String> {
 /// [`resolve_service`]'s own halves produce, so every fact both processes need
 /// is computed in exactly one place.
 pub fn resolve(cfg_path: &Path) -> Result<Resolved, String> {
-    match super::node_toml::load_raw_node_toml(cfg_path)? {
-        (super::node_toml::RawNodeToml::Network(raw), _) => {
+    match load_raw_node_toml(cfg_path)? {
+        (RawNodeToml::Network(raw), _) => {
             let base = absolute_runtime_path(cfg_path.parent().unwrap_or_else(|| Path::new(".")))?;
             resolve_network_shape(&base, raw)
         }
-        (super::node_toml::RawNodeToml::DevSeed(raw), _) => resolve_dev_shape(raw),
+        (RawNodeToml::DevSeed(raw), _) => resolve_dev_shape(raw),
     }
 }
 
@@ -454,8 +470,8 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     }
     // mesh = validators ∪ every reach identity (direct + coordinated). A
     // fresh network-shape joiner may be outside this set at genesis; it parks
-    // until governance admits it (join ADR §4: the gate rides the WireGuard-
-    // tunnel doorbell, so a pre-admission joiner needs no mesh door — its
+    // until governance admits it (the gate rides the WireGuard-tunnel
+    // doorbell, so a pre-admission joiner needs no mesh door — its
     // REAL key is re-tracked onto every member's mesh at its Redeem grant).
     let mut mesh = validators.clone();
     for (k, _) in &bootstrap {
@@ -489,8 +505,19 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         raw.wireguard_advertised_value(),
         wireguard_listen,
     )?;
-    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised_value())?;
+    let wireguard_advertised = resolved_wireguard_advertised(
+        raw.wireguard_advertised_value(),
+        Some(&raw.advertised),
+        &raw.listen,
+        wireguard_listen,
+    )?;
     let compute_backend = gate_on_compute_grant(service.sandbox.as_ref(), &service.workspace)?;
+    // the descriptor IS the genesis code set here: its hashes are already in
+    // the namespace fingerprint, so the bundle beside it only has to match.
+    let genesis = GenesisModules {
+        hashes: descriptor.module_hashes()?,
+        bundle_dir: base.join("modules"),
+    };
 
     Ok(Resolved {
         label: hex_bytes(&me.as_ref()[..4]),
@@ -522,6 +549,7 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         wireguard_advertised,
         service,
         compute_backend,
+        genesis,
     })
 }
 
@@ -533,10 +561,9 @@ fn parse_wireguard_listen(raw: Option<&str>) -> Result<Option<SocketAddr>, Strin
     .transpose()
 }
 
-/// resolve `wireguard_advertised` into a dial ingress: absent = "derive from
-/// `wireguard_listen`" (the caller's job — see `reachability_plane.rs`), an
-/// explicit value must be dialable (a hostname is kept VERBATIM, resolved
-/// once at plane start, same discipline as the mesh `advertised`).
+/// parse an EXPLICIT `wireguard_advertised` into a dial ingress: it must be
+/// dialable (a hostname is kept VERBATIM, resolved once at plane start, same
+/// discipline as the mesh `advertised`).
 fn parse_wireguard_advertised(raw: Option<&str>) -> Result<Option<Ingress>, String> {
     match raw {
         None => Ok(None),
@@ -545,6 +572,41 @@ fn parse_wireguard_advertised(raw: Option<&str>) -> Result<Option<Ingress>, Stri
             .map(Some)
             .ok_or_else(|| format!("wireguard_advertised addr {a:?} is not dialable")),
     }
+}
+
+/// the WireGuard endpoint this node ADVERTISES, decided once for both of its
+/// consumers — the reachability plane's signed mesh record and the invite
+/// blob — so a peer never learns one endpoint from the invite and another
+/// (or none) from the mesh. an explicit `wireguard_advertised` wins verbatim;
+/// otherwise the host the invite hands out ([`invite_wireguard_endpoint`]: a
+/// concrete `wireguard_listen` IP, else `advertised`/`listen`) at the
+/// WireGuard port. a node with no dialable underlay host at all (`advertised
+/// = "overlay"`, unspecified binds) advertises NO endpoint: peers install its
+/// tunnel without one and its own initiations complete it (WireGuard roams to
+/// the authenticated source).
+///
+/// the plane used to derive this from `wireguard_listen` ALONE: two joiners
+/// on one LAN, both bound `0.0.0.0` with a dialable `advertised`, both
+/// advertised no endpoint, and neither could ever initiate the other's
+/// tunnel — consensus ran over the underlay, only the code plane was dark.
+fn resolved_wireguard_advertised(
+    explicit: Option<&str>,
+    advertised: Option<&str>,
+    listen: &str,
+    wireguard_listen: Option<SocketAddr>,
+) -> Result<Option<Ingress>, String> {
+    if let Some(explicit) = parse_wireguard_advertised(explicit)? {
+        return Ok(Some(explicit));
+    }
+    let Some(wg) = wireguard_listen else {
+        return Ok(None);
+    };
+    let Ok(derived) = invite_wireguard_endpoint(advertised, listen, wg, None) else {
+        return Ok(None);
+    };
+    // a derived value that is not dialable (a port-0 bind) is endpoint-less,
+    // not a config error — only an EXPLICIT value is held to that.
+    ingress_of(&derived).map_err(|e| format!("wireguard endpoint: {e}"))
 }
 
 /// the DIRECT invite intro listener the plane binds: [`resolved_invite_listen`],
@@ -688,9 +750,8 @@ fn resolve_advertised(
 /// the dev-seed shape: every peer dials every other through the
 /// index-aligned `peer_addrs` list (the mesh has no address gossip).
 fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
-    // the shared half first: it owns the storage/workspace derivation (which
-    // doubles as the podman-socket base) and must run before any field of `raw`
-    // is moved out below.
+    // the shared half first: it owns the storage/workspace derivation and must
+    // run before any field of `raw` is moved out below.
     let service = service_dev_shape(&raw)?;
     // the dev shape's per-process state dir stands in as its workspace, so its
     // grant file sits beside its storage — one rule for both shapes.
@@ -772,11 +833,28 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         &ed25519::PrivateKey::from_seed(id).public_key(),
     )?;
 
-    let wireguard_advertised = parse_wireguard_advertised(raw.wireguard_advertised.as_deref())?;
+    let wireguard_advertised = resolved_wireguard_advertised(
+        raw.wireguard_advertised.as_deref(),
+        raw.advertised.as_deref(),
+        &raw.listen,
+        wireguard_listen,
+    )?;
     let gateway_listen = raw
         .gateway_listen
         .clone()
         .or_else(|| raw.http_listen.as_ref().map(|_| "127.0.0.1:0".to_string()));
+    // the dev shape has no descriptor, so the FILES are its genesis code set:
+    // whatever `<dir>/<id>.component.wasm` hashes to is what this node seeds.
+    // LAST, because it is the only check that touches the disk — a config with
+    // a typo'd `listen` must be told about the typo, not about the bundle.
+    let bundle_dir = PathBuf::from(&raw.modules);
+    let genesis = GenesisModules {
+        hashes: hash_bundle(
+            &bundle_dir,
+            &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
+        )?,
+        bundle_dir,
+    };
     Ok(Resolved {
         signer: ed25519::PrivateKey::from_seed(id),
         label: format!("#{id}"),
@@ -809,6 +887,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
         wireguard_advertised,
         service,
         compute_backend,
+        genesis,
     })
 }
 
@@ -829,6 +908,35 @@ mod tests {
         dir
     }
 
+    /// a stand-in genesis module set for the network-shape descriptors these
+    /// tests resolve: a descriptor with NO modules is not a runnable network.
+    fn fake_modules() -> Vec<crate::config::ModuleCode> {
+        vec![crate::config::ModuleCode {
+            id: "pages".into(),
+            code_hash: "11".repeat(32),
+        }]
+    }
+
+    /// a dev-shape genesis bundle under `dir`: one stub `<id>.component.wasm`
+    /// per production wasm tenant, returned as the `modules = ...` line a
+    /// dev-seed config must carry (its code set is derived from these files).
+    /// Append it BEFORE any `[sandbox]` table — a scalar after a table header
+    /// belongs to the table.
+    fn fake_bundle(dir: &Path) -> String {
+        let modules = dir.join("modules");
+        std::fs::create_dir_all(&modules).expect("modules dir");
+        for id in topology::TOPOLOGY.wasm_ids(topology::PRODUCTION) {
+            std::fs::write(component_path(&modules, id), id.as_bytes()).expect("write component");
+        }
+        format!("modules = {:?}\n", modules.to_str().expect("utf8 path"))
+    }
+
+    /// the `modules` line for a dev-seed config whose resolve must fail BEFORE
+    /// the bundle is ever read: the key is required by the parse, the directory
+    /// is deliberately absent. A test using this and still passing is the proof
+    /// that hashing runs after the cheap checks.
+    const UNREAD_BUNDLE: &str = "modules = \"/no/such/bundle\"\n";
+
     #[test]
     fn a_hostname_advertised_boots_without_dns_and_stays_a_hostname() {
         // the tunnel case: a stable name whose IP moves (or does not resolve
@@ -838,7 +946,6 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
             chain_id: "net#44444444".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![format!(
                 "{}@definitely-not-resolvable.ducktape.invalid:443",
@@ -846,6 +953,7 @@ mod tests {
             )],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -874,18 +982,18 @@ mod tests {
 
     #[test]
     fn the_mesh_carries_no_derived_lobby_identity() {
-        // join ADR §4: the derived lobby transport identity is RETIRED — the
+        // the derived lobby transport identity is RETIRED — the
         // tracked mesh is exactly the descriptor's real identities, nothing
         // derivable from the namespace alone.
         let dir = tmp("lobbymesh");
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
             chain_id: "net#33333333".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -916,11 +1024,11 @@ mod tests {
         let founder = ed25519::PrivateKey::from_seed(7).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "net#44444444".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(founder.as_ref())],
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.add_bootstrap(&founder, "203.0.113.7:41000");
         d.save(&dir.join("network.toml")).expect("save");
@@ -939,7 +1047,6 @@ mod tests {
         let other = ed25519::PrivateKey::from_seed(9).public_key();
         let mut d = NetworkDescriptor {
             chain_id: "net#11223344".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![
                 hex_bytes(me.public_key().as_ref()),
                 hex_bytes(other.as_ref()),
@@ -947,6 +1054,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.add_bootstrap(&other, "127.0.0.1:52200");
         d.save(&dir.join("network.toml")).expect("save descriptor");
@@ -965,7 +1073,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&r.namespace).starts_with("net#11223344@"));
         assert_eq!(r.validators.len(), 2);
         // exactly the validators — no derived lobby identity any more (the
-        // join gate rides the tunnel doorbell, join ADR §4).
+        // join gate rides the tunnel doorbell).
         assert_eq!(r.mesh.len(), 2);
         // self never appears in dial_hints; the other member does.
         assert_eq!(r.dial_hints.len(), 1);
@@ -976,6 +1084,12 @@ mod tests {
         // the workspace base is the config directory — where a joiner would
         // persist a `coord.cap` delivered over its Admitted gate reply.
         assert_eq!(r.service.workspace, dir);
+        // the genesis code set comes STRAIGHT off the descriptor (its hashes
+        // are already in the namespace fingerprint), and its bytes are read
+        // from the bundle beside the config.
+        assert_eq!(r.genesis.bundle_dir, dir.join("modules"));
+        assert_eq!(r.genesis.hashes["pages"], [0x11u8; 32]);
+        assert_eq!(r.genesis.hashes.len(), fake_modules().len());
     }
 
     #[test]
@@ -989,11 +1103,11 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         NetworkDescriptor {
             chain_id: "relative#11223344".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1021,23 +1135,31 @@ mod tests {
     #[test]
     fn dev_shape_relative_storage_is_absolute_from_launch_cwd() {
         let launch_cwd = std::env::current_dir().expect("current directory");
-        let raw: DevSeedToml = toml::from_str(
+        let dir = tmp("devrelative");
+        let bundle = fake_bundle(&dir);
+        let raw: DevSeedToml = toml::from_str(&format!(
             "id = 7\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
              peer_seeds = [7]\n\
-             storage_dir = \"relative/storage\"\n",
-        )
+             storage_dir = \"relative/storage\"\n{bundle}"
+        ))
         .expect("parse dev config");
         let resolved = resolve_dev_shape(raw).expect("resolve relative storage");
-        assert_eq!(resolved.service.storage_dir, launch_cwd.join("relative/storage"));
+        assert_eq!(
+            resolved.service.storage_dir,
+            launch_cwd.join("relative/storage")
+        );
         assert!(resolved.service.storage_dir.is_absolute());
 
-        let default_raw: DevSeedToml = toml::from_str(
+        let default_raw: DevSeedToml = toml::from_str(&format!(
             "id = 8\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
-             peer_seeds = [8]\n",
-        )
+             peer_seeds = [8]\n{bundle}"
+        ))
         .expect("parse default dev config");
         let default = resolve_dev_shape(default_raw).expect("resolve default storage");
-        assert_eq!(default.service.storage_dir, std::env::temp_dir().join("ducktape-8"));
+        assert_eq!(
+            default.service.storage_dir,
+            std::env::temp_dir().join("ducktape-8")
+        );
         assert!(default.service.storage_dir.is_absolute());
     }
 
@@ -1087,11 +1209,11 @@ mod tests {
         let (me, _) = load_or_generate_identity(&network_dir.join("identity.key")).expect("keygen");
         NetworkDescriptor {
             chain_id: "deleted-cwd#11223344".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&network_dir.join("network.toml"))
         .expect("save descriptor");
@@ -1109,7 +1231,10 @@ mod tests {
         let dev_config = dev_dir.join("node.toml");
         std::fs::write(
             &dev_config,
-            "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\npeer_seeds = [0]\n",
+            format!(
+                "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\npeer_seeds = [0]\n{}",
+                fake_bundle(&dev_dir)
+            ),
         )
         .expect("write dev config");
         let doomed_cwd = tmp("deleted-cwd-launch");
@@ -1146,11 +1271,11 @@ mod tests {
         let other = ed25519::PrivateKey::from_seed(3).public_key();
         let d = NetworkDescriptor {
             chain_id: "closed#00000000".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(other.as_ref())],
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
         std::fs::write(
@@ -1165,9 +1290,87 @@ mod tests {
         assert_eq!(r.signer.public_key(), me.public_key());
         assert!(!r.validators.contains(&me.public_key()));
         assert_eq!(r.validators, vec![other.clone()]);
-        // no derived lobby door any more (join ADR §4): the joiner's own key
+        // no derived lobby door any more: the joiner's own key
         // enters the mesh at its Redeem grant, not at resolve time.
         assert_eq!(r.mesh, vec![other]);
+    }
+
+    #[test]
+    fn dev_shape_hashes_its_modules_dir() {
+        use sha2::Digest as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modules = dir.path().join("modules");
+        std::fs::create_dir_all(&modules).expect("modules dir");
+        for id in topology::TOPOLOGY.wasm_ids(topology::PRODUCTION) {
+            std::fs::write(component_path(&modules, id), id.as_bytes()).expect("write component");
+        }
+        let cfg = dir.path().join("node.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "id = 1\nnamespace = \"t\"\npeer_seeds = [1]\nlisten = \"127.0.0.1:0\"\n\
+                 storage_dir = {:?}\nmodules = {:?}\n",
+                dir.path().join("storage").to_str().expect("utf8 path"),
+                modules.to_str().expect("utf8 path")
+            ),
+        )
+        .expect("write node.toml");
+        let r = resolve(&cfg).expect("resolve dev shape");
+        assert_eq!(r.genesis.bundle_dir, modules);
+        assert_eq!(
+            r.genesis.hashes["pages"],
+            <[u8; 32]>::from(sha2::Sha256::digest(b"pages")),
+            "each hash is the sha256 of the component file on disk"
+        );
+    }
+
+    #[test]
+    fn dev_shape_names_a_missing_component() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modules = dir.path().join("modules");
+        std::fs::create_dir_all(&modules).expect("modules dir");
+        let cfg = dir.path().join("node.toml");
+        std::fs::write(
+            &cfg,
+            format!(
+                "id = 1\nnamespace = \"t\"\npeer_seeds = [1]\nlisten = \"127.0.0.1:0\"\n\
+                 storage_dir = {:?}\nmodules = {:?}\n",
+                dir.path().join("storage").to_str().expect("utf8 path"),
+                modules.to_str().expect("utf8 path")
+            ),
+        )
+        .expect("write node.toml");
+        let err = resolve(&cfg).expect_err("an empty bundle dir is refused");
+        // the refusal names the FULL path of the first component it could not
+        // read — an operator pointed at the wrong directory needs the path,
+        // not a bare module id. `hash_bundle` walks BY ID, so "first" is the
+        // alphabetically first wasm module, not the first in topology order.
+        let mut ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+        ids.sort_unstable();
+        let missing = component_path(&modules, ids[0]);
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+    }
+
+    /// a network with no modules is not a runnable network — its nodes would
+    /// seed an empty code registry — so it is refused beside the empty
+    /// validator set, by the loader BOTH paths run.
+    #[test]
+    fn network_shape_refuses_an_empty_module_list() {
+        let dir = tmp("nomodules");
+        let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        NetworkDescriptor {
+            chain_id: "nomodules#12345678".into(),
+            validators: vec![hex_bytes(me.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: Vec::new(),
+        }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write node.toml");
+        let err = resolve(&dir.join("node.toml")).expect_err("an empty module list is refused");
+        assert!(err.contains("no modules"), "{err}");
     }
 
     #[test]
@@ -1175,7 +1378,10 @@ mod tests {
         let dir = tmp("devdups");
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\npeer_seeds = [0, 1, 1]\n",
+            format!(
+                "id = 0\nlisten = \"127.0.0.1:52220\"\nnamespace = \"demo\"\n\
+                 peer_seeds = [0, 1, 1]\n{UNREAD_BUNDLE}"
+            ),
         )
         .expect("write");
         let err = resolve(&dir.join("node.toml")).expect_err("dup seeds refused");
@@ -1191,10 +1397,11 @@ mod tests {
         // run) that resolves the same id.
         let base = format!(
             "id = 0\nlisten = \"127.0.0.1:52221\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             storage_dir = {:?}\n",
-            dir.join("storage").to_str().expect("utf8 path")
+             storage_dir = {:?}\n{}",
+            dir.join("storage").to_str().expect("utf8 path"),
+            fake_bundle(&dir)
         );
-        let sandbox = sandbox_table("podman", "docker.io/library/node:22-slim", 0, 0);
+        let sandbox = sandbox_table("firecracker", "/var/lib/ducktape/guest", 0, 0);
 
         // a sandbox table alone announces NOTHING: it says how a run would be
         // isolated, never that the user consented to run any.
@@ -1232,7 +1439,7 @@ mod tests {
         std::fs::write(
             workspace.join("services.toml"),
             format!(
-                "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
+                "[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
                  nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{list}]\n\
                  scopes = []\n",
                 "11".repeat(32),
@@ -1244,19 +1451,23 @@ mod tests {
 
     /// one `[sandbox]` line-set for the dev-seed harness shape, appended
     /// LAST (everything after a toml table header belongs to the table).
-    fn sandbox_table(runtime: &str, image: &str, cores: u64, mem_gb: u64) -> String {
+    fn sandbox_table(runtime: &str, guest_dir: &str, cores: u64, mem_gb: u64) -> String {
         format!(
-            "[sandbox]\nruntime = \"{runtime}\"\nimage = \"{image}\"\ncores = {cores}\nmem_gb = {mem_gb}\n"
+            "[sandbox]\nruntime = \"{runtime}\"\nkernel = \"{guest_dir}/vmlinux\"\n\
+             rootfs = \"{guest_dir}/rootfs.ext4\"\ncores = {cores}\nmem_gb = {mem_gb}\n"
         )
     }
 
     #[test]
     fn sandbox_table_selects_the_compute_plane() {
         let dir = tmp("sandbox");
-        let base = "id = 0\nlisten = \"127.0.0.1:52222\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
+        let base = format!(
+            "id = 0\nlisten = \"127.0.0.1:52222\"\nnamespace = \"demo\"\npeer_seeds = [0]\n{}",
+            fake_bundle(&dir)
+        );
 
         // no [sandbox] table ⇒ consensus-only: no backend, no capacity.
-        std::fs::write(dir.join("node.toml"), base).expect("write");
+        std::fs::write(dir.join("node.toml"), &base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve default");
         assert_eq!(resolved.service.sandbox, None);
         assert!(
@@ -1273,36 +1484,63 @@ mod tests {
         .expect("write");
         resolve(&dir.join("node.toml")).expect_err("flat sandbox key refused");
 
-        // podman ⇒ Podman with the table's image + probed capacity (0 = probe).
+        // firecracker ⇒ the two guest images + probed capacity (0 = probe).
         std::fs::write(
             dir.join("node.toml"),
-            format!(
-                "{base}{}",
-                sandbox_table("podman", "docker.io/library/node:22-slim", 0, 0)
-            ),
+            format!("{base}{}", sandbox_table("firecracker", "/srv/guest", 0, 0)),
         )
         .expect("write");
-        let resolved = resolve(&dir.join("node.toml")).expect("resolve podman");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve firecracker");
         assert!(
             matches!(
                 &resolved.service.sandbox,
-                Some(SandboxBackend::Podman { image, .. })
-                    if image == "docker.io/library/node:22-slim"
+                Some(SandboxBackend::MicroVm { vmm: Vmm::Firecracker, kernel, rootfs, executors })
+                    if kernel == Path::new("/srv/guest/vmlinux")
+                        && rootfs == Path::new("/srv/guest/rootfs.ext4")
+                        // the agent CLIs are per-machine, so the table never
+                        // names them and this is the operator's own directory.
+                        && executors == &workspace_config::executor_dir().expect("executor dir")
             ),
-            "podman backend with the probed image: {:?}",
+            "firecracker backend with the configured images: {:?}",
+            resolved.service.sandbox
+        );
+
+        // the macOS runtime resolves the same shape with the vz flavor; the
+        // OS gate lives in the boot probe, not in config resolution, so a
+        // node.toml can be written on either OS and fail loudly on the wrong
+        // one.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!("{base}{}", sandbox_table("vz", "/srv/guest", 0, 0)),
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve vz");
+        assert!(
+            matches!(
+                &resolved.service.sandbox,
+                Some(SandboxBackend::MicroVm { vmm: Vmm::Vz, kernel, .. })
+                    if kernel == Path::new("/srv/guest/vmlinux")
+            ),
+            "vz backend with the configured images: {:?}",
             resolved.service.sandbox
         );
         assert!(
-            resolved.service.sandbox_capacity.get("cores").copied().unwrap_or(0) >= 1,
-            "a podman node announces its probed capacity"
+            resolved
+                .service
+                .sandbox_capacity
+                .get("cores")
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "a compute node announces its probed capacity"
         );
 
-        // an override wins over the probe; a custom image is honored.
+        // an override wins over the probe; a custom guest directory is honored.
         std::fs::write(
             dir.join("node.toml"),
             format!(
                 "{base}{}",
-                sandbox_table("podman", "docker.io/library/rust:1", 99, 128)
+                sandbox_table("firecracker", "/opt/other", 99, 128)
             ),
         )
         .expect("write");
@@ -1310,58 +1548,28 @@ mod tests {
         assert!(
             matches!(
                 &resolved.service.sandbox,
-                Some(SandboxBackend::Podman { image, .. }) if image == "docker.io/library/rust:1"
+                Some(SandboxBackend::MicroVm { kernel, .. })
+                    if kernel == Path::new("/opt/other/vmlinux")
             ),
-            "custom image honored: {:?}",
+            "custom guest dir honored: {:?}",
             resolved.service.sandbox
         );
         assert_eq!(resolved.service.sandbox_capacity.get("cores"), Some(&99));
         assert_eq!(resolved.service.sandbox_capacity.get("mem_gb"), Some(&128));
 
-        // tart ⇒ the Tart backend, probed capacity, and the minimum-cores
-        // rule enforced at this boundary.
-        std::fs::write(
-            dir.join("node.toml"),
-            format!(
-                "{base}{}",
-                sandbox_table("tart", "ghcr.io/cirruslabs/macos-sonoma-base:latest", 0, 0)
-            ),
-        )
-        .expect("write");
-        let tart = resolve(&dir.join("node.toml")).expect("tart accepted");
-        assert_eq!(
-            tart.service.sandbox,
-            Some(SandboxBackend::Tart {
-                image: "ghcr.io/cirruslabs/macos-sonoma-base:latest".into()
-            })
-        );
-        assert!(
-            ["cores", "mem_gb"]
-                .iter()
-                .all(|dimension| tart.service.sandbox_capacity.contains_key(*dimension)),
-            "both enforceable capacity dimensions ride Tart"
-        );
-        std::fs::write(
-            dir.join("node.toml"),
-            format!(
-                "{base}{}",
-                sandbox_table("tart", "ghcr.io/cirruslabs/macos-sonoma-base:latest", 1, 0)
-            ),
-        )
-        .expect("write");
-        let err = resolve(&dir.join("node.toml")).expect_err("undersized Tart capacity refused");
-        assert!(err.contains("requires at least 2 cores"), "{err}");
-
-        // any other runtime — "direct" included — is a loud config error
-        // naming the audited adapters.
-        for runtime in ["gvisor", "direct"] {
+        // any other runtime is a loud config error naming the one audited
+        // adapter. "tart" and "podman" are in this list ON PURPOSE: both
+        // backends were removed, and an operator whose node.toml still names
+        // one must be told so at boot rather than silently getting something
+        // else.
+        for runtime in ["tart", "podman", "gvisor", "direct"] {
             std::fs::write(
                 dir.join("node.toml"),
-                format!("{base}{}", sandbox_table(runtime, "img", 0, 0)),
+                format!("{base}{}", sandbox_table(runtime, "/g", 0, 0)),
             )
             .expect("write");
             let err = resolve(&dir.join("node.toml")).expect_err("unknown runtime refused");
-            assert!(err.contains("podman"), "{err}");
+            assert!(err.contains("firecracker"), "{err}");
         }
     }
 
@@ -1374,11 +1582,11 @@ mod tests {
     #[test]
     fn primary_coordinator_key_survives_resolve_default_absent_and_explicit() {
         let dir = tmp("primary-coordinator-key");
-        std::fs::write(
-            dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n",
-        )
-        .expect("write");
+        let base = format!(
+            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n{}",
+            fake_bundle(&dir)
+        );
+        std::fs::write(dir.join("node.toml"), &base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
         assert_eq!(
             resolved.primary_coordinator, None,
@@ -1387,8 +1595,7 @@ mod tests {
 
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             primary_coordinator = \"none\"\n",
+            format!("{base}primary_coordinator = \"none\"\n"),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve none");
@@ -1401,8 +1608,7 @@ mod tests {
 
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52260\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             primary_coordinator = \"203.0.113.9:3478\"\n",
+            format!("{base}primary_coordinator = \"203.0.113.9:3478\"\n"),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve override");
@@ -1412,7 +1618,7 @@ mod tests {
         );
     }
 
-    /// `coordinator_relay` (join ADR item 2) rides resolve exactly like
+    /// `coordinator_relay` rides resolve exactly like
     /// `primary_coordinator`: the key ABSENT resolves to `None` — the
     /// zero-config joiner default, deriving the relay from the ambient
     /// coordinator at the wiring site; the disable sentinel and an explicit
@@ -1422,8 +1628,11 @@ mod tests {
     #[test]
     fn coordinator_relay_key_survives_resolve_default_absent_and_explicit() {
         let dir = tmp("coordinator-relay-key");
-        let base = "id = 0\nlisten = \"127.0.0.1:52261\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
-        std::fs::write(dir.join("node.toml"), base).expect("write");
+        let base = format!(
+            "id = 0\nlisten = \"127.0.0.1:52261\"\nnamespace = \"demo\"\npeer_seeds = [0]\n{}",
+            fake_bundle(&dir)
+        );
+        std::fs::write(dir.join("node.toml"), &base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
         assert_eq!(
             resolved.coordinator_relay, None,
@@ -1444,30 +1653,30 @@ mod tests {
         }
     }
 
-    /// `wireguard_advertised` (change 3, issue #331): the key ABSENT resolves
-    /// to `None` — `reachability_plane.rs` then derives it from
-    /// `wireguard_listen` exactly like today; an explicit concrete override
-    /// parses to a socket ingress, and a hostname stays a hostname (DNS
-    /// deferred to plane start, same discipline as the mesh `advertised`).
+    /// `wireguard_advertised` (change 3, issue #331): the key ABSENT derives
+    /// the endpoint the invite hands out — the dialable listen host at the
+    /// WireGuard port; an explicit concrete override parses to a socket
+    /// ingress, and a hostname stays a hostname (DNS deferred to plane start,
+    /// same discipline as the mesh `advertised`).
     #[test]
     fn wireguard_advertised_key_absent_defaults_and_explicit_value_parses() {
         let dir = tmp("wg-advertised-key");
-        std::fs::write(
-            dir.join("node.toml"),
+        let base = format!(
             "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             wireguard_listen = \"0.0.0.0:51820\"\n",
-        )
-        .expect("write");
+             wireguard_listen = \"0.0.0.0:51820\"\n{}",
+            fake_bundle(&dir)
+        );
+        std::fs::write(dir.join("node.toml"), &base).expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve absent");
         assert_eq!(
-            resolved.wireguard_advertised, None,
-            "absent key: reachability_plane.rs derives it from wireguard_listen, unchanged"
+            resolved.wireguard_advertised,
+            Some(Ingress::Socket("127.0.0.1:51820".parse().unwrap())),
+            "absent key: the dialable listen host at the wireguard port — what the invite hands out"
         );
 
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"203.0.113.9:41820\"\n",
+            format!("{base}wireguard_advertised = \"203.0.113.9:41820\"\n"),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("resolve override");
@@ -1478,9 +1687,10 @@ mod tests {
 
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52270\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             wireguard_listen = \"0.0.0.0:51820\"\n\
-             wireguard_advertised = \"definitely-not-resolvable.ducktape.invalid:41820\"\n",
+            format!(
+                "{base}wireguard_advertised = \
+                 \"definitely-not-resolvable.ducktape.invalid:41820\"\n"
+            ),
         )
         .expect("write");
         let resolved = resolve(&dir.join("node.toml")).expect("hostnames never block boot");
@@ -1543,11 +1753,11 @@ mod tests {
         let founder = ed25519::PrivateKey::from_seed(11).public_key();
         NetworkDescriptor {
             chain_id: "keyless#12345678".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(founder.as_ref())],
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         }
         .save(&dir.join("network.toml"))
         .expect("save descriptor");
@@ -1584,40 +1794,34 @@ mod tests {
     /// against.
     ///
     /// The service path loads `network.toml` for its chain id, so it would
-    /// happily resolve a descriptor with a foreign signature scheme or an empty
-    /// validator set — and `ducktape service run compute` would then announce
-    /// capacity for a network its own node refuses to start. Both paths run
+    /// happily resolve a descriptor with an empty validator set — and
+    /// `ducktape service run compute` would then announce capacity for a
+    /// network its own node refuses to start. Both paths run
     /// [`load_valid_descriptor`], and this is what says so: weaken either
-    /// refusal and one of these four assertions goes red.
+    /// refusal and one of these assertions goes red.
     #[test]
     fn both_paths_refuse_a_descriptor_no_node_can_run() {
-        let cases = [
-            ("badscheme", "sr25519", vec![hex_bytes(ed25519::PrivateKey::from_seed(5).public_key().as_ref())], "scheme"),
-            ("novalidators", SCHEME_ED25519, vec![], "no validators"),
-        ];
-        for (slug, scheme, validators, expected) in cases {
-            let dir = tmp(slug);
-            // a REAL key on disk, so the node path fails on the descriptor
-            // rather than on a missing identity.
-            load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
-            NetworkDescriptor {
-                chain_id: format!("{slug}#12345678"),
-                scheme: scheme.into(),
-                validators,
-                bootstrap: vec![],
-                reach: vec![],
-                coordination: None,
-            }
-            .save(&dir.join("network.toml"))
-            .expect("save descriptor");
-            std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write");
-
-            let node = resolve(&dir.join("node.toml")).expect_err("the node path refuses it");
-            assert!(node.contains(expected), "node path: {node}");
-            let service =
-                resolve_service(&dir.join("node.toml")).expect_err("so must the daemon path");
-            assert!(service.contains(expected), "service path: {service}");
+        let (slug, expected) = ("novalidators", "no validators");
+        let dir = tmp(slug);
+        // a REAL key on disk, so the node path fails on the descriptor
+        // rather than on a missing identity.
+        load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
+        NetworkDescriptor {
+            chain_id: format!("{slug}#12345678"),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            modules: fake_modules(),
         }
+        .save(&dir.join("network.toml"))
+        .expect("save descriptor");
+        std::fs::write(dir.join("node.toml"), network_shape_toml(&[])).expect("write");
+
+        let node = resolve(&dir.join("node.toml")).expect_err("the node path refuses it");
+        assert!(node.contains(expected), "node path: {node}");
+        let service = resolve_service(&dir.join("node.toml")).expect_err("so must the daemon path");
+        assert!(service.contains(expected), "service path: {service}");
     }
 
     /// the desktop shape's posture: a config with no dialable underlay host
@@ -1632,11 +1836,11 @@ mod tests {
         let (me, _) = load_or_generate_identity(&dir.join("identity.key")).expect("keygen");
         let d = NetworkDescriptor {
             chain_id: "net#55555555".into(),
-            scheme: SCHEME_ED25519.into(),
             validators: vec![hex_bytes(me.public_key().as_ref())],
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            modules: fake_modules(),
         };
         d.save(&dir.join("network.toml")).expect("save");
 
@@ -1675,13 +1879,54 @@ mod tests {
         );
     }
 
+    /// the endpoint a peer learns from this node's signed mesh record is the
+    /// one the invite blob hands out — ONE derivation. the real-network lane
+    /// found the plane deriving from `wireguard_listen` alone: two joiners on
+    /// one LAN, both bound `0.0.0.0`, both advertised no endpoint, and
+    /// neither could ever initiate the other's tunnel.
+    #[test]
+    fn wireguard_endpoint_derives_from_advertised_when_the_bind_is_unspecified() {
+        let dir = tmp("wg-advertised-derived");
+        let bundle = fake_bundle(&dir);
+        std::fs::write(
+            dir.join("node.toml"),
+            format!(
+                "id = 0\nlisten = \"0.0.0.0:52272\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+                 advertised = \"192.0.2.7:52272\"\nwireguard_listen = \"0.0.0.0:51820\"\n{bundle}"
+            ),
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve advertised");
+        assert_eq!(
+            resolved.wireguard_advertised,
+            Some(Ingress::Socket("192.0.2.7:51820".parse().unwrap())),
+            "the advertised host at the wireguard port"
+        );
+
+        // no dialable underlay host at all (the desktop shape): endpoint-less,
+        // and that is a shape, never an error.
+        std::fs::write(
+            dir.join("node.toml"),
+            format!(
+                "id = 0\nlisten = \"[::]:52272\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+                 advertised = \"overlay\"\nwireguard_listen = \"[::]:51820\"\n{bundle}"
+            ),
+        )
+        .expect("write");
+        let resolved = resolve(&dir.join("node.toml")).expect("resolve overlay");
+        assert_eq!(resolved.wireguard_advertised, None);
+    }
+
     #[test]
     fn wireguard_advertised_rejects_an_unspecified_or_port_zero_value() {
         let dir = tmp("wg-advertised-bad");
         std::fs::write(
             dir.join("node.toml"),
-            "id = 0\nlisten = \"127.0.0.1:52280\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
-             wireguard_listen = \"0.0.0.0:51820\"\nwireguard_advertised = \"0.0.0.0:0\"\n",
+            format!(
+                "id = 0\nlisten = \"127.0.0.1:52280\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+                 wireguard_listen = \"0.0.0.0:51820\"\n\
+                 wireguard_advertised = \"0.0.0.0:0\"\n{UNREAD_BUNDLE}"
+            ),
         )
         .expect("write");
         let err = resolve(&dir.join("node.toml")).expect_err(
@@ -1712,7 +1957,7 @@ mod tests {
                 unspecified,
                 Some("tunnel.example.com:9999")
             )
-                .unwrap(),
+            .unwrap(),
             "tunnel.example.com",
             "a hostname override stays a hostname"
         );
@@ -1775,11 +2020,19 @@ mod tests {
         let dir = tmp("devself");
         std::fs::write(
             dir.join("node.toml"),
-            "id = 1\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [1, 0]\npeer_addrs = [\"127.0.0.1:52230\", \"127.0.0.1:52231\"]\n",
+            format!(
+                "id = 1\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [1, 0]\n\
+                 peer_addrs = [\"127.0.0.1:52230\", \"127.0.0.1:52231\"]\n{}",
+                fake_bundle(&dir)
+            ),
         )
         .expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
-        assert_eq!(r.dial_hints.len(), 1, "self is filtered, the other peer stays");
+        assert_eq!(
+            r.dial_hints.len(),
+            1,
+            "self is filtered, the other peer stays"
+        );
         assert_eq!(
             r.dial_hints[0].0,
             ed25519::PrivateKey::from_seed(0).public_key(),
@@ -1789,15 +2042,18 @@ mod tests {
 
     #[test]
     fn dev_shape_builds_the_full_hint_list() {
-        let toml = r#"
+        let dir = tmp("dev");
+        let toml = format!(
+            r#"
 id = 1
 listen = "127.0.0.1:52210"
 namespace = "demo"
 peer_seeds = [0, 1, 2]
 validator_seeds = [0, 1]
 peer_addrs = ["127.0.0.1:52200", "127.0.0.1:52210", "127.0.0.1:52202"]
-"#;
-        let dir = tmp("dev");
+{}"#,
+            fake_bundle(&dir)
+        );
         std::fs::write(dir.join("node.toml"), toml).expect("write");
         let r = resolve(&dir.join("node.toml")).expect("resolve");
         assert!(r.dev_demo);
@@ -1821,7 +2077,10 @@ peer_addrs = ["127.0.0.1:52200", "127.0.0.1:52210", "127.0.0.1:52202"]
     #[test]
     fn retired_wireguard_effect_key_is_refused() {
         let dir = tmp("wgeffect");
-        let base = "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n";
+        let base = format!(
+            "id = 0\nlisten = \"127.0.0.1:52230\"\nnamespace = \"demo\"\npeer_seeds = [0]\n\
+             {UNREAD_BUNDLE}"
+        );
         for spelled in ["socket", "fake", "tun"] {
             std::fs::write(
                 dir.join("node.toml"),
@@ -1836,8 +2095,13 @@ peer_addrs = ["127.0.0.1:52200", "127.0.0.1:52210", "127.0.0.1:52202"]
     #[test]
     fn overlay_advertised_derives_the_ula_and_requires_v6_listen() {
         let dir = tmp("overlay-advertised");
-        let base = "id = 1\nnamespace = \"demo\"\npeer_seeds = [0, 1]\n\
-                    peer_addrs = [\"127.0.0.1:52240\", \"127.0.0.1:52241\"]\n";
+        // a REAL bundle: this test's first half resolves successfully, so it
+        // reaches the hashing the refusal half never gets to.
+        let base = format!(
+            "id = 1\nnamespace = \"demo\"\npeer_seeds = [0, 1]\n\
+             peer_addrs = [\"127.0.0.1:52240\", \"127.0.0.1:52241\"]\n{}",
+            fake_bundle(&dir)
+        );
         std::fs::write(
             dir.join("node.toml"),
             format!("{base}listen = \"[::]:52241\"\nadvertised = \"overlay\"\n"),

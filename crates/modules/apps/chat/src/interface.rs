@@ -37,7 +37,7 @@ pub const HUDDLE_NODE_KEY_BYTES: usize = 32;
 
 /// who authored a message — derived from `Env.origin`, never from a payload.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthorRef {
     /// an external submitter's (non-empty) public key bytes.
     User(Vec<u8>),
@@ -57,7 +57,7 @@ pub enum AuthorRef {
 /// inline formatting applied to a [`Span`]. mentions are structured so
 /// agent-trigger parsing stays deterministic.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Mark {
     Bold,
     Italic,
@@ -67,6 +67,7 @@ pub enum Mark {
 
 /// a run of text with uniform marks.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Span {
     pub text: String,
     pub marks: Vec<Mark>,
@@ -84,7 +85,7 @@ impl Span {
 
 /// one block of a message body.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Block {
     Paragraph(Vec<Span>),
     Code { lang: Option<String>, text: String },
@@ -101,7 +102,7 @@ impl Block {
 
 /// who may post (and react) in a channel.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PostPolicy {
     /// any authenticated author.
     Open,
@@ -114,6 +115,7 @@ pub enum PostPolicy {
 /// (the media plane authenticates by transport identity; this is routing, not
 /// authorship). `user` derives from `Env.origin` like every chat author.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct HuddleMember {
     pub user: Vec<u8>,
     pub node: Vec<u8>,
@@ -123,6 +125,7 @@ pub struct HuddleMember {
 /// the per-channel record: metadata plus the head sequence counter that
 /// assigns every message's position (P3 — gap-free, in-state, at execute time).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Channel {
     pub id: String,
     pub name: String,
@@ -151,6 +154,7 @@ pub struct Channel {
 /// records; a delete tombstones the head but keeps the skeleton so thread
 /// linkage and the per-channel sequence promise survive.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MessageHead {
     pub message_id: String,
     pub author: AuthorRef,
@@ -174,6 +178,7 @@ pub struct MessageHead {
 /// summaries and head-sequence watermarks are read-model decoration and
 /// live on the index tier — dispatch consumers read heads.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MessageView {
     pub channel_id: String,
     pub seq: u64,
@@ -181,7 +186,7 @@ pub struct MessageView {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatMsg {
     /// `channel_id`s containing `:` are a reserved module namespace: an
     /// external (user) origin may not create one, and a module origin `m`
@@ -286,12 +291,10 @@ pub enum ChatMsg {
 /// derived tier instead — consensus never reads the unverifiable index,
 /// and canonical state never grows scan machinery for a human surface.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatQuery {
     /// one channel record by id — the existence/policy probe.
-    Channel {
-        channel_id: String,
-    },
+    Channel { channel_id: String },
     /// `limit` messages starting at `from_seq`, ascending — the agent
     /// context window. computed-key point reads driven by the gap-free
     /// sequence space (P3), deterministic on every validator.
@@ -301,13 +304,11 @@ pub enum ChatQuery {
         limit: u64,
     },
     /// global message-id lookup — the id-collision probe.
-    Message {
-        message_id: String,
-    },
+    Message { message_id: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatReply {
     Channel(Option<Channel>),
     Messages(Vec<MessageView>),
@@ -317,7 +318,7 @@ pub enum ChatReply {
 /// the hook notification payload: one follow-up [`sdk::Msg`]-shaped dispatch
 /// per registered hook module, emitted in the same block as the post (P2).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatEvent {
     MessagePosted {
         channel_id: String,
@@ -334,7 +335,7 @@ pub enum ChatEvent {
 /// followers (the index fold, clients) consume exact assignments instead of
 /// re-deriving them by counting.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatAssigned {
     /// `PostMessage`: the message's assigned per-channel sequence.
     Posted { seq: u64 },

@@ -7,21 +7,20 @@ use commonware_runtime::{Clock as _, IoBuf};
 use commonware_utils::ordered::Set;
 
 use consensus::ContentStore;
-use directory::{DirQuery, DirReply, decode_reply, encode_query};
 use recovery::Manifest;
 use sdk::Msg;
+use tasks::{TaskQuery, TaskReply, decode_task_reply, encode_task_query};
 
 use super::ValidatorRuntime;
 use crate::constants::{DRAIN_TICK, NOP_TARGET};
 use crate::drain_actions::{
     CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
 };
-use noded::projection::{BlockProjection, project_block};
-use crate::host_reads::{
-    read_valset_members, read_valset_mesh_window, read_valset_residents,
-};
-use crate::{lobby, relay};
+use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
 use crate::util::{fatal, hex, participant_bytes, resident_bytes};
+use crate::validator::code_announce::CodeVerdict;
+use crate::{join_gate, relay};
+use noded::projection::{BlockProjection, project_block};
 
 impl ValidatorRuntime<'_> {
     /// one drain turn: the pass over delivered finalizations, then the
@@ -34,7 +33,6 @@ impl ValidatorRuntime<'_> {
     }
 
     async fn drain_pass(&mut self) {
-
         let Self {
             context,
             node,
@@ -70,6 +68,7 @@ impl ValidatorRuntime<'_> {
             last_published,
             blocks_since_checkpoint,
             checkpoint_not_before,
+            last_written_root,
             last_reach_view,
             pending_retarget,
             next_drain,
@@ -93,31 +92,11 @@ impl ValidatorRuntime<'_> {
             }
         };
         *applied += drained_count;
-        // durabilize the tip seal when the chain goes idle. a seal is a
-        // plain journal append made durable only by the NEXT block's
-        // pre-apply sync; on an idle chain the tip block's seal can sit
-        // un-synced for a whole block-time, and a crash there loses it,
-        // turning the tip into a TRAILING block. that is fine for most
-        // ops, but a trailing SELF-READING op — a files CAS commit whose
-        // re-execution reads the claimant's already-durable post-state —
-        // cannot be selective-replayed and would brick a SOLO node (no
-        // peer to re-sync from). syncing on the idle transition closes
-        // the window; a busy chain amortizes durability against the next
-        // pre-apply and needs no extra sync here.
-        if drained_count > 0
-            && node.pending_batch_len() == 0
-            && node.orderer().pending_len() == 0
-            && let Err(e) = node.sink_mut().sync().await
-        {
-            // the idle-transition durability sync: losing it turns the tip into a
-            // TRAILING block, which on a SOLO node can brick a self-reading op.
-            tracing::warn!(
-                target: "ducktape::consensus",
-                node = %label,
-                error = %e,
-                "tip-seal sync failed — the tip block may not be durable"
-            );
-        }
+        // NO tip-seal sync here. the seal fsyncs where it is written
+        // (`recovery`'s `BlockSink::seal`), so the tip is durable the moment
+        // it is sealed — idle chain or busy. an idle-transition sync used to
+        // stand here to close the same window from the far side; keeping both
+        // would be a second path to one guarantee.
         // resolve held app-surface submits against what this
         // drain finished with; every disposition is deterministic,
         // so the reply faithfully reports the op's consensus fate.
@@ -181,7 +160,7 @@ impl ValidatorRuntime<'_> {
             if d.disposition == node::Disposition::Discarded {
                 continue;
             }
-            // resolve a HELD JOIN GATE (ADR §3.2 / join ADR §4): the joiner's
+            // resolve a HELD JOIN GATE: the joiner's
             // outcome was held against this Redeem frame — now the drain knows
             // its consensus fate. Applied ⇒ the AUTHORITATIVE Admitted at the
             // committed height (carrying the coord cap); Rejected ⇒ map the
@@ -194,7 +173,7 @@ impl ValidatorRuntime<'_> {
             if let Some(gate) = pending_gates.remove(&d.id) {
                 gating.remove(&gate.joiner);
                 let reply = match d.disposition {
-                    node::Disposition::Applied => lobby::IntroReply::Admitted {
+                    node::Disposition::Applied => join_gate::IntroReply::Admitted {
                         height: d.height,
                         cap: gate.cap,
                     },
@@ -212,14 +191,14 @@ impl ValidatorRuntime<'_> {
                             .iter()
                             .any(|r| r.as_slice() == gate.joiner.as_slice());
                         if admitted {
-                            lobby::IntroReply::Admitted {
+                            join_gate::IntroReply::Admitted {
                                 height: d.height,
                                 cap: gate.cap,
                             }
                         } else {
                             let (code, terminal) =
-                                lobby::redeem_reject_outcome(d.reason.as_deref());
-                            lobby::IntroReply::Rejected {
+                                join_gate::redeem_reject_outcome(d.reason.as_deref());
+                            join_gate::IntroReply::Rejected {
                                 code,
                                 detail: d.reason.clone().unwrap_or_else(|| {
                                     "invite redemption rejected in consensus".into()
@@ -240,7 +219,7 @@ impl ValidatorRuntime<'_> {
                 // actually waited out the cutover. every validator resolves
                 // this same Applied block in its own drain, so the widened
                 // window converges within a beat.
-                if let lobby::IntroReply::Admitted { .. } = &reply {
+                if let join_gate::IntroReply::Admitted { .. } = &reply {
                     let window = read_valset_mesh_window(node.host()).await;
                     mesh_window.track_new(mesh_oracle, mesh_book, &window);
                 }
@@ -377,7 +356,7 @@ impl ValidatorRuntime<'_> {
             }
         }
         // held join gates that never settled within GATE_SETTLE_TIMEOUT: write
-        // Busy (NON-terminal, §3.2) into the outcome map so the joiner's next
+        // Busy (NON-terminal) into the outcome map so the joiner's next
         // retransmit reads it and fails over to another member rather than
         // exiting. the Redeem may still land later — a re-forward then hits
         // the V9 idempotent Admitted.
@@ -394,8 +373,8 @@ impl ValidatorRuntime<'_> {
                     super::settle_gate(
                         gate_outcomes,
                         gate.joiner,
-                        lobby::IntroReply::Rejected {
-                            code: lobby::RejectCode::Busy,
+                        join_gate::IntroReply::Rejected {
+                            code: join_gate::RejectCode::Busy,
                             detail: "the gate could not settle in time — trying another member"
                                 .into(),
                             terminal: false,
@@ -472,12 +451,19 @@ impl ValidatorRuntime<'_> {
         // The cadence is therefore gated on BOTH: enough blocks, and enough
         // recovery time since the last attempt to keep the loop's occupancy
         // under one part in `CHECKPOINT_DUTY_LIMIT`.
-        if checkpoint_due(
-            *blocks_since_checkpoint,
-            checkpoint_blocks,
-            context.current(),
-            *checkpoint_not_before,
-        ) && let Some(f) = node.finalized()
+        // ...and on the state having MOVED. The sealed boundary's root-hash is
+        // free here (the drain already stamped it), so an idle chain's nop
+        // blocks no longer buy a full re-encode of the same manifest every 32
+        // blocks — see `checkpoint_due` and `IDLE_CHECKPOINT_BLOCKS`.
+        if let Some(f) = node.finalized()
+            && checkpoint_due(
+                *blocks_since_checkpoint,
+                checkpoint_blocks,
+                context.current(),
+                *checkpoint_not_before,
+                f.root_hash,
+                *last_written_root,
+            )
         {
             // EVERY STAGE BELOW RUNS ON THE SELECT LOOP, so its duration is
             // time the `http_ingress` arm is not polled and `/v1/query` is
@@ -512,6 +498,7 @@ impl ValidatorRuntime<'_> {
                     Ok(()) => {
                         let written_at = context.current();
                         *blocks_since_checkpoint = 0;
+                        *last_written_root = Some(m.root_hash);
                         let floor_passed = matches!(
                             node.sink_mut().floor_cert(),
                             Ok(Some(fc))
@@ -681,7 +668,8 @@ impl ValidatorRuntime<'_> {
                 // the gateway plane serves (and admits) exactly
                 // who the mesh tracks — follow the cutover.
                 if let Some(book) = &gateway_book {
-                    book.set_peers(plan.valset().transport_members().iter());
+                    book.peers()
+                        .set_peers(plan.valset().transport_members().iter());
                 }
                 // the media planes authenticate inbound by the same
                 // tracked set — follow the re-track too, so a
@@ -790,6 +778,7 @@ impl ValidatorRuntime<'_> {
                         Ok(()) => {
                             *blocks_since_checkpoint = 0;
                             *prev_ckpt = (m.height, pos);
+                            *last_written_root = Some(m.root_hash);
                         }
                         Err(e) => tracing::warn!(
                             target: "ducktape::recovery",
@@ -890,33 +879,60 @@ impl ValidatorRuntime<'_> {
         }
         notes.finish();
         if dev_demo && !*converged && *applied >= expected {
+            // the board is read BEFORE the marker so the marker can carry it.
+            // `applied` counts a finalized frame however it was dispositioned
+            // (`kernel/node/src/lib.rs:1393-1399`), so a REJECTED seed latches
+            // this just as an applied one does — `seeds=<landed>/<expected>` on
+            // the one line everything already greps is what makes a seed that
+            // never landed visible at all.
+            //
+            // the signal is ONE-WAY, and reading it as two-way would be wrong:
+            // the latch counts BATCHES, heartbeat nops included
+            // (`kernel/node/src/lib.rs:1362-1367`), so on a multi-node demo a
+            // peer's seed can still be unproposed when this node latches — a
+            // healthy `large_file_e2e` run can print `seeds=1/2`. `seeds=N/N`
+            // proves the seeds landed; a short count means "not landed AT THIS
+            // INSTANT", never "never landed". ONE query: the demo seeds are a
+            // handful of tasks, so the board's first `List` page holds them all.
+            let reply = node
+                .host()
+                .query(
+                    "tasks",
+                    &encode_task_query(&TaskQuery::List {
+                        limit: tasks::MAX_LIST_LIMIT,
+                        after: None,
+                    }),
+                )
+                .await
+                .expect("tasks query");
+            let TaskReply::Tasks(board) = decode_task_reply(&reply).expect("task reply") else {
+                unreachable!("a list answers a page");
+            };
+            // the count goes BEFORE the marker, and that is load-bearing: the
+            // harness reads a marker as the REST OF ITS LINE
+            // (`tests/common/mod.rs:1783-1788`) and `cluster_e2e.rs:154-155`
+            // compares that whole remainder against the genesis marker's to
+            // prove ops applied. anything appended after the hash — a tracing
+            // field included — would make that `assert_ne!` vacuously true.
+            let seeds_landed = board.iter().filter(|t| is_a_dev_seed(&t.id)).count();
             let h = node.root_hash();
             tracing::info!(
                 target: "ducktape::consensus",
-                "node={label} converged root_hash={}", hex(&h)
+                "node={label} seeds={seeds_landed}/{expected} converged root_hash={}",
+                hex(&h)
             );
-            // dump every directory key so the demo can eyeball the ops
-            // (each node ends holding the op it originated AND the peer's).
-            for k in 0..expected {
-                let reply = node
-                    .host()
-                    .query(
-                        "directory",
-                        &encode_query(&DirQuery::Get {
-                            key: format!("k{k}"),
-                        }),
-                    )
-                    .await
-                    .expect("directory query");
-                if let Ok(DirReply::Value(v)) = decode_reply(&reply) {
-                    tracing::debug!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        key = %format_args!("k{k}"),
-                        value = ?v,
-                        "demo directory value"
-                    );
-                }
+            // then one line per task so the demo can eyeball the ops (each node
+            // ends holding the task it originated AND the peer's). a title is
+            // arbitrary user text on a shared board — render it Debug so an
+            // embedded newline or quote cannot split the log event.
+            for task in board {
+                tracing::debug!(
+                    target: "ducktape::modules",
+                    node = %label,
+                    task_id = %task.id,
+                    title = ?task.title,
+                    "demo task"
+                );
             }
             *converged = true;
         }
@@ -948,11 +964,16 @@ impl ValidatorRuntime<'_> {
     // quiet, never the instant a stall clears.
     async fn pump_heartbeat(&mut self) {
         let now = self.context.current();
-        let heartbeat_due = now.duration_since(self.last_flush).unwrap_or_default()
-            >= consensus::BLOCK_TIME;
+        let heartbeat_due =
+            now.duration_since(self.last_flush).unwrap_or_default() >= consensus::BLOCK_TIME;
         let ops_pending = self.node.pending_batch_len() > 0;
         let orderer_idle = self.node.orderer().pending_len() == 0;
-        match heartbeat_action(self.heartbeat_disabled, ops_pending, heartbeat_due, orderer_idle) {
+        match heartbeat_action(
+            self.heartbeat_disabled,
+            ops_pending,
+            heartbeat_due,
+            orderer_idle,
+        ) {
             HeartbeatAction::Idle => {}
             HeartbeatAction::Restamp => self.last_flush = now,
             HeartbeatAction::BeatNop => self.beat_nop(now).await,
@@ -1049,9 +1070,8 @@ impl ValidatorRuntime<'_> {
         }
         let ops_pending = self.node.pending_batch_len() > 0;
         let orderer_idle = self.node.orderer().pending_len() == 0;
-        let beat_now =
-            heartbeat_action(self.heartbeat_disabled, ops_pending, true, orderer_idle)
-                == HeartbeatAction::BeatNop;
+        let beat_now = heartbeat_action(self.heartbeat_disabled, ops_pending, true, orderer_idle)
+            == HeartbeatAction::BeatNop;
         if beat_now {
             self.beat_nop(self.context.current()).await;
         }
@@ -1145,13 +1165,51 @@ impl ValidatorRuntime<'_> {
         let Ok(bytes) = node.host().query(host::LIFECYCLE_MODULE_ID, &req).await else {
             return; // registry absent: byte-identical drain on a baseline net.
         };
-        let Ok(lifecycle::LifecycleReply::ModuleStatus { modules }) = lifecycle::decode_reply(&bytes)
+        let Ok(lifecycle::LifecycleReply::ModuleStatus { modules }) =
+            lifecycle::decode_reply(&bytes)
         else {
             return;
         };
-        // residency is a VERIFYING read (content re-hashed on the disk path):
-        // signing ready must mean sha256(local bytes) == committed hash.
-        let actions = code_signaller.decide(&modules, |digest| blobs.has_chunk(digest));
+        // residency is a VERIFYING read (content re-hashed on the disk path)
+        // AND a LOADABILITY read: signing ready must mean sha256(local bytes)
+        // == committed hash AND "this binary can instantiate them". Byte
+        // residency alone let a validator on an older build arm a swap at
+        // R = n and then deterministically reject every op to the module while
+        // its peers applied them — a silent fork on activation (#1297).
+        //
+        // WHAT IT COSTS: the probe COMPILES the component synchronously on
+        // this select loop — a few hundred ms for a 1.8 MB module, during
+        // which `http_ingress` is unpolled, the same occupancy the checkpoint
+        // branch carries a duty cooldown for (#1018). It is paid at most once
+        // per pending swap per boot — `decide` latches the verdict, loadable
+        // and unloadable alike — and every validator pays it at the same
+        // moment, right after the swap commits.
+        let actions = code_signaller.decide(&modules, |digest| {
+            let Some(bytes) = blobs.get_chunk(digest) else {
+                return CodeVerdict::Absent;
+            };
+            match wasm_host::WasmModule::check_loadable(&bytes) {
+                Ok(()) => CodeVerdict::Loadable,
+                // the loader's first line only: a wasmtime error carries a
+                // multi-line trace, and the whole thing would evict the ring
+                // it is evidence in.
+                Err(e) => CodeVerdict::Unloadable {
+                    detail: e.to_string().lines().next().unwrap_or_default().to_string(),
+                },
+            }
+        });
+        for (key, detail) in actions.refusals {
+            tracing::warn!(
+                target: "ducktape::modules",
+                node = %label,
+                module = %key.0,
+                swap = key.1,
+                reason = "code_not_loadable",
+                detail = %detail,
+                "pending-swap code refused: this binary cannot instantiate it, so \
+                 this node will not signal ready"
+            );
+        }
         for digest in actions.fetches {
             let client = blob_client.clone();
             let blobs = blobs.clone();
@@ -1223,7 +1281,8 @@ impl ValidatorRuntime<'_> {
             ..
         } = self;
         let now = context.current();
-        let crank_due = now.duration_since(*last_crank).unwrap_or_default() >= consensus::BLOCK_TIME;
+        let crank_due =
+            now.duration_since(*last_crank).unwrap_or_default() >= consensus::BLOCK_TIME;
         if crank_due
             && let Some(finalized_height) = node.finalized().map(|f| f.height)
             && let Some(expiry) = saga_next_expiry(node.host()).await
@@ -1281,7 +1340,8 @@ impl ValidatorRuntime<'_> {
             ..
         } = self;
         let now = context.current();
-        let nudge_due = now.duration_since(*last_nudge).unwrap_or_default() >= consensus::BLOCK_TIME;
+        let nudge_due =
+            now.duration_since(*last_nudge).unwrap_or_default() >= consensus::BLOCK_TIME;
         if nudge_due && dispatch_pending_deliveries(node.host()).await > 0 {
             *last_nudge = now;
             let seq = *next_seq;
@@ -1356,6 +1416,17 @@ fn heartbeat_action(
 /// aggregate under load instead of reviving the 1-tx-1-block regime.
 fn eager_flush_due(disabled: bool, ops_pending: bool, orderer_idle: bool) -> bool {
     !disabled && ops_pending && orderer_idle
+}
+
+/// is this task id one the dev-demo boot seed minted? the seed writes exactly
+/// `k{node-label}` (`validator/engine.rs:273-283`), and nothing else that
+/// reaches a demo board is shaped like that. counting the WHOLE board instead
+/// would let any unrelated write mask a seed that never landed — restart_e2e's
+/// own writes land before the converge latch and do exactly that.
+fn is_a_dev_seed(task_id: &str) -> bool {
+    task_id
+        .strip_prefix('k')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// the round-robin leader for `view`, MIRRORING the engine's elector
@@ -1495,7 +1566,11 @@ mod block_cadence_tests {
     #[test]
     fn a_sealed_block_count_alone_does_not_authorize_an_expensive_checkpoint() {
         let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
-        let owed = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+        let owed =
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+        // real work sealed since the last manifest, so the change gate is open
+        // throughout and the cooldown is the ONLY thing under test here.
+        let moved = sdk::StateRoot([9; sdk::ROOT_LEN]);
 
         // 32 blocks have sealed — the ENTIRE old trigger — but only ~30s of
         // chain has passed, which is exactly the shape that had the node
@@ -1505,7 +1580,9 @@ mod block_cadence_tests {
                 32,
                 32,
                 finished + std::time::Duration::from_secs(30),
-                owed
+                owed,
+                moved,
+                None
             ),
             "a 60s checkpoint must not be re-authorized 30s later just because 32 blocks sealed"
         );
@@ -1514,16 +1591,21 @@ mod block_cadence_tests {
             32,
             32,
             finished + std::time::Duration::from_secs(420),
-            owed
+            owed,
+            moved,
+            None
         ));
         // A CHEAP CHECKPOINT IS NEVER DELAYED: 25ms owes 175ms of quiet, long
         // gone by the time 32 blocks seal, so the configured cadence governs.
-        let cheap = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
+        let cheap =
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
         assert!(crate::drain_actions::checkpoint_due(
             32,
             32,
             finished + std::time::Duration::from_secs(30),
-            cheap
+            cheap,
+            moved,
+            None
         ));
         // The cooldown never SUBSTITUTES for the cadence: quiet is necessary,
         // not sufficient.
@@ -1531,7 +1613,9 @@ mod block_cadence_tests {
             31,
             32,
             finished + std::time::Duration::from_secs(420),
-            owed
+            owed,
+            moved,
+            None
         ));
     }
 
@@ -1543,7 +1627,8 @@ mod block_cadence_tests {
         let finished = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
         // the demo workspace's pre-#1023 checkpoint: 60s of loop occupancy
         // every 32 blocks (~30s of chain), i.e. it never stopped.
-        let expensive = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
+        let expensive =
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::from_secs(60));
         assert_eq!(
             expensive,
             finished + std::time::Duration::from_secs(420),
@@ -1551,7 +1636,8 @@ mod block_cadence_tests {
         );
         // post-#1023: 25ms. The hold is 175ms, far under the 32-block cadence,
         // so the configured cadence still governs and this guard is invisible.
-        let cheap = crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
+        let cheap =
+            crate::drain_actions::cooldown_until(finished, std::time::Duration::from_millis(25));
         assert_eq!(cheap, finished + std::time::Duration::from_millis(175));
     }
 

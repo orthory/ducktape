@@ -17,6 +17,10 @@ pub struct Sim {
     child: Child,
     stdout: BufReader<ChildStdout>,
     port: u16,
+    /// this sim's operator credential, minted 0600 into its storage dir at
+    /// boot. EVERY mutating `/v1` route wants either it or a user signature,
+    /// and a harness driving a sim it spawned IS that sim's local operator.
+    operator: String,
 }
 
 impl Drop for Sim {
@@ -52,9 +56,20 @@ impl Sim {
             child,
             stdout,
             port: 0,
+            operator: String::new(),
         };
         sim.port = sim.read_listen_port();
+        // the credential is written before the listener binds, so a sim that
+        // announced its port has already minted it.
+        sim.operator = noded::admin::read_operator_token(storage)
+            .expect("the sim minted an operator credential");
         sim
+    }
+
+    /// this sim's operator credential — for a route the helpers below do not
+    /// wrap.
+    pub fn operator_token(&self) -> &str {
+        &self.operator
     }
 
     /// Wait on the child's listener-bound event and return its OS-selected port.
@@ -102,7 +117,7 @@ impl Sim {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> (u16, serde_json::Value) {
-        try_request(self.port, method, path, body).expect("sim reachable")
+        credentialed_request(self.port, &self.operator, method, path, body).expect("sim reachable")
     }
 
     pub fn status(&self) -> serde_json::Value {
@@ -174,7 +189,8 @@ impl Sim {
         if let Some(origin) = origin {
             body["origin"] = serde_json::json!(origin);
         }
-        try_request(self.port, "POST", "/v1/submit", Some(&body)).expect("submit reachable")
+        credentialed_request(self.port, &self.operator, "POST", "/v1/submit", Some(&body))
+            .expect("submit reachable")
     }
 
     /// inline submit that must COMMIT — returns the receipt.
@@ -213,13 +229,15 @@ impl Sim {
         origin: Option<&str>,
     ) -> std::thread::JoinHandle<(u16, serde_json::Value)> {
         let port = self.port;
+        let operator = self.operator.clone();
         let target = target.to_string();
         let mut body = serde_json::json!({ "target": target, "payload": payload });
         if let Some(origin) = origin {
             body["origin"] = serde_json::json!(origin);
         }
         std::thread::spawn(move || {
-            try_request(port, "POST", "/v1/submit", Some(&body)).expect("held submit reachable")
+            credentialed_request(port, &operator, "POST", "/v1/submit", Some(&body))
+                .expect("held submit reachable")
         })
     }
 
@@ -248,7 +266,9 @@ impl Sim {
         )
     }
 
-    /// commit a concurrent writer's block, independent of the held queue.
+    /// commit a concurrent writer's one-op block, independent of the held
+    /// queue — a one-element `/sim/peer-block` batch whose single member must
+    /// apply. returns the `BatchInfo` reply (`height`, `root_hash`, `members`).
     pub fn peer_block(
         &self,
         target: &str,
@@ -259,12 +279,18 @@ impl Sim {
             "POST",
             "/sim/peer-block",
             Some(&serde_json::json!({
-                "target": target,
-                "payload": payload,
-                "origin": origin,
+                "ops": [{
+                    "target": target,
+                    "payload": payload,
+                    "origin": origin,
+                }],
             })),
         );
         assert_eq!(status, 200, "peer block failed: {reply}");
+        assert_eq!(
+            reply["members"][0]["disposition"], "applied",
+            "peer op rejected: {reply}"
+        );
         reply
     }
 
@@ -288,7 +314,36 @@ impl Sim {
 /// json request/response against the sim's /v1 + /sim wires — the shared raw
 /// http/1.1 client, `io::Result` so `await_status` can poll a not-yet-up sim.
 /// `embed.rs` drives the embedded server through this directly.
+// each tests/*.rs is its own crate, so a suite that only makes CREDENTIALED
+// requests never names this one.
+#[allow(unused_imports)]
 pub use nettest::try_http_json as try_request;
+
+/// [`try_request`] carrying the sim's operator credential — what a MUTATING
+/// `/v1` route wants from a caller acting as the node's own operator.
+pub fn credentialed_request(
+    port: u16,
+    operator: &str,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> std::io::Result<(u16, serde_json::Value)> {
+    let bytes = body
+        .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+        .unwrap_or_default();
+    let (status, raw) = nettest::try_http_bytes_with(
+        port,
+        method,
+        path,
+        "application/json",
+        &[(noded::admin::ADMIN_TOKEN_HEADER, operator)],
+        &bytes,
+    )?;
+    Ok((
+        status,
+        serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+    ))
+}
 
 /// POST arbitrary body bytes with an explicit content-type — the raw-bytes
 /// twin of [`try_request`] (which is json-only), for the octet-stream frame
@@ -300,7 +355,10 @@ fn post_raw(
     body: &[u8],
 ) -> std::io::Result<(u16, serde_json::Value)> {
     let (status, raw) = nettest::try_http_bytes(port, "POST", path, content_type, body)?;
-    Ok((status, serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null)))
+    Ok((
+        status,
+        serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+    ))
 }
 
 pub fn create_channel(channel: &str, name: &str) -> serde_json::Value {
@@ -321,16 +379,49 @@ pub fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::
     })
 }
 
-/// a `MemberAuth` JSON whose ed25519 `key` consents to `preimage` under the
-/// identity bind namespace — the shared member-auth builder the bound and
-/// governed scenarios reuse (identity binds, gateway routes, share adoption).
-/// the ed25519 signing + `MemberAuth` shape now live ONCE in `identity::testkit`;
-/// this wraps it back to the untyped JSON the sim's `/v1/submit` lane takes (the
-/// serde shape is byte-identical to the hand-rolled json).
-pub fn ed_bind_auth(
-    key: &commonware_cryptography::ed25519::PrivateKey,
-    preimage: &[u8],
+/// the sim's identity chain id — the composer's `Bindings { chain_id: "local" }`
+/// seeded into the identity guest's genesis `__config`, so every add-key consent
+/// signs over it (the same value the gateway guest scopes routes to).
+pub const IDENTITY_CHAIN: &str = "local";
+
+/// the `hex:` origin escape naming a REAL ed25519 key as the submit origin —
+/// the only way a json-string origin lane can found an account whose member
+/// can later sign (an ASCII origin like `"a"*32` is well-formed for ed25519
+/// but holds no secret, so it can found but never consent).
+pub fn key_origin(key: &commonware_cryptography::ed25519::PrivateKey) -> String {
+    use commonware_cryptography::Signer as _;
+    let hex: String = key
+        .public_key()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("hex:{hex}")
+}
+
+/// the `Create` op founding an account for the submit ORIGIN (declared
+/// ed25519, so a 32-byte origin — an ASCII stand-in or a real key via
+/// [`key_origin`] — founds; anything else is refused as malformed). the
+/// message shape lives ONCE in `identity::testkit`; this wraps it back to the
+/// untyped JSON the sim's `/v1/submit` lane takes.
+pub fn create(name: &str) -> serde_json::Value {
+    serde_json::to_value(identity::testkit::create(name)).expect("Create serializes")
+}
+
+/// the `AddKey` op admitting `new_key` (the op's ORIGIN) into ed25519
+/// `member`'s account, consented to at `generation` on the sim's chain. the
+/// consent is single-use: acceptance advances `new_key`'s generation.
+pub fn add_ed25519_key(
+    member: &commonware_cryptography::ed25519::PrivateKey,
+    new_key: &[u8],
+    generation: u64,
 ) -> serde_json::Value {
-    serde_json::to_value(identity::testkit::ed_bind_auth(key, preimage))
-        .expect("MemberAuth serializes")
+    serde_json::to_value(identity::testkit::add_ed25519_key(
+        member,
+        IDENTITY_CHAIN,
+        new_key,
+        generation,
+        None,
+    ))
+    .expect("AddKey serializes")
 }

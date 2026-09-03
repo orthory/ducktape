@@ -19,10 +19,11 @@ use crate::pages::sync::{
 /// The page's child pages, in document order. Subpages are navigation, not
 /// prose: they have no markdown spelling, so the document editor never holds
 /// them and the screen lists them underneath it instead.
-pub fn subpage_blocks(blocks: Vec<PageBlock>) -> Vec<PageBlock> {
+pub fn subpage_blocks(blocks: &[PageBlock]) -> Vec<PageBlock> {
     blocks
-        .into_iter()
+        .iter()
         .filter(|block| !crate::pages::sync::is_prose(block))
+        .cloned()
         .collect()
 }
 
@@ -51,7 +52,7 @@ pub fn refreshed_page_editor(
     blocks: Vec<PageBlock>,
     saved: String,
 ) -> iced::widget::text_editor::Content {
-    match refreshed_page_text(&document, &title, &blocks, &saved) {
+    match refreshed_page_text(&document.text(), &title, &blocks, &saved) {
         Some(canonical) => iced::widget::text_editor::Content::with_text(&canonical),
         None => document,
     }
@@ -59,27 +60,28 @@ pub fn refreshed_page_editor(
 
 /// The saved-baseline mirror of [`refreshed_page_editor`] — the SAME decision
 /// on the SAME inputs, so the buffer and its dirty baseline move together.
+///
+/// Takes the buffer's TEXT (`editor_text(page_editor)` at the call site), not
+/// the editor: a by-value `editor` at the extern boundary is a `Content::clone`,
+/// and iced's clone is `with_text(&self.text())` — a whole second cosmic-text
+/// buffer shaped under a WRITE lock on the process-global font system, per
+/// live delta.
 pub fn refreshed_page_saved(
-    document: iced::widget::text_editor::Content,
+    text: String,
     title: String,
     blocks: Vec<PageBlock>,
     saved: String,
 ) -> String {
-    refreshed_page_text(&document, &title, &blocks, &saved).unwrap_or(saved)
+    refreshed_page_text(&text, &title, &blocks, &saved).unwrap_or(saved)
 }
 
 fn refreshed_page_text(
-    document: &iced::widget::text_editor::Content,
+    text: &str,
     title: &str,
     blocks: &[PageBlock],
     saved: &str,
 ) -> Option<String> {
-    // `.text()`, NOT `page_text(document.clone())`: iced's `Content: Clone` is
-    // `with_text(&self.text())` — a whole second cosmic-text buffer built under
-    // a WRITE lock on the process-global font system. This runs on every live
-    // chat delta (`on live_updated`), so the clone was a full re-shape of the
-    // open page per incoming message.
-    let dirty = document.text() != saved;
+    let dirty = text != saved;
     if dirty {
         return None;
     }
@@ -92,7 +94,7 @@ fn refreshed_page_text(
 /// are mid-typing in the page that merely reloaded. One decision, computed
 /// once into a `let` and applied to buffer and baseline together.
 pub fn install_decision(
-    document: iced::widget::text_editor::Content,
+    text: String,
     current_page: String,
     next_page: String,
     saved: String,
@@ -101,7 +103,7 @@ pub fn install_decision(
     if current_page != next_page {
         return true;
     }
-    let clean = document.text() == saved;
+    let clean = text == saved;
     // A clean, IDENTICAL buffer is left alone: a rebuilt `Content` throws the
     // caret to the origin, and there is nothing to install.
     clean && canonical != saved
@@ -301,7 +303,9 @@ pub async fn save_page_document(
     let title = document_title(&text);
     let title_moved = title_write_owed(&title, &saved, &current.active_page_title);
     if title_moved {
-        let bounded = bounded_exact_text(title, "page title", 512).map_err(app_error)?;
+        // The same UpdateText the block path takes, so the title rides the one
+        // module-derived bound instead of a second literal.
+        let bounded = bounded_updated_block_text(BlockKind::Page, title).map_err(app_error)?;
         write(
             &client,
             &password,

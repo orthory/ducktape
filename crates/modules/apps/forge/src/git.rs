@@ -13,7 +13,7 @@
 use std::{
     cmp::Ordering,
     collections::BTreeSet,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use git2::{
@@ -113,9 +113,6 @@ pub fn update_ref(repo: &Repository, name: &str, target: Oid) -> Result<(), git2
     Ok(())
 }
 
-/// the raw width of a sha1 oid — the snapshot's head-oid header size.
-pub const OID_RAW_LEN: usize = 20;
-
 /// the ref namespace forge manages — every branch lives under it and the wire
 /// carries SHORT names ("main", "feature/x"); this prefix is a local detail.
 pub const HEADS_PREFIX: &str = "refs/heads/";
@@ -193,6 +190,91 @@ pub fn install_pack(repo: &Repository, pack: &[u8]) -> Result<(), git2::Error> {
         .map_err(|e| git2::Error::from_str(&format!("write pack: {e}")))?;
     pw.commit()?;
     Ok(())
+}
+
+/// the repo's installed packfiles, as a set so [`compact`] can name exactly
+/// the ones that predate the pack it writes. a repo with no pack dir yet is an
+/// empty set, not an error.
+fn pack_files(dir: &Path) -> Result<BTreeSet<PathBuf>, git2::Error> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(e) => return Err(git2::Error::from_str(&format!("read pack dir: {e}"))),
+    };
+    let mut out = BTreeSet::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| git2::Error::from_str(&format!("read pack dir: {e}")))?
+            .path();
+        if path.extension().is_some_and(|ext| ext == "pack") {
+            out.insert(path);
+        }
+    }
+    Ok(out)
+}
+
+/// collapse a repo holding MORE than `min_packs` packfiles into ONE carrying
+/// the closure of every on-disk branch head, and return how many packs that
+/// reclaimed (`0` = left alone).
+///
+/// [`install_pack`] adds one pack per materialized push and libgit2 implements
+/// no gc at all — there is no `git_repack`/`git_gc` in its API and no auto-gc
+/// behind its writes — so on this substrate NOTHING else ever collapses them.
+/// measured on a 1000-push repo of 3003 objects: 1001 packs cost 212 MB on
+/// disk and 0.68s to build a clone pack, the identical history in one pack
+/// costs 6 MB and 0.01s. the disk multiple is cross-pack delta loss (a push's
+/// pack re-stores a whole blob it could have delta'd against the previous
+/// one); the read multiple is that every object lookup binary-searches every
+/// `.idx`.
+///
+/// node-local maintenance with exactly `materialize`'s standing: it READS
+/// refs, never moves one, never touches the pending map — so it cannot reach
+/// a root. objects no live branch reaches (an abandoned force-push, a deleted
+/// feature branch) go with the old packs, which is safe because nothing reads
+/// them: a PR diff resolves its oids from the LIVE branch heads and a review's
+/// `commit_oid` is only ever string-compared.
+///
+/// the new pack is written BEFORE any old one is unlinked, so a reader never
+/// sees a gap; a pack another thread installs meanwhile is not in the snapshot
+/// and survives untouched.
+pub fn compact(repo: &Repository, min_packs: usize) -> Result<usize, git2::Error> {
+    let pack_dir = repo.path().join("objects").join("pack");
+    let before = pack_files(&pack_dir)?;
+    let heads: Vec<Oid> = list_branches(repo)?
+        .into_iter()
+        .map(|(_, oid)| oid)
+        .collect();
+    let worth_compacting = before.len() > min_packs && !heads.is_empty();
+    if !worth_compacting {
+        return Ok(0);
+    }
+
+    let pack = pack_closure_many(repo, &heads)?;
+    install_pack(repo, &pack)?;
+
+    // a packfile is named for its contents, so a closure that ALREADY lives in
+    // one of these packs re-installs that same file and leaves nothing new
+    // behind. bail rather than unlink the one pack that holds everything.
+    let installed = pack_files(&pack_dir)?;
+    let compacted = installed.difference(&before).next().is_some();
+    if !compacted {
+        return Ok(0);
+    }
+
+    let mut reclaimed = 0;
+    for stale in &before {
+        // the index first: without it the pack is already invisible to a
+        // reader, so the pair never half-exists in the other order.
+        match std::fs::remove_file(stale.with_extension("idx")) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(git2::Error::from_str(&format!("remove pack index: {e}"))),
+        }
+        std::fs::remove_file(stale)
+            .map_err(|e| git2::Error::from_str(&format!("remove pack: {e}")))?;
+        reclaimed += 1;
+    }
+    Ok(reclaimed)
 }
 
 /// delete a ref if it exists (idempotent) — installing the empty state onto a
@@ -483,7 +565,10 @@ fn next_tree_entry<'repo>(
     let kind = entry
         .kind()
         .ok_or_else(|| git2::Error::from_str("git tree entry has an invalid mode"))?;
-    if !matches!(kind, ObjectType::Blob | ObjectType::Tree | ObjectType::Commit) {
+    if !matches!(
+        kind,
+        ObjectType::Blob | ObjectType::Tree | ObjectType::Commit
+    ) {
         return Err(git2::Error::from_str("unsupported git tree entry type").into());
     }
     Ok(Some((
@@ -516,11 +601,19 @@ fn tree_entry_cmp(
             let old_next = old
                 .get(common)
                 .copied()
-                .unwrap_or(if old_kind == ObjectType::Tree { b'/' } else { 0 });
+                .unwrap_or(if old_kind == ObjectType::Tree {
+                    b'/'
+                } else {
+                    0
+                });
             let new_next = new
                 .get(common)
                 .copied()
-                .unwrap_or(if new_kind == ObjectType::Tree { b'/' } else { 0 });
+                .unwrap_or(if new_kind == ObjectType::Tree {
+                    b'/'
+                } else {
+                    0
+                });
             old_next.cmp(&new_next)
         }
         order => order,
@@ -704,17 +797,9 @@ pub fn bounded_diff(
     for path in &preflight.paths {
         opts.pathspec(path);
     }
-    let diff = repo.diff_tree_to_tree(
-        Some(&target_tree),
-        Some(&source_tree),
-        Some(&mut opts),
-    )?;
+    let diff = repo.diff_tree_to_tree(Some(&target_tree), Some(&source_tree), Some(&mut opts))?;
     let stats = diff.stats()?;
-    let counts = (
-        stats.files_changed(),
-        stats.insertions(),
-        stats.deletions(),
-    );
+    let counts = (stats.files_changed(), stats.insertions(), stats.deletions());
 
     let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
     let mut truncated = false;

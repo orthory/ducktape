@@ -2,10 +2,10 @@
 //! upgrade: a member-gated proposal + simple-majority tally, and on passing,
 //! `handle_execute` emits the modreg op as a host-drained follow-up.
 //!
-//! unlike the upgrade twin (which pins against a stub), these tests register the
-//! REAL code registry: what is pinned is the whole authorization chain the live
-//! network runs — governance emits, the host stamps `Origin::Module("governance")`,
-//! modreg's origin gate accepts, and the pending swap LANDS in consensus state.
+//! these tests register the REAL code registry: what is pinned is the whole
+//! authorization chain the live network runs — governance emits, the host
+//! stamps `Origin::Module("governance")`, modreg's origin gate accepts, and
+//! the pending swap LANDS in consensus state.
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
@@ -47,8 +47,13 @@ async fn gov_host_with_modreg() -> Host {
     let mut host = Host::genesis(vec![
         Box::new(valset),
         Box::new(
-            Governance::new("governance", Box::new(MemStore::new()), "valset", "identity")
-                .with_code_registry("lifecycle"),
+            Governance::new(
+                "governance",
+                Box::new(MemStore::new()),
+                "valset",
+                "identity",
+            )
+            .with_code_registry("lifecycle"),
         ),
         Box::new(Lifecycle::new(
             "lifecycle",
@@ -360,7 +365,6 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         );
     });
 }
-
 
 /// the module lookup, admission flavor: any id, absent allowed.
 async fn module_code(host: &Host, id: &str) -> Option<lifecycle::ModuleCode> {

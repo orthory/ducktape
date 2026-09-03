@@ -1,30 +1,49 @@
-//! Test-only ed25519 member-auth builders, beside [`IDENTITY_BIND_NS`] where
-//! they belong. The [`MemberAuth`] these produce is what a bound/governed
-//! scenario submits as an `authorizer`; it was re-rolled in ~8 node/sim suites
-//! before landing here.
+//! Test-only consent builders, beside [`IDENTITY_ADD_KEY_NS`] where they
+//! belong. Every node/sim suite that founds an account or admits a key mints
+//! its messages here, so "what a signer produces" is written once.
 //!
 //! Gated behind the `testkit` feature — consumers enable it as a dev-dependency
 //! feature only, so it never compiles into a shipping build.
 
 use commonware_cryptography::{Signer as _, ed25519};
 
-use crate::{IDENTITY_BIND_NS, KeyKind, MemberAuth, MemberProof};
+use crate::{Authorizer, IDENTITY_ADD_KEY_NS, IdentityMsg, KeyScheme, add_key_preimage};
 
-/// a [`MemberAuth`] whose ed25519 `key` signs `preimage` in the `ns` domain —
-/// the general builder (bind, unbind, add/remove-member differ only in `ns` and
-/// the preimage bytes the caller passes).
-pub fn ed_auth(key: &ed25519::PrivateKey, ns: &[u8], preimage: &[u8]) -> MemberAuth {
-    MemberAuth {
-        key: key.public_key().as_ref().to_vec(),
-        kind: KeyKind::Ed25519,
-        proof: MemberProof::Signature {
-            sig: key.sign(ns, preimage).as_ref().to_vec(),
-        },
+/// an existing ed25519 member's consent to admit `new_key` (of `scheme`) at
+/// generation `gen` on chain `chain_id`.
+pub fn ed_authorizer(
+    member: &ed25519::PrivateKey,
+    chain_id: &str,
+    scheme: KeyScheme,
+    new_key: &[u8],
+    generation: u64,
+) -> Authorizer {
+    let preimage = add_key_preimage(chain_id, scheme, new_key, generation);
+    Authorizer {
+        key: member.public_key().as_ref().to_vec(),
+        proof: keyscheme::testkit::ed25519_proof(member, IDENTITY_ADD_KEY_NS, &preimage),
     }
 }
 
-/// [`ed_auth`] fixed to the node-bind namespace ([`IDENTITY_BIND_NS`]) — the
-/// common case (a member consents to binding a node over some `bind_preimage`).
-pub fn ed_bind_auth(key: &ed25519::PrivateKey, preimage: &[u8]) -> MemberAuth {
-    ed_auth(key, IDENTITY_BIND_NS, preimage)
+/// the founding op for an ed25519 origin.
+pub fn create(name: &str) -> IdentityMsg {
+    IdentityMsg::Create {
+        name: name.into(),
+        scheme: KeyScheme::Ed25519,
+    }
+}
+
+/// the admission op for an ed25519 origin, consented to by `member`.
+pub fn add_ed25519_key(
+    member: &ed25519::PrivateKey,
+    chain_id: &str,
+    new_key: &[u8],
+    generation: u64,
+    label: Option<&str>,
+) -> IdentityMsg {
+    IdentityMsg::AddKey {
+        scheme: KeyScheme::Ed25519,
+        label: label.map(str::to_string),
+        authorizer: ed_authorizer(member, chain_id, KeyScheme::Ed25519, new_key, generation),
+    }
 }

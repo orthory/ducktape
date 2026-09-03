@@ -49,7 +49,9 @@ The tier is two loops, coupled only through each module's database:
   batch per module per block. No domain logic; this is the whole host side.
 - **the fold** (the module's index guest): a fluent31 **changes-mode
   trigger** (`"fold"`) on the `op/` range delivers every committed op row to
-  the guest's `on_apply` — exactly once, in commit order, value inline. The
+  the guest's `on_apply` — exactly once, in commit order, the row inline up to
+  the engine's inline cap (64 KiB). A larger row arrives key-only and the
+  shell re-reads it from state, which is exact: op rows are immutable. The
   guest folds it into derived keys inside its own transaction: its writes and
   the event's consumption commit together (at-least-once invocation,
   exactly-once effects). Trigger-made writes never re-trigger; loops are
@@ -105,8 +107,9 @@ A mapper is two files in the module crate:
   feature: backs `StateRead` with the engine ABI (`EngineRead`), applies the
   decided writes, and exports the roles via `index_guest::fold!`/`view!`.
   The whole file is ~15 lines; `guest-builder --index` packages it into the
-  committed `index.wasm` (`make wasm-modules` refreshes, `wasm-modules-check`
-  guards presence).
+  committed `index.wasm` (`make wasm-modules` refreshes,
+  `wasm-modules-check` guards presence and `make wasm-index-check` guards the
+  bytes against a rebuild of the source).
 
 Within one op a read never sees that op's own writes (they apply after the
 decision); across ops in one feed batch it sees everything earlier — the
@@ -282,16 +285,52 @@ modules as a workspace that lost its contents. The shipped answer is the
 BACKFILL lane: the joiner fetches the SOURCE'S OWN op rows below its boundary
 and writes them into its own feed.
 
-The lane is three moves at the join seams (resident ascension, cold direct
-admission), inline, BEFORE the node serves anything:
+The lane runs at the join seams (resident ascension, cold direct admission),
+inline, BEFORE the node serves anything, over every module whose feed trails
+the boundary:
 
-1. the heal stamps every stale module at the boundary (§6) and returns the
-   stamped ids — this re-registers a fresh fold trigger over an empty `op/`;
-2. for each stamped module, `SyncRequest::IndexOps { boundary, module, after }`
-   walks the source's rows in ASCENDING key order, cursor-paged and bounded by
-   bytes, writing each page through `IndexStore::write_backfill_rows`;
-3. the fold drains, and `IndexStore::set_backfill_floor` composes the source's
-   own floor into this node's — `None` when the source reaches genesis.
+1. a module that already holds a feed RESUMES: the walk starts strictly above
+   its own watermark (`(watermark, u32::MAX)` — the watermark vouches for whole
+   heights), so only the delta crosses the wire and the derived views folded
+   from the rows below it stand untouched. `IndexStore::advance_watermark`
+   closes it: the feed now reaches the boundary, and the floor never moved
+   because nothing below it was ever dropped;
+2. a module with nothing to resume from is STAMPED at the boundary (§6) —
+   which re-registers a fresh fold trigger over an empty `op/` — and walks the
+   whole history below it. So is one whose resume the source cannot cover
+   (a source floor ABOVE the resume point would leave a hole between the two
+   that a single floor cannot express);
+3. either way `SyncRequest::IndexOps { boundary, module, after }` walks the
+   source's rows in ASCENDING key order, cursor-paged and bounded by bytes,
+   writing each page through `IndexStore::write_backfill_rows`;
+4. the fold drains, and `IndexStore::set_backfill_floor` composes the source's
+   own floor into a stamped module's — `None` when the source reaches genesis.
+
+A module that is NOT stale can still be missing everything below its FLOOR, and
+that gap is what a resident restarting over a wiped index directory holds: the
+checkpoint heal stamps the empty databases and the journal replay folds the
+suffix back on top, so every watermark is at the tip and nothing is stale.
+The seam therefore also runs over the floored modules — the restart seam calls
+the same helper the ascension does. The FEED is never wiped there: that module
+has one, and a stamp would destroy it for a walk that can still fail on its
+next page, leaving it worse than it was and doing the same again at the next
+seam. The rows land UNDER the feed instead, which only ever GAINS rows here,
+and the floor drops only when the walk completed.
+
+The READ MODEL is a different matter: rows below what the fold already consumed
+arrive out of key order by construction, so the derived keyspace is CLEARED and
+re-driven from the whole feed afterwards (`IndexStore::refold` — drop the guest
+marker, clear the derived keys, re-drive `op/` in key order, drain, write the
+marker back), whether the walk finished or died holding half a range. Views are
+blank for the length of that replay — the same window a mapper swap opens at
+boot (§6) — with the feed under them intact throughout, and a walk that wrote
+nothing skips it entirely. The marker discipline is what makes a crash mid-refold
+safe: nothing vouches for the keyspace while it is being rebuilt, so an
+interrupted refold is re-run whole by the next `open` instead of being adopted.
+
+The walk is asked for only when it can succeed: one request from a cursor past
+the boundary returns an empty page carrying the source's own floor, and a
+source floored no lower than this node ends the matter there.
 
 **Why no refold is needed, and why this window is the only one.** Pre-serving
 there are no live folds, no ws subscribers, and no view readers on this node.
@@ -300,9 +339,11 @@ So ascending fetch-and-write makes COMMIT ORDER EQUAL KEY ORDER, which for
 folds every row correctly as it lands, and the fold tip advances monotonically
 to the last backfilled row. Doing this later — against a folding, serving node
 — would hand a guest history backwards, and is a defect rather than a slow path.
-`write_backfill_rows` never touches `meta/height`: the heal already stamped it,
-and it vouches for feed contiguity FROM THE FLOOR UP. The floor is the one
-thing a backfill moves.
+`write_backfill_rows` never touches `meta/height`: on a stamped module the heal
+already set it, and it vouches for feed contiguity FROM THE FLOOR UP. A resumed
+module's watermark moves once, after the walk (`advance_watermark`), for the
+same reason — it may only claim the boundary once the rows below it have
+landed.
 
 Contents are NOT root-verifiable (the derived tier has no root by design), so
 the lane trusts the serving node — accepted, because the read model is how a

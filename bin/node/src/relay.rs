@@ -7,10 +7,9 @@
 //! EVERY current validator in bounded, content-addressed chunks; only after all
 //! validators acknowledge the bytes does one validator take consensus custody.
 //! the SENDING peer's transport identity is deliberately NOT consulted:
-//! residents speak from the network's DERIVED LOBBY identity (the lobby key
-//! folded into every mesh), which ANY invite holder can derive — so origin
-//! could never equal a real resident's transport peer, and a peer-vs-origin
-//! gate adds nothing anyway. the frame's OWN signature is the authorization
+//! mesh admission and submit authorization are separate facts, and a
+//! peer-vs-origin gate would fork this lane apart from the validator's local
+//! HTTP submit lane. the frame's OWN signature is the authorization
 //! AND the whole door: it binds (origin, seq, target, payload) to the origin
 //! key, so forgery is impossible, and a byte-identical replay collapses in the
 //! consensus lane's exactly-once digest gate. the door adds NO standing
@@ -23,32 +22,49 @@
 //! block's coordinates, Rejected for a deterministic no-op, Refused for door
 //! failures and expired holds.
 //!
-//! json on the wire: matches the lobby idiom. blob chunks use hex rather than a
+//! json on the wire: matches the module-interface idiom. blob chunks use hex rather than a
 //! JSON byte array so the encoded message stays below commonware's 2 MiB cap.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 /// Forge packs relayed by a resident or fanned out by a validator are bounded
-/// below the smart-HTTP lane's 512 MiB ceiling. The relay channel has a bounded
-/// message queue and is shared with ordinary submits, so bulkier repositories
-/// must be pushed directly after an operator arranges a dedicated blob plane.
-pub const MAX_RELAY_BLOB_BYTES: usize = 64 * 1024 * 1024;
+/// at exactly the smart-HTTP lane's ceiling (`noded::GIT_PACK_BODY_LIMIT`):
+/// a pack the door accepted, hashed and stored is one the relay carries. The
+/// two were separate numbers once (64 MiB here, 512 MiB there) and this
+/// repository's own 83 MiB pack was refused by the relay after the door had
+/// taken it in. The shared number is sized by THIS lane: every chunk of a
+/// pack crosses a 128-message inbound backlog (`constants::MAX_BACKLOG`)
+/// that the p2p peer actor DROPS on when full, with no chunk retransmit —
+/// the pins below keep one offer plus a max-size pack's chunks inside it.
+pub const MAX_RELAY_BLOB_BYTES: usize = noded::GIT_PACK_BODY_LIMIT;
 
 /// 768 KiB raw -> 1.5 MiB hex plus a small JSON envelope, safely below the
-/// process-wide 2 MiB commonware message cap while keeping a 64 MiB transfer to
-/// 86 chunk messages (under the channel's 128-message inbound backlog).
+/// process-wide 2 MiB commonware message cap.
 pub const RELAY_BLOB_CHUNK_BYTES: usize = 768 * 1024;
 
+// every chunk of a max-size pack plus its one offer fits the inbound backlog
+// the chunks are delivered through — a DROP boundary, not a backpressure one.
+const RELAY_MESSAGES_PER_PACK: usize = MAX_RELAY_BLOB_BYTES.div_ceil(RELAY_BLOB_CHUNK_BYTES) + 1;
+const _: () = assert!(RELAY_MESSAGES_PER_PACK <= crate::constants::MAX_BACKLOG);
+// this repository's own full-history pack (83 MiB) fits.
+const _: () = assert!(MAX_RELAY_BLOB_BYTES >= 83 * 1024 * 1024);
+
 /// The extra hold a forge pack transfer earns on top of `SUBMIT_HOLD`,
-/// budgeted at a 1 MiB/s payload floor. The base hold alone assumed the pack
-/// lands within an app-submit budget — structurally impossible for a multi-MB
-/// pack crossing a WAN validator link (chunks ride hex-encoded, doubling the
-/// wire bytes), so every such push died as "timed out receiving the forge
-/// pack" at 10s. `MAX_RELAY_BLOB_BYTES` bounds the whole allowance at 64s.
-pub fn blob_transfer_allowance(total: u64) -> std::time::Duration {
+/// budgeted at a 1 MiB/s floor over the bytes that actually cross the wire:
+/// chunks ride hex-encoded (2x), and the fan-out is SERIAL per target, so the
+/// last target only starts receiving after every earlier one is done. The
+/// base hold alone assumed the pack lands within an app-submit budget —
+/// structurally impossible for a multi-MB pack crossing a WAN validator
+/// link — and a single-target 1 MiB/s window still timed out every multi-
+/// validator push of a large pack.
+pub fn blob_transfer_allowance(total: u64, targets: usize) -> std::time::Duration {
     const FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
-    std::time::Duration::from_secs(total.div_ceil(FLOOR_BYTES_PER_SEC))
+    const HEX_INFLATION: u64 = 2;
+    let wire_bytes = total
+        .saturating_mul(HEX_INFLATION)
+        .saturating_mul(targets.max(1) as u64);
+    std::time::Duration::from_secs(wire_bytes.div_ceil(FLOOR_BYTES_PER_SEC))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -205,10 +221,9 @@ impl BlobAssembly {
 /// that is the WHOLE door — no standing set is consulted. any key's validly
 /// signed frame enters consensus here, exactly as it would on a validator's
 /// local HTTP submit lane; the two lanes deliberately carry one contract.
-/// the sending peer is DELIBERATELY not an argument: residents ride the
-/// network's derived lobby transport identity — derivable by any invite
-/// holder — so a peer-vs-origin check could never pass for a real resident
-/// and would gate nothing. authorization is per-module policy resolved
+/// the sending peer is DELIBERATELY not an argument: mesh admission and
+/// submit authorization are separate facts, and a peer-vs-origin check would
+/// fork the two submit lanes apart. authorization is per-module policy resolved
 /// deterministically at dispatch (the acl module's gate plus each module's
 /// own origin checks), never a transport-door decision — a door-side policy
 /// would only fork the two submit lanes apart again.
@@ -263,19 +278,39 @@ mod tests {
     }
 
     #[test]
-    fn a_pack_transfer_earns_hold_proportional_to_its_size() {
+    fn a_pack_transfer_earns_hold_proportional_to_its_size_and_fan_out() {
         use std::time::Duration;
-        assert_eq!(blob_transfer_allowance(1), Duration::from_secs(1));
+        assert_eq!(blob_transfer_allowance(1, 1), Duration::from_secs(1));
         assert_eq!(
-            blob_transfer_allowance(4 * 1024 * 1024),
-            Duration::from_secs(4),
-            "a 4 MiB pack earns 4s of transfer on top of the base hold"
+            blob_transfer_allowance(4 * 1024 * 1024, 1),
+            Duration::from_secs(8),
+            "a 4 MiB pack crosses one link as 8 MiB of hex: 8s on top of the base hold"
         );
         assert_eq!(
-            blob_transfer_allowance(MAX_RELAY_BLOB_BYTES as u64),
-            Duration::from_secs(64),
-            "the relay cap bounds the allowance"
+            blob_transfer_allowance(4 * 1024 * 1024, 3),
+            Duration::from_secs(24),
+            "three serial targets each take the whole transfer in turn"
         );
+        assert!(
+            blob_transfer_allowance(83 * 1024 * 1024, 2)
+                > blob_transfer_allowance(64 * 1024 * 1024, 2),
+            "the budget grows with the pack"
+        );
+        assert_eq!(
+            blob_transfer_allowance(MAX_RELAY_BLOB_BYTES as u64, 1),
+            Duration::from_secs(191),
+            "the relay cap (95.25 MiB, 190.5 MiB of hex) bounds a single-target allowance"
+        );
+    }
+
+    /// A pack the door accepts is a pack the assembly accepts, right up to
+    /// the shared limit — and not one byte past it.
+    #[test]
+    fn the_relay_assembly_accepts_every_pack_the_door_does() {
+        let digest = [1; 32];
+        assert!(BlobAssembly::new(digest, 83 * 1024 * 1024).is_ok());
+        assert!(BlobAssembly::new(digest, noded::GIT_PACK_BODY_LIMIT as u64).is_ok());
+        assert!(BlobAssembly::new(digest, noded::GIT_PACK_BODY_LIMIT as u64 + 1).is_err());
     }
 
     #[test]
@@ -340,15 +375,12 @@ mod tests {
         let sig_start = tampered.len() - 64;
         tampered[sig_start] ^= 0x01;
 
-        // it fails at signature verification, NOT as a parse error: a genuine
+        // it fails at proof verification, NOT as a parse error: a genuine
         // junk envelope errors with different wording.
         let junk = verify_relay_submit(b"not a frame").unwrap_err();
         let err = verify_relay_submit(&tampered).unwrap_err();
-        assert_ne!(
-            err, junk,
-            "tamper must fail at the signature, not the parser"
-        );
-        assert!(err.contains("signature"), "{err}");
+        assert_ne!(err, junk, "tamper must fail at the proof, not the parser");
+        assert!(err.contains("frame proof does not bind"), "{err}");
     }
 
     #[test]
@@ -362,6 +394,7 @@ mod tests {
                 repo: "ducktape".into(),
                 updates: Vec::new(),
                 pack_digest: Some(digest.to_vec()),
+                cert: None,
             }),
         };
         let frame = node::encode_frame(&author, 1, &msg);
@@ -381,6 +414,7 @@ mod tests {
                 repo: "ducktape".into(),
                 updates: Vec::new(),
                 pack_digest: Some(digest.to_vec()),
+                cert: None,
             }),
         };
         assert_eq!(

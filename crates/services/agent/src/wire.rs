@@ -113,13 +113,9 @@ pub struct Credential {
     pub seal_pk: [u8; 32],
 }
 
-/// which vendor a credential is for. Mirrors `provider_host::CredentialKind`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum CredentialKind {
-    Claude,
-    Codex,
-}
+/// which vendor a credential is for — the one airlock vocabulary, serialized
+/// snake_case on this wire exactly as the lender serializes it.
+pub use provider_host::CredentialKind;
 
 /// daemon → node. The lifecycle of a session, as the process that owns it sees
 /// it.
@@ -162,7 +158,8 @@ pub enum Refusal {
     AtCapacity,
     /// no provider in this daemon's set serves the requested tag.
     UnknownProvider,
-    /// the interactive spawn itself failed (image absent, podman error, …).
+    /// the interactive spawn itself failed (guest artifacts absent, no
+    /// `/dev/kvm`, the guest never dialled back, …).
     SpawnFailed,
 }
 

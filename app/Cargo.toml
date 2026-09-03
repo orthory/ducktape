@@ -11,13 +11,15 @@ icon = "assets/icon.svg"
 category = "public.app-category.productivity"
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a", version = "=0.1.0" }
 
 [dependencies]
 # the network's node -> announced-provider registry, behind the Shell's host
 # picker: which peers can actually run an agent.
 capability.workspace = true
 chat.workspace = true
+# the huddle media planes: the call-socket framing and voice/video wire.
+media-service.workspace = true
 design.workspace = true
 ducktape-rpc.workspace = true
 forge.workspace = true
@@ -28,14 +30,44 @@ gateway.workspace = true
 # http on loopback/LAN; probed against a live node before adoption).
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 governance.workspace = true
+# THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
+# zero-dependency leaf so every reader of that root agrees about it.
+ducktape-home.workspace = true
 identity.workspace = true
 inbox.workspace = true
+# THE device keystore, linked rather than spawned. Opening your own key is the
+# app's own business: it used to reach argon2id by starting `ducktape` and
+# piping to it, which made "can this process find a binary on disk?" a
+# precondition for unlocking a wallet — and the sentence a person got when it
+# could not was about checking their install.
+keystore.workspace = true
+# the signed op frame `/v1/submit/frame` takes. Signing one is the other half
+# of holding the key in-process; `node::encode_frame` is the ONE encoder, and a
+# second implementation of a machine wire format is not a thing to write.
+node.workspace = true
+authpage.workspace = true
+# the ed25519 signer `keystore` hands back and `node::encode_frame` signs with.
+commonware-cryptography.workspace = true
+# scheduling a durable agent run in-process: the work spec the saga carries and
+# the run envelope's headless composer. `run-envelope` is the SCHEMA only —
+# reaching the composer through `compute-service` would link provider-host and
+# the microVM sandbox into a GUI.
+dispatch.workspace = true
+run-envelope.workspace = true
+# the 32 random bytes of a fresh dispatch id.
+rand.workspace = true
 pages.workspace = true
 saga.workspace = true
 # RUNTIME, not dev-only: `local_member` derives the signing identity through
 # `sdk::Origin::External(..).actor_string()` on the product path, so a
 # dev-dependency here builds every TEST lane and breaks only the BINARY.
 sdk.workspace = true
+# The join ceremony, linked rather than spawned. Joining is the one node
+# operation with no daemon to ask — it is what BRINGS a workspace into
+# existence — so the app runs it here instead of shelling out to
+# `ducktape node join` and diffing the workspace registry to find out which
+# directory the child had created.
+workspace-config.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The huddle's media leg (`src/call.rs`): microphone/speaker streams and the
@@ -45,14 +77,38 @@ tokio-tungstenite = "0.24"
 # The camera leg (`src/video.rs`): capture + the pure-Rust intra-only JPEG
 # codec v1 (see the module doc for the codec seam).
 nokhwa = { version = "0.10", features = ["input-native"] }
+# The screen-share leg (`src/video.rs`): a root-window grab over X11. Already
+# in this binary under winit, and pure Rust — the portal/pipewire route would
+# put a build-time system library on every machine that builds this app, to
+# reach a compositor iced is not built for here (`x11`, no `wayland`).
+x11rb = "0.13"
 jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
+# The picture viewer (`src/backend/picture.rs`) decodes to RGBA off-thread;
+# iced itself stays codec-less (`image-without-codecs`).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+# The same viewer validates and measures an SVG before handing it to iced's
+# `svg` widget (resvg draws it); usvg is already in the graph under resvg.
+usvg = "0.45"
+# A web picture in forge Markdown is one capped GET (`web_picture_bytes`);
+# the workspace's reqwest is already in the binary under rpc-client.
+reqwest.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+# The app's own diagnostics: `main.rs` installs ONE subscriber over
+# `<DUCKTAPE_HOME>/app.log` (rotated at open by `node::log_file`, the same
+# opener as the node's daemon.log) plus a panic hook that lands there. Every
+# failure a person must act on is still a plate on screen; the file is what a
+# member attaches to an issue when the plate is not enough.
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# the device key's name is the host's (`device_key_name`); a kernel call
+# works on every OS the app runs on.
+gethostname = "1"
 zeroize.workspace = true
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", default-features = false, features = ["log-timeline", "terminal"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
+ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a", default-features = false, features = ["log-timeline", "terminal"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 
 [dev-dependencies]
 commonware-cryptography.workspace = true
@@ -61,7 +117,6 @@ commonware-cryptography.workspace = true
 # `iced_runtime`. The explicit test-only ui-lang runtime feature below keeps
 # that renderer out of the product dependency surface.
 iced_test = "=0.14.0"
-node.workspace = true
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "2377ffa61861c36d7405ff6a86e18b1611d780f5", version = "=0.1.0", default-features = false, features = ["test-runtime"] }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1334f31274e97dcdc43c5d6ba43a0a645a6eed8a", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 
 pub const FILE_NAME: &str = "gateway-routes.json";
-const FORMAT_VERSION: u8 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -21,30 +20,17 @@ pub struct LocalRoute {
     pub port: u16,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// `deny_unknown_fields` is the schema guard: a file this build does not
+/// understand is refused outright (no version field, no migrations — the
+/// remedy is re-binding the routes).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LocalRoutes {
-    pub version: u8,
     pub routes: Vec<LocalRoute>,
-}
-
-impl Default for LocalRoutes {
-    fn default() -> Self {
-        Self {
-            version: FORMAT_VERSION,
-            routes: Vec::new(),
-        }
-    }
 }
 
 impl LocalRoutes {
     fn validate(&self) -> Result<(), String> {
-        if self.version != FORMAT_VERSION {
-            return Err(format!(
-                "gateway routes: unsupported format version {}",
-                self.version
-            ));
-        }
         if self.routes.len() > gateway::MAX_ROUTES_PER_ACCOUNT {
             return Err(format!(
                 "gateway routes: at most {} local routes",
@@ -114,15 +100,26 @@ pub fn load(workspace: &Path) -> Result<LocalRoutes, String> {
         }
         Err(error) => return Err(format!("read {path:?}: {error}")),
     };
-    let routes: LocalRoutes =
-        serde_json::from_slice(&bytes).map_err(|error| format!("decode {path:?}: {error}"))?;
+    let routes: LocalRoutes = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("decode {path:?}: {error}\n  {REMEDY}"))?;
     routes.validate()?;
     let canonical = serde_json::to_vec_pretty(&routes).expect("routes serialize");
     if canonical != bytes {
-        return Err(format!("{path:?} is not canonical; re-bind its routes"));
+        return Err(format!("{path:?} is not canonical\n  {REMEDY}"));
     }
     Ok(routes)
 }
+
+/// Every way this file is refused has ONE remedy, and it is cheap: the file is
+/// a cache of ports the daemons themselves chose, so deleting it loses nothing
+/// a heartbeat does not put straight back.
+///
+/// Worth spelling out because the refusal reads like data loss when it is not.
+/// A stale field name in here took down a whole `make dev` — the message named
+/// the offending field, and nothing else — and the remedy people reached for
+/// was hand-editing JSON under `~/.ducktape`.
+const REMEDY: &str = "this file only caches which local port each daemon chose: \
+                      delete it and restart the node, and each re-registers its own route";
 
 fn temporary_path(workspace: &Path) -> PathBuf {
     workspace.join(format!(".{FILE_NAME}.{}.tmp", std::process::id()))
@@ -159,7 +156,6 @@ fn save(workspace: &Path, routes: &LocalRoutes) -> Result<(), String> {
     }
     Ok(())
 }
-
 
 /// the `ducktape gateway` verbs — node-local loopback route management.
 #[derive(Debug, clap::Subcommand)]
@@ -249,11 +245,7 @@ fn bind(args: BindArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// Register or update a node-local loopback route `name -> port` at boot — the
 /// programmatic equivalent of the `gateway-route-bind` CLI, for services the node
 /// runs itself (e.g. an embedded airlock gateway on an ephemeral port).
-pub fn register(
-    workspace: &Path,
-    name: gateway::RouteName,
-    port: u16,
-) -> Result<(), String> {
+pub fn register(workspace: &Path, name: gateway::RouteName, port: u16) -> Result<(), String> {
     if port == 0 {
         return Err("gateway route port must be non-zero".into());
     }
@@ -283,7 +275,9 @@ pub fn sweep_stale_temporaries(workspace: &Path) {
         let is_a_temp = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(&format!(".{FILE_NAME}.")) && name.ends_with(".tmp"));
+            .is_some_and(|name| {
+                name.starts_with(&format!(".{FILE_NAME}.")) && name.ends_with(".tmp")
+            });
         if !is_a_temp || path == ours {
             continue;
         }
@@ -419,10 +413,7 @@ mod tests {
         bind(bind_args(dir.path(), Some("api"), None, 4000)).unwrap();
         let loaded = load(dir.path()).unwrap();
         assert_eq!(loaded.port(&gateway::RouteName::apex()), Some(3000));
-        assert_eq!(
-            loaded.port(&gateway::RouteName::named("api")),
-            Some(4000)
-        );
+        assert_eq!(loaded.port(&gateway::RouteName::named("api")), Some(4000));
 
         unbind(route(dir.path(), None, None)).unwrap();
         unbind(route(dir.path(), Some("api"), None)).unwrap();
@@ -461,7 +452,10 @@ mod tests {
 
         // a second daemon starts and takes it. The first must now yield.
         register(dir.path(), name.clone(), 4200).unwrap();
-        assert_eq!(reassert(dir.path(), &name, 4100).unwrap(), RouteOwner::Foreign);
+        assert_eq!(
+            reassert(dir.path(), &name, 4100).unwrap(),
+            RouteOwner::Foreign
+        );
         assert_eq!(
             load(dir.path()).unwrap().port(&name),
             Some(4200),
@@ -469,7 +463,10 @@ mod tests {
         );
 
         // ...and the first daemon's SIGTERM must not delete the survivor's entry.
-        assert_eq!(retire(dir.path(), &name, 4100).unwrap(), RouteOwner::Foreign);
+        assert_eq!(
+            retire(dir.path(), &name, 4100).unwrap(),
+            RouteOwner::Foreign
+        );
         assert_eq!(load(dir.path()).unwrap().port(&name), Some(4200));
 
         // the owner retires its own: gone, no husk file, and safe twice (the
@@ -480,7 +477,10 @@ mod tests {
         assert_eq!(retire(dir.path(), &name, 4200).unwrap(), RouteOwner::Vacant);
 
         // a hand `gateway unbind` is corrected on the next beat.
-        assert_eq!(reassert(dir.path(), &name, 4200).unwrap(), RouteOwner::Vacant);
+        assert_eq!(
+            reassert(dir.path(), &name, 4200).unwrap(),
+            RouteOwner::Vacant
+        );
         assert_eq!(load(dir.path()).unwrap().port(&name), Some(4200));
     }
 
@@ -498,7 +498,10 @@ mod tests {
 
         assert_eq!(routes.owner(&name, 4100), RouteOwner::Ours);
         assert_eq!(routes.owner(&name, 4200), RouteOwner::Foreign);
-        assert_eq!(routes.owner(&gateway::RouteName::apex(), 4100), RouteOwner::Vacant);
+        assert_eq!(
+            routes.owner(&gateway::RouteName::apex(), 4100),
+            RouteOwner::Vacant
+        );
 
         // the survivor's entry is what a foreign retire must not touch, and the
         // snapshot is the only thing that can say whose it is.
@@ -506,7 +509,9 @@ mod tests {
         assert_eq!(routes.owner(&name, 4100), RouteOwner::Foreign);
         routes.drop_route(&name);
         assert_eq!(routes.owner(&name, 4200), RouteOwner::Vacant);
-        routes.validate().expect("upsert/drop keep the sorted-unique invariant");
+        routes
+            .validate()
+            .expect("upsert/drop keep the sorted-unique invariant");
     }
 
     /// The TOCTOU is invisible to a value test — reading the file twice is only
@@ -548,14 +553,44 @@ mod tests {
 
         sweep_stale_temporaries(dir.path());
 
-        assert!(!orphan.exists(), "another process's leftover temp is reaped");
+        assert!(
+            !orphan.exists(),
+            "another process's leftover temp is reaped"
+        );
         assert!(ours.exists(), "our own in-flight temp is not");
         assert_eq!(
-            load(dir.path()).unwrap().port(&gateway::RouteName::named("airlock")),
+            load(dir.path())
+                .unwrap()
+                .port(&gateway::RouteName::named("airlock")),
             Some(4100),
             "the sweep must never touch the route file itself"
         );
         std::fs::remove_file(&ours).unwrap();
+    }
+
+    /// A file this build does not understand is refused — and the refusal has
+    /// to carry its own remedy, because it reads like data loss and is not. A
+    /// stale `version` field written by an old tool took a whole `make dev`
+    /// down with `unknown field 'version'` and nothing else, and the reflex it
+    /// produced was hand-editing JSON under `~/.ducktape`.
+    #[test]
+    fn a_file_this_build_cannot_read_is_refused_with_its_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+
+        for bytes in [
+            // a field this schema does not have (deny_unknown_fields)
+            br#"{"version": 1, "routes": []}"#.as_slice(),
+            // valid, decodable, but not the bytes `save` would have written
+            br#"{"routes":[]}"#.as_slice(),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let refusal = load(dir.path()).unwrap_err();
+            assert!(
+                refusal.contains(REMEDY),
+                "every refusal names the remedy: {refusal}"
+            );
+        }
     }
 
     #[test]

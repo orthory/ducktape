@@ -74,7 +74,7 @@ format = "jsonl-events"
 # fallback. NOTE (PR1 scope): interactive sessions do NOT wire the [tools] MCP
 # plane — a human at the TUI needs no autonomous session-key tool door. The
 # exact TUI invocation is pending live validation against the real codex binary
-# on a podman host (see the design spec).
+# (see the design spec).
 args = []
 # The RESTRICTED argv for a SHARED (command-lane) session: read-only + never
 # ask. A shared session is driven by ordered commands, so no single member is
@@ -96,10 +96,10 @@ restricted_args = ["--sandbox", "read-only", "--ask-for-approval", "never"]
 # and must use the broker the argv names. Without it the broker would be
 # decorative — codex would just log in from the dotfile as before.
 #
-# Note there is deliberately NO [sandbox] rw_dirs here (it is a hard load error
-# to have both): mounting ~/.codex would put the credential back in the child
-# and quietly undo all of the above. Applies under the Direct AND Podman
-# backends; Tart is rejected loudly (a VM guest cannot reach host loopback).
+# There is no way to mount ~/.codex in instead: the spec format has no
+# [sandbox] table, and a run's microVM shares no filesystem with the host. The
+# guest reaches the host-side broker because duck-guest-init serves its port on
+# the VM's own loopback and tunnels it over vsock.
 # Inherited by every [[variants]] tag below.
 config_home_env = "CODEX_HOME"
 broker = "codex-responses"
@@ -116,7 +116,7 @@ broker = "codex-responses"
 # provisioner deletes before duckfs/forge scan the tree: the soul can never
 # become an agent artifact, and it never collides with a repository's OWN
 # AGENTS.md (which stays inside the checkout and layers on top of this one).
-# Under the Podman sandbox it crosses for free — the workdir is already mounted.
+# It crosses for free — the workdir rides the run's workspace device.
 # Inherited by every [[variants]] tag below.
 path = "config-home:AGENTS.md"
 

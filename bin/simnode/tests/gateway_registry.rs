@@ -20,40 +20,37 @@
 //!   (or is needed): the placeholder authorization never gets inspected.
 //!
 //! authorship is the reactor_seams ceremony exactly: the founding Ed25519 member
-//! signs the route-signing preimage under `GATEWAY_ROUTE_NS`, keyed on the node
-//! its Identity bind seated. the sim wires `Gateway::new(.., None, "local")` (no
-//! valset), so membership gating is absent and the only ceremony is the account
-//! bind plus the member signature — the same reach reactor_seams walks.
+//! signs the route-signing preimage under `GATEWAY_ROUTE_NS` and submits the op
+//! as the origin (its `hex:` escape). the sim wires `Gateway::new(.., None,
+//! "local")` (no valset), so membership gating is absent and the only ceremony
+//! is the account's Create plus the member signature — the same reach
+//! reactor_seams walks.
 
 mod harness;
 
 use commonware_cryptography::Signer as _;
-use harness::{Sim, ed_bind_auth};
-use identity::bind_preimage;
+use harness::{Sim, create, key_origin};
 use serde_json::{Value, json};
 use std::path::Path;
 
 type Ed = commonware_cryptography::ed25519::PrivateKey;
 
-/// the sim's gateway chain id (`Gateway::new(.., "local")`).
+/// the sim's gateway chain id (the composer's `Bindings { chain_id: "local" }`).
 const CHAIN: &str = "local";
+/// the account the first Create founds.
+const ACCOUNT: u64 = 1;
 
 // ── the founding ceremony ───────────────────────────────
 
-/// spawn an `--auto` sim and found one Identity account: `key` binds the 32-byte
-/// publisher `node` (nonce 0, empty chain_id), seating `key` as the account's
-/// sole current Ed25519 member. returns the sim, the account key, and the node.
+/// spawn an `--auto` sim and found one Identity account for `key` (account 1 on
+/// the `local` chain), seating it as the sole current Ed25519 member. returns the
+/// sim, the account key, and the key's submit origin (its `hex:` escape).
 fn published(storage: &Path) -> (Sim, Ed, String) {
     let sim = Sim::spawn(storage, &["--auto"]);
     let key = Ed::from_seed(7);
-    let node = "n".repeat(32);
-    let preimage = bind_preimage("", node.as_bytes(), 0);
-    sim.submit_ok(
-        "identity",
-        json!({ "bind_node": { "authorizer": ed_bind_auth(&key, &preimage) } }),
-        Some(&node),
-    );
-    (sim, key, node)
+    let origin = key_origin(&key);
+    sim.submit_ok("identity", create("alice"), Some(&origin));
+    (sim, key, origin)
 }
 
 // ── route builders ──────────────────────────────────────
@@ -73,20 +70,19 @@ fn loopback_route() -> gateway::RouteDefinition {
     }
 }
 
-/// a route statement for the account `key` founded, published by `node`.
+/// a route statement for the account `key` founded, published by a node the
+/// account vouches for (any 32-byte key; the module checks no publisher).
 fn statement(
     key: &Ed,
-    node: &str,
     name: gateway::RouteName,
     revision: u64,
     route: Option<gateway::RouteDefinition>,
 ) -> gateway::RouteStatement {
     gateway::RouteStatement {
-        version: 1,
         chain_id: CHAIN.into(),
-        account_id: key.public_key().as_ref().to_vec(),
+        account_id: ACCOUNT,
         name,
-        publisher_node: node.as_bytes().to_vec(),
+        publisher_node: key.public_key().as_ref().to_vec(),
         revision,
         route,
     }
@@ -128,9 +124,9 @@ fn unsigned_set_route(key: &Ed, statement: gateway::RouteStatement) -> Value {
 // ── query helpers ───────────────────────────────────────
 
 /// the `Get` reply's `Option<RouteRecord>` for one exact name.
-fn get_route(sim: &Sim, account: &[u8], name: gateway::RouteName) -> Value {
+fn get_route(sim: &Sim, account: u64, name: gateway::RouteName) -> Value {
     let query = serde_json::to_value(gateway::GatewayQuery::Get {
-        account_id: account.to_vec(),
+        account_id: account,
         name,
     })
     .expect("query serializes");
@@ -138,9 +134,9 @@ fn get_route(sim: &Sim, account: &[u8], name: gateway::RouteName) -> Value {
 }
 
 /// the `List` reply's `Vec<RouteSummary>` for one account.
-fn list_routes(sim: &Sim, account: &[u8]) -> Value {
+fn list_routes(sim: &Sim, account: u64) -> Value {
     let query = serde_json::to_value(gateway::GatewayQuery::List {
-        account_id: account.to_vec(),
+        account_id: account,
     })
     .expect("query serializes");
     sim.query("gateway", query)["routes"].clone()
@@ -163,40 +159,36 @@ fn named(label: &str) -> gateway::RouteName {
 #[test]
 fn get_returns_records_list_returns_live_routes_and_a_tombstone_drops_from_the_list() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, key, node) = published(storage.path());
-    let account = key.public_key().as_ref().to_vec();
+    let (sim, key, origin) = published(storage.path());
 
     // publish an apex route and a named `api` route, each at its opening revision.
     sim.submit_ok(
         "gateway",
-        signed_set_route(
-            &key,
-            statement(&key, &node, apex(), 1, Some(loopback_route())),
-        ),
-        Some(&node),
+        signed_set_route(&key, statement(&key, apex(), 1, Some(loopback_route()))),
+        Some(&origin),
     );
     sim.submit_ok(
         "gateway",
         signed_set_route(
             &key,
-            statement(&key, &node, named("api"), 1, Some(loopback_route())),
+            statement(&key, named("api"), 1, Some(loopback_route())),
         ),
-        Some(&node),
+        Some(&origin),
     );
 
     // Get resolves each exact name to a live record (route present).
-    let apex_rec = get_route(&sim, &account, apex());
+    let apex_rec = get_route(&sim, ACCOUNT, apex());
     assert!(
         apex_rec["statement"]["route"].is_object(),
         "apex is live: {apex_rec}"
     );
     assert!(
-        get_route(&sim, &account, named("api"))["statement"]["route"].is_object(),
+        get_route(&sim, ACCOUNT, named("api"))["statement"]["route"].is_object(),
         "api is live"
     );
 
     // List carries both, in canonical RouteName order (apex sorts before labels).
-    let live = list_routes(&sim, &account);
+    let live = list_routes(&sim, ACCOUNT);
     let names: Vec<Value> = live
         .as_array()
         .expect("routes array")
@@ -213,13 +205,13 @@ fn get_returns_records_list_returns_live_routes_and_a_tombstone_drops_from_the_l
     // TOMBSTONE the apex: a signed `route = None` at the next revision.
     sim.submit_ok(
         "gateway",
-        signed_set_route(&key, statement(&key, &node, apex(), 2, None)),
-        Some(&node),
+        signed_set_route(&key, statement(&key, apex(), 2, None)),
+        Some(&origin),
     );
 
     // Get STILL resolves the apex — but its route is now null (a queryable
     // tombstone the publisher reads to continue the revision stream).
-    let tomb = get_route(&sim, &account, apex());
+    let tomb = get_route(&sim, ACCOUNT, apex());
     assert!(
         !tomb.is_null(),
         "the tombstone record is still queryable: {tomb}"
@@ -234,7 +226,7 @@ fn get_returns_records_list_returns_live_routes_and_a_tombstone_drops_from_the_l
     );
 
     // List drops it: only the live `api` route remains.
-    let live = list_routes(&sim, &account);
+    let live = list_routes(&sim, ACCOUNT);
     assert_eq!(
         live.as_array().map(Vec::len),
         Some(1),
@@ -246,11 +238,8 @@ fn get_returns_records_list_returns_live_routes_and_a_tombstone_drops_from_the_l
     // must be 3, so re-stating revision 2 is a stale CAS.
     let error = sim.submit_rejected(
         "gateway",
-        signed_set_route(
-            &key,
-            statement(&key, &node, apex(), 2, Some(loopback_route())),
-        ),
-        Some(&node),
+        signed_set_route(&key, statement(&key, apex(), 2, Some(loopback_route()))),
+        Some(&origin),
     );
     assert!(
         error.contains("route revision must be 3, got 2"),
@@ -267,17 +256,16 @@ fn get_returns_records_list_returns_live_routes_and_a_tombstone_drops_from_the_l
 #[test]
 fn the_per_name_revision_is_a_strict_monotonic_cas() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, key, node) = published(storage.path());
-    let account = key.public_key().as_ref().to_vec();
+    let (sim, key, origin) = published(storage.path());
 
     // open `api` at revision 1.
     sim.submit_ok(
         "gateway",
         signed_set_route(
             &key,
-            statement(&key, &node, named("api"), 1, Some(loopback_route())),
+            statement(&key, named("api"), 1, Some(loopback_route())),
         ),
-        Some(&node),
+        Some(&origin),
     );
 
     // re-stating revision 1 is stale: the CAS demands 2.
@@ -285,9 +273,9 @@ fn the_per_name_revision_is_a_strict_monotonic_cas() {
         "gateway",
         signed_set_route(
             &key,
-            statement(&key, &node, named("api"), 1, Some(loopback_route())),
+            statement(&key, named("api"), 1, Some(loopback_route())),
         ),
-        Some(&node),
+        Some(&origin),
     );
     assert!(
         error.contains("route revision must be 2, got 1"),
@@ -299,9 +287,9 @@ fn the_per_name_revision_is_a_strict_monotonic_cas() {
         "gateway",
         signed_set_route(
             &key,
-            statement(&key, &node, named("api"), 3, Some(loopback_route())),
+            statement(&key, named("api"), 3, Some(loopback_route())),
         ),
-        Some(&node),
+        Some(&origin),
     );
     assert!(
         error.contains("route revision must be 2, got 3"),
@@ -313,12 +301,12 @@ fn the_per_name_revision_is_a_strict_monotonic_cas() {
         "gateway",
         signed_set_route(
             &key,
-            statement(&key, &node, named("api"), 2, Some(loopback_route())),
+            statement(&key, named("api"), 2, Some(loopback_route())),
         ),
-        Some(&node),
+        Some(&origin),
     );
     assert_eq!(
-        get_route(&sim, &account, named("api"))["statement"]["revision"],
+        get_route(&sim, ACCOUNT, named("api"))["statement"]["revision"],
         2,
         "revision 2 is current"
     );
@@ -329,9 +317,9 @@ fn the_per_name_revision_is_a_strict_monotonic_cas() {
         "gateway",
         signed_set_route(
             &key,
-            statement(&key, &node, named("other"), 2, Some(loopback_route())),
+            statement(&key, named("other"), 2, Some(loopback_route())),
         ),
-        Some(&node),
+        Some(&origin),
     );
     assert!(
         error.contains("route revision must be 1, got 2"),
@@ -350,7 +338,7 @@ fn the_per_name_revision_is_a_strict_monotonic_cas() {
 #[test]
 fn request_cap_past_the_16_mib_ceiling_is_refused_at_admission() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, key, node) = published(storage.path());
+    let (sim, key, origin) = published(storage.path());
 
     // At the ceiling: admitted (a claude turn's context is multi-MB).
     let at_ceiling = gateway::RouteDefinition {
@@ -366,8 +354,8 @@ fn request_cap_past_the_16_mib_ceiling_is_refused_at_admission() {
     };
     sim.submit_ok(
         "gateway",
-        signed_set_route(&key, statement(&key, &node, named("big"), 1, Some(at_ceiling))),
-        Some(&node),
+        signed_set_route(&key, statement(&key, named("big"), 1, Some(at_ceiling))),
+        Some(&origin),
     );
 
     // One byte past: refused by the admission gate.
@@ -384,8 +372,8 @@ fn request_cap_past_the_16_mib_ceiling_is_refused_at_admission() {
     };
     let error = sim.submit_rejected(
         "gateway",
-        unsigned_set_route(&key, statement(&key, &node, named("huge"), 1, Some(over))),
-        Some(&node),
+        unsigned_set_route(&key, statement(&key, named("huge"), 1, Some(over))),
+        Some(&origin),
     );
     assert!(
         error.contains("request body cap exceeds"),
@@ -396,7 +384,7 @@ fn request_cap_past_the_16_mib_ceiling_is_refused_at_admission() {
 #[test]
 fn malformed_route_policies_are_refused_by_the_content_and_method_gates() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let (sim, key, node) = published(storage.path());
+    let (sim, key, origin) = published(storage.path());
 
     // a DuckFs content route offering only GET (missing HEAD) breaks the content
     // constraint — GET+HEAD, no request body, no auth, no upgrade, bounded cap.
@@ -415,8 +403,8 @@ fn malformed_route_policies_are_refused_by_the_content_and_method_gates() {
     };
     let error = sim.submit_rejected(
         "gateway",
-        unsigned_set_route(&key, statement(&key, &node, named("site"), 1, Some(duckfs))),
-        Some(&node),
+        unsigned_set_route(&key, statement(&key, named("site"), 1, Some(duckfs))),
+        Some(&origin),
     );
     assert!(
         error.contains("content routes require GET+HEAD"),
@@ -437,11 +425,8 @@ fn malformed_route_policies_are_refused_by_the_content_and_method_gates() {
     };
     let error = sim.submit_rejected(
         "gateway",
-        unsigned_set_route(
-            &key,
-            statement(&key, &node, named("svc"), 1, Some(unsorted)),
-        ),
-        Some(&node),
+        unsigned_set_route(&key, statement(&key, named("svc"), 1, Some(unsorted))),
+        Some(&origin),
     );
     assert!(
         error.contains("methods must be strictly sorted and unique"),

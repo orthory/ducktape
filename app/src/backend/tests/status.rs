@@ -2,9 +2,9 @@ use super::*;
 
 #[test]
 fn a_count_of_one_takes_the_singular_noun() {
-    assert_eq!(plural(1, "agent".into(), "agents".into()), "1 agent");
-    assert_eq!(plural(0, "agent".into(), "agents".into()), "0 agents");
-    assert_eq!(plural(2, "agent".into(), "agents".into()), "2 agents");
+    assert_eq!(plural(1, "agent", "agents"), "1 agent");
+    assert_eq!(plural(0, "agent", "agents"), "0 agents");
+    assert_eq!(plural(2, "agent", "agents"), "2 agents");
     // the register subtitles that used to read `1 agents` / `1 validators`.
     assert_eq!(tally_note(1, 4), "1 approval · 3 more for quorum");
 }
@@ -67,29 +67,23 @@ fn a_subtitle_that_is_all_zeros_says_nothing_at_all() {
     };
 
     // Nothing there: the plate on each screen says it in words.
-    assert_eq!(members_summary(true, Vec::new()), "");
-    assert_eq!(agents_summary(true, Vec::new()), "");
-    assert_eq!(proposals_summary(true, Vec::new()), "");
-    assert_eq!(fs_counts_summary(true, true, Vec::new()), "");
+    assert_eq!(members_summary(true, &[]), "");
+    assert_eq!(agents_summary(true, &[]), "");
+    assert_eq!(proposals_summary(true, &[]), "");
+    assert_eq!(fs_counts_summary(true, true, &[]), "");
 
     // Something there: every subtitle speaks, zeros included.
-    assert_eq!(members_summary(true, vec![human]), "1 human · 0 agents");
+    assert_eq!(members_summary(true, &[human]), "1 human · 0 agents");
+    assert_eq!(agents_summary(true, &[agent(false)]), "1 agent · 0 working");
     assert_eq!(
-        agents_summary(true, vec![agent(false)]),
-        "1 agent · 0 working"
-    );
-    assert_eq!(
-        proposals_summary(true, vec![proposal(true)]),
+        proposals_summary(true, &[proposal(true)]),
         "1 open · 0 settled"
     );
     assert_eq!(
-        proposals_summary(true, vec![proposal(false)]),
+        proposals_summary(true, &[proposal(false)]),
         "0 open · 1 settled"
     );
-    assert_eq!(
-        fs_counts_summary(true, true, vec![entry]),
-        "1 file · 0 dirs"
-    );
+    assert_eq!(fs_counts_summary(true, true, &[entry]), "1 file · 0 dirs");
 }
 
 #[test]
@@ -251,7 +245,7 @@ fn a_status_without_operations_produces_unmeasured_readings() {
 /// SYNC IS READ OFF `phase`, NEVER OFF THE PRESENCE OF `sync`.
 ///
 /// `operations.sync` is set by `begin_sync` and never cleared — no writer in
-/// `bin/noded/src/metrics.rs` puts it back to `None`. A node that finished
+/// `crates/noded/src/metrics.rs` puts it back to `None`. A node that finished
 /// syncing hours ago still carries the last run's heights, so reading presence
 /// as "is syncing" paints a progress bar that never goes away.
 #[test]
@@ -301,23 +295,20 @@ fn a_finished_sync_is_not_a_sync_in_progress() {
 /// Settings cannot disagree about what the node is doing.
 #[test]
 fn the_sync_label_shows_progress_only_while_catching_up() {
-    assert_eq!(sync_label("syncing".into(), 412, 900), "Syncing 412 / 900");
+    assert_eq!(sync_label("syncing", 412, 900), "Syncing 412 / 900");
 
     // CAUGHT UP: the phase alone, however live the numbers beside it look.
     // `operations.sync` is never cleared, so a finished run's heights sit in
     // the document forever and must not reach a reader.
-    assert_eq!(sync_label("serving".into(), 900, 900), "Serving");
-    assert_eq!(sync_label("validating".into(), 900, 900), "Validating");
+    assert_eq!(sync_label("serving", 900, 900), "Serving");
+    assert_eq!(sync_label("validating", 900, 900), "Validating");
 
     // syncing with nothing published yet is still honest about the phase.
-    assert_eq!(
-        sync_label("syncing".into(), UNMEASURED, UNMEASURED),
-        "Syncing"
-    );
-    assert_eq!(sync_label("syncing".into(), 412, UNMEASURED), "Syncing");
+    assert_eq!(sync_label("syncing", UNMEASURED, UNMEASURED), "Syncing");
+    assert_eq!(sync_label("syncing", 412, UNMEASURED), "Syncing");
 
     // and a node that published no phase says NOTHING rather than guessing.
-    assert_eq!(sync_label(String::new(), 412, 900), "");
+    assert_eq!(sync_label("", 412, 900), "");
 }
 
 /// A record stamp is a BLOCK HEIGHT on this chain, so every record-time
@@ -388,8 +379,8 @@ fn a_proposal_renders_its_payload_and_its_frozen_bar() {
     );
 
     assert_eq!(tagged_name(&view["action"]), "add_validator");
-    assert_eq!(proposal_kind_tone("add_validator".into()), "access");
-    assert_eq!(proposal_kind_tone("signal".into()), "neutral");
+    assert_eq!(proposal_kind_tone("add_validator"), "access");
+    assert_eq!(proposal_kind_tone("signal"), "neutral");
     assert_eq!(
         gov_action_detail(&serde_json::json!({ "signal": { "text": "ship it" } })),
         "ship it"
@@ -487,4 +478,15 @@ fn a_defaulted_node_facts_prints_as_unserved_everywhere() {
     // `an_unpublished_operations_reading_renders_as_unknown` above — including
     // that a real `0` still prints `h 0`. Repeating it here would be
     // duplication wearing the costume of defence in depth.
+}
+
+/// The duckfs root is `/`, never "": the module's path check is `starts_with('/')`,
+/// so the crumb's "" root answered every root open with a 400.
+#[test]
+fn the_files_root_is_a_slash() {
+    assert_eq!(fs_parent("/shared".into()), "/");
+    assert_eq!(fs_parent("/".into()), "/");
+    assert_eq!(fs_parent("/shared/reports".into()), "/shared");
+    assert_eq!(fs_child("/".into(), "notes".into()), "/notes");
+    assert_eq!(fs_child("/shared".into(), "notes".into()), "/shared/notes");
 }

@@ -3,10 +3,10 @@
 //! [`WgDevice`] + [`VirtualStack`]
 //! pair instead of a TUN.
 //!
-//! the ADR's rule is that the orchestration boundary does not move: the
-//! reachability orchestrator, epoch cutover, standby pre-warm, and cold
+//! the rule is that the orchestration boundary does not move: the
+//! reachability executor, epoch cutover, standby pre-warm, and cold
 //! restart keep driving tunnels through `create_interface` / `apply` /
-//! `remove_interface` with the same `InterfaceConfiguration`. this adapter
+//! `remove_interface` with the same `InterfaceConfig`. this adapter
 //! maps that contract onto the userspace core:
 //!
 //! - `create_interface` marks the interface live (the create-before-apply
@@ -27,9 +27,8 @@ use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
-use defguard_wireguard_rs::{InterfaceConfiguration, key::Key};
 use tokio::sync::mpsc;
-use wireguard::effect::WireGuardEffect;
+use wireguard::effect::{InterfaceConfig, WireGuardEffect};
 
 use super::device::{PeerConfig, ProbeSlot, UnderlaySocket, WgDevice};
 use super::stack::{StackSlot, VirtualStack};
@@ -49,13 +48,10 @@ const PACKET_CHANNEL: usize = 1024;
 #[derive(Debug)]
 pub enum UserspaceEffectError {
     /// `apply`/`remove_interface` without a live `create_interface` — the
-    /// same ordering invariant `FakeWireGuardEffect` and the Defguard path
-    /// enforce.
+    /// same ordering invariant `FakeWireGuardEffect` enforces.
     NotCreated,
     /// `create_interface` while the interface is already live.
     AlreadyCreated,
-    /// `prvkey` is not a valid base64 32-byte X25519 key.
-    InvalidPrivateKey,
     /// no v6 overlay address on the interface — the userspace backend is
     /// ULA-v6 only (the shipped overlay mode); v4 overlays need `tun`.
     NoOverlayAddress,
@@ -73,8 +69,8 @@ pub enum UserspaceEffectError {
     PortMismatch { configured: u16, bound: u16 },
 }
 
-/// what `apply` needs, decoded and validated out of defguard's
-/// stringly/masked `InterfaceConfiguration`.
+/// what `apply` needs, validated out of the effect's [`InterfaceConfig`]:
+/// the ULA-v6-only restrictions this backend adds on top of the plan shape.
 struct ParsedConfig {
     private_key: [u8; 32],
     port: u16,
@@ -82,15 +78,11 @@ struct ParsedConfig {
     peers: Vec<PeerConfig>,
 }
 
-fn parse_config(config: &InterfaceConfiguration) -> Result<ParsedConfig, UserspaceEffectError> {
-    let private_key = Key::try_from(config.prvkey.as_str())
-        .map_err(|_| UserspaceEffectError::InvalidPrivateKey)?
-        .as_array();
-    let port = config.port;
+fn parse_config(config: &InterfaceConfig) -> Result<ParsedConfig, UserspaceEffectError> {
     let ula = config
         .addresses
         .iter()
-        .find_map(|mask| match mask.address {
+        .find_map(|route| match route.addr {
             IpAddr::V6(v6) => Some(v6),
             IpAddr::V4(_) => None,
         })
@@ -102,26 +94,25 @@ fn parse_config(config: &InterfaceConfiguration) -> Result<ParsedConfig, Userspa
             let allowed_ips = peer
                 .allowed_ips
                 .iter()
-                .map(|mask| match (mask.address, mask.cidr) {
+                .map(|route| match (route.addr, route.cidr) {
                     (IpAddr::V6(v6), 128) => Ok(v6),
                     _ => Err(UserspaceEffectError::UnsupportedAllowedIp(format!(
                         "{}/{}",
-                        mask.address, mask.cidr
+                        route.addr, route.cidr
                     ))),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(PeerConfig {
-                public_key: peer.public_key.as_array(),
-                preshared_key: peer.preshared_key.as_ref().map(|key| key.as_array()),
+                public_key: peer.wireguard_public_key.0,
                 endpoint: peer.endpoint,
-                persistent_keepalive: peer.persistent_keepalive_interval,
+                persistent_keepalive: peer.keepalive_seconds,
                 allowed_ips,
             })
         })
         .collect::<Result<Vec<_>, UserspaceEffectError>>()?;
     Ok(ParsedConfig {
-        private_key,
-        port,
+        private_key: config.private_key,
+        port: config.listen_port,
         ula,
         peers,
     })
@@ -145,7 +136,7 @@ pub struct UserspaceWireGuardEffect {
     /// `Some` between `create_interface` and `remove_interface`; the inner
     /// backend is `Some` from the first successful `apply`.
     live: Option<Option<Backend>>,
-    /// the seam's handle to the live stack (ADR phase 2): published on the
+    /// the seam's handle to the live stack: published on the
     /// `apply` that stands a backend up, cleared whenever the backend drops.
     slot: StackSlot,
     /// the handshake-probe seam: published on the `apply` that stands a backend
@@ -153,7 +144,7 @@ pub struct UserspaceWireGuardEffect {
     /// what lets the plane observe a COMPLETED handshake rather than an accepted
     /// config, which are different events and were previously indistinguishable.
     probes: ProbeSlot,
-    /// a node-owned underlay socket shared with the NAT punch (ADR phase 3),
+    /// a node-owned underlay socket shared with the NAT punch,
     /// reused across interface rebuilds instead of binding per backend;
     /// `None` = each backend binds its own (the standalone posture the
     /// loopback proofs and the interop probe use).
@@ -171,7 +162,7 @@ impl UserspaceWireGuardEffect {
         }
     }
 
-    /// the node wiring (ADR phase 3): the seam's slot is created by the node
+    /// the node wiring: the seam's slot is created by the node
     /// before the reachability plane's thread exists (the mesh context and
     /// the data-plane factory consume it), and the underlay socket is bound
     /// at plane start so the NAT client shares the tunnel's 5-tuple — this
@@ -198,7 +189,7 @@ impl UserspaceWireGuardEffect {
     }
 
     /// the handshake-probe handle. take it BEFORE moving this effect into the
-    /// orchestrator; it stays valid across backend rebuilds for the effect's life.
+    /// executor; it stays valid across backend rebuilds for the effect's life.
     pub fn probe_slot(&self) -> ProbeSlot {
         self.probes.clone()
     }
@@ -278,7 +269,7 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
         Ok(())
     }
 
-    fn apply(&mut self, config: &InterfaceConfiguration) -> Result<(), Self::Error> {
+    fn apply(&mut self, config: &InterfaceConfig) -> Result<(), Self::Error> {
         let Some(live) = self.live.as_mut() else {
             return Err(UserspaceEffectError::NotCreated);
         };
@@ -356,8 +347,12 @@ impl WireGuardEffect for UserspaceWireGuardEffect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use defguard_wireguard_rs::net::IpAddrMask;
-    use defguard_wireguard_rs::peer::Peer;
+    use wireguard::effect::PeerTunnelConfig;
+    use wireguard::{AllowedIp, X25519PublicKey};
+
+    fn route(addr: &str, cidr: u8) -> AllowedIp {
+        AllowedIp::new(addr.parse().unwrap(), cidr).unwrap()
+    }
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
@@ -367,21 +362,19 @@ mod tests {
             .expect("test runtime")
     }
 
-    fn sample_config() -> InterfaceConfiguration {
-        let mut peer = Peer::new(Key::new([7u8; 32]));
-        peer.set_allowed_ips(vec![IpAddrMask::new(
-            "fda2:8ad3:eaee::7".parse().unwrap(),
-            128,
-        )]);
-        InterfaceConfiguration {
+    fn sample_config() -> InterfaceConfig {
+        InterfaceConfig {
             name: "dt-userspace0".into(),
-            prvkey: "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=".into(),
-            addresses: vec![IpAddrMask::new("fda2:8ad3:eaee::1".parse().unwrap(), 128)],
+            private_key: [3u8; 32],
             // port 0: the OS allocates — tests must not claim fixed ports.
-            port: 0,
-            peers: vec![peer],
-            mtu: None,
-            fwmark: None,
+            listen_port: 0,
+            addresses: vec![route("fda2:8ad3:eaee::1", 128)],
+            peers: vec![PeerTunnelConfig {
+                wireguard_public_key: X25519PublicKey([7u8; 32]),
+                endpoint: None,
+                allowed_ips: vec![route("fda2:8ad3:eaee::7", 128)],
+                keepalive_seconds: None,
+            }],
         }
     }
 
@@ -390,7 +383,7 @@ mod tests {
         let runtime = runtime();
         let mut effect = UserspaceWireGuardEffect::new(runtime.handle().clone());
 
-        // apply / remove before create: rejected, like Fake and Defguard.
+        // apply / remove before create: rejected, like the fake.
         assert!(matches!(
             effect.apply(&sample_config()),
             Err(UserspaceEffectError::NotCreated)
@@ -418,7 +411,7 @@ mod tests {
         assert!(effect.stack().is_none(), "remove drops the backend");
         effect.create_interface().unwrap();
         let mut same_port = sample_config();
-        same_port.port = bound.port();
+        same_port.listen_port = bound.port();
         effect.apply(&same_port).unwrap();
         assert_eq!(
             effect.local_underlay_addr().expect("rebound").port(),
@@ -434,25 +427,15 @@ mod tests {
         let mut effect = UserspaceWireGuardEffect::new(runtime.handle().clone());
         effect.create_interface().unwrap();
 
-        let mut bad_key = sample_config();
-        bad_key.prvkey = "not-a-key".into();
-        assert!(matches!(
-            effect.apply(&bad_key),
-            Err(UserspaceEffectError::InvalidPrivateKey)
-        ));
-
         let mut no_ula = sample_config();
-        no_ula.addresses = vec![IpAddrMask::new("100.64.0.1".parse().unwrap(), 32)];
+        no_ula.addresses = vec![route("100.64.0.1", 32)];
         assert!(matches!(
             effect.apply(&no_ula),
             Err(UserspaceEffectError::NoOverlayAddress)
         ));
 
         let mut coarse_route = sample_config();
-        coarse_route.peers[0].set_allowed_ips(vec![IpAddrMask::new(
-            "fda2:8ad3:eaee::".parse().unwrap(),
-            48,
-        )]);
+        coarse_route.peers[0].allowed_ips = vec![route("fda2:8ad3:eaee::", 48)];
         assert!(matches!(
             effect.apply(&coarse_route),
             Err(UserspaceEffectError::UnsupportedAllowedIp(_))

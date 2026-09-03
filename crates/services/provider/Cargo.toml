@@ -9,17 +9,17 @@ version.workspace = true
 # which replicates WHO provides what; this crate is the machine-local half
 # that actually provides it.
 [dependencies]
+# THE ducktape home resolution (`$DUCKTAPE_HOME` else `~/.ducktape`), in a
+# zero-dependency leaf so every reader of that root agrees about it.
+ducktape-home = { workspace = true }
 async-trait = { workspace = true }
-axum = "0.8"
-# StreamExt for the Anthropic broker's SSE passthrough (reqwest bytes_stream →
-# axum Body::from_stream, never buffered) — see src/broker.rs.
-futures = { workspace = true }
 # the shared capability-tag shape rule: a tag that validates at spec-parse
 # time can never bounce off the consensus registry's Announce validation.
 capability = { workspace = true }
-# the sandbox muscle: SandboxBackend + its boot probe, the Tart guest plan, and
-# the node-private rootless podman (libpod socket) + egress firewall. carved out
-# of this crate; re-exported from src/lib.rs so callers see no move.
+# the sandbox muscle: SandboxBackend + its boot probe, the microVM lifecycle
+# (guest manifest, workspace image, vsock frames) and the tap's egress
+# firewall. carved out of this crate; re-exported from src/lib.rs so callers
+# see no move.
 sandbox-host = { workspace = true }
 # the run-scoped credential broker (crates/services/broker): the loopback
 # endpoint a provider child dials, and the airlock client layer behind it. the
@@ -34,7 +34,6 @@ reqwest = { workspace = true }
 toml = "0.8"
 # "net" pulls in tokio::io::unix::AsyncFd — the async wrapper around the
 # interactive session's pty master (see src/interactive.rs).
-tokio-stream = "0.1"
 tokio = { workspace = true, features = ["process", "io-util", "net"] }
 tracing = { workspace = true }
 
@@ -57,8 +56,8 @@ testkit = ["sandbox-host/testkit"]
 # on too — the lockstep the feature comment above requires.
 provider-host = { path = ".", features = ["testkit"] }
 # the shared capability-skip gate: a host-probe skip must be loud AND become a
-# failure by default, or a box without podman reports two green pty proofs that
-# ran nothing (libtest captures the "skipping" line too).
+# failure by default, or a box with no /dev/kvm reports green proofs that ran
+# nothing (libtest captures the "skipping" line too).
 nettest = { path = "../../testing/nettest" }
 # `testkit` exposes RunBroker::start_for_test — the idle-control test drives a
 # real run against a broker whose upstream is a dead port.

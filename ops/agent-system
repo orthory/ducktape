@@ -4,7 +4,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const stateFile = path.join(os.homedir(), ".ducktape", "agent-system-url");
+// the operator root every other reader resolves ($DUCKTAPE_HOME when set,
+// else ~/.ducktape) — a node under an override keeps its registry and this
+// script's remembered url there, not in $HOME.
+const duckHome = process.env.DUCKTAPE_HOME || path.join(os.homedir(), ".ducktape");
+const stateFile = path.join(duckHome, "agent-system-url");
 const usage = `usage: ops/agent-system <command> [args]
 
   use URL                         remember one local node
@@ -45,23 +49,36 @@ const json = (value) => {
     die("invalid JSON");
   }
 };
-const localUrl = (value) => {
+const loopbackUrl = (value) => {
   let selected;
   try {
     selected = new URL(value);
   } catch {
-    die("node URL is invalid");
+    return null;
   }
-  if (
-    selected.protocol !== "http:" ||
-    !["127.0.0.1", "localhost", "[::1]"].includes(selected.hostname)
-  )
-    die("the local-trust node URL must be loopback HTTP");
+  const isLoopbackHost = ["127.0.0.1", "localhost", "[::1]"].includes(selected.hostname);
+  if (selected.protocol !== "http:" || !isLoopbackHost) return null;
   return selected.toString().replace(/\/$/, "");
+};
+const localUrl = (value) => {
+  const selected = loopbackUrl(value);
+  if (!selected) die("the local-trust node URL must be loopback HTTP");
+  return selected;
 };
 
 const rememberedUrl = () => {
-  if (process.env.DUCKTAPE_URL) return process.env.DUCKTAPE_URL;
+  const fromEnv = process.env.DUCKTAPE_NODE;
+  if (fromEnv) {
+    // DUCKTAPE_NODE is commonly a remote node for the CLI and the app; this tool
+    // only ever talks to a loopback one, so name the source instead of refusing
+    // blankly, and never fall through — a silent fallback would hide it.
+    const selected = loopbackUrl(fromEnv);
+    if (!selected)
+      die(
+        `DUCKTAPE_NODE is ${fromEnv}; this tool talks to a loopback node only — unset DUCKTAPE_NODE or set it to http://127.0.0.1:<port>`,
+      );
+    return selected;
+  }
   try {
     return fs.readFileSync(stateFile, "utf8").trim();
   } catch {
@@ -69,7 +86,7 @@ const rememberedUrl = () => {
   }
   try {
     const registry = JSON.parse(
-      fs.readFileSync(path.join(os.homedir(), ".ducktape", "registry.json"), "utf8"),
+      fs.readFileSync(path.join(duckHome, "registry.json"), "utf8"),
     );
     const active = registry.workspaces?.find((workspace) => workspace.id === registry.active);
     if (active?.ports?.http) return `http://127.0.0.1:${active.ports.http}`;
@@ -79,12 +96,41 @@ const rememberedUrl = () => {
   die("no node selected; run `ops/agent-system use URL` or start an active workspace");
 };
 
-let base = localUrl(rememberedUrl());
+// Resolved on first use, so a verb that needs no node (`use`, `help`, `cgroup`)
+// never consults the environment and never fails on it.
+let base;
+const nodeUrl = () => (base ??= localUrl(rememberedUrl()));
+
+// The node's own operator credential, when this box holds the workspace serving
+// the selected URL. Every MUTATING /v1 route refuses a caller that presents
+// neither it nor a per-request user signature; a URL with no local workspace
+// behind it (an explicit `use`, or DUCKTAPE_NODE) reads only, and the node's own
+// 401 names what is missing.
+let operator;
+const operatorToken = () => {
+  if (operator !== undefined) return operator;
+  operator = null;
+  try {
+    const registry = JSON.parse(
+      fs.readFileSync(path.join(duckHome, "registry.json"), "utf8"),
+    );
+    const active = registry.workspaces?.find((workspace) => workspace.id === registry.active);
+    if (active?.ports?.http && nodeUrl().endsWith(`:${active.ports.http}`)) {
+      const token = fs
+        .readFileSync(path.join(duckHome, "workspaces", active.id, "admin.token"), "utf8")
+        .trim();
+      if (token) operator = token;
+    }
+  } catch {
+    // no registry, no workspace dir, no credential — reads still work.
+  }
+  return operator;
+};
 
 const request = async (pathname, options = {}) => {
   let response;
   try {
-    response = await fetch(`${base}${pathname}`, options);
+    response = await fetch(`${nodeUrl()}${pathname}`, options);
   } catch (error) {
     die(error instanceof Error ? error.message : String(error));
   }
@@ -93,12 +139,12 @@ const request = async (pathname, options = {}) => {
   return text ? JSON.parse(text) : null;
 };
 
-const post = (pathname, body) =>
-  request(pathname, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+const post = (pathname, body) => {
+  const headers = { "content-type": "application/json" };
+  const token = operatorToken();
+  if (token) headers["x-ducktape-admin-token"] = token;
+  return request(pathname, { method: "POST", headers, body: JSON.stringify(body) });
+};
 const query = (target, queryBody) => post("/v1/query", { target, query: queryBody });
 const submit = (target, payload) => post("/v1/submit", { target, payload });
 const receipt = (value) =>
@@ -148,7 +194,7 @@ switch (command) {
     break;
   }
   case "url":
-    console.log(base);
+    console.log(nodeUrl());
     break;
   case "status": {
     const value = await request("/v1/status");

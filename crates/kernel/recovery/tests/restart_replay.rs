@@ -21,8 +21,14 @@ fn sk(seed: u64) -> commonware_cryptography::ed25519::PrivateKey {
 }
 
 fn set(key: &str, value: &str) -> Msg {
+    set_on("directory", key, value)
+}
+
+/// a directory `Set` addressed to `target` — a second directory instance
+/// stands in for a post-genesis admission below.
+fn set_on(target: &str, key: &str, value: &str) -> Msg {
     Msg {
-        target: "directory".into(),
+        target: target.into(),
         payload: encode_msg(&DirMsg::Set {
             key: key.into(),
             value: value.into(),
@@ -35,16 +41,100 @@ fn fresh_host() -> Host {
 }
 
 async fn get(host: &Host, key: &str) -> Option<String> {
+    get_on(host, "directory", key).await
+}
+
+async fn get_on(host: &Host, target: &str, key: &str) -> Option<String> {
     let reply = host
-        .query(
-            "directory",
-            &encode_query(&DirQuery::Get { key: key.into() }),
-        )
+        .query(target, &encode_query(&DirQuery::Get { key: key.into() }))
         .await
         .expect("query");
     match decode_reply(&reply).expect("decode") {
         DirReply::Value(v) => v,
     }
+}
+
+/// a module admitted AFTER the checkpoint: the manifest never captured it, and
+/// the composer adopts it EMPTY (`adopt_admitted_modules`). the first block
+/// that touches it must replay from that empty pre-root — not be classed torn
+/// because the manifest holds no root for it.
+///
+/// the module's op must be the FIRST thing sealed after the checkpoint: every
+/// seal records every host root, so an earlier replayed block would carry
+/// `later: empty` in its seal, be classed `at_post` for it, and recovery's
+/// own post-block bookkeeping would seed the very root under test before the
+/// op block arrived — green with or without the seed. with the op in the first
+/// block, `changed == {later}` and only the seed makes it `at_pre`.
+#[test]
+fn an_adopted_empty_module_replays_its_first_op_from_the_empty_pre_root() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        // ---- the first run: the checkpoint predates `later` -----------------
+        let recovery = Recovery::open(context.child("r1"))
+            .await
+            .expect("open recovery");
+        let live = Host::genesis(vec![
+            Box::new(Directory::new("directory")),
+            Box::new(Directory::new("later")),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::with_sink(live, RoundOrderer::new(), recovery);
+        // the genesis checkpoint, captured from a host WITHOUT `later` —
+        // exactly what a checkpoint taken before an admission holds.
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest = Manifest::capture(&fresh_host(), None, 0, 0, vec![], vec![], None, pos, 1)
+            .expect("capture");
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write manifest");
+
+        let signer = sk(1);
+        // `later`'s first op, in the first block after the checkpoint: the
+        // block a live admission would have activated it in.
+        node.submit(&signer, 0, set_on("later", "k1", "v1"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        node.submit(&signer, 1, set("k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.root_hash();
+        // shutdown with NO explicit barrier: `seal` fsyncs where it is written,
+        // so the tip is durable already. deleting this line is the regression
+        // proof — without the seal's own sync the replay below loses the tip.
+        drop(node);
+
+        // ---- boot: `later` is adopted empty, absent from the manifest -------
+        let mut recovery = Recovery::open(context.child("r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery
+            .manifest()
+            .expect("manifest decodes")
+            .expect("manifest present");
+        assert!(
+            manifest.root("later").is_none(),
+            "the checkpoint predates the admission"
+        );
+        let mut host = fresh_host();
+        host.register(Box::new(Directory::new("later")));
+
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect("the adopting block replays from the empty pre-root");
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(
+            recovered.root_hash, tip_hash,
+            "recomposed root-hash is byte-identical"
+        );
+        assert_eq!(recovered.applied, 2, "both blocks re-applied");
+        assert_eq!(get_on(&host, "later", "k1").await.as_deref(), Some("v1"));
+    });
 }
 
 #[test]
@@ -126,8 +216,7 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
         let tip = node.finalized().expect("boundary");
         let tip_hash = node.root_hash();
 
-        // ---- a graceful shutdown: the journal tail is made durable ---------
-        node.sink_mut().sync().await.expect("shutdown sync");
+        // ---- shutdown, no explicit barrier: the seal fsync'd itself --------
         drop(node);
 
         // ---- boot: reopen the store, restore the checkpoint, replay -------

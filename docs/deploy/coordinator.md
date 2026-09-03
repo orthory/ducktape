@@ -1,6 +1,6 @@
-# Coordinator Deployment Recipe (`p2p.ducktape.byeongsu.dev`)
+# Coordinator Deployment Recipe (`relay.ducktape.industries`)
 
-How to run `bin/coordinator` as `p2p.ducktape.byeongsu.dev`: an **untrusted,
+How to run `bin/coordinator` as `relay.ducktape.industries`: an **untrusted,
 non-validator reachability helper** that lets two NAT'd validators find each
 other and hole-punch a direct path. Its optional TCP lane carries only sealed
 first-contact admission datagrams when UDP setup is exhausted; it never carries
@@ -14,9 +14,15 @@ and operating contract.
 > reachability plane is wired behind `wireguard_listen`: `bin/node` constructs a
 > `reachability::NatResolver` (reflexive discovery, `register`, hole-punch
 > against the configured coordinators) only when `wireguard_listen` is
-> configured. v1 `Coordinated` hints are consumed as reachability routes;
-> successful punching is still NAT-dependent because there is no relay fallback.
-> The cross-machine procedure is [the runbook](cross-machine-zero-exposure-runbook.md).
+> configured. v1 `Coordinated` hints are consumed as reachability routes.
+> The TCP/443 relay lane is the **joiner's first-contact fallback**: when every
+> UDP path to an inviter is exhausted, the joiner re-races its sealed intro
+> through `<coordinator host>:443`, an address it derives from its ambient
+> coordinator and never from the invite (`bin/node/src/replica/wiring.rs`,
+> `coordinator_relays`). Nothing after first contact rides a relay — the
+> established WireGuard tunnel and every per-use plane on it are still
+> NAT-dependent. The cross-machine procedure is
+> [the runbook](cross-machine-zero-exposure-runbook.md).
 
 ## Why this is safe (untrusted by design)
 
@@ -78,8 +84,10 @@ The UDP control socket provides two services:
 The optional TCP listener is a bounded fallback for the sealed first-contact
 intro only. It resolves a member through the same live advert book, forwards
 one opaque datagram, and returns the member's opaque reply. It is not a
-WireGuard-over-TCP or general peer-data relay. Pass `--relay-listen none` when
-that admission fallback is not deployed.
+WireGuard-over-TCP or general peer-data relay. Keep it on: a joiner assumes
+it at `<coordinator host>:443` and is never told otherwise, so
+`--relay-listen none` is a deliberate "members behind a non-punching NAT
+cannot join through this coordinator" decision, not a footprint trim.
 
 Registrations have a lifetime: a `register`/`readvertise` mapping expires
 `REGISTRATION_TTL_SECS` (120 s) after the last accepted advert; an expired key
@@ -215,52 +223,65 @@ sudo install -D -m 0644 ops/coordinator/coordinator.env.example /etc/ducktape/co
 sudo cp ops/coordinator/ducktape-coordinator.service /etc/systemd/system/
 
 # Optional: edit /etc/ducktape/coordinator.env to choose a bind address and auth
-# mode. The supplied file selects four auth workers, public proof-of-possession,
-# and no TCP fallback. For private mode use:
-# COORDINATOR_ARGS=--relay-listen none --workers 4 --metrics-interval 10 --genesis-set /etc/ducktape/network.toml
+# mode. The supplied file binds the TCP relay lane on 0.0.0.0:443, selects four
+# auth workers and public proof-of-possession. For private mode use:
+# COORDINATOR_ARGS=--relay-listen 0.0.0.0:443 --workers 4 --metrics-interval 10 --genesis-set /etc/ducktape/network.toml
 
 # 4. Start it.
 sudo systemctl daemon-reload
 sudo systemctl enable --now ducktape-coordinator
 
-# 5. Verify.
+# 5. Verify — BOTH lanes.
 systemctl status ducktape-coordinator
 ss -lunp 'sport = :3478'     # the fixed control socket, owned by the dynamic user
+ss -ltnp 'sport = :443'      # the relay lane; absent = the bind failed
+journalctl -u ducktape-coordinator | grep -E 'relay listening|relay_lane_disabled'
+journalctl -u ducktape-coordinator | grep coordinator_metrics | tail -1   # carries relay=on|off
 ```
 
 The unit runs under `DynamicUser=yes` (an ephemeral throwaway user — no home,
-no shell, nothing to compromise), with `CapabilityBoundingSet=` and
-`AmbientCapabilities=` **empty** (port 3478 > 1024 needs no privileged-port
-capability), `NoNewPrivileges=yes`, `ProtectSystem=strict` + `ReadOnlyPaths=/`
-(no writable path at all — the coordinator keeps no state), and
-`RestrictAddressFamilies=AF_INET AF_INET6` (Internet IP sockets only; no
+no shell, nothing to compromise), with **exactly one** capability —
+`CapabilityBoundingSet=CAP_NET_BIND_SERVICE` and
+`AmbientCapabilities=CAP_NET_BIND_SERVICE`, so the relay lane can bind 443
+(port 3478 needs none) — `NoNewPrivileges=yes`, `ProtectSystem=strict` +
+`ReadOnlyPaths=/` (no writable path at all — the coordinator keeps no state),
+and `RestrictAddressFamilies=AF_INET AF_INET6` (Internet IP sockets only; no
 unix/raw/packet sockets). This posture is deliberate: **there is no secret to
 steal and no state to corrupt**, so the box can be treated as disposable and
 replaced at will.
+
+A relay bind failure does **not** stop the unit: the coordinator keeps
+serving UDP, logs `relay_lane_disabled` at ERROR on boot (with the fix in the
+message), and every `coordinator_metrics` row thereafter says `relay=off`. Joiners derive
+their fallback as `<this host>:443` regardless, so treat `relay=off` on a
+public coordinator as an outage for every member behind a NAT that cannot
+hole-punch.
 
 ## Deploy B — Docker / OCI
 
 ```sh
 docker build -f ops/coordinator/Dockerfile -t ducktape-coordinator .
 
-# This deployment explicitly disables the TCP fallback, so one published UDP
-# port is enough. Harden the container to match the systemd unit.
+# Harden the container to match the systemd unit. The relay lane binds an
+# unprivileged port inside the container and the host maps TCP 443 onto it,
+# so the non-root container needs no capability at all.
 docker run \
   --cap-drop=ALL \
   --security-opt no-new-privileges \
   --read-only \
   --restart unless-stopped \
   -p 3478:3478/udp \
-  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen none --workers 4
+  -p 443:8443/tcp \
+  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen 0.0.0.0:8443 --workers 4
 ```
 
 For private mode in Docker, append the auth args after the image name:
 
 ```sh
 docker run --cap-drop=ALL --security-opt no-new-privileges --read-only \
-  -p 3478:3478/udp \
+  -p 3478:3478/udp -p 443:8443/tcp \
   -v /etc/ducktape/network.toml:/etc/ducktape/network.toml:ro \
-  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen none --workers 4 \
+  ducktape-coordinator --listen 0.0.0.0:3478 --relay-listen 0.0.0.0:8443 --workers 4 \
     --genesis-set /etc/ducktape/network.toml
 ```
 
@@ -270,11 +291,12 @@ The image is multi-stage: a `rust:1.96-bookworm` build stage compiles exactly
 dynamically-linked binary, **no shell, no package manager**, running as the
 built-in non-root uid `65532`. The `docker run` flags above are not optional
 decoration — they mirror the systemd unit's posture and are the container-side
-equivalent of its empty capability set and read-only root:
+equivalent of its single-capability set and read-only root:
 
-- `--cap-drop=ALL` — the binary needs **no** Linux capabilities (3478 > 1024, so
-  no privileged-port capability), the same as the unit's empty
-  `CapabilityBoundingSet=`/`AmbientCapabilities=`.
+- `--cap-drop=ALL` — the container needs **no** Linux capability. The unit
+  holds `CAP_NET_BIND_SERVICE` for exactly one reason, binding the relay lane
+  on 443; in Docker the relay binds unprivileged 8443 and the host's
+  `443:8443` map exposes the standard port, so even that one is dropped.
 - `--security-opt no-new-privileges` — mirrors `NoNewPrivileges=yes`.
 - `--read-only` — the coordinator keeps **no** state, so its root filesystem can
   be immutable, mirroring `ProtectSystem=strict` + `ReadOnlyPaths=/`.
@@ -283,17 +305,18 @@ equivalent of its empty capability set and read-only root:
   throwaway smoke run.
 
 Keep these: the whole premise is that a compromised coordinator has nothing to
-steal and nowhere to write. Publishing **only** `-p 3478:3478/udp` (not
-`--network host`) is sufficient for the explicit `--relay-listen none`
-deployment above. To enable the sealed-intro fallback, add
-`-p 443:8443/tcp` and `--relay-listen 0.0.0.0:8443`; the host mapping exposes
-the standard port without granting the container a privileged bind.
+steal and nowhere to write. Publish exactly the two ports (not
+`--network host`). The `-p 443:8443/tcp` map is load-bearing: a joiner
+derives the relay as `<coordinator host>:443` and is never told otherwise, so
+a container without it (or run with `--relay-listen none`) is the `relay=off`
+outage the systemd section describes — every member behind a non-punching
+NAT is locked out.
 
 ## DNS + firewall
 
-- Point an `A` record `p2p.ducktape.byeongsu.dev` → the VPS IP.
-- Open **inbound UDP 3478**. When the sealed-intro fallback is enabled, also
-  open its externally mapped TCP port (normally 443).
+- Point an `A` record `relay.ducktape.industries` → the VPS IP.
+- Open **inbound UDP 3478** and **inbound TCP 443** (the relay lane, on by
+  default; with a reverse proxy or DNAT, the port it forwards to).
 
 ## Redundancy — the coordinator is not load-bearing
 
@@ -319,7 +342,10 @@ constructs a `NatResolver` that discovers its reflexive, `register`s, and
 hole-punches against the configured coordinators, and v1 `Coordinated` invite
 hints route into that path instead of being dialed as mesh peers.
 
-What this page does **not** promise is universal zero-exposure connectivity:
-the coordinator is rendezvous-only, so NAT pairs that cannot punch fail
-honestly rather than falling back to a relay. The cross-machine procedure is
+What this page does **not** promise is universal zero-exposure connectivity.
+The TCP/443 lane relays exactly one thing — the joiner's sealed first-contact
+intro — so a member behind a NAT that cannot punch can *redeem an invite*
+through it and then has no tunnel: no statesync, no huddle, no gateway, no
+agent telemetry. Every per-use plane rides the WireGuard overlay, and the
+overlay has no relay by design. The cross-machine procedure is
 [`cross-machine-zero-exposure-runbook.md`](cross-machine-zero-exposure-runbook.md).

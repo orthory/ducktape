@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use commonware_cryptography::ed25519;
-use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::Receiver as P2pReceiver;
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_runtime::{Clock, Quota, Spawner, Supervisor};
 use commonware_utils::ordered::Set;
 use statesync::fetch_manifest;
@@ -37,6 +37,7 @@ pub(crate) async fn run(
     storage_for_sync: std::path::PathBuf,
     namespace: Vec<u8>,
     blobs: noded::blobs::BlobHandle,
+    genesis: &crate::config::GenesisModules,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
 ) {
     metrics.set_role_phase(noded::NodeRole::SyncOnly, noded::NodePhase::Syncing);
@@ -118,7 +119,7 @@ pub(crate) async fn run(
     }
     // rotate across every validator that can serve — the payloads
     // verify against consensus roots, so source choice is pure
-    // availability. carry this node's real-key standing proof (ADR §5.1):
+    // availability. carry this node's real-key standing proof:
     // a sync-only node WITH committed standing (a resident observing) is
     // served; a standing-less observer is now refused, by design.
     let (sync_requester, sync_proof) = statesync::sign_sync_proof(signer, &namespace);
@@ -181,6 +182,7 @@ pub(crate) async fn run(
             blobs: blobs.clone(),
         },
         0,
+        genesis,
     )
     .await
     {

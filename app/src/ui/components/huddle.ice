@@ -330,20 +330,18 @@ component HuddleTile(person:HuddleParticipant, muted:bool)
 // It reads `huddle_roster` from app state, which is kept ONLY while
 // `active_channel == huddle_channel` — the same guard `huddle_channel` itself
 // carries, since a load of any other channel carries THAT channel's roster.
-component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str, muted:bool, camera:bool, video_live:bool)
+component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str, muted:bool, camera:bool, sharing:bool, stage:str, video_live:bool)
   emits
     dock_huddle
     huddle_go_channel
     leave_huddle_here
     toggle_call_mute
     toggle_call_camera
+    toggle_call_screen
   // No `bg=` on the root: the window's own background IS the app background
   // (`bg app_background` in app.ice), so the stage band is the bare window and
   // only the two chrome bands paint a plate over it.
-  col #root
-    with
-      w=fill
-      h=fill
+  col #root w=fill h=fill
     // BAND 1 — THE HEADER, and the ONLY place the clock and the channel are
     // named. It used to be two bands: a mono "Huddle · <channel>" title over a
     // separate clock row whose right end printed the word `live` beside a
@@ -384,10 +382,7 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
         // `clip=true` ancestor cuts the overflow, which is why the channel
         // list's own rows survive the same names (their 236px pane clips).
         // Without this box the name painted straight through the dock button.
-        box
-          with
-            w=fill
-            clip=true
+        box w=fill clip=true
           row gap=3.0 align=center
             text "#"
               with
@@ -458,11 +453,19 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
           pr=12.0
           pt=12.0
           pb=12.0
-        // The video strip: every live camera's latest frame (peers first,
-        // the local preview last), only while any camera is on. The widget
-        // repaints itself — mounting it is the whole contract.
+        // THE STAGE — a shared screen, whole and as wide as the panel. It
+        // takes the top of the band because it is what the huddle is about
+        // whenever it is there: a desktop cropped into the 4:3 plate below
+        // would be a picture of somebody's wallpaper. Its height follows the
+        // frame's own aspect, so an empty stage occupies nothing.
+        if !empty(stage)
+          extern call_video_stage(stage)
+        // The video strip: every live source's latest frame (peers first,
+        // the local preview last) EXCEPT whatever the stage above is already
+        // showing whole. The widget repaints itself — mounting it is the
+        // whole contract.
         if video_live
-          extern call_video_tiles()
+          extern call_video_tiles(stage)
         // `max-cell` owns the column count so no tile carries a width: 2
         // columns at the window's 320px minimum, 4 at 560. It is the MAX and
         // not the min because the min form stretches a lone tile across the
@@ -470,10 +473,7 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
         // 100px-tall bar with a 34px avatar adrift in it.
         grid max-cell=168.0 gap=8.0
           for tile in rows
-            HuddleTile
-              with
-                person=tile.person
-                muted=tile.muted
+            HuddleTile person=tile.person muted=tile.muted
     box
       with
         w=fill
@@ -599,6 +599,58 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
             active bg=subtle text=fg border=control_line_hover border-w=1.0 r=9.0
             hovered bg=subtle text=fg border=control_line_hover
             pressed bg=subtle text=fg
+        // SHARE — the third source control, wearing the camera's own two
+        // plates because it IS the camera's alternative: one video stream,
+        // and starting this one stops that one (`toggle_call_screen`). One
+        // glyph, two plates, like every other toggle in this row.
+        if !sharing
+          button #share -> emit(toggle_call_screen)
+            with
+              label="Share this screen"
+              checked=sharing
+              w=32.0
+              h=32.0
+              @icon_action
+              @px-0px
+              @py-0px
+            box
+              with
+                w=fill
+                h=fill
+                align-x=center
+                align-y=center
+              Icon
+                with
+                  name="screen-share"
+                  tone="muted"
+                  px=14.0
+            active bg=elevated text=fg border=control_line border-w=1.0 r=9.0
+            hovered bg=subtle text=fg border=control_line_hover
+            pressed bg=subtle text=fg
+        if sharing
+          button #share-stop -> emit(toggle_call_screen)
+            with
+              label="Stop sharing this screen"
+              checked=sharing
+              w=32.0
+              h=32.0
+              @icon_action
+              @px-0px
+              @py-0px
+            box
+              with
+                w=fill
+                h=fill
+                align-x=center
+                align-y=center
+              Icon
+                with
+                  name="screen-share"
+                  tone="ink"
+                  px=14.0
+            active bg=subtle text=fg border=control_line_hover border-w=1.0 r=9.0
+            hovered bg=subtle text=fg border=control_line_hover
+            pressed bg=subtle text=fg
         // The channel is NAMED in the header, so this is a glyph and not the
         // window's loudest element: `open # <channel>` spelled out was wider
         // than both media controls together and grew without bound with the
@@ -626,7 +678,7 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
           hovered bg=subtle text=fg border=control_line_hover
           pressed bg=subtle text=fg
         space w=fill
-        button -> emit(leave_huddle_here)
+        button #leave -> emit(leave_huddle_here)
           with
             label="Leave the huddle"
             @icon_action

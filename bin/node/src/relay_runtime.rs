@@ -145,8 +145,10 @@ impl ResidentRelay {
                 return Err((hold, detail));
             }
             // the pack has to cross the wire before anyone can ack it — the
-            // fanout hold earns the transfer allowance on top of the base.
-            let deadline = deadline + relay::blob_transfer_allowance(bytes.len() as u64);
+            // fanout hold earns the transfer allowance on top of the base,
+            // sized by the serial fan-out width.
+            let deadline =
+                deadline + relay::blob_transfer_allowance(bytes.len() as u64, targets.len());
             self.fanouts.insert(
                 frame_id,
                 ResidentFanout {
@@ -411,8 +413,9 @@ impl ValidatorRelay {
             return Err((reply, detail));
         }
         // the pack has to cross the wire before every peer can ack it — the
-        // fanout hold earns the transfer allowance on top of the base.
-        let deadline = deadline + relay::blob_transfer_allowance(pack.len() as u64);
+        // fanout hold earns the transfer allowance on top of the base, sized
+        // by the serial fan-out width.
+        let deadline = deadline + relay::blob_transfer_allowance(pack.len() as u64, peers.len());
         self.local_fanouts.insert(
             frame_id,
             LocalFanout {
@@ -469,9 +472,12 @@ impl ValidatorRelay {
                     Ok(assembly) => {
                         // the chunks are still crossing the wire — the
                         // assembly hold earns the transfer allowance on top
-                        // of the base, sized by the offered total.
-                        let deadline =
-                            now + SUBMIT_HOLD + relay::blob_transfer_allowance(total);
+                        // of the base, sized by the offered total and the
+                        // sender's serial fan-out (this node may be its last
+                        // target, so the whole membership is the width).
+                        let deadline = now
+                            + SUBMIT_HOLD
+                            + relay::blob_transfer_allowance(total, members.len());
                         self.incoming.insert(
                             frame_id,
                             IncomingBlob {
@@ -754,16 +760,6 @@ where
 mod tests {
     use super::*;
     use sha2::{Digest as _, Sha256};
-
-    #[test]
-    fn relay_blob_limit_matches_bounded_queue_budget() {
-        let chunks = relay::MAX_RELAY_BLOB_BYTES.div_ceil(relay::RELAY_BLOB_CHUNK_BYTES);
-        let messages = chunks + 1;
-        assert!(
-            messages <= 128,
-            "one offer plus a max-size transfer must fit the relay backlog"
-        );
-    }
 
     #[test]
     fn blob_digest_is_content_addressed() {

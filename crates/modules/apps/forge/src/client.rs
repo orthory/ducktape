@@ -381,6 +381,7 @@ mod tests {
             repo: "lab".into(),
             updates: Vec::new(),
             pack_digest: None,
+            cert: None,
         });
         let refreshed = refresh_from_op(&push).expect("push classifies");
         assert_eq!(refreshed.repo, "lab");

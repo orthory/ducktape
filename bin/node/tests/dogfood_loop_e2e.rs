@@ -39,7 +39,7 @@
 //! nothing else — so a provider CANNOT race a push any more, and a scenario
 //! that cannot happen is not a regression this suite can hold. The property
 //! itself is covered where it lives, against the provisioner:
-//! `bin/noded/src/agent_provision/forge_tests.rs`'s
+//! `crates/noded/src/agent_provision/forge_tests.rs`'s
 //! `a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed` (plus the
 //! merge-preserving and author-preservation variants beside it).
 //!
@@ -55,7 +55,7 @@ use std::time::Duration;
 use agent::{ACTION_CHAT_POST, AgentMsg, ResourceCaps};
 use capability::{CapabilityQuery, CapabilityReply};
 use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, Span};
-use common::{Cluster, SANDBOX_IMAGE, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{Cluster, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
 use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply, TurnPolicy};
 
 const CONVERGE: Duration = Duration::from_secs(180);
@@ -67,9 +67,10 @@ const ROUND_TRIP: Duration = Duration::from_secs(120);
 /// workspace, so it rides the run's own commit into the branch — readable from
 /// any node, forever, instead of from a host path the container cannot see.
 const HEAD_FILE: &str = ".dogfood-run";
-/// the neutral guest cwd every sandboxed run gets (`podman_api::GUEST_ROOT`),
-/// which is the point: the operator's real layout never reaches the workload.
-const GUEST_WORKDIR: &str = "/ducktape/workspace";
+/// the neutral guest cwd every sandboxed run gets
+/// (`sandbox_host::guest_paths::GUEST_WORKSPACE`), which is the point: the
+/// operator's real layout never reaches the workload.
+const GUEST_WORKDIR: &str = "/duck/workspace";
 
 const AGENT_ID: &str = "quacker-dogfood";
 const REPO: &str = "dogfood";
@@ -80,15 +81,20 @@ const ISSUE_TITLE: &str = "prove the dogfood loop";
 
 /// one script-backed provider standing in for a coding agent.
 ///
-/// It runs INSIDE the run's container, so `sh`, `cat` and `printf` are the whole
+/// It runs INSIDE the run's microVM, so `sh`, `cat` and `printf` are the whole
 /// of its dependencies and its only writable surface is the workspace it was
 /// handed. It records `pwd|HEAD` into [`HEAD_FILE`] — which the host commits —
 /// and answers on stdout.
+///
+/// The behaviour rides the spec's ARGV, not a staged `provider.sh`: a microVM
+/// mounts nothing from the host, so an executor a node lends has to already be
+/// in the guest rootfs. A host script arrives as
+/// `execve /opt/duck/bin/provider.sh` and exit 126.
 struct DogfoodProvider {
     tag: String,
     spec_dir: PathBuf,
     env_var: String,
-    script: PathBuf,
+    bin: PathBuf,
 }
 
 impl DogfoodProvider {
@@ -109,44 +115,36 @@ impl DogfoodProvider {
                  bin = \"{tag}-nonexistent-cli\"\n\
                  env = \"{env_var}\"\n\
                  [invoke]\n\
-                 args = []\n\
+                 args = {}\n\
                  prompt = \"stdin\"\n\
                  timeout_secs = 60\n\
                  [output]\n\
-                 format = \"text\"\n"
+                 format = \"text\"\n",
+                Self::argv()
             ),
         )
         .expect("write provider spec");
-        let script = dir.join("provider.sh");
-        // Everything the script needs of its image: `sh`, `cat`, `printf`.
-        //
-        // `.git/HEAD` is read RAW rather than through `git rev-parse`. The run
-        // workspace is a self-contained clone (`.git` lives inside the bind
-        // mount), detached at the pin — so that file holds the bare oid, and
-        // reading it proves BOTH which commit the run forked and that the
-        // checkout is detached: a branch checkout would hold `ref: refs/…`
-        // instead, and the assertions below would name it.
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 set -e\n\
-                 cat > /dev/null\n\
-                 printf '%s|%s\\n' \"$(pwd)\" \"$(cat .git/HEAD)\" > {HEAD_FILE}\n\
-                 printf '%s\\n' '{REPLY_TITLE}'\n"
-            ),
-        )
-        .expect("write provider script");
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod provider script");
         Self {
             tag: tag.into(),
             spec_dir,
             env_var,
-            script,
+            // resolved by basename to /opt/duck/bin/sh inside the guest
+            bin: PathBuf::from("/bin/sh"),
         }
+    }
+
+    /// Everything this executor needs of its image: `sh`, `cat`, `printf`.
+    ///
+    /// `.git/HEAD` is read RAW rather than through `git rev-parse`. The run
+    /// workspace is a self-contained clone (`.git` rides the workspace image),
+    /// detached at the pin — so that file holds the bare oid, and reading it
+    /// proves BOTH which commit the run forked and that the checkout is
+    /// detached: a branch checkout would hold `ref: refs/…` instead, and the
+    /// assertions below would name it.
+    fn argv() -> String {
+        format!(
+            r#"["-c", "set -e; cat > /dev/null; printf '%s|%s\\n' \"$(pwd)\" \"$(cat .git/HEAD)\" > {HEAD_FILE}; printf '%s\\n' '{REPLY_TITLE}'"]"#
+        )
     }
 
     fn env(&self) -> Vec<(String, String)> {
@@ -155,7 +153,7 @@ impl DogfoodProvider {
                 "DUCKTAPE_CAPABILITY_DIR".into(),
                 self.spec_dir.display().to_string(),
             ),
-            (self.env_var.clone(), self.script.display().to_string()),
+            (self.env_var.clone(), self.bin.display().to_string()),
         ]
     }
 }
@@ -176,7 +174,10 @@ fn hermetic_env(root: &Path, name: &str) -> Vec<(String, String)> {
     std::fs::create_dir_all(&empty).expect("empty spec dir");
     let missing = root.join(name).join("missing-executor");
     vec![
-        ("DUCKTAPE_CAPABILITY_DIR".into(), empty.display().to_string()),
+        (
+            "DUCKTAPE_CAPABILITY_DIR".into(),
+            empty.display().to_string(),
+        ),
         ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
         ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
     ]
@@ -290,9 +291,11 @@ fn find_message(
 /// the anchor seq of a just-posted mention — NEVER hardcoded: forge posts
 /// system lines into item channels on state changes, so seqs are discovered.
 fn seq_of(cluster: &Cluster, idx: usize, channel: &str, message_id: &str) -> u64 {
-    poll_until(&format!("mention {message_id} to finalize"), FINALIZE, || {
-        find_message(cluster, idx, channel, message_id).map(|(seq, _)| seq)
-    })
+    poll_until(
+        &format!("mention {message_id} to finalize"),
+        FINALIZE,
+        || find_message(cluster, idx, channel, message_id).map(|(seq, _)| seq),
+    )
 }
 
 fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) -> String {
@@ -399,6 +402,21 @@ fn git_ok(dir: &Path, args: &[&str]) {
     );
 }
 
+/// a `git push` carrying a node's operator credential (`cluster.git_push_env`)
+/// — the proof `git-receive-pack` now requires (#1292).
+fn git_push_ok(env: [(String, String); 3], dir: &Path, args: &[&str]) {
+    let output = git_command(dir, args)
+        .envs(env)
+        .output()
+        .expect("spawn git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
     let output = git_output(dir, args);
     assert!(
@@ -449,8 +467,12 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     // HOW a run is isolated (the table) is independent of WHETHER this node runs
     // any (the grant); the compute daemon needs both and refuses to boot without
     // the table. Appended LAST — nothing may follow a toml table header.
-    cluster.extra_toml.extend(sandbox_toml(SANDBOX_IMAGE));
-    cluster.env[0] = [hermetic_env(fixtures.path(), "node0"), vec![runs_root_env.clone()]].concat();
+    cluster.extra_toml.extend(sandbox_toml());
+    cluster.env[0] = [
+        hermetic_env(fixtures.path(), "node0"),
+        vec![runs_root_env.clone()],
+    ]
+    .concat();
     cluster.env[1] = [
         provider.env(),
         hide_builtins(fixtures.path(), "node1"),
@@ -474,7 +496,11 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     let dev_tip = git_stdout(seed.path(), &["rev-parse", "HEAD"]);
     let seed_url = format!("http://127.0.0.1:{}/forge/{REPO}", cluster.http_ports[0]);
     git_ok(seed.path(), &["remote", "add", "origin", &seed_url]);
-    git_ok(seed.path(), &["push", "origin", "HEAD:dev"]);
+    git_push_ok(
+        cluster.git_push_env(0),
+        seed.path(),
+        &["push", "origin", "HEAD:dev"],
+    );
     // committed on the EXECUTING node before any run pins it.
     poll_until("the seed push to finalize on node 1", CONVERGE, || {
         (branch_tip(&cluster, 1, "dev")? == dev_tip).then_some(())
@@ -542,7 +568,11 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     // ---- run 1: issue mention → worktree at the pinned dev tip → branch
     //      `agent/item-1` born → a PR titled by the bound Forge issue.
     post_mention(&cluster, 0, &issue_channel, "m1");
-    let run_1 = runs::run_id_for(&issue_channel, seq_of(&cluster, 0, &issue_channel, "m1"), AGENT_ID);
+    let run_1 = runs::run_id_for(
+        &issue_channel,
+        seq_of(&cluster, 0, &issue_channel, "m1"),
+        AGENT_ID,
+    );
     assert_eq!(
         wait_for_reply(&cluster, 0, &issue_channel, &run_1),
         REPLY_TITLE,
@@ -564,7 +594,6 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
         }
     };
     assert_ne!(run1_oid, dev_tip, "the run pushed a NEW commit");
-
 
     // the PR: opened by the sink, titled from verified bound issue metadata.
     let pr_number = poll_until("the PR to open", FINALIZE, || {
@@ -590,14 +619,21 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     });
     assert_eq!(record.outcome, RunOutcome::Delivered);
     assert!(!record.degraded, "run 1 is clean: {record:?}");
-    assert_eq!(record.output_ref.as_deref(), Some(format!("{WORK_BRANCH}@{run1_oid}").as_str()));
+    assert_eq!(
+        record.output_ref.as_deref(),
+        Some(format!("{WORK_BRANCH}@{run1_oid}").as_str())
+    );
     assert_eq!(record.pr_number, Some(pr_number));
 
     // ---- run 2: the PR channel IS the session — re-mention forks the branch
     //      TIP, lands a second commit on the SAME branch, opens NO second PR.
     watch(&pr_channel);
     post_mention(&cluster, 0, &pr_channel, "m2");
-    let run_2 = runs::run_id_for(&pr_channel, seq_of(&cluster, 0, &pr_channel, "m2"), AGENT_ID);
+    let run_2 = runs::run_id_for(
+        &pr_channel,
+        seq_of(&cluster, 0, &pr_channel, "m2"),
+        AGENT_ID,
+    );
     assert_eq!(
         wait_for_reply(&cluster, 0, &pr_channel, &run_2),
         REPLY_TITLE,
@@ -614,19 +650,31 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     let dest = checkout.path().join("after-run2");
     git_ok(
         checkout.path(),
-        &["clone", "--quiet", "--branch", WORK_BRANCH, &clone_url, dest.to_str().unwrap()],
+        &[
+            "clone",
+            "--quiet",
+            "--branch",
+            WORK_BRANCH,
+            &clone_url,
+            dest.to_str().unwrap(),
+        ],
     );
     assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run2_oid);
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD^"]), run1_oid, "run 2's parent is run 1's commit");
+    assert_eq!(
+        git_stdout(&dest, &["rev-parse", "HEAD^"]),
+        run1_oid,
+        "run 2's parent is run 1's commit"
+    );
     assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~2"]), dev_tip);
 
     // What each run SAW, read out of the commit it produced: the sandboxed
     // neutral cwd, and a detached `.git/HEAD` naming the commit it forked. Run 1
     // forks the pinned dev tip; run 2 forks the branch TIP, which is what makes
     // the PR channel a session rather than a second independent run.
-    for (commit, pinned_at, which) in
-        [(&run1_oid, &dev_tip, "run 1"), (&run2_oid, &run1_oid, "run 2")]
-    {
+    for (commit, pinned_at, which) in [
+        (&run1_oid, &dev_tip, "run 1"),
+        (&run2_oid, &run1_oid, "run 2"),
+    ] {
         let (cwd, head) = run_evidence(&dest, commit);
         assert_eq!(cwd, GUEST_WORKDIR, "{which} ran at the neutral sandbox cwd");
         assert_eq!(
@@ -636,12 +684,23 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
         );
     }
 
-    assert_eq!(open_pr_count(&cluster, 0), 1, "the duplicate guard opened NO second PR");
+    assert_eq!(
+        open_pr_count(&cluster, 0),
+        1,
+        "the duplicate guard opened NO second PR"
+    );
     let record = poll_until("run 2 in the delivered-runs ring", FINALIZE, || {
         run_record(&cluster, 0, &run_2)
     });
     assert_eq!(record.outcome, RunOutcome::Delivered);
     assert!(!record.degraded, "run 2 is clean: {record:?}");
-    assert_eq!(record.output_ref.as_deref(), Some(format!("{WORK_BRANCH}@{run2_oid}").as_str()));
-    assert_eq!(record.pr_number, Some(pr_number), "the ring names the UPDATED PR");
+    assert_eq!(
+        record.output_ref.as_deref(),
+        Some(format!("{WORK_BRANCH}@{run2_oid}").as_str())
+    );
+    assert_eq!(
+        record.pr_number,
+        Some(pr_number),
+        "the ring names the UPDATED PR"
+    );
 }

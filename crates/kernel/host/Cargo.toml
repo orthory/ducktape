@@ -13,12 +13,11 @@ tracing = { workspace = true }
 sdk = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
-# WIRE-TYPES-ONLY dep: `Host::effective_version` decodes the lifecycle module's
-# `UpgradeStatus` reply and applies the shared version derivation, and the
-# boundary code-swap realization reads its committed active/pending hashes and
-# injects the shared `Advance` tick. host uses only the crate-root wire types —
-# it never constructs or registers the module impl (same shape as governance
-# reading valset's wire types).
+# WIRE-TYPES-ONLY dep: the drain's boundary code-swap realization reads the
+# lifecycle module's committed active/pending hashes and injects the shared
+# `Advance` tick. host uses only the crate-root wire types — it never
+# constructs or registers the module impl (same shape as governance reading
+# valset's wire types).
 lifecycle = { workspace = true }
 # WIRE-TYPES-ONLY dep, same shape: the drain's delivery injection reads
 # the dispatch module's committed mailbox count between blocks.
@@ -61,9 +60,10 @@ duckdns = { workspace = true }
 gateway = { workspace = true }
 governance = { workspace = true }
 greeter = { workspace = true }
-# the identity parity proof synthesizes WebAuthn passkey assertions exactly as
-# identity's own tests do (deterministic RFC-6979 P-256 signatures — no OS
-# randomness inside a consensus proof).
+# the identity parity proof mints member proofs through keyscheme's testkit
+# (deterministic RFC-6979 P-256 signatures — no OS randomness inside a
+# consensus proof); p256 names the passkey signing-key type it hands around.
+keyscheme = { workspace = true, features = ["testkit"] }
 p256 = { workspace = true }
 base64 = { workspace = true }
 # the delivery drain-injection test stands the real dispatch + saga modules
@@ -79,6 +79,11 @@ automations = { workspace = true }
 # its wasm port side by side. files needs an on-disk odb dir (tempfile).
 runs = { workspace = true }
 files = { workspace = true }
+# the forge root-continuity proof stands the native module beside its wasm port
+# over the git substrate; `testkit` builds the real git history + packs the
+# push ops need.
+forge = { workspace = true, features = ["testkit"] }
+blobstore = { workspace = true }
 tempfile = "3"
 commonware-cryptography = { workspace = true }
 commonware-runtime = { workspace = true }

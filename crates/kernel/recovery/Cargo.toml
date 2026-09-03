@@ -8,6 +8,7 @@ sdk = { workspace = true }
 host = { workspace = true }
 node = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 commonware-storage = { workspace = true }
 commonware-runtime = { workspace = true }
 commonware-codec = "2026.5.0"

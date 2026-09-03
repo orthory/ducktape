@@ -68,22 +68,21 @@ in the same trust class as a shell profile or a systemd unit:
   audit the spec.
 
 **Auth: the operator brings a logged-in CLI; the spec decides where the
-credential ends up.** There are exactly two ways, and a spec may use only one:
+credential ends up.** There is exactly one way:
 
-- **`[isolation]` — the strong path.** The *host* reads the credential and keeps
-  it in the node process. A run-scoped, loopback-only broker serves the model
-  API, and the child gets only an unrelated opaque run bearer, a localhost base
-  URL, and a **fresh, empty config home** (which is what stops the CLI reading
-  the operator's real one and forces it through the broker). The credential
-  never enters the child's process tree. Codex is here.
-- **`[sandbox] rw_dirs` — the weak path.** For a CLI with no broker: its own auth
-  dir is mounted into the sandbox and the credential **does** enter the child.
-  Claude is here, until an Anthropic-side broker exists.
+- **`[isolation]`.** The *host* reads the credential and keeps it in the node
+  process. A run-scoped, loopback-only broker serves the model API, and the
+  child gets only an unrelated opaque run bearer, a localhost base URL, and a
+  **fresh, empty config home** (which is what stops the CLI reading the
+  operator's real one and forces it through the broker). The credential never
+  enters the child's process tree. Codex and Claude are both here.
 
-**Declaring both is a hard load error.** A broker exists so the credential never
-reaches the child; `rw_dirs` would mount it in anyway — and the run would still
-*work*, so the regression would be silent. The load error is what makes it
-impossible: an executor that gains a broker drops its `rw_dirs` in the same edit.
+**A spec cannot ask for a host directory instead.** A run executes inside its
+own microVM, which shares no filesystem with the host — the only things that
+cross are the per-run block devices the backend builds. There is no `[sandbox]`
+table in the format, so a spec that declares one fails to load rather than being
+accepted and quietly ignored. An executor that can only authenticate by reading
+its own dotfiles cannot be lent by a node.
 
 ---
 
@@ -233,12 +232,6 @@ being silently ignored.
 | `config_home_env` | string | no | executor config-home env name such as `CODEX_HOME`; must match `[A-Z_][A-Z0-9_]*` |
 | `broker` | string | no | currently only `"codex-responses"`; credentials remain in the host process |
 
-### `[sandbox]`
-
-| Field | Type | Required | Rules |
-|---|---|---|---|
-| `rw_dirs` | string array | no (default `[]`) | the executor's own auth/state dirs, mounted read-write into a sandbox. **Home-relative only** — absolute paths and `..` are rejected at load. **Rejected outright if the spec also declares `[isolation] broker`.** |
-
 ### `[tools]`
 
 | Field | Type | Required | Rules |
@@ -283,27 +276,11 @@ port, requires the per-run bearer, accepts only Responses POSTs, enforces
 body/response/total-byte, concurrency and request-count budgets, and is torn down
 when the run ends. It substitutes the host credential only on the upstream hop.
 
-**Backends.** Works under `Direct` and `Podman` (whose `--network=host` leaves
-the host's loopback reachable from inside the container). **`Tart` is refused
-loudly**: a VM guest has its own network stack, so the host's `127.0.0.1` is not
-the broker's — every model call would fail as what looks like a broken login.
-Giving the guest a host-gateway address is the upgrade path.
-
-### `[sandbox] rw_dirs` — the credential enters the child
-
-```toml
-[sandbox]
-rw_dirs = ["~/.claude", "~/.claude.json"]
-```
-
-For a CLI with no broker. Under a sandbox backend `HOME` is *set* but not
-*mounted*, so the node's data dir and user key stay outside (D7); these named
-home-relative dirs are the only paths under `HOME` that cross, read-write, at
-their identical container paths — enough for the CLI to find its own login.
-Inert under `Direct` (the child inherits `HOME` whole).
-
-Entries are validated at load: an absolute path or any `..` segment is rejected,
-since either would defeat the boundary the sandbox exists to hold.
+**How the guest reaches it.** A microVM has its own network stack, so the
+broker's `127.0.0.1` is not the guest's. `duck-guest-init` closes that gap
+without giving the guest any host network at all: it listens on the broker's
+port on the VM's *own* loopback and tunnels each connection to the host over
+vsock. The CLI dials the localhost URL its env names and never knows.
 
 ---
 

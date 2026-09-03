@@ -14,3 +14,8 @@ state
   hydration_retry_attempt:i64 = 0
   mutation_phase:MutationPhase = MutationPhase.idle
   error = ""
+  // A `duck://` URL the OS handed this process on the command line (the
+  // `x-scheme-handler/duck` desktop entry's `%u`). Parked until the first
+  // status names the connected chain — the earliest moment the open plane can
+  // tell this network's addresses from another's — then spent exactly once.
+  startup_duck_link:str = startup_duck_url()

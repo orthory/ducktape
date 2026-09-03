@@ -20,7 +20,7 @@
 // row can only fire these six. With 4,096 rows that used to manufacture
 // 48 callback routes per row on every unrelated rebuild. This component keeps
 // the row loop's routing surface equal to what the row can actually do.
-component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, loading:bool)
+component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -63,9 +63,9 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
               h=1.0
               bg=brand/40
             text ""
-      // The selected row stays live because selection and loading are screen
-      // state. Quiet rows keep their own element/layout memo within the
-      // whole-timeline boundary. The plain dependency is intentional: the
+      // The selected row stays live because selection is screen state. Quiet
+      // rows keep their own element/layout memo within the whole-timeline
+      // boundary. The plain dependency is intentional: the
       // outer keyed lazy lends `messages` as a closure-local value, while the
       // compiler permits nested cheap-key capture only from app state. A live
       // batch rebuilds this bounded window once; an unchanged frame never
@@ -77,7 +77,6 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
               message
               selected=true
               menu_open=true
-              disabled=loading
             forward
               add_reaction_at
               remove_reaction_at
@@ -93,7 +92,6 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
                 message=cached_message
                 selected=false
                 menu_open=false
-                disabled=false
               forward
                 add_reaction_at
                 remove_reaction_at
@@ -105,7 +103,7 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
 // Same boundary for the rail: the root, target and menu rows stay live; quiet
 // replies keep their per-row memo. Paging controls stay outside this component
 // because they are constant-size chrome, not part of the chain-fed list.
-component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_target_seq:i64, thread_selected_seq:i64, loading:bool)
+component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_target_seq:i64, thread_selected_seq:i64)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -129,7 +127,6 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
             message=thread_message
             selected=(thread_message.seq == thread_target_seq)
             menu_open=(thread_message.seq == thread_selected_seq)
-            disabled=loading
           forward
             add_reaction_at
             remove_reaction_at
@@ -144,7 +141,6 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               message=cached_reply
               selected=false
               menu_open=false
-              disabled=false
             forward
               add_reaction_at
               remove_reaction_at
@@ -153,7 +149,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               open_thread_message_reactions
               open_message_link
 
-component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], messages_revision:i64, has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_messages_revision:i64, thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
+component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
   lifetime retained
   emits
     search_chat_submit()
@@ -171,6 +167,8 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
     load_more_history()
     chat_scrolled(f64, f64, f64, f64)
     open_message_link(str)
+    copy_to_clipboard(str, str)
+    copy_message_link(str)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
@@ -324,10 +322,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     h=fill
                     align-x=center
                     align-y=center
-                  text "×"
-                    with
-                      size=13.0
-                      wrap=none
+                  text "×" size=13.0 wrap=none
                 active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                 hovered bg=elevated text=fg
                 pressed bg=subtle text=fg
@@ -370,8 +365,9 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                 // second spelling of the disabled term. `active text=label`
                 // keeps the resting `label` tone the old tinted mount named;
                 // token and tone are the same hex in both palettes.
-                svg icon("plus") memory color=inherit
+                svg icon("plus") memory
                   with
+                    color=inherit
                     w=16.0
                     h=16.0
                 active bg=transparent text=label border=transparent border-w=1.0 r=5.0
@@ -393,10 +389,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     h=fill
                     align-x=center
                     align-y=center
-                  text "×"
-                    with
-                      size=13.0
-                      wrap=none
+                  text "×" size=13.0 wrap=none
                 active bg=separator text=muted border=transparent border-w=1.0 r=5.0
                 hovered bg=subtle text=fg
                 pressed bg=subtle text=fg
@@ -454,7 +447,12 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                       font=code_medium
                       @text-label
             for dm in dm_rows
-              DmButton peer=dm.peer selected=(dm.peer.key == active_dm_peer) unread=dm.unread disabled=(mutation_phase != MutationPhase.idle)
+              DmButton
+                with
+                  peer=dm.peer
+                  selected=(dm.peer.key == active_dm_peer)
+                  unread=dm.unread
+                  disabled=(mutation_phase != MutationPhase.idle)
                 forward
                   choose_dm
         // No account footer: the rail's avatar and Settings already carry the
@@ -511,10 +509,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                   // the peer's name and moved with its length, and a long
                   // name pushed the huddle control and ⋯ past the pane's clip.
                   if !empty(active_dm.name)
-                    box
-                      with
-                        w=fill
-                        clip=true
+                    box w=fill clip=true
                       DmHeader peer=active_dm
                   if empty(active_dm.name)
                     text "#"
@@ -533,10 +528,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                   // could still click, and dropped ⋯ entirely. The window's
                   // `min-size` bounds the other axis; this bounds this one.
                   if empty(active_dm.name)
-                    box
-                      with
-                        w=fill
-                        clip=true
+                    box w=fill clip=true
                       text active_channel_name
                         with
                           size=14.0
@@ -617,10 +609,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                         h=fill
                         align-x=center
                         align-y=center
-                      text "⋯"
-                        with
-                          size=14.0
-                          wrap=none
+                      text "⋯" size=14.0 wrap=none
                     active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
                     hovered bg=elevated text=fg
                     pressed bg=subtle text=fg
@@ -653,7 +642,11 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
               // THREE SKELETON ROWS, not a centred sentence — see
               // `SkeletonRow` for the geometry they hold to.
               if connected && loading && empty(messages)
-                col w=fill gap=14.0 pt=4.0
+                col
+                  with
+                    w=fill
+                    gap=14.0
+                    pt=4.0
                   SkeletonRow
                   SkeletonRow
                   SkeletonRow
@@ -705,7 +698,11 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     // height its content needs (still capped by the box's
                     // limits, so a long timeline scrolls exactly as before) and
                     // `align-y=end` drops that block onto the composer.
-                    box w=fill h=fill align-y=end
+                    box
+                      with
+                        w=fill
+                        h=fill
+                        align-y=end
                       scroll #message-stream
                         with
                           dir=vertical
@@ -803,18 +800,31 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                           // carries the visible rows along with it.
                           // WHOLE-TIMELINE MEMO. The value stays borrowed from
                           // root state and only enters the cached element when
-                          // this cheap revision (or one of the five visible
+                          // this cheap revision (or one of the four visible
                           // screen inputs) moves. Composer edits, clocks and
                           // unrelated live planes therefore build one memo
                           // widget instead of enumerating every message.
-                          lazy messages by messages_revision, active_channel, unread_boundary, unread_marker_seq, selected_message_seq, loading as cached_messages
+                          //
+                          // `loading` STAYS OUT OF THE KEY. It is the
+                          // workspace hydration flag — a page load moves it
+                          // while a full chat timeline is on screen — and
+                          // the only thing in here that read it was the
+                          // live row's `disabled=`. A room switch and a
+                          // reconnect both empty the stream before they
+                          // raise the flag, so no row ever drew under the
+                          // chat's own load; keying on it cloned every
+                          // message for a dim that never showed. No row
+                          // reads the flag now, so the live row routes like
+                          // the quiet rows always did: the reaction handlers
+                          // keep refusing while loading; the openers never
+                          // did.
+                          lazy messages by active_channel, unread_boundary, unread_marker_seq, selected_message_seq as cached_messages
                             MessageTimeline
                               with
                                 messages=cached_messages
                                 unread_boundary
                                 unread_marker_seq
                                 selected_message_seq
-                                loading
                               forward
                                 add_reaction_at
                                 remove_reaction_at
@@ -833,8 +843,17 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     content
                       space w=fill h=fill
                     layer
-                      box w=fill h=fill pt=block_action_menu_y(chat_pointer_y, chat_height) align-x=end align-y=start
+                      // THE LAYER IS THE MENU, NOT THE PANE. Codegen wraps an
+                      // overlay's layer in a press swallower (a press on a menu
+                      // row's padding must not fall through to the backdrop), so
+                      // a fill-sized layer carrying the pointer-y offset as
+                      // padding covered the backdrop end to end: every press on
+                      // the pane died in the swallower and Esc was the menu's
+                      // only exit. The offset is a pressable gap instead, routed
+                      // to the same dismiss the backdrop carries.
                         col
+                          mouse press=emit(clear_message_selection)
+                            space w=fill h=block_action_menu_y(chat_pointer_y, chat_height)
                           if message_action == MessageAction.more
                             stack
                               input "" #message-action-focus <-> message_action_focus
@@ -920,6 +939,46 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                                             tone="muted"
                                             px=14.0
                                         text "Reply in thread"
+                                          with
+                                            size=12.5
+                                            wrap=none
+                                            @text-accent_fg
+                                    active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+                                    hovered bg=fg/8 text=fg
+                                    pressed bg=fg/12 text=fg
+                                  // COPY LINK. A message has no address a
+                                  // member could type: the channel id is a
+                                  // uuid and the seq is nowhere on screen, so
+                                  // this row is the only way one leaves the
+                                  // app. The built link names its network, so
+                                  // pasted into a workspace on another chain
+                                  // it refuses instead of opening that
+                                  // chain's message 42.
+                                  button -> emit(copy_message_link, duck_channel_message_link(active_channel, selected_message_seq, network_chain_id))
+                                    with
+                                      label="Copy message link"
+                                      w=fill
+                                      h=30.0
+                                      p=0.0
+                                      @ghost_action
+                                    box
+                                      with
+                                        w=fill
+                                        h=fill
+                                        pl=9.0
+                                        pr=9.0
+                                        align-y=center
+                                      row
+                                        with
+                                          w=fill
+                                          gap=9.0
+                                          align=center
+                                        Icon
+                                          with
+                                            name="link"
+                                            tone="muted"
+                                            px=14.0
+                                        text "Copy link"
                                           with
                                             size=12.5
                                             wrap=none
@@ -1138,7 +1197,22 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
             // child, so a search reflowed the whole conversation down by
             // 148px; as a stack layer it drops over the stream instead and
             // everything beneath keeps its place.
-            if search_phase != SearchPhase.idle
+            //
+            // THE GATE CARRIES THE RETIREMENT, so the three arms below stay
+            // the phase reads they already were and no edit to one of them can
+            // leave an empty card floating. `done` alone stood while the
+            // reader typed on: this field is enter-to-submit and two-way
+            // bound, so a keystroke runs no handler and only
+            // `trim(draft) == query` can retire an answer as the box moves
+            // away from it.
+            //
+            // ONLY THE ZERO-HIT ARM RETIRES THAT WAY. Hit rows are still
+            // useful under a draft nobody has sent — they are the thing being
+            // typed toward — so `!empty(search_hits)` holds the float up on
+            // its own until a new query is sent or the box is cleared, which
+            // is what the pages hits float does. A sentence claiming NOTHING
+            // matched has no such life: it is a claim about one string.
+            if search_phase == SearchPhase.searching || !empty(search_hits) || search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)
               box
                 with
                   w=fill
@@ -1161,14 +1235,19 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     shadow-blur=24.0
                   col w=fill
                     if search_phase == SearchPhase.searching
-                      col w=fill gap=14.0 p=8.0
+                      col
+                        with
+                          w=fill
+                          gap=14.0
+                          p=8.0
                         SkeletonRow
                     if search_phase == SearchPhase.done && empty(search_hits)
-                      box w=fill p=14.0 align-x=center
-                        text "No messages match"
-                          with
-                            size=12.5
-                            @text-muted
+                      box
+                        with
+                          w=fill
+                          p=14.0
+                          align-x=center
+                        text "No messages match" size=12.5 @text-muted
                     if search_phase == SearchPhase.done && !empty(search_hits)
                       scroll
                         with
@@ -1203,9 +1282,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                 pl=18.0
                 pr=18.0
                 pt=12.0
-              ComposerGate
-                with
-                  reason=post_refusal
+              ComposerGate reason=post_refusal
           box
             with
               w=fill
@@ -1362,6 +1439,15 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                           h=29.0
                           p=6.0
                           @secondary_action
+                  // A channel id is a uuid: this is the only place a member
+                  // can get one out of the app. The link names its network.
+                  button "Copy channel link" -> emit(copy_to_clipboard, duck_channel_link(active_channel, network_chain_id), "Channel link copied")
+                    with
+                      label="Copy channel link"
+                      w=fill
+                      h=29.0
+                      p=6.0
+                      @secondary_action
                   col w=fill gap=6.0
                     row
                       with
@@ -1415,7 +1501,10 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                     if !empty(channel_members)
                       col w=fill gap=1.0
                         for member in channel_members
-                          ChatMemberRow member=member disabled=(mutation_phase != MutationPhase.idle)
+                          ChatMemberRow
+                            with
+                              member=member
+                              disabled=(mutation_phase != MutationPhase.idle)
                             forward
                               remove_channel_member_submit
               box
@@ -1585,15 +1674,16 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                       // Reply-composer edits and unrelated app state stop at
                       // the cheap revision instead of walking every loaded
                       // reply. Paging chrome stays outside the memo, so its
-                      // busy phase does not invalidate the timeline.
-                      lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, loading as cached_thread_messages
+                      // busy phase does not invalidate the timeline, and the
+                      // workspace `loading` flag stays out of the key for the
+                      // same reason the stream's does.
+                      lazy thread_messages by active_channel, active_thread_seq, thread_target_seq, thread_selected_seq as cached_thread_messages
                         ThreadTimeline
                           with
                             messages=cached_thread_messages
                             active_thread_seq
                             thread_target_seq
                             thread_selected_seq
-                            loading
                           forward
                             add_reaction_at
                             remove_reaction_at
@@ -1679,8 +1769,11 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                 content
                   space w=fill h=fill
                 layer
-                  box w=fill h=fill pt=block_action_menu_y(thread_pointer_y, thread_height) align-x=end align-y=start
+                  // Same shape as the stream menu: the layer is the menu, the
+                  // gap above it dismisses.
                     col
+                      mouse press=emit(clear_thread_message_selection)
+                        space w=fill h=block_action_menu_y(thread_pointer_y, thread_height)
                       if thread_message_action == MessageAction.more
                         stack
                           input "" #thread-action-focus <-> message_action_focus
@@ -1725,6 +1818,42 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                                         tone="muted"
                                         px=14.0
                                     text "Add reaction"
+                                      with
+                                        size=12.5
+                                        wrap=none
+                                        @text-accent_fg
+                                active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+                                hovered bg=fg/8 text=fg
+                                pressed bg=fg/12 text=fg
+                              // A reply is addressable exactly like a stream
+                              // message — same channel, its own seq — and the
+                              // rail is where a reader stands when they want
+                              // to hand one to somebody.
+                              button -> emit(copy_message_link, duck_channel_message_link(active_channel, thread_selected_seq, network_chain_id))
+                                with
+                                  label="Copy message link"
+                                  w=fill
+                                  h=30.0
+                                  p=0.0
+                                  @ghost_action
+                                box
+                                  with
+                                    w=fill
+                                    h=fill
+                                    pl=9.0
+                                    pr=9.0
+                                    align-y=center
+                                  row
+                                    with
+                                      w=fill
+                                      gap=9.0
+                                      align=center
+                                    Icon
+                                      with
+                                        name="link"
+                                        tone="muted"
+                                        px=14.0
+                                    text "Copy link"
                                       with
                                         size=12.5
                                         wrap=none

@@ -17,7 +17,7 @@
 //! The offered half is a real `POST /v1/services/hello` against the resident's
 //! own app surface, refreshed on a heartbeat — a service daemon's entire
 //! contribution to THIS lane. The daemon PROCESS is deliberately not spawned:
-//! an announce test that boots a container runtime pays podman's availability
+//! an announce test that boots a sandbox pays the hypervisor's availability
 //! and startup cost for no extra signal. What a real daemon would additionally
 //! prove — that a REAL hello carries the shape this lane expects — belongs in
 //! the dispatch e2e (#826), which owns the `[sandbox]` fixture and the runtime
@@ -69,7 +69,7 @@ fn opt_in_serving(cluster: &NetworkShapeCluster, idx: usize, tag: &str) {
     std::fs::write(
         workspace.join("services.toml"),
         format!(
-            "version = 1\n\n[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
+            "[[service]]\nkind = \"compute\"\ninstance = \"{}\"\n\
              nonce = \"{}\"\ngranted_unix = 1700000000\ncapabilities = [{tag:?}]\n\
              scopes = []\n",
             "11".repeat(32),
@@ -85,7 +85,10 @@ fn a_joined_resident_announces_into_the_committed_registry() {
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("resident-announce");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
@@ -93,7 +96,11 @@ fn a_joined_resident_announces_into_the_committed_registry() {
     // invite, a member redeems it automatically, resident standing lands.
     let invite = cluster.invite();
     let friend_key_hex = cluster.join_friend(&invite);
-    assert_eq!(friend_key_hex.len(), 64, "join prints the friend's pubkey hex");
+    assert_eq!(
+        friend_key_hex.len(),
+        64,
+        "join prints the friend's pubkey hex"
+    );
     let friend_key = common::unhex(&friend_key_hex);
     opt_in_serving(&cluster, 1, TAG);
     cluster.spawn(1);

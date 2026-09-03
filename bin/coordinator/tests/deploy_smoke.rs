@@ -65,6 +65,40 @@ async fn cli_rejects_missing_and_unknown_flags() {
     }
 }
 
+/// A typo in the one operator gesture the deploy docs advertise
+/// (`RUST_LOG=ducktape::reachability=debug`) must not be swallowed: the
+/// coordinator has no `/v1/log-filter` reload seam, so silence would cost a
+/// restart to discover. It falls back to the default filter and NAMES it.
+#[tokio::test]
+async fn a_malformed_rust_log_is_named_rather_than_skipped() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coordinator"))
+        .env("RUST_LOG", "ducktape::reachability=lourd")
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--relay-listen")
+        .arg("none")
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the compiled coordinator binary");
+
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut lines = BufReader::new(stderr).lines();
+    timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.expect("read stderr") {
+            if line.contains("malformed_rust_log") {
+                return;
+            }
+        }
+        panic!("coordinator never said its RUST_LOG was ignored");
+    })
+    .await
+    .expect("the refusal must be reported before serving");
+
+    let _ = child.start_kill();
+}
+
 #[tokio::test]
 async fn deployed_coordinator_binary_answers_a_bind_request() {
     // Boot the ACTUAL binary the recipe installs, with the OS choosing the port.
@@ -194,5 +228,42 @@ async fn deployed_relay_lane_announces_and_serves_the_tcp_frame_protocol() {
         }
     );
 
+    let _ = child.start_kill();
+}
+
+#[tokio::test]
+async fn metrics_rows_say_whether_the_relay_lane_bound() {
+    // `--relay-listen none` is the one relay state a test can produce
+    // hermetically; the row must say so on every tick, not only at boot.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_coordinator"))
+        .arg("--listen")
+        .arg("127.0.0.1:0")
+        .arg("--relay-listen")
+        .arg("none")
+        .arg("--metrics-interval")
+        .arg("1")
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn the compiled coordinator binary");
+
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut lines = BufReader::new(stderr).lines();
+    let row = timeout(Duration::from_secs(10), async {
+        while let Some(line) = lines.next_line().await.expect("read stderr") {
+            if line.starts_with("coordinator_metrics") {
+                return line;
+            }
+        }
+        panic!("coordinator exited before its first metrics row");
+    })
+    .await
+    .expect("a metrics row must arrive within the interval");
+
+    assert!(
+        row.contains("| relay=off sessions="),
+        "the metrics row must carry the relay lane state: {row}"
+    );
     let _ = child.start_kill();
 }

@@ -219,7 +219,10 @@ mod tests {
         }
         assert_eq!(slot.finish().unwrap(), digest);
         assert!(store.has_chunk(&digest));
-        assert_eq!(store.get_chunk(&digest).as_deref(), Some(payload.as_slice()));
+        assert_eq!(
+            store.get_chunk(&digest).as_deref(),
+            Some(payload.as_slice())
+        );
         // published under the content-addressed name; staging slot gone.
         assert!(root.path().join(hex(&digest)).is_file());
         assert!(!root.path().join("staging").join(hex(&digest)).exists());
@@ -240,7 +243,10 @@ mod tests {
         assert_eq!(resumed.offset(), b"first half|".len() as u64);
         resumed.append(b"second half").unwrap();
         assert_eq!(resumed.finish().unwrap(), digest);
-        assert_eq!(store.get_chunk(&digest).as_deref(), Some(payload.as_slice()));
+        assert_eq!(
+            store.get_chunk(&digest).as_deref(),
+            Some(payload.as_slice())
+        );
     }
 
     #[test]
@@ -266,7 +272,10 @@ mod tests {
         let mut slot = store.stage(digest, 3).unwrap();
         assert!(matches!(
             slot.append(b"xyzz"),
-            Err(StageError::Length { expected: 3, got: 4 })
+            Err(StageError::Length {
+                expected: 3,
+                got: 4
+            })
         ));
         slot.append(b"xyz").unwrap();
         assert_eq!(slot.finish().unwrap(), digest);
@@ -281,7 +290,10 @@ mod tests {
         slot.append(b"abc").unwrap();
         assert!(matches!(
             slot.finish(),
-            Err(StageError::Length { expected: 6, got: 3 })
+            Err(StageError::Length {
+                expected: 6,
+                got: 3
+            })
         ));
     }
 }

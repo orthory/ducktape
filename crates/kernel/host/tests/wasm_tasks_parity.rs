@@ -87,12 +87,19 @@ fn block(height: u64, origin: Origin) -> BlockContext {
     }
 }
 
-/// the read matrix: the task board's whole surface (the unpaged `List`) plus
-/// the job board's kept dispatch read — `Get`, hit and absent shapes alike
-/// (board enumeration is the index guest's job on the derived tier).
+/// the read matrix: the task board's whole surface (a `List` page and a `Get`,
+/// hit and absent) plus the job board's kept dispatch read — `Get`, hit and
+/// absent shapes alike (board enumeration is the index guest's job on the
+/// derived tier).
 async fn replies(h: &Host) -> Vec<Vec<u8>> {
     let queries = [
-        encode_task_query(&TaskQuery::List),
+        encode_task_query(&whole_board()),
+        encode_task_query(&TaskQuery::Get {
+            task_id: "t1".into(),
+        }),
+        encode_task_query(&TaskQuery::Get {
+            task_id: "absent".into(),
+        }),
         encode_job_query(&JobsQuery::Get {
             job_id: "build".into(),
         }),
@@ -110,12 +117,22 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
     out
 }
 
+/// the whole board as ONE page — the parity board is far under the clamp.
+fn whole_board() -> TaskQuery {
+    TaskQuery::List {
+        limit: tasks::MAX_LIST_LIMIT,
+        after: None,
+    }
+}
+
 async fn listed(h: &Host) -> Vec<tasks::Task> {
     let reply = h
-        .query("tasks", &encode_task_query(&TaskQuery::List))
+        .query("tasks", &encode_task_query(&whole_board()))
         .await
         .expect("query");
-    let TaskReply::Tasks(tasks) = decode_task_reply(&reply).expect("decode");
+    let TaskReply::Tasks(tasks) = decode_task_reply(&reply).expect("decode") else {
+        panic!("a list answers a page");
+    };
     tasks
 }
 

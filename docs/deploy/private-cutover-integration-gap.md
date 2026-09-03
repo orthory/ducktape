@@ -100,10 +100,12 @@ dropped from the race (an all-coordinated invite on a TUN node then hits the
 honest terminal immediately rather than hanging).
 
 The two-node real-WireGuard container smoke that proved mesh-over-tunnels
-(and its cold-restart leg) lives at `ops/wg-smoke/run-smoke.sh`; extending
-it to drive this join recipe end-to-end on real tunnels is the standing
-verification gate for the tunnel-first flow (the TCP-carrier halves are
-proven by `bin/node/tests/join_request_e2e.rs`).
+(and its cold-restart leg) was `ops/wg-smoke/run-smoke.sh`; it hand-wrote a
+pre-2026-07-23 node.toml (`bootstrapper_addr`, no `http_listen`/`[sandbox]`)
+that today's node refuses, so it was removed rather than left as a gate
+nobody could run. A tunnel-first end-to-end gate on real tunnels is still
+owed; it should generate its configs with `ducktape node init`, not by hand
+(the TCP-carrier halves are proven by `bin/node/tests/join_request_e2e.rs`).
 
 ## Cold restart (shipped)
 
@@ -118,9 +120,8 @@ needs no gossip; one-sided resolution suffices because WireGuard roams on
 authenticated inbound) — and the dialer is seeded with the persisted control
 ULAs for peers without a configured hint. The restored mesh is purely a
 gossip carrier: the boot epoch's own live assembly replaces it at its apply.
-What it deliberately does NOT cover: the FIRST join on a coordinated-only
-config (nothing persisted yet — the throwaway fronted hint in the join
-recipe above remains required for the join window).
+What it deliberately does NOT cover: the FIRST join (nothing persisted yet) —
+that is the invite tunnel's job, per the join recipe above.
 
 ## Standby tunnel pre-warming (shipped)
 
@@ -155,7 +156,7 @@ needs both sides to resolve simultaneously: the pump answers
 coordinator-vouched `PunchSync` fan-outs while the node is otherwise idle, and
 the active side re-`Lookup`s on every punch retry (each one re-fans the sync),
 so one-sided resolution completes against an idle-but-alive peer. What still
-moves with the userspace-overlay ADR's phase 3 is the punched-pinhole ↔
+moves with the userspace overlay's phase 3 is the punched-pinhole ↔
 WireGuard-socket alignment (the punch must originate from the plane's own UDP
 socket) and reflexive-bearing endpoint advertisements.
 

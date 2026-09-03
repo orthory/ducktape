@@ -72,15 +72,20 @@
 //! peer traffic; it is a value for state ops to reference. a key that is not
 //! 32 bytes of hex fails loud at startup.
 //!
+//! genesis composition: the sim runs the SAME composer bin/node does
+//! (`noded::compose::compose` over a `topology` selection), so every wasm tenant
+//! is the REAL guest component — read from `--modules <dir>`, defaulting to the
+//! repo's kernel fixtures so a bare checkout boots with nothing installed.
+//!
 //! opt-in governance genesis: `--with-valset <hex-pubkey>[,<hex>...]` (comma-
-//! separated, and repeatable) appends the kv/valset/governance/lifecycle system
-//! modules AFTER the default 14, seeding the validator set with the given
+//! separated, and repeatable) appends the kv/valset/acl/governance/lifecycle
+//! system modules AFTER the default 15, seeding the validator set with the given
 //! genesis ed25519 keys exactly like bin/node. `--invite-binding <string>`
 //! (default `"sim"`, meaningful only with `--with-valset`) sets the network
 //! binding governance verifies invite tokens against. registering the upgrade
 //! module makes the host's once-per-block boundary `Advance` ride every sim
-//! block automatically. the DEFAULT genesis is byte-identical to before —
-//! these modules exist only under the flag.
+//! block automatically, and it is also the code registry governance is wired
+//! to — so `UpdateModule` proposals are live here, not gated off.
 //!
 //! origin hex escape (sim lanes only): a `/v1/submit` or `/sim/peer-block`
 //! origin string prefixed `hex:` (e.g. `hex:ab12…`, any even-length hex)
@@ -97,10 +102,11 @@
 //! noded's, but reused module state defeats the same-script reproducibility
 //! this tool exists for).
 //!
-//! run: `cargo run -p simnode -- [--listen 127.0.0.1:8845] [--storage <dir>]
+//! run: `cargo run -p simnode -- [--listen <addr>] [--storage <dir>]
 //!       [--auto] [--persona local|networked] [--echo-oracle]
 //!       [--with-valset <hex>[,<hex>...]] [--invite-binding <string>]
-//!       [--node-key <64-hex>]`
+//!       [--node-key <64-hex>] [--modules <dir>]`
+//! — `--listen` defaults to [`DEFAULT_LISTEN`].
 //!
 //! block-on-reject (validator parity): a rejected SINGLE op JOURNALS a block
 //! here, exactly like the ordered validator — the op rides the drain, seals its
@@ -110,13 +116,11 @@
 //! batch is folded into that batch's one block with its own `rejected` verdict,
 //! as before.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agent::AgentModule;
-use automations::Automations;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
@@ -124,48 +128,41 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chat::Chat;
 use commonware_runtime::{Metrics as _, Runner as _, Supervisor as _};
-use dispatch::DispatchModule;
-use files::Files;
-use forge::Forge;
-use gateway::Gateway;
-use runs::RunsModule;
-use tagging::TaggingModule;
-// the opt-in `--with-valset` governance genesis modules (registered only under
-// the flag; the default genesis stays byte-identical without them).
 use futures::StreamExt as _;
 use futures::channel::{mpsc, oneshot};
 use futures::select;
-use governance::Governance;
+use host::BlockOp;
 use host::worker;
-use host::{BlockOp, Host};
-use identity::Identity;
-use inbox::Inbox;
 use indexer::IndexStore;
-use kv::Kv;
-use lifecycle::Lifecycle;
 use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle, StepOrderer};
+use noded::bundle::{DirCodeSource, host_from, qmdb_stores};
+use noded::compose::{Bindings, Boot, Substrates, compose};
 use noded::{
-    BlockDisposition, BlockSummary, ModuleCategory, ModuleStatus, NodeCommand, NodeHandle,
-    NodeStatus, StreamHub, hex_bytes, hex_root,
+    BlockDisposition, BlockSummary, LOCAL_CHAIN_ID, ModuleCategory, ModuleStatus, NodeCommand,
+    NodeHandle, NodeStatus, ORACLE_ORIGIN, StreamHub, hex_bytes, hex_root,
 };
-use pages::Pages;
-use saga::SagaModule;
-use sdk::{Event, Module, Msg, Origin};
+use sdk::{Event, Msg, Origin};
 use serde::{Deserialize, Serialize};
-use statesync::qmdb::QmdbStore;
-use tasks::Tasks;
-use acl::Acl;
-use valset::Valset;
+use topology::TOPOLOGY;
 
 // the sim's genesis sets are the `sim_base` (+ `sim_valset`) selections of the
-// single-source `host::topology` — noded's exact 14-module default plus the
-// opt-in 4 system modules. changing the daemon set changes the topology, which
-// re-pins here and at node/demo. the native genesis vec below composes these
-// same ids over native module structs (the wasm/native root split is by design).
-const ORACLE_ORIGIN: &[u8] = b"oracle";
+// single-source `topology` — noded's exact 15-module default plus the
+// opt-in 5 system modules. changing the daemon set changes the topology, which
+// re-pins here and at node/demo. the composer below builds exactly those ids,
+// the same way bin/node does.
 const PEER_ORIGIN: &[u8] = b"peer";
+
+/// where the binary serves `/v1` when `--listen` is absent — the ONE spelling
+/// of the sim's default port.
+///
+/// It sits outside the real node's operator block (HTTP 8844, admin RPC 8845,
+/// mesh 8846) on purpose, and that is a correctness property rather than
+/// tidiness: the sim is a dev tool run BESIDE a node, so a shared port makes
+/// the second process to boot die on its bind, and makes a client on that port
+/// reach whichever daemon won — answering an admin-RPC caller with `/v1` http.
+/// Keep any new default out of 8844..=8846; a test below pins it.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:8850";
 
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
 /// a fixed epoch keeps module timestamps (message sent_at, task created_at)
@@ -202,7 +199,7 @@ struct CommittedInfo {
     op_hash: String,
     target: String,
     /// `held` (a client submit released by this step), `oracle` (a worker
-    /// follow-up), or `peer` (a /sim/peer-block).
+    /// follow-up).
     kind: &'static str,
 }
 
@@ -225,8 +222,7 @@ struct PersonaRequest {
     persona: Persona,
 }
 
-/// one op inside a `/sim/peer-block` request — the single-op body IS one of
-/// these, and the multi-op body is an array of them.
+/// one op inside a `/sim/peer-block` request's `ops` array.
 #[derive(Deserialize)]
 struct PeerOp {
     target: String,
@@ -238,14 +234,12 @@ struct PeerOp {
 /// `hex:` origin escape is still unresolved here — the actor resolves it.
 type PeerOpWire = (String, Vec<u8>, Vec<u8>);
 
-/// `/sim/peer-block` accepts EITHER shape (additive, sim-only wire). untagged:
-/// a body with `ops` is a `Batch` (the only shape that carries it); anything
-/// else falls through to the original `Single` op. ops-wins if both are present.
+/// `/sim/peer-block`: ONE shape — `{ops:[…]}`. a single-op peer block is a
+/// one-element batch; the reply is always the per-member [`BatchInfo`].
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum PeerBlockRequest {
-    Batch { ops: Vec<PeerOp> },
-    Single(PeerOp),
+#[serde(deny_unknown_fields)]
+struct PeerBlockRequest {
+    ops: Vec<PeerOp>,
 }
 
 /// one member's verdict in a `/sim/peer-block` batch reply (input order).
@@ -286,16 +280,10 @@ enum SimCommand {
         persona: Persona,
         reply: oneshot::Sender<SimSnapshot>,
     },
-    PeerBlock {
-        target: String,
-        payload: Vec<u8>,
-        origin: Vec<u8>,
-        reply: oneshot::Sender<Result<CommittedInfo, String>>,
-    },
     /// N ops committed as ONE block via the host's `submit_block` batch engine.
     /// each tuple is `(target, payload_bytes, origin_bytes)`; the `hex:` origin
-    /// escape resolves in the actor, same as the single-op path.
-    PeerBatch {
+    /// escape resolves in the actor.
+    PeerBlock {
         ops: Vec<PeerOpWire>,
         reply: oneshot::Sender<Result<BatchInfo, String>>,
     },
@@ -327,7 +315,7 @@ pub struct SimOpts {
     /// register the deterministic echo oracle (`--echo-oracle`).
     pub echo_oracle: bool,
     /// opt-in governance genesis: raw 32-byte ed25519 validator pubkeys. empty
-    /// => the default 14-module set, byte-identical.
+    /// => the default 15-module set (`topology::SIM_BASE`) alone.
     pub valset_keys: Vec<Vec<u8>>,
     /// the invite namespace governance verifies tokens against — meaningful only
     /// with `valset_keys`. defaults to `b"sim"`.
@@ -338,6 +326,10 @@ pub struct SimOpts {
     pub node_key: Option<String>,
     /// the receipt/ring persona — local daemon vs networked validator shapes.
     pub persona: Persona,
+    /// the directory of `<id>.component.wasm` the sim composes its wasm tenants
+    /// from; `None` = the repo's kernel fixtures, so an embedder in this
+    /// checkout needs no install.
+    pub modules_dir: Option<PathBuf>,
     /// install noded's PROCESS-GLOBAL tracing subscriber + panic hook (feeding
     /// the log ring). the binary sets this; an embedder leaves it `false` so
     /// `boot` has no global side effects and repeated boots don't stack hooks.
@@ -353,6 +345,7 @@ impl Default for SimOpts {
             invite_binding: b"sim".to_vec(),
             node_key: None,
             persona: Persona::Local,
+            modules_dir: None,
             install_log: false,
         }
     }
@@ -372,20 +365,35 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
         invite_binding,
         node_key,
         persona,
+        modules_dir,
         install_log,
     } = opts;
+    // the component bytes every wasm tenant composes from. the default is the
+    // repo's kernel fixtures — the sim is a dev tool that must boot from a bare
+    // checkout, with no bundle install and no managed modules dir.
+    let modules_dir = modules_dir.unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../crates/kernel/host/tests/fixtures")
+    });
 
     // the status module list and the index tier both extend only under valset
-    // keys; the default path stays the exact 14-module set the parity lane pins.
+    // keys; the default path stays the exact 15-module set `daemon_e2e` pins
+    // against noded.
     let module_ids: Vec<&'static str> = if valset_keys.is_empty() {
-        host::topology::SIM_BASE.to_vec()
+        topology::SIM_BASE.to_vec()
     } else {
-        host::topology::SIM_BASE
+        topology::SIM_BASE
             .iter()
-            .chain(host::topology::SIM_VALSET)
+            .chain(topology::SIM_VALSET)
             .copied()
             .collect()
     };
+    // read and hash the bundle HERE, in the caller: ONE decision about whether
+    // the components are usable, surfaced as `boot`'s own Err instead of a
+    // panic on the actor thread that reaches an embedder as "sim actor died
+    // during genesis". the source (a path and a hash table) then rides in.
+    let wasm_ids = TOPOLOGY.wasm_ids(&module_ids);
+    let (code, code_hashes) = DirCodeSource::open(&modules_dir, &wasm_ids)?;
+
     let storage = storage.to_path_buf();
     let forge_repo = storage.join("forge-git");
 
@@ -411,9 +419,10 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // and the binary has no HTTP stop path at all (`sim_router` has no shutdown
     // of its own; `SimHandle::wait` waits on exactly `/v1/admin/shutdown`).
     // Minted into `storage`, so a driver reads it back with
-    // `noded::admin::read_operator_token(storage)`. `DUCKTAPE_ADMIN=off` still
-    // removes the surface entirely; a mint failure refuses every admin request
-    // rather than falling back to loopback trust.
+    // `noded::admin::read_operator_token(storage)`, and so does the harness for
+    // its mutating `/v1` writes. `DUCKTAPE_ADMIN=off` still removes the control
+    // surface entirely (the credential is minted regardless); a mint failure
+    // refuses every admin request rather than falling back to loopback trust.
     let handle = handle
         .with_forge_repo(forge_repo.clone())
         .with_index_store(index.clone())
@@ -453,6 +462,8 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
             run_sim(
                 actor_storage,
                 forge_repo,
+                code,
+                code_hashes,
                 index,
                 blobs,
                 actor_persona,
@@ -602,35 +613,20 @@ impl SimHandle {
     }
 
     /// commit a concurrent writer's block past any parked queue. `body` is the
-    /// `/sim/peer-block` request shape — a single `{target,payload,origin?}` op
-    /// OR a `{ops:[…]}` batch — and the reply matches (`CommittedInfo` or
-    /// `BatchInfo`).
+    /// `/sim/peer-block` request shape (`{ops:[…]}`); the reply is the
+    /// per-member `BatchInfo`.
     pub fn peer_block(&self, body: serde_json::Value) -> Result<serde_json::Value, String> {
         let request: PeerBlockRequest =
             serde_json::from_value(body).map_err(|err| err.to_string())?;
-        match request {
-            PeerBlockRequest::Single(op) => {
-                let (target, payload, origin) = encode_peer_op(op).map_err(|(_, msg)| msg)?;
-                let info = self.call(|reply| SimCommand::PeerBlock {
-                    target,
-                    payload,
-                    origin,
-                    reply,
-                })??;
-                serde_json::to_value(info).map_err(|err| err.to_string())
-            }
-            PeerBlockRequest::Batch { ops } => {
-                let mut encoded = Vec::with_capacity(ops.len());
-                for op in ops {
-                    encoded.push(encode_peer_op(op).map_err(|(_, msg)| msg)?);
-                }
-                let info = self.call(|reply| SimCommand::PeerBatch {
-                    ops: encoded,
-                    reply,
-                })??;
-                serde_json::to_value(info).map_err(|err| err.to_string())
-            }
+        let mut encoded = Vec::with_capacity(request.ops.len());
+        for op in request.ops {
+            encoded.push(encode_peer_op(op).map_err(|(_, msg)| msg)?);
         }
+        let info = self.call(|reply| SimCommand::PeerBlock {
+            ops: encoded,
+            reply,
+        })??;
+        serde_json::to_value(info).map_err(|err| err.to_string())
     }
 
     /// the current [`SimSnapshot`] as JSON, the shape `GET /sim/state` returns.
@@ -772,6 +768,8 @@ struct Sim {
 fn run_sim(
     storage: PathBuf,
     forge_repo: PathBuf,
+    code: DirCodeSource,
+    code_hashes: BTreeMap<String, [u8; 32]>,
     index: Arc<IndexStore>,
     blobs: blobstore::BlobHandle,
     persona: Arc<Mutex<Persona>>,
@@ -795,147 +793,35 @@ fn run_sim(
     let executor = commonware_runtime::tokio::Runner::new(rt_cfg);
 
     executor.start(|context| async move {
-        // genesis: noded's exact module set (topology `sim_base`), composed here
-        // over native module structs so app queries and status roots behave like
-        // a real daemon's.
-        let chat = Chat::new("chat", Box::new(QmdbStore::init(context.child("chat"), "chat").await))
-            .with_tagging("tagging");
-        let saga = SagaModule::new(
-            "saga",
-            Box::new(QmdbStore::init(context.child("saga"), "saga").await),
-        );
-        let dispatch = DispatchModule::new(
-            "dispatch",
-            "saga",
-            Box::new(QmdbStore::init(context.child("dispatch"), "dispatch").await),
-        );
-        let tagging = TaggingModule::new(
-            "tagging",
-            Box::new(QmdbStore::init(context.child("tagging"), "tagging").await),
+        // genesis: the topology selection composed the way bin/node composes —
+        // wasm tenants fetched by hash from the source `boot` opened, the native
+        // registries seeded from the sim's bindings. governance composes as
+        // wasm, so its code registry is wired and UpdateModule proposals are
+        // live in the sim.
+        let selection: &[&'static str] = &module_ids;
+        let substrates = Substrates {
+            forge_repo,
+            duckfs_dir,
+            blobs: blobs.clone(),
+        };
+        let bindings = Bindings {
+            invite: &invite_binding,
+            chain_id: LOCAL_CHAIN_ID,
+            validators: &valset_keys,
+            code_hashes: &code_hashes,
+        };
+        let mut stores = qmdb_stores(&context);
+        let modules = compose(
+            selection,
+            &code,
+            &mut stores,
+            &substrates,
+            &bindings,
+            Boot::Genesis,
         )
-        .with_direct_owner("runs");
-        let tasks = Tasks::new(
-            "tasks",
-            Box::new(QmdbStore::init(context.child("tasks"), "tasks").await),
-        );
-        let inbox = Inbox::new(
-            "inbox",
-            Box::new(QmdbStore::init(context.child("inbox"), "inbox").await),
-        );
-        let automations = Automations::new(
-            "automations",
-            Box::new(QmdbStore::init(context.child("automations"), "automations").await),
-            "chat",
-            "tasks",
-            "inbox",
-        );
-        let agent = AgentModule::new(
-            "agent",
-            Box::new(QmdbStore::init(context.child("agent"), "agent").await),
-            "saga",
-            Some("runs".into()),
-        );
-        let runs = RunsModule::new(
-            "runs",
-            "chat",
-            "saga",
-            "tagging",
-            "dispatch",
-            "agent",
-            Some("tasks".into()),
-            Some("tasks".into()),
-        )
-        // The portable composer pins its source head from duckfs/files.
-        .with_files_module("files")
-        // the pages module the composer renders [[page:<id>]] refs from and
-        // the pages effects lane writes to; unwired, both degrade.
-        .with_pages_module("pages");
-        let pages = Pages::new("pages", Box::new(QmdbStore::init(context.child("pages"), "pages").await))
-            .with_tagging("tagging");
-        let forge = Forge::with_blobs("forge", forge_repo, blobs.clone())
-            .expect("forge init")
-            .with_chat("chat");
-        let files = Files::open("files", duckfs_dir).expect("duckfs open");
-        // the deterministic user->nodes binding registry — no valset, no chain
-        // (the simulator has neither), matching noded's daemon wiring. It is
-        // also the canonical account display-name registry. store-backed like
-        // chat/pages.
-        let identity = Identity::new(
-            "identity",
-            Box::new(QmdbStore::init(context.child("identity"), "identity").await),
-            None,
-            String::new(),
-        );
-        let gateway = Gateway::new(
-            "gateway",
-            Box::new(QmdbStore::init(context.child("gateway"), "gateway").await),
-            "identity",
-            None,
-            "local",
-        );
-        let mut modules: Vec<Box<dyn Module>> = vec![
-            Box::new(chat),
-            Box::new(saga),
-            Box::new(dispatch),
-            Box::new(tagging),
-            Box::new(tasks),
-            Box::new(inbox),
-            Box::new(automations),
-            Box::new(agent),
-            Box::new(runs),
-            Box::new(pages),
-            Box::new(forge),
-            Box::new(files),
-            Box::new(identity),
-            Box::new(gateway),
-        ];
-        // opt-in governance genesis, AFTER the default 14 in registry order:
-        // kv, valset (seeded with the given genesis validators exactly like
-        // bin/node), acl (the submit-policy table, EMPTY = allow-all),
-        // governance (the sole authorized author of valset and acl change,
-        // bound to the invite namespace), and the lifecycle coordinator — whose
-        // registration alone makes the host's once-per-block boundary `Advance`
-        // ride every sim block. governance's code-registry path stays unwired
-        // (no `with_code_registry`, so UpdateModule proposals are gated off) and
-        // capability is left out; saga's construction is untouched. empty
-        // valset_keys => the default set, byte-identical.
-        if !valset_keys.is_empty() {
-            let kv = Kv::new("kv", Box::new(QmdbStore::init(context.child("kv"), "kv").await));
-            let mut valset = Valset::new(
-                "valset",
-                Box::new(QmdbStore::init(context.child("valset"), "valset").await),
-            );
-            for key in &valset_keys {
-                valset.seed(key.clone()).await.expect("seed sim valset");
-            }
-            valset.finish_seed().await.expect("seed sim valset");
-            let acl_table = Acl::new(
-                "acl",
-                Box::new(QmdbStore::init(context.child("acl"), "acl").await),
-            );
-            // identity is already in the default module set above. store-backed
-            // like bin/node; the sim wires the binding through the native
-            // builder (no wasm guest here, so no `__config` seeding).
-            let governance = Governance::new(
-                "governance",
-                Box::new(QmdbStore::init(context.child("governance"), "governance").await),
-                "valset",
-                "identity",
-            )
-            .with_invite_binding(invite_binding)
-            .with_acl("acl");
-            let lifecycle = Lifecycle::new(
-                "lifecycle",
-                Box::new(QmdbStore::init(context.child("lifecycle"), "lifecycle").await),
-                "valset",
-            );
-            modules.push(Box::new(kv));
-            modules.push(Box::new(valset));
-            modules.push(Box::new(acl_table));
-            modules.push(Box::new(governance));
-            modules.push(Box::new(lifecycle));
-        }
-        let host = Host::genesis(modules).expect("genesis");
+        .await
+        .expect("sim genesis composes");
+        let host = host_from(modules).expect("genesis");
 
         // a lib must not write to stdout — this is a once-per-boot lifecycle
         // fact, so it rides tracing (visible on the binary's stderr + ring under
@@ -1119,27 +1005,11 @@ impl Sim {
                 *self.persona.lock().expect("persona poisoned") = persona;
                 let _ = reply.send(self.snapshot());
             }
-            SimCommand::PeerBlock {
-                target,
-                payload,
-                origin,
-                reply,
-            } => {
-                // same `hex:` origin escape as /v1/submit — a concurrent writer
-                // can also author as a raw ed25519 key; bad hex rejects the block.
-                let result = match decode_origin(origin) {
-                    Ok(origin) => {
-                        self.commit_peer(Origin::External(origin), Msg { target, payload })
-                            .await
-                    }
-                    Err(err) => Err(err),
-                };
-                let _ = reply.send(result);
-            }
-            SimCommand::PeerBatch { ops, reply } => {
+            SimCommand::PeerBlock { ops, reply } => {
                 // resolve each member's origin through the SAME `hex:` escape as
-                // the single-op lane; one bad origin rejects the whole request
-                // (before any state moves — nothing has committed yet).
+                // /v1/submit — a concurrent writer can also author as a raw
+                // ed25519 key; one bad origin rejects the whole request (before
+                // any state moves — nothing has committed yet).
                 let resolved: Result<Vec<(Origin, Msg)>, String> = ops
                     .into_iter()
                     .map(|(target, payload, origin)| {
@@ -1148,7 +1018,7 @@ impl Sim {
                     })
                     .collect();
                 let result = match resolved {
-                    Ok(ops) => self.commit_peer_batch(ops).await,
+                    Ok(ops) => self.commit_peer_block(ops).await,
                     Err(err) => Err(err),
                 };
                 let _ = reply.send(result);
@@ -1197,27 +1067,14 @@ impl Sim {
         self.committed_info(&drained, "held")
     }
 
-    /// commit a concurrent-writer block (one op, immediate), returning its
-    /// `CommittedInfo`. a rejected peer op journals its block (validator parity)
-    /// but the reply is the rejection — the same single-op convention as a held
-    /// submit.
-    async fn commit_peer(&mut self, origin: Origin, msg: Msg) -> Result<CommittedInfo, String> {
-        let (drained, events) = self.commit_block(vec![(origin, msg)]).await?;
-        self.settle(&drained, events).await;
-        match self.committed_info(&drained, "peer") {
-            Some(info) => Ok(info),
-            None => Err(Self::member_summary(&drained).err().unwrap_or_default()),
-        }
-    }
-
-    /// commit N ops as ONE block, returning per-member verdicts. the batch twin
-    /// of [`Self::commit_peer`]: `submit_decoded` each, flush into ONE batch (one
-    /// block, one root-hash, per-op isolation), and read each member's
-    /// applied/rejected disposition from the drain — the shared `project_block`
-    /// already wrote the block's one row (all members, each with its disposition)
-    /// and the per-module index feed. an empty `ops` produces no ordered frame
-    /// and so no block.
-    async fn commit_peer_batch(&mut self, ops: Vec<(Origin, Msg)>) -> Result<BatchInfo, String> {
+    /// commit N ops as ONE concurrent-writer block, returning per-member
+    /// verdicts: `submit_decoded` each, flush into ONE batch (one block, one
+    /// root-hash, per-op isolation), and read each member's applied/rejected
+    /// disposition from the drain — the shared `project_block` already wrote
+    /// the block's one row (all members, each with its disposition) and the
+    /// per-module index feed. an empty `ops` produces no ordered frame and so
+    /// no block. a rejected member still journals its block (validator parity).
+    async fn commit_peer_block(&mut self, ops: Vec<(Origin, Msg)>) -> Result<BatchInfo, String> {
         let (drained, events) = self.commit_block(ops).await?;
         self.settle(&drained, events).await;
         // the batch is ONE block: every member frame shares its height and the
@@ -1226,10 +1083,11 @@ impl Sim {
             .iter()
             .filter_map(|d| {
                 let op = d.op.as_ref()?;
+                let disposition = block_disposition(d.disposition)?;
                 Some(MemberInfo {
                     target: op.target.clone(),
                     proposer: proposer_hex(&op.origin),
-                    disposition: block_disposition(d.disposition),
+                    disposition,
                     rejection: d.reason.clone(),
                 })
             })
@@ -1422,12 +1280,17 @@ impl Sim {
         };
         match frame.disposition {
             node::Disposition::Applied => Ok(block),
-            _ => Err(frame.reason.clone().unwrap_or_default()),
+            node::Disposition::Rejected => Err(frame.reason.clone().unwrap_or_default()),
+            // a discarded frame carries no `reason`, so the rejected arm would
+            // hand the submitter an EMPTY error. it cannot happen in the sim
+            // (no cutover ceiling), and the arm exists so a fourth variant
+            // fails the build rather than inheriting that empty string.
+            node::Disposition::Discarded => Err("discarded at the cutover ceiling".into()),
         }
     }
 
     /// the `CommittedInfo` for an APPLIED one-op commit; `None` if the op was
-    /// rejected (the step/peer reply reports no commit, the submitter got the
+    /// rejected (the step reply reports no commit, the submitter got the
     /// rejection). `op_hash` re-stages the payload (idempotent, content-address).
     fn committed_info(
         &self,
@@ -1484,6 +1347,7 @@ impl Sim {
             // seeded key names an identity for consensus-op scenarios; no mesh
             // routes behind it.
             public_key: self.public_key.clone(),
+            chain_id: LOCAL_CHAIN_ID.into(),
             operations: noded::OperationalStatus {
                 role: noded::NodeRole::Local,
                 phase: noded::NodePhase::Serving,
@@ -1558,13 +1422,20 @@ impl worker::Lane for AutoLane<'_> {
     }
 }
 
-/// the disposition of a drained frame as its explorer wire twin (`Discarded`
-/// can never reach the sim — it sets no cutover ceiling — so it folds to
-/// rejected).
-fn block_disposition(disposition: node::Disposition) -> BlockDisposition {
+/// the disposition of a drained frame as its explorer wire twin, or `None` for
+/// a frame that owns no explorer row. `Discarded` is that `None`: it never ran
+/// and is re-proposed under the same id at cutover, so publishing it as
+/// `Rejected` would lie in the `/v1/blocks` twin the sim exists to make
+/// trustworthy — both sibling mappers drop it the same way
+/// (`noded::projection::project_block` skips the member, `bin/node`'s
+/// sealed-frame row drops the block). it cannot reach the sim today
+/// (`StepOrderer` sets no cutover ceiling); every arm is named anyway, so a
+/// fourth variant fails the build here as it already does in the siblings.
+fn block_disposition(disposition: node::Disposition) -> Option<BlockDisposition> {
     match disposition {
-        node::Disposition::Applied => BlockDisposition::Applied,
-        _ => BlockDisposition::Rejected,
+        node::Disposition::Applied => Some(BlockDisposition::Applied),
+        node::Disposition::Rejected => Some(BlockDisposition::Rejected),
+        node::Disposition::Discarded => None,
     }
 }
 
@@ -1599,23 +1470,40 @@ struct EchoWorker;
 #[async_trait::async_trait(?Send)]
 impl worker::Worker for EchoWorker {
     async fn run(&self, event: &Event) -> Result<worker::WorkOutcome, worker::Error> {
-        let request = match saga::decode_worker_request(&event.payload) {
-            Ok(request) => request,
-            Err(_) => return Ok(worker::WorkOutcome::NotMine),
+        let Ok(request) = saga::decode_worker_request(&event.payload) else {
+            return Ok(worker::WorkOutcome::NotMine);
         };
         // a dispatch-plane WorkSpec echoes its raw-text lane (the dispatch
         // module judged a Text contract; the agent module normalizes).
         let Ok(work) = dispatch::decode_work_spec(&request.spec) else {
             return Ok(worker::WorkOutcome::NotMine);
         };
-        Ok(worker::WorkOutcome::Handled(Some(Msg {
-            target: "saga".into(),
-            payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
-                saga_id: request.saga_id,
-                attempt: request.attempt,
+        let saga::WorkerRequest {
+            saga_id,
+            attempt,
+            assignee,
+            ..
+        } = request;
+        // the saga guest runs the STRICT lease policy, so this walks the same
+        // bid-then-work lane a real compute node does: an UNASSIGNED request is
+        // an announcement, claimed with `Accept` (the module then re-emits the
+        // work order naming the winner), and only the assignee's own result
+        // lands. the sim commits every follow-up under `ORACLE_ORIGIN`, so that
+        // is the key this worker holds its leases under.
+        let follow = match assignee.as_deref() {
+            None => saga::SagaMsg::Accept { saga_id, attempt },
+            Some(ORACLE_ORIGIN) => saga::SagaMsg::OracleResult {
+                saga_id,
+                attempt,
                 outcome: Ok(format!("echo: handling dispatch {}", work.dispatch_id).into_bytes()),
                 usage: None,
-            }),
+            },
+            // an order another node won is not this worker's to answer.
+            Some(_) => return Ok(worker::WorkOutcome::NotMine),
+        };
+        Ok(worker::WorkOutcome::Handled(Some(Msg {
+            target: "saga".into(),
+            payload: saga::encode_msg(&follow),
         })))
     }
 }
@@ -1700,46 +1588,23 @@ async fn sim_peer_block(
     State(handle): State<ControlState>,
     Json(req): Json<PeerBlockRequest>,
 ) -> Response {
-    match req {
-        // the original single-op path: ONE block, one member (unchanged wire).
-        PeerBlockRequest::Single(op) => {
-            let (target, payload, origin) = match encode_peer_op(op) {
-                Ok(parts) => parts,
-                Err((status, msg)) => return (status, msg).into_response(),
-            };
-            match control(handle, |reply| SimCommand::PeerBlock {
-                target,
-                payload,
-                origin,
-                reply,
-            })
-            .await
-            {
-                Ok(Ok(info)) => Json(info).into_response(),
-                Ok(Err(rejection)) => (StatusCode::BAD_REQUEST, rejection).into_response(),
-                Err(resp) => resp,
-            }
+    // N members committed as ONE block via submit_block.
+    let mut encoded = Vec::with_capacity(req.ops.len());
+    for op in req.ops {
+        match encode_peer_op(op) {
+            Ok(parts) => encoded.push(parts),
+            Err((status, msg)) => return (status, msg).into_response(),
         }
-        // the multi-op path: N members committed as ONE block via submit_block.
-        PeerBlockRequest::Batch { ops } => {
-            let mut encoded = Vec::with_capacity(ops.len());
-            for op in ops {
-                match encode_peer_op(op) {
-                    Ok(parts) => encoded.push(parts),
-                    Err((status, msg)) => return (status, msg).into_response(),
-                }
-            }
-            match control(handle, |reply| SimCommand::PeerBatch {
-                ops: encoded,
-                reply,
-            })
-            .await
-            {
-                Ok(Ok(info)) => Json(info).into_response(),
-                Ok(Err(rejection)) => (StatusCode::BAD_REQUEST, rejection).into_response(),
-                Err(resp) => resp,
-            }
-        }
+    }
+    match control(handle, |reply| SimCommand::PeerBlock {
+        ops: encoded,
+        reply,
+    })
+    .await
+    {
+        Ok(Ok(info)) => Json(info).into_response(),
+        Ok(Err(rejection)) => (StatusCode::BAD_REQUEST, rejection).into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -1793,6 +1658,42 @@ async fn strip_receipt_op_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the sim's `/v1/blocks` twin must map every disposition the way the two
+    /// production mappers do — applied and rejected publish a member row, and a
+    /// discarded frame publishes NONE (it never ran). the arm this pins used to
+    /// be a `_ =>` that read `Discarded` as `Rejected`.
+    #[test]
+    fn a_discarded_frame_publishes_no_member_row() {
+        assert_eq!(
+            block_disposition(node::Disposition::Applied),
+            Some(BlockDisposition::Applied)
+        );
+        assert_eq!(
+            block_disposition(node::Disposition::Rejected),
+            Some(BlockDisposition::Rejected)
+        );
+        assert_eq!(block_disposition(node::Disposition::Discarded), None);
+    }
+
+    /// the sim binary and a real node are run side by side all day, so their
+    /// eagerly-bound defaults must not overlap. `workspace-config` owns the
+    /// node's operator block — HTTP 8844, admin RPC 8845, mesh 8846 — and this
+    /// crate deliberately does not link it, so the block is restated here as
+    /// the thing [`DEFAULT_LISTEN`] must stay clear of. A default back inside
+    /// it means the second process to boot dies on its bind, and a client on
+    /// that port reaches whichever daemon won, speaking the wrong protocol.
+    #[test]
+    fn the_default_listen_avoids_the_nodes_operator_ports() {
+        let node_operator_ports = 8844..=8846;
+        let addr: SocketAddr = DEFAULT_LISTEN.parse().expect("DEFAULT_LISTEN parses");
+        let clear_of_the_node = !node_operator_ports.contains(&addr.port());
+        assert!(
+            clear_of_the_node,
+            "the sim default {addr} is inside the node's operator block \
+             {node_operator_ports:?} — it will fight a real node for the bind"
+        );
+    }
 
     /// WHERE the status snapshot is published is load-bearing, and the bug it
     /// replaced was a race — so this pins the SHAPE, which is deterministic,
@@ -1859,7 +1760,7 @@ mod tests {
         assert_eq!(handle.set_auto(false).unwrap_err(), "boom");
         assert_eq!(
             handle
-                .peer_block(serde_json::json!({ "target": "chat", "payload": {} }))
+                .peer_block(serde_json::json!({ "ops": [{ "target": "chat", "payload": {} }] }))
                 .unwrap_err(),
             "boom",
         );

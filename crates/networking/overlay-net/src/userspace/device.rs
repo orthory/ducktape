@@ -2,7 +2,7 @@
 //! `Tunn`s (one per peer, keyed by allowed-ip `/128`) pumped over ONE
 //! process-owned underlay UDP socket.
 //!
-//! this is the sans-io half of the ADR's `UserspaceOverlayNet`: it never sees
+//! this is the sans-io half of `UserspaceOverlayNet`: it never sees
 //! a TCP stream or a virtual socket — it moves raw IP packets between the
 //! underlay (encrypted WireGuard datagrams on the UDP socket) and the
 //! [`stack`](super::stack) (plaintext IP packets over a channel pair), and it
@@ -15,12 +15,12 @@
 //! every pump copies the packets a `Tunn` call produces out of the lock, then
 //! sends. the peer table itself is an `RwLock` written only by
 //! [`WgDevice::replace_peers`] (the effect's `apply`), which swaps the whole
-//! table in one write — the atomic peer-set replace the ADR requires.
+//! table in one write — the peer-set replace must be atomic.
 
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -30,6 +30,7 @@ use defguard_boringtun::noise::{Packet, Tunn, TunnResult};
 use defguard_boringtun::x25519::{PublicKey, StaticSecret};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
 
 /// max size of one WireGuard datagram / decapsulated IP packet we handle;
@@ -53,13 +54,29 @@ pub type Datagram = (Vec<u8>, SocketAddr);
 /// the WG lane's re-installable sender: each spawned device attaches its own.
 type WgLane = Arc<RwLock<Option<mpsc::Sender<Datagram>>>>;
 
+/// count one dropped packet and report it at a bounded cadence — the first
+/// drop and every 1024th after, carrying the running count. a drop is a
+/// per-frame event, so it never gets an unconditional log line, and it is
+/// never silent either: the counter IS the diagnosis.
+pub(super) fn note_drop(counter: &AtomicU64, reason: &'static str) {
+    let dropped = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped == 1 || dropped.is_multiple_of(1024) {
+        tracing::warn!(
+            target: "ducktape::dataplane",
+            reason,
+            dropped,
+            "overlay packet dropped"
+        );
+    }
+}
+
 // ── the underlay socket ─────────────────────────────────
 
-/// the ADR's "one process-owned underlay UDP socket per node": the bound WG
+/// one process-owned underlay UDP socket per node: the bound WG
 /// listen socket plus its single receive pump, demuxing inbound datagrams
 /// between the WireGuard device and a BYPASS lane.
 ///
-/// the bypass lane is why this exists as its own object (ADR phase 3): the
+/// the bypass lane is why this exists as its own object: the
 /// NAT punch must originate from the same 5-tuple the tunnel runs on, so the
 /// nat-traversal client sends through [`send_to`](Self::send_to) and
 /// receives whatever the pump classifies as not-WireGuard. classification is
@@ -205,6 +222,8 @@ fn bind_retrying(port: u16) -> io::Result<std::net::UdpSocket> {
 /// would let one congested lane starve the other.
 async fn demux_pump(udp: Arc<UdpSocket>, wg_lane: WgLane, bypass: mpsc::Sender<Datagram>) {
     let mut buf = Box::new([0u8; MAX_PACKET]);
+    let wg_lane_full = AtomicU64::new(0);
+    let bypass_full = AtomicU64::new(0);
     loop {
         let (len, src) = match udp.recv_from(&mut buf[..]).await {
             Ok(received) => received,
@@ -222,26 +241,27 @@ async fn demux_pump(udp: Arc<UdpSocket>, wg_lane: WgLane, bypass: mpsc::Sender<D
             },
             SocketAddr::V4(_) => src,
         };
+        // a closed lane is its consumer gone (no live device, the NAT client
+        // released) — a downed interface, not a drop to account for.
         if Tunn::parse_incoming_packet(&buf[..len]).is_ok() {
             let lane = wg_lane.read().expect("wg lane lock poisoned").clone();
-            if let Some(lane) = lane {
-                let _ = lane.try_send((buf[..len].to_vec(), src));
+            if let Some(lane) = lane
+                && let Err(TrySendError::Full(_)) = lane.try_send((buf[..len].to_vec(), src))
+            {
+                note_drop(&wg_lane_full, "wg_lane_full");
             }
-        } else {
-            let _ = bypass.try_send((buf[..len].to_vec(), src));
+        } else if let Err(TrySendError::Full(_)) = bypass.try_send((buf[..len].to_vec(), src)) {
+            note_drop(&bypass_full, "bypass_lane_full");
         }
     }
 }
 
 /// one peer relationship, as the effect layer hands it to the device: the
-/// validated, decoded form of a `defguard_wireguard_rs` `Peer`.
+/// validated form of one `PeerTunnelConfig`.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PeerConfig {
     /// the peer's static X25519 public key.
     pub public_key: [u8; 32],
-    /// optional preshared key (unused by this mesh today, carried for wire
-    /// fidelity with the TUN backend).
-    pub preshared_key: Option<[u8; 32]>,
     /// where to send the peer's encrypted datagrams. `None` for a passive
     /// relationship: the endpoint is learned from the peer's first
     /// authenticated inbound datagram (WireGuard roaming), exactly as the
@@ -370,7 +390,7 @@ impl PeerState {
         }
         let endpoint = *self.endpoint.read().expect("endpoint lock poisoned");
         tracing::warn!(
-            target: "ducktape::overlay",
+            target: "ducktape::dataplane",
             peer = %self.overlay_ip(),
             endpoint = ?endpoint,
             reason = "handshake_unanswered",
@@ -386,7 +406,7 @@ impl PeerState {
         }
         let endpoint = *self.endpoint.read().expect("endpoint lock poisoned");
         tracing::info!(
-            target: "ducktape::overlay",
+            target: "ducktape::dataplane",
             peer = %self.overlay_ip(),
             endpoint = ?endpoint,
             "wg session RE-ESTABLISHED"
@@ -492,7 +512,7 @@ impl WgDevice {
                         tunn: Mutex::new(Tunn::new(
                             self.inner.secret.clone(),
                             PublicKey::from(config.public_key),
-                            config.preshared_key,
+                            None,
                             config.persistent_keepalive,
                             index,
                             None,
@@ -544,7 +564,7 @@ impl WgDevice {
     }
 
     /// a cheap, cloneable handle for HANDSHAKE PROBES that must outlive the move
-    /// of this device into the effect (and thence into the orchestrator).
+    /// of this device into the effect (and thence into the executor).
     ///
     /// the device's state already lives behind an `Arc`, so this is a refcount
     /// bump — it exists because applying a tunnel CONFIG and completing a
@@ -652,6 +672,8 @@ async fn inbound_pump(
     to_stack: mpsc::Sender<Vec<u8>>,
 ) {
     let mut buf = Box::new([0u8; MAX_PACKET]);
+    let unroutable = AtomicU64::new(0);
+    let unadmitted = AtomicU64::new(0);
     while let Some((datagram, src)) = wg_lane.recv().await {
         // route the datagram to its peer: a handshake initiation identifies
         // the peer by its (encrypted) static key; everything else carries a
@@ -678,7 +700,10 @@ async fn inbound_pump(
                 Packet::PacketData(data) => table.by_index.get(&(data.receiver_idx >> 8)).cloned(),
             }
         };
-        let Some(peer) = peer else { continue };
+        let Some(peer) = peer else {
+            note_drop(&unroutable, "wg_inbound_unroutable");
+            continue;
+        };
 
         let out = peer.tunn_call(
             TunnOp::Decapsulate {
@@ -711,6 +736,8 @@ async fn inbound_pump(
                 if to_stack.send(pkt).await.is_err() {
                     return; // stack gone — the backend is shutting down.
                 }
+            } else {
+                note_drop(&unadmitted, "wg_inner_source_unadmitted");
             }
         }
     }
@@ -742,8 +769,8 @@ async fn outbound_pump(inner: Arc<DeviceInner>, mut from_stack: mpsc::Receiver<V
 
 /// drive every peer's timer machinery: handshake retransmission, persistent
 /// keepalive, rekey-after-time, session expiry. this loop is what makes the
-/// `Tunn`s live objects rather than passive codecs — the "new moving part"
-/// the ADR calls out.
+/// `Tunn`s live objects rather than passive codecs — the new moving part the
+/// userspace backend adds.
 async fn timer_pump(inner: Arc<DeviceInner>) {
     let mut tick = tokio::time::interval(TIMER_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

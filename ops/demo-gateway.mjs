@@ -1,11 +1,17 @@
 #!/usr/bin/env bun
-// Publish two authenticated gateway routes on the running demo node:
+// Found the demo user's Identity account and publish authenticated gateway
+// routes on the running demo node:
 //   site — network-hosted static bytes in DuckFS
 //   app  — user-hosted loopback HTTP
+//   board — the reference kanban app (network audience, WebSocket)
+// Every gateway op is a USER-signed frame over /v1/submit/frame: the frame's
+// signer is the op origin, which the gateway resolves to the account through
+// identity `OfKey`. The frameless /v1/submit lane stamps the node key, and a
+// node key never resolves to an account.
 
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 
 // Consensus rejects these handles — a seed that asks for one aborts the demo.
 // Mirrors RESERVED_ROOT_LABELS in crates/duckdns/src/wire.rs (the source
@@ -45,17 +51,28 @@ const INDEX_HTML = `<!doctype html>
 async function main() {
   const [url, nodeBin, workdir, chain, requestedHandle = "demo", userKeyArg, password = ""] = Bun.argv.slice(2);
   if (!url || !nodeBin || !workdir || !chain) {
-    throw new Error("usage: demo-gateway.mjs <http-url> <node-bin> <workdir> <chain-id> [handle] [user-key] [password]");
+    throw new Error("usage: demo-gateway.mjs <http-url> <node-bin> <workdir> <chain-id> [handle] <user-key> [password]");
   }
-  // The signing key is the local user identity demo-seed provisioned (encrypted
-  // v1) — its password unlocks each sign-* call over stdin. Fall back to the
-  // legacy in-workdir path for older callers.
-  const userKey = userKeyArg || join(workdir, "user.key");
+  // The signing key is the local user identity demo-seed provisioned
+  // (encrypted) — its password unlocks each sign-* call over stdin.
+  if (!userKeyArg) {
+    throw new Error("usage: demo-gateway.mjs <http-url> <node-bin> <workdir> <chain-id> [handle] <user-key> [password]");
+  }
+  const userKey = userKeyArg;
+  // This boot's operator credential. `/v1/files/commit` is a MUTATING route
+  // and the write gate (crates/noded/src/signed_req.rs) refuses it without
+  // one; `/v1/query` below is a read and does not need it, but one helper
+  // serves both. Read once — the file is minted per boot and demo-seed.sh
+  // has already failed fatally if it is missing.
+  const operator = readFileSync(`${workdir}/admin.token`, "utf8").trim();
 
   async function post(path, body) {
     const response = await fetch(`${url}${path}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        "x-ducktape-admin-token": operator,
+      },
       body: JSON.stringify(body),
     });
     const text = await response.text();
@@ -63,46 +80,63 @@ async function main() {
     return JSON.parse(text);
   }
 
-  const submit = (target, payload) => post("/v1/submit", { target, payload });
   const query = (target, query) => post("/v1/query", { target, query });
-  function sign(args) {
-    // every `user sign-*` verb unlocks the encrypted key by reading its
-    // password as the first (only) stdin line — see load_user_signer.
-    const result = spawnSync(nodeBin, args, { encoding: "utf8", input: `${password}\n` });
+  // A user-signed frame, raw bytes to /v1/submit/frame — the frame's verified
+  // signer becomes the op's origin (see node_http::submit_frame).
+  async function submitFrame(frameHex) {
+    const response = await fetch(`${url}/v1/submit/frame`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: Buffer.from(frameHex, "hex"),
+    });
+    const text = await response.text();
+    if (!response.ok) throw new Error(`[gateway] POST /v1/submit/frame failed [${response.status}]: ${text.slice(0, 400)}`);
+    return JSON.parse(text);
+  }
+  // Every signing verb unlocks the encrypted key by reading its password as
+  // the first stdin line (see load_user_signer); `lines` follow it. Returns
+  // stdout's non-empty lines.
+  function run(args, lines = []) {
+    const input = [password, ...lines].map((line) => `${line}\n`).join("");
+    const result = spawnSync(nodeBin, args, { encoding: "utf8", input });
     if (result.status !== 0) {
       const detail = (result.stderr || result.stdout || result.error?.message || "unknown error").trim();
-      throw new Error(`[gateway] ${args[0]} failed: ${detail}`);
+      throw new Error(`[gateway] ${args.slice(0, 2).join(" ")} failed: ${detail}`);
     }
-    return result.stdout.trim().split(/\r?\n/).at(-1);
+    return result.stdout.trim().split(/\r?\n/).filter(Boolean);
+  }
+  const sign = (args) => run(args).at(-1);
+  // Wrap already-encoded module payloads in frames the user key signs — ONE
+  // process for the whole batch, because the unlock is one argon2id pass and
+  // the requests are per op. Returns the frame hex lines in request order.
+  function signFrames(requests) {
+    const base = BigInt(Date.now()) * 1000n;
+    const lines = requests.map(({ target, payload }, i) =>
+      `${target} ${base + BigInt(i)} ${Buffer.from(JSON.stringify(payload)).toString("hex")}`);
+    const frames = run(["user", "sign-frame", "--key", userKey], lines);
+    if (frames.length !== lines.length) throw new Error(`[gateway] sign-frame returned ${frames.length} frames for ${lines.length} requests`);
+    return frames;
   }
 
   const nodeBytes = (await query("valset", "validators")).validators[0];
   const nodeHex = Buffer.from(nodeBytes).toString("hex");
 
-  const bind = JSON.parse(sign([
-    "user",
-    "sign-bind",
-    "--key", userKey,
-    "--chain-id", chain,
-    "--node-pub", nodeHex,
-    "--nonce", "0",
-  ]));
-  const accountId = bind.bind_node.authorizer.key;
-  try {
-    await submit("identity", bind);
-  } catch (error) {
-    // Same wire-drift family as the gateway component: a module rejecting a
-    // map where its (stale or changed) type wants a sequence. Route
-    // publishing is a demo garnish — skip it loudly, never die over it.
-    if (!error.message.includes("invalid type: map, expected a sequence")) throw error;
-    console.error("[gateway] SKIPPED all routes: identity bind rejected with a map-vs-sequence wire drift — see the gateway-component regen note below");
-    process.exitCode = 78;
-    return;
-  }
+  // Found the demo user's account from its own key (a user-signed Create),
+  // then resolve the key to its account NUMBER — the id every route carries.
+  run(["account", "create", "--name", requestedHandle, "--key", userKey, "--node", url]);
+  const userPubHex = sign(["user", "key", "status", "--key", userKey]).split(" ").at(-1);
+  const resolved = await query("identity", { of_key: { key: [...Buffer.from(userPubHex, "hex")] } });
+  const account = resolved.account;
+  if (!account) throw new Error("[gateway] the demo key founded no account");
+  const accountId = account.number;
+  console.log(`[gateway] account ${accountId} (${account.name}) founded by the demo key`);
 
+  // Gateway ops, in order: the optional .duck handle, then the routes. All
+  // are signed into frames by the same user key below.
+  const ops = [];
   let handle = requestedHandle;
   if (/^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(handle) && !RESERVED_ROOT_LABELS.includes(handle)) {
-    await submit("gateway", { set_handle: { handle } });
+    ops.push({ target: "gateway", payload: { set_handle: { handle } } });
   } else {
     handle = null;
     console.log("[gateway] skipped .duck handle (workspace id is not a legal DNS label)");
@@ -136,18 +170,20 @@ async function main() {
     changes: [put("index.html", data), put(".manifest.json", manifestBytes)],
   });
 
-  async function publish(statement) {
+  // The route statement is signed by a member key of its account (the
+  // canonical preimage under GATEWAY_ROUTE_NS); the resulting SetRoute rides
+  // a frame the same key signs.
+  function publish(statement) {
     const message = JSON.parse(sign([
       "user",
       "sign-gateway-route",
       "--key", userKey,
       "--statement", JSON.stringify(statement),
     ]));
-    await submit("gateway", message);
+    ops.push({ target: "gateway", payload: message });
   }
 
   const site = {
-    version: 1,
     chain_id: chain,
     account_id: accountId,
     name: { label: "site" },
@@ -165,21 +201,11 @@ async function main() {
       },
     },
   };
-  try {
-    await publish(site);
-  } catch (error) {
-    // The thrown message carries the raw HTTP body (JSON-wrapped, quotes
-    // escaped), so match only the module's rejection text.
-    if (!error.message.includes("invalid type: map, expected a sequence")) throw error;
-    // NO-BACKCOMPAT: the embedded gateway component must be regenerated for
-    // Identity's Vec<NodeView>; never retry with its stale Vec<Vec<u8>> wire.
-    console.error("[gateway] SKIPPED all routes: embedded gateway component expects Identity AccountView.nodes as byte arrays, but Identity now returns NodeView objects; regenerate crates/modules/system/gateway/component.wasm (cargo run -p guest-builder -- crates/modules/system/gateway)");
-    process.exitCode = 78;
-    return;
-  }
+  // A stale embedded gateway component is a build error, not a condition to
+  // survive: a publish rejection fails the demo loudly.
+  publish(site);
 
-  await publish({
-    version: 1,
+  publish({
     chain_id: chain,
     account_id: accountId,
     name: { label: "app" },
@@ -200,8 +226,7 @@ async function main() {
 
   // The reference app (spec §8): board.<handle>.duck — served by
   // ops/demo-kanban.mjs, reachable by any admitted member, WebSocket-realtime.
-  await publish({
-    version: 1,
+  publish({
     chain_id: chain,
     account_id: accountId,
     name: { label: "board" },
@@ -220,12 +245,16 @@ async function main() {
     },
   });
 
+  for (const frame of signFrames(ops)) {
+    await submitFrame(frame);
+  }
+
   const routes = await query("gateway", { list: { account_id: accountId } });
   const count = routes.routes?.length ?? 0;
   if (handle) {
     console.log(`[gateway] published ${count} routes on ${handle}.duck: site.${handle}.duck (static), app.${handle}.duck (loopback), board.${handle}.duck (kanban, WS)`);
   } else {
-    console.log(`[gateway] published ${count} routes on account ${Buffer.from(accountId).toString("hex").slice(0, 12)}… (no .duck handle — reach them via the Gateway view)`);
+    console.log(`[gateway] published ${count} routes on account ${accountId} (no .duck handle — reach them via the Gateway view)`);
   }
 }
 

@@ -5,12 +5,17 @@ use crate::host_reads::{read_sync_mesh_window, read_valset_members, read_valset_
 use crate::sync::serve::{SyncBoundary, SyncIndexOps, SyncStateRequest};
 use crate::util::{participant_bytes, resident_bytes};
 
-/// one page of a module's stored op rows at or below `up_to_height`, in key
-/// order, for the joiner backfill lane. the store's own `scan` already pages
-/// in key order off one MVCC snapshot; all this adds is the height ceiling —
-/// op keys are fixed-width hex, so lexicographic order IS `(height, seq)`
-/// order and the ceiling is a prefix of the page.
-fn read_index_ops(
+/// up to [`crate::sync::serve::INDEX_OPS_LOOP_PAGES`] wire pages of a module's
+/// stored op rows at or below `up_to_height`, in key order, for the joiner
+/// backfill lane. the store's own `scan` already pages in key order off one
+/// MVCC snapshot; all this adds is the height ceiling — op keys are
+/// fixed-width hex, so lexicographic order IS `(height, seq)` order and the
+/// ceiling is a prefix of the page.
+///
+/// READING A BUDGET, not a page: this read crosses to the consensus loop, and
+/// the serve task hands the surplus out itself, so a joiner's walk costs one
+/// touch per budget instead of one per wire page.
+pub(crate) fn read_index_ops(
     index: &indexer::IndexStore,
     module: &str,
     after: Option<(u64, u32)>,
@@ -22,9 +27,9 @@ fn read_index_ops(
             module,
             indexer::OP_PREFIX.as_bytes(),
             cursor.as_deref().map(str::as_bytes),
-            // the wire's page cap, so the store's own `has_more` already
-            // answers for the whole page and nothing is dropped downstream.
-            statesync::INDEX_OPS_BATCH_LEN,
+            // a whole budget of wire pages, so the store's own `has_more`
+            // answers for all of them and nothing is dropped downstream.
+            crate::sync::serve::INDEX_OPS_LOOP_ROWS,
         )
         .map_err(|e| format!("index op page for {module}: {e}"))?;
     let above_ceiling =
@@ -186,8 +191,7 @@ impl ValidatorRuntime<'_> {
                         // committed valset reads, like the Standing arm — the
                         // window must reflect a just-committed grant NOW, not
                         // at the epoch cutover.
-                        let (generation, mesh_window) =
-                            read_sync_mesh_window(node.host()).await;
+                        let (generation, mesh_window) = read_sync_mesh_window(node.host()).await;
                         Ok(statesync::TipCoords {
                             height: f.height,
                             root_hash: f.root_hash,
@@ -201,13 +205,20 @@ impl ValidatorRuntime<'_> {
                                 .is_some_and(|fc| fc.height == f.height),
                             generation,
                             mesh_window,
+                            // the detection lane's only DIAGNOSTIC: this
+                            // node's build stamp, so a poller can name a
+                            // skew instead of watching roots drift in
+                            // silence. `None` for a build that cannot
+                            // identify itself — a silence, not a claim —
+                            // and nothing on either side gates on it.
+                            build: noded::services::build_identity().map(str::to_string),
                         })
                     }
                 };
                 let _ = reply.send(answer);
             }
             SyncStateRequest::Standing { requester, reply } => {
-                // the fail-closed standing gate (ADR §5.1). read the COMMITTED
+                // the fail-closed standing gate. read the COMMITTED
                 // valset projection (updates at the Redeem block, unlike the
                 // orchestrator's transport set which lags to the cutover), so a
                 // freshly-admitted resident is servable the instant its grant

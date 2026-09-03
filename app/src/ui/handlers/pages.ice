@@ -432,7 +432,7 @@ on pages_updated(next)
   // buffer on the SAME page is the user mid-typing through a reload, and a
   // reload must never eat keystrokes.
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
+  let page_install = install_decision(editor_text(page_editor), buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -478,7 +478,7 @@ on pages_mutated(next)
   // BEFORE the assignments so both reads see the pre-move state (the pair
   // must move on one shared decision).
   let page_landing = page_document_text(next.active_page_title, next.blocks)
-  let page_install = install_decision(page_editor, buffer_page, next.active_page, page_saved_text, page_landing)
+  let page_install = install_decision(editor_text(page_editor), buffer_page, next.active_page, page_saved_text, page_landing)
   blocks = merge_pending_blocks(next.blocks, blocks, buffer_page, next.active_page, "")
   active_page = next.active_page
   active_page_title = next.active_page_title
@@ -579,13 +579,16 @@ on page_edited(event)
   block_comments_open = block_comments_open || page_rail_open
   block_comments_target = keep_str(page_rail_open, active_page, block_comments_target)
   block_comment_threads_loading = block_comment_threads_loading || page_rail_open
-  // A link press never touched the buffer — it is a hand-off to the OS. The
-  // two runs are exclusive by event kind; each backend treats an empty
-  // argument as "not my turn" and answers without side effects.
+  // A link press goes through the ONE open plane (`open_message_link`), not
+  // straight to the OS: a page cites `duck://` addresses as readily as a chat
+  // message does, and only that plane knows the module table and the
+  // network scope. It never touched the buffer either way. The two runs are
+  // exclusive by event kind; each backend treats an empty argument as "not my
+  // turn" and answers without side effects.
   let page_link = page_link_of(event)
   return if empty(page_link) && !page_rail_open
   parallel
-    run every open_external_url(page_link) -> external_url_opened _ | external_url_failed _
+    run every duck_echo_str(page_link) -> open_message_link _ | external_url_failed _
     run replace lane=block_threads load_page_threads(connected_rpc, keep_str(page_rail_open, active_page, ""), block_comments_generation) -> block_threads_loaded _ | block_threads_failed _
 
 on external_url_opened(_opened)
@@ -613,7 +616,7 @@ on page_autosave_tick
   // tick, and a second chain against the same page defeats the ordering
   // rule the awaited loop exists for (backend/document.rs).
   return if block_autosave_status == AutosaveStatus.saving
-  let text = page_text(page_editor)
+  let text = editor_text(page_editor)
   return if text == page_saved_text
   // An open ``` swallows every line under it when parsed — the save waits
   // for the close instead of writing (or refusing) a half-typed fence, and
@@ -649,7 +652,7 @@ on page_document_saved(next)
   // since the tick submitted. Otherwise the buffer is kept (the newest words
   // must survive), the baseline moves to the node's text, and the still-dirty
   // buffer re-plans on the next tick with the refusal line explaining why.
-  let untouched = page_text(page_editor) == page_inflight_text
+  let untouched = editor_text(page_editor) == page_inflight_text
   page_editor = rolled_back_editor(page_editor, untouched, next.document)
   // THE SUBMITTED TEXT, never the live buffer: she keeps typing through the
   // round trip, and `untouched` above exists because of it. Adopting her

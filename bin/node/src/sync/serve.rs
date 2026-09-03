@@ -393,7 +393,7 @@ pub(crate) enum SyncStateRequest {
     TipCoords {
         reply: tokio::sync::oneshot::Sender<Result<statesync::TipCoords, String>>,
     },
-    /// the fail-closed standing check (ADR §5.1): is `requester` in committed
+    /// the fail-closed standing check: is `requester` in committed
     /// standing (validators ∪ residents)? answered from the loop's own
     /// committed host reads, FRESH per request — a just-committed Redeem grant
     /// is seen immediately (a cached snapshot would starve a fresh resident
@@ -424,9 +424,46 @@ pub(crate) struct SyncIndexOps {
     pub(crate) applied_height: u64,
 }
 
-const MAX_SYNC_RESPONSE_BODY_LEN: usize =
-    MAX_MESSAGE_SIZE as usize - statesync::RPC_AUTHED_HEADER_LEN;
+const MAX_SYNC_RESPONSE_BODY_LEN: usize = MAX_MESSAGE_SIZE as usize - statesync::RPC_HEADER_LEN;
 const _: () = assert!(MAX_SYNC_RESPONSE_BODY_LEN >= 9);
+
+/// the `Error` reply body a requester sees when its answer could not ride the
+/// mesh: a stable token, greppable on both sides.
+pub(crate) const SYNC_REPLY_OVER_CAP: &str = "sync_reply_over_cap";
+
+/// Encode `resp` for the mesh — or, when its body would exceed the message cap
+/// commonware's sender ASSERTS on, the `Error` reply that says so. The ONE
+/// guard between every response and the send: the frame and index-op pages
+/// bound themselves above, but a module's own `serve_sync` bytes
+/// (`SyncResponse::Module`) arrive unmeasured, and an honest batch of adjacent
+/// ~1 MiB records used to walk straight into the assert and abort the serving
+/// validator. Latched: one refusal per hundred is the diagnosis, not a log
+/// bomb per request.
+pub(crate) fn encode_bounded_response(
+    resp: statesync::SyncResponse,
+) -> (statesync::SyncResponse, Vec<u8>) {
+    static OVER_CAP: noded::log::Latch = noded::log::Latch::new(100);
+    let body = statesync::encode_response(&resp);
+    let fits_transport = body.len() <= MAX_SYNC_RESPONSE_BODY_LEN;
+    if fits_transport {
+        return (resp, body);
+    }
+    if let Some(attempts) = OVER_CAP.hit(SYNC_REPLY_OVER_CAP) {
+        tracing::warn!(
+            target: "ducktape::statesync",
+            kind = resp.kind_name(),
+            body_len = body.len(),
+            cap = MAX_SYNC_RESPONSE_BODY_LEN,
+            reason = SYNC_REPLY_OVER_CAP,
+            attempts,
+            "statesync reply REFUSED — the response body exceeds the mesh message cap the \
+             sender asserts on; the requester gets an error instead of this node aborting"
+        );
+    }
+    let refusal = statesync::SyncResponse::Error(SYNC_REPLY_OVER_CAP.into());
+    let body = statesync::encode_response(&refusal);
+    (refusal, body)
+}
 
 /// Return the largest non-empty prefix that fits the mesh's configured message
 /// cap. An available frame that cannot fit alone is an explicit error: an empty
@@ -460,23 +497,103 @@ fn bounded_frames_response(mut frames: Vec<statesync::FinalizedFrame>) -> states
     statesync::SyncResponse::Frames { frames }
 }
 
+/// how many wire pages ONE consensus-loop touch reads for the joiner backfill
+/// lane. every page a joiner walks otherwise costs a full round trip through
+/// the loop — the one task that owns the derived index — so a long history
+/// paces itself against consensus work, a page per turn.
+///
+/// CEILING: two, because [`indexer::MAX_SCAN_LIMIT`] bounds one snapshot scan
+/// at 1024 rows and a wire page is 512 of them. A deeper budget needs a read
+/// LOOP on the state owner (several snapshots per touch) and parks
+/// proportionally more of a walking joiner's history in the serve task's
+/// read-ahead — raise it there, deliberately, if the round trips ever measure.
+pub(crate) const INDEX_OPS_LOOP_PAGES: usize =
+    indexer::MAX_SCAN_LIMIT / statesync::INDEX_OPS_BATCH_LEN;
+const _: () = assert!(INDEX_OPS_LOOP_PAGES >= 1);
+
+/// how many op rows one consensus-loop touch reads: the budget above, in rows.
+pub(crate) const INDEX_OPS_LOOP_ROWS: usize = INDEX_OPS_LOOP_PAGES * statesync::INDEX_OPS_BATCH_LEN;
+
+/// the serve task's READ-AHEAD for the joiner backfill lane: the rows one
+/// consensus-loop touch read past the wire page it answered, held for the next
+/// request of the same walk.
+///
+/// ONE SLOT, not a map: a walk is strictly sequential — a page, then the next
+/// from the cursor that page handed out — so the slot belongs to whichever
+/// joiner is walking now. A second concurrent walk misses it and touches the
+/// loop, exactly as every page did before, and a request that does not match
+/// what the slot holds drops it: a walk that stops carries nothing.
+#[derive(Default)]
+pub(crate) struct IndexOpsPager {
+    held: Option<ReadAhead>,
+}
+
+/// rows already read, and the exact ask they answer.
+struct ReadAhead {
+    module: String,
+    up_to_height: u64,
+    /// the cursor the next request must carry for these rows to be its answer.
+    after: (u64, u32),
+    page: SyncIndexOps,
+}
+
+impl IndexOpsPager {
+    /// the rows this ask is owed, when the last loop touch already read them.
+    fn take(
+        &mut self,
+        module: &str,
+        up_to_height: u64,
+        after: Option<(u64, u32)>,
+    ) -> Option<SyncIndexOps> {
+        let held = self.held.take()?;
+        let same_walk =
+            held.module == module && held.up_to_height == up_to_height && after == Some(held.after);
+        same_walk.then_some(held.page)
+    }
+
+    /// hold what the wire page could not carry, keyed by the cursor that page
+    /// just handed the joiner. a page whose cursor is absent ends the walk, so
+    /// there is nobody to hand the rest to.
+    fn keep(
+        &mut self,
+        module: &str,
+        up_to_height: u64,
+        after: Option<(u64, u32)>,
+        page: SyncIndexOps,
+    ) {
+        self.held = after.map(|after| ReadAhead {
+            module: module.to_string(),
+            up_to_height,
+            after,
+            page,
+        });
+    }
+}
+
 /// Same binary search as [`bounded_frames_response`], over index op rows: keep
 /// the largest non-empty prefix that fits the mesh's message cap, and set the
 /// cursor whenever anything was left behind. A single row that cannot fit alone
 /// is an explicit error — an empty successful page with `next_after` set would
 /// make the joiner's walk spin without advancing.
-fn bounded_index_ops_response(page: SyncIndexOps) -> statesync::SyncResponse {
+///
+/// The rows past that prefix are the loop touch's READ-AHEAD ([`IndexOpsPager`]),
+/// returned rather than dropped: the next request of the same walk answers from
+/// them without crossing to the consensus loop again.
+pub(crate) fn split_index_ops_response(
+    page: SyncIndexOps,
+) -> (statesync::SyncResponse, Option<SyncIndexOps>) {
     let SyncIndexOps {
         mut rows,
-        mut has_more,
+        has_more,
         source_floor,
         applied_height,
     } = page;
-    // the wire caps a page; dropping past it still OWES those rows.
-    if rows.len() > statesync::INDEX_OPS_BATCH_LEN {
-        rows.truncate(statesync::INDEX_OPS_BATCH_LEN);
-        has_more = true;
-    }
+    // the wire caps a page; everything past it is read-ahead, never dropped.
+    let mut rest = if rows.len() > statesync::INDEX_OPS_BATCH_LEN {
+        rows.split_off(statesync::INDEX_OPS_BATCH_LEN)
+    } else {
+        Vec::new()
+    };
 
     let mut fitting = 0usize;
     let mut excluded = rows.len() + 1;
@@ -492,27 +609,39 @@ fn bounded_index_ops_response(page: SyncIndexOps) -> statesync::SyncResponse {
     }
 
     if fitting == 0 && !rows.is_empty() {
-        return statesync::SyncResponse::Error(format!(
-            "index op row {} exceeds the {MAX_MESSAGE_SIZE}-byte statesync mesh message limit",
-            rows[0].0
-        ));
+        return (
+            statesync::SyncResponse::Error(format!(
+                "index op row {} exceeds the {MAX_MESSAGE_SIZE}-byte statesync mesh message limit",
+                rows[0].0
+            )),
+            None,
+        );
     }
-    if fitting < rows.len() {
-        has_more = true;
-        rows.truncate(fitting);
-    }
-    let next_after = has_more
+    // what the byte cap trimmed belongs in FRONT of what the page cap did:
+    // read-ahead stays in key order, which is the order the walk resumes in.
+    rest.splice(0..0, rows.drain(fitting..));
+    let carried = !rest.is_empty();
+    let next_after = (has_more || carried)
         .then(|| {
             rows.last()
                 .and_then(|(key, _)| indexer::parse_op_key(key.as_bytes()))
         })
         .flatten();
-    statesync::SyncResponse::IndexOps {
-        rows,
-        next_after,
+    let read_ahead = carried.then_some(SyncIndexOps {
+        rows: rest,
+        has_more,
         source_floor,
         applied_height,
-    }
+    });
+    (
+        statesync::SyncResponse::IndexOps {
+            rows,
+            next_after,
+            source_floor,
+            applied_height,
+        },
+        read_ahead,
+    )
 }
 
 /// drive one decoded statesync request against the serve-task-owned
@@ -521,6 +650,7 @@ fn bounded_index_ops_response(page: SyncIndexOps) -> statesync::SyncResponse {
 /// against the next source.
 pub(crate) async fn drive_sync_request(
     server: &mut SyncServer,
+    pager: &mut IndexOpsPager,
     state_tx: &futures::channel::mpsc::Sender<SyncStateRequest>,
     req: statesync::SyncRequest,
 ) -> statesync::SyncResponse {
@@ -627,18 +757,37 @@ pub(crate) async fn drive_sync_request(
             module,
             after,
         } => {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            ask(SyncStateRequest::IndexOps {
-                module,
-                after,
-                up_to_height: boundary,
-                reply: tx,
-            })
-            .await;
-            match rx.await {
-                Ok(Ok(page)) => bounded_index_ops_response(page),
-                Ok(Err(e)) => statesync::SyncResponse::Error(e),
-                Err(_) => statesync::SyncResponse::Error(CLOSED.into()),
+            // the loop reads a BUDGET of pages at a time; this ask is either
+            // the one that reads, or the one that spends what the last read.
+            let read = match pager.take(&module, boundary, after) {
+                Some(held) => Ok(held),
+                None => {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    ask(SyncStateRequest::IndexOps {
+                        module: module.clone(),
+                        after,
+                        up_to_height: boundary,
+                        reply: tx,
+                    })
+                    .await;
+                    match rx.await {
+                        Ok(read) => read.map_err(statesync::SyncResponse::Error),
+                        Err(_) => Err(statesync::SyncResponse::Error(CLOSED.into())),
+                    }
+                }
+            };
+            match read {
+                Ok(page) => {
+                    let (response, read_ahead) = split_index_ops_response(page);
+                    if let Some(rest) = read_ahead {
+                        let statesync::SyncResponse::IndexOps { next_after, .. } = &response else {
+                            unreachable!("a split page answers on the index-op lane");
+                        };
+                        pager.keep(&module, boundary, *next_after, rest);
+                    }
+                    response
+                }
+                Err(refusal) => refusal,
             }
         }
         statesync::ServeStep::NeedCoords => {
@@ -669,7 +818,137 @@ mod tests {
 
     fn encoded_mesh_len(resp: &statesync::SyncResponse) -> usize {
         let body = statesync::encode_response(resp);
-        statesync::encode_rpc_authed(&[0; 32], &[0; 64], 7, &body).len()
+        statesync::encode_rpc(&[0; 32], &[0; 64], 7, &body).len()
+    }
+
+    /// The Module lane is the one reply nothing else measures: a module's
+    /// `serve_sync` bytes go straight to the sender, which ASSERTS on the mesh
+    /// cap. An over-cap body must leave here as an `Error` the requester can
+    /// read, framed under the cap; a fitting one passes through untouched.
+    #[test]
+    fn an_over_cap_module_reply_becomes_an_error_not_a_send() {
+        let over = statesync::SyncResponse::Module(vec![0xEE; MAX_SYNC_RESPONSE_BODY_LEN]);
+        let (resp, body) = encode_bounded_response(over);
+        assert!(
+            matches!(resp, statesync::SyncResponse::Error(ref why) if why == SYNC_REPLY_OVER_CAP),
+            "an over-cap module reply is refused with the reason token"
+        );
+        assert!(
+            statesync::encode_rpc(&[0; 32], &[0; 64], 7, &body).len() <= MAX_MESSAGE_SIZE as usize,
+            "the refusal itself rides under the cap"
+        );
+        assert_eq!(body, statesync::encode_response(&resp));
+
+        let fitting = statesync::SyncResponse::Module(vec![0xEE; 64]);
+        let (resp, body) = encode_bounded_response(fitting);
+        assert!(matches!(resp, statesync::SyncResponse::Module(ref bytes) if bytes.len() == 64));
+        assert_eq!(body, statesync::encode_response(&resp));
+    }
+
+    /// N WIRE PAGES MUST NOT COST N CONSENSUS-LOOP ROUND TRIPS. The joiner
+    /// backfill lane reads through the loop — the one task that owns the
+    /// derived index — so a joiner walking a long history paced itself
+    /// against consensus work at one page per round trip. One touch now reads
+    /// a whole page BUDGET and the serve task hands the rest out itself, so a
+    /// walk of N pages costs ceil(N / budget) touches and serves the same rows
+    /// in the same order.
+    #[tokio::test]
+    async fn a_backfill_walk_touches_the_loop_once_per_page_budget() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const PAGES: usize = 3;
+        let dir = tempfile::tempdir().expect("index dir");
+        let index = std::sync::Arc::new(
+            indexer::IndexStore::open(dir.path(), &[indexer::IndexModule::bare("chat")])
+                .expect("open index"),
+        );
+        let seeded = (PAGES * statesync::INDEX_OPS_BATCH_LEN) as u64;
+        let rows: Vec<(String, Vec<u8>)> = (1..=seeded)
+            .map(|height| (indexer::op_key(height, 0), vec![height as u8; 8]))
+            .collect();
+        index
+            .write_backfill_rows("chat", &rows)
+            .expect("seed the feed");
+
+        // the consensus loop's side of the seam: answers the state touch off
+        // the store it owns, and counts every one it is asked for.
+        let (state_tx, mut state_rx) = futures::channel::mpsc::channel::<SyncStateRequest>(8);
+        let touches = std::sync::Arc::new(AtomicUsize::new(0));
+        let loop_side = {
+            let index = index.clone();
+            let touches = touches.clone();
+            tokio::spawn(async move {
+                while let Some(req) = state_rx.next().await {
+                    let SyncStateRequest::IndexOps {
+                        module,
+                        after,
+                        up_to_height,
+                        reply,
+                    } = req
+                    else {
+                        unreachable!("only the index-op lane is asked here");
+                    };
+                    touches.fetch_add(1, Ordering::Relaxed);
+                    let _ = reply.send(crate::validator::run::sync::read_index_ops(
+                        &index,
+                        &module,
+                        after,
+                        up_to_height,
+                    ));
+                }
+            })
+        };
+
+        let mut server = SyncServer::new();
+        let mut pager = IndexOpsPager::default();
+        let mut after = None;
+        let mut pages = 0usize;
+        let mut served: Vec<(u64, u32)> = Vec::new();
+        loop {
+            let resp = drive_sync_request(
+                &mut server,
+                &mut pager,
+                &state_tx,
+                statesync::SyncRequest::IndexOps {
+                    boundary: u64::MAX,
+                    module: "chat".into(),
+                    after,
+                },
+            )
+            .await;
+            let statesync::SyncResponse::IndexOps {
+                rows, next_after, ..
+            } = resp
+            else {
+                panic!("the index-op lane answers its own response");
+            };
+            pages += 1;
+            served.extend(
+                rows.iter()
+                    .filter_map(|(key, _)| indexer::parse_op_key(key.as_bytes())),
+            );
+            match next_after {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        drop(state_tx);
+        loop_side
+            .await
+            .expect("the loop side ends with its channel");
+
+        assert_eq!(pages, PAGES, "the walk pages at the wire cap");
+        assert_eq!(
+            served,
+            (1..=seeded).map(|height| (height, 0)).collect::<Vec<_>>(),
+            "every row crosses exactly once, in key order"
+        );
+        assert_eq!(
+            touches.load(Ordering::Relaxed),
+            PAGES.div_ceil(INDEX_OPS_LOOP_PAGES),
+            "one loop touch per page budget, not one per wire page"
+        );
     }
 
     #[test]
@@ -713,8 +992,8 @@ mod tests {
 
     #[test]
     fn frames_response_accepts_exact_limit_and_rejects_one_byte_over() {
-        let fixed_len = statesync::RPC_AUTHED_HEADER_LEN
-            + statesync::encoded_frames_response_len(&[frame(1, 0)]);
+        let fixed_len =
+            statesync::RPC_HEADER_LEN + statesync::encoded_frames_response_len(&[frame(1, 0)]);
         let exact_payload_len = MAX_MESSAGE_SIZE as usize - fixed_len;
 
         let exact = bounded_frames_response(vec![frame(1, exact_payload_len)]);

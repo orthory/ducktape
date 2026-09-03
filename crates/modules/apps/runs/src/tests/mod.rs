@@ -1,5 +1,5 @@
 use super::*;
-use crate::facets::{WireSink, decode_run_result_v1};
+use crate::facets::{WireSink, decode_run_result};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
 };
@@ -447,7 +447,23 @@ impl Ctx for CaptureCtx {
                     }),
                 ))),
             },
-            "tasks" => Ok(tasks_encode_reply(&TaskReply::Tasks(self.tasks.clone()))),
+            // the board answers the SAME two reads the real module does: the
+            // by-id `Get` the validator probes with, and a bounded `List` page.
+            "tasks" => match tasks::decode_task_query(req).map_err(Error::Module)? {
+                TaskQuery::Get { task_id } => Ok(tasks_encode_reply(&TaskReply::Task(
+                    self.tasks.iter().find(|t| t.id == task_id).cloned(),
+                ))),
+                TaskQuery::List { limit, after } => {
+                    let page = self
+                        .tasks
+                        .iter()
+                        .filter(|t| after.as_deref().is_none_or(|cursor| t.id.as_str() > cursor))
+                        .take(limit.clamp(1, tasks::MAX_LIST_LIMIT) as usize)
+                        .cloned()
+                        .collect();
+                    Ok(tasks_encode_reply(&TaskReply::Tasks(page)))
+                }
+            },
             "jobs" => match tasks::decode_job_query(req).map_err(Error::Module)? {
                 JobsQuery::Get { job_id } => Ok(jobs_encode_reply(&JobsReply::Job(
                     self.jobs.get(&job_id).cloned(),

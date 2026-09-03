@@ -6,16 +6,21 @@ view
   // between open and register.
   col w=fill h=fill
     if (console_win != some(window)) && (huddle_win != some(window))
-      HubColumn
+      HubColumn name_draft<->welcome_name_draft
         with
           step=hub_step
-          key_state=hub_key_state
+          network=network_name
+          phase=ceremony_phase
+          qr=ceremony_qr
+          detail=ceremony_detail
+          left=ceremony_left
+          wallets=hub_wallets
+          wallet_selected=hub_wallet_selected
           networks=hub_networks
           selected=hub_selected
           hidden=hub_hidden
           name=onboarding_name
           invite=invite_link
-          reveal=reveal_words
           steps=provision_steps
           step_index=provision_index
           height=block_height
@@ -25,18 +30,27 @@ view
           restore_empty=empty(restore_words)
           join_empty=empty(join_invite)
         events
+          pick_wallet -> pick_wallet _
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
-          create_submit -> create_submit _
-          reveal_confirm -> reveal_confirm
+          password_submit -> password_submit _
+          phrase_written_down -> phrase_written_down
+          show_phrase_again -> show_phrase_again
+          confirm_phrase_submit -> confirm_phrase_submit _
+          welcome_create_submit -> welcome_create_submit _
+          welcome_login_submit -> welcome_login_submit
+          welcome_desktop -> welcome_desktop
+          welcome_cancel -> welcome_cancel
+          welcome_skip -> welcome_skip
           go_restore -> go_restore
           go_login -> go_login
-          restore_submit -> restore_submit _
+          restore_submit -> restore_submit _ _
           pick_network -> pick_network _
           open_network_submit -> open_network_submit
           forget_network_submit -> forget_network_submit _ _
           go_join -> go_join
           go_networks -> go_networks
+          go_wallets -> go_wallets
           join_network_submit -> join_network_submit
           copy_onboarding_invite -> copy_onboarding_invite
           connect_remote_submit -> connect_remote_submit _
@@ -83,6 +97,8 @@ view
           status=call_status
           muted=call_muted
           camera=call_camera
+          sharing=call_sharing
+          stage=huddle_stage
           video_live=call_video_live
         events
           dock_huddle -> dock_huddle
@@ -90,6 +106,7 @@ view
           leave_huddle_here -> leave_huddle_here
           toggle_call_mute -> toggle_call_mute
           toggle_call_camera -> toggle_call_camera
+          toggle_call_screen -> toggle_call_screen
     if console_win == some(window)
       WorkspaceTabs wall_now=wall_now #workspace-tabs
         with
@@ -118,6 +135,15 @@ view
           switch_network -> switch_network
         notice:
           col w=fill
+            AccountBanner #account-banner
+              with
+                connected
+                account_exists
+                dismissed=account_banner_dismissed
+                password
+              events
+                open_account_welcome -> open_account_welcome
+                dismiss_account_banner -> dismiss_account_banner
             if has_error
               box
                 with
@@ -169,9 +195,11 @@ view
             with
               endpoint=connected_rpc
               network_name
+              network_chain_id
               status
               block_height
               search_phase=chat_search_phase
+              search_query=chat_search_query
               search_hits=chat_search_hits
               rooms
               dm_rows
@@ -195,7 +223,6 @@ view
               call_muted
               huddle_popped
               messages
-              messages_revision
               has_older_history
               history_view
               history_loading
@@ -208,7 +235,6 @@ view
               active_thread_seq
               thread_target_seq
               thread_messages
-              thread_messages_revision
               thread_selected_seq
               thread_selected_rev
               thread_message_action
@@ -231,6 +257,8 @@ view
               load_more_history -> load_more_history
               chat_scrolled -> chat_scrolled _ _ _ _
               open_message_link -> open_message_link _
+              copy_to_clipboard -> copy_to_clipboard _ _
+              copy_message_link -> copy_message_link _
               add_reaction_at -> add_reaction_at _ _
               remove_reaction_at -> remove_reaction_at _ _
               open_thread_for -> open_thread_for _
@@ -261,9 +289,11 @@ view
         shell:
           ShellScreen draft<->shell_chat_draft #shell
             with
-              mode=shell_mode
+              surface=shell_surface
+              setup_open=shell_setup_open
+              identity_options=shell_identity_options
+              identity=shell_identity
               provider=shell_provider
-              credential_options=shell_credential_options
               credential=shell_credential
               host_node_options=shell_host_node_options
               host_node=shell_host_node
@@ -279,26 +309,31 @@ view
               chat_status=shell_chat_status
               chat_detail=shell_chat_detail
               live=shell_chat_live
-              chat_error=shell_chat_error
               saga_id=shell_chat_saga
+              steps_open=shell_steps_open
+              detached_saga=shell_detached_saga
               connected
               dark
             events
-              shell_mode_changed -> shell_mode_changed _
-              shell_provider_changed -> shell_provider_changed _
-              shell_credential_changed -> shell_credential_changed _
+              shell_surface_changed -> shell_surface_changed _
+              shell_setup_toggled -> shell_setup_toggled
+              shell_identity_changed -> shell_identity_changed _
               shell_host_node_changed -> shell_host_node_changed _
               shell_credentials_refresh -> shell_credentials_refresh
               shell_terminal_start -> shell_terminal_start
               shell_terminal_stop -> shell_terminal_stop
               shell_composer_event -> shell_composer_event _
               shell_chat_reset -> shell_chat_reset
-              shell_chat_suggest -> shell_chat_suggest _
+              shell_chat_detach -> shell_chat_detach
+              shell_chat_reopen -> shell_chat_reopen
+              shell_chat_discard -> shell_chat_discard
+              shell_chat_steps_toggled -> shell_chat_steps_toggled _
               shell_open_link -> open_message_link _
 
         pages:
           PagesScreen page_draft<->page_draft page_search_draft<->page_search_draft page_editor<->page_editor block_comment_draft<->block_comment_draft #pages
             with
+              network_chain_id
               pages
               page_create_open
               loading
@@ -355,6 +390,7 @@ view
               load_more_block_comments -> load_more_block_comments
               post_block_comment_submit -> post_block_comment_submit
               resolve_thread_submit -> resolve_thread_submit _
+              copy_to_clipboard -> copy_to_clipboard _ _
 
         files:
           FilesScreen new_name<->fs_new_name draft<->fs_editor
@@ -377,7 +413,12 @@ view
               preview_binary=fs_preview_binary
               editing=fs_editing
               preview_text=fs_preview_text
+              preview_picture=fs_preview_picture
+              preview_width=fs_preview_width
+              preview_height=fs_preview_height
+              dark
             events
+              open_message_link -> open_message_link _
               fs_open_dir -> fs_open_dir _
               fs_open_file -> fs_open_file _
               fs_open_parent -> fs_open_parent
@@ -406,10 +447,11 @@ view
         agents:
           AgentsScreen rows=agents_rows connected answered=agents_answered #agents
         forge:
-          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor
+          ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor #forge
             with
               org=network_name
               about=account_bio
+              network_chain_id
               connected_rpc
               tier=member_tier(members_rows)
               repos=forge_repos
@@ -447,6 +489,7 @@ view
               staged_comments=forge_comment_staged
               discussion=forge_discussion
               discussion_pending=forge_discussion_pending
+              linked_note=forge_linked_note
               connected
               loading
               dark
@@ -466,6 +509,7 @@ view
               forge_comment_drop -> forge_comment_drop _
               note_composer_event -> forge_composer_event _
               open_message_link -> open_message_link _
+              copy_to_clipboard -> copy_to_clipboard _ _
         governance:
           GovernanceScreen #governance
             with
@@ -508,21 +552,27 @@ view
             activity_log:
               extern node_log_timeline(node_log_timeline, connected_rpc) #node-log-timeline -> node_log_timeline_changed _
         settings:
-          SettingsScreen account_name_draft<->account_name_draft #settings
+          SettingsScreen account_name_draft<->account_name_draft account_create_draft<->account_create_draft account_key_draft<->account_key_draft account_key_label_draft<->account_key_label_draft account_join_draft<->account_join_draft #settings
             with
               account_name
               network_name
               connected_rpc
+              account_ceremony_phase
+              account_ceremony_qr
+              account_ceremony_detail
+              account_ceremony_left
               settings_key_state
               settings_key_path
               settings_open_tabs
               members_rows
               members_answered
-              account_id
+              account_number
               account_renaming
-              account_bound
-              account_members
-              account_nodes
+              account_exists
+              account_keys
+              account_key_rows
+              account_busy
+              account_ticket
               appearance
               password
               status
@@ -534,6 +584,19 @@ view
               reconnect -> reconnect
               account_name_draft_changed -> account_name_draft_changed _
               account_rename_submit -> account_rename_submit
+              account_create_draft_changed -> account_create_draft_changed _
+              account_create_submit -> account_create_submit
+              account_key_draft_changed -> account_key_draft_changed _
+              account_key_label_draft_changed -> account_key_label_draft_changed _
+              account_key_add_submit -> account_key_add_submit
+              account_join_draft_changed -> account_join_draft_changed _
+              account_key_join_submit -> account_key_join_submit
+              account_key_remove -> account_key_remove _
+              account_passkey_submit -> account_passkey_submit
+              account_passkey_desktop -> account_passkey_desktop
+              account_ceremony_cancel -> account_ceremony_cancel
+              account_wallet_submit -> account_wallet_submit
+              account_login_submit -> account_login_submit
               copy_to_clipboard -> copy_to_clipboard _ _
               settings_clear_tabs -> settings_clear_tabs
               switch_network -> switch_network
@@ -698,5 +761,10 @@ view
                           w=fill
                           h=290.0
                           anchor-y=keep
-                        keyed item in bell_items by=item.seq virtual-row=58.0 w=fill p=5.0 gap=1.0
+                        keyed item in bell_items by=item.seq
+                          with
+                            virtual-row=58.0
+                            w=fill
+                            p=5.0
+                            gap=1.0
                           BellRow item=item

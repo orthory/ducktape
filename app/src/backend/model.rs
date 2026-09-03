@@ -398,7 +398,7 @@ pub fn near_scroll_top(relative_offset: f64) -> bool {
 /// network A's `#general` and network B's `#general` are two rooms, and the
 /// park store this replaced had to be emptied by hand on every network switch
 /// to keep one from handing its words to the other.
-pub fn composer_scope(endpoint: String, channel_id: String) -> String {
+pub fn composer_scope(endpoint: &str, channel_id: &str) -> String {
     format!("{endpoint}\u{1f}{channel_id}")
 }
 
@@ -436,7 +436,7 @@ pub fn composer_op_prefix(kind: crate::ComposerKind) -> String {
 
 /// The rail's key: a reply belongs to its THREAD, and the same seq under two
 /// rooms is two different threads.
-pub fn thread_scope(endpoint: String, channel_id: String, thread_seq: i64) -> String {
+pub fn thread_scope(endpoint: &str, channel_id: &str, thread_seq: i64) -> String {
     format!("{endpoint}\u{1f}{channel_id}#{thread_seq}")
 }
 
@@ -704,7 +704,7 @@ pub fn commented_targets_of(threads: Vec<PageCommentThread>, page_id: String) ->
 }
 
 /// The open thread's resolved flag, read off the rail's own list.
-pub fn thread_is_resolved(threads: Vec<PageCommentThread>, id: String) -> bool {
+pub fn thread_is_resolved(threads: &[PageCommentThread], id: &str) -> bool {
     threads
         .iter()
         .find(|thread| thread.id == id)
@@ -756,7 +756,7 @@ fn append_recovered_draft(drafts: &mut Vec<String>, draft: String) {
     }
 }
 
-pub fn scope_key(scope: String, id: String) -> String {
+pub fn scope_key(scope: &str, id: &str) -> String {
     format!("{scope}\0{id}")
 }
 
@@ -792,10 +792,44 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
     static CLIENTS: std::sync::Mutex<std::collections::BTreeMap<String, RpcClient>> =
         std::sync::Mutex::new(std::collections::BTreeMap::new());
     let mut clients = CLIENTS.lock().expect("rpc client cache");
-    if let Some(client) = clients.get(&configured) {
-        return Ok(client.clone());
-    }
-    let client = RpcClient::new(&configured).map_err(String::from)?;
-    clients.insert(configured, client.clone());
-    Ok(client)
+    let client = match clients.get(&configured) {
+        Some(client) => client.clone(),
+        None => {
+            let client = RpcClient::new(&configured).map_err(String::from)?;
+            clients.insert(configured, client.clone());
+            client
+        }
+    };
+    // The node's own operator credential, when this device holds the node's
+    // workspace: every MUTATING `/v1` route (a files commit, an invite mint, a
+    // frameless submit) refuses a caller that presents neither it nor a
+    // per-request user signature. The app already reads this same directory for
+    // the service-link token, and a node with no local workspace here is a
+    // REMOTE one — read-only from this device, which the node's own 401 says.
+    //
+    // Read per call and NEVER latched into the cached client: the node re-mints
+    // this secret on every boot, so a client that kept the one it was built
+    // with would 401 every write from the first node restart until the app
+    // itself restarted. The cache exists for the connection pool, not the
+    // credential.
+    Ok(match operator_token_for(client.origin()) {
+        Some(token) => client.with_operator_token(token),
+        None => client,
+    })
+}
+
+/// The `admin.token` of the node serving `origin`, if this device has its
+/// workspace registered.
+///
+/// Matches on the ALREADY-CANONICAL origin the client just parsed, never
+/// through `shell::workspace_at` — that canonicalizes by calling
+/// [`rpc_client`], which is where this runs, holding its cache lock. The
+/// bug that shape produced was not a slow test but a dead process.
+fn operator_token_for(origin: &str) -> Option<String> {
+    let (_, workspace) = super::shell::registered_workspaces()
+        .into_iter()
+        .find(|(_, dir)| super::shell::workspace_endpoint(dir).as_deref() == Some(origin))?;
+    let token = std::fs::read_to_string(workspace.join("admin.token")).ok()?;
+    let token = token.trim().to_string();
+    (!token.is_empty()).then_some(token)
 }

@@ -35,8 +35,8 @@ use statesync::dataplane::{DataPlaneSyncClient, read_frame, statesync_flow, writ
 use statesync::p2p::P2pSyncClient;
 use statesync::{
     BoundaryId, FinalizedFrame, FrameDisposition, Manifest, ManifestEntry, PayloadKind, SyncClient,
-    SyncError, SyncRequest, SyncResponse, TipCoords, decode_request, decode_rpc_authed,
-    encode_response, encode_rpc_authed,
+    SyncError, SyncRequest, SyncResponse, TipCoords, decode_request, decode_rpc, encode_response,
+    encode_rpc,
 };
 
 // ============================================================================
@@ -109,6 +109,14 @@ fn full_suite() -> Vec<(&'static str, SyncRequest)> {
             },
         ),
         (
+            "ForgeObjects",
+            SyncRequest::ForgeObjects {
+                repo: "ducktape".into(),
+                head: [6u8; statesync::FORGE_OID_LEN],
+                bases: vec![[5u8; statesync::FORGE_OID_LEN]],
+            },
+        ),
+        (
             "FramesInvertedRange (protocol-error probe)",
             SyncRequest::Frames {
                 after_height: 99,
@@ -164,6 +172,11 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
                 root_hash: StateRoot([6u8; 32]),
             }],
         },
+        // the forge object lane: the head's low byte stands in for "which
+        // pack did the host stage", so the two bindings must agree on it.
+        SyncRequest::ForgeObjects { head, .. } => SyncResponse::ForgeObjects {
+            digest: Some([head[0]; 32]),
+        },
         SyncRequest::IndexOps {
             boundary, after, ..
         } => SyncResponse::IndexOps {
@@ -186,6 +199,7 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
                 validators: vec![vec![9u8; 32]],
                 residents: vec![],
             }],
+            build: Some("test-build".into()),
         }),
         SyncRequest::Blob { digest } => SyncResponse::Blob {
             bytes: Some(digest.to_vec()),
@@ -371,7 +385,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
                     return;
                 };
                 let bytes: Vec<u8> = msg.into();
-                let Ok((_requester, _proof, id, body)) = decode_rpc_authed(&bytes) else {
+                let Ok((_requester, _proof, id, body)) = decode_rpc(&bytes) else {
                     continue;
                 };
                 let Ok(req) = decode_request(body) else {
@@ -380,7 +394,7 @@ fn run_mesh_leg(suite: Vec<(&'static str, SyncRequest)>) -> (LegResults, Transpo
                 let resp = encode_response(&canned_response(&req));
                 let _ = server_tx.send(
                     Recipients::One(peer),
-                    IoBuf::from(encode_rpc_authed(&[0u8; 32], &[0u8; 64], id, &resp)),
+                    IoBuf::from(encode_rpc(&[0u8; 32], &[0u8; 64], id, &resp)),
                     false,
                 );
             }

@@ -69,6 +69,7 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
         public_key: "node-key".into(),
         version: "0.2.0".into(),
         root_hash: "hash-new".into(),
+        chain_id: "mynet#d0cdf950".into(),
         checkpoint_height: 512,
         last_finalized_at: 999,
         height: 888,
@@ -87,7 +88,8 @@ fn a_pushed_status_moves_the_facts_and_leaves_the_table() {
     // ALL SEVENTEEN, because a field the handler forgot stays frozen at its
     // connect-time value for as long as the console is open.
     assert_eq!(app.node_key, "node-key");
-    assert_eq!(app.node_version, "0.2.0");
+    assert_eq!(app.node_root_hash, "hash-new");
+    assert_eq!(app.network_chain_id, "mynet#d0cdf950");
     assert_eq!(app.node_root_hash, "hash-new");
     assert_eq!(app.node_checkpoint, 512);
     assert_eq!(app.node_last_finalized, 999);
@@ -283,7 +285,7 @@ fn switching_panes_retires_a_stale_error_banner_on_every_tab() {
 
 /// EVERY READER OF `/v1/peers` USES THE NAMES `PeerView` SERIALIZES.
 ///
-/// `bin/noded/src/peers.rs` serves `peer` / `connected` / `role`; it has never
+/// `crates/noded/src/peers.rs` serves `peer` / `connected` / `role`; it has never
 /// served `key`, `live`, or a per-peer `height`. Reading the wrong ones does
 /// not fail — `as_str()` answers `None` and the row renders blank, zero and
 /// offline for a peer that is connected.
@@ -303,7 +305,7 @@ fn peer_readers_use_the_names_the_node_serves() {
             assert!(
                 !source.contains(wrong),
                 "{name} reads {wrong}, which `/v1/peers` does not serve — \
-                 see bin/noded/src/peers.rs for the names it does"
+                 see crates/noded/src/peers.rs for the names it does"
             );
         }
         assert!(
@@ -504,10 +506,10 @@ fn a_gated_plane_is_gated_at_the_call_site_and_still_lands_off_tab() {
 /// connect load still in flight. Every other generation on that
 /// block may bump freely — their loaders draw one tab, so opening it re-earns
 /// the read. The settings facts are the exception: `settings_user_key` is
-/// chat's `me`, chat returns above the tab block, and nothing chat does ever
-/// re-issues the load. Lose it and `me` stays "" for the session — which
-/// `chat_sidebar_rooms` reads as "show every DM under CHANNELS" and `post_gate` as
-/// "not seated", refusing the composer on every DM.
+/// chat's seating key, chat returns above the tab block, and nothing chat does
+/// ever re-issues the load. Lose it and the key stays "" for the session —
+/// which `post_gate` reads as "not seated", refusing the composer on every
+/// members-only room.
 #[test]
 fn a_move_to_a_pane_that_does_not_draw_the_settings_facts_keeps_the_connect_load() {
     let (mut app, _) = Ducktape::__boot();
@@ -579,7 +581,7 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
         }],
     }));
     assert!(
-        backend::any_agent_active(app.agents_rows.clone()),
+        backend::any_agent_active(&app.agents_rows),
         "the move off-tab must not revoke the run's own refetch — the dot is drawn on every tab"
     );
 
@@ -591,14 +593,47 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
     );
 }
 
+/// THE JOIN OPENS THE HUDDLE. Every face, every shared screen and every media
+/// control lives in the huddle window; the header pill it docks into shows
+/// none of them. A join routed back to the generic `chat_acked` leaves someone
+/// sitting in a live call watching a static pill, which is indistinguishable
+/// from a huddle that does not work — so the route is pinned here.
+#[test]
+fn joining_a_huddle_opens_the_window_that_shows_it() {
+    let handler = inlined(include_str!("../ui/handlers/chat.ice"));
+    assert!(
+        handler
+            .contains("join_huddle(connected_rpc, password, active_channel) -> huddle_joined_ack"),
+        "the join's ack is its own, not the generic one"
+    );
+    let ack = handler
+        .split_once("on huddle_joined_ack")
+        .expect("the join ack handler exists")
+        .1;
+    let ack = ack.split_once("\non ").map_or(ack, |split| split.0);
+    assert!(ack.contains("task window open huddle"));
+    assert!(
+        ack.contains("return if huddle_win != none"),
+        "a window already up is not opened twice"
+    );
+}
+
 #[test]
 fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
     let handler = inlined(include_str!("../ui/handlers/huddle.ice"));
-    let leave = handler
-        .split_once("on leave_huddle_here")
-        .expect("the leave handler exists")
-        .1;
+    let after = |marker: &str| {
+        let body = handler
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("{marker} exists"))
+            .1;
+        // ONE handler, not the rest of the file: the ack below legitimately
+        // blanks what the request must not.
+        body.split_once("\non ")
+            .map_or(body, |split| split.0)
+            .to_string()
+    };
 
+    let leave = after("on leave_huddle_here");
     assert!(leave.contains("call_peers = []"));
     assert!(
         leave.contains("huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)")
@@ -607,6 +642,19 @@ fn a_failed_huddle_leave_keeps_the_retained_roster_visible() {
         !leave.contains("huddle_rows = []"),
         "an uncommitted leave failure retains the roster, so blanking its mirror is permanent"
     );
+
+    // THE COMMITTED LEAVE IS WHAT ENDS IT. The resync behind it loads the room
+    // on screen, which the popped huddle window outlives — so the ack, not the
+    // load, has to be the thing that takes her off this device's huddle.
+    let acked = after("on huddle_left");
+    for cleared in [
+        "huddle_joined = false",
+        "huddle_roster = []",
+        "huddle_rows = []",
+        "huddle_channel = \"\"",
+    ] {
+        assert!(acked.contains(cleared), "the leave ack clears {cleared}");
+    }
 }
 
 #[test]
@@ -702,30 +750,30 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
     );
 }
 
-/// ACCOUNT FACTS ONLY WHEN THERE IS AN ACCOUNT. With no account bound,
-/// `load_account` returns zeros for every field, and the identity card printed
-/// `0 keys 0 nodes` one line under "· validator keypair on this device" — a
-/// count of the ACCOUNT's keys reading as a count of THIS DEVICE's, and the two
-/// contradicting each other inside one card.
+/// ACCOUNT FACTS ONLY WHEN THERE IS AN ACCOUNT. With the local key in no
+/// account, `load_account` returns zeros for every field, and the identity
+/// card printed `0 keys` one line under "· validator keypair on this device" —
+/// a count of the ACCOUNT's keys reading as a count of THIS DEVICE's, and the
+/// two contradicting each other inside one card.
 ///
-/// `account_bound` is the fact that tells an empty account from no account. It
-/// was already in state, already gating the Rename submit, and simply was not
-/// given to the screen.
+/// `account_exists` is the fact that tells an empty account from no account.
+/// It was already in state, already gating the Rename submit, and simply was
+/// not given to the screen.
 #[test]
-fn the_identity_card_counts_only_a_bound_account() {
+fn the_identity_card_counts_only_an_existing_account() {
     let settings = inlined(include_str!("../ui/screens/settings.ice"));
     assert!(
-        settings.contains("account_bound:bool"),
+        settings.contains("account_exists:bool"),
         "the screen has to be handed the fact before it can use it"
     );
     let card = settings
-        .split("if account_bound")
+        .split("if account_exists")
         .nth(1)
-        .expect("the counts sit under the bound gate")
+        .expect("the counts sit under the exists gate")
         .split("\n        col ")
         .next()
         .expect("card region");
-    for reading in ["account_members", "account_nodes", "Copy key"] {
+    for reading in ["account_keys", "Copy number"] {
         assert!(
             card.contains(reading),
             "{reading} is an account reading and belongs under the gate"
@@ -734,26 +782,29 @@ fn the_identity_card_counts_only_a_bound_account() {
 
     // And view.ice actually passes it, or the screen renders a default.
     let view = inlined(include_str!("../ui/view.ice"));
-    assert!(view.contains("account_bound"), "the mount has to supply it");
+    assert!(
+        view.contains("account_exists"),
+        "the mount has to supply it"
+    );
 
-    // THE SEPARATOR BELONGS TO THE KEY. #998 stopped the card counting an
+    // THE SEPARATOR BELONGS TO THE NUMBER. #998 stopped the card counting an
     // account that does not exist; the dot that had joined those counts stayed
-    // ungated, and an unbound account has no `account_id` either — so the line
-    // led with it: `· validator keypair on this device`. Every other separator
-    // in the console is gated by the run it introduces (forge.ice's repo-count
-    // dot carries the reasoning in its own comment).
-    let key_line = settings
-        .split_once("text account_id")
-        .expect("the key line")
+    // ungated, and a key in no account has no `account_number` either — so the
+    // line led with it: `· validator keypair on this device`. Every other
+    // separator in the console is gated by the run it introduces (forge.ice's
+    // repo-count dot carries the reasoning in its own comment).
+    let number_line = settings
+        .split_once("text account_number")
+        .expect("the number line")
         .1
         .split_once(r#"text "keypair on this device""#)
         .expect("the custody clause closes it")
         .0;
-    let dot = key_line.find(r#"text "·""#).expect("the separator");
-    let guard = key_line
-        .find("if !empty(account_id)")
+    let dot = number_line.find(r#"text "·""#).expect("the separator");
+    let guard = number_line
+        .find("if !empty(account_number)")
         .expect("the separator's guard");
-    assert!(guard < dot, "the dot is gated by the key it introduces");
+    assert!(guard < dot, "the dot is gated by the number it introduces");
 }
 
 /// A ZERO IS A CLAIM, AND THIS APP SAYS IT WITH BLANK. `count_label` returns
@@ -1311,7 +1362,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
         "the listing answered for it"
     );
     assert_eq!(
-        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         "0 files · 1 dir"
     );
 
@@ -1331,7 +1382,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
          of `entries` on the screen is gated on it"
     );
     assert_eq!(
-        backend::fs_counts_summary(app.connected, false, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, false, &app.fs_entries),
         "",
         "no tally for a directory nobody has answered for"
     );
@@ -1342,7 +1393,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
     let _ = app.__update(listing(app.fs_generation, "/shared/reports", Vec::new()));
     assert_eq!(app.fs_listed_path, app.fs_path);
     assert_eq!(
-        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         ""
     );
 
@@ -1355,7 +1406,7 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
     ));
     assert_eq!(app.fs_listed_path, app.fs_path, "a refresh never disagrees");
     assert_eq!(
-        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         "1 file · 0 dirs",
         "and it speaks again as soon as there is something to count"
     );
@@ -1386,5 +1437,649 @@ fn the_files_pane_reports_only_a_directory_it_has_listed() {
     assert!(
         view.contains("listed=(fs_listed_path == fs_path)"),
         "the mount has to compute it"
+    );
+}
+
+/// THE FILES PREVIEW IS THE FORGE READER, NOT A PLAIN TEXT NODE.
+///
+/// Text files read as numbered, syntect-coloured rows through the same
+/// `forge_code` extern the forge blob pane mounts (behind the same `lazy`
+/// memo boundary), and a Markdown path reads as a document through
+/// `agent_markdown`. Pinned so the pane cannot quietly fall back to the one-ink
+/// `text preview_text` it shipped with — and so a pick clears the previous
+/// body before the read lands, instead of showing A's text under B's path.
+#[test]
+fn the_files_preview_reads_text_through_the_forge_reader() {
+    let storage = inlined(include_str!("../ui/screens/storage.ice"));
+    let files = storage
+        .split_once("component FilesScreen(")
+        .expect("the screen")
+        .1
+        .split_once("\ncomponent ")
+        .expect("the screen ends")
+        .0;
+    assert!(
+        files.contains("lazy preview_text by preview_text, preview_path, dark as cached_source"),
+        "the reader's memo boundary is the mount's lazy"
+    );
+    assert!(
+        files.contains("extern forge_code(cached_source, preview_path, dark) #fs-code"),
+        "text mounts the highlighted reader"
+    );
+    assert!(
+        files.contains("if !preview_binary && !preview_picture && markdown_path(preview_path)")
+            && files
+                .contains("lazy preview_text by preview_text, preview_path, dark as cached_doc")
+            && files.contains("extern agent_markdown(cached_doc, dark) #fs-markdown"),
+        "a markdown path reads as a document"
+    );
+    assert!(
+        files.contains("if preview_picture\n")
+            && files.contains("extern picture(\"files\", preview_path) #fs-picture"),
+        "a picture draws through the viewer"
+    );
+    assert!(
+        files.contains("if !preview_binary && !preview_picture && !editing && !preview_truncated"),
+        "a picture has no Edit"
+    );
+    assert!(
+        !files.contains("text preview_text\n"),
+        "no arm falls back to the one-ink text node"
+    );
+
+    let view = inlined(include_str!("../ui/view.ice"));
+    let mount = view
+        .split_once("FilesScreen new_name<->fs_new_name")
+        .expect("the mount")
+        .1
+        .split_once("\n        members:")
+        .expect("the mount ends")
+        .0;
+    assert!(mount.contains("dark\n"), "the mount hands the screen the appearance");
+    assert!(
+        mount.contains("open_message_link -> open_message_link _"),
+        "markdown links route through the shell's link seam"
+    );
+
+    let handlers = include_str!("../ui/handlers/files.ice");
+    let open_file = handlers
+        .split_once("on fs_open_file(path)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    let cleared = open_file.find("fs_preview_text = \"\"").expect("the old body is cleared");
+    let unpictured = open_file.find("fs_preview_picture = false").expect("the old picture flag is cleared");
+    let read = open_file.find("run replace lane=files_preview").expect("the read");
+    assert!(cleared < read && unpictured < read, "the body is cleared before the read is issued");
+}
+
+/// ESCAPE CLOSES WHAT IS ON SCREEN, AND THE THREAD RAIL IS NOT.
+///
+/// Channel details unmounts the rail — `if active_thread_seq > 0 &&
+/// !channel_settings_open` in `screens/chat.ice` — and nothing clears the ⋯
+/// flag on the way in, so opening a thread action and then the drawer is a
+/// mouse-reachable state where the ladder's first rung named a menu nobody
+/// could see: the press wiped a half-typed `thread_edit_draft` and left the
+/// drawer standing. Same rule as the tab scoping, one level down — a rung
+/// answers only while its surface is mounted.
+#[test]
+fn escape_closes_the_drawer_over_a_thread_menu_the_drawer_unmounted() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Chat;
+    app.active_channel = "general".into();
+    app.thread_selected_seq = 7;
+    app.thread_message_action = MessageAction::Editing;
+    app.thread_edit_draft = "half typed".into();
+    app.channel_settings_open = true;
+
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert!(
+        !app.channel_settings_open,
+        "the first Escape closes the drawer the reader is looking at"
+    );
+    assert_eq!(
+        app.thread_edit_draft, "half typed",
+        "and leaves the unmounted rail's draft where she left it"
+    );
+    assert_eq!(app.thread_message_action, MessageAction::Editing);
+
+    // With the drawer down the rail is mounted again, and its rung answers.
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
+    assert_eq!(app.thread_edit_draft, "");
+}
+
+/// THE FILES DELETE CONFIRM IS AN OVERLAY, SO IT ANSWERS ESCAPE.
+///
+/// `fs_delete_target` arms a scrim + `ConfirmDelete` over duckfs
+/// (`screens/storage.ice`). Its dismiss route is the backdrop click and the
+/// Cancel button — a destructive confirm with no keyboard exit, which is the
+/// state the drawer was in before #1132 gave it a rung.
+#[test]
+fn escape_disarms_the_files_delete_confirm_from_the_files_tab_only() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Files;
+    app.fs_delete_target = "/shared/report.md".into();
+
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert_eq!(
+        app.fs_delete_target, "",
+        "Escape is the keyboard way out of a destructive confirm"
+    );
+
+    // And the rung is scoped like every other per-tab rung: from another tab
+    // the confirm is not on screen, so the press names no layer at all.
+    app.shell_tab = ShellTab::Node;
+    app.fs_delete_target = "/shared/report.md".into();
+    app.bell_open = true;
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert!(!app.bell_open, "the bell rides every tab and answers first");
+    assert_eq!(app.fs_delete_target, "/shared/report.md");
+}
+
+/// THE LADDER'S TAB SCOPING IS READ OFF THE MOUNT LAYOUT — SO THE LAYOUT PINS IT.
+///
+/// #1132 scoped every per-tab rung in `topmost_overlay` by reading
+/// `components/shell.ice`'s `match tab`: a rung whose surface is mounted under
+/// an arm answers only from that arm's tab, and one whose surface sits OUTSIDE
+/// the match (the palette, the bell, the create modal) rides every tab. That
+/// reading was done once, by hand, and nothing held it: move a screen to
+/// another arm — or add a rung and forget its guard — and the pre-#1132 symptom
+/// comes back silently, a stale flag eating the first Escape on every other
+/// tab while the visible screen swallows the press.
+///
+/// So the rule is derived here instead of restated: `match tab` says which slot
+/// each tab mounts, `view.ice` says which state each slot is handed, and the
+/// ladder itself says which flags each rung reads and which tab it is guarded
+/// on. Nothing in this test names a tab, a slot or a rung — the three sources
+/// have to agree on their own.
+#[test]
+fn every_ladder_rung_is_scoped_to_the_tab_that_mounts_its_surface() {
+    /// `contains`, but a whole identifier — `message_action` must not match
+    /// inside `thread_message_action`.
+    fn mentions(haystack: &str, needle: &str) -> bool {
+        let part = |c: char| c.is_alphanumeric() || c == '_';
+        haystack.match_indices(needle).any(|(at, _)| {
+            !haystack[..at].chars().next_back().is_some_and(part)
+                && !haystack[at + needle.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(part)
+        })
+    }
+
+    // 1. THE MOUNT LAYOUT. Every `slot` the shell declares, and the tab arm
+    //    that mounts it — `None` for the window-level layers outside the match.
+    let shell = include_str!("../ui/components/shell.ice");
+    assert_eq!(
+        shell
+            .lines()
+            .filter(|line| line.trim() == "match tab")
+            .count(),
+        1,
+        "one tab match, and this walk found it"
+    );
+    let arms = shell.split_once("match tab\n").expect("the tab match").1;
+    let mut mounted: Vec<(&str, &str)> = Vec::new();
+    let mut arm: Option<&str> = None;
+    for line in arms.lines() {
+        let line = line.trim();
+        if let Some(tab) = line.strip_prefix("ShellTab.") {
+            arm = Some(tab);
+        } else if let Some(slot) = line.strip_prefix("slot ") {
+            // A `slot` with no arm above it is past the match — the palette,
+            // the bell and the huddle, which ride every screen.
+            let Some(tab) = arm.take() else { break };
+            mounted.push((slot, tab));
+        }
+    }
+    let declared: Vec<&str> = shell
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("slot "))
+        .collect();
+    assert!(
+        mounted.len() > 8 && declared.len() > mounted.len(),
+        "the walk found the arms ({}) and the layers outside them ({})",
+        mounted.len(),
+        declared.len()
+    );
+
+    // 2. WHAT EACH SLOT IS HANDED. `view.ice` fills them, and the state a
+    //    surface is plumbed is what says which surface a flag belongs to.
+    let view = include_str!("../ui/view.ice");
+    let filled: Vec<(&str, Option<&str>, String)> = declared
+        .iter()
+        .map(|slot| {
+            let head = format!("\n        {slot}:\n");
+            let body = view
+                .split_once(&head)
+                .unwrap_or_else(|| panic!("`{slot}:` is filled in view.ice"))
+                .1
+                .lines()
+                .take_while(|line| line.trim().is_empty() || line.starts_with("          "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let tab = mounted
+                .iter()
+                .find(|(mounted, _)| mounted == slot)
+                .map(|(_, tab)| *tab);
+            (*slot, tab, body)
+        })
+        .collect();
+
+    // 3. THE LADDER: its layer flags, its tab predicates, and its rungs.
+    let explorer = include_str!("../backend/explorer.rs");
+    let ladder = explorer
+        .split_once("pub fn topmost_overlay(")
+        .expect("the ladder")
+        .1;
+    let (signature, body) = ladder.split_once(") -> String {").expect("the ladder");
+    let body = body.split_once("\n}\n").expect("the ladder ends").0;
+    let layers: Vec<&str> = signature
+        .lines()
+        .filter_map(|line| line.trim().split_once(':'))
+        .map(|(name, _)| name)
+        .collect();
+    let guards: Vec<(&str, &str)> = body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("let "))
+        .filter_map(|line| line.split_once(" = shell_tab == crate::ShellTab::"))
+        .map(|(name, tab)| (name, tab.trim_end_matches(';')))
+        .collect();
+    let mut rungs: Vec<(&str, &str)> = Vec::new();
+    let mut condition: Option<&str> = None;
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(open) = line.strip_prefix("if ").and_then(|c| c.strip_suffix(" {")) {
+            condition = Some(open);
+        } else if let Some(rung) = line
+            .strip_prefix("return \"")
+            .and_then(|rung| rung.strip_suffix("\".into();"))
+            && let Some(open) = condition.take()
+        {
+            rungs.push((rung, open));
+        }
+    }
+    assert_eq!(
+        rungs.len(),
+        body.matches("return \"").count(),
+        "every rung's condition parsed — one `if <condition> {{` per rung"
+    );
+
+    // 4. AND THE THREE HAVE TO AGREE.
+    for (rung, condition) in rungs {
+        let read: Vec<&&str> = layers
+            .iter()
+            .filter(|layer| mentions(condition, layer))
+            .collect();
+        assert!(!read.is_empty(), "rung `{rung}` reads no layer flag");
+        let mut tabs: Vec<&str> = Vec::new();
+        let mut rides_every_tab = false;
+        for layer in read {
+            let plumbed: Vec<&(&str, Option<&str>, String)> = filled
+                .iter()
+                .filter(|(_, _, body)| mentions(body, layer))
+                .collect();
+            assert!(
+                !plumbed.is_empty(),
+                "`{layer}` reaches no slot — rung `{rung}` is scoped against nothing"
+            );
+            for (_, tab, _) in plumbed {
+                match tab {
+                    Some(tab) => tabs.push(tab),
+                    None => rides_every_tab = true,
+                }
+            }
+        }
+        let guard = guards
+            .iter()
+            .find(|(predicate, _)| mentions(condition, predicate));
+        // A layer plumbed into a slot outside `match tab` stays on screen
+        // across a switch, so its rung must keep answering from every tab.
+        if rides_every_tab {
+            assert!(
+                guard.is_none(),
+                "rung `{rung}` is mounted outside the tab match and must not be scoped"
+            );
+            continue;
+        }
+        tabs.dedup();
+        assert_eq!(
+            tabs.len(),
+            1,
+            "rung `{rung}` reads state from more than one tab's slot: {tabs:?}"
+        );
+        let (predicate, scoped_to) = guard.unwrap_or_else(|| {
+            panic!(
+                "rung `{rung}` mounts under `{}` and must be scoped to it",
+                tabs[0]
+            )
+        });
+        assert!(
+            scoped_to.eq_ignore_ascii_case(tabs[0]),
+            "rung `{rung}` is scoped by `{predicate}` to {scoped_to}, but the shell mounts \
+             its surface under ShellTab.{}",
+            tabs[0]
+        );
+    }
+}
+
+/// A TAB MOVE RETIRES THE MENUS THE TAB IT LEFT OWNED.
+///
+/// Nothing did: `select_shell_tab` left every menu flag set, which is the whole
+/// reason the escape ladder has to be scoped tab by tab (#1132). The scoping
+/// stays — a rung must not answer for a surface that is not on screen, however
+/// the flag got there — and this is the other half of it: an armed delete
+/// confirm that survives a tab round trip is a mouse click away from deleting
+/// the page the reader forgot she armed, and a ⋯ menu is not state anyone
+/// expects to come back to.
+#[test]
+fn a_tab_move_retires_the_menu_only_state_of_the_screen_it_left() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Chat;
+    app.selected_message_seq = 4;
+    app.selected_message_rev = 2;
+    app.message_action = MessageAction::More;
+    app.message_edit_draft = "half typed".into();
+    app.thread_selected_seq = 7;
+    app.thread_selected_rev = 1;
+    app.thread_message_action = MessageAction::Editing;
+    app.thread_edit_draft = "half typed too".into();
+    app.forge_repo_menu = true;
+    app.page_delete_armed = true;
+    app.fs_delete_target = "/shared/report.md".into();
+
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Node));
+
+    assert_eq!(app.message_action, MessageAction::Toolbar);
+    assert_eq!(app.message_edit_draft, "");
+    assert_eq!(app.selected_message_seq, 0);
+    assert_eq!(app.selected_message_rev, 0);
+    assert_eq!(app.thread_message_action, MessageAction::Toolbar);
+    assert_eq!(app.thread_edit_draft, "");
+    assert_eq!(app.thread_selected_seq, 0);
+    assert_eq!(app.thread_selected_rev, 0);
+    assert!(!app.forge_repo_menu);
+    assert!(
+        !app.page_delete_armed,
+        "an armed delete never rides a tab move"
+    );
+    assert_eq!(app.fs_delete_target, "");
+
+    // The disconnected path returns before the generation bumps, and retires
+    // the same set — the clear sits above both early returns, like `error`.
+    let (mut app, _) = Ducktape::__boot();
+    app.shell_tab = ShellTab::Files;
+    app.fs_delete_target = "/shared/report.md".into();
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    assert_eq!(app.fs_delete_target, "");
+    assert_eq!(app.shell_tab, ShellTab::Chat);
+
+    // AND A RE-SELECT IS NOT A MOVE. The rail emits `select_shell_tab(item.id)`
+    // from the seat that is already active, and Settings' rows emit their own
+    // tab while the reader is on it — so an unconditional retire is one click
+    // from destroying an inline edit on the screen she never left.
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Chat;
+    app.selected_message_seq = 4;
+    app.selected_message_rev = 2;
+    app.message_action = MessageAction::Editing;
+    app.message_edit_draft = "still typing".into();
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Chat));
+    assert_eq!(
+        app.message_edit_draft, "still typing",
+        "clicking the tab you are on retires nothing"
+    );
+    assert_eq!(app.message_action, MessageAction::Editing);
+    assert_eq!(app.selected_message_seq, 4);
+    assert_eq!(app.selected_message_rev, 2);
+}
+
+/// A RUN IN FLIGHT IS NOT A CAGE.
+///
+/// The Shell screen used to refuse, while a task or a session was live: the
+/// surface switch, both pickers, and the reset — `return if shell_terminal_busy
+/// || shell_terminal_running || shell_chat_busy` at the top of every one. That
+/// left exactly one state with no exit: a run whose event stream stalls holds
+/// `shell_chat_busy` forever, and every control that could have moved the
+/// operator off it is disabled by the same flag. The tab is wedged until the
+/// app restarts.
+///
+/// Two properties close it, and both are pinned here: the switch always lands,
+/// and `shell_chat_detach` — the operator's way out — is reachable from INSIDE
+/// the busy state it exits.
+#[test]
+fn a_running_turn_never_locks_the_screen_that_started_it() {
+    let saga = format!("origin/sched\u{1f}{}", "a".repeat(64));
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Shell;
+    app.shell_provider = "codex".into();
+    app.shell_chat_entries =
+        backend::agent_chat_push_user(Vec::new(), "do it".into(), "codex".into());
+    app.shell_chat_busy = true;
+    app.shell_chat_saga = saga.clone();
+
+    let _ = app.__update(__DucktapeMessage::ShellSurfaceChanged(
+        ShellSurface::Terminal,
+    ));
+    assert_eq!(
+        app.shell_surface,
+        ShellSurface::Terminal,
+        "a live task must not pin the operator to the surface that started it"
+    );
+
+    let _ = app.__update(__DucktapeMessage::ShellChatDetach);
+    assert!(!app.shell_chat_busy, "detaching leaves the busy state");
+    assert_eq!(
+        app.shell_detached_saga, saga,
+        "STOP WATCHING, NOT STOP RUNNING: the turn keeps the id that reaches \
+         the still-executing saga"
+    );
+    let closed = app.shell_chat_entries.last().expect("the turn is closed");
+    assert_eq!(closed.status, "detached");
+    assert_eq!(closed.saga_id, saga);
+
+    // and discarding it hands the composer back.
+    let _ = app.__update(__DucktapeMessage::ShellChatDiscard);
+    assert!(app.shell_detached_saga.is_empty());
+    assert_eq!(app.shell_chat_entries.len(), 1);
+}
+
+/// ONE PICK, BOTH ANSWERS. `--cred` decides the provider, so choosing an
+/// identity settles the credential AND the provider, and re-narrows the host
+/// list to the peers that announced it — a peer that cannot serve the pick must
+/// not survive the change that made it unreachable.
+#[test]
+fn choosing_an_identity_settles_the_provider_and_re_narrows_the_hosts() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Shell;
+    app.shell_host_nodes = vec![backend::AgentHostNode {
+        key: "b".repeat(64),
+        label: "bo".into(),
+        providers: vec!["codex".into()],
+    }];
+    app.shell_identities = backend::agent_identities(vec![
+        backend::AgentCredential {
+            name: "x1".into(),
+            provider: "codex".into(),
+        },
+        backend::AgentCredential {
+            name: "c1".into(),
+            provider: "claude".into(),
+        },
+    ]);
+
+    let _ = app.__update(__DucktapeMessage::ShellIdentityChanged("x1 · Codex".into()));
+    assert_eq!(app.shell_provider, "codex");
+    assert_eq!(app.shell_credential, "x1");
+    assert_eq!(app.shell_host_node_options, ["This node", "bo"]);
+
+    let _ = app.__update(__DucktapeMessage::ShellHostNodeChanged("bo".into()));
+    assert_eq!(app.shell_host_node_key, "b".repeat(64));
+
+    // bo announces no claude provider, so the run it would bounce is not on
+    // offer — and the pick that pointed at it falls back to the local row.
+    let _ = app.__update(__DucktapeMessage::ShellIdentityChanged(
+        "c1 · Claude Code".into(),
+    ));
+    assert_eq!(app.shell_provider, "claude");
+    assert_eq!(app.shell_host_node_options, ["This node"]);
+    assert_eq!(app.shell_host_node, "This node");
+    assert_eq!(app.shell_host_node_key, "");
+}
+
+/// THE FOUR IDENTITY OPS LAND IN ONE PLACE. `account_changed` is the only
+/// handler that re-reads the account for them, and it clears every draft an op
+/// consumed — a ticket left on screen after its device joined is a stale blob
+/// that looks like a secret, and a create draft after the account exists is a
+/// second Create waiting to be refused.
+#[test]
+fn a_committed_identity_op_rereads_the_account_and_clears_its_drafts() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.account_busy = true;
+    app.account_create_draft = "me".into();
+    app.account_join_draft = "{}".into();
+    app.account_ticket = "{}".into();
+    let before = app.account_generation;
+
+    let _ = app.__update(__DucktapeMessage::AccountChanged(true));
+
+    assert!(!app.account_busy, "the op is over");
+    assert_eq!(app.account_generation, before + 1, "the account is re-read");
+    assert!(app.account_create_draft.is_empty());
+    assert!(app.account_join_draft.is_empty());
+    assert!(app.account_key_draft.is_empty());
+    assert!(app.account_key_label_draft.is_empty());
+    assert!(app.account_ticket.is_empty());
+}
+
+/// THE BROWSER CEREMONIES ARE WIRED LIKE THE PASTED OPS: each button emits
+/// its own signal, each handler runs its backend fn on the connected chain
+/// under the signing seat, and every one lands in `account_changed` /
+/// `account_op_failed` — the one pair that re-reads the account and frees
+/// the card. And each is offered only where consensus would accept it:
+/// registering/linking with an account, logging in without one.
+#[test]
+fn the_browser_ceremonies_land_where_the_pasted_ops_do() {
+    let settings = include_str!("../ui/screens/settings.ice");
+    let roster = include_str!("../ui/handlers/roster.ice");
+    for (button, signal, backend) in [
+        (
+            "In this browser",
+            "account_passkey_desktop",
+            "register_passkey",
+        ),
+        ("Link a wallet", "account_wallet_submit", "link_wallet"),
+        (
+            "Log in with a passkey",
+            "account_login_submit",
+            "login_with_passkey",
+        ),
+    ] {
+        assert!(
+            settings.contains(&format!(r#"button "{button}" -> emit({signal})"#)),
+            "{button} emits {signal}"
+        );
+        let handler = roster
+            .split(&format!("\non {signal}\n"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("a handler for {signal}"))
+            .split("\non ")
+            .next()
+            .unwrap();
+        assert!(
+            handler.contains(&format!(
+                "run every {backend}(connected_rpc, password, network_chain_id"
+            )),
+            "{signal} runs {backend} on the connected chain"
+        );
+        assert!(
+            handler.contains("-> account_changed _ | account_op_failed _"),
+            "{signal} lands where the pasted ops do"
+        );
+        assert!(
+            handler.contains("empty(password)"),
+            "{signal} needs the signing seat"
+        );
+    }
+    let login = settings
+        .find(r#"button "Log in with a passkey""#)
+        .expect("the login button");
+    let last_gate = |upto: usize| {
+        let with = settings[..upto].rfind("if account_exists");
+        let without = settings[..upto].rfind("if !account_exists");
+        (with, without)
+    };
+    let (with, without) = last_gate(login);
+    assert!(
+        without > with,
+        "login is offered only while there is no account"
+    );
+    for button in ["On your phone", "In this browser", "Link a wallet"] {
+        let at = settings
+            .find(&format!(r#"button "{button}""#))
+            .expect(button);
+        let (with, without) = last_gate(at);
+        assert!(with > without, "{button} is offered only with an account");
+    }
+}
+
+/// A MINTED TICKET COMMITS NOTHING: it is shown to copy, the inputs that
+/// produced it clear, and the account is NOT re-read — the other device's
+/// join is what moves it.
+#[test]
+fn a_minted_ticket_is_shown_and_consumes_its_drafts_without_a_reread() {
+    let (mut app, _) = Ducktape::__boot();
+    app.account_busy = true;
+    app.account_key_draft = "ab".into();
+    app.account_key_label_draft = "phone".into();
+    let before = app.account_generation;
+
+    let _ = app.__update(__DucktapeMessage::AccountTicketMinted(
+        r#"{"add_key":{}}"#.into(),
+    ));
+
+    assert!(!app.account_busy);
+    assert_eq!(app.account_ticket, r#"{"add_key":{}}"#);
+    assert!(app.account_key_draft.is_empty());
+    assert!(app.account_key_label_draft.is_empty());
+    assert_eq!(app.account_generation, before, "minting re-reads nothing");
+}
+
+/// THE CARD OFFERS ONLY WHAT CONSENSUS WOULD ACCEPT: founding only while there
+/// is no account, and never the removal of the last key (the module refuses
+/// it, and a button that always refuses is a lie).
+#[test]
+fn the_account_card_gates_founding_and_the_last_key() {
+    let settings = include_str!("../ui/screens/settings.ice");
+    let create = settings.find("#account-create").expect("the create input");
+    assert!(
+        settings[..create].rfind("if !account_exists").is_some(),
+        "founding is offered only while there is no account"
+    );
+    let remove = settings
+        .split_once(r#"button "Remove" -> emit(account_key_remove, row.pubkey)"#)
+        .expect("the remove button")
+        .1;
+    let gate_line = remove
+        .split_once("disabled=")
+        .expect("its gate")
+        .1
+        .lines()
+        .next()
+        .unwrap_or_default();
+    assert!(
+        gate_line.contains("account_keys <= 1"),
+        "the last key is never offered for removal: {gate_line}"
     );
 }

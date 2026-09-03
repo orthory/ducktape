@@ -13,6 +13,9 @@ sim = []
 [dependencies]
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+# One line's worth: the silent drop of an arrival from an untracked `/128`
+# (`OverlaySockets::note_unknown_source`) is otherwise unobservable anywhere.
+tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "io-util", "net"] }
 
 [dev-dependencies]

@@ -3,16 +3,16 @@
 //! pool + optional replica-restart recovery-by-replay), then the park
 //! `loop` itself (serve window, drain pass, detection lane, ascension), and
 //! finally the promotion checkpoint + [`reboot_self`]. one function on
-//! purpose (decision 2 in the plan): the join gate phase (ADR §3.3), the
-//! loop's `not_serving` closure, and its mountain of loop-scoped state never
-//! leave it, so splitting sub-phases into separate functions would just turn
-//! them back into a carrier struct with more steps.
+//! purpose: the join gate phase, the loop's `not_serving` closure, and its
+//! mountain of loop-scoped state never leave it, so splitting sub-phases into
+//! separate functions would just turn them back into a carrier struct with
+//! more steps.
 
 use commonware_codec::DecodeExt as _;
 use commonware_consensus::simplex::scheme::ed25519 as simplex_ed25519;
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_p2p::authenticated::lookup;
 use commonware_p2p::Receiver as P2pReceiver;
+use commonware_p2p::authenticated::lookup;
 use commonware_runtime::{Clock, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
 use recovery::{Manifest, Recovery};
@@ -40,8 +40,8 @@ use super::wiring::ReplicaChannels;
 use crate::validator::PromotionBaton;
 
 use sdk::StateRoot;
+use statesync::fetch_manifest;
 use statesync::p2p::P2pSyncClient;
-use statesync::{fetch_manifest, fetch_tip_coords};
 use std::time::Duration;
 
 /// one direct-peer sample off this lane's registry: the exposition parse
@@ -55,10 +55,63 @@ async fn peers_sample(
     host: Option<&host::Host>,
     announce_targets: &[ed25519::PublicKey],
     height: u64,
+    builds: &std::collections::BTreeMap<String, String>,
 ) -> noded::peers::PeersView {
     let (validators, residents) = replica_roles(host, announce_targets).await;
     noded::peers::peers_from_exposition(&exposition, crate::util::unix_ms(), height, None)
         .with_roles(&validators, &residents)
+        .with_builds(builds)
+}
+
+/// Record the build stamp a polled sync source just reported, and name a
+/// disagreement ONCE.
+///
+/// Detection only, by ruling: nothing here refuses a peer, drops a
+/// connection, re-routes a source or gates admission — two builds whose
+/// consensus logic has drifted still finalize together, and this only makes
+/// the drift visible on `node peers` and greppable in the log.
+///
+/// The latch is keyed on `(peer, stamp)`, so a peer stuck on a foreign build
+/// warns once however long it stays wrong, and a peer flapping between two
+/// builds warns twice rather than once per poll — the detection cadence is
+/// `RESIDENT_FALLBACK_POLL`, which an unlatched warn would turn into a slow
+/// drip that evicts the ring.
+/// `mine` is passed rather than read here so the decision is a function of its
+/// arguments: this node's own stamp is an `option_env!` fixed at compile time,
+/// and a rule that read it directly could only be exercised on a build that
+/// happened to have one.
+fn note_source_build(
+    mine: &str,
+    peer: &str,
+    reported: Option<&str>,
+    builds: &mut std::collections::BTreeMap<String, String>,
+    warned: &mut std::collections::BTreeSet<(String, String)>,
+) {
+    // the same filter the skew rule applies, so the map and the rule agree on
+    // what a stamp IS: a server that could not identify its own build — by
+    // saying nothing, or by naming the literal `unknown` — said nothing, and
+    // that is not a disagreement. leave the surface's `unknown` standing.
+    let Some(theirs) = reported.filter(|it| *it != noded::services::UNKNOWN_BUILD) else {
+        return;
+    };
+    builds.insert(peer.to_string(), theirs.to_string());
+    match crate::services::Skew::between(mine, Some(theirs)) {
+        crate::services::Skew::Matched | crate::services::Skew::Unknown => {}
+        crate::services::Skew::Skewed => {
+            let first_sighting = warned.insert((peer.to_string(), theirs.to_string()));
+            if !first_sighting {
+                return;
+            }
+            tracing::warn!(
+                target: "ducktape::node",
+                peer = %peer,
+                ours = %mine,
+                theirs = %theirs,
+                reason = "build_stamp_mismatch",
+                "sync source is running a different build — roots can diverge silently"
+            );
+        }
+    }
 }
 
 /// the replica's valset standing, hex-keyed: the serving host's committed
@@ -86,7 +139,10 @@ async fn replica_roles(
                 .collect(),
         ),
         None => (
-            announce_targets.iter().map(|k| hex_bytes(k.as_ref())).collect(),
+            announce_targets
+                .iter()
+                .map(|k| hex_bytes(k.as_ref()))
+                .collect(),
             std::collections::BTreeSet::new(),
         ),
     }
@@ -150,6 +206,7 @@ async fn shutdown_reach_plane(
 /// section rides along so index watermarks stay current with the boundary,
 /// and the peers standing rides too (the off-lane /v1/peers composition
 /// reads it beside the live exposition).
+#[allow(clippy::too_many_arguments)]
 async fn publish_replica_status(
     status: &noded::StatusCell,
     metrics: &noded::NodeMetrics,
@@ -158,6 +215,7 @@ async fn publish_replica_status(
     status_public_key: &str,
     announce_targets: &[ed25519::PublicKey],
     serving: Option<(u64, &host::Host)>,
+    builds: &std::collections::BTreeMap<String, String>,
 ) {
     metrics.update_storage(
         ckpt_height.unwrap_or_default(),
@@ -185,11 +243,12 @@ async fn publish_replica_status(
         None => (0, String::new(), Vec::new()),
     };
     status.publish(noded::NodeStatus {
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: crate::build_version(),
         root_hash,
         height,
         modules,
         public_key: status_public_key.into(),
+        chain_id: String::new(),
         operations: metrics.operational_status(),
     });
     // the same standing the retired per-request sample attested; the epoch
@@ -201,6 +260,9 @@ async fn publish_replica_status(
         residents,
         height,
         epoch: None,
+        // the stamps this lane's detection polls have heard so far; see
+        // `note_source_build`.
+        builds: builds.clone(),
     });
 }
 
@@ -227,6 +289,7 @@ pub(super) async fn park(
     session_manager: Option<noded::TerminalSessions>,
     session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
     local_gateway_via: String,
+    node_api_ports: Vec<u16>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     metrics: noded::NodeMetrics,
@@ -241,6 +304,7 @@ pub(super) async fn park(
     duckfs_dir: std::path::PathBuf,
     manifest: &Option<Manifest>,
     recovery: Recovery<commonware_runtime::tokio::Context>,
+    genesis: &crate::config::GenesisModules,
 ) -> crate::validator::PromotionBaton {
     let ReplicaChannels {
         context,
@@ -269,7 +333,7 @@ pub(super) async fn park(
         "joining: awaiting redemption"
     );
     let media_peers = if wireguard_listen.is_some() {
-        let tracked = crate::voice_plane::MediaPeers::new(
+        let tracked = crate::overlay_book::OverlayPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
         );
         tracked.set_peers(peers.iter());
@@ -329,10 +393,10 @@ pub(super) async fn park(
     // handed to the seat if this node is promoted, so the announce keeps its
     // read-through grant across the transition.
     let gateway_book = gateway_requests.map(|requests| {
-        let book = crate::gateway_plane::OverlayBook::new(
+        let book = crate::gateway_plane::OverlayBook::new(crate::overlay_book::OverlayPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-        );
-        book.set_peers(peers.iter());
+        ));
+        book.peers().set_peers(peers.iter());
         crate::gateway_plane::spawn(
             crate::gateway_plane::SpawnConfig {
                 label: label.clone(),
@@ -346,6 +410,7 @@ pub(super) async fn park(
                 planes: planes.clone(),
                 commands: gateway_commands,
                 workspace,
+                node_api_ports,
             },
             requests,
         );
@@ -368,7 +433,7 @@ pub(super) async fn park(
     // the joiner's sync client: the mesh path, ROTATING across every
     // validator that can serve. no unmatched-frame hook: drop-on-miss
     // (the blob fetch lane that consumed those frames is retired). the
-    // real-key standing proof (ADR §5.1) is signed ONCE here with the same
+    // real-key standing proof is signed ONCE here with the same
     // `signer` the join proof uses: pre-admission the server refuses it (key
     // not in standing), once admitted (key in residents) it serves — the
     // client is oblivious to its own standing; the server decides.
@@ -388,7 +453,7 @@ pub(super) async fn park(
         Some(sync_reclaim),
     );
 
-    // the CANDIDATE members the join gate (ADR §3.3) targets — the descriptor's
+    // the CANDIDATE members the join gate targets — the descriptor's
     // validators (inviter ∪ fronts, as discovered). also the resident relay's
     // targets once standing lands; the manifest poll refreshes it to the tip's
     // current members.
@@ -406,6 +471,16 @@ pub(super) async fn park(
     // (awaiting a deliberate promote) — the not-admitted bail below
     // must never fire.
     let mut resident_standing = false;
+    // peer key hex -> the build stamp that peer reported about ITSELF on the
+    // detection lane, and the (peer, stamp) pairs already warned about. the
+    // mesh gossips no stamp, so this only ever holds sources this lane
+    // polled; see `note_source_build`. both die with `park()`: a promoted
+    // node polls nobody, so the `build=` column an operator saw on a joiner
+    // is empty again once it holds a seat.
+    let mut peer_builds: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut warned_builds: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
 
     // ---- the RESIDENT's serving lanes ------------------------------
     //
@@ -505,6 +580,11 @@ pub(super) async fn park(
     // the last checkpoint's (height, oplog position) — the prune
     // anchor: the journal below it drops once the floor passes it.
     let mut replica_prev_ckpt: (Option<u64>, u64) = (None, 0);
+    // the composed root-hash recorded by the last manifest THIS loop wrote —
+    // the periodic checkpoint's change gate, the validator drain's exact
+    // discipline. `None` until the first write, so a restart or a freshly
+    // installed boundary re-anchors on its first cadence hit (#1308).
+    let mut replica_written_root: Option<StateRoot> = None;
     // the root-hash of the last boundary the derived tier followed:
     // the index feed (heal + explorer row + ws event) fires only when
     // the verified root-hash MOVED. an unchanged hash is an idle
@@ -538,6 +618,7 @@ pub(super) async fn park(
             &duckfs_dir,
             ckpt,
             blobs.clone(),
+            genesis,
         )
         .await;
         let mut host = match restored {
@@ -625,7 +706,16 @@ pub(super) async fn park(
             root_hash = %hex(&root),
             "resident: pre-synced boundary {tip} root_hash={}", hex(&root)
         );
-        heal_index(&index, tip, &label);
+        // THE LAST SEAM BEFORE THIS RESIDENT SERVES, and the only one a
+        // restart passes through: the same helper the ascension runs, because
+        // a restart over a WIPED index directory lands here holding nothing
+        // but a floor. The replay above stamped it (`heal_index` at the
+        // checkpoint) and then folded the suffix back on top, so no module is
+        // stale and no later seam looks again — the pre-boundary history is
+        // reachable only here, and only from a source. An unreachable one
+        // leaves every floor standing, which is exactly where this line
+        // stood before.
+        heal_and_backfill_index(&index, &client, tip, &label).await;
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
         metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Serving);
@@ -637,7 +727,9 @@ pub(super) async fn park(
             &status_public_key,
             &announce_targets,
             serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
-        ).await;
+            &peer_builds,
+        )
+        .await;
         tracing::info!(
             event = "node_phase_transition",
             role = "resident",
@@ -730,8 +822,8 @@ pub(super) async fn park(
     // compute daemon serves this node's assigned work and its announcements
     // over /v1, on both tiers alike.
     //
-    // No podman service here either: each service daemon starts its own under
-    // its own root (see the validator boot for the rationale).
+    // No sandbox here either: a run's VMM is a child of the service daemon that
+    // started it (see the validator boot for the rationale).
     // A resident discovers nothing and executes nothing: the compute daemon
     // does both, and reaches consensus through this node's own /v1 surface —
     // which serves a resident's committed queries and relays its submits
@@ -740,12 +832,12 @@ pub(super) async fn park(
     // (`crate::announce`) retracts it, both over that same /v1 surface. A
     // resident therefore runs no announce pump at all.
 
-    // ── THE JOIN GATE rides first contact now (join ADR §4) ────────────────
+    // ── THE JOIN GATE rides first contact now ──────────────────────────────
     // a fresh TOKENED joiner's sealed intro IS its gate request: the wiring
     // phase's first-contact race announces it to every candidate member's
     // doorbell, and the settled outcome comes back over the same tunnel —
     // `Admitted` sets the shared `admitted` flag (cap persisted, token
-    // deleted, by that task), a terminal `Rejected` exits there (R2). the
+    // deleted, by that task), a terminal `Rejected` exits there. the
     // loop below just picks the flag up; the RESTORE path (persisted
     // standing) and the token-less MANUAL path (out-of-band pubkey, admitted
     // by `node resident accept`/`node member promote`) keep their existing detection.
@@ -865,7 +957,7 @@ pub(super) async fn park(
                                 "this node is not a member — join requests queue on \
                                  validators",
                             ),
-                            // the node-owned join state (ADR §6): derived from
+                            // the node-owned join state: derived from
                             // the gate outcome + committed chain progress this
                             // loop already holds — never a scattered guess. a
                             // TERMINAL reject exits the process before the loop,
@@ -898,6 +990,7 @@ pub(super) async fn park(
                                         serving.as_ref().map(|(_, node_r)| node_r.host()),
                                         &announce_targets,
                                         serving.as_ref().map(|(h, _)| *h).unwrap_or(0),
+                                        &peer_builds,
                                     )
                                     .await,
                                 ),
@@ -1079,6 +1172,7 @@ pub(super) async fn park(
                                         &status_public_key,
                                         &announce_targets,
                                         None,
+                                        &peer_builds,
                                     ).await;
                                     metrics.record_sync_failure(e.detail.clone());
                                     replica_scheme = None;
@@ -1169,6 +1263,7 @@ pub(super) async fn park(
                                             &status_public_key,
                                             &announce_targets,
                                             None,
+                                            &peer_builds,
                                         ).await;
                                         metrics.record_sync_failure(e.detail.clone());
                                         metrics.set_role_phase(
@@ -1335,7 +1430,9 @@ pub(super) async fn park(
                     &status_public_key,
                     &announce_targets,
                     Some((*served_height, node_r.host())),
-                ).await;
+                    &peer_builds,
+                )
+                .await;
             }
             // ---- valset orchestration (the replica mirror) --------
             //
@@ -1392,10 +1489,8 @@ pub(super) async fn park(
                         .difference(members)
                         .cloned()
                         .collect();
-                    let plan_resident_bytes: Vec<Vec<u8>> = plan_residents
-                        .iter()
-                        .map(|k| k.as_ref().to_vec())
-                        .collect();
+                    let plan_resident_bytes: Vec<Vec<u8>> =
+                        plan_residents.iter().map(|k| k.as_ref().to_vec()).collect();
                     // THE ACTIVATION CUTOVER THAT SEATS THIS KEY: promotion
                     // is decided HERE, off this node's own folded state —
                     // never by polling members, who may already be halted
@@ -1416,7 +1511,8 @@ pub(super) async fn park(
                         // index when the change committed. the epoch-plane
                         // books follow the cutover, like the validator.
                         if let Some(book) = &gateway_book {
-                            book.set_peers(plan.valset().transport_members().iter());
+                            book.peers()
+                                .set_peers(plan.valset().transport_members().iter());
                         }
                         if let Some(peers) = &media_peers {
                             peers.set_peers(plan.valset().transport_members().iter());
@@ -1424,8 +1520,7 @@ pub(super) async fn park(
                         // the follower swap: same OrderedNode, fresh
                         // orderer, cutover journaled — the epoch-local
                         // view clock restarts with the new base.
-                        let follower =
-                            consensus::FollowerOrderer::new(replica_store.clone());
+                        let follower = consensus::FollowerOrderer::new(replica_store.clone());
                         if let Err(e) = node_r
                             .cutover(
                                 follower,
@@ -1438,8 +1533,7 @@ pub(super) async fn park(
                         {
                             fatal!(label, "replica cutover journal write: {e}");
                         }
-                        replica_scheme =
-                            Some(replica_verifier(&namespace, &member_bytes));
+                        replica_scheme = Some(replica_verifier(&namespace, &member_bytes));
                         replica_epoch = plan.epoch();
                         replica_view_base = plan.cutover_app_height();
                         replica_watermark = None;
@@ -1453,6 +1547,15 @@ pub(super) async fn park(
                         // an unpaid cooldown from the previous checkpoint would
                         // otherwise hold this one off for minutes.
                         checkpoint_not_before = context.current();
+                        // ...and the CHANGE GATE with it. A cutover moves the
+                        // manifest's epoch/view_base WITHOUT moving the state
+                        // root, so `state_moved` is false at exactly the moment
+                        // the new boundary must reach disk. `None` is the gate's
+                        // own "re-anchor on the first cadence hit", so the force
+                        // stays a force. The validator's post-cutover checkpoint
+                        // escapes the gate by living in its own branch; the
+                        // replica routes through the shared one, so it clears it.
+                        replica_written_root = None;
                         tracing::info!(
                             target: "ducktape::consensus",
                             node = %label,
@@ -1501,12 +1604,15 @@ pub(super) async fn park(
             // epoch coordinates describe). journal pruning stays the
             // validator's concern for now (a replica's journal prunes
             // at its next ascension checkpoint).
-            if crate::drain_actions::checkpoint_due(
-                blocks_since_checkpoint,
-                checkpoint_blocks,
-                context.current(),
-                checkpoint_not_before,
-            ) && let Some(f) = node_r.finalized()
+            if let Some(f) = node_r.finalized()
+                && crate::drain_actions::checkpoint_due(
+                    blocks_since_checkpoint,
+                    checkpoint_blocks,
+                    context.current(),
+                    checkpoint_not_before,
+                    f.root_hash,
+                    replica_written_root,
+                )
             {
                 let pos = node_r.sink_mut().oplog_pos().await;
                 let checkpoint_started = context.current();
@@ -1573,6 +1679,7 @@ pub(super) async fn park(
                                 );
                             }
                             replica_prev_ckpt = (ckpt.height, pos);
+                            replica_written_root = Some(ckpt.root_hash);
                             blocks_since_checkpoint = 0;
                             let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
                                 b.duration_since(a).unwrap_or_default().as_millis()
@@ -1625,8 +1732,9 @@ pub(super) async fn park(
         // same process. a quorum-widening cutover HALTS the members awaiting
         // this very node's votes, so nothing here may fetch from them.
         if let Some(seat) = seat_plan {
-            let (folded_tip, mut node_r) =
-                serving.take().expect("a seat plan only forms while serving");
+            let (folded_tip, mut node_r) = serving
+                .take()
+                .expect("a seat plan only forms while serving");
             metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Draining);
             tracing::info!(
                 event = "node_phase_transition",
@@ -1749,8 +1857,13 @@ pub(super) async fn park(
             continue;
         }
         next_manifest_fetch = std::time::Instant::now() + RESIDENT_FALLBACK_POLL;
-        let tip = match fetch_tip_coords(&client).await {
-            Ok(tip) => tip,
+        // the answering peer comes back WITH the answer: the client's source
+        // cursor is shared with every lane holding a clone of it (the pack
+        // sweeper rotates it on its own failures), so a read taken after the
+        // await could name a peer that answered nothing — and this poll puts
+        // that name on a build stamp and in a warn.
+        let (tip, source) = match client.fetch_tip_coords().await {
+            Ok(answered) => answered,
             Err(e) => {
                 // this poll runs POST-admission (the gate already granted
                 // standing, or this is the manual/restore path); a fetch miss
@@ -1767,6 +1880,15 @@ pub(super) async fn park(
                 continue;
             }
         };
+        // the source's own build stamp rode along with the coordinates.
+        // record it for the peers surface and name a disagreement once.
+        note_source_build(
+            noded::services::build_identity_or_unknown(),
+            &hex_bytes(source.as_ref()),
+            tip.build.as_deref(),
+            &mut peer_builds,
+            &mut warned_builds,
+        );
         // follow the mesh rotation while parked: track the tip's
         // REPLICATED generation window — the identical snapshots every
         // member tracks, so a parked joiner's tracked sets can never
@@ -1797,7 +1919,7 @@ pub(super) async fn park(
                     .filter_map(|key| ed25519::PublicKey::decode(key.as_slice()).ok())
                     .collect();
                 if let Some(book) = &gateway_book {
-                    book.set_peers(transport.iter());
+                    book.peers().set_peers(transport.iter());
                 }
                 if let Some(peers) = &media_peers {
                     peers.set_peers(transport.iter());
@@ -1876,12 +1998,15 @@ pub(super) async fn park(
                 &status_public_key,
                 &announce_targets,
                 None,
-            ).await;
+                &peer_builds,
+            )
+            .await;
             metrics.set_role_phase(noded::NodeRole::Resident, noded::NodePhase::Syncing);
             replica_scheme = None;
             replica_orchestrator = None;
-            recovery_slot =
-                Some(reopen_recovery(&context, &mut recovery_reopens, &label, code_source.clone()).await);
+            recovery_slot = Some(
+                reopen_recovery(&context, &mut recovery_reopens, &label, code_source.clone()).await,
+            );
         }
         if !member_in_tip {
             // the tip names the CURRENT members — better announce
@@ -1961,6 +2086,7 @@ pub(super) async fn park(
                             blobs: blobs.clone(),
                         },
                         attempt,
+                        genesis,
                     )
                     .await
                     {
@@ -2111,19 +2237,18 @@ pub(super) async fn park(
                             // ascension tip; per-block folds keep it
                             // current from here (no more healing).
                             if last_indexed_root.as_ref() != Some(&root) {
-                                // the stamp, then the SOURCE'S OWN op rows
-                                // below it — inline, while this node is not
-                                // yet serving and not yet folding live
+                                // the SOURCE'S OWN op rows, under whatever
+                                // this node already holds — inline, while it
+                                // is not yet serving and not yet folding live
                                 // blocks. that window is the whole
                                 // correctness argument for writing straight
                                 // into the feed (see
                                 // `heal_and_backfill_index`), and it closes
                                 // at `serving = Some(..)` below.
                                 heal_and_backfill_index(&index, &client, tip, &label).await;
-                                if let Err(err) = index.apply_block_record(
-                                    tip,
-                                    boundary_block_row(tip, &root),
-                                ) {
+                                if let Err(err) =
+                                    index.apply_block_record(tip, boundary_block_row(tip, &root))
+                                {
                                     tracing::warn!(
                                         target: "ducktape::modules",
                                         node = %label,
@@ -2158,7 +2283,9 @@ pub(super) async fn park(
                                 &status_public_key,
                                 &announce_targets,
                                 serving.as_ref().map(|(h, node_r)| (*h, node_r.host())),
-                            ).await;
+                                &peer_builds,
+                            )
+                            .await;
                             tracing::info!(
                                 event = "node_phase_transition",
                                 role = "resident",
@@ -2267,6 +2394,7 @@ pub(super) async fn park(
                 blobs: blobs.clone(),
             },
             attempt,
+            genesis,
         )
         .await
         {
@@ -2314,11 +2442,11 @@ pub(super) async fn park(
                         );
                         let boundary = boundary.clone();
                         let boundary_floor = match verify_manifest_floor(&namespace, &boundary) {
-                                Ok(floor) => floor,
-                                Err(e) => {
-                                    fatal!(label, "promotion floor verify: {e}");
-                                }
-                            };
+                            Ok(floor) => floor,
+                            Err(e) => {
+                                fatal!(label, "promotion floor verify: {e}");
+                            }
+                        };
                         tracing::debug!(
                             target: "ducktape::join",
                             from = boundary.height,
@@ -2333,10 +2461,9 @@ pub(super) async fn park(
                         });
                         // THE LAST MOMENT A SYNC CLIENT EXISTS: `run_promoted`
                         // seats from the baton and never sees one, so the
-                        // op-row backfill has to run here. it stamps first
-                        // (the wipe would eat anything written before it) at
-                        // exactly the boundary `run_promoted` heals against,
-                        // which makes that later heal the no-op it should be.
+                        // op-row backfill has to run here — at exactly the
+                        // boundary `run_promoted` heals against, which makes
+                        // that later heal the no-op it should be.
                         heal_and_backfill_index(&index, &client, boundary.height, &label).await;
                         break (boundary, host, floor);
                     }
@@ -2445,5 +2572,51 @@ pub(super) async fn park(
         prev_ckpt: (Some(boundary.height), pos),
         mesh_window,
         mesh_book,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::note_source_build;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// the whole detection rule in one pass: a stamp is recorded for the peer
+    /// that reported it, a disagreement is named ONCE per (peer, stamp), and
+    /// an unknown on either side is never a disagreement.
+    #[test]
+    fn a_skewed_source_is_named_once_and_an_unknown_one_never() {
+        let mut builds = BTreeMap::new();
+        let mut warned = BTreeSet::new();
+
+        // agreeing: recorded for the surface, nothing warned.
+        note_source_build("abc1234", "aa", Some("abc1234"), &mut builds, &mut warned);
+        assert_eq!(builds.get("aa").map(String::as_str), Some("abc1234"));
+        assert!(warned.is_empty());
+
+        // disagreeing: recorded, and named exactly once however often the
+        // detection poll re-observes it.
+        for _ in 0..5 {
+            note_source_build("abc1234", "bb", Some("def5678"), &mut builds, &mut warned);
+        }
+        assert_eq!(builds.get("bb").map(String::as_str), Some("def5678"));
+        assert_eq!(
+            warned.iter().collect::<Vec<_>>(),
+            vec![&("bb".to_string(), "def5678".to_string())]
+        );
+
+        // a source that named no build is not a mismatch, and mints no entry:
+        // the surface shows it as unknown rather than as agreeing with us.
+        note_source_build("abc1234", "cc", None, &mut builds, &mut warned);
+        assert!(!builds.contains_key("cc"));
+        // neither is a source that named one while WE cannot name ours.
+        note_source_build(
+            noded::services::UNKNOWN_BUILD,
+            "dd",
+            Some("def5678"),
+            &mut builds,
+            &mut warned,
+        );
+        assert_eq!(builds.get("dd").map(String::as_str), Some("def5678"));
+        assert_eq!(warned.len(), 1, "only the real disagreement was named");
     }
 }

@@ -1,11 +1,11 @@
-//! statesync fail-closed (ADR §5.1, the server half of R4): a validator refuses
+//! statesync fail-closed — the server half: a validator refuses
 //! statesync/manifest service to any key WITHOUT committed standing (validators ∪
 //! residents), so a valid targeted invite alone leaks ZERO chain state.
 //!
-//! The decisive fact this pins is that TRANSPORT reachability is NOT enough. A
-//! pre-admission joiner rides the derived lobby key and an admitted resident
-//! rides it too — same peer identity on `CHANNEL_STATE_SYNC` — so a transport
-//! gate cannot tell them apart. Enforcement is a REQUEST-LEVEL real-key proof
+//! The decisive fact this pins is that TRANSPORT reachability is NOT enough:
+//! mesh admission and committed standing are separate facts — a peer the mesh
+//! authorizes may hold no standing at all — so a transport gate cannot tell
+//! them apart. Enforcement is a REQUEST-LEVEL real-key proof
 //! checked against committed standing. This test drives a peer that is EVEN MORE
 //! privileged than an invite holder — its key is in the founder's descriptor
 //! mesh (`peer_seeds`), so the mesh authorizes it and it CONNECTS — yet it holds
@@ -25,7 +25,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Cluster, poll_until};
-use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 #[test]
 fn a_non_standing_peer_is_refused_statesync() {
@@ -40,19 +40,30 @@ fn a_non_standing_peer_is_refused_statesync() {
     // give the founder REAL, servable state and a finalized boundary, so the
     // ONLY reason node 1 cannot obtain a manifest is the fail-closed refusal —
     // not a server that simply has nothing to serve yet.
-    cluster.submit(0, "directory", &encode_msg(&DirMsg::Set {
-        key: "secret".into(),
-        value: "chain-state".into(),
-    }));
-    poll_until("the founder's write to finalize", Duration::from_secs(30), || {
-        cluster
-            .query(0, "directory", &encode_query(&DirQuery::Get { key: "secret".into() }))
-            .and_then(|raw| decode_reply(&raw).ok())
-            .and_then(|r| match r {
-                DirReply::Value(Some(v)) if v == "chain-state" => Some(()),
-                _ => None,
-            })
-    });
+    cluster.submit(
+        0,
+        "tasks",
+        &encode_task_msg(&TaskMsg::CreateTask {
+            task_id: "secret".into(),
+            title: "chain-state".into(),
+        }),
+    );
+    poll_until(
+        "the founder's write to finalize",
+        Duration::from_secs(30),
+        || {
+            let req = encode_task_query(&TaskQuery::Get {
+                task_id: "secret".into(),
+            });
+            cluster
+                .query(0, "tasks", &req)
+                .and_then(|raw| decode_task_reply(&raw).ok())
+                .and_then(|r| match r {
+                    TaskReply::Task(task) => task.filter(|t| t.title == "chain-state").map(|_| ()),
+                    TaskReply::Tasks(_) => None,
+                })
+        },
+    );
 
     // node 1 (mesh-reachable, NON-STANDING) runs `--sync-only`: it connects to
     // the founder's statesync channel and loops `fetch_manifest`, but every
@@ -61,7 +72,7 @@ fn a_non_standing_peer_is_refused_statesync() {
     let (ok, log) = cluster.run_sync_only(1, Duration::from_secs(35));
     assert!(
         !ok,
-        "a NON-STANDING peer must be REFUSED statesync (fail-closed, ADR §5.1); it \
+        "a NON-STANDING peer must be REFUSED statesync (fail-closed); it \
          instead synced:\n{log}"
     );
     assert!(

@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use provider_host::SandboxBackend;
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer, ed25519};
 use commonware_p2p::Ingress;
+use provider_host::SandboxBackend;
 
 use crate::config::{self, Resolved, hex_bytes};
 
@@ -45,7 +45,7 @@ pub(crate) struct BootEnv {
     /// site so a bad value degrades there instead of aborting boot.
     pub(crate) primary_coordinator: Option<String>,
     /// the TCP relay override (`node.toml coordinator_relay`), raw — consumed
-    /// by the joiner's first-contact wiring (join ADR item 2); `None` derives
+    /// by the joiner's first-contact wiring; `None` derives
     /// the relay from the ambient coordinator there.
     pub(crate) coordinator_relay: Option<String>,
     /// the WireGuard bind/advertise split (`node.toml wireguard_advertised`),
@@ -57,10 +57,9 @@ pub(crate) struct BootEnv {
     pub(crate) checkpoint_blocks: u64,
     pub(crate) dev_demo: bool,
     /// the operator's `[sandbox]` table — HOW a run is isolated on this host.
-    /// `None` = consensus-only: no podman service, no terminal plane. The node
-    /// itself no longer executes provider work, so this drives the pty plane
-    /// and the podman service the compute daemon shares; the daemon resolves
-    /// the same table for its own provider set.
+    /// `None` = consensus-only: no terminal plane, no runs. The node itself no
+    /// longer executes provider work, so this drives the pty plane; the compute
+    /// daemon resolves the same table for its own provider set.
     pub(crate) sandbox: Option<SandboxBackend>,
     /// the same table, gated on the user's `services.toml` compute grant —
     /// `None` when a sandbox is configured but compute was never enabled,
@@ -70,6 +69,10 @@ pub(crate) struct BootEnv {
     /// for its pool's ledger, so the scheduler can never be promised what this
     /// host cannot seat. EMPTY for a consensus-only node.
     pub(crate) sandbox_capacity: BTreeMap<String, u64>,
+    /// the genesis wasm set (descriptor hashes + the bundle dir its bytes are
+    /// read from), carried whole to the three host composers — genesis,
+    /// checkpoint restore, and state sync all seed from it.
+    pub(crate) genesis: config::GenesisModules,
 }
 
 pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
@@ -117,6 +120,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         coordinator_relay,
         wireguard_advertised,
         compute_backend,
+        genesis,
     } = resolved;
     // A key outside the GENESIS validator set is not an error: post-genesis
     // standing is admitted via governance and resolved from the latest
@@ -305,13 +309,39 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
     }
     if let Some(wg) = &wireguard_listen {
         // the backend is always the userspace socket stack now — no field.
-        tracing::info!(
-            target: "ducktape::reachability",
-            node = %label,
-            listen = %wg,
-            endpoint_less = wg.ip().is_unspecified(),
-            "reachability plane configured"
+        let endpoint_less = wg.ip().is_unspecified();
+        let ambient_coordinator = matches!(
+            config::coordinator_ingress(primary_coordinator.as_deref()),
+            Ok(Some(_))
         );
+        // `coordinated` is the coordinated reach TARGET list, not the ambient
+        // coordinator: a non-empty one still proves some coordinator is
+        // configured, which is all the dark-shape predicate asks.
+        let coordinator_configured = ambient_coordinator || !coordinated.is_empty();
+        let dark = wireguard_endpoint_dark(
+            endpoint_less,
+            wireguard_advertised.is_some(),
+            coordinator_configured,
+        );
+        if dark {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                node = %label,
+                listen = %wg,
+                reason = "wireguard_endpoint_less_no_coordinator",
+                "WireGuard bind is unspecified with no `wireguard_advertised` and no \
+                 coordinator — this node's mesh record carries no endpoint, so peers \
+                 cannot dial its tunnel; only tunnels it dials itself will come up"
+            );
+        } else {
+            tracing::info!(
+                target: "ducktape::reachability",
+                node = %label,
+                listen = %wg,
+                endpoint_less,
+                "reachability plane configured"
+            );
+        }
     }
 
     BootEnv {
@@ -349,5 +379,36 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
         sandbox,
         compute_backend,
         sandbox_capacity,
+        genesis,
+    }
+}
+
+/// The DARK WireGuard shape: an unspecified bind advertises no endpoint in
+/// this node's mesh record, and without `wireguard_advertised` or a
+/// coordinator to learn a reflexive endpoint through, no peer can ever
+/// initiate a tunnel to it — joiner↔joiner tunnels stay dark while the LAN
+/// p2p mesh and the chain look healthy. Every example config binds 0.0.0.0,
+/// so this is a config-surface trap, not an operator mistake; boot says so.
+fn wireguard_endpoint_dark(
+    bind_unspecified: bool,
+    advertised: bool,
+    coordinator_configured: bool,
+) -> bool {
+    bind_unspecified && !advertised && !coordinator_configured
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wireguard_endpoint_dark;
+
+    #[test]
+    fn the_dark_shape_is_unspecified_bind_without_advertised_or_coordinator() {
+        assert!(wireguard_endpoint_dark(true, false, false), "the LXC trap");
+        // the desktop shape: unspecified bind, endpoint learned via the coordinator.
+        assert!(!wireguard_endpoint_dark(true, false, true));
+        // an advertised host is dialable regardless of the bind.
+        assert!(!wireguard_endpoint_dark(true, true, false));
+        // a concrete bind advertises itself.
+        assert!(!wireguard_endpoint_dark(false, false, false));
     }
 }

@@ -57,6 +57,14 @@ impl Daemon {
             .arg(format!("127.0.0.1:{port}"))
             .arg("--storage")
             .arg(storage)
+            // the daemon composes its wasm tenants from a modules dir; this
+            // suite points at the repo's kernel fixtures so it needs no
+            // `make install-node` bundle in `~/.ducktape/modules`.
+            .arg("--modules")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../crates/kernel/host/tests/fixtures"
+            ))
             .stdout(Stdio::null())
             // startup failures (port stolen in the free_port window, bad
             // storage) land on stderr — keep it visible or they read as an
@@ -83,6 +91,15 @@ impl Daemon {
         daemon
     }
 
+    /// a duckfs transport whose writes this daemon admits.
+    fn files(&self) -> duckfs_client::http::HttpNode {
+        let token = self.admin_token.clone();
+        duckfs_client::http::HttpNode::new(format!("http://127.0.0.1:{}", self.port))
+            .with_write_auth(std::sync::Arc::new(move |_method, _path, _body| {
+                vec![(noded::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
+            }))
+    }
+
     /// POST the graceful-exit route with this daemon's operator credential —
     /// the ONLY thing that may drive it.
     fn admin_shutdown(&self) -> Option<u16> {
@@ -95,7 +112,12 @@ impl Daemon {
     }
 
     fn await_status(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // generous because genesis COMPILES: every tenant is a wasm component
+        // the daemon cranelift-compiles at boot, and `cargo test` runs this
+        // suite's daemons in parallel — one per test, each compiling the whole
+        // set at once. The bound is only a hang-catcher; the loop below exits
+        // on the daemon's own readiness answer, never on the clock.
+        let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             // liveness BEFORE the probe, never after. If our child lost a race
             // for the port and exited, something else is listening on it — and
@@ -129,7 +151,35 @@ impl Daemon {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> std::io::Result<(u16, serde_json::Value)> {
-        nettest::try_http_json(self.port, method, path, body)
+        let bytes = body
+            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+            .unwrap_or_default();
+        let (status, raw) = self.try_bytes(method, path, "application/json", &bytes)?;
+        Ok((
+            status,
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+        ))
+    }
+
+    /// every request this harness makes carries the daemon's own operator
+    /// credential. The harness OWNS this daemon, so it is the local operator
+    /// the credential names — and every mutating `/v1` route now refuses a
+    /// caller holding neither it nor a user signature.
+    fn try_bytes(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> std::io::Result<(u16, Vec<u8>)> {
+        nettest::try_http_bytes_with(
+            self.port,
+            method,
+            path,
+            content_type,
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &self.admin_token)],
+            body,
+        )
     }
 
     fn request(
@@ -174,7 +224,7 @@ impl Daemon {
             "POST",
             &format!("/v1/index/{module}/view"),
             "application/json",
-            &[],
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &self.admin_token)],
             &body,
         )
         .expect("daemon reachable");
@@ -213,7 +263,8 @@ impl Daemon {
     /// BYTES exactly as received. the json helpers above lossy-decode the
     /// whole response as utf-8, which would corrupt binary chunk bodies.
     fn request_bytes(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
-        nettest::http_bytes(self.port, method, path, "application/octet-stream", body)
+        self.try_bytes(method, path, "application/octet-stream", body)
+            .expect("daemon reachable")
     }
 
     /// open /v1/ws with a minimal rfc6455 client handshake and return the
@@ -368,6 +419,44 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
     })
 }
 
+/// an INCOMPLETE modules dir is refused at argv time, naming the component it
+/// could not read plus the remedy. `main` opens the code source itself, so this
+/// is the ONE completeness decision — before a storage root exists, and never a
+/// stack trace from the actor thread.
+#[test]
+fn an_incomplete_modules_dir_is_refused_before_boot() {
+    let storage = tempfile::TempDir::new().expect("storage dir");
+    // a directory that EXISTS and holds no components: the half-installed
+    // bundle (`make install-node` interrupted, a hand-assembled --modules).
+    let modules = tempfile::TempDir::new().expect("modules dir");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape-noded"))
+        .arg("--storage")
+        .arg(storage.path())
+        .arg("--modules")
+        .arg(modules.path())
+        .output()
+        .expect("spawn ducktape-noded");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "an empty modules dir composes no genesis: {stderr}"
+    );
+    // a path INSIDE the dir, i.e. the component it could not read — never just
+    // the directory. WHICH id comes first is `hash_bundle`'s sorted-by-id walk
+    // and not this test's business.
+    let names_a_component = format!("{}{}", modules.path().display(), std::path::MAIN_SEPARATOR);
+    assert!(
+        stderr.contains(&names_a_component),
+        "refusal names the component it could not read: {stderr}"
+    );
+    assert!(
+        stderr.contains("make install-node"),
+        "refusal carries the remedy: {stderr}"
+    );
+}
+
 /// the embedded daemon runs no mesh, so it never wires a call hub — which
 /// makes the real binary exactly the no-hub case /v1/call/ws must refuse
 /// LOUDLY: 503 at upgrade with a body that says why (the #178 posture — every
@@ -408,25 +497,7 @@ fn full_surface_blocks_authorship_and_ws() {
         .iter()
         .map(|m| m["id"].as_str().expect("module id"))
         .collect();
-    assert_eq!(
-        modules,
-        [
-            "chat",
-            "saga",
-            "dispatch",
-            "tagging",
-            "tasks",
-            "inbox",
-            "automations",
-            "agent",
-            "runs",
-            "pages",
-            "forge",
-            "files",
-            "identity",
-            "gateway"
-        ]
-    );
+    assert_eq!(modules, topology::SIM_BASE);
     let genesis_hash = status["root_hash"].as_str().expect("root_hash").to_string();
 
     // connect before submitting: the stream heartbeats without a subscription,
@@ -638,14 +709,16 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
         block["height"], 4,
         "the receipt should carry the post's inclusion block"
     );
-    // …while the drain tail runs behind it: the oracle follow-up block (5)
-    // commits the result into the dispatch mailbox, and the nudge block (6)
-    // carries the DeliverPending injection that posts the reply — the
-    // never-pop-stack rule made visible in the block arithmetic.
+    // …while the drain tail runs behind it: the saga guest runs the STRICT
+    // lease policy, so the echo worker BIDS for the unassigned announcement
+    // (block 5), answers the re-emitted order that names it (block 6, the
+    // result into the dispatch mailbox), and the nudge block (7) carries the
+    // DeliverPending injection that posts the reply — the never-pop-stack rule
+    // made visible in the block arithmetic.
     assert_eq!(
         daemon.status()["height"],
-        6,
-        "post + oracle follow-up + delivery nudge should all drain"
+        7,
+        "post + oracle bid + oracle result + delivery nudge should all drain"
     );
 
     let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";
@@ -1726,6 +1799,40 @@ fn git_capture(dir: &Path, args: &[&str]) -> std::process::Output {
     git_cmd(dir, args).output().expect("spawn git")
 }
 
+/// a git command against the daemon's smart-HTTP surface, carrying its
+/// operator credential.
+///
+/// `git-receive-pack` refuses a push that proves nothing (#1292): it takes
+/// git's own push certificate, or this node's operator credential. A test that
+/// spawned the daemon IS its operator, and the credential rides `GIT_CONFIG_*`
+/// exactly the way `ops/dogfood-forge.sh` sets it — never an argv, which is
+/// world-readable through /proc.
+fn git_push(daemon: &Daemon, dir: &Path, args: &[&str]) -> std::process::Output {
+    git_cmd(dir, args)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            format!(
+                "{}: {}",
+                noded::admin::ADMIN_TOKEN_HEADER,
+                daemon.admin_token
+            ),
+        )
+        .output()
+        .expect("spawn git")
+}
+
+/// [`git_push`] that must succeed.
+fn git_push_ok(daemon: &Daemon, dir: &Path, args: &[&str]) {
+    let out = git_push(daemon, dir, args);
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        render(&out)
+    );
+}
+
 /// run a git command that must succeed.
 fn git_ok(dir: &Path, args: &[&str]) {
     let out = git_capture(dir, args);
@@ -1786,7 +1893,7 @@ fn git_push_over_http_lands_in_forge_head() {
     git_ok(wd, &["remote", "add", "ducktape", &url]);
 
     // THE gate: a real `git push` to the daemon exits 0 and updates the ref.
-    let push1 = git_capture(wd, &["push", "ducktape", "main"]);
+    let push1 = git_push(&daemon, wd, &["push", "ducktape", "main"]);
     eprintln!("=== git push #1 (create) ===\n{}", render(&push1));
     assert!(
         push1.status.success(),
@@ -1804,7 +1911,7 @@ fn git_push_over_http_lands_in_forge_head() {
     commit_file(wd, "hello.txt", "hi again\n", "second commit");
     let head2 = rev_parse_head(wd);
     assert_ne!(head2, head1, "second commit is a new oid");
-    let push2 = git_capture(wd, &["push", "ducktape", "main"]);
+    let push2 = git_push(&daemon, wd, &["push", "ducktape", "main"]);
     eprintln!("=== git push #2 (fast-forward) ===\n{}", render(&push2));
     assert!(
         push2.status.success(),
@@ -1822,7 +1929,7 @@ fn git_push_over_http_lands_in_forge_head() {
     // advertised head and refuses; forge's HEAD stays put.
     git_ok(wd, &["reset", "--hard", "HEAD~1"]);
     commit_file(wd, "hello.txt", "divergent line\n", "divergent commit");
-    let push3 = git_capture(wd, &["push", "ducktape", "main"]);
+    let push3 = git_push(&daemon, wd, &["push", "ducktape", "main"]);
     eprintln!(
         "=== git push #3 (non-fast-forward, expected reject) ===\n{}",
         render(&push3)
@@ -1871,7 +1978,7 @@ fn git_clone_over_http_round_trips_full_history() {
     commit_file(wd, "readme.md", "line one\n", "first commit");
     commit_file(wd, "readme.md", "line one\nline two\n", "second commit");
     git_ok(wd, &["remote", "add", "ducktape", &url]);
-    let push = git_capture(wd, &["push", "ducktape", "main"]);
+    let push = git_push(&daemon, wd, &["push", "ducktape", "main"]);
     eprintln!("=== git push (2 commits) ===\n{}", render(&push));
     assert!(push.status.success(), "push failed:\n{}", render(&push));
 
@@ -1960,7 +2067,7 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
         commit_file(src, "history.txt", &content, &message);
     }
     git_ok(src, &["remote", "add", "ducktape", &url]);
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let first_head = rev_parse_head(src);
 
     let checkout_root = tempfile::TempDir::new().expect("checkout root");
@@ -1977,7 +2084,7 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
     // A fetch from a non-empty repo has a common first commit. This exercises
     // the intermediate have/NAK round and leaves the worktree at its prior head.
     commit_file(src, "history.txt", "fetched\n", "fetched commit");
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let fetch = git_capture(&checkout, &["fetch", "origin"]);
     eprintln!("=== negotiated git fetch ===\n{}", render(&fetch));
     assert!(
@@ -1994,7 +2101,7 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
     // Advance once more so pull performs its own negotiated fetch, then verify
     // both the ref update and checkout bytes through stock git.
     commit_file(src, "history.txt", "pulled\n", "pulled commit");
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let pull = git_capture(&checkout, &["pull", "--ff-only"]);
     eprintln!("=== negotiated git pull ===\n{}", render(&pull));
     assert!(
@@ -2027,7 +2134,7 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
     git_ok(src, &["init"]);
     commit_file(src, "history.txt", "one\n", "first commit");
     git_ok(src, &["remote", "add", "ducktape", &url]);
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let first_head = rev_parse_head(src);
 
     let mirror_dir = tempfile::TempDir::new().expect("mirror dir");
@@ -2050,7 +2157,7 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
     // origin advances; the re-sync's haves earn an ACK + delta pack, and the
     // mirror must still complete the new head's closure from it.
     commit_file(src, "history.txt", "two\n", "second commit");
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let second_head = rev_parse_head(src);
     fetch(&mirror);
     let second_oid = git2::Oid::from_str(&second_head).expect("head oid");
@@ -2096,7 +2203,11 @@ fn git_push_larger_than_post_buffer_uses_the_probe_path() {
     git_ok(wd, &["remote", "add", "ducktape", &url]);
 
     // `-c http.postBuffer=1` forces git through the large-request probe.
-    let push = git_capture(wd, &["-c", "http.postBuffer=1", "push", "ducktape", "main"]);
+    let push = git_push(
+        &daemon,
+        wd,
+        &["-c", "http.postBuffer=1", "push", "ducktape", "main"],
+    );
     eprintln!("=== probed git push ===\n{}", render(&push));
     assert!(
         push.status.success(),
@@ -2124,12 +2235,13 @@ fn git_push_larger_than_post_buffer_uses_the_probe_path() {
 fn duckfs_engine_round_trips_and_reports_conflict_through_http_node() {
     use duckfs_client::checkout::{CheckoutOptions, checkout_with};
     use duckfs_client::commit::{CommitError, commit};
-    use duckfs_client::http::HttpNode;
 
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
     let base_url = format!("http://127.0.0.1:{}", daemon.port);
-    let node = HttpNode::new(base_url.clone());
+    // the harness owns this daemon, so its duckfs writes carry the operator
+    // credential the daemon minted at boot.
+    let node = daemon.files();
     let opts = CheckoutOptions {
         node_url: base_url.clone(),
         ..Default::default()

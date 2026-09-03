@@ -20,11 +20,11 @@ use crate::config;
 use crate::constants::*;
 use crate::explorer::heal_index;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
-use crate::lobby;
+use crate::join_gate;
 use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
 use crate::sync::catchup::derive_pending_boot;
 use crate::sync::serve::{SyncStateRequest, drive_sync_request};
-use crate::{voice, voice_plane};
+use crate::{overlay_book, voice};
 use futures::StreamExt as _;
 use statesync::SyncServer;
 
@@ -40,12 +40,12 @@ pub(super) struct PreWiring {
     pub(super) sync_rx: super::MeshReceiver,
     pub(super) relay_tx: super::MeshSender,
     pub(super) relay_rx: super::MeshReceiver,
-    pub(super) media_peers: Option<Arc<voice_plane::MediaPeers>>,
+    pub(super) media_peers: Option<Arc<overlay_book::OverlayPeers>>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
-    /// the join GATE's loop end (join ADR §4): forwarded requests arrive here…
-    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
+    /// the join GATE's loop end: forwarded requests arrive here…
+    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<join_gate::GateForward>,
     /// …kept open by this never-sending clone even when no plane was wired…
-    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<join_gate::GateForward>,
     /// …and settled outcomes go back through this shared map.
     pub(super) gate_outcomes: GateOutcomes,
 }
@@ -90,6 +90,10 @@ pub(super) async fn finish(
     gateway_requests: Option<tokio::sync::mpsc::Receiver<noded::GatewayJob>>,
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     gateway_workspace: std::path::PathBuf,
+    node_api_ports: Vec<u16>,
+    // forge's git substrate — the serve lane builds a peer's catch-up objects
+    // straight off it (see `blob_fetch::serve_forge_objects`).
+    forge_repo: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
     initial_member_keys: Vec<ed25519::PublicKey>,
     initial_resident_keys: Vec<ed25519::PublicKey>,
@@ -159,10 +163,10 @@ pub(super) async fn finish(
     // only the process-wide bulk pacer with state sync and follows the same
     // finalized transport-member cut at boot and every epoch transition.
     let gateway_book = gateway_requests.map(|requests| {
-        let book = crate::gateway_plane::OverlayBook::new(
+        let book = crate::gateway_plane::OverlayBook::new(crate::overlay_book::OverlayPeers::new(
             String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
-        );
-        book.set_peers(
+        ));
+        book.peers().set_peers(
             initial_member_keys
                 .iter()
                 .chain(initial_resident_keys.iter()),
@@ -177,6 +181,7 @@ pub(super) async fn finish(
                 planes,
                 commands: gateway_commands,
                 workspace: gateway_workspace,
+                node_api_ports,
             },
             requests,
         );
@@ -196,6 +201,7 @@ pub(super) async fn finish(
             .chain(initial_resident_keys.iter())
             .cloned()
             .collect(),
+        forge_repo,
         blobs,
         sync_monitor,
         sync_tx,
@@ -239,7 +245,6 @@ pub(super) async fn finish(
     }
 }
 
-
 /// the statesync serve lanes, shared by the fresh-boot wiring and the
 /// in-process promotion seat: the ingress bridge, the SERVE task (capture
 /// cache + authed envelope + standing gate + blob demux), and the blob
@@ -257,6 +262,7 @@ pub(super) fn wire_serve_lanes(
     signer: &ed25519::PrivateKey,
     namespace: &[u8],
     initial_transport: Vec<ed25519::PublicKey>,
+    forge_repo: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
     sync_monitor: statesync::monitor::ServeMonitor,
     sync_tx: super::MeshSender,
@@ -301,6 +307,9 @@ pub(super) fn wire_serve_lanes(
     let blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>> =
         Arc::new(std::sync::RwLock::new(initial_transport));
     let sync_blobs = blobs;
+    // one staged catch-up pack per repo, replaced as the next answer lands —
+    // see `blob_fetch::serve_forge_objects`.
+    let served_packs: blob_fetch::ServedPacks = Default::default();
     // the serve-lane blob co-client: this validator's own fetch side of the
     // blob lane. sends ride a sender clone under this node's OWN standing
     // proof (a validator's key is in the committed valset); answers route
@@ -318,12 +327,15 @@ pub(super) fn wire_serve_lanes(
     let sync_lease_serve = sync_lease.clone();
     let mut sync_tx = sync_tx;
     let mut ingress = sync_ingress;
-    // the genesis namespace the standing proof is bound to (ADR §5.1).
+    // the genesis namespace the standing proof is bound to.
     let serve_namespace = namespace.to_vec();
     context
         .child("statesync_serve")
         .spawn(move |_ctx| async move {
             let mut server = SyncServer::new();
+            // the joiner backfill lane's read-ahead: one loop touch reads a
+            // budget of wire pages, and this hands the surplus out.
+            let mut pager = crate::sync::serve::IndexOpsPager::default();
             // every refusal below is a SILENT DROP: "why is this joiner never
             // syncing?" is unanswerable from the serving side, because
             // standing-refused, proof-invalid and malformed all look identical
@@ -333,9 +345,7 @@ pub(super) fn wire_serve_lanes(
             while let Some((peer, bytes)) = ingress.next().await {
                 // mesh frames ride the AUTHENTICATED rpc envelope
                 // (requester ‖ proof ‖ id ‖ body — the id correlates).
-                let Ok((requester, proof, rpc_id, body)) =
-                    statesync::decode_rpc_authed(&bytes)
-                else {
+                let Ok((requester, proof, rpc_id, body)) = statesync::decode_rpc(&bytes) else {
                     if let Some(attempts) = REFUSED.hit("malformed_rpc_envelope") {
                         tracing::debug!(
                             target: "ducktape::statesync",
@@ -363,7 +373,7 @@ pub(super) fn wire_serve_lanes(
                     }
                     continue; // ours — never a request to serve.
                 }
-                // FAIL-CLOSED (ADR §5.1). a transport-key standing gate is
+                // FAIL-CLOSED. a transport-key standing gate is
                 // IMPOSSIBLE at this seam: a pre-admission joiner and an
                 // admitted resident share the derived LOBBY key on this
                 // channel (boot/mesh.rs), so their peer identity is the
@@ -377,12 +387,11 @@ pub(super) fn wire_serve_lanes(
                 //  (2) that key must be in COMMITTED standing (validators ∪
                 //      residents), read fresh per request through the loop
                 //      seam. a valid targeted invite alone yields no standing
-                //      key ⇒ leaks ZERO chain state (R4). the restore path
+                //      key ⇒ leaks ZERO chain state. the restore path
                 //      and validator backfill dial under their real keys —
                 //      which ARE in the valset — so they still sync; an
                 //      admitted resident's key enters residents at its Redeem
-                //      block, so it syncs the instant it is admitted, still
-                //      under the shared lobby transport key.
+                //      block, so it syncs the instant it is admitted.
                 // a failed check DROPS the request (deny-by-default, like the
                 // malformed/non-request drops), never a reply.
                 if !statesync::verify_sync_proof(requester, proof, &serve_namespace) {
@@ -469,6 +478,18 @@ pub(super) fn wire_serve_lanes(
                         offset,
                         len,
                     } => blob_fetch::serve_blob_range(&sync_blobs, &digest, offset, len),
+                    // forge object catch-up: also host state, built off this
+                    // node's own git substrate — SyncServer cannot see it.
+                    statesync::SyncRequest::ForgeObjects { repo, head, bases } => {
+                        blob_fetch::serve_forge_objects(
+                            &forge_repo,
+                            &sync_blobs,
+                            &served_packs,
+                            &repo,
+                            head,
+                            &bases,
+                        )
+                    }
                     req => {
                         // renew the sync retention lease: this node is
                         // actively serving a syncer, so the drain defers
@@ -477,15 +498,14 @@ pub(super) fn wire_serve_lanes(
                             crate::sync::serve::unix_now_secs(),
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        drive_sync_request(&mut server, &state_tx, req).await
+                        drive_sync_request(&mut server, &mut pager, &state_tx, req).await
                     }
                 };
-                let framed = statesync::encode_rpc_authed(
-                    &[0u8; 32],
-                    &[0u8; 64],
-                    rpc_id,
-                    &statesync::encode_response(&resp),
-                );
+                // the mesh cap is enforced HERE, on every response kind: the
+                // sender asserts on it, so an over-cap reply becomes an
+                // `Error` the requester can act on, never a send.
+                let (resp, body) = crate::sync::serve::encode_bounded_response(resp);
+                let framed = statesync::encode_rpc(&[0u8; 32], &[0u8; 64], rpc_id, &body);
                 // the serve-lane observation (`ducktape_statesync_serve_*`):
                 // who pulled what, and the progression the response
                 // itself proves (served boundary / frame heights).
@@ -642,10 +662,10 @@ pub(super) async fn wire(
     // the ingress select arm and the drain-resolution/expiry code.
     let (relay_tx, relay_rx) = network.register(CHANNEL_SUBMIT_RELAY, quota, MAX_BACKLOG);
 
-    // the voice + video hub: huddle media between members. per the
-    // per-use data-plane ADR (docs/adr/2026-07-07-per-use-data-plane.mdx),
-    // media rides the OVERLAY — audio+control on Service::Voice's overlay
-    // socket (45902), camera on Service::Video's (45903) — never the mesh.
+    // the voice + video hub: huddle media between members. one per-use data
+    // plane per service: media rides the OVERLAY — audio+control on
+    // Service::Voice's overlay socket (45902), camera on Service::Video's
+    // (45903) — never the mesh.
     let media_peers = {
         // media needs the overlay: with no overlay (fake effect, or the
         // reachability plane unconfigured) there is no media transport at
@@ -655,7 +675,7 @@ pub(super) async fn wire(
         if overlay_capable {
             // tracked media set = transport members ∪ residents, refreshed
             // on every valset cutover (below, beside the statesync book).
-            let peers = voice_plane::MediaPeers::new(
+            let peers = overlay_book::OverlayPeers::new(
                 String::from_utf8(namespace.clone()).expect("namespace is utf-8"),
             );
             peers.set_peers(
@@ -699,12 +719,12 @@ pub(super) async fn wire(
     let (reach_p2p_tx, mut reach_p2p_rx) =
         network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
     // the join GATE's two connectors between the intro doorbell (the plane's
-    // thread) and the validator run loop (join ADR §4): verified gate requests
+    // thread) and the validator run loop: verified gate requests
     // forward in over the channel; resolved outcomes ride back through the
     // shared map. created whether or not the plane runs — the loop's select
     // arm stays wired either way (the keepalive sender keeps it pending, not
     // None-spinning, when no doorbell exists to ring it).
-    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<lobby::GateForward>(256);
+    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<join_gate::GateForward>(256);
     let gate_outcomes = GateOutcomes::default();
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> =
         match wireguard_listen {
@@ -750,7 +770,7 @@ pub(super) async fn wire(
                     invite_listen,
                     coord_cap.clone(),
                     // MEMBER side: the doorbells ring the join gate through
-                    // to this validator's run loop (§4).
+                    // to this validator's run loop.
                     Some(GateHook {
                         forward: gate_fwd_tx.clone(),
                         outcomes: gate_outcomes.clone(),

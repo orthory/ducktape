@@ -1,0 +1,139 @@
+[package]
+name = "noded"
+edition.workspace = true
+version.workspace = true
+
+# the ducktape node daemon LIBRARY: owns ONE embedded `host::Host` on a
+# dedicated actor thread (the host is deliberately non-Send) and exposes it to
+# clients over http + websocket — POST /v1/submit (one msg = one block), POST
+# /v1/query (read committed state), GET /v1/status (version + root-hash +
+# module roots), POST /v1/admin/shutdown (graceful exit), GET /v1/ws (a
+# block-finalized event stream). Three processes serve this surface: the
+# `ducktape-noded` daemon (bin/noded), the `ducktape` validator (bin/node) and
+# the deterministic simnode twin (bin/simnode); every ducktape app build is a
+# client of one of them.
+
+[features]
+# the in-process daemon testkit (`noded::testkit`): a real Host + router on
+# loopback threads, for e2e harnesses. dev-only — consumers enable it as a
+# dev-dependency feature, so it never compiles into the shipping node.
+testkit = ["dep:nettest"]
+
+[dependencies]
+# the shared raw-http/port/poll test client — only pulled by the `testkit`
+# feature (the in-proc daemon's readiness probe), never in a normal build.
+nettest = { path = "../testing/nettest", optional = true }
+# streamed gateway response bodies (GatewayBody chunks + Body::from_stream relay).
+bytes = "1"
+# the host-side qmdb store handle injected into disk-backed modules.
+statesync = { workspace = true }
+host = { workspace = true }
+sdk = { workspace = true }
+# the ONE module composer (`src/compose.rs`): the topology names each module's
+# shape, wasm-host wraps the component over its backing, and the three native
+# system modules (valset/lifecycle/kv) plus the two odb substrates (files/forge)
+# are the only constructors it calls by name.
+topology = { workspace = true }
+wasm-host = { workspace = true }
+valset = { workspace = true }
+lifecycle = { workspace = true }
+kv = { workspace = true }
+files = { workspace = true }
+chat = { workspace = true }
+# the `/v1/call/ws` framing (the webview leg of a huddle) and the voice frame size.
+media-service = { workspace = true }
+tasks = { workspace = true }
+identity = { workspace = true }
+gateway = { workspace = true }
+agent = { workspace = true }
+runs = { workspace = true }
+dispatch = { workspace = true }
+tagging = { workspace = true }
+compute-service = { workspace = true }
+# the interactive-terminal wire: this node holds the rings, the ws topics and
+# the admission decisions; the agent daemon on the other end of `wire` holds the
+# ptys. Linking the crate is how both sides agree on the protocol — the node
+# never constructs a `Sessions`.
+agent-service = { workspace = true }
+# host-side provider discovery: the dispatch worker runs the operator's locally
+# installed executor CLIs (BYO), never any credential file.
+provider-host = { workspace = true }
+saga = { workspace = true }
+# the forge module's wire types — the git smart-HTTP receive-pack bridge encodes
+# ForgeMsg::PushRefs / ForgeQuery::HeadOf onto the actor lane (the ONE forge-specific
+# route pair; every other route stays module-agnostic opaque json).
+forge = { workspace = true }
+# `git push --signed`: the bridge dearmors the push certificate's OpenSSH
+# signature and refuses a bad one early (consensus re-verifies regardless).
+keyscheme = { workspace = true }
+# duckfs wire/path/object helpers used by the daemon's HTTP and workspace
+# adapter surfaces without depending on the module adapter re-export.
+duckfs-core = { workspace = true }
+# the node-local op-receipt blob store (the http blob lane): op payloads staged
+# at submit time, served back by digest. re-exported by `src/blobs.rs`.
+blobstore = { workspace = true }
+# the derived read-model tier: the actor feeds per-module fluent31 databases
+# as blocks commit; each module's bundled wasm index guest folds them and
+# serves its view endpoint. /v1/index/* serves snapshot reads.
+indexer = { workspace = true }
+# decoding the borsh op-row envelopes for the /v1/index/*/ops json projection.
+borsh = { workspace = true }
+# the ONE invite TTL policy (default + bounds) `/v1/invite` shares with the
+# `ducktape node invite` verb — two doors, one number.
+workspace-config = { workspace = true }
+# the duckfs checkout/commit engine: the workspace RPC (/v1/fs/workspaces) drives
+# it over an actor-lane `NodeApi` adapter, so the daemon manages checkouts with
+# no self-dial. NOT a consensus-path crate — a client engine, OS-side only.
+duckfs-client = { workspace = true }
+# the workspace RPC decodes file-read replies (base64) off the actor lane.
+base64 = { workspace = true }
+# forge attribution emails include a bounded sha256-derived suffix so distinct
+# committed agent ids cannot collapse onto the same synthetic address.
+sha2 = { workspace = true }
+# the op-frame codec. `/v1/submit/frame` VERIFIES an already-signed frame before
+# it reaches any actor, and the embedded daemon takes the op's origin from that
+# verification — never from a caller-supplied string. same codec every validator
+# runs, so one definition of "who signed this op".
+node = { workspace = true }
+# the per-run agent session keypair: minted with the SAME ed25519 types
+# `node::encode_frame` signs with (no second crypto stack, no hand-rolled key).
+commonware-cryptography = { workspace = true }
+commonware-codec = { workspace = true }
+
+commonware-runtime = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+# the service-daemon lane (`node_link`): a daemon reaches its node over the
+# node's own /v1 surface, never the in-process actor channel.
+reqwest = { workspace = true }
+rand = "0.8"
+async-trait = { workspace = true }
+futures = "0.3"
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
+# inflate a gzip-compressed git receive-pack request body (Content-Encoding: gzip).
+flate2 = "1"
+# the git upload-pack (clone/fetch) lane opens a forge repo READ-ONLY and builds
+# the wanted oids' closure into a packfile. same vendored libgit2 forge builds,
+# so the node stays self-contained (no host `git`); default-features drops the
+# ssh/https transport forge doesn't use either.
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+# the log subscriber every bin installs (src/log.rs): ONE reloadable filter over
+# stderr + the ws-streamed LogRing. `reload` backs POST /v1/log-filter.
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# MemStore: the in-memory MerkleStore double behind store-backed modules in
+# the in-crate provision tests.
+sdk-testkit = { workspace = true }
+# the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
+nettest = { path = "../testing/nettest" }
+tokio-tungstenite = "0.24"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["test-util"] }
+# isolated storage roots for the admin-token, git-lane and testkit tests.
+tempfile = "3"

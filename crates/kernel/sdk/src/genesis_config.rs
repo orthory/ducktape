@@ -17,11 +17,12 @@
 //! state-sync nothing special happens: the checkpoint snapshot carries
 //! `__config` like any other store key.
 //!
-//! the encoding is deliberately minimal and versioned: a version byte, a
-//! `u64-le` count, then per parameter a length-prefixed utf-8 key and a
-//! length-prefixed byte value, with keys strictly increasing so one parameter
-//! set has exactly one encoding. host and guests share THIS module (sdk is the
-//! one crate both sides already depend on), so the two ends can never drift.
+//! the encoding is deliberately minimal: a `u64-le` count, then per parameter
+//! a length-prefixed utf-8 key and a length-prefixed byte value, with keys
+//! strictly increasing so one parameter set has exactly one encoding. there
+//! is no version byte — the frame is a fixed shape (flag-day rule: no in-band
+//! version). host and guests share THIS module (sdk is the one crate both
+//! sides already depend on), so the two ends can never drift.
 
 use crate::Error;
 use crate::codec::{Cursor, push_bytes, push_str};
@@ -29,15 +30,12 @@ use crate::codec::{Cursor, push_bytes, push_str};
 /// the reserved host-store key the config travels under.
 pub const CONFIG_KEY: &[u8] = b"__config";
 
-/// The current encoding tag.
-pub const CONFIG_VERSION: u8 = 1;
-
 /// canonical bytes of a genesis parameter list. keys must be strictly
 /// increasing (one parameter set, one encoding) — the caller is the host's
 /// genesis wiring handing a fixed literal slice, so a violation is a
 /// programming error and panics rather than encoding ambiguity.
 pub fn encode_config(params: &[(&str, &[u8])]) -> Vec<u8> {
-    let mut out = vec![CONFIG_VERSION];
+    let mut out = Vec::new();
     out.extend_from_slice(&(params.len() as u64).to_le_bytes());
     let mut prev: Option<&str> = None;
     for (key, value) in params {
@@ -52,19 +50,13 @@ pub fn encode_config(params: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 
-/// strict decode of genesis-config bytes: version-checked, every length
-/// bounded by the remaining buffer, keys strictly increasing, no trailing
-/// bytes. the bytes come from the module's OWN consensus store (host-installed
-/// at genesis), so a failure here is wiring corruption surfaced
-/// deterministically — never a per-node divergence.
+/// strict decode of genesis-config bytes: every length bounded by the
+/// remaining buffer, keys strictly increasing, no trailing bytes. the bytes
+/// come from the module's OWN consensus store (host-installed at genesis), so
+/// a failure here is wiring corruption surfaced deterministically — never a
+/// per-node divergence.
 pub fn decode_config(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, Error> {
     let mut cur = Cursor::new(bytes);
-    let version = cur.byte("genesis-config version")?;
-    if version != CONFIG_VERSION {
-        return Err(Error::Module(format!(
-            "genesis-config version {version} is not the supported {CONFIG_VERSION}"
-        )));
-    }
     let count = cur.u64("genesis-config parameter count")?;
     // each parameter costs at least its two 8-byte length prefixes.
     cur.bound(count, 16, "genesis-config parameter")?;
@@ -119,11 +111,6 @@ mod tests {
         // and different params encode differently (the per-network root seam).
         assert_ne!(encoded, encode_config(&[("chain_id", b"net#2")]));
 
-        // an unknown version refuses.
-        let mut bad = encoded.clone();
-        bad[0] = 2;
-        assert!(decode_config(&bad).is_err());
-
         // trailing bytes refuse.
         let mut trailing = encoded.clone();
         trailing.push(0);
@@ -133,7 +120,7 @@ mod tests {
         assert!(decode_config(&encoded[..encoded.len() - 1]).is_err());
 
         // out-of-order keys refuse.
-        let mut unordered = vec![CONFIG_VERSION];
+        let mut unordered = Vec::new();
         unordered.extend_from_slice(&2u64.to_le_bytes());
         push_str(&mut unordered, "b");
         push_bytes(&mut unordered, b"1");

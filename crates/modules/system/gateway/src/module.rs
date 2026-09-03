@@ -1,11 +1,13 @@
 //! The merged gateway module: the whole `.duck` **name → AccountId → route**
 //! pipeline as ONE consensus tenant, qmdb-backed.
 //!
-//! Two planes share this module, both gated the same way (external 32-byte node
-//! origin, valset standing = validators ∪ residents, identity `OfNode` account
-//! derivation):
+//! Two planes share this module, both gated the same way: the frame origin is
+//! a USER key of any scheme, and identity `OfKey` resolves it to the ACTING
+//! ACCOUNT (a key of no account is refused; no node is bound to an account
+//! anywhere — the ACL policy on the `gateway` target is the operator's
+//! standing knob):
 //! * the **handle plane** (absorbed from duckdns) — an optional human `.duck`
-//!   name for one Identity account. Resolution stops at the stable AccountId;
+//!   name for one Identity account. Resolution stops at the account number;
 //!   this module stores no node address.
 //! * the **route plane** — an Identity account signs one monotonic route from
 //!   its apex or a service label to a typed upstream plus an invocation policy,
@@ -18,13 +20,13 @@
 //! to [`Gateway::new`], so this crate never names a storage crate. the record
 //! families:
 //!
-//! * `handle\0{name}` → owning account id, with the 1:1 inverse
-//!   `owner\0{account}` → handle (one handle per account BY CONSTRUCTION —
-//!   the old full-map scan is now a point read), behind the sorted handle
-//!   roster (`handles`, bounded by [`MAX_HANDLES`]) the paginated
-//!   `Registrations` listing walks;
-//! * `route\0{len|account|flag|label}` → [`RouteRecord`] (borsh), behind a
-//!   PER-ACCOUNT name roster (`routes\0{account}`, bounded by
+//! * `handle\0{name}` → owning account number (borsh `u64`), with the 1:1
+//!   inverse `owner\0{account LE8}` → handle (one handle per account BY
+//!   CONSTRUCTION — the old full-map scan is now a point read), behind the
+//!   sorted handle roster (`handles`, bounded by [`MAX_HANDLES`]) the
+//!   paginated `Registrations` listing walks;
+//! * `route\0{account LE8|flag|label}` → [`RouteRecord`] (borsh), behind a
+//!   PER-ACCOUNT name roster (`routes\0{account LE8}`, bounded by
 //!   [`MAX_ROUTES_PER_ACCOUNT`]) the `List` read walks — routes are never
 //!   deleted (a `route: None` revision is the tombstone), so the roster only
 //!   grows to its cap;
@@ -40,8 +42,8 @@
 //! oversized values never reach the store (the poison-value lesson): a route
 //! record is byte-gated at [`MAX_RECORD_BYTES`] on top of
 //! `validate_route_statement`'s JSON bound, a credential record is bounded by
-//! construction ([`MAX_CREDENTIAL_GRANTS`] grants of `MAX_ACCOUNT_ID_BYTES`),
-//! and every roster is byte-gated on top of its count cap.
+//! construction ([`MAX_CREDENTIAL_GRANTS`] 8-byte grants), and every roster is
+//! byte-gated on top of its count cap.
 //!
 //! ## Genesis config (the chain id)
 //!
@@ -56,17 +58,12 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 use duckdns::{HandleRegistration, ResolvedAccount, validate_handle};
 use identity::{
-    AccountView, IdentityQuery, IdentityReply, KeyKind, MemberProof,
-    decode_reply as identity_decode_reply, encode_query as identity_encode_query, verify_authority,
+    AccountView, IdentityQuery, IdentityReply, KeyView, decode_reply as identity_decode_reply,
+    encode_query as identity_encode_query,
 };
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
-};
-use std::collections::BTreeSet;
-use valset::{
-    ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
-    encode_query as valset_encode_query,
 };
 
 use crate::{
@@ -76,7 +73,7 @@ use crate::{
     RemoveCredentialStatement, RouteName, RouteRecord, RouteStatement, RouteSummary,
     SetCredentialStatement, decode_msg, decode_query, encode_reply, grant_credential_preimage,
     remove_credential_preimage, revoke_credential_preimage, route_signing_preimage,
-    set_credential_preimage, validate_account_id, validate_authorization,
+    set_credential_preimage, validate_account_number, validate_authorization,
     validate_credential_name, validate_route_statement,
 };
 
@@ -91,10 +88,6 @@ pub const MAX_CREDENTIALS: usize = 1024;
 /// roster byte backstop shared by the three roster records.
 const MAX_ROSTER_RECORD_BYTES: usize = 512 * 1024;
 
-/// the handle plane accepted account ids up to this bound before the merge
-/// (duckdns's contract, preserved verbatim).
-const MAX_HANDLE_ACCOUNT_ID_LEN: usize = 1024;
-
 /// per-handle record key: prefix + 0 + handle. safe because every key literal
 /// below is fixed and none is another followed by a 0 byte.
 fn handle_key(handle: &str) -> Vec<u8> {
@@ -105,24 +98,23 @@ fn handle_key(handle: &str) -> Vec<u8> {
     key
 }
 
-/// the 1:1 inverse of [`handle_key`]: prefix + 0 + account id → handle.
-fn owner_key(account: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(5 + 1 + account.len());
+/// the 1:1 inverse of [`handle_key`]: prefix + 0 + account LE8 → handle.
+fn owner_key(account: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(5 + 1 + 8);
     key.extend_from_slice(b"owner");
     key.push(0);
-    key.extend_from_slice(account);
+    key.extend_from_slice(&account.to_le_bytes());
     key
 }
 
-/// per-route record key: prefix + 0 + length-framed account id + the name
-/// (flag byte 0 = apex, 1 + label bytes = named). the length frame keeps the
-/// key injective for arbitrary account-id bytes.
-fn route_key(account: &[u8], name: &RouteName) -> Vec<u8> {
-    let mut key = Vec::with_capacity(5 + 1 + 8 + account.len() + 1 + 64);
+/// per-route record key: prefix + 0 + account LE8 + the name (flag byte 0 =
+/// apex, 1 + label bytes = named). the fixed-width account keeps the key
+/// injective.
+fn route_key(account: u64, name: &RouteName) -> Vec<u8> {
+    let mut key = Vec::with_capacity(5 + 1 + 8 + 1 + 64);
     key.extend_from_slice(b"route");
     key.push(0);
-    key.extend_from_slice(&(account.len() as u64).to_le_bytes());
-    key.extend_from_slice(account);
+    key.extend_from_slice(&account.to_le_bytes());
     match &name.label {
         None => key.push(0),
         Some(label) => {
@@ -133,12 +125,12 @@ fn route_key(account: &[u8], name: &RouteName) -> Vec<u8> {
     key
 }
 
-/// per-account route-name roster key: prefix + 0 + account id.
-fn route_roster_key(account: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(6 + 1 + account.len());
+/// per-account route-name roster key: prefix + 0 + account LE8.
+fn route_roster_key(account: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(6 + 1 + 8);
     key.extend_from_slice(b"routes");
     key.push(0);
-    key.extend_from_slice(account);
+    key.extend_from_slice(&account.to_le_bytes());
     key
 }
 
@@ -159,7 +151,6 @@ const CRED_ROSTER_KEY: &[u8] = b"creds";
 pub struct Gateway {
     id: ModuleId,
     identity_id: ModuleId,
-    valset_id: Option<ModuleId>,
     chain_id: String,
     /// the host-injected authenticated store plus this block's staging overlay
     /// (read-your-writes, folded into `root()` at `commit_block`). store key
@@ -173,13 +164,11 @@ impl Gateway {
         id: impl Into<ModuleId>,
         store: Box<dyn MerkleStore>,
         identity_id: impl Into<ModuleId>,
-        valset_id: Option<ModuleId>,
         chain_id: impl Into<String>,
     ) -> Self {
         Self {
             id: id.into(),
             identity_id: identity_id.into(),
-            valset_id,
             chain_id: chain_id.into(),
             staged: StagedStore::new(store),
         }
@@ -237,12 +226,12 @@ impl Gateway {
     }
 
     /// the account owning `handle`, if registered.
-    async fn handle_owner(&self, handle: &str) -> Result<Option<Vec<u8>>, Error> {
+    async fn handle_owner(&self, handle: &str) -> Result<Option<u64>, Error> {
         self.load(&handle_key(handle)).await
     }
 
     /// the handle `account` registered, if any — the 1:1 inverse index.
-    async fn handle_of(&self, account: &[u8]) -> Result<Option<String>, Error> {
+    async fn handle_of(&self, account: u64) -> Result<Option<String>, Error> {
         self.load(&owner_key(account)).await
     }
 
@@ -253,15 +242,18 @@ impl Gateway {
 
     async fn route_record(
         &self,
-        account: &[u8],
+        account: u64,
         name: &RouteName,
     ) -> Result<Option<RouteRecord>, Error> {
         self.load(&route_key(account, name)).await
     }
 
     /// the per-account route-name roster, sorted (apex before labels).
-    async fn route_roster(&self, account: &[u8]) -> Result<Vec<RouteName>, Error> {
-        Ok(self.load(&route_roster_key(account)).await?.unwrap_or_default())
+    async fn route_roster(&self, account: u64) -> Result<Vec<RouteName>, Error> {
+        Ok(self
+            .load(&route_roster_key(account))
+            .await?
+            .unwrap_or_default())
     }
 
     async fn credential_record(&self, name: &str) -> Result<Option<CredentialRecord>, Error> {
@@ -275,58 +267,14 @@ impl Gateway {
 
     // ---- sibling reads --------------------------------------------------------
 
-    async fn members(&self, ctx: &dyn Ctx) -> Result<Option<BTreeSet<Vec<u8>>>, Error> {
-        let Some(valset_id) = &self.valset_id else {
-            return Ok(None);
-        };
-        let validators = match valset_decode_reply(
-            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Validators))
-                .await?,
-        )
-        .map_err(Error::Module)?
-        {
-            ValsetReply::Validators(nodes) => nodes,
-            other => {
-                return Err(Error::Module(format!(
-                    "gateway: valset answered Validators with {other:?}"
-                )));
-            }
-        };
-        let residents = match valset_decode_reply(
-            &ctx.query(valset_id, &valset_encode_query(&ValsetQuery::Residents))
-                .await?,
-        )
-        .map_err(Error::Module)?
-        {
-            ValsetReply::Residents(nodes) => nodes,
-            other => {
-                return Err(Error::Module(format!(
-                    "gateway: valset answered Residents with {other:?}"
-                )));
-            }
-        };
-        Ok(Some(validators.into_iter().chain(residents).collect()))
-    }
-
-    async fn require_standing(&self, ctx: &dyn Ctx, node: &[u8]) -> Result<(), Error> {
-        if self
-            .members(ctx)
-            .await?
-            .is_some_and(|members| !members.contains(node))
-        {
-            return Err(Error::Module(
-                "gateway: origin is not a validator or admitted resident".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn account_of_node(&self, ctx: &dyn Ctx, node: &[u8]) -> Result<AccountView, Error> {
+    /// the ACTING ACCOUNT: the one the origin key belongs to, through the one
+    /// resolver every consumer reads (`OfKey`).
+    async fn account_of_origin(&self, ctx: &dyn Ctx, origin: &[u8]) -> Result<AccountView, Error> {
         match identity_decode_reply(
             &ctx.query(
                 &self.identity_id,
-                &identity_encode_query(&IdentityQuery::OfNode {
-                    node_key: node.to_vec(),
+                &identity_encode_query(&IdentityQuery::OfKey {
+                    key: origin.to_vec(),
                 }),
             )
             .await?,
@@ -335,32 +283,69 @@ impl Gateway {
         {
             IdentityReply::Account(Some(account)) => Ok(account),
             IdentityReply::Account(None) => Err(Error::Module(
-                "gateway: origin is not bound to an Identity account".into(),
+                "gateway: origin key belongs to no Identity account".into(),
             )),
             other => Err(Error::Module(format!(
-                "gateway: identity answered OfNode with {other:?}"
+                "gateway: identity answered OfKey with {other:?}"
             ))),
         }
     }
 
-    fn origin_node(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
+    /// the authenticated submitter key: a non-empty external origin of any
+    /// scheme (the frame signature already proved possession).
+    fn origin_key(ctx: &dyn Ctx) -> Result<Vec<u8>, Error> {
         match &ctx.env().origin {
-            Origin::External(node) if node.len() == crate::NODE_KEY_BYTES => Ok(node.clone()),
-            Origin::External(node) => Err(Error::Module(format!(
-                "gateway: origin must be a {}-byte node key, got {} bytes",
-                crate::NODE_KEY_BYTES,
-                node.len()
-            ))),
+            Origin::External(key) if key.is_empty() => Err(Error::Module(
+                "gateway: origin must be an external key".into(),
+            )),
+            Origin::External(key) => Ok(key.clone()),
             other => Err(Error::Module(format!(
-                "gateway: mutation requires an external node origin, got {other:?}"
+                "gateway: origin must be an external key, got {other:?}"
             ))),
         }
+    }
+
+    /// the shared authority gate of every signed statement: the statement's
+    /// account must be the origin's, the signer a current member of it, and
+    /// the proof must verify under the signer's STORED scheme.
+    fn verify_member_signature(
+        account: &AccountView,
+        statement_account: u64,
+        authorization: &MemberAuthorization,
+        ns: &[u8],
+        preimage: &[u8],
+        what: &str,
+    ) -> Result<(), Error> {
+        if statement_account != account.number {
+            return Err(Error::Module(format!(
+                "gateway: {what} account is not the origin's account"
+            )));
+        }
+        let signer: &KeyView = account
+            .keys
+            .iter()
+            .find(|key| key.pubkey == authorization.signer)
+            .ok_or_else(|| {
+                Error::Module("gateway: signer is not a current account member".into())
+            })?;
+        let verifies = signer.scheme.verify(
+            &authorization.signer,
+            ns,
+            preimage,
+            &authorization.signature,
+        );
+        if !verifies {
+            return Err(Error::Module(format!(
+                "gateway: {what} signature does not verify"
+            )));
+        }
+        Ok(())
     }
 
     // ---- the handle plane -------------------------------------------------------
 
-    /// the handle plane: bind the authenticated node's account to (or free) one
-    /// optional `.duck` name. AccountId is authority; the handle is a mutable
+    /// the handle plane: bind the origin's account to (or free) one optional
+    /// `.duck` name. the account number is authority; the handle is a mutable
     /// presentation alias. renames are atomic; re-setting the current handle is
     /// an idempotent no-op that stages nothing.
     async fn set_handle(
@@ -369,13 +354,7 @@ impl Gateway {
         origin: &[u8],
         handle: Option<String>,
     ) -> Result<(), Error> {
-        let account = self.account_of_node(ctx, origin).await?.account_id;
-        if account.is_empty() || account.len() > MAX_HANDLE_ACCOUNT_ID_LEN {
-            return Err(Error::Module(format!(
-                "duckdns: account id must be 1..={MAX_HANDLE_ACCOUNT_ID_LEN} bytes, got {}",
-                account.len()
-            )));
-        }
+        let account = self.account_of_origin(ctx, origin).await?.number;
         if let Some(handle) = &handle {
             validate_handle(handle).map_err(Error::Module)?;
             if self
@@ -389,7 +368,7 @@ impl Gateway {
             }
         }
 
-        let current = self.handle_of(&account).await?;
+        let current = self.handle_of(account).await?;
         if current.as_deref() == handle.as_deref() {
             return Ok(());
         }
@@ -427,7 +406,7 @@ impl Gateway {
                     "handle roster",
                 )?;
                 self.store(handle_key(&handle), &account);
-                self.store(owner_key(&account), &handle);
+                self.store(owner_key(account), &handle);
             }
             None => {
                 if roster.is_empty() {
@@ -435,7 +414,7 @@ impl Gateway {
                 } else {
                     self.store(HANDLE_ROSTER_KEY.to_vec(), &roster);
                 }
-                self.staged.delete(owner_key(&account));
+                self.staged.delete(owner_key(account));
             }
         }
         Ok(())
@@ -455,42 +434,18 @@ impl Gateway {
                 "gateway: route belongs to another chain".into(),
             ));
         }
-        if statement.publisher_node != origin {
-            return Err(Error::Module(
-                "gateway: publisher does not match the authenticated origin".into(),
-            ));
-        }
-        let account = self.account_of_node(ctx, origin).await?;
-        if statement.account_id != account.account_id {
-            return Err(Error::Module(
-                "gateway: route account does not own the publisher node".into(),
-            ));
-        }
-        let signer_is_current = account
-            .member_keys
-            .iter()
-            .any(|member| member.pubkey == authorization.signer && member.kind == KeyKind::Ed25519);
-        if !signer_is_current {
-            return Err(Error::Module(
-                "gateway: signer is not a current Ed25519 account member".into(),
-            ));
-        }
+        // the account vouches for the node it names as publisher; the origin
+        // is a user key, never compared to it.
+        let account = self.account_of_origin(ctx, origin).await?;
         let preimage = route_signing_preimage(&statement).map_err(Error::Module)?;
-        let proof = MemberProof::Signature {
-            sig: authorization.signature.clone(),
-        };
-        if !verify_authority(
-            KeyKind::Ed25519,
-            &authorization.signer,
-            None,
+        Self::verify_member_signature(
+            &account,
+            statement.account_id,
+            &authorization,
             GATEWAY_ROUTE_NS,
             &preimage,
-            &proof,
-        ) {
-            return Err(Error::Module(
-                "gateway: route signature does not verify".into(),
-            ));
-        }
+            "route",
+        )?;
 
         let record = RouteRecord {
             statement,
@@ -498,17 +453,18 @@ impl Gateway {
         };
         validate_route_statement(&record.statement).map_err(Error::Module)?;
         validate_authorization(&record.authorization).map_err(Error::Module)?;
-        let account_id = record.statement.account_id.clone();
+        let account_id = record.statement.account_id;
         let name = record.statement.name.clone();
 
-        let existing = self.route_record(&account_id, &name).await?;
+        let existing = self.route_record(account_id, &name).await?;
         // the revision chain: 1 for a fresh name, current + 1 for a replace.
-        let expected = match &existing {
-            None => 1,
-            Some(current) => current.statement.revision.checked_add(1).ok_or_else(|| {
-                Error::Module("gateway: route revision is exhausted".to_string())
-            })?,
-        };
+        let expected =
+            match &existing {
+                None => 1,
+                Some(current) => current.statement.revision.checked_add(1).ok_or_else(|| {
+                    Error::Module("gateway: route revision is exhausted".to_string())
+                })?,
+            };
         if record.statement.revision != expected {
             return Err(Error::Module(format!(
                 "gateway: route revision must be {expected}, got {}",
@@ -516,7 +472,7 @@ impl Gateway {
             )));
         }
         if existing.is_none() {
-            let mut roster = self.route_roster(&account_id).await?;
+            let mut roster = self.route_roster(account_id).await?;
             let Err(position) = roster.binary_search(&name) else {
                 return Err(Error::Module(
                     "gateway: route roster carries a name with no record".into(),
@@ -529,14 +485,14 @@ impl Gateway {
             }
             roster.insert(position, name.clone());
             self.store_bounded(
-                route_roster_key(&account_id),
+                route_roster_key(account_id),
                 &roster,
                 MAX_ROSTER_RECORD_BYTES,
                 "route roster",
             )?;
         }
         self.store_bounded(
-            route_key(&account_id, &name),
+            route_key(account_id, &name),
             &record,
             MAX_RECORD_BYTES,
             "route",
@@ -545,16 +501,16 @@ impl Gateway {
 
     // ---- the credential plane -------------------------------------------------
 
-    /// The shared credential authority check, mirroring [`Self::set_route`]'s
-    /// signer gate: the origin node must be bound to `owner_account`, the
-    /// signer must be a current Ed25519 member key of that account, and the
-    /// signature must verify over `preimage` under [`GATEWAY_CREDENTIAL_NS`].
+    /// The shared credential authority check, the same gate as
+    /// [`Self::set_route`]'s: `owner_account` must be the origin's account, the
+    /// signer a current member key of it, and the proof must verify over
+    /// `preimage` under [`GATEWAY_CREDENTIAL_NS`] with the signer's stored scheme.
     async fn verify_credential_owner(
         &self,
         ctx: &dyn Ctx,
         origin: &[u8],
         chain_id: &str,
-        owner_account: &[u8],
+        owner_account: u64,
         authorization: &MemberAuthorization,
         preimage: &[u8],
     ) -> Result<(), Error> {
@@ -563,37 +519,15 @@ impl Gateway {
                 "gateway: credential belongs to another chain".into(),
             ));
         }
-        let account = self.account_of_node(ctx, origin).await?;
-        if account.account_id != owner_account {
-            return Err(Error::Module(
-                "gateway: credential owner does not own the publisher node".into(),
-            ));
-        }
-        let signer_is_current = account
-            .member_keys
-            .iter()
-            .any(|member| member.pubkey == authorization.signer && member.kind == KeyKind::Ed25519);
-        if !signer_is_current {
-            return Err(Error::Module(
-                "gateway: signer is not a current Ed25519 account member".into(),
-            ));
-        }
-        let proof = MemberProof::Signature {
-            sig: authorization.signature.clone(),
-        };
-        if !verify_authority(
-            KeyKind::Ed25519,
-            &authorization.signer,
-            None,
+        let account = self.account_of_origin(ctx, origin).await?;
+        Self::verify_member_signature(
+            &account,
+            owner_account,
+            authorization,
             GATEWAY_CREDENTIAL_NS,
             preimage,
-            &proof,
-        ) {
-            return Err(Error::Module(
-                "gateway: credential signature does not verify".into(),
-            ));
-        }
-        Ok(())
+            "credential",
+        )
     }
 
     /// Load an owner's record for a grant/revoke/remove mutation, refusing when
@@ -601,7 +535,7 @@ impl Gateway {
     async fn owned_credential(
         &self,
         name: &str,
-        owner_account: &[u8],
+        owner_account: u64,
     ) -> Result<CredentialRecord, Error> {
         validate_credential_name(name).map_err(Error::Module)?;
         let record = self
@@ -623,17 +557,12 @@ impl Gateway {
         statement: SetCredentialStatement,
         authorization: MemberAuthorization,
     ) -> Result<(), Error> {
-        if statement.record.publisher_node != origin {
-            return Err(Error::Module(
-                "gateway: publisher does not match the authenticated origin".into(),
-            ));
-        }
         let preimage = set_credential_preimage(&statement).map_err(Error::Module)?;
         self.verify_credential_owner(
             ctx,
             origin,
             &statement.chain_id,
-            &statement.record.owner_account,
+            statement.record.owner_account,
             &authorization,
             &preimage,
         )
@@ -641,7 +570,7 @@ impl Gateway {
 
         let record = statement.record;
         validate_credential_name(&record.name).map_err(Error::Module)?;
-        validate_account_id(&record.owner_account).map_err(Error::Module)?;
+        validate_account_number(record.owner_account).map_err(Error::Module)?;
         if !record.grants.is_empty() {
             return Err(Error::Module(
                 "gateway: credential registration carries no grants".into(),
@@ -695,12 +624,12 @@ impl Gateway {
             ctx,
             origin,
             &statement.chain_id,
-            &statement.owner_account,
+            statement.owner_account,
             &authorization,
             &preimage,
         )
         .await?;
-        self.owned_credential(&statement.name, &statement.owner_account)
+        self.owned_credential(&statement.name, statement.owner_account)
             .await?;
         let mut roster = self.cred_roster().await?;
         if let Ok(position) = roster.binary_search(&statement.name) {
@@ -727,14 +656,14 @@ impl Gateway {
             ctx,
             origin,
             &statement.chain_id,
-            &statement.owner_account,
+            statement.owner_account,
             &authorization,
             &preimage,
         )
         .await?;
-        validate_account_id(&statement.account).map_err(Error::Module)?;
+        validate_account_number(statement.account).map_err(Error::Module)?;
         let mut record = self
-            .owned_credential(&statement.name, &statement.owner_account)
+            .owned_credential(&statement.name, statement.owner_account)
             .await?;
         let is_new_grant = record.grants.insert(statement.account);
         if is_new_grant && record.grants.len() > MAX_CREDENTIAL_GRANTS {
@@ -758,13 +687,13 @@ impl Gateway {
             ctx,
             origin,
             &statement.chain_id,
-            &statement.owner_account,
+            statement.owner_account,
             &authorization,
             &preimage,
         )
         .await?;
         let mut record = self
-            .owned_credential(&statement.name, &statement.owner_account)
+            .owned_credential(&statement.name, statement.owner_account)
             .await?;
         record.grants.remove(&statement.account);
         self.store(cred_key(&statement.name), &record);
@@ -800,8 +729,7 @@ impl Module for Gateway {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        let origin = Self::origin_node(ctx)?;
-        self.require_standing(ctx, &origin).await?;
+        let origin = Self::origin_key(ctx)?;
         match decode_msg(&msg.payload).map_err(Error::Module)? {
             GatewayMsg::SetHandle { handle } => self.set_handle(ctx, &origin, handle).await,
             GatewayMsg::SetRoute {
@@ -878,17 +806,17 @@ impl Module for Gateway {
                 Ok(encode_reply(&GatewayReply::Registrations(registrations)))
             }
             GatewayQuery::Get { account_id, name } => {
-                validate_account_id(&account_id).map_err(Error::Module)?;
+                validate_account_number(account_id).map_err(Error::Module)?;
                 name.validate().map_err(Error::Module)?;
                 Ok(encode_reply(&GatewayReply::Route(Box::new(
-                    self.route_record(&account_id, &name).await?,
+                    self.route_record(account_id, &name).await?,
                 ))))
             }
             GatewayQuery::List { account_id } => {
-                validate_account_id(&account_id).map_err(Error::Module)?;
+                validate_account_number(account_id).map_err(Error::Module)?;
                 let mut routes = Vec::new();
-                for name in self.route_roster(&account_id).await? {
-                    let record = self.route_record(&account_id, &name).await?.ok_or_else(|| {
+                for name in self.route_roster(account_id).await? {
+                    let record = self.route_record(account_id, &name).await?.ok_or_else(|| {
                         Error::Module("gateway: route roster carries a name with no record".into())
                     })?;
                     let Some(route) = record.statement.route.as_ref() else {

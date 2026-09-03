@@ -331,12 +331,22 @@ impl IndexStore {
             );
         }
         let blocks = Arc::new(Db::open(base.join(BLOCKS_DB_ID), opts)?);
-        Ok(Self {
+        let store = Self {
             base,
             modules: open,
             blocks,
             poisoned: AtomicBool::new(false),
-        })
+        };
+        // the height the node resumes above — read here, not inside the
+        // macro, so a read failure refuses the open at every filter level.
+        let height = store.resume_height()?;
+        tracing::info!(
+            target: "ducktape::index",
+            height,
+            modules = store.modules.len(),
+            "index store opened"
+        );
+        Ok(store)
     }
 
     pub fn base(&self) -> &Path {
@@ -359,6 +369,24 @@ impl IndexStore {
 
     fn db(&self, module: &str) -> Result<&Arc<Db>> {
         Ok(&self.module(module)?.db)
+    }
+
+    /// the ONE place the store poisons. every write path hands its outcome
+    /// through here, so a poison is never silent: from this line on writes
+    /// refuse, reads keep serving, and the remedy is the crate's — delete the
+    /// index directory and replay.
+    fn poison_on_err(&self, op: &'static str, out: Result<()>) -> Result<()> {
+        if let Err(err) = &out {
+            self.poisoned.store(true, Ordering::Relaxed);
+            tracing::warn!(
+                target: "ducktape::index",
+                reason = "index_poisoned",
+                op,
+                error = %err,
+                "index store poisoned — writes refuse until the index directory is deleted and replayed"
+            );
+        }
+        out
     }
 
     /// the watermark: every block at or below this height is fully in the
@@ -410,11 +438,7 @@ impl IndexStore {
     /// the backfill floor: when present, the module was stamped at a boundary
     /// — its op feed (and everything derived) visibly begins above it.
     pub fn backfill_height(&self, module: &str) -> Result<Option<u64>> {
-        let db = self.db(module)?;
-        Ok(db
-            .get(META_BACKFILL.as_bytes())?
-            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-            .map(u64::from_be_bytes))
+        Ok(read_backfill(self.db(module)?)?)
     }
 
     /// the fold trigger's backlog + last drain error, `None` for a module
@@ -444,21 +468,22 @@ impl IndexStore {
         if self.is_poisoned() {
             return Err(Error::Poisoned);
         }
-        let out = self.apply_inner(block);
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err("apply_block", self.apply_inner(block))
     }
 
     fn apply_inner(&self, block: &BlockOps) -> Result<()> {
-        // group by module, keeping the block-wide dispatch index as seq. an
-        // unknown module refuses BEFORE any batch commits — a block folded
-        // into some databases and refused for the rest would be torn.
+        // group by module, keeping the block-wide dispatch index as seq. a
+        // module this store does not index — one admitted after boot by the
+        // lifecycle registry, whose guest (if any) is not bundled — writes no
+        // rows: the index is a read model over the DECLARED tenants, and
+        // skipping an undeclared op on every block leaves nothing torn.
+        // refusing it poisoned every node on a real network for the rest of
+        // its life the first time a live-registered module received an op.
         let mut per: BTreeMap<&str, Vec<(u32, &AppliedOp)>> = BTreeMap::new();
         for (seq, op) in block.ops.iter().enumerate() {
-            if !self.modules.contains_key(op.module.as_str()) {
-                return Err(Error::UnknownModule(op.module.clone()));
+            let indexed = self.modules.contains_key(op.module.as_str());
+            if !indexed {
+                continue;
             }
             per.entry(op.module.as_str())
                 .or_default()
@@ -536,10 +561,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err("apply_block_record", out)
     }
 
     /// the newest `limit` explorer rows, oldest-first — the durable equivalent
@@ -599,10 +621,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err("mark_backfilled", out)
     }
 
     /// write verbatim op rows into a module's feed WITHOUT touching the
@@ -650,10 +669,7 @@ impl IndexStore {
             }
             Ok(())
         })();
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
-        }
-        out
+        self.poison_on_err("write_backfill_rows", out)
     }
 
     /// set (or clear) a module's backfill floor and NOTHING else — no wipe, no
@@ -671,10 +687,80 @@ impl IndexStore {
             Some(height) => db.put(META_BACKFILL, height.to_be_bytes()),
             None => db.delete(META_BACKFILL),
         };
-        if out.is_err() {
-            self.poisoned.store(true, Ordering::Relaxed);
+        self.poison_on_err("set_backfill_floor", out.map_err(Error::from))
+    }
+
+    /// re-derive a module's read model from the op feed it already holds:
+    /// every derived key cleared, then the whole `op/` range re-driven through
+    /// the guest in KEY order. `op/` and `meta/` are untouched — a refold
+    /// changes what the rows MEAN, never what the feed saw.
+    ///
+    /// the closing move of a backfill that extended the feed DOWNWARD (the
+    /// floored-module seam, indexable spec §7): rows below what the fold has
+    /// already consumed arrive out of order by construction, so the read model
+    /// disagrees with the feed until this runs — and it must run whether the
+    /// walk finished or died holding half a range. that is what buys the seam
+    /// its safety: nothing is wiped ahead of a pull that might fail.
+    ///
+    /// the same sequence [`converge_guest`] runs for a new mapper (feed down,
+    /// clear, feed up, replay, drain), and a no-op for a module with no
+    /// folding guest. failures poison, like every other write here.
+    pub fn refold(&self, module: &str) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
         }
-        Ok(out?)
+        let m = self.module(module)?;
+        if !m.has_fold {
+            return Ok(());
+        }
+        let out = (|| -> Result<()> {
+            // THE MARKER COMES DOWN FIRST AND GOES BACK UP LAST, exactly as
+            // `converge_guest` writes it last: while the derived keyspace is
+            // cleared and re-driven, NOTHING may vouch for it. A crash in
+            // between must leave no marker at all, so the next `open` finds
+            // one absent, refolds whole, and writes it — instead of matching
+            // the guest hash, returning early, and serving a half-built read
+            // model with a fold tip below its own feed.
+            let marker = m.db.get(META_GUEST.as_bytes())?;
+            m.db.delete(META_GUEST)?;
+            // the feed goes down next: its pending events describe rows the
+            // clear below is about to delete, and `delete_trigger` discards
+            // them with the registration.
+            m.db.delete_trigger(FOLD_TRIGGER)?;
+            clear_derived(&m.db)?;
+            create_fold_trigger(&m.db)?;
+            // AND WAIT FOR IT, for `converge_guest`'s reason: returning over a
+            // cleared keyspace serves "no such page" for every page, which is
+            // indistinguishable from a workspace that lost its documents.
+            refold_feed(&m.db, module)?;
+            if let Some(marker) = marker {
+                m.db.put(META_GUEST, marker)?;
+            }
+            Ok(())
+        })();
+        self.poison_on_err("refold", out)
+    }
+
+    /// advance a module's feed watermark to `height` and NOTHING else — the
+    /// closing move of a RESUMED backfill, where the rows between the old
+    /// watermark and the boundary just landed verbatim, so the feed honestly
+    /// covers them. no wipe, no floor change, no trigger teardown (unlike
+    /// [`IndexStore::mark_backfilled`]); a watermark already at or past
+    /// `height` stands, so this is idempotent. failures poison, like every
+    /// other feed write.
+    pub fn advance_watermark(&self, module: &str, height: u64) -> Result<()> {
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        let db = self.db(module)?;
+        let out = (|| -> Result<()> {
+            if read_height(db)? >= height {
+                return Ok(());
+            }
+            db.put(META_HEIGHT, height.to_be_bytes())?;
+            Ok(())
+        })();
+        self.poison_on_err("advance_watermark", out)
     }
 
     /// point read of one stored key at the current snapshot.
@@ -825,7 +911,6 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     if has_fold {
         clear_derived(db)?;
         create_fold_trigger(db)?;
-        replay_op_feed(db)?;
         // AND WAIT FOR IT. `replay_op_feed` only STAGES the re-writes; the
         // trigger runner folds them behind it. Returning here would hand the
         // node an open store whose read model is the freshly CLEARED keyspace
@@ -839,7 +924,7 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         // does at `wasm_entries` above: a guest that cannot fold its own feed
         // has no read model to serve, and saying so beats serving nothing
         // quietly.
-        drain_fold(db, spec.id)?;
+        refold_feed(db, spec.id)?;
     }
     // written LAST, so an interrupted refold re-runs whole at the next open
     // instead of leaving a marker that vouches for a half-derived read model.
@@ -933,23 +1018,55 @@ fn clear_derived(db: &Db) -> Result<()> {
     Ok(())
 }
 
-/// re-drive the fold over every op row the database already holds.
+/// re-drive the fold over the whole op feed and WAIT for it — the shared tail
+/// of a mapper converge and a backfill's closing refold. two lines per refold
+/// and none per row: a boot that replays a chain's history used to do so in
+/// silence, from the last `open` line until it returned.
+fn refold_feed(db: &Db, module: &str) -> Result<()> {
+    let from_height = read_backfill(db)?.unwrap_or(0);
+    let to_height = read_height(db)?;
+    tracing::info!(
+        target: "ducktape::index",
+        module,
+        from_height,
+        to_height,
+        "refold started"
+    );
+    let started = std::time::Instant::now();
+    let rows = replay_op_feed(db)?;
+    drain_fold(db, module)?;
+    tracing::info!(
+        target: "ducktape::index",
+        module,
+        from_height,
+        to_height,
+        rows,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "refold complete"
+    );
+    Ok(())
+}
+
+/// re-drive the fold over every op row the database already holds, answering
+/// how many rows were re-staged.
 ///
 /// a changes-mode trigger delivers writes COMMITTED AFTER its registration, so
 /// re-registering one over a populated range replays nothing. re-writing each
 /// row does: an identical put is still a committed change, and capture happens
 /// inside the commit critical section, so the guest receives the feed in key
 /// order — which for `op/{height:016x}/{seq:04x}` IS block-and-drain order.
-fn replay_op_feed(db: &Db) -> Result<()> {
+fn replay_op_feed(db: &Db) -> Result<u64> {
     let lo = OP_PREFIX.as_bytes();
     let hi = prefix_successor(lo);
     let snap = db.snapshot();
     let iter = db.iter_at(Some(lo), hi.as_deref(), false, &snap)?;
     let mut batch = WriteBatch::new();
     let mut staged = 0usize;
+    let mut rows = 0u64;
     for kv in iter {
         let (key, value) = kv?;
         staged += key.len() + value.len();
+        rows += 1;
         batch.put(key, value);
         if staged >= REPLAY_FLUSH_BYTES {
             db.write(std::mem::replace(&mut batch, WriteBatch::new()))?;
@@ -959,7 +1076,7 @@ fn replay_op_feed(db: &Db) -> Result<()> {
     if staged > 0 {
         db.write(batch)?;
     }
-    Ok(())
+    Ok(rows)
 }
 
 /// register the fold feed: [`GUEST_NAME`]'s `on_apply` over exactly the
@@ -1044,6 +1161,14 @@ fn read_height(db: &Db) -> fluent31::Result<u64> {
         .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
         .map(u64::from_be_bytes)
         .unwrap_or(0))
+}
+
+/// the backfill floor, when a boundary stamp set one.
+fn read_backfill(db: &Db) -> fluent31::Result<Option<u64>> {
+    Ok(db
+        .get(META_BACKFILL.as_bytes())?
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map(u64::from_be_bytes))
 }
 
 /// the smallest byte string greater than every key with `prefix`: increment

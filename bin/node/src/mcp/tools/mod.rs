@@ -91,7 +91,9 @@ pub fn arg_str(args: &Value, name: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
-            crate::mcp::node::NodeError::Rejected(format!("this tool needs a string {name:?} argument"))
+            crate::mcp::node::NodeError::Rejected(format!(
+                "this tool needs a string {name:?} argument"
+            ))
         })
 }
 
@@ -103,7 +105,9 @@ pub fn opt_u64(args: &Value, name: &str) -> Option<u64> {
 /// a required boolean argument.
 pub fn arg_bool(args: &Value, name: &str) -> Result<bool> {
     args.get(name).and_then(Value::as_bool).ok_or_else(|| {
-        crate::mcp::node::NodeError::Rejected(format!("this tool needs a boolean {name:?} argument"))
+        crate::mcp::node::NodeError::Rejected(format!(
+            "this tool needs a boolean {name:?} argument"
+        ))
     })
 }
 
@@ -127,7 +131,11 @@ mod tests {
             );
             assert!(!t.description.is_empty(), "{} has no description", t.name);
             let schema = (t.schema)();
-            assert_eq!(schema["type"], "object", "{} schema is not an object", t.name);
+            assert_eq!(
+                schema["type"], "object",
+                "{} schema is not an object",
+                t.name
+            );
         }
     }
 

@@ -1,12 +1,12 @@
 ---
 name: module-dev
-description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — MODULE_IDS, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the root-hash, the registry parity test, include_bytes compilation, or wasm-modules-check.
+description: Use when creating a new ducktape consensus module, porting a native module to a wasm guest, or wiring a module into the genesis set — topology::PRODUCTION, host_state, crates/guests, Makefile wasm-modules. Also when a module change breaks the root-hash pin, the registry parity test, a missing component in the fixtures/modules dir, or wasm-modules-check.
 ---
 
 # Module development — the end-to-end wiring runbook
 
 A module is four layers: native crate (the logic) → wasm guest (the packaging)
-→ registration (across FOUR bins, not one) → proofs (parity + fixtures).
+→ registration (the topology, then THREE bins) → proofs (parity + fixtures).
 
 **REQUIRED BACKGROUND:** `docs/records/architecture/wasm-module-authoring.md`
 — the guest contract (host-owned state, sibling reads, live update, the
@@ -15,13 +15,35 @@ External/third-party authoring rides `ducktape-quack`, not this path.
 
 ## Decide first: genesis registration is a root-hash break
 
-A module in `MODULE_IDS` joins the genesis set: every existing workspace fails
-closed, dev networks re-genesis. Post-genesis admission (lifecycle
-`ScheduleRegister`) exists, but the recovery/state-sync composers still
-enumerate a fixed module set, so restore past an admitted module's first
-checkpoint fails closed. A new module today ⇒ a new genesis — get that agreed
-before wiring.
-Experiments that shouldn't pay this cost live unwired in `crates/labs`.
+A module in `topology::PRODUCTION` (`bin/node`'s `MODULE_IDS` IS that
+selection) joins the genesis set: every existing workspace fails closed, dev
+networks re-genesis, and `GENESIS_ROOT_HASH` moves. A genesis module ⇒ a new
+genesis — get that agreed before wiring.
+
+A POST-genesis module does NOT move the root and needs no genesis edit, no
+topology row, and no bin change — it is one operator command against a LIVE
+network:
+
+```
+ducktape module register <id> <component.wasm> [--after N]  # admit a new id
+ducktape module update   <id> <component.wasm> [--after N]  # swap live code
+ducktape module status                                      # the registry
+```
+
+`register`/`update` stage the component at this node's owner-gated admin route
+(which fans it out to every validator and returns their receipts), then drive
+the governance proposal that schedules the admission/swap; it activates at
+`height + N` (`N > MIN_SWAP_LEAD`, i.e. `> 3`; default 50 to leave room for the
+ceremony's own blocks). `status` prints one row per module — `id  active
+pending`, a pending swap carrying `ready k` (validators that signalled) or
+`ready ✓`. `adopt_admitted_modules` composes every admitted id on restore and
+state sync, and a module admitted after the last checkpoint restores empty and
+is rebuilt by replay (unit-pinned in `host_state.rs`; no e2e drives the full
+restore lane yet — live-upgrade part 4).
+
+The CLI stages bytes, it never builds them: the component still comes from
+`make wasm-modules` / `guest-builder` (§2).
+Experiments that shouldn't pay the genesis cost live unwired in `crates/labs`.
 
 ## 1. Native crate — `crates/modules/{apps|system}/<id>`
 
@@ -65,45 +87,66 @@ module crate:
 
 `guest-builder --index <module-dir>` writes the committed `index.wasm`; add
 the module to `INDEX_MODULES` in the Makefile and to `index_guest_wasm()` in
-`bin/noded/src/index.rs` (the bundled include_bytes registry). The fold runs
+`crates/noded/src/index.rs` (the bundled include_bytes registry). The fold runs
 ASYNC behind a fluent31 changes-mode trigger — views trail the op feed
 observably (`/v1/index/status` `fold.{module}`), never atomically.
 
-## 3. Registration — four bins compose modules
+The engine's side of that contract — no backfill at registration, at-least-once
+invocation with exactly-once effects, a row above the inline cap arriving
+key-only, a failing fold holding its queue with backoff — is fluent31's own
+`SKILL.md` ("Priors that do not transfer"), at the rev the root `Cargo.toml`
+pins; read it before writing a mapper. A guest's `log` output is a `debug`
+event under `fluent31::wasm::guest` — turn that one target up to see it.
+
+## 3. Registration — `module register`, or (for genesis) the topology + three bins
+
+Post-genesis is the whole of this section for most modules: `ducktape module
+register <id> <component.wasm>` admits the id on a live network and `ducktape
+module update <id> <component.wasm>` swaps its code later. The registry is
+consensus state, so nothing below needs editing — every node composes the
+admitted module from it.
+
+The table is the GENESIS path: the flag day that moves the root hash.
 
 | Bin | Runs | What to touch |
 |---|---|---|
-| `bin/node` | production set: native + wasm tenants | `constants.rs`: `MODULE_IDS` (bump the `[..; N]` literal). `host_state.rs`: ~10 sites — grep an existing module id and mirror EVERY hit (`include_bytes!`, id const, `genesis_<id>_wasm`, `seeded_lifecycle`, `seed_genesis_components`, `ProductionModules` field, `compose`, `genesis_host`, `restore_host`, `sync_all_modules`). `Cargo.toml` dep. |
+| `bin/node` | production set: native + wasm tenants | `crates/topology/src/lib.rs`: a `ModuleSpec` row in `MODULES` (`code`/`backing`/`config`) and the id in `PRODUCTION`; the siblings a module reads are compiled into its guest, not declared here; `host_state` composes genesis/restore/sync from that selection — nothing to mirror there. A native tenant also needs the `Cargo.toml` dep. The component is NOT embedded: `node init` hashes `<id>.component.wasm` out of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `<ducktape home>/modules` — `$DUCKTAPE_HOME` when set, else `~/.ducktape` — filled by `make install-node`) into the descriptor, then copies those bytes into `<workspace>/modules/`. The kernel fixtures dir pins the same bytes. |
 | `bin/noded` | daemon, composes native instances | grep `"tasks"`: id list, `use`, construct, register |
 | `bin/simnode` | deterministic /v1 twin | same shape as noded |
-| `bin/demo` | in-process walkthrough | same shape |
+| the indexer | one index database per composed module | `open_index_store` opens a database for EVERY id in the selection, so joining or leaving `PRODUCTION` gains or loses one — nothing to touch for a module with no mapper. A module that ships one also needs its arm in `index_guest_wasm()` (`crates/noded/src/index.rs`, `include_bytes!` of the committed `index.wasm`) and its `INDEX_MODULES` entry in the `Makefile`. |
 
-noded/simnode/demo run a SUBSET — a wasm-only tenant (e.g. `vaults`) appears
-in `bin/node` alone. Decide whether the module belongs in the daemon/sim lanes;
-if it should be testable in sim-lane or visible in the app, it does.
+noded/simnode run a SUBSET: `SIM_BASE` is 15 of production's 19, and the four
+it leaves out — `acl`, `governance`, `lifecycle`, `valset` — are exactly what
+simnode's `--with-valset` appends (with native `kv`). So no production tenant
+is `bin/node`-only today; the two wasm ones outside the default set (`acl`,
+`governance`) compose in the sim under that flag. Decide which selection a new
+module joins: `SIM_BASE` if it should boot by default (testable in sim-lane,
+visible in the app), `SIM_VALSET` if it is governance-shaped.
 
-A new module joins `MODULE_IDS`; keep its declared `[..; N]` length equal to
-its contents (the auto-merge count trap).
+A new module joins `topology::PRODUCTION`; update the topology's count and
+membership pins and `host_state.rs`'s `GENESIS_ROOT_HASH` in the SAME commit
+(the failing pin prints the new hex) and name the flag day in the message.
 
 ## 4. Gates — ordering is load-bearing
 
 ```
 cargo test -p <id>                                        # 1. native logic
 cargo run -p guest-builder -- crates/modules/<plane>/<id> # 2. catches native-dep leaks
-make wasm-modules                                         # 3. BEFORE bin/node compiles —
-                                                          #    include_bytes! needs the artifact
+make wasm-modules                                         # 3. BEFORE the node pins run —
+                                                          #    the fixtures dir needs the artifact
 cargo check --workspace --all-targets                     # 4. registry parity test gates
-cargo clippy -p <id> --tests --no-deps                    #    constants↔live-module drift
+cargo clippy -p <id> --tests --no-deps                    #    topology↔composed-host drift
 make wasm-modules-check                                   # 5. committed copies byte-identical
+make wasm-index-check                                     # 6. index guests match a rebuild (needs wasm32)
 ```
 
 ## Common mistakes
 
 | Mistake | Reality |
 |---|---|
-| Registering only in `bin/node` | noded/simnode/demo compose their own instances; the module is invisible in daemon/sim lanes |
-| Array `[..; N]` length left stale after adding/removing a module | the declared length must equal the contents or the build fails (the auto-merge count trap) |
+| Registering only in `bin/node` | noded/simnode compose their own instances; the module is invisible in daemon/sim lanes |
+| Topology pins or `GENESIS_ROOT_HASH` left stale after adding/removing a module | `cargo test -p topology` and the root-hash pin fail; update both in the same commit |
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
-| `include_bytes!` before `make wasm-modules` | bin/node cannot compile until the component exists |
+| Node pins run before `make wasm-modules` | the fixtures dir lacks the component; `hash_bundle` refuses by name |
 | Rebuilding one guest's component alone | bytes are toolchain-dependent; refresh the set together or `wasm-modules-check` fails |
-| Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files`/`chat` shape) |
+| Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files` shape) |

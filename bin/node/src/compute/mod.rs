@@ -1,8 +1,8 @@
 //! `ducktape service run compute` — the standalone compute daemon.
 //!
 //! This is the compute plane. The node process constructs no provider set, no
-//! dispatch pool, no resource ledger and — since the agent carve — no podman
-//! service either; it keeps the consensus lanes and nothing else. Everything
+//! dispatch pool and no resource ledger; it keeps the consensus lanes and
+//! nothing else. Everything
 //! below runs in a separate process with its own failure domain, and reaches its
 //! node exactly the way the CLI does — over localhost `/v1` + ws.
 //!
@@ -16,16 +16,14 @@
 //! | `WorkspaceProvisioner` | `noded::agent_provision` over the same `/v1` lane |
 //! | work intake (effect lane) | `SagaQuery::AssignedPending` + ws hints ([`intake`]) |
 //! | `OutputSink` → stream hub | a `run_output` ws frame ([`link`]) |
-//! | `__egress-hook` | already a subcommand of THIS binary — the hook podman fires is `ducktape __egress-hook`, and the daemon ships in the same executable, so nothing moved |
 //!
-//! ## podman is this daemon's, not the node's
+//! ## a run's isolation is this daemon's, not the node's
 //!
-//! This daemon starts its own node-private podman service under
-//! `<storage>/services/compute` — socket, storage root and egress hook. The node
-//! starts none, and neither does it share one with the agent daemon: a
-//! `kill_on_drop` service child shared between two processes would make them a
-//! single failure domain. Container ownership is label-scoped ON TOP of that —
-//! see [`reap`] — so the two guarantees are independent.
+//! Every run this daemon starts is its own microVM: the VMM is a child of THIS
+//! process and dies with the run, so there is no daemon to share with the node
+//! or with the agent daemon and no long-lived state between runs. Run ownership
+//! is still tracked explicitly — see [`reap`] — because a crashed daemon's VMs
+//! have to be identifiable by the one that replaces it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -36,7 +34,7 @@ use noded::node_link::NodeLink;
 use crate::config;
 use crate::services::ServiceGrant;
 
-mod cred;
+pub(crate) mod cred;
 mod intake;
 mod link;
 
@@ -69,8 +67,8 @@ pub(crate) struct Compute {
 /// operational state, not an error.
 ///
 /// Through [`crate::services::serve_until_stopped`], which owns the runtime and
-/// arms SIGTERM/SIGINT before a line of this daemon runs: the `podman system
-/// service` started below must never outlive the process that started it.
+/// arms SIGTERM/SIGINT before a line of this daemon runs: a run's VMM is a
+/// child of this process and must never outlive it holding guest memory.
 pub(crate) fn serve(compute: Compute) -> Result<(), Box<dyn std::error::Error>> {
     crate::services::serve_until_stopped(std::future::pending(), |stop| run(compute, stop))
 }
@@ -86,7 +84,13 @@ async fn run(
         node_key,
     } = compute;
     let node_key = node_key.to_vec();
-    let node = NodeLink::new(&http_base).with_forge_repo(service.storage_dir.join("forge-repo"));
+    // the workspace credential is what makes this daemon's WRITES land: every
+    // mutating `/v1` route refuses a caller holding neither it nor a user
+    // signature, and a lease heartbeat, a bid and a run's duckfs commit are the
+    // NODE's ops, not a person's.
+    let node = NodeLink::new(&http_base)
+        .with_forge_repo(service.storage_dir.join("forge-repo"))
+        .with_workspace_credential(&service.workspace);
 
     // the node must be ANSWERING before anything is discovered or reaped: a
     // daemon that boots first would otherwise reap against a socket that does
@@ -102,25 +106,16 @@ async fn run(
         () = &mut stop => return Ok(()),
     }
 
-    // this daemon's OWN podman service, under `<storage>/services/compute`. The
-    // node used to start one for everybody; it does not any more, because a
-    // `kill_on_drop` service child shared between two daemons made them one
-    // failure domain. Fail-closed: a start failure ends the process rather than
-    // leaving a daemon that announces capacity it cannot sandbox.
-    let backend = crate::services::podman_backend(&service, &grant.kind)?;
-    let self_exe = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve this daemon's own executable: {error}"))?;
-    let podman = provider_host::PodmanService::start_for(
-        &backend,
-        &crate::services::podman_data_dir(&service, &grant.kind),
-        &self_exe,
-    )
-    .await?;
-    // whatever still carries this instance's label got here through a death
-    // that ran no code — the stop path leaves none — and is destroyed, never
-    // resumed. See [`crate::services::Sweep`].
-    crate::services::sweep_own_containers(&backend, &grant, crate::services::Sweep::CrashOrphans)
-        .await;
+    // Fail-closed at BOOT: a daemon that announces capacity it cannot sandbox
+    // is worse than one that refuses to start, and the probe answers the
+    // question that actually predicts a run — whether /dev/kvm opens
+    // read-write for THIS process, and whether the guest images exist.
+    //
+    // There is no service to start any more. Each run's VMM is a child of this
+    // process, so two daemons on one node no longer share a failure domain at
+    // all, rather than sharing one carefully.
+    let backend = crate::services::sandbox_backend(&service)?;
+    backend.probe()?;
 
     let (line_tx, line_rx) = tokio::sync::mpsc::channel(link::OUTPUT_LANE);
     let providers = provider_host::discover(
@@ -134,11 +129,7 @@ async fn run(
     let offered = providers.capabilities();
 
     let hint = Arc::new(tokio::sync::Notify::new());
-    tokio::spawn(link::attach(
-        ws_url(&http_base),
-        hint.clone(),
-        line_rx,
-    ));
+    tokio::spawn(link::attach(ws_url(&http_base), hint.clone(), line_rx));
 
     let (mut pump, mut delivered) = build_pool(&node, &service, node_key, providers).await?;
 
@@ -180,42 +171,15 @@ async fn run(
             () = &mut stop => break,
         }
     }
-    stop_sandbox(podman, &backend, &grant).await;
-    Ok(())
-}
-
-/// Tear the sandbox down, containers FIRST.
-///
-/// Order is the whole point. Killing the `podman system service` does not stop
-/// what it created: each container's conmon is its own parent, ignores SIGTERM,
-/// and would keep the workload running under a service that no longer exists.
-/// So this instance's containers are REMOVED here rather than left for the next
-/// start's reaper — over the socket that is still answering right now, which is
-/// the only instrument that reaches them — and only then does the service child
-/// go. Leaving them would mean a stopped daemon still burning CPU and holding a
-/// graph root until something happened to start that kind again, which on a
-/// torn-down workspace is never.
-///
-/// SIGKILL still leaves both behind, and nothing here can change that: the
-/// answer there is the next start of the same kind, where `PodmanService::claim`
-/// reaps the podman service under a root nobody holds any more and the boot
-/// sweep destroys the containers.
-async fn stop_sandbox(
-    podman: Option<provider_host::PodmanService>,
-    backend: &provider_host::SandboxBackend,
-    grant: &ServiceGrant,
-) {
-    crate::services::sweep_own_containers(backend, grant, crate::services::Sweep::Teardown).await;
-    let Some(service) = podman else {
-        // a non-Podman backend started no service (Tart deletes its VM per run).
-        return;
-    };
-    service.shutdown().await;
+    // Nothing to tear down: every live run's VMM is a child of this process
+    // spawned kill_on_drop, so returning from here IS the teardown — and it
+    // covers SIGKILL, which the container backend's sweep could not.
     tracing::info!(
         target: "ducktape::service",
         instance = %grant.display_id(),
         "compute daemon stopped"
     );
+    Ok(())
 }
 
 /// Block until the node answers a committed query.
@@ -273,13 +237,7 @@ async fn build_pool(
     service: &config::ServiceConfig,
     node_key: Vec<u8>,
     providers: provider_host::ProviderSet,
-) -> Result<
-    (
-        intake::WorkPump,
-        tokio::sync::mpsc::Receiver<sdk::Msg>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(intake::WorkPump, tokio::sync::mpsc::Receiver<sdk::Msg>), Box<dyn std::error::Error>> {
     let spawn: SpawnFn = Arc::new(|kind, future| {
         match kind {
             // Queue waiters share the runtime. An admitted run gets a task of
@@ -325,9 +283,24 @@ async fn build_pool(
         )),
     );
 
-    let resolver: compute_service::SharedCredentialResolver = Arc::new(
-        cred::NodeCredentialResolver::new(node.clone(), browser_gateway(node).await),
-    );
+    // `agent sched` REQUIRES a `--cred`, and a credential is routed through
+    // this node's own browser gateway — so a daemon without one can execute no
+    // scheduled run at all, while still announcing every capability it has.
+    // It learns that here, at boot, and used to say nothing: the operator's
+    // first evidence was a saga burning all three attempts on
+    // "this node has no browser gateway to route credential traffic".
+    let via = browser_gateway(node).await;
+    if via.is_none() {
+        tracing::warn!(
+            target: "ducktape::compute",
+            reason = "no_browser_gateway",
+            "this node serves no browser gateway, so every run naming a --cred \
+             will fail to resolve it (the browser gateway starts only when the \
+             node api binds a loopback address)"
+        );
+    }
+    let resolver: compute_service::SharedCredentialResolver =
+        Arc::new(cred::NodeCredentialResolver::new(node.clone(), via));
 
     let pool = DispatchPool::with_limit(
         Arc::new(providers),
@@ -388,7 +361,10 @@ mod tests {
         assert_eq!(ws_url("http://127.0.0.1:8844"), "ws://127.0.0.1:8844/v1/ws");
         assert_eq!(ws_url("https://node.example"), "wss://node.example/v1/ws");
         // a trailing slash must not produce a double slash in the path.
-        assert_eq!(ws_url("http://127.0.0.1:8844/"), "ws://127.0.0.1:8844/v1/ws");
+        assert_eq!(
+            ws_url("http://127.0.0.1:8844/"),
+            "ws://127.0.0.1:8844/v1/ws"
+        );
     }
 
     #[test]

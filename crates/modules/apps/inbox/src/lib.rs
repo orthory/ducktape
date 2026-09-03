@@ -24,7 +24,7 @@
 //!   name their own queue, and "permanently delete another member's whole
 //!   notification history, unattributed" stops being expressible.
 //! - only an AUTHENTICATED EXTERNAL submitter owns a queue. `Origin::Module`
-//!   and `Origin::System` are refused outright (the `vaults` posture), as is
+//!   and `Origin::System` are refused outright, as is
 //!   the pre-consensus default `Origin::External(vec![])`: nothing in the tree
 //!   emits an ack as a follow-up, so admitting a module origin would only have
 //!   handed the delivering module a lever over the queue it delivered to —

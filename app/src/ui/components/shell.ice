@@ -462,8 +462,9 @@ component TitleBar(network:str, height:i64, sync_line:str, loading:bool, degrade
               style=transparent
             StatusPill degraded=degraded loading=loading
             box pr=13.0
-              StatusCard wall_now=wall_now
+              StatusCard
                 with
+                  wall_now=wall_now
                   degraded
                   loading
                   answered

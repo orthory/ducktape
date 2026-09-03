@@ -75,6 +75,7 @@ pub(crate) fn commit_refs<S: ObjectStore, R: RefsStore>(
     refs: Refs,
     height: u64,
     gc_watermark: u64,
+    gc_faulted: &mut bool,
 ) -> Result<u64, Error> {
     // 4. the commit point: refs file durable (atomic rename + parent fsync).
     refs_store
@@ -89,12 +90,44 @@ pub(crate) fn commit_refs<S: ObjectStore, R: RefsStore>(
     if !gc_due(height, gc_watermark) {
         return Ok(gc_watermark);
     }
-    fs.gc()
-        .map_err(|e| Error::Module(format!("files: gc: {e}")))?;
+    // a gc fault SKIPS the sweep; it never fails the block. gc is
+    // consensus-neutral by construction — mark reads committed refs, the sweep
+    // removes only unreachable objects, and the root is `root_bytes(refs)` —
+    // so a boundary that skips its sweep costs disk and NOTHING else. failing
+    // here instead turned one lost or bit-rotted object into a deterministic
+    // brick: every node holding it fail-stops at the same boundary, and the
+    // only remedy is a full wipe-and-resync. mark refuses BEFORE removing
+    // anything, so the store is exactly as it was and the objects stay put.
+    //
+    // the watermark advances either way: the fault outlives the boundary (no
+    // live refetch drives possession on a running node — that lane is still
+    // join-time only), so retrying every files-active block would re-walk the
+    // whole graph for the same answer. the next period retries.
+    match fs.gc() {
+        Ok(_) => *gc_faulted = false,
+        Err(fault) => note_gc_fault(gc_faulted, height, &fault),
+    }
     refs_store
         .save(fs.refs(), height, height)
         .map_err(|e| Error::Module(format!("files: refs save (gc watermark): {e}")))?;
     Ok(height)
+}
+
+/// report a skipped sweep ONCE per fault run, LATCHED: the fault persists
+/// across boundaries by nature (a lost object stays lost), so a warn per
+/// boundary would bury the first — the only one that dates the corruption. the
+/// latch clears on the next sweep that completes.
+fn note_gc_fault(gc_faulted: &mut bool, height: u64, fault: &str) {
+    if std::mem::replace(gc_faulted, true) {
+        return;
+    }
+    tracing::warn!(
+        target: "ducktape::files",
+        reason = "gc_object_missing",
+        height,
+        fault = %fault,
+        "gc sweep skipped; every object kept"
+    );
 }
 
 /// the native module glue over the pure [`Fs`] core. generic over the two
@@ -120,6 +153,9 @@ pub struct Files<S: ObjectStore = DiskStore, R: RefsStore = DiskRefs> {
     /// gc watermark (per-node bookkeeping); the trigger policy lands in task 13,
     /// so it stays 0 here but is threaded through save/load already.
     gc_watermark: u64,
+    /// latch for [`note_gc_fault`]: has a skipped sweep already been reported?
+    /// per-node observability only — never persisted, never in the root.
+    gc_faulted: bool,
 }
 
 impl Files {
@@ -145,6 +181,7 @@ impl Files {
             refs_store,
             durable_height,
             gc_watermark,
+            gc_faulted: false,
         })
     }
 }
@@ -162,6 +199,7 @@ impl Files<MemStore, MemRefs> {
             refs_store: MemRefs::new(),
             durable_height: None,
             gc_watermark: 0,
+            gc_faulted: false,
         }
     }
 }
@@ -480,8 +518,14 @@ impl<S: ObjectStore, R: RefsStore> Module for Files<S, R> {
         // 4-6. the commit point (refs save), adopt (root moves here), and the
         // consensus-neutral gc watermark trigger — the ordering shared verbatim
         // with the wasm-tenant backing's publish/adopt sequence.
-        self.gc_watermark =
-            commit_refs(&mut self.fs, &mut self.refs_store, refs, height, self.gc_watermark)?;
+        self.gc_watermark = commit_refs(
+            &mut self.fs,
+            &mut self.refs_store,
+            refs,
+            height,
+            self.gc_watermark,
+            &mut self.gc_faulted,
+        )?;
         self.durable_height = Some(height);
         Ok(())
     }

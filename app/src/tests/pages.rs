@@ -220,7 +220,7 @@ fn page_autosave_freshness_is_compiler_owned_without_aborting_writes() {
     let onboarding = inlined(include_str!("../ui/handlers/onboarding.ice"));
     assert_eq!(
         onboarding.matches("invalidate lane=page_autosave").count(),
-        2
+        3
     );
 }
 
@@ -390,7 +390,7 @@ fn a_refused_write_does_not_hand_the_baseline_someone_elses_title() {
 /// looking at an empty, fully typable document under the new page's title.
 ///
 /// One keystroke there used to reach the 900ms save tick, which wrote
-/// `page_text(page_editor)` into `active_page`. Saving an empty document
+/// `editor_text(page_editor)` into `active_page`. Saving an empty document
 /// against a real page is a `RemoveBlock` for every line it had: the page would
 /// be destroyed by the act of failing to open it, and the reader would never
 /// have seen a line of it.
@@ -1332,4 +1332,43 @@ fn block_comment_recovery_always_unlocks_mutations() {
         "and neither does the failure arm"
     );
     assert!(!overtaken_failure.block_comment_threads_loading);
+}
+
+/// AN ARMED DELETE IS A LAYER, AND A LAYER SEALS WHAT IS UNDER IT.
+///
+/// `page_delete_armed` paints a scrim and a confirm over the canvas. It had no
+/// Escape rung — the mouse was the only way out, while every other overlay in
+/// the console answered the key — and `pages_ready` did not name it either, so
+/// Cmd/Ctrl+Z walked through the scrim and mutated the very document the
+/// reader is being asked to confirm the deletion of, autosave following the
+/// buffer down.
+#[test]
+fn an_armed_page_delete_answers_escape_and_seals_the_document() {
+    crate::pages::history::reset();
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.shell_tab = ShellTab::Pages;
+    app.active_page = "alpha".into();
+    app.page_editor = compose("one");
+    crate::pages::history::record(|| ("".to_owned(), app.page_editor.cursor()));
+    app.page_delete_armed = true;
+
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyZ,
+    )));
+    assert_eq!(
+        app.page_editor.text(),
+        "one",
+        "the scrim seals the document behind it"
+    );
+
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(escape_press()));
+    assert!(!app.page_delete_armed, "and Escape is the way out of it");
+
+    // With the confirm down the chord reaches the buffer again.
+    let _ = app.__update(__DucktapeMessage::GlobalKeyPressed(command_chord(
+        iced::keyboard::key::Code::KeyZ,
+    )));
+    assert_eq!(app.page_editor.text(), "");
+    crate::pages::history::reset();
 }

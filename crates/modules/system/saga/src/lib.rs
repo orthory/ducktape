@@ -2233,7 +2233,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_control_codec_is_versioned_and_disjoint_from_worker_requests() {
+    fn worker_control_codec_is_kind_tagged_and_disjoint_from_worker_requests() {
         let control = WorkerControl::cancel_attempt(sid("s1"), 2, b"node-a".to_vec());
         let bytes = encode_worker_control(&control);
         assert_eq!(decode_worker_control(&bytes).unwrap(), control);
@@ -2243,9 +2243,6 @@ mod tests {
         );
 
         let mut wrong = control.clone();
-        wrong.version += 1;
-        assert!(decode_worker_control(&encode_worker_control(&wrong)).is_err());
-        wrong = control.clone();
         wrong.kind = "other".into();
         assert!(decode_worker_control(&encode_worker_control(&wrong)).is_err());
 

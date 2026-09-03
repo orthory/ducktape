@@ -76,37 +76,31 @@ pub type Digest = sha256::Digest;
 /// through — keyed by [`Digest`], over ed25519 peers, no subscribers.
 type PayloadMailbox = ResolverMailbox<Digest, commonware_cryptography::ed25519::PublicKey, ()>;
 
-/// the versioned consensus signature / certificate scheme — a GENESIS-WIDE constant
-/// every validator must agree on (it domain-separates the simplex scheme + certificates;
-/// a mismatch means engines never agree and the mesh hangs).
-///
-/// [`V1Ed25519`](ConsensusScheme::V1Ed25519) is the only wired scheme: each validator
-/// signs with its own ed25519 key; a certificate is a COLLECTION of ed25519 signatures,
-/// so cert size (and verification cost) grows linearly with the validator set.
-///
-/// # the rekey / respawn contract (read before wiring a new scheme or dynamic validators)
-/// the scheme AND the validator set are fixed at simplex `Engine` construction — neither
-/// can be hot-swapped in a running engine. changing EITHER (a scheme change, or a
-/// validator join/leave) requires an **epoch transition**: at a height the OLD engine
-/// finalizes, every validator tears down the current engine and RE-SPAWNS a new one with
-/// the new `(scheme, participants)`. finalizing the switch through the old engine FIRST is
-/// what makes every node cut over at the SAME point (else they fork). this one
-/// teardown-and-respawn mechanism backs both a scheme change and dynamic valset. the same
-/// epoch boundary is where validator-owned transport membership rotates: bootnodes,
-/// relayers, and control participants must be derived from that epoch's validator set,
-/// not from a static external relay.
-///
-/// # implementation note
-/// [`SimplexOrderer`]'s spawn fns are GENERIC over the simplex scheme `S` (with
-/// `S::PublicKey` pinned to ed25519 — the transport identity), and the orderer itself is
-/// scheme-erased. so selecting a scheme is purely a construction-time choice: build the
-/// scheme value (`simplex::scheme::ed25519::Scheme::signer`) and hand it to the spawn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ConsensusScheme {
-    /// per-validator ed25519 signatures; certificates are collections of them.
-    #[default]
-    V1Ed25519,
-}
+// the consensus signature / certificate scheme is ed25519, wired at simplex
+// `Engine` construction — a GENESIS-WIDE constant every validator must agree
+// on (it domain-separates the simplex scheme + certificates; a mismatch means
+// engines never agree and the mesh hangs). each validator signs with its own
+// ed25519 key; a certificate is a COLLECTION of ed25519 signatures, so cert
+// size (and verification cost) grows linearly with the validator set.
+//
+// THE REKEY / RESPAWN CONTRACT (read before wiring a new scheme or dynamic
+// validators): the scheme AND the validator set are fixed at simplex `Engine`
+// construction — neither can be hot-swapped in a running engine. changing
+// EITHER (a scheme change, or a validator join/leave) requires an **epoch
+// transition**: at a height the OLD engine finalizes, every validator tears
+// down the current engine and RE-SPAWNS a new one with the new
+// `(scheme, participants)`. finalizing the switch through the old engine
+// FIRST is what makes every node cut over at the SAME point (else they fork).
+// this one teardown-and-respawn mechanism backs both a scheme change and
+// dynamic valset. the same epoch boundary is where validator-owned transport
+// membership rotates: bootnodes, relayers, and control participants must be
+// derived from that epoch's validator set, not from a static external relay.
+//
+// implementation note: [`SimplexOrderer`]'s spawn fns are GENERIC over the
+// simplex scheme `S` (with `S::PublicKey` pinned to ed25519 — the transport
+// identity), and the orderer itself is scheme-erased. so selecting a scheme
+// is purely a construction-time choice: build the scheme value
+// (`simplex::scheme::ed25519::Scheme::signer`) and hand it to the spawn.
 
 /// hash a frame's bytes into the [`Digest`] simplex will order — the
 /// content-address (identical bytes always map to the same digest).
@@ -1110,10 +1104,7 @@ impl FinalizedInbox {
     /// slot may have become drainable, so the owning run loop can drain
     /// event-driven instead of waiting out its periodic tick.
     pub fn set_wake(&self, wake: commonware_utils::channel::mpsc::UnboundedSender<()>) {
-        self.inner
-            .lock()
-            .expect("finalized inbox poisoned")
-            .wake = Some(wake);
+        self.inner.lock().expect("finalized inbox poisoned").wake = Some(wake);
     }
 
     /// complete an AWAITING slot with fetched bytes, off the sync reporter (from
@@ -1446,7 +1437,7 @@ impl SimplexOrderer {
     /// enqueues onto the very FIFO the automaton peeks — all over the shared
     /// `store`.
     ///
-    /// GENERIC over the simplex scheme `S` (the [`ConsensusScheme`] seam) with
+    /// GENERIC over the simplex scheme `S` (the scheme seam) with
     /// `S::PublicKey` pinned to ed25519 — the transport identity every p2p bound in
     /// this crate keys on; only the vote/certificate signatures vary by scheme. also
     /// generic over the runtime `context` E, the `blocker` B, and the three engine
@@ -1881,7 +1872,7 @@ where
     use commonware_parallel::Sequential;
     let finalization =
         Finalization::<S, Digest>::decode_cfg(bytes, &scheme.certificate_codec_config())
-    .map_err(|e| format!("finalization certificate does not decode: {e}"))?;
+            .map_err(|e| format!("finalization certificate does not decode: {e}"))?;
     if !finalization.verify(rng, scheme, &Sequential) {
         return Err(
             "finalization certificate does not carry the epoch quorum's signatures".to_string(),

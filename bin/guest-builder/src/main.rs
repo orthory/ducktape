@@ -14,14 +14,25 @@
 //!               [--scratch <dir>] [--platform-root <dir>]
 //! ```
 //!
-//! the synthesized workspace is EPHEMERAL by design: guest workspaces never
-//! committed lockfiles — the committed artifact is the canonical bytes
-//! (`wasm-modules-check` guards the copies) — so regenerating the packaging
-//! loses nothing. the standalone workspace is what keeps wasm32 dep
-//! resolution, feature unification, and the `[patch.crates-io]` stubs
-//! (getrandom, blst) out of the host workspace; the patch set is applied
-//! uniformly — cargo warns "unused patch" for modules whose graphs never pull
-//! those crates, which is expected and harmless.
+//! the synthesized workspace is EPHEMERAL by design — the committed artifact
+//! is the canonical bytes (`wasm-modules-check` guards the copies), so
+//! regenerating the packaging loses nothing. its `Cargo.lock` is the one thing
+//! that must NOT be scratch state: [`synthesize`] seeds it from the platform
+//! checkout's committed lock on every run, so the guest graph inherits the
+//! resolution the host already reviewed. Unseeded, cargo re-resolves the
+//! wasm32 graph against the live registry each synthesis, and a crates.io
+//! publish between two rebuilds moves the component bytes with no source
+//! change. `wasm-modules-check` cannot catch that — it compares the committed
+//! copies to each other, and a sweep refreshes them together — so the shift
+//! lands as an unexplained artifact diff nobody can attribute.
+//!
+//! the standalone workspace is what keeps wasm32 dep resolution, feature
+//! unification, and the `[patch.crates-io]` stubs (getrandom, blst) out of the
+//! host workspace; the patch set is applied uniformly — cargo warns "unused
+//! patch" for modules whose graphs never pull those crates, which is expected
+//! and harmless. the stubs are wasm-only, so they are also the crates the seed
+//! does not pin: cargo resolves them fresh against the patch paths and trims
+//! the host entries the guest graph never reaches.
 //!
 //! that scratch workspace also holds `tree/` — a snapshot of the platform
 //! checkout — and the build compiles THAT, never the checkout in place. The
@@ -271,7 +282,16 @@ fn read_module(module_dir: &Path, kind: GuestKind) -> Result<Module, String> {
 
 /// write the scratch packaging workspace: a cdylib crate whose only dependency
 /// is the module (the contract feature on, native off) plus the uniform wasm32
-/// patch set. regenerated on every run — nothing here is hand-maintained state.
+/// patch set, over a `Cargo.lock` seeded from the platform checkout's own.
+/// regenerated on every run — nothing here is hand-maintained state.
+///
+/// The seed is what makes a rebuild reproducible in TIME, the way the snapshot
+/// below makes it reproducible across PATHS. Without it the guest workspace
+/// starts from no lock and cargo resolves the wasm32 graph against the live
+/// registry, so the same source rebuilt after any crates.io publish can produce
+/// different bytes. The host lock pins everything the host already resolved;
+/// the build runs without `--locked` so cargo can still trim it to the guest
+/// graph and resolve the wasm-only patch stubs the host never sees.
 ///
 /// Every path dependency is reached through [`snapshot`] — `tree/...`, INSIDE
 /// the scratch workspace — because cargo hashes a path package's location into
@@ -342,7 +362,14 @@ blst = {{ path = "{blst}" }}
     );
 
     write(&scratch.join("Cargo.toml"), &manifest)?;
-    write(&src.join("lib.rs"), &lib)
+    write(&src.join("lib.rs"), &lib)?;
+
+    // rewritten every run, never merged: the host lock IS the intended
+    // resolution, so a scratch lock left over from an older one is drift.
+    let host_lock = platform_root.join("Cargo.lock");
+    fs::copy(&host_lock, scratch.join("Cargo.lock"))
+        .map(|_| ())
+        .map_err(|e| format!("seeding the guest lock from {}: {e}", host_lock.display()))
 }
 
 /// refresh `<scratch>/tree` with a copy of the platform checkout's TRACKED
@@ -352,13 +379,12 @@ blst = {{ path = "{blst}" }}
 /// The list comes from `git ls-files`, never from walking the directory: the
 /// tracked set IS the build input set — the committed artifacts rebuild
 /// byte-identically from it, which is the proof that nothing gitignored is an
-/// input — while the directory around it is mostly not. A checkout that
-/// followed the documented docs setup (`cd docs && bun install`) carries ~950 MB
-/// of gitignored bulk (docs/node_modules alone is 834 MB), and a
+/// input — while the directory around it is mostly not: gitignored bulk (a
+/// `node_modules/`, a stray `target/`) runs to hundreds of MB, and a
 /// `make wasm-modules` sweep would tar all of it into each of its 22 scratch
-/// dirs. Walking is also unstable: a live writer (`bun run dev` rewriting
-/// docs/.astro) makes GNU tar exit 1 with "file changed as we read it" and
-/// aborts the sweep half-refreshed.
+/// dirs. Walking is also unstable: a live writer rewriting a cache dir makes
+/// GNU tar exit 1 with "file changed as we read it" and aborts the sweep
+/// half-refreshed.
 ///
 /// tar rather than a hand-rolled walk: it carries symlinks (`CLAUDE.md`,
 /// `.claude/skills`) and mtimes over verbatim, and the mtimes are what keep the
@@ -545,4 +571,59 @@ fn snake(name: &str) -> String {
 
 fn write(path: &Path, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+// ============================================================================
+// tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// the versions a lock pins for one crate name, in file order.
+    fn pinned(lock: &str, crate_name: &str) -> Vec<String> {
+        lock.split("[[package]]")
+            .filter(|entry| entry.contains(&format!("\nname = \"{crate_name}\"\n")))
+            .filter_map(|entry| {
+                entry
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = \""))
+            })
+            .map(|version| version.trim_end_matches('"').to_string())
+            .collect()
+    }
+
+    /// synthesis must hand the scratch workspace the host's resolution. an
+    /// unseeded guest workspace re-resolves its wasm32 graph against the live
+    /// registry on every run, so a crates.io publish between two rebuilds
+    /// silently moves the component bytes of a module whose source nobody
+    /// touched.
+    #[test]
+    fn synthesis_seeds_the_host_lock() {
+        let platform_root = default_platform_root().expect("platform root");
+        let scratch = tempfile::tempdir().expect("scratch dir");
+        let module_dir = platform_root.join("crates/modules/apps/tasks");
+        synthesize(
+            scratch.path(),
+            &module_dir,
+            "tasks",
+            &platform_root,
+            GuestKind::Component,
+        )
+        .expect("synthesize");
+
+        let host = fs::read_to_string(platform_root.join("Cargo.lock")).expect("host lock");
+        let seeded =
+            fs::read_to_string(scratch.path().join("Cargo.lock")).expect("seeded scratch lock");
+
+        // serde is in both graphs, so the host pin is the guest pin.
+        let host_serde = pinned(&host, "serde");
+        assert!(!host_serde.is_empty(), "host lock pins no serde");
+        assert_eq!(
+            pinned(&seeded, "serde"),
+            host_serde,
+            "seeded lock must carry the host's serde pin"
+        );
+    }
 }

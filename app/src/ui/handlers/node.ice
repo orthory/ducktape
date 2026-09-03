@@ -30,6 +30,7 @@ on node_facts_loaded(next)
   node_key = next.public_key
   node_version = next.version
   node_root_hash = next.root_hash
+  network_chain_id = next.chain_id
   node_last_finalized = next.last_finalized_at
   node_checkpoint = next.checkpoint_height
   node_height = next.height
@@ -43,6 +44,21 @@ on node_facts_loaded(next)
   node_sync_retries = next.sync_retries
   node_sync_failures = next.sync_failures
   node_sync_last_error = next.sync_last_error
+  // THE OS HANDED THIS PROCESS A LINK, and this status is the first moment it
+  // can be judged: the open plane refuses a link whose `?net=` names another
+  // network, and `network_chain_id` — set from this same document above — is
+  // what it compares against. Blanked before the run, so it is spent once and
+  // no later reconnect re-opens it.
+  // A launch link WAITS for that first status rather than being refused on
+  // the way there: a poll that fails while the node is still coming up would
+  // otherwise eat a link that opens fine a second later.
+  // ponytail: so an app that never connects at all opens nothing and says
+  // nothing — give the link its own visible pending/refused plate if that is
+  // ever felt.
+  let launch_link = startup_duck_link
+  startup_duck_link = ""
+  return if empty(launch_link)
+  run every duck_echo_str(launch_link) -> open_message_link _ | external_url_failed _
 
 on node_facts_failed(_cause)
 
@@ -52,6 +68,7 @@ on node_status_pushed(next)
   node_key = next.public_key
   node_version = next.version
   node_root_hash = next.root_hash
+  network_chain_id = next.chain_id
   node_last_finalized = next.last_finalized_at
   node_checkpoint = next.checkpoint_height
   node_height = next.height
@@ -85,7 +102,7 @@ on settings_loaded(next)
   // whether it is seated in a members-only room. The facts load lands after the
   // first chat load, so without these the sidebar listed every DM under
   // CHANNELS and the composer stayed refused until the next delta.
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   settings_open_tabs = next.open_tabs

@@ -1,6 +1,7 @@
 use super::*;
 use ::chat;
 use ::forge;
+use identity::{AccountView, IdentityQuery, IdentityReply};
 
 /// One UI publication may carry at most this many consecutive chat deltas.
 /// The cap bounds one reducer pass; the capacity-one publication gate below
@@ -1273,22 +1274,65 @@ pub fn keep_members(
     if loaded { next } else { current }
 }
 
-/// The huddle roster, kept only while this device is IN the huddle. Every chat
-/// load carries the roster of the channel it loaded, so a load of any other
-/// channel must not leave the popped panel painting strangers — dropping it is
-/// the same guard `huddle_channel` itself carries.
-pub fn keep_roster(joined: bool, next: Vec<HuddleParticipant>) -> Vec<HuddleParticipant> {
-    if joined { next } else { Vec::new() }
+/// Everything a chat load says about the huddle — the one rule, in one place,
+/// for the five folds that used to spell it out in four lines each.
+///
+/// A LOAD CARRIES THE ROSTER OF THE CHANNEL IT LOADED, AND THAT IS NOT ALWAYS
+/// THE HUDDLE'S. The docked pill and the popped panel follow you onto every
+/// other room and every other screen — that is what they are FOR — so reading
+/// "am I in a huddle" off the room you happen to be looking at answered no the
+/// moment you clicked a second channel. And that answer is not cosmetic:
+/// `huddle_joined` is the media leg's subscription gate, so a channel click cut
+/// the audio and video of the call you were in, closed the window, and blanked
+/// the `huddle_channel` that `leave_huddle_here` needs — leaving you on the
+/// on-chain roster with no control left that could take you off it.
+///
+/// So: while joined, a load of ANY OTHER channel says nothing about the huddle
+/// and changes nothing about it. A load of the huddle's own channel (or any
+/// load at all while not joined) answers in full, and a resync that carried no
+/// chat at all (`loaded == false`) answers not at all.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct HuddleAfterLoad {
+    pub joined: bool,
+    pub roster: Vec<HuddleParticipant>,
+    pub channel: String,
+    pub channel_name: String,
 }
 
-/// [`keep_roster`]'s loaded-gated half: a resync that did NOT load chat must
-/// leave the roster alone rather than blank it.
-pub fn keep_participants(
+// Eight, because the rule compares two whole huddles — the standing one and
+// the one the load carries. Folding either half into a struct only moves the
+// four names to the call site, where five folds would each build it by hand.
+#[allow(clippy::too_many_arguments)]
+pub fn huddle_after_load(
     loaded: bool,
-    next: Vec<HuddleParticipant>,
-    current: Vec<HuddleParticipant>,
-) -> Vec<HuddleParticipant> {
-    if loaded { next } else { current }
+    joined: bool,
+    channel: String,
+    channel_name: String,
+    roster: Vec<HuddleParticipant>,
+    loaded_channel: String,
+    loaded_channel_name: String,
+    loaded_roster: Vec<HuddleParticipant>,
+) -> HuddleAfterLoad {
+    let standing = HuddleAfterLoad {
+        joined,
+        roster,
+        channel,
+        channel_name,
+    };
+    let speaks_for_the_huddle = loaded && (!joined || loaded_channel == standing.channel);
+    if !speaks_for_the_huddle {
+        return standing;
+    }
+    let joined_now = huddle_self(loaded_roster.clone());
+    if !joined_now {
+        return HuddleAfterLoad::default();
+    }
+    HuddleAfterLoad {
+        joined: true,
+        roster: loaded_roster,
+        channel: loaded_channel,
+        channel_name: loaded_channel_name,
+    }
 }
 
 pub fn keep_pages(loaded: bool, next: Vec<PageItem>, current: Vec<PageItem>) -> Vec<PageItem> {
@@ -1483,8 +1527,8 @@ pub fn keep_folded_block_texts(
         .collect()
 }
 
-pub fn keep_str(loaded: bool, next: String, current: String) -> String {
-    if loaded { next } else { current }
+pub fn keep_str(loaded: bool, next: &str, current: &str) -> String {
+    if loaded { next } else { current }.to_owned()
 }
 
 pub fn keep_forge_phase(
@@ -1708,39 +1752,47 @@ pub struct DmPeersData {
 /// channel member, an agent row in this directory would be a button that
 /// cannot work.
 ///
-/// ponytail: the row is keyed on `account_id`, the account's FOUNDING member
-/// key, so a multi-device account is reachable only at that key. Pair-wide DMs
-/// need account-keyed membership in the chat module itself.
+/// The row is keyed on the account NUMBER (decimal), so every key of a
+/// multi-device account reaches the same row, and the channel id hashes the
+/// PAIR OF ACCOUNT NUMBERS so both ends of one DM land on the same room.
 pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
-        let me = local_user_key().await.map(|key| hex_encode(&key));
-        let reply: serde_json::Value = client
+        let me = local_user_key().await;
+        let reply: IdentityReply = client
             .query(
                 "identity",
-                &serde_json::json!({ "all": { "from": 0, "limit": 256 } }),
+                &IdentityQuery::All {
+                    from: 0,
+                    limit: identity::MAX_QUERY_LIMIT,
+                },
             )
             .await?;
+        let accounts = match reply {
+            IdentityReply::Accounts(accounts) => accounts,
+            IdentityReply::Account(_) | IdentityReply::Gen(_) => {
+                return Err("the identity module returned the wrong reply".to_string());
+            }
+        };
+        // self is the account THIS key is a member of (a key holds at most one).
+        let is_mine = |account: &AccountView| {
+            me.as_ref()
+                .is_some_and(|me| account.keys.iter().any(|key| &key.pubkey == me))
+        };
+        let my_number = accounts
+            .iter()
+            .find(|account| is_mine(account))
+            .map(|account| account.number.to_string());
         let mut peers: Vec<DmPeer> = Vec::new();
-        for account in reply["accounts"].as_array().cloned().unwrap_or_default() {
-            // self is any account THIS key is a member of — comparing against
-            // `account_id` alone puts a second device in its own directory.
-            let mine = account["member_keys"].as_array().is_some_and(|keys| {
-                keys.iter().any(|member| {
-                    me.as_deref() == Some(hex_encode(&json_bytes(&member["pubkey"])).as_str())
-                })
-            });
-            if mine {
+        for account in accounts {
+            if is_mine(&account) {
                 continue;
             }
-            let key = hex_encode(&json_bytes(&account["account_id"]));
-            let name = match account["display_name"].as_str() {
-                Some(name) if !name.is_empty() => name.to_string(),
-                _ => short_label(&key),
-            };
-            let channel_id = me
-                .as_deref()
-                .map(|me| dm_channel_id(me.to_string(), key.clone()))
+            let key = account.number.to_string();
+            let name = account.name;
+            let channel_id = my_number
+                .as_ref()
+                .map(|mine| dm_channel_id(mine.clone(), key.clone()))
                 .unwrap_or_default();
             peers.push(DmPeer {
                 initials: initials_of(&name),
@@ -1819,8 +1871,9 @@ pub fn no_dm_peer() -> DmPeer {
     DmPeer::default()
 }
 
-/// Open the DM with one peer: resolve the deterministic channel when it
-/// exists, else create it members-only and seat both keys, then load it.
+/// Open the DM with one peer (an account number): resolve the deterministic
+/// channel when it exists, else create it members-only and seat every key of
+/// the peer's account plus this device's, then load it.
 ///
 /// NOT confidential. `MembersOnly` gates who may POST; every node replicates
 /// the channel's plaintext, so a DM is a two-person room, not a private one.
@@ -1838,18 +1891,46 @@ pub async fn open_dm(
     generation: i64,
 ) -> Result<ChatData, HydrationError> {
     async {
-        let peer = public_key(&peer_key, "peer public key")?;
+        let number: u64 = peer_key
+            .trim()
+            .parse()
+            .map_err(|_| "peer must be an account number".to_string())?;
         let me = local_user_key()
             .await
             .ok_or_else(|| "this device has no user key — a DM needs one".to_string())?;
-        let channel_id = dm_channel_id(hex_encode(&me), hex_encode(&peer));
-        let peer_name = short_label(&hex_encode(&peer));
         let client = rpc_client(&rpc)?;
+        let reply: IdentityReply = client
+            .query("identity", &IdentityQuery::OfKey { key: me })
+            .await?;
+        let mine = match reply {
+            IdentityReply::Account(account) => account,
+            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+                return Err("the identity module returned the wrong reply".to_string());
+            }
+        };
+        let mine = mine.ok_or_else(|| "this key is on no account — a DM needs one".to_string())?;
+        let channel_id = dm_channel_id(mine.number.to_string(), number.to_string());
         let mut existing = load_chat_data(&client, Some(&channel_id)).await?;
         if existing.active_channel == channel_id {
             existing.generation = generation;
             return Ok(existing);
         }
+        let reply: IdentityReply = client
+            .query("identity", &IdentityQuery::Get { number })
+            .await?;
+        let account = match reply {
+            IdentityReply::Account(account) => account,
+            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+                return Err("the identity module returned the wrong reply".to_string());
+            }
+        };
+        let account = account.ok_or_else(|| format!("account {number} does not exist"))?;
+        let peer_name = account.name;
+        // every key of both accounts is seated, so any device of either end
+        // reads and posts in the room.
+        let my_keys = mine.keys.into_iter().map(|key| key.pubkey);
+        let peer_keys = account.keys.into_iter().map(|key| key.pubkey);
+        let members: Vec<Vec<u8>> = my_keys.chain(peer_keys).collect();
         signed_write(
             &client,
             "chat",
@@ -1861,7 +1942,8 @@ pub async fn open_dm(
             password.clone(),
         )
         .await?;
-        let seated = [&me, &peer]
+        let seated = members
+            .iter()
             .map(|key| {
                 let handle = hex_encode(key);
                 ChatMember {
@@ -1869,8 +1951,8 @@ pub async fn open_dm(
                     key: handle,
                 }
             })
-            .to_vec();
-        for member in [me, peer] {
+            .collect();
+        for member in members {
             signed_write(
                 &client,
                 "chat",

@@ -42,7 +42,9 @@ fn page_query_replies_stop_before_the_rpc_client_limit() {
             },
         )
         .await;
-        let title = "x".repeat(700 * 1024);
+        // block TEXT is what can carry this much: a page title is capped at
+        // MAX_PAGE_TITLE_LEN, so a title can no longer bloat a reply.
+        let text = "x".repeat(700 * 1024);
         let mut after = None;
         for index in 0..10 {
             let id = format!("p{index:02}");
@@ -51,7 +53,7 @@ fn page_query_replies_stop_before_the_rpc_client_limit() {
                 &PageMsg::InsertBlock {
                     parent: "root".into(),
                     after,
-                    block: page(&id, &title),
+                    block: para(&id, &text),
                 },
             )
             .await;

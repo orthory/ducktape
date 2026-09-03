@@ -118,7 +118,7 @@ pub enum ModuleEvent {
     /// The chain head, as the node's heartbeat reports it.
     ///
     /// The heartbeat rides EVERY block wake — nop fillers included, which feed
-    /// no topic at all (`bin/noded/src/stream.rs`, the `block_rx` arm) — so this
+    /// no topic at all (`crates/noded/src/stream.rs`, the `block_rx` arm) — so this
     /// is the only event that moves a follower's head on a chain whose
     /// subscribed modules are quiet. Folding an op is not a substitute: an idle
     /// chain finalizes nop blocks forever and emits no ops, which used to freeze
@@ -233,7 +233,18 @@ pub struct Client {
     origin: String,
     base: Url,
     http: reqwest::Client,
+    /// The node's operator credential, when this caller can read the node's own
+    /// workspace. Every MUTATING `/v1` route refuses a caller that presents
+    /// neither it nor a per-request user signature, so a client without one
+    /// READS — its writes come back as the node's 401 naming the credential.
+    operator_token: Option<String>,
 }
+
+/// The header the operator credential travels in — the same one `/v1/admin/*`
+/// takes, because it is the same secret and the same bar ("can read the node's
+/// own workspace"). Spelled here rather than taken from `noded`: this crate is
+/// the thin public client and depends on no node internals.
+pub const OPERATOR_TOKEN_HEADER: &str = "x-ducktape-admin-token";
 
 #[derive(Serialize)]
 struct QueryRequest<'a, Q> {
@@ -299,7 +310,28 @@ impl Client {
             .timeout(TIMEOUT)
             .build()
             .map_err(|error| Error::new(format!("could not initialize RPC client: {error}")))?;
-        Ok(Self { origin, base, http })
+        Ok(Self {
+            origin,
+            base,
+            http,
+            operator_token: None,
+        })
+    }
+
+    /// Carry `token` — the node's `admin.token`, read out of its workspace — on
+    /// every request, which is what makes this client's WRITES land.
+    pub fn with_operator_token(mut self, token: String) -> Self {
+        self.operator_token = Some(token);
+        self
+    }
+
+    /// Attach the operator credential when this client holds one. Harmless on a
+    /// read (the gate never looks) and required on every write.
+    fn credentialed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.operator_token.as_deref() {
+            Some(token) => request.header(OPERATOR_TOKEN_HEADER, token),
+            None => request,
+        }
     }
 
     /// Canonical origin without a trailing slash.
@@ -447,8 +479,7 @@ impl Client {
         body: &serde_json::Value,
     ) -> Result<serde_json::Value> {
         let response = self
-            .http
-            .post(self.url(&format!("v1/files/{lane}"))?)
+            .credentialed(self.http.post(self.url(&format!("v1/files/{lane}"))?))
             .json(body)
             .send()
             .await
@@ -460,8 +491,7 @@ impl Client {
     /// returns the staged chunk's digest.
     pub async fn files_stage(&self, bytes: Vec<u8>) -> Result<String> {
         let response = self
-            .http
-            .post(self.url("v1/files/stage")?)
+            .credentialed(self.http.post(self.url("v1/files/stage")?))
             .header("content-type", "application/octet-stream")
             .body(bytes)
             .send()
@@ -481,8 +511,7 @@ impl Client {
     /// a pack staged there would never be found by a `pack_digest` lookup.
     pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<String> {
         let response = self
-            .http
-            .post(self.url("v1/files/blob")?)
+            .credentialed(self.http.post(self.url("v1/files/blob")?))
             .header("content-type", "application/octet-stream")
             .body(bytes)
             .send()
@@ -679,6 +708,58 @@ impl Client {
         }
         let receipt: Receipt = decode_json(response).await?;
         Ok(receipt.height)
+    }
+
+    /// Submit one module op over the FRAMELESS lane, answering the height of
+    /// the block that included it.
+    ///
+    /// The distinction from [`Client::submit_frame`] is authorship, and it is
+    /// load-bearing: this node re-signs the op with ITS OWN key, so the
+    /// committed origin is the node rather than the person at the keyboard.
+    /// That is right for an op the NODE is the actor of — a run pinned to it,
+    /// whose saga id is namespaced under its own actor string — and wrong for
+    /// anything a user authors, which must carry the user's signature.
+    pub async fn submit(&self, target: &str, payload: serde_json::Value) -> Result<u64> {
+        let response = self
+            .credentialed(self.http.post(self.url("v1/submit")?))
+            .json(&serde_json::json!({ "target": target, "payload": payload }))
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("transaction submission failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
+        }
+        #[derive(Deserialize)]
+        struct Receipt {
+            height: u64,
+        }
+        let receipt: Receipt = decode_json(response).await?;
+        Ok(receipt.height)
+    }
+
+    /// Mint one bearer invite valid for `ttl_days` and answer the paste blob.
+    ///
+    /// The NODE mints it, not the caller: minting folds this member's dial hint
+    /// into the network descriptor and SAVES it, and reads the persisted mesh
+    /// state for the member fronts a joiner can bring its tunnel up against —
+    /// both files the running daemon owns. A daemon with no workspace (an
+    /// embedder that wired no minter) answers 503.
+    pub async fn mint_invite(&self, ttl_days: u64) -> Result<String> {
+        let response = self
+            .credentialed(self.http.post(self.url("v1/invite")?))
+            .json(&serde_json::json!({ "ttl_days": ttl_days }))
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("minting an invite failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
+        }
+        #[derive(Deserialize)]
+        struct Minted {
+            invite: String,
+        }
+        let minted: Minted = decode_json(response).await?;
+        Ok(minted.invite)
     }
 
     /// Connect to the node stream and subscribe to committed module changes.

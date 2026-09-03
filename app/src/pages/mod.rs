@@ -43,9 +43,9 @@ pub fn block_at_line_target(blocks: Vec<crate::backend::PageBlock>, line: i64) -
 }
 
 /// The document lines wearing a commented block's wash, for the highlighter.
-pub fn commented_lines(blocks: Vec<crate::backend::PageBlock>, targets: Vec<String>) -> Vec<i64> {
+pub fn commented_lines(blocks: &[crate::backend::PageBlock], targets: &[String]) -> Vec<i64> {
     let mut lines = Vec::new();
-    for (id, start, len) in sync::line_spans(&blocks) {
+    for (id, start, len) in sync::line_spans(blocks) {
         if !targets.contains(&id) {
             continue;
         }
@@ -60,13 +60,13 @@ pub fn commented_lines(blocks: Vec<crate::backend::PageBlock>, targets: Vec<Stri
 /// and a snippet of the block it marks, or the page itself.
 /// The composer's own caption: where a NEW comment will anchor.
 pub fn comment_compose_hint(
-    blocks: Vec<crate::backend::PageBlock>,
-    target: String,
-    page_id: String,
+    blocks: &[crate::backend::PageBlock],
+    target: &str,
+    page_id: &str,
 ) -> String {
     format!(
         "New comment on {}",
-        comment_anchor_label(blocks, target, page_id)
+        anchor_label(&comment_anchor_labels(blocks), target, page_id)
     )
 }
 
@@ -246,16 +246,16 @@ const DOCUMENT_PAD_X: f32 = 2.0;
 
 /// The page's writing surface. `commented` is the document lines wearing a
 /// commented block's wash.
-pub fn page_document(
-    document: &Content,
+pub fn page_document<'a>(
+    document: &'a Content,
     dark: bool,
     disabled: bool,
-    blocks: Vec<crate::backend::PageBlock>,
-    hits: Vec<String>,
-) -> Element<'_, PageEvent> {
+    blocks: &[crate::backend::PageBlock],
+    hits: &[String],
+) -> Element<'a, PageEvent> {
     let cursor = document.cursor().position;
-    let commented = commented_lines(blocks.clone(), hits.clone());
-    let marks = comment_marks(&blocks, &hits);
+    let commented = commented_lines(blocks, hits);
+    let marks = comment_marks(blocks, hits);
     let editor = RichTextEditor::new(document, content_version(document))
         .id("page-document")
         .placeholder("Write something… `#` for a heading, `-` for a list")
@@ -448,7 +448,7 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
         let PageAction::MoveTo(cursor) = action else {
             return document;
         };
-        document.move_to(cursor);
+        crate::editor::move_to(&mut document, cursor);
         return document;
     };
     let Action::Edit(edit) = &edit_action else {
@@ -483,17 +483,6 @@ pub fn apply_page_action(mut document: Content, action: PageAction) -> Content {
         renumber_below(&mut document, from);
     }
     document
-}
-
-/// The document's text, for the save tick's dirty check and its plan.
-///
-/// Owned, not borrowed: the extern boundary hands state fields by value.
-/// VERBATIM: iced 0.14's `Content::text()` joins lines without inventing a
-/// trailing newline, so a trailing newline here IS a final empty line — the
-/// empty paragraph a page can end on. Trimming it made every such page dirty
-/// on open, and the resulting plan REMOVED the block.
-pub fn page_text(document: Content) -> String {
-    document.text()
 }
 
 /// Enter at the end of an UNMATCHED ``` line closes the fence: the newline is
@@ -852,6 +841,24 @@ mod tests {
         content
     }
 
+    /// The page's own seam: a `MoveTo` without a selection lands a bare
+    /// caret while a drag's selection still stands — a press after a drag
+    /// must not read as a drag from the old anchor.
+    #[test]
+    fn a_caret_move_without_a_selection_drops_the_page_selection() {
+        let mut document = typed("Title\nbody text", 1, 4);
+        document.move_to(Cursor {
+            position: Position { line: 1, column: 4 },
+            selection: Some(Position { line: 0, column: 0 }),
+        });
+        let landed = Cursor {
+            position: Position { line: 1, column: 2 },
+            selection: None,
+        };
+        let moved = apply_page_action(document, PageAction::MoveTo(landed));
+        assert_eq!(moved.cursor(), landed);
+    }
+
     /// The buffer's exact text after one key. NOT trimmed: a carried list
     /// marker ends in the space the caret sits after, and trimming it away
     /// would let a regression that drops it pass.
@@ -1061,10 +1068,7 @@ mod tests {
             "a removed block"
         );
         // The code block owns lines 2..=5 (fence, two body lines, fence).
-        assert_eq!(
-            commented_lines(blocks.clone(), vec!["a\nb".into()]),
-            vec![2, 3, 4, 5]
-        );
+        assert_eq!(commented_lines(&blocks, &["a\nb".into()]), vec![2, 3, 4, 5]);
         // A caret line inside the code body anchors a comment on that block —
         // resolved by LINE (Content::clone resets the cursor, so an
         // editor-valued sync could never read it).
@@ -1207,11 +1211,17 @@ mod tests {
     }
 
     #[test]
-    fn page_text_keeps_a_final_empty_line_because_it_is_a_block() {
+    fn editor_text_keeps_a_final_empty_line_because_it_is_a_block() {
+        // The save tick reads the buffer VERBATIM through `editor_text`
+        // (iced's `Content::text()`): it joins lines without inventing a
+        // trailing newline, so a trailing newline IS a final empty paragraph.
         // Trimming it made every page ending on an empty paragraph dirty on
         // open — and the resulting plan REMOVED that block unprompted.
-        let content = Content::with_text("one\ntwo\n");
-        assert_eq!(page_text(content), "one\ntwo\n");
-        assert_eq!(page_text(Content::with_text("one")), "one");
+        // `: Content` is load-bearing: `Content<R = Renderer>` only takes its
+        // default renderer from an annotated binding (E0283 otherwise).
+        let content: Content = Content::with_text("one\ntwo\n");
+        assert_eq!(content.text(), "one\ntwo\n");
+        let content: Content = Content::with_text("one");
+        assert_eq!(content.text(), "one");
     }
 }

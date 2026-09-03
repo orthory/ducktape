@@ -2,7 +2,9 @@
 //!
 //! Alice publishes `api.alice.duck` to one loopback HTTP server. Bob resolves
 //! the finalized route, sends POST and browser traffic over the authenticated
-//! userspace WireGuard stream, and is identified to Alice by node/account.
+//! userspace WireGuard stream, and is identified to Alice by NODE only — a
+//! caller account is stamped solely from a user proof-of-possession, which a
+//! peer node's proxy request does not carry.
 //! The same live cluster proves that stale revisions, undeclared methods,
 //! ambient credentials, cross-origin browser calls, and owner-only policy fail
 //! before reaching loopback.
@@ -15,36 +17,17 @@ use std::thread;
 use std::time::Duration;
 
 use base64::Engine as _;
-use common::{Cluster, hex, poll_until, serial};
+use common::{Cluster, create_account, hex, poll_until, serial, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 use gateway::{
     DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience,
     RouteDefinition, RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget,
 };
-use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth};
 
 const READY: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
 
-fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
-    identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
-}
-
-fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<AccountView> {
-    let bytes = cluster.query(
-        reader,
-        "identity",
-        &identity::encode_query(&IdentityQuery::OfNode {
-            node_key: node.to_vec(),
-        }),
-    )?;
-    match identity::decode_reply(&bytes).ok()? {
-        IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) => None,
-    }
-}
-
-fn resolve_alice(cluster: &Cluster, reader: usize) -> Option<Vec<u8>> {
+fn resolve_alice(cluster: &Cluster, reader: usize) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
@@ -63,14 +46,14 @@ fn resolve_alice(cluster: &Cluster, reader: usize) -> Option<Vec<u8>> {
 fn signed_route(
     member: &ed25519::PrivateKey,
     chain: &str,
+    account: u64,
     publisher: &[u8],
     revision: u64,
     audience: RouteAudience,
 ) -> GatewayMsg {
     let statement = RouteStatement {
-        version: 1,
         chain_id: chain.into(),
-        account_id: member.public_key().as_ref().to_vec(),
+        account_id: account,
         name: RouteName::named("api"),
         publisher_node: publisher.to_vec(),
         revision,
@@ -102,15 +85,12 @@ fn signed_route(
     }
 }
 
-fn route_revision(cluster: &Cluster, reader: usize) -> Option<u64> {
+fn route_revision(cluster: &Cluster, reader: usize, account: u64) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
         &gateway::encode_query(&GatewayQuery::Get {
-            account_id: ed25519::PrivateKey::from_seed(42)
-                .public_key()
-                .as_ref()
-                .to_vec(),
+            account_id: account,
             name: RouteName::named("api"),
         }),
     )?;
@@ -151,10 +131,14 @@ fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
     }
 }
 
+/// Alice's loopback upstream, asserting what the gateway stamps on each hop:
+/// the vouched-for caller NODE, the route's account NUMBER — and NO caller
+/// account: a `/v1/gateway/proxy` request from a peer node carries no user
+/// proof-of-possession, and a caller without one has no account.
 fn spawn_loopback(
     alice_node: Vec<u8>,
     bob_node: Vec<u8>,
-    bob_account: Vec<u8>,
+    alice_account: u64,
 ) -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind Alice loopback");
     let port = listener.local_addr().unwrap().port();
@@ -168,12 +152,12 @@ fn spawn_loopback(
                 "unexpected upstream request:\n{text}"
             );
             let lower = text.to_ascii_lowercase();
-            assert!(lower.contains(&format!("x-duck-caller-account: {}", hex(&bob_account))));
+            assert!(
+                !lower.contains("x-duck-caller-account"),
+                "no user PoP, no caller account:\n{text}"
+            );
             assert!(lower.contains(&format!("x-duck-caller-node: {}", hex(&bob_node))));
-            assert!(lower.contains(&format!(
-                "x-duck-route-account: {}",
-                hex(ed25519::PrivateKey::from_seed(42).public_key().as_ref())
-            )));
+            assert!(lower.contains(&format!("x-duck-route-account: {alice_account}\r\n")));
             assert!(lower.contains("x-duck-route-label: api"));
             assert!(!lower.contains("cookie:"));
             assert!(!lower.contains("authorization:"));
@@ -202,6 +186,7 @@ fn spawn_loopback(
 
 fn proxy_request(
     cluster: &Cluster,
+    account: u64,
     revision: u64,
     method: &str,
     path: &str,
@@ -214,7 +199,7 @@ fn proxy_request(
         "/v1/gateway/proxy",
         Some(&serde_json::json!({
             "head": {
-                "account_id": ed25519::PrivateKey::from_seed(42).public_key().as_ref(),
+                "account_id": account,
                 "name": { "label": "api" },
                 "revision": revision,
                 "method": method,
@@ -273,29 +258,17 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
         cluster.wait_marker(index, "gateway plane: overlay stream bound", READY);
     }
 
+    // Alice founds her account through her node; Bob needs none — his node
+    // is a caller, and a node is never an account.
     let alice = ed25519::PrivateKey::from_seed(42);
-    let bob = ed25519::PrivateKey::from_seed(43);
     let alice_node = Cluster::identity(0);
     let bob_node = Cluster::identity(1);
-    for (index, member, node) in [
-        (0usize, &alice, alice_node.as_slice()),
-        (1usize, &bob, bob_node.as_slice()),
-    ] {
-        cluster.submit(
-            index,
-            "identity",
-            &identity::encode_msg(&IdentityMsg::BindNode {
-                authorizer: bind_auth(member, &cluster.namespace, node),
-            }),
-        );
-        poll_until("identity binding", FINALIZE, || {
-            account_of_node(&cluster, index, node)
-                .filter(|account| account.account_id == member.public_key().as_ref())
-        });
-    }
+    let alice_account = create_account(&cluster, 0, &alice, "alice");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
@@ -305,14 +278,11 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
         let resolved = poll_until("alice.duck resolution", FINALIZE, || {
             resolve_alice(&cluster, reader)
         });
-        assert_eq!(resolved, alice.public_key().as_ref());
+        assert_eq!(resolved, alice_account);
     }
 
-    let (loopback_port, upstream) = spawn_loopback(
-        alice_node.clone(),
-        bob_node.clone(),
-        bob.public_key().as_ref().to_vec(),
-    );
+    let (loopback_port, upstream) =
+        spawn_loopback(alice_node.clone(), bob_node.clone(), alice_account);
     let workspace = cluster.workspace(0);
     let (ok, output) = cluster.run_verb(&[
         "gateway",
@@ -326,24 +296,28 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
     ]);
     assert!(ok, "local gateway bind failed: {output}");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&signed_route(
             &alice,
             &cluster.namespace,
+            alice_account,
             &alice_node,
             1,
             RouteAudience::Network,
         )),
     );
     poll_until("gateway route revision 1", FINALIZE, || {
-        (route_revision(&cluster, 1) == Some(1)).then_some(())
+        (route_revision(&cluster, 1, alice_account) == Some(1)).then_some(())
     });
 
     let body = br#"{"name":"duck"}"#;
     let (status, response) = proxy_request(
         &cluster,
+        alice_account,
         1,
         "post",
         "/items",
@@ -420,30 +394,50 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
         ),
         ("get", "http://127.0.0.1:9/", serde_json::json!([]), 400),
     ] {
-        let (status, _) = proxy_request(&cluster, 1, method, path, headers, &[]);
+        let (status, _) = proxy_request(&cluster, alice_account, 1, method, path, headers, &[]);
         assert_eq!(
             status, expected,
             "unexpected policy result for {method} {path}"
         );
     }
 
-    cluster.submit(
+    // owner-only: a caller with no user PoP has no account, so it is never the
+    // owner — the peer node's request is refused before reaching loopback.
+    submit_frame(
+        &cluster,
         0,
+        &alice,
         "gateway",
         &gateway::encode_msg(&signed_route(
             &alice,
             &cluster.namespace,
+            alice_account,
             &alice_node,
             2,
             RouteAudience::Owner,
         )),
     );
     poll_until("gateway route revision 2", FINALIZE, || {
-        (route_revision(&cluster, 1) == Some(2)).then_some(())
+        (route_revision(&cluster, 1, alice_account) == Some(2)).then_some(())
     });
-    let (status, _) = proxy_request(&cluster, 1, "get", "/items", serde_json::json!([]), &[]);
+    let (status, _) = proxy_request(
+        &cluster,
+        alice_account,
+        1,
+        "get",
+        "/items",
+        serde_json::json!([]),
+        &[],
+    );
     assert_eq!(status, 409, "stale revision must conflict");
-    let (status, response) =
-        proxy_request(&cluster, 2, "get", "/items", serde_json::json!([]), &[]);
+    let (status, response) = proxy_request(
+        &cluster,
+        alice_account,
+        2,
+        "get",
+        "/items",
+        serde_json::json!([]),
+        &[],
+    );
     assert_eq!(status, 403, "owner-only audience leaked: {response}");
 }

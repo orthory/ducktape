@@ -14,9 +14,7 @@ mod harness;
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
-use governance::invite::{
-    INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof,
-};
+use governance::invite::{INVITE_GRANT_NAMESPACE, INVITE_NONCE_LEN, InviteToken, sign_join_proof};
 use harness::Sim;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -530,7 +528,7 @@ fn governance_gates_the_electorate_tracks_votes_and_honors_the_deadline() {
         Some(origin(&outsider).as_str()),
     );
     assert!(
-        error.contains("no validator-set standing"),
+        error.contains("not a validator-set member node"),
         "electorate gating: {error}"
     );
 
@@ -667,8 +665,8 @@ fn governance_gates_the_electorate_tracks_votes_and_honors_the_deadline() {
 
 #[test]
 fn share_governance_refuses_actions_that_precede_an_adoption() {
-    // the account-share ladder's entry guards, without the full identity-bind
-    // ceremony: adopting shares must name existing Identity accounts, and both
+    // the account-share ladder's entry guards, without founding any identity
+    // account: adopting shares must name existing Identity accounts, and both
     // SetShares and enabling share mode require an adopted registry first.
     let storage = tempfile::tempdir().expect("storage dir");
     let (sim, validators) = governed(storage.path());
@@ -677,7 +675,7 @@ fn share_governance_refuses_actions_that_precede_an_adoption() {
     let error = sim.submit_rejected(
         "governance",
         json!({ "propose": { "proposal_id": "adopt", "voting_period": 1000, "action": {
-            "adopt_shares": { "allocations": [ { "account_id": [1,2,3], "shares": 10 } ] }
+            "adopt_shares": { "allocations": [ { "account_id": 99, "shares": 10 } ] }
         }}}),
         Some(v0.as_str()),
     );
@@ -689,7 +687,7 @@ fn share_governance_refuses_actions_that_precede_an_adoption() {
     let error = sim.submit_rejected(
         "governance",
         json!({ "propose": { "proposal_id": "setshares", "voting_period": 1000, "action": {
-            "set_shares": { "account_id": [1,2,3], "shares": 5 }
+            "set_shares": { "account_id": 99, "shares": 5 }
         }}}),
         Some(v0.as_str()),
     );

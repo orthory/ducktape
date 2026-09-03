@@ -14,7 +14,7 @@ on fs_open_dir(path)
   run replace lane=files_list files_ls(connected_rpc, fs_path, fs_generation) -> fs_listed _ | fs_failed _
 
 on fs_open_parent
-  return if fs_loading || !connected || empty(fs_path)
+  return if fs_loading || !connected || fs_path == "/"
   invalidate lane=files_preview
   invalidate lane=files_diff
   fs_path = fs_parent(fs_path)
@@ -29,6 +29,12 @@ on fs_open_file(path)
   return if fs_loading || !connected
   fs_preview_path = path
   fs_preview_entry = fs_entry_named(fs_entries, fs_preview_path)
+  // The old body must not sit under the new path while the read is in
+  // flight — the pane would show A's text (and A's Edit button) under B.
+  fs_preview_text = ""
+  fs_preview_truncated = false
+  fs_preview_binary = false
+  fs_preview_picture = false
   fs_generation = fs_generation + 1
   run replace lane=files_preview files_preview(connected_rpc, fs_preview_path, fs_generation) -> fs_previewed _ | fs_failed _
 
@@ -39,12 +45,20 @@ on fs_listed(next)
   fs_listed_path = next.path
   fs_entries = next.entries
   fs_preview_entry = fs_entry_named(fs_entries, fs_preview_path)
+  // A deep link's second step: the directory is listed, now its file.
+  return if empty(fs_focus_path)
+  let focus = fs_focus_path
+  fs_focus_path = ""
+  run every duck_echo_str(focus) -> fs_open_file _ | external_url_failed _
 
 on fs_previewed(next)
   return if next.generation != fs_generation
   fs_preview_text = next.text
   fs_preview_truncated = next.truncated
   fs_preview_binary = next.binary
+  fs_preview_picture = next.picture
+  fs_preview_width = next.width
+  fs_preview_height = next.height
 
 on fs_history_loaded(next)
   return if next.generation != fs_generation

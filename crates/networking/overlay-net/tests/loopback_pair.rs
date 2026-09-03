@@ -1,22 +1,23 @@
-//! the ADR phase-1 loopback pair proof: two (three, for the replace case)
+//! the loopback pair proof: two (three, for the replace case)
 //! userspace backends on 127.0.0.1-class loopback underlay, driven ONLY
 //! through the `WireGuardEffect` boundary — handshake, datagram echo through
 //! the virtual stack, TCP dial/listen through the tunnel, forced rekey,
 //! session preservation across an identical re-apply, and the atomic peer
-//! replace. plus the phase-2 consumer faces over the same pair: the overlay
+//! replace. plus the consumer faces over the same pair: the overlay
 //! seam's `Virtual` arm (a commonware `Network` dial/bind terminating in the
 //! virtual stacks) and data-plane's `VirtualSocketFactory`.
 //!
 //! everything here runs unprivileged: no TUN, no CAP_NET_ADMIN, no external
-//! binaries — the property the whole ADR exists to win.
+//! binaries — the property the userspace backend exists to win.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
+use defguard_boringtun::x25519::{PublicKey, StaticSecret};
 use overlay_net::userspace::UserspaceWireGuardEffect;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use wireguard::effect::WireGuardEffect;
+use wireguard::effect::{InterfaceConfig, PeerTunnelConfig, WireGuardEffect};
+use wireguard::{AllowedIp, X25519PublicKey};
 
 /// a fixture chain /48 (the shape `ula_v6_prefix` mints) with per-node
 /// member /128s.
@@ -28,38 +29,45 @@ fn ula(host: u16) -> Ipv6Addr {
 /// the identity facts a peer needs to know it.
 struct Node {
     effect: UserspaceWireGuardEffect,
-    secret: Key,
+    secret: [u8; 32],
     ula: Ipv6Addr,
     /// the loopback underlay endpoint of the node's bound WG socket.
     endpoint: SocketAddr,
 }
 
-fn peer_entry(of: &Node, endpoint: Option<SocketAddr>) -> Peer {
-    let mut peer = Peer::new(of.secret.public_key());
-    peer.endpoint = endpoint;
-    peer.set_allowed_ips(vec![IpAddrMask::new(IpAddr::V6(of.ula), 128)]);
-    peer
+fn peer_entry(of: &Node, endpoint: Option<SocketAddr>) -> PeerTunnelConfig {
+    PeerTunnelConfig {
+        wireguard_public_key: public_key(&of.secret),
+        endpoint,
+        allowed_ips: vec![member_route(of.ula)],
+        keepalive_seconds: None,
+    }
 }
 
-fn config(node: &Node, port: u16, peers: Vec<Peer>) -> InterfaceConfiguration {
-    InterfaceConfiguration {
+fn config(node: &Node, port: u16, peers: Vec<PeerTunnelConfig>) -> InterfaceConfig {
+    InterfaceConfig {
         name: "dt-loopback".into(),
-        prvkey: node.secret.to_string(),
-        addresses: vec![IpAddrMask::new(IpAddr::V6(node.ula), 128)],
-        port,
+        private_key: node.secret,
+        listen_port: port,
+        addresses: vec![member_route(node.ula)],
         peers,
-        mtu: None,
-        fwmark: None,
     }
+}
+
+/// a member's cryptokey route: its overlay `/128`.
+fn member_route(ula: Ipv6Addr) -> AllowedIp {
+    AllowedIp::new(IpAddr::V6(ula), 128).expect("a /128 is a valid route")
+}
+
+fn public_key(secret: &[u8; 32]) -> X25519PublicKey {
+    X25519PublicKey(PublicKey::from(&StaticSecret::from(*secret)).to_bytes())
 }
 
 /// stand a node up through the effect boundary: create + first apply with an
 /// empty peer set and port 0 (the OS allocates), so nodes can learn each
 /// other's real underlay ports before the peered re-apply.
 fn stand_up(key_seed: u8, host: u16) -> Node {
-    let secret = Key::new(
-        defguard_boringtun_secret(key_seed), // clamped X25519 scalar bytes
-    );
+    let secret = fixture_secret(key_seed);
     let mut node = Node {
         effect: UserspaceWireGuardEffect::new(tokio::runtime::Handle::current()),
         secret,
@@ -84,7 +92,7 @@ fn stand_up(key_seed: u8, host: u16) -> Node {
 /// derive a deterministic private key from a seed byte. any 32 bytes are a
 /// valid X25519 secret (the curve clamps), so a filled array is fine for a
 /// fixture — but each node needs a distinct one.
-fn defguard_boringtun_secret(seed: u8) -> [u8; 32] {
+fn fixture_secret(seed: u8) -> [u8; 32] {
     let mut bytes = [seed; 32];
     bytes[0] = seed.wrapping_add(1); // avoid the all-equal degenerate look
     bytes
@@ -133,7 +141,7 @@ async fn udp_round_trip(a: &Node, b: &Node, payload: &[u8]) {
     assert_eq!(from.ip(), IpAddr::V6(b.ula), "echo source is b's /128");
 }
 
-/// the ADR's core loopback proof: handshake + datagram echo, with the
+/// the core loopback proof: handshake + datagram echo, with the
 /// passive side learning the initiator's endpoint from the wire.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn handshake_and_datagram_echo() {
@@ -162,7 +170,11 @@ async fn handshake_and_datagram_echo() {
     // this seam existed, that distinction was observable only from tests, which is
     // why "the overlay never came up" and "the overlay is up but the peer is dark"
     // were indistinguishable in production and presented as one string.
-    let probe = a.effect.probe_slot().get().expect("a live probe after apply");
+    let probe = a
+        .effect
+        .probe_slot()
+        .get()
+        .expect("a live probe after apply");
     let peers = probe.peers();
     let (ip, since) = peers
         .iter()
@@ -298,7 +310,7 @@ async fn forced_rekey_keeps_traffic_flowing() {
 }
 
 /// re-applying an IDENTICAL configuration preserves live sessions — the
-/// property the orchestrator's mid-epoch `update_peer_tunnels` re-apply
+/// property the executor's mid-epoch `update_peer_tunnels` re-apply
 /// depends on (an apply that re-tunneled every peer would drop traffic on
 /// every standby record arrival).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -461,7 +473,7 @@ async fn one_node_carries_two_concurrent_tunnels() {
     );
 }
 
-// ── ADR phase 3: the shared underlay + the mesh listener's virtual leg ──
+// ── the shared underlay + the mesh listener's virtual leg ───────────────
 
 /// the node wiring's shared underlay socket: WireGuard traffic and the NAT
 /// bypass lane demux off ONE socket — tunnel datagrams reach the device
@@ -481,7 +493,7 @@ async fn shared_underlay_demuxes_nat_bypass_alongside_tunnel_traffic() {
             StackSlot::new(),
             underlay.clone(),
         ),
-        secret: Key::new(defguard_boringtun_secret(0x17)),
+        secret: fixture_secret(0x17),
         ula: ula(0xa),
         endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
     };
@@ -575,7 +587,7 @@ async fn shared_underlay_demuxes_nat_bypass_alongside_tunnel_traffic() {
         .expect("echo after the rebuild");
 }
 
-/// the mesh listener's virtual leg (the seam's `Dual` bind, ADR phase 3):
+/// the mesh listener's virtual leg (the seam's `Dual` bind):
 /// lazily binds at the node's own ULA once a stack exists, accepts
 /// tunnel-carried connections, and re-binds across an interface rebuild —
 /// the inbound path an OS listener on `[::]` can never see in socket mode.
@@ -649,7 +661,7 @@ async fn lazy_virtual_leg_accepts_across_rebuilds() {
     .expect("second accept within deadline — the leg re-bound on the new stack");
 }
 
-// ── ADR phase 2: the consumer faces over the pair ───────
+// ── the consumer faces over the pair ────────────────────
 
 /// the overlay seam's `Virtual` arm: a commonware `Network` bind and dial on
 /// overlay ULAs terminate in the virtual stacks and carry bytes both ways

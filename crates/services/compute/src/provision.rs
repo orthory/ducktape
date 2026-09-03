@@ -102,7 +102,7 @@ pub struct RoMount {
 
 /// the host-assembled receipt embedded in the `RunnerResult`. field-for-field
 /// with `runs::WorkspaceReceipt` so the assembled bytes round-trip through
-/// `runs::decode_run_result_v1` — a rename in either crate must fail the
+/// `runs::decode_run_result` — a rename in either crate must fail the
 /// cross-crate wire test, never production.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceReceipt {
@@ -335,7 +335,7 @@ struct RunnerResultWire<'a> {
 /// the winning attempt's delivered bytes for a portable run: the model prose,
 /// host-assembled receipt, requested sink, and status under marker
 /// `ducktape_runner_result` (R1, host-assembled). the version is
-/// [`crate::envelope::RUNNER_RESULT_VERSION`] — the SINGLE owner, never a second
+/// [`crate::envelope::RUNNER_RESULT_MARKER`] — the SINGLE owner, never a second
 /// const; `runs` reads it back as `u32 == 1` and unwraps `response_text`
 /// deterministically on every node. Empty/default facets skip serialization.
 ///
@@ -353,7 +353,7 @@ pub fn assemble_runner_result(
 ) -> Vec<u8> {
     let encode = |text: &str| {
         serde_json::to_vec(&RunnerResultWire {
-            ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
+            ducktape_runner_result: crate::envelope::RUNNER_RESULT_MARKER,
             response_text: text,
             workspace_receipt: receipt,
             sink: sink.clone(),
@@ -399,7 +399,7 @@ pub fn assemble_runner_result(
         ..receipt_stub(receipt)
     };
     serde_json::to_vec(&RunnerResultWire {
-        ducktape_runner_result: crate::envelope::RUNNER_RESULT_VERSION,
+        ducktape_runner_result: crate::envelope::RUNNER_RESULT_MARKER,
         response_text: &note,
         workspace_receipt: &stub,
         sink: Sink::Chain,

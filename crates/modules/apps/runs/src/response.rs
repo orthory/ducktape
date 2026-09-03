@@ -5,7 +5,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::paths::canonical as canonical_duckfs_path;
 
-use super::facets::{WireStatus, decode_run_result_v1, encode_delivery_receipt, output_ref_of};
+use super::facets::{WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of};
 use super::{
     ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, BTreeSet,
     Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus,
@@ -141,7 +141,14 @@ fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool
     // the runner result. It is not a consensus-delivery facet, and retaining
     // it here could needlessly inflate a job's bounded finalize payload.
     response.commit_message = None;
-    response.actions.truncate(MAX_ACTIONS_PER_RUN);
+    // NOTHING is dropped from the action set here. normalization SHAPES a
+    // response (unknown block kinds, empty texts); the caps are the validator's
+    // to enforce, loudly — `validate_response` refuses an over-cap set by name
+    // and the run fails with that sentence in its reply. this used to
+    // `truncate(MAX_ACTIONS_PER_RUN)`, which silently dropped the tail (an
+    // agent closing a run with twelve actions lost four, with no line in the
+    // log, the run output or the reply) and made the validator's own count
+    // check unreachable from the provider path.
     response.reply_blocks = response
         .reply_blocks
         .into_iter()
@@ -227,16 +234,6 @@ fn task_status(name: &str) -> Option<TaskStatus> {
 /// whether the registry granted this agent an action name.
 pub(super) fn allows(agent: &AgentRecord, action: &str) -> bool {
     agent.allowed_actions.iter().any(|a| a == action)
-}
-
-/// whether an action belongs to the STRICT all-or-nothing lane's tasks arm —
-/// the only arm that needs a configured tasks module and the committed task
-/// ids, so a response without one never pays for either.
-fn is_task_action(action: &AgentAction) -> bool {
-    matches!(
-        action,
-        AgentAction::CreateTask { .. } | AgentAction::UpdateTaskStatus { .. }
-    )
 }
 
 impl RunsModule {
@@ -371,7 +368,7 @@ impl RunsModule {
         entry: &PendingState,
         bytes: &[u8],
     ) {
-        let result = match decode_run_result_v1(bytes) {
+        let result = match decode_run_result(bytes) {
             Ok(result) => result,
             Err(reason) => return self.fail_delegated_run(ctx, run_id, entry, reason).await,
         };
@@ -532,7 +529,7 @@ impl RunsModule {
         entry: &PendingState,
         bytes: &[u8],
     ) {
-        let result = match decode_run_result_v1(bytes) {
+        let result = match decode_run_result(bytes) {
             Ok(r) => r,
             Err(reason) => return self.fail_run(ctx, run_id, entry, reason).await,
         };
@@ -714,20 +711,8 @@ impl RunsModule {
         // and validate at apply (`emit_pages_effects`), where a bad one degrades
         // ALONE with a breadcrumb instead of failing the whole run.
         //
-        // only the tasks arm needs a tasks module and the committed task ids, so
-        // a response carrying none pays for neither.
-        let tasks = match response.actions.iter().any(is_task_action) {
-            true => Some(
-                self.tasks
-                    .clone()
-                    .ok_or_else(|| "no tasks module is configured".to_string())?,
-            ),
-            false => None,
-        };
-        let existing = match &tasks {
-            Some(tasks) => self.task_ids(ctx, tasks).await?,
-            None => BTreeSet::new(),
-        };
+        // the tasks arms probe BY ID (`task_exists`), so a response carrying no
+        // task action never touches the tasks module at all.
         let mut created: BTreeSet<&str> = BTreeSet::new();
         for (index, action) in response.actions.iter().enumerate() {
             if super::pages_effects::is_pages_action(action) {
@@ -792,7 +777,8 @@ impl RunsModule {
                         .map_err(|e| e.to_string())?;
                     // duplicates — committed or earlier in this very
                     // response — would make tasks reject the follow-up.
-                    if existing.contains(task_id) || !created.insert(task_id) {
+                    let on_board = self.task_exists(ctx, task_id).await?;
+                    if on_board || !created.insert(task_id) {
                         return Err(format!("task already exists: {task_id}"));
                     }
                 }
@@ -800,7 +786,8 @@ impl RunsModule {
                     if task_status(status).is_none() {
                         return Err(format!("unknown task status: {status}"));
                     }
-                    if !existing.contains(task_id) && !created.contains(task_id.as_str()) {
+                    let staged_here = created.contains(task_id.as_str());
+                    if !staged_here && !self.task_exists(ctx, task_id).await? {
                         return Err(format!("unknown task: {task_id}"));
                     }
                 }
@@ -1148,13 +1135,30 @@ impl RunsModule {
         })
     }
 
-    async fn task_ids(&self, ctx: &dyn Ctx, tasks: &str) -> Result<BTreeSet<String>, String> {
+    /// does `task_id` name a live task RIGHT NOW — this block's staged creates
+    /// included (the tasks board answers both its reads through its overlay)?
+    ///
+    /// a BY-ID read, never the board. a validated response carries at most
+    /// [`MAX_ACTIONS_PER_RUN`] actions, so a settle spends at most that many
+    /// point reads here; the whole-board walk this replaced cost one store read
+    /// PER TASK, and blew the wasm host's 4096-read budget for good once the
+    /// board outgrew it — every settle failing from then on, with no delete op
+    /// to shrink the board back.
+    async fn task_exists(&self, ctx: &dyn Ctx, task_id: &str) -> Result<bool, String> {
+        let tasks = self
+            .tasks
+            .clone()
+            .ok_or_else(|| "no tasks module is configured".to_string())?;
+        let req = tasks_encode_query(&TaskQuery::Get {
+            task_id: task_id.to_string(),
+        });
         let reply = ctx
-            .query(tasks, &tasks_encode_query(&TaskQuery::List))
+            .query(&tasks, &req)
             .await
             .map_err(|e| format!("tasks lookup failed: {e}"))?;
         match tasks_decode_reply(&reply) {
-            Ok(TaskReply::Tasks(list)) => Ok(list.into_iter().map(|t| t.id).collect()),
+            Ok(TaskReply::Task(task)) => Ok(task.is_some()),
+            Ok(TaskReply::Tasks(_)) => Err("tasks answered a page, not a task".into()),
             Err(e) => Err(format!("undecodable tasks reply: {e}")),
         }
     }

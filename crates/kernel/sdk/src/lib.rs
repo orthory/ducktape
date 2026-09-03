@@ -131,33 +131,6 @@ pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 /// data lane; an oversized stamp is a deterministic rejection of the op.
 pub const MAX_ASSIGNED_BYTES: usize = 4 * 1024;
 
-/// DEAD SURFACE, awaiting one deletion outside this crate's PR boundary.
-///
-/// This was the relay slot of the ENVELOPE CONTINUATION LANE, which is
-/// deleted: an op frame can no longer carry a `continue` body, so the host
-/// never derives a continuation unit and NOTHING IN THE TREE CONSTRUCTS A
-/// `Relay`. [`Ctx::relay`] is therefore `None` on every dispatch, always.
-///
-/// The lane was a consensus takeover. The host derived the continuation's
-/// dispatch origin as `Origin::Module(parent_op_target)` — an attacker-chosen
-/// string on an attacker-signed frame — so any key with submit standing
-/// reached every `Origin::Module(_)`-gated arm in the tree, valset membership
-/// included. It fired even when the parent op was rejected and even when the
-/// module id did not exist.
-///
-/// This type and [`Ctx::relay`] survive only because
-/// `crates/modules/apps/runs/src/module_impl.rs` forwards `relay()` through a
-/// `Ctx` wrapper, and that file is out of scope here (a `crates/modules/`
-/// diff is a genesis flag day). Delete that forwarder, then delete these two.
-/// `no_continuation_lane.rs` fails the build if a constructor reappears first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Relay {
-    pub author: Origin,
-    pub parent_target: ModuleId,
-    pub parent_frame: [u8; 32],
-    pub outcome: Result<Vec<u8>, String>,
-}
-
 /// a record a module emits via [`Ctx::emit_event`]. it LEAVES the state machine
 /// (handed to the effectful node layer) and never re-enters as a follow-up. one
 /// lane, two consumer classes: observability readers, and the host-owned worker
@@ -208,7 +181,7 @@ impl Origin {
 }
 
 /// reject an empty required string field with the uniform module error
-/// message — the op-validation guard shared by tasks/automations/vaults.
+/// message — the op-validation guard shared by tasks/automations.
 pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
     if value.is_empty() {
         return Err(Error::Module(format!("{field} must not be empty")));
@@ -357,13 +330,6 @@ pub trait Ctx {
     /// emit an event — leaves the state machine (observability, and the lane
     /// the host-side worker seam claims off-consensus work from).
     fn emit_event(&mut self, ev: Event);
-
-    /// DEAD SURFACE: always `None`. The envelope continuation lane that
-    /// populated it is deleted (see [`Relay`]), and nothing constructs a
-    /// `Relay`. Kept only for the `runs` forwarder; delete both together.
-    fn relay(&self) -> Option<&Relay> {
-        None
-    }
 
     /// declare this op's output. staged with the op (rolled back on
     /// rejection); capped at [`MAX_OUTPUT_BYTES`], and exceeding the cap is a
@@ -522,6 +488,32 @@ pub trait Module {
     /// the default is a no-op.
     async fn abort_block(&mut self) -> Result<(), Error> {
         Ok(())
+    }
+
+    /// whether this module's committed state is DURABLE ON ITS OWN DISK at
+    /// every block boundary — recovery's "disk cohort". such a module is NOT
+    /// restored from a checkpoint snapshot: it reopens its own substrate at
+    /// whatever height it last committed, and the checkpoint cadence lets that
+    /// sit arbitrarily far AHEAD of the checkpoint. recovery needs the fact to
+    /// tell a legitimately-ahead disk root from a rolled-back in-memory one.
+    ///
+    /// this is a DURABILITY property, not a sync one, and conflating the two
+    /// bricked restarts: forge commits its refs image to disk every block yet
+    /// ships one self-contained container ([`StateSyncHandle::SnapshotBytes`]),
+    /// so a cohort read off the sync handle alone left it out. the default
+    /// still answers for every resolver-backed module — a qmdb store and the
+    /// duckfs object lane are per-block durable by construction — and a module
+    /// that is per-block durable behind a snapshot-shaped sync surface MUST
+    /// override this. `false` is the FAIL-CLOSED answer (recovery refuses a
+    /// state it cannot place instead of trusting it), so the default can only
+    /// ever under-claim, never wave damage through.
+    ///
+    /// NEVER a consensus input: per-node recovery bookkeeping only.
+    fn block_durable(&self) -> bool {
+        matches!(
+            self.state_sync_handle(),
+            Ok(StateSyncHandle::ResolverBacked { .. })
+        )
     }
 
     /// the PER-COMMIT HEIGHT CURSOR of a per-block-durable (disk-cohort)

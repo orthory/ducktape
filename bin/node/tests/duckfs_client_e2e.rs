@@ -44,7 +44,9 @@ fn two_validators() -> Cluster {
 /// an `HttpNode` for node `idx`, plus checkout options recording its url.
 fn engine(cluster: &Cluster, idx: usize) -> (HttpNode, CheckoutOptions) {
     let base = cluster.http_base(idx);
-    let node = HttpNode::new(base.clone());
+    // the harness owns this node, so its writes carry the node's own operator
+    // credential — the same file a local daemon reads (`cluster.files`).
+    let node = cluster.files(idx);
     // wait for the app surface to actually answer before driving the engine.
     poll_until(
         &format!("node {idx} http surface up"),
@@ -60,7 +62,7 @@ fn engine(cluster: &Cluster, idx: usize) -> (HttpNode, CheckoutOptions) {
 
 /// block until node `idx` has finalized `snapshot` as its head.
 fn wait_head(cluster: &Cluster, idx: usize, snapshot: &str) {
-    let node = HttpNode::new(cluster.http_base(idx));
+    let node = cluster.files(idx);
     poll_until(
         &format!("node {idx} finalizes head {snapshot}"),
         Duration::from_secs(60),

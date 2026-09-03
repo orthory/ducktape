@@ -2,8 +2,12 @@
 //! hot-swappable module runs.
 //!
 //! it holds, folded into a single `root()`: per hot-swappable module, the
-//! ACTIVE 32-byte code hash plus at most one pending `ScheduledSwap` with its
-//! byte-receipt readiness latch (the height-gated wasm code swap).
+//! activation HISTORY — every `(height, code_hash)` that ever went live, its
+//! last entry the ACTIVE 32-byte code hash — and at most one pending
+//! `ScheduledSwap` with its byte-receipt readiness latch (the height-gated
+//! wasm code swap). the history is what lets a crash-restart replay against
+//! this disk-durable, already-AHEAD registry run each block on the code that
+//! sealed it ([`code_at`]).
 //!
 //! governance authorizes a schedule/cancel/register by emitting a host-drained
 //! follow-up (origin `Module("governance")`); validators self-submit the
@@ -17,8 +21,7 @@
 //! end-of-(H-1) state — never staged-over-committed — the SAME snapshot the
 //! host `realize_module_swaps` boundary read uses, so live, recovery-replay,
 //! and state-sync nodes all reconstruct the activation identically, applying
-//! the `ready && activation_height <= height` gate the host's `ArmedAt` read
-//! realizes.
+//! the one `ScheduledSwap::armed_at` gate the host's `ArmedAt` read realizes.
 //!
 //! ## code bytes are out-of-band
 //!
@@ -79,8 +82,29 @@ const MODULE_ROSTER_KEY: &[u8] = b"modules";
 /// one encoding).
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct ModuleEntry {
-    active_code_hash: Vec<u8>,
     pending: Option<ScheduledSwap>,
+    /// every activation in block order — appended by a register/seed and by
+    /// each `Advance` flip, never rewritten; its last entry IS the active
+    /// code (no second field to disagree with it). 40 bytes per swap for the
+    /// module's whole life, each one a governance vote away; the qmdb record
+    /// decode cap is the ceiling, thousands of swaps out.
+    history: Vec<Activation>,
+}
+
+impl ModuleEntry {
+    /// the running code's hash: the last activation, or empty for an
+    /// admission that has not reached its boundary.
+    fn active_code_hash(&self) -> &[u8] {
+        self.history.last().map_or(&[], |a| &a.code_hash)
+    }
+}
+
+/// the activation `code_hash` makes for block `height`.
+fn activation(height: u64, code_hash: &[u8]) -> Activation {
+    Activation {
+        height,
+        code_hash: code_hash.to_vec(),
+    }
 }
 
 pub struct Lifecycle {
@@ -135,10 +159,11 @@ impl Lifecycle {
                 "module roster",
             )?;
         }
+        // genesis is block zero: the seed is the activation at 0.
         self.store(
             mod_key(&module_id),
             &ModuleEntry {
-                active_code_hash: code_hash,
+                history: vec![activation(0, &code_hash)],
                 pending: None,
             },
         );
@@ -190,8 +215,13 @@ impl Lifecycle {
         }
     }
 
-    /// stage a value whose serialized size is bounded by construction (a
-    /// module entry: fixed-size hashes plus a member-capped readiness list).
+    /// stage a value with no write-time cap. a module entry is fixed-size
+    /// hashes, a member-capped readiness list and the activation `history`,
+    /// which grows 40 bytes per swap for the module's life — only the qmdb
+    /// record decode cap bounds it. the day that matters, the refusal goes
+    /// through `store_bounded` in `handle_schedule_swap` (refuse to schedule
+    /// what could not be recorded), NEVER at the `Advance` flip: refusing
+    /// there would strand an armed pending forever.
     fn store<T>(&mut self, key: Vec<u8>, value: &T)
     where
         T: BorshSerialize,
@@ -326,7 +356,7 @@ impl Lifecycle {
             roster,
             module_id,
             &ModuleEntry {
-                active_code_hash: code_hash,
+                history: vec![activation(ctx.env().height, &code_hash)],
                 pending: None,
             },
         )
@@ -355,7 +385,7 @@ impl Lifecycle {
             )));
         }
         // a swap to the currently-active code is a no-op — reject it.
-        if code_hash == entry.active_code_hash {
+        if code_hash == entry.active_code_hash() {
             return Err(Error::Module(
                 "scheduled code_hash equals the active code (no-op swap)".into(),
             ));
@@ -371,7 +401,7 @@ impl Lifecycle {
             activation_height,
             code_hash,
             readiness: Vec::new(),
-            ready: false,
+            ready_at: None,
         });
         self.store(mod_key(&module_id), &entry);
         Ok(())
@@ -380,10 +410,7 @@ impl Lifecycle {
     /// admission of a brand-new module: like `handle_schedule_swap`, but the entry
     /// must NOT exist yet. the created entry carries an EMPTY active hash —
     /// "registered, not yet running" — and the normal readiness/advance machinery
-    /// realizes the initial code at the boundary. KNOWN GAP: the recovery /
-    /// state-sync composers still enumerate a fixed module set, so a node
-    /// restarting past an admitted module's first checkpoint fails closed until
-    /// the admitted-module restore path lands.
+    /// realizes the initial code at the boundary.
     async fn handle_schedule_register(
         &mut self,
         ctx: &mut dyn Ctx,
@@ -423,14 +450,14 @@ impl Lifecycle {
             roster,
             module_id,
             &ModuleEntry {
-                active_code_hash: Vec::new(),
                 pending: Some(ScheduledSwap {
                     name,
                     activation_height,
                     code_hash,
                     readiness: Vec::new(),
-                    ready: false,
+                    ready_at: None,
                 }),
+                history: Vec::new(),
             },
         )
     }
@@ -460,10 +487,10 @@ impl Lifecycle {
             }
         }
         entry.pending = None;
-        // cancelling an ADMISSION (empty active hash: the module never ran)
+        // cancelling an ADMISSION (no activation yet: the module never ran)
         // removes the entry entirely — lifecycle must never claim a codeless
         // module. its roster slot is freed with it.
-        if entry.active_code_hash.is_empty() {
+        if entry.active_code_hash().is_empty() {
             let mut roster = self.roster().await?;
             if let Ok(position) = roster.binary_search(&module_id) {
                 roster.remove(position);
@@ -519,14 +546,16 @@ impl Lifecycle {
         if let Err(at) = swap.readiness.binary_search(&pubkey) {
             swap.readiness.insert(at, pubkey);
         }
-        // the covering signal LATCHES ready (R = n at this instant). a member
-        // admitted later heals through the fetch lane, never un-arms a swap.
-        if !members.is_empty()
+        // the FIRST covering signal LATCHES readiness at THIS block (R = n at
+        // this instant); a later re-signal never moves it. a member admitted
+        // later heals through the fetch lane, never un-arms a swap.
+        let covers_member_set = !members.is_empty()
             && members
                 .iter()
-                .all(|m| swap.readiness.binary_search(m).is_ok())
-        {
-            swap.ready = true;
+                .all(|m| swap.readiness.binary_search(m).is_ok());
+        let first_cover = covers_member_set && swap.ready_at.is_none();
+        if first_cover {
+            swap.ready_at = Some(ctx.env().height);
         }
         self.store(mod_key(&module_id), &entry);
         Ok(())
@@ -557,7 +586,7 @@ impl Lifecycle {
                 .load_committed::<ModuleEntry>(&mod_key(&id))
                 .await?
                 .and_then(|e| e.pending)
-                .is_some_and(|p| p.ready && height >= p.activation_height);
+                .is_some_and(|p| p.armed_at(height));
             if armed {
                 armed_swaps.push(id);
             }
@@ -568,14 +597,16 @@ impl Lifecycle {
             return Ok(());
         }
 
-        // flip every armed swap's active hash into the root, applied over the
-        // staged view like every other write.
+        // flip every armed swap into the root, applied over the staged view
+        // like every other write. the flip IS the activation for this block:
+        // appending it makes the code active AND lets a later replay of
+        // `height` find this code, not whatever replaced it since.
         for id in armed_swaps {
             let mut entry = self.rostered_entry(&id).await?;
             let Some(swap) = entry.pending.take() else {
                 continue;
             };
-            entry.active_code_hash = swap.code_hash;
+            entry.history.push(activation(height, &swap.code_hash));
             self.store(mod_key(&id), &entry);
         }
         Ok(())
@@ -587,10 +618,12 @@ impl Lifecycle {
         let mut modules = Vec::new();
         for id in self.roster().await? {
             let e = self.rostered_entry(&id).await?;
+            let active_code_hash = e.active_code_hash().to_vec();
             modules.push(ModuleCode {
                 module_id: id,
-                active_code_hash: e.active_code_hash,
+                active_code_hash,
                 pending: e.pending,
+                history: e.history,
             });
         }
         Ok(LifecycleReply::ModuleStatus { modules })
@@ -601,7 +634,7 @@ impl Lifecycle {
         for id in self.roster().await? {
             let e = self.rostered_entry(&id).await?;
             let Some(p) = e.pending else { continue };
-            if p.ready && height >= p.activation_height {
+            if p.armed_at(height) {
                 swaps.push(ArmedSwap {
                     module_id: id,
                     code_hash: p.code_hash,

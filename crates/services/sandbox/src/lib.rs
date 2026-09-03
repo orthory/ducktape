@@ -1,10 +1,13 @@
 //! the sandbox muscle: how a node-local child is spawned in isolation.
 //!
-//! [`sandbox`] owns the [`SandboxBackend`] seam — the boot probe and the Tart
-//! (macOS / Apple Silicon) guest plan. [`podman_api`] owns the Linux backend's
-//! execution: the node-private rootless podman driven over its libpod REST
-//! socket, the neutral-path container spec, and the egress nft firewall each
-//! run's netns gets.
+//! Every run gets its own Firecracker microVM. [`sandbox`] owns the
+//! [`SandboxBackend`] seam and its boot probe; [`microvm`] owns the lifecycle
+//! (boot, stdio, teardown, workspace read-back); [`firecracker_api`] owns the
+//! VM configuration; [`workspace_image`] moves the workspace in and out as a
+//! block device, since a microVM has no shared filesystem.
+//!
+//! [`guest_proto`] and [`guest_manifest`] are the host<->guest contract, shared
+//! verbatim with `duck-guest-init`.
 //!
 //! This crate is pure muscle — it decides nothing about WHICH executor runs or
 //! with what credentials. That is `capability-host`'s job, and it is the only
@@ -12,15 +15,39 @@
 
 use std::path::Path;
 
-// unix-only: the libpod client speaks over a unix socket, and the egress hook
-// enters a netns. all real node targets (Linux, macOS) are unix.
+// unix-only: the VMM client speaks over unix sockets and the storage path
+// shells out to e2fsprogs.
 #[cfg(unix)]
-pub mod podman_api;
+pub mod egress;
+#[cfg(unix)]
+pub mod firecracker_api;
+pub mod guest_paths;
+#[cfg(unix)]
+pub mod host_tools;
+#[cfg(unix)]
+pub mod microvm;
 pub mod sandbox;
+// the host<->guest contract. Both files are included verbatim by the guest init
+// (`#[path = ...]`) rather than depended on, so the wire format and the run
+// manifest exist in exactly one copy while PID 1 stays free of tokio + tracing.
+pub mod guest_manifest;
+pub mod guest_proto;
+// the microVM backend's storage: shells out to e2fsprogs and walks unix modes.
+#[cfg(unix)]
+pub mod workspace_image;
+// the agent CLIs a run may exec, derived from the operator's executors dir.
+#[cfg(unix)]
+pub mod executor_image;
 
 #[cfg(unix)]
-pub use podman_api::{PodmanService, egress_nftables, reap_by_label, run_egress_hook};
-pub use sandbox::{SandboxBackend, TART_MAX_CONCURRENT, TART_MIN_CORES, tart_semaphore};
+pub use egress::tap_egress_nftables;
+pub use guest_paths::GuestLayout;
+#[cfg(unix)]
+pub use host_tools::{find_executable, find_on_path, find_system_tool};
+#[cfg(unix)]
+pub use microvm::{MicroVm, MicroVmIo};
+pub use sandbox::{SandboxBackend, Vmm};
+pub use workspace_image::GuestAsset;
 
 /// whether `p` is a file this process could exec. the shared predicate behind
 /// both PATH walks: the sandbox runtime probe here, and capability-host's

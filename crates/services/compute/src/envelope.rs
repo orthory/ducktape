@@ -16,7 +16,7 @@
 //! of always-skills, a state you can see.
 //!
 //! a payload that is not a run envelope — or one that cannot be honored
-//! (unknown version, malformed fields) — fails the run loudly: feeding a
+//! (wrong magic, malformed fields) — fails the run loudly: feeding a
 //! half-understood payload is exactly the quiet corruption this format exists
 //! to kill.
 
@@ -27,14 +27,12 @@ use serde_json::Value;
 use crate::provision::{PortablePlan, RoMount, Sink};
 use crate::workspace_source::WireWorkspace;
 
-/// the ONLY envelope version this worker assembles: the portable
-/// duckfs/forge-workspace runner contract.
-pub const RUN_ENVELOPE_VERSION: u64 = 1;
-/// the runner-result wrapper version — the SINGLE owner across this crate. the
-/// provisioning wrapper's [`crate::provision::assemble_runner_result`] stamps
-/// it, the v1 accept slice validates the envelope requests it, and `runs`
-/// reads it back as `u32 == 1`. never redeclare a second const.
-pub const RUNNER_RESULT_VERSION: u64 = 1;
+// The magic and the headless composer live in `run-envelope`: the SCHEMA is
+// shared with programs that cannot link this crate (the desktop app would drag
+// provider-host and the microVM sandbox in behind it). Re-exported here so
+// every existing `envelope::RUN_ENVELOPE_MARKER` path still resolves — this
+// crate remains the single owner of what READS one.
+pub use run_envelope::{RUN_ENVELOPE_MARKER, RUNNER_RESULT_MARKER, compose_headless};
 
 /// the wire shape shared by supported envelopes. field ORDER is the composer's
 /// business (committed bytes); decoding here is by name.
@@ -125,10 +123,10 @@ pub struct Prepared {
 }
 
 /// turn one dispatch payload into the provider's input and per-run context.
-/// every payload MUST be the current v1 run envelope; anything with a different
-/// shape, unknown version, or malformed fields is a loud `Err` that becomes
-/// the saga result (NEVER a silent fallback: the pinned workspace and the
-/// curated skills are the whole point).
+/// every payload MUST be the run envelope; anything with a different shape,
+/// wrong magic, or malformed fields is a loud `Err` that becomes the saga
+/// result (NEVER a silent fallback: the pinned workspace and the curated
+/// skills are the whole point).
 ///
 pub fn prepare(input: &str) -> Result<Prepared, String> {
     let claimed = match serde_json::from_str::<Value>(input) {
@@ -141,20 +139,19 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
         }
     };
 
-    let version = claimed
+    let marker = claimed
         .get("ducktape_run")
         .and_then(Value::as_u64)
         .ok_or_else(|| "run envelope's ducktape_run marker is not an integer".to_string())?;
-    if version != RUN_ENVELOPE_VERSION {
+    if marker != RUN_ENVELOPE_MARKER {
         return Err(format!(
-            "run envelope version {version} is not supported by this worker \
-             (understands {RUN_ENVELOPE_VERSION} only; other envelope versions are \
-             unsupported); upgrade or recompose"
+            "run envelope marker {marker} is not the ducktape_run magic \
+             ({RUN_ENVELOPE_MARKER}); recompose the run"
         ));
     }
     let envelope: WireEnvelope =
         serde_json::from_value(claimed).map_err(|e| format!("run envelope is malformed: {e}"))?;
-    debug_assert_eq!(envelope.ducktape_run, version);
+    debug_assert_eq!(envelope.ducktape_run, marker);
 
     let agent_display_name = envelope.agent_display_name;
     let ctx = RunContext {
@@ -200,35 +197,6 @@ pub fn prepare(input: &str) -> Result<Prepared, String> {
     })
 }
 
-/// Compose the ONE payload shape a headless `sched` run carries: a minimal
-/// valid v3 run envelope with the prompt as its instructions, a fresh per-run
-/// duckfs workspace (no pinned snapshot — a headless prompt has no workspace to
-/// resume), no skills, no chat contract, and the given credential name. The CLI
-/// builder calls this so the envelope schema lives in exactly one place.
-pub fn compose_headless(run_id: &str, prompt: &str, credential: Option<&str>) -> String {
-    let mut envelope = serde_json::json!({
-        "ducktape_run": RUN_ENVELOPE_VERSION,
-        "agent_id": "sched",
-        "agent_display_name": "sched",
-        "run_id": run_id,
-        "instructions": prompt,
-        "contract": "",
-        "conversation": "",
-        "workspace": {
-            "kind": "duckfs",
-            "source_prefix": "/shared/agent-workspaces/sched",
-            "source_snapshot": null,
-        },
-        "skills": [],
-        "library_readable": false,
-        "result_contract": { "ducktape_runner_result": RUNNER_RESULT_VERSION },
-    });
-    if let Some(credential) = credential {
-        envelope["credential"] = serde_json::Value::String(credential.to_string());
-    }
-    serde_json::to_string(&envelope).expect("a headless envelope always serializes")
-}
-
 /// ACCEPT a portable envelope and surface its pinned plan, without
 /// ACTIVATING portable execution HERE.
 ///
@@ -248,16 +216,17 @@ fn accept_portable_envelope(
     agent_display_name: String,
     library_readable: bool,
 ) -> Result<PortablePlan, String> {
-    let workspace = workspace.ok_or_else(|| "v1 run envelope is missing workspace".to_string())?;
+    let workspace = workspace.ok_or_else(|| "run envelope is missing workspace".to_string())?;
     // the tagged source block validates per variant (duckfs keeps its
     // non-empty-prefix rule; forge requires repo/commit/branch) with loud,
     // field-naming errors — see [`crate::workspace_source`].
     let source = workspace.validate()?;
     let result_contract =
-        result_contract.ok_or_else(|| "v1 run envelope is missing result_contract".to_string())?;
-    if result_contract.ducktape_runner_result != RUNNER_RESULT_VERSION {
+        result_contract.ok_or_else(|| "run envelope is missing result_contract".to_string())?;
+    if result_contract.ducktape_runner_result != RUNNER_RESULT_MARKER {
         return Err(format!(
-            "v1 run envelope requests runner result version {}, but this worker understands {RUNNER_RESULT_VERSION}",
+            "run envelope's runner result marker {} is not the ducktape_runner_result \
+             magic ({RUNNER_RESULT_MARKER})",
             result_contract.ducktape_runner_result
         ));
     }
@@ -268,7 +237,7 @@ fn accept_portable_envelope(
         .iter()
         .any(|s| s.name.is_empty() || s.source_prefix.is_empty())
     {
-        return Err("v1 run envelope skill entries must carry a name and source_prefix".into());
+        return Err("run envelope skill entries must carry a name and source_prefix".into());
     }
 
     // set NO workdir_override/env here (W1/M2) — the plan is data the pool
@@ -372,7 +341,7 @@ mod tests {
     #[test]
     fn headless_envelope_round_trips_the_credential() {
         let json = compose_headless("sched\u{1f}d1", "summarize this", Some("jess-fable-1"));
-        let prepared = prepare(&json).expect("a valid v3 envelope");
+        let prepared = prepare(&json).expect("a valid run envelope");
         assert_eq!(prepared.credential.as_deref(), Some("jess-fable-1"));
         assert!(prepared.input.contains("summarize this"));
     }
@@ -412,13 +381,13 @@ mod tests {
     }
 
     #[test]
-    fn other_envelope_versions_are_rejected() {
-        // exactly one envelope version exists; anything else is refused loud.
+    fn a_wrong_marker_value_is_rejected() {
+        // the magic has exactly one value; anything else is refused loud.
         let mut v: serde_json::Value = serde_json::from_str(&envelope_json()).unwrap();
         v["ducktape_run"] = serde_json::json!(2);
         let err = prepare(&v.to_string()).unwrap_err();
-        assert!(err.contains("version 2"), "got {err:?}");
-        assert!(err.contains("understands 1"), "got {err:?}");
+        assert!(err.contains("marker 2"), "got {err:?}");
+        assert!(err.contains("recompose"), "got {err:?}");
     }
 
     #[test]
@@ -443,9 +412,9 @@ mod tests {
 
     #[test]
     fn claimed_but_broken_envelopes_are_loud_errors() {
-        // an unknown version is a mixed-network signal, never model input.
+        // a wrong magic value is a mixed-binary signal, never model input.
         let err = prepare(r#"{"ducktape_run":99}"#).unwrap_err();
-        assert!(err.contains("version 99"), "got {err:?}");
+        assert!(err.contains("marker 99"), "got {err:?}");
 
         // a non-integer marker.
         let err = prepare(r#"{"ducktape_run":"1"}"#).unwrap_err();
@@ -478,7 +447,7 @@ mod tests {
     fn envelopes_are_accepted_without_activating_a_mount() {
         // the worker ACCEPTS the envelope, but it does NOT activate a workspace
         // mount: no consensus-supplied cwd override, no workspace env. the pool
-        // activates the plan iff a provisioner is wired (ADR ROL/M2 + W1).
+        // activates the plan iff a provisioner is wired.
         let Prepared {
             input,
             ctx,
@@ -705,7 +674,7 @@ mod tests {
         let mut bad_result = base.clone();
         bad_result["result_contract"]["ducktape_runner_result"] = serde_json::json!(99);
         let err = prepare(&bad_result.to_string()).unwrap_err();
-        assert!(err.contains("runner result version 99"), "got {err:?}");
+        assert!(err.contains("runner result marker 99"), "got {err:?}");
 
         // a present skill entry with no source is a mixed-network signal too.
         let mut empty_skill = base.clone();

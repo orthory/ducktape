@@ -16,7 +16,7 @@ pub struct NavItem {
 /// directory/directories), so both forms are stated by the caller. Every
 /// count label goes through here; a bare `format!("{n} agents")` renders the
 /// `1 agents` the register-machine subtitles used to show.
-pub fn plural(count: i64, one: String, many: String) -> String {
+pub fn plural(count: i64, one: &str, many: &str) -> String {
     let noun = if count == 1 { one } else { many };
     format!("{count} {noun}")
 }
@@ -50,34 +50,30 @@ pub fn plural(count: i64, one: String, many: String) -> String {
 /// that field — so these two counts partition the list and sum to the All chip
 /// beside them. The validator count is not lost: it is its own chip, and every
 /// row carries its role marker.
-pub fn members_summary(connected: bool, rows: Vec<MemberRow>) -> String {
+pub fn members_summary(connected: bool, rows: &[MemberRow]) -> String {
     if !connected || rows.is_empty() {
         return String::new();
     }
     let agents = rows.iter().filter(|row| row.is_agent).count();
-    let left = plural(
-        count_i64(rows.len() - agents),
-        "human".into(),
-        "humans".into(),
-    );
-    let right = plural(count_i64(agents), "agent".into(), "agents".into());
+    let left = plural(count_i64(rows.len() - agents), "human", "humans");
+    let right = plural(count_i64(agents), "agent", "agents");
     format!("{left} · {right}")
 }
 
 /// `4 agents · 2 working` — the Agents title's machine subtitle. `working` is
 /// runs in flight, not `AgentStatus::Active`: Active is the registration
 /// default and would report every registered agent as busy forever.
-pub fn agents_summary(connected: bool, rows: Vec<AgentRow>) -> String {
+pub fn agents_summary(connected: bool, rows: &[AgentRow]) -> String {
     if !connected || rows.is_empty() {
         return String::new();
     }
     let working = rows.iter().filter(|row| row.live).count();
-    let registered = plural(count_i64(rows.len()), "agent".into(), "agents".into());
+    let registered = plural(count_i64(rows.len()), "agent", "agents");
     format!("{registered} · {working} working")
 }
 
 /// `12 open · 3 settled` — the Approvals title's machine subtitle.
-pub fn proposals_summary(connected: bool, rows: Vec<ProposalRow>) -> String {
+pub fn proposals_summary(connected: bool, rows: &[ProposalRow]) -> String {
     if !connected || rows.is_empty() {
         return String::new();
     }
@@ -86,13 +82,13 @@ pub fn proposals_summary(connected: bool, rows: Vec<ProposalRow>) -> String {
 }
 
 /// `N pending` — the header count, open proposals only.
-pub fn pending_label(rows: Vec<ProposalRow>) -> String {
+pub fn pending_label(rows: &[ProposalRow]) -> String {
     format!("{} pending", rows.iter().filter(|row| row.open).count())
 }
 
 /// The settled half of the register — the RECENTLY FINALIZED column.
-pub fn settled_proposals(rows: Vec<ProposalRow>) -> Vec<ProposalRow> {
-    rows.into_iter().filter(|row| !row.open).collect()
+pub fn settled_proposals(rows: &[ProposalRow]) -> Vec<ProposalRow> {
+    rows.iter().filter(|row| !row.open).cloned().collect()
 }
 
 /// One seat per REQUIRED signature, filled for each approval already in —
@@ -121,8 +117,8 @@ pub fn tally_label(approvals: i64, required: i64) -> String {
 /// `optional_number` string (`—` when the node reports nothing). Joining the
 /// numbers instead would mean carrying them as `i64` and printing a measured
 /// `0` for "not reported".
-pub fn reading_pair(left: impl AsRef<str>, right: impl AsRef<str>) -> String {
-    format!("{} / {}", left.as_ref(), right.as_ref())
+pub fn reading_pair(left: &str, right: &str) -> String {
+    format!("{left} / {right}")
 }
 
 /// `near` one vote from quorum (or past it), else `far` — success vs meta ink.
@@ -139,7 +135,7 @@ pub fn tally_note(approvals: i64, required: i64) -> String {
     if remaining <= 0 {
         return "quorum met".into();
     }
-    let have = plural(approvals, "approval".into(), "approvals".into());
+    let have = plural(approvals, "approval", "approvals");
     format!("{have} · {remaining} more for quorum")
 }
 
@@ -152,9 +148,9 @@ pub fn approve_label(approvals: i64, required: i64) -> String {
 }
 
 /// The kind pill's two tones: an access-class action reads `access`.
-pub fn proposal_kind_tone(action: String) -> String {
+pub fn proposal_kind_tone(action: &str) -> String {
     let access = matches!(
-        action.as_str(),
+        action,
         "add_validator" | "add_resident" | "remove_validator" | "remove_resident" | "grant_client"
     );
     match access {
@@ -164,7 +160,7 @@ pub fn proposal_kind_tone(action: String) -> String {
 }
 
 /// How many proposals are still open — the count the rail pins to Approvals.
-pub fn open_proposals(rows: Vec<ProposalRow>) -> i64 {
+pub fn open_proposals(rows: &[ProposalRow]) -> i64 {
     rows.iter().filter(|row| row.open).count() as i64
 }
 
@@ -280,65 +276,34 @@ pub(crate) fn registered_endpoint() -> Option<String> {
     Some(format!("http://127.0.0.1:{http}"))
 }
 
-/// `$DUCKTAPE_HOME`, else `~/.ducktape` — the same resolution the user key uses.
+/// `$DUCKTAPE_HOME`, else `~/.ducktape` — the same resolution the user key
+/// uses, because it IS that resolution: [`ducktape_home::root`].
 pub(crate) fn ducktape_home() -> Option<PathBuf> {
-    if let Some(root) = std::env::var_os("DUCKTAPE_HOME") {
-        return Some(PathBuf::from(root));
-    }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".ducktape"))
+    ducktape_home::root().ok()
 }
 
-/// The CLI's workspace registry: `<ducktape home>/workspaces`. `node init` and
-/// `node join` materialize one directory per network in here, so the directory
-/// listing IS the registry — there is no index file to keep in sync.
-fn workspaces_root() -> Option<PathBuf> {
-    ducktape_home().map(|home| home.join("workspaces"))
-}
-
-/// Every registered workspace as `(chain id, directory)`: a directory holding
-/// a `node.toml` is a workspace, whatever else it contains.
+/// Every registered workspace as `(chain id, directory)` — the CLI's own
+/// registry walk (`workspace_config::list_workspaces`), so membership and the
+/// id agree with what `node init`/`node join` wrote and what `-n` resolves.
 pub(crate) fn registered_workspaces() -> Vec<(String, PathBuf)> {
-    let Some(root) = workspaces_root() else {
+    let Ok(root) = workspace_config::workspaces_root() else {
         return Vec::new();
     };
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut workspaces: Vec<(String, PathBuf)> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|dir| dir.join("node.toml").is_file())
-        .filter_map(|dir| {
-            let name = dir.file_name()?.to_str()?.to_string();
-            Some((name, dir))
-        })
-        .collect();
-    workspaces.sort();
-    workspaces
+    registered_workspaces_in(&root)
 }
 
-/// One top-level value out of a workspace file (`key = "value"`). `node.toml`
-/// and `network.toml` are both written key-per-line by the CLI, so this reads
-/// them without a toml parser the app would otherwise not need.
-pub(crate) fn node_dir_value(dir: &Path, file: &str, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join(file)).ok()?;
-    text.lines()
-        .filter_map(|line| line.split_once('='))
-        .find(|(name, _)| name.trim() == key)
-        .map(|(_, value)| {
-            value
-                .split('#')
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .trim_matches(['"', '\''])
-                .to_string()
-        })
+pub(crate) fn registered_workspaces_in(root: &Path) -> Vec<(String, PathBuf)> {
+    workspace_config::list_workspaces_in(root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(chain_id, node_toml)| Some((chain_id, node_toml.parent()?.to_path_buf())))
+        .collect()
 }
 
-/// This workspace's app endpoint, from its `http_listen`.
+/// This workspace's app endpoint, from its `http_listen` — a wildcard bind is
+/// rewritten to loopback, the same as the CLI dials it.
 pub(crate) fn workspace_endpoint(dir: &Path) -> Option<String> {
-    node_dir_value(dir, "node.toml", "http_listen").map(|listen| format!("http://{listen}"))
+    workspace_config::http_base_in(dir).ok()
 }
 
 /// The registered workspace this app is pointed at, matched on the endpoint it
@@ -363,8 +328,8 @@ pub(crate) fn forgotten_workspaces() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// What `node init` / `node join` hand back: the network's id, where it
-/// materialized, and the endpoint this app should connect to.
+/// What a join hands back: the network's id, where it materialized, and the
+/// endpoint this app should connect to.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct WorkspaceInit {
     pub chain_id: String,
@@ -372,93 +337,78 @@ pub struct WorkspaceInit {
     pub rpc: String,
 }
 
-/// Materialize this device's workspace from an invite blob:
-/// `ducktape node join <blob>`.
+/// Materialize this device's workspace from an invite blob, in this process.
+///
+/// Joining is the one node operation with no daemon to ask — it is what BRINGS
+/// a workspace into existence — so it is a library call
+/// ([`workspace_config::join_workspace`]) rather than an endpoint. It writes a
+/// directory, mints two keys and runs argon2-free but still blocking file work,
+/// hence `spawn_blocking`.
 pub async fn join_network(blob: ui_lang_runtime::Secret) -> Result<WorkspaceInit, AppError> {
     async {
-        let blob = blob.expose().trim();
+        let blob = blob.expose().trim().to_string();
         let valid = !blob.is_empty()
             && blob.len() <= 64 * 1024
             && !blob.chars().any(|character| character == '\0');
         if !valid {
             return Err("invite must be between 1 and 65536 bytes".into());
         }
-        // `join` reports progress on stderr, so the workspace it materialized
-        // is identified by diffing the registry around the call.
-        let before: BTreeSet<String> = registered_workspaces()
-            .into_iter()
-            .map(|(chain_id, _)| chain_id)
-            .collect();
-        ducktape_cli(&["node", "join", blob]).await?;
-        let chain_id = registered_workspaces()
-            .into_iter()
-            .map(|(chain_id, _)| chain_id)
-            .find(|chain_id| !before.contains(chain_id))
-            .ok_or_else(|| "the invite did not materialize a workspace".to_string())?;
-        workspace_init(&chain_id)
+        let joining = tokio::task::spawn_blocking(move || {
+            workspace_config::join_workspace(&blob, None, &Default::default())
+        });
+        let joined = joining
+            .await
+            .map_err(|_| "joining this network did not finish".to_string())??;
+        let rpc = workspace_endpoint(&joined.dir)
+            .ok_or_else(|| "the new workspace has no node.toml http_listen".to_string())?;
+        Ok(WorkspaceInit {
+            chain_id: joined.chain_id,
+            workspace: joined.dir.display().to_string(),
+            rpc,
+        })
     }
     .await
     .map_err(app_error)
 }
 
-/// Mint a single-use bearer invite for a workspace: `ducktape node invite`
-/// prints the `🦆…` blob on stdout. This WRITES (it folds this member's dial
-/// hint into the descriptor), so it is not a read-only probe.
-pub async fn mint_invite(workspace: String, ttl_days: i64) -> Result<String, AppError> {
-    async {
-        let ttl = ttl_days.clamp(1, 365).to_string();
-        ducktape_cli(&["node", "invite", "-n", &workspace, "--ttl-days", &ttl]).await
+/// Mint a single-use bearer invite for a workspace — the `🦆…` paste blob.
+///
+/// The RUNNING node mints it (`POST /v1/invite`), because minting is a WRITE
+/// to that node's own files: it folds this member's dial hint into the network
+/// descriptor and saves it, and reads the persisted mesh state for the member
+/// fronts the blob carries. Asking the daemon that owns those files is the
+/// difference between one writer and two racing ones.
+///
+/// The cost of that choice, stated: a workspace whose node is stopped can no
+/// longer mint from here. An invite names paths a joiner must be able to reach,
+/// so a network nobody is serving has nothing useful to hand out anyway.
+///
+/// The app takes no TTL: it mints the ONE default every other door mints
+/// (`workspace_config::DEFAULT_INVITE_TTL_DAYS`). Ice cannot read a Rust
+/// constant, so the constant is applied here rather than passed from a handler.
+pub async fn mint_invite(workspace: String) -> Result<String, AppError> {
+    let minted: Result<String, String> = async {
+        let endpoint = workspace_rpc(&workspace)?;
+        let ttl = workspace_config::DEFAULT_INVITE_TTL_DAYS;
+        Ok(rpc_client(&endpoint)?.mint_invite(ttl).await?)
     }
-    .await
-    .map_err(app_error)
+    .await;
+    minted.map_err(app_error)
 }
 
-/// The workspace facts of a freshly registered chain id.
-fn workspace_init(chain_id: &str) -> Result<WorkspaceInit, String> {
-    let (chain_id, dir) = registered_workspaces()
+/// The endpoint serving a workspace named by directory OR by chain id — the
+/// same two spellings the CLI's `-n` selector takes, because the callers that
+/// used to pass one to `-n` now need a URL instead.
+fn workspace_rpc(selector: &str) -> Result<String, String> {
+    let selector = selector.trim();
+    let matches_selector = |chain_id: &str, dir: &Path| {
+        chain_id == selector || dir.file_name().is_some_and(|name| name == selector)
+    };
+    registered_workspaces()
         .into_iter()
-        .find(|(id, _)| id == chain_id)
-        .ok_or_else(|| format!("{chain_id} is not in the workspace registry"))?;
-    let rpc = workspace_endpoint(&dir)
-        .ok_or_else(|| "the new workspace has no node.toml http_listen".to_string())?;
-    Ok(WorkspaceInit {
-        chain_id,
-        workspace: dir.display().to_string(),
-        rpc,
-    })
-}
-
-/// Run one `ducktape` verb and return its stdout's last non-empty line — the
-/// CLI's machine value (diagnostics ride stderr).
-async fn ducktape_cli(args: &[&str]) -> Result<String, String> {
-    // Name the `<noun> <verb>` head only. The tail is values, and `node join`
-    // carries the whole invite blob — hundreds of characters that, echoed into
-    // the banner's fixed column, push the CLI's actual reason off the bottom.
-    let verb = args[..args.len().min(2)].join(" ");
-    let mut command = tokio::process::Command::new(ducktape_binary());
-    command.args(args).kill_on_drop(true);
-    let output = tokio::time::timeout(CLI_TIMEOUT, command.output())
-        .await
-        .map_err(|_| format!("ducktape {verb} timed out"))?
-        .map_err(|error| {
-            format!(
-                "could not start the ducktape CLI ({error}); build node-bin or set DUCKTAPE_BIN"
-            )
-        })?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "ducktape {verb} refused: {}",
-            bounded_detail(&detail)
-        ));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
-        .ok_or_else(|| format!("ducktape {verb} returned nothing"))
+        .find(|(chain_id, dir)| matches_selector(chain_id, dir))
+        .and_then(|(_, dir)| workspace_endpoint(&dir))
+        .ok_or_else(|| format!("no local workspace named {selector:?} to mint an invite from"))
 }
 
 /// One provisioning step. `state` is `done` | `running` | `pending` | `blocked`.
@@ -582,7 +532,7 @@ pub fn provision_progress(
                     let listen = state
                         .dir
                         .as_deref()
-                        .and_then(|dir| node_dir_value(dir, "node.toml", "http_listen"))
+                        .and_then(workspace_endpoint)
                         .unwrap_or_else(|| state.rpc.clone());
                     state.step = 5;
                     Some((
@@ -617,12 +567,9 @@ fn registered_step(index: i64, label: &str, established: bool) -> ProvisionStep 
 
 /// The workspace's own node identity, short — `network.toml` seats it as the
 /// founding validator, so a fresh network's admin key is readable there.
-fn workspace_identity(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("network.toml")).ok()?;
-    let line = text
-        .lines()
-        .find(|line| line.trim_start().starts_with("validators"))?;
-    let key = line.split('"').nth(1)?;
+pub(crate) fn workspace_identity(dir: &Path) -> Option<String> {
+    let descriptor = workspace_config::NetworkDescriptor::load(&dir.join("network.toml")).ok()?;
+    let key = descriptor.validators.first()?;
     Some(short_label(key))
 }
 
@@ -652,11 +599,10 @@ pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
 /// `active` cannot answer), then the demo registry's name, then the bound
 /// account, then the endpoint's host, then the product name.
 pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
-    let connected = workspace_at(rpc.as_ref()).map(|(dir_name, dir)| {
-        let chain_id = node_dir_value(&dir, "network.toml", "chain_id").unwrap_or_default();
+    let connected = workspace_at(rpc.as_ref()).map(|(chain_id, _)| {
         let named = chain_id.split('#').next().unwrap_or_default();
         match named.is_empty() {
-            true => dir_name,
+            true => chain_id,
             false => named.to_string(),
         }
     });
@@ -682,10 +628,52 @@ pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> Str
     host.to_string()
 }
 
+// THE STATUS ITEM'S WORDS. Ice has no string concatenation, so every tray text
+// that joins a count or a name to a label is spelled here, beside the
+// titlebar's. A row's text is also what a test chooses it by, so each verb
+// below is a contract with `tests/app.ice`.
+
+/// The count beside the menu-bar icon: nothing at all while the bell is empty.
+pub fn tray_badge(unread: i64) -> String {
+    match unread > 0 {
+        true => unread.to_string(),
+        false => String::new(),
+    }
+}
+
+pub fn tray_tooltip(network: String, status: String) -> String {
+    match network.is_empty() {
+        true => format!("Ducktape — {status}"),
+        false => format!("{network} — {status}"),
+    }
+}
+
+pub fn tray_bell_row(unread: i64) -> String {
+    match unread > 0 {
+        true => format!("Notifications · {unread} unread"),
+        false => "Notifications".into(),
+    }
+}
+
+pub fn tray_huddle_row(joined: bool, channel: String) -> String {
+    match joined {
+        true => format!("Huddle · #{channel}"),
+        false => "Huddle".into(),
+    }
+}
+
+/// A radio row: the chosen one wears the check.
+pub fn tray_choice_row(label: String, chosen: bool) -> String {
+    match chosen {
+        true => format!("✓ {label}"),
+        false => label,
+    }
+}
+
 /// A consensus stamp at or above this is unix MILLIS, not a block height.
 ///
 /// `consensus_time` is stamped `= height` by the validator lane
-/// (bin/noded/src/index.rs) and `= unix_millis()` by a single-writer noded
+/// (crates/noded/src/index.rs) and `= unix_millis()` by a single-writer noded
 /// (bin/noded/src/main.rs), and every module record time is that value. No
 /// chain reaches 10^12 blocks and no unix-millis clock has ever been below it,
 /// so the two lanes are told apart by the magnitude alone. Rendering the millis
@@ -750,8 +738,7 @@ pub(crate) fn grouped_digits(value: i64) -> String {
 
 /// TWO uppercase letters for a 28px+ avatar plate: the initials of the first
 /// two words, else the first two alphanumerics of one word.
-pub fn initials_of(name: impl AsRef<str>) -> String {
-    let name = name.as_ref();
+pub fn initials_of(name: &str) -> String {
     let words: Vec<&str> = name.split_whitespace().take(2).collect();
     if words.len() == 2 {
         let letters: String = words
@@ -778,7 +765,7 @@ pub fn initials_of(name: impl AsRef<str>) -> String {
 /// In this app exactly two values qualify, both off `/v1/status`:
 /// `NodeFacts.last_finalized_at` and `operations.phase_since`. NEVER call it on
 /// a module record's time — the consensus validator stamps `consensus_time =
-/// height` (bin/noded/src/index.rs) and a single-writer noded stamps unix
+/// height` (crates/noded/src/index.rs) and a single-writer noded stamps unix
 /// MILLIS, so a record time is a block height, not seconds. Render those with
 /// [`height_ago`] / [`height_label_short`].
 pub fn relative_time(unix_seconds: i64, wall_now: i64) -> String {
@@ -894,9 +881,8 @@ pub(crate) fn encode_wire(payload: &serde_json::Value) -> Vec<u8> {
 /// of the module rail, and a `?` in a circle there does not read as "unnamed",
 /// it reads as HELP. `PrincipalPlate` draws an empty string as a bare plate,
 /// which is what an identity with no name looks like.
-pub fn initial_of(name: impl AsRef<str>) -> String {
-    name.as_ref()
-        .trim()
+pub fn initial_of(name: &str) -> String {
+    name.trim()
         .chars()
         .next()
         .map(|first| first.to_uppercase().to_string())

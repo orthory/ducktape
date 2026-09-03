@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # make dogfood-forge — host ducktape's OWN source in ducktape's forge module.
 # This flows GitHub origin/dev -> Forge dev without moving release-only main.
-# Use ops/mirror-forge-pr.sh for canonical Forge PR -> GitHub delivery.
 #
 # Registers a static git remote `ducktape-dev` pointing at the local dev node's
 # forge git smart-HTTP endpoint, fetches the canonical development branch, then
@@ -18,8 +17,9 @@
 #
 # Resolution of the node's forge base URL, in order:
 #   1. $DUCKTAPE_DEV_FORGE_URL           — explicit base, e.g. http://127.0.0.1:8844
-#   2. the ACTIVE workspace's http_listen — ~/.ducktape/registry.json (.active)
-#                                            -> ~/.ducktape/workspaces/<active>/node.toml
+#   2. the ACTIVE workspace's http_listen — <home>/registry.json (.active)
+#                                            -> <home>/workspaces/<active>/node.toml
+#      where <home> is $DUCKTAPE_HOME when set, else ~/.ducktape
 #      (the workspace flow assigns a RANDOM http port, so this is not a fixed :8844)
 #
 # Env knobs:
@@ -60,12 +60,16 @@ resolve_base_url() {
     printf '%s' "${DUCKTAPE_DEV_FORGE_URL%/}"
     return
   fi
-  local reg="$HOME/.ducktape/registry.json"
+  # the operator root every other reader resolves: $DUCKTAPE_HOME when set,
+  # else ~/.ducktape. A node started under an override keeps its registry
+  # there, and reading $HOME's instead dies with "no node selected" beside it.
+  local duck="${DUCKTAPE_HOME:-$HOME/.ducktape}"
+  local reg="$duck/registry.json"
   if [ -f "$reg" ]; then
     local active
     active=$(sed -n 's/.*"active"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$reg" | head -1)
     if [ -n "$active" ]; then
-      local toml="$HOME/.ducktape/workspaces/$active/node.toml"
+      local toml="$duck/workspaces/$active/node.toml"
       if [ -f "$toml" ]; then
         local listen
         listen=$(sed -n 's/^[[:space:]]*http_listen[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$toml" | head -1)
@@ -79,8 +83,37 @@ resolve_base_url() {
   die "no Forge node selected; set DUCKTAPE_DEV_FORGE_URL or start an active workspace"
 }
 
+# The workspace behind the resolved node, when there is one — the directory
+# holding the operator credential this script's pushes present.
+resolve_workspace() {
+  local duck="${DUCKTAPE_HOME:-$HOME/.ducktape}"
+  local reg="$duck/registry.json"
+  [ -f "$reg" ] || return 0
+  local active
+  active=$(sed -n 's/.*"active"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$reg" | head -1)
+  [ -n "$active" ] || return 0
+  printf '%s' "$duck/workspaces/$active"
+}
+
 BASE_URL="$(resolve_base_url)"
 REMOTE_URL="$BASE_URL/forge/$FORGE_REPO"
+
+# A push MUST prove itself: `git-receive-pack` takes git's own push certificate
+# (`git push --signed`, whose signer becomes the repo's owner on chain) or this
+# node's operator credential, which makes the NODE the owner. This script seeds
+# the node's own mirror of the canonical repo, so the node is the right owner
+# and this is the right proof.
+#
+# GIT_CONFIG_*, not `git -c`: an argv is world-readable through /proc, and this
+# is a secret. Exported so `git push`/`git fetch` below inherit it.
+WORKSPACE="$(resolve_workspace)"
+if [ -n "$WORKSPACE" ] && [ -r "$WORKSPACE/admin.token" ]; then
+  export GIT_CONFIG_COUNT=1
+  export GIT_CONFIG_KEY_0=http.extraHeader
+  export GIT_CONFIG_VALUE_0="x-ducktape-admin-token: $(cat "$WORKSPACE/admin.token")"
+else
+  log "WARNING: no operator credential found; the node will refuse an unsigned push"
+fi
 
 log "node forge endpoint: $REMOTE_URL"
 
@@ -100,8 +133,12 @@ log "source commit: $SOURCE_OID ($SRC_REF)"
 # a healthy node is required (git-receive-pack is served off the node's http
 # surface). fail fast with an actionable message rather than a git transport error.
 if ! curl -fsS -m 5 "$BASE_URL/v1/status" >/dev/null 2>&1; then
-  die "no node responding at $BASE_URL — start a node first (\
-`cargo run -p noded`), or set DUCKTAPE_DEV_FORGE_URL to a running node."
+  # NOTE: no backticks in this string — it is double-quoted, so they would be
+  # command substitution, and the die message would RUN whatever it names.
+  die "no node responding at $BASE_URL — start a node first \
+(make install-node, once, to fill <home>/modules with the components its \
+genesis composes from; then cargo run -p noded-bin), or set \
+DUCKTAPE_DEV_FORGE_URL to a running node."
 fi
 
 # idempotent remote wiring: add, or re-point if it already exists.

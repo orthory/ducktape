@@ -1,5 +1,5 @@
-//! Host-lifecycle helpers for per-use planes (per-use data-plane ADR,
-//! `docs/adr/2026-07-07-per-use-data-plane.mdx`): every service binds the
+//! Host-lifecycle helpers for per-use planes (the per-use data plane):
+//! every service binds the
 //! same way — compute its overlay addresses, retry the bind until the
 //! reachability plane's interface (and this node's `/128`) exists,
 //! construct the [`DataPlane`], and register its stream service. Only
@@ -40,6 +40,60 @@ pub enum StreamPacing {
     Shared(BulkPacer),
 }
 
+/// Bind one service's overlay sockets on this node's `/128`, retrying on
+/// `retry` until the overlay interface (and the `/128`) exists. The wait is
+/// unbounded by contract — the reachability plane brings the interface up in
+/// the background — so it is reported at a bounded cadence: the first failed
+/// attempt and every 20th after carry the running count (a plane that never
+/// comes up is a climbing `attempts`), and a bind that lands after retries
+/// says so once.
+pub async fn bind_overlay_sockets(
+    factory: Arc<dyn SocketFactory>,
+    own_ip: IpAddr,
+    service: Service,
+    book: Arc<dyn AddressBook>,
+    retry: Duration,
+) -> OverlaySockets {
+    let datagram_bind = SocketAddr::new(own_ip, service.overlay_datagram_port());
+    let stream_bind = SocketAddr::new(own_ip, service.overlay_stream_port());
+    let started = std::time::Instant::now();
+    let mut attempts: u64 = 0;
+    loop {
+        match OverlaySockets::bind_with(factory.clone(), datagram_bind, stream_bind, book.clone())
+            .await
+        {
+            Ok(sockets) => {
+                if attempts > 0 {
+                    tracing::info!(
+                        target: "ducktape::dataplane",
+                        ?service,
+                        attempts,
+                        elapsed_s = started.elapsed().as_secs(),
+                        "overlay plane bound (the interface came up)"
+                    );
+                }
+                return sockets;
+            }
+            Err(err) => {
+                attempts += 1;
+                if attempts == 1 || attempts.is_multiple_of(20) {
+                    tracing::warn!(
+                        target: "ducktape::dataplane",
+                        reason = "overlay_bind_retry",
+                        ?service,
+                        %datagram_bind,
+                        attempts,
+                        elapsed_s = started.elapsed().as_secs(),
+                        error = %err,
+                        "overlay plane NOT bound — waiting on the overlay interface"
+                    );
+                }
+                tokio::time::sleep(retry).await;
+            }
+        }
+    }
+}
+
 /// Bind the service's overlay sockets (retrying on `spec.retry` until the
 /// overlay interface is up), start the plane, and register its stream
 /// service. The returned [`DataPlane`] must be kept alive by the caller —
@@ -61,19 +115,14 @@ pub async fn bind_stream_plane<B>(
 where
     B: AddressBook + AdmissionPolicy + Send + Sync + 'static,
 {
-    let datagram_bind = SocketAddr::new(spec.own_ip, spec.service.overlay_datagram_port());
-    let stream_bind = SocketAddr::new(spec.own_ip, spec.service.overlay_stream_port());
-    let sockets = loop {
-        match OverlaySockets::bind_with(factory.clone(), datagram_bind, stream_bind, book.clone())
-            .await
-        {
-            Ok(sockets) => break sockets,
-            // The interface (or our /128) is not up yet — retry quietly;
-            // callers that want a log line keep it on their own side (see
-            // e.g. the node's gateway plane bring-up success println).
-            Err(_) => tokio::time::sleep(spec.retry).await,
-        }
-    };
+    let sockets = bind_overlay_sockets(
+        factory,
+        spec.own_ip,
+        spec.service,
+        book.clone() as Arc<dyn AddressBook>,
+        spec.retry,
+    )
+    .await;
     let admission: Arc<dyn AdmissionPolicy> = book;
     let plane = match spec.pacing {
         StreamPacing::Local(config) => DataPlane::new(sockets, admission, config),

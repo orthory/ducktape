@@ -5,8 +5,11 @@ use super::*;
 
 mod connection;
 mod design;
+mod font_fallback;
 mod forge;
+mod huddle_live;
 mod messages;
+mod page_autosave_gate;
 mod pages;
 mod rooms;
 mod sends;
@@ -77,6 +80,45 @@ fn ice_sources() -> Vec<(String, String)> {
         &mut out,
     );
     out
+}
+
+/// Every `on <name>` handler in one `.ice` source, as (name, body). A handler
+/// body runs from its header to the next line at or above its own indent, so a
+/// slice taken this way cannot absorb the handler after it — which is what
+/// keeps a `contains`/`!contains` assertion over one falsifiable. App handlers
+/// sit at column 0 and a component's at column 2; both are found the same way.
+fn ice_handlers(source: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut current: Option<(String, usize, Vec<&str>)> = None;
+    for line in source.lines() {
+        let indent = line.len() - line.trim_start().len();
+        if let Some((_, header_indent, body)) = &mut current
+            && (line.trim().is_empty() || indent > *header_indent)
+        {
+            body.push(line);
+            continue;
+        }
+        if let Some((name, _, body)) = current.take() {
+            out.push((name, body.join("\n")));
+        }
+        let Some(rest) = line.trim_start().strip_prefix("on ") else {
+            continue;
+        };
+        let name = rest.split(['(', ' ']).next().unwrap_or_default().to_owned();
+        current = Some((name, indent, Vec::new()));
+    }
+    if let Some((name, _, body)) = current {
+        out.push((name, body.join("\n")));
+    }
+    out
+}
+
+fn ice_handler_body(source: &str, handler: &str) -> String {
+    ice_handlers(source)
+        .into_iter()
+        .find(|(name, _)| name == handler)
+        .unwrap_or_else(|| panic!("`on {handler}` is a handler in this source"))
+        .1
 }
 
 fn ice_sources_in(directory: &str) -> String {
@@ -154,7 +196,7 @@ fn composer_scope_named(app: &Ducktape, mount: &str, key: &str) -> Option<String
 /// The stream composer of the room the app is in, materializing it if needed.
 fn composer_scope(app: &mut Ducktape) -> String {
     materialize_composers(app);
-    let key = backend::composer_scope(app.connected_rpc.clone(), app.active_channel.clone());
+    let key = backend::composer_scope(&app.connected_rpc, &app.active_channel);
     composer_scope_named(app, "/composer(", &key)
         .unwrap_or_else(|| panic!("the composer for `{}` materialized", app.active_channel))
 }
@@ -163,8 +205,8 @@ fn composer_scope(app: &mut Ducktape) -> String {
 fn reply_composer_scope(app: &mut Ducktape) -> String {
     materialize_composers(app);
     let key = backend::thread_scope(
-        app.connected_rpc.clone(),
-        app.active_channel.clone(),
+        &app.connected_rpc,
+        &app.active_channel,
         app.active_thread_seq,
     );
     composer_scope_named(app, "/reply_composer(", &key).unwrap_or_else(|| {
@@ -330,7 +372,7 @@ fn compose(text: &str) -> iced::widget::text_editor::Content {
 
 /// The page document's text, the way the save tick reads it.
 fn page_document_text(app: &Ducktape) -> String {
-    crate::pages::page_text(app.page_editor.clone())
+    app.page_editor.text()
 }
 
 fn default_ice_color(name: &str) -> iced::Color {
@@ -514,7 +556,7 @@ fn assert_no_polling(lifecycle: &str) {
             // the page document's write gate: dirty IS the condition, so the
             // tick exists only while the buffer has drifted from the node's
             // text — not a poll, an edit-driven flush.
-            "every 900ms when (connected && !empty(active_page) && page_text(page_editor) != page_saved_text) -> page_autosave_tick",
+            "every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick",
         ]
     );
 }
@@ -580,6 +622,19 @@ fn command_chord(code: iced::keyboard::key::Code) -> __IceKeyPress {
         physical_key: iced::keyboard::key::Physical::Code(code),
         location: iced::keyboard::Location::Standard,
         modifiers: iced::keyboard::Modifiers::COMMAND,
+        text: None,
+        repeat: false,
+    }
+}
+
+/// The press the escape ladder answers, as the subscription delivers it.
+fn escape_press() -> __IceKeyPress {
+    __IceKeyPress {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        modified_key: iced::keyboard::Key::Unidentified,
+        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Escape),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
         text: None,
         repeat: false,
     }

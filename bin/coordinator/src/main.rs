@@ -110,7 +110,82 @@ fn parse_metrics_interval(raw: &str) -> std::io::Result<u64> {
     })
 }
 
-async fn log_metrics(metrics: CoordinatorMetrics, relay_metrics: RelayMetrics, seconds: u64) {
+/// Install the process log sink: `tracing` events to stderr, which the unit
+/// captures into the journal.
+///
+/// The coordinator has no LogRing and no node-crate dependency, so this is the
+/// only place its events can go. Two lines deliberately do NOT come through it
+/// — the two bind announcements and the `coordinator_metrics` rows are parsed
+/// by tooling and by `tests/deploy_smoke.rs`, and a subscriber would prefix
+/// them with a timestamp and a level.
+///
+/// RUST_LOG *adds to* the `info` floor rather than replacing it: with
+/// `EnvFilter`'s own default, a bare `RUST_LOG=ducktape::reachability=debug`
+/// would turn every other event OFF while appearing to turn one plane UP.
+///
+/// The directives are parsed STRICTLY. `EnvFilter::new` SKIPS a malformed
+/// directive and carries on, so a typo'd `ducktape:reachability=debug` would
+/// look like it worked: no plane, no error, no clue — and this binary has no
+/// `/v1/log-filter` reload seam, so a restart is the only retry. A bad
+/// RUST_LOG falls back to the default filter and says so, once there is a
+/// subscriber to say it through.
+fn install_tracing() {
+    let env = std::env::var("RUST_LOG").unwrap_or_default();
+    let directives = if env.is_empty() {
+        "info".to_string()
+    } else {
+        format!("info,{env}")
+    };
+    let (filter, bad_env) = match tracing_subscriber::EnvFilter::builder().parse(&directives) {
+        Ok(filter) => (filter, None),
+        Err(error) => (
+            tracing_subscriber::EnvFilter::new("info"),
+            Some(error.to_string()),
+        ),
+    };
+    // colour only for a human at a terminal: the deployed sink is the journal,
+    // where escape codes are noise in every grep.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(interactive)
+        .with_env_filter(filter)
+        .init();
+    if let Some(error) = bad_env {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            event = "coordinator_log_filter_refused",
+            reason = "malformed_rust_log",
+            error,
+            "RUST_LOG is malformed — ignored, running at the default filter"
+        );
+    }
+}
+
+/// Whether the TCP relay lane bound — carried on every metrics row so a
+/// coordinator whose 443 bind failed at boot (the one-time line scrolled
+/// away long ago) keeps saying so for as long as it runs.
+#[derive(Clone, Copy)]
+enum RelayLane {
+    On,
+    Off,
+}
+
+impl RelayLane {
+    fn as_str(self) -> &'static str {
+        match self {
+            RelayLane::On => "on",
+            RelayLane::Off => "off",
+        }
+    }
+}
+
+async fn log_metrics(
+    metrics: CoordinatorMetrics,
+    relay_metrics: RelayMetrics,
+    relay_lane: RelayLane,
+    seconds: u64,
+) {
     let mut ticker = tokio::time::interval(Duration::from_secs(seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     ticker.tick().await;
@@ -138,7 +213,7 @@ async fn log_metrics(metrics: CoordinatorMetrics, relay_metrics: RelayMetrics, s
             .map(|rss| format!("{:.2}", rss as f64 / 1_048_576.0))
             .unwrap_or_else(|| "na".into());
         eprintln!(
-            "coordinator_metrics | traffic received={} authenticated={} rejected={} malformed={} replies={} send_errors={} | queue inflight={} inflight_max={} saturated={} | relay sessions={} rejected={} forwards={} replies={} expired={} | host cpu_pct={cpu_pct} rss_mib={rss_mib}",
+            "coordinator_metrics | traffic received={} authenticated={} rejected={} malformed={} replies={} send_errors={} | queue inflight={} inflight_max={} saturated={} | relay={} sessions={} rejected={} forwards={} replies={} expired={} | host cpu_pct={cpu_pct} rss_mib={rss_mib}",
             m.received,
             m.authenticated,
             m.rejected,
@@ -148,6 +223,7 @@ async fn log_metrics(metrics: CoordinatorMetrics, relay_metrics: RelayMetrics, s
             m.inflight,
             m.inflight_max,
             m.saturated,
+            relay_lane.as_str(),
             r.sessions_opened,
             r.sessions_rejected,
             r.forwards,
@@ -165,6 +241,8 @@ async fn main() -> std::io::Result<()> {
         print!("{USAGE}");
         return Ok(());
     }
+
+    install_tracing();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     validate_args(&args)?;
@@ -209,8 +287,9 @@ async fn main() -> std::io::Result<()> {
     // rendezvous keepalives maintain.
     let coord = Coordinator::with_shared_policy(policy.clone());
     let relay_metrics = RelayMetrics::default();
-    if let Some(relay_addr) = relay_listen {
-        match TcpListener::bind(relay_addr).await {
+    let relay_lane = match relay_listen {
+        None => RelayLane::Off,
+        Some(relay_addr) => match TcpListener::bind(relay_addr).await {
             Ok(listener) => {
                 // parseable like the UDP line above (tooling/tests read its tail).
                 eprintln!(
@@ -223,24 +302,45 @@ async fn main() -> std::io::Result<()> {
                     coord.adverts(),
                     relay_metrics.clone(),
                 ));
+                RelayLane::On
             }
             Err(error) => {
                 // The relay is a FALLBACK lane: failing to bind it (EACCES on
                 // 443 as non-root is the everyday dev case) must not take the
-                // UDP rendezvous down with it. Warn loudly and keep serving.
-                eprintln!("WARNING: relay lane disabled: binding tcp/{relay_addr} failed: {error}");
+                // UDP rendezvous down with it. Say exactly what is now dark
+                // and keep serving; every metrics row repeats `relay=off`.
+                tracing::error!(
+                    target: "ducktape::reachability",
+                    event = "relay_lane_disabled",
+                    reason = "bind_failed",
+                    relay_listen = %relay_addr,
+                    error = %error,
+                    "relay lane DISABLED: every joiner derives its first-contact fallback as \
+                     <this host>:443, so a member whose NAT cannot hole-punch cannot join through \
+                     this coordinator. Fix: run with CAP_NET_BIND_SERVICE \
+                     (ops/coordinator/ducktape-coordinator.service), bind an unprivileged port \
+                     behind a 443 forward, or pass --relay-listen none to run without it on purpose."
+                );
+                RelayLane::Off
             }
-        }
-    }
+        },
+    };
 
     let metrics = CoordinatorMetrics::default();
     if metrics_interval != 0 {
         tokio::spawn(log_metrics(
             metrics.clone(),
             relay_metrics.clone(),
+            relay_lane,
             metrics_interval,
         ));
     }
-    run_coordinator_workers_with_metrics_using(sock, coord, workers, metrics).await;
+    run_coordinator_workers_with_metrics_using(
+        nat_traversal::NatSocket::Owned(sock),
+        coord,
+        workers,
+        metrics,
+    )
+    .await;
     Ok(())
 }

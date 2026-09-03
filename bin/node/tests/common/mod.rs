@@ -23,10 +23,22 @@
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// the `ducktape module …` verbs as an e2e drives them, shared by the suites
+/// that exercise a live code swap.
+pub mod module_verbs;
+
+/// the checked-in `<id>.component.wasm` set every founding e2e names: a network
+/// has no embedded wasm, so `node init` hashes THIS directory into the
+/// descriptor and the dev shape derives its genesis code set from it.
+pub const FIXTURES: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../crates/kernel/host/tests/fixtures"
+);
 
 /// A cluster's storage root, named so an ABANDONED one can be found and swept.
 ///
@@ -191,44 +203,25 @@ pub struct Cluster {
 }
 
 impl Drop for Cluster {
-    /// Reap each compute daemon AND the podman service it left behind.
+    /// Kill every daemon this cluster started.
     ///
-    /// [`NodeProc::drop`] SIGKILLs, so a compute daemon never runs
-    /// [`provider_host::PodmanService`]'s `kill_on_drop` — and that service was
-    /// started `--time=0`, meaning it never idle-exits. It therefore outlives the
-    /// whole test holding ~45 MB, rooted in a tempdir that is about to vanish.
-    /// `PodmanService::claim` only reaps such an orphan when a SUCCESSOR boots on
-    /// the same root, and a torn-down cluster never gets one: left alone these
-    /// accumulate for as long as the box stays up (102 of them, ~4.5 GB, were
-    /// swept by hand once).
-    ///
-    /// Runs BEFORE the fields drop, which is the whole point — the pid file lives
-    /// in `dir`. Daemons go first so nothing re-creates a service after the sweep.
-    /// The reap is identity-verified by executable inside `provider_host`, never a
-    /// `pkill -f` pattern match (which has killed an agent's own shell here).
+    /// There is nothing to reap after them any more. A compute daemon used to
+    /// leave a `podman system service` child behind — started `--time=0` so it
+    /// never idle-exited, surviving the SIGKILL in [`NodeProc::drop`], holding
+    /// ~45 MB rooted in a tempdir about to vanish, and reaped only when a
+    /// SUCCESSOR booted on the same root, which a torn-down cluster never gets
+    /// (102 of them, ~4.5 GB, were once swept by hand). A run's VMM is a child
+    /// of its daemon spawned `kill_on_drop`, so the SIGKILL that ends the
+    /// daemon ends its guests too.
     fn drop(&mut self) {
-        // BOTH daemon sets, and both before the sweep: the implicit compute
-        // daemon `spawn` starts, and whatever `spawn_service` started by hand.
-        // A survivor of either kind could re-create a service after the sweep.
         for daemon in &mut self.daemons {
             *daemon = None; // NodeProc::drop kills + waits
         }
         for procs in &mut self.services {
             procs.clear(); // same: kill + wait
         }
-        for idx in 0..self.peer_ids.len() {
-            provider_host::reap_service_at(
-                &self.workspace(idx).join("services").join(COMPUTE_SERVICE_KIND),
-            );
-        }
     }
 }
-
-/// the service kind whose podman root this harness reaps. It is the only kind
-/// that HAS one: `airlock`, the other kind [`Cluster::spawn_service`] starts,
-/// spawns no container runtime at all — that is the whole point of the lender
-/// being a keyless plug. An `agent` daemon would need its own entry here.
-const COMPUTE_SERVICE_KIND: &str = "compute";
 
 /// One `ducktape service run <kind>` daemon attached to a node.
 struct ServiceProc {
@@ -284,12 +277,57 @@ impl NetworkShapeCluster {
         }
     }
 
+    /// this shape's per-node workspace — the directory holding `node.toml`, and
+    /// the credential the node mints beside it.
+    pub fn workspace(&self, idx: usize) -> PathBuf {
+        match idx {
+            0 => self.founder_dir.clone(),
+            _ => self.friend_dir.clone(),
+        }
+    }
+
+    /// the `GIT_CONFIG_*` environment a push at node `idx` must carry — the
+    /// shape-cluster twin of [`Cluster::git_push_env`].
+    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
+        git_push_env_for(&self.workspace(idx))
+    }
+
+    /// one request against node `idx`'s app surface, carrying that node's
+    /// operator credential — the shape-cluster twin of [`Cluster::http`].
+    pub fn http(
+        &self,
+        idx: usize,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        let token = noded::admin::read_operator_token(&self.workspace(idx))
+            .expect("the node minted an operator credential");
+        let bytes = body
+            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+            .unwrap_or_default();
+        let (status, raw) = nettest::try_http_bytes_with(
+            self.http_ports[idx],
+            method,
+            path,
+            "application/json",
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &token)],
+            &bytes,
+        )
+        .expect("app-surface request");
+        (
+            status,
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
     pub fn init_founder(&self, name: &str) -> String {
         // the join protocol refuses to mint an invite from a member with no reachability
         // plane, and this harness is deliberately coordinator-free — so every
         // founder carries a distinct-port WireGuard listen.
         let wg_listen = format!("127.0.0.1:{}", alloc_ports(1)[0]);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args([
                 "init",
                 "--name",
@@ -302,6 +340,11 @@ impl NetworkShapeCluster {
                 // shape has its own e2e (coordinated_invite_cli).
                 "--primary-coordinator",
                 "none",
+                // the genesis wasm set lives on disk, not in the binary: found
+                // from the checked-in components rather than the operator's
+                // ~/.ducktape/modules, which a test box need not have.
+                "--modules",
+                FIXTURES,
                 "--dir",
                 self.founder_dir.to_str().expect("utf-8 founder dir"),
                 "--listen",
@@ -328,7 +371,8 @@ impl NetworkShapeCluster {
     /// and return its pubkey hex — the JOIN CODE the invite locks to.
     /// `join_friend` reuses this pre-generated identity.
     pub fn keygen_friend(&self, _idx: usize) -> String {
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args(["key", "--dir"])
             .arg(&self.friend_dir)
             .output()
@@ -347,7 +391,8 @@ impl NetworkShapeCluster {
     pub fn invite(&self) -> String {
         self.keygen_friend(1);
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args(["invite", "--config"])
             .arg(cfg)
             .output()
@@ -377,7 +422,8 @@ impl NetworkShapeCluster {
     /// `join requests` verb's JSON stdout.
     pub fn join_requests(&self) -> serde_json::Value {
         let cfg = self.config_file(0);
-        let out = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args(["join", "requests", "--config"])
             .arg(cfg)
             .output()
@@ -395,7 +441,8 @@ impl NetworkShapeCluster {
     /// success — the caller inspects the outcome (a targeted invite refuses a
     /// mismatched local identity at the CLI, before any node spawns).
     pub fn try_join_friend(&self, invite: &str) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .args([
                 "join",
                 invite,
@@ -448,7 +495,8 @@ impl NetworkShapeCluster {
         let log = self.dir.path().join(format!("{label}.log"));
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .arg("run")
             .arg("--config")
             .arg(&cfg)
@@ -469,13 +517,12 @@ impl NetworkShapeCluster {
     ///
     /// The daemon PROCESS is deliberately not spawned, and that is a SCOPING
     /// choice, not a limitation of the host: a daemon's entire contribution to
-    /// the announce lane is this POST, so booting a container runtime to prove
-    /// capability announcement buys no extra signal and couples this lane to
-    /// podman's availability and startup cost. What a real daemon would
-    /// additionally prove — that a REAL hello carries the shape this lane
-    /// expects — is a daemon-fixture concern, and it belongs in the dispatch
-    /// e2e (#826), which owns the `[sandbox]` fixture, the portable-podman
-    /// PATH, and the libpod pull-on-404 fix that lane actually needs.
+    /// the announce lane is this POST, so booting a sandbox to prove capability
+    /// announcement buys no extra signal and couples this lane to `/dev/kvm`
+    /// and the guest artifacts. What a real daemon would additionally prove —
+    /// that a REAL hello carries the shape this lane expects — is a
+    /// daemon-fixture concern, and it belongs in the dispatch e2e (#826), which
+    /// owns the `[sandbox]` fixture that lane actually needs.
     ///
     /// The FIRST hello is synchronous and asserted — that IS the readiness
     /// event; the refresh then rides a heartbeat thread like the daemon's.
@@ -525,12 +572,7 @@ impl NetworkShapeCluster {
             .spawn(move || {
                 loop {
                     std::thread::sleep(noded::services::HELLO_TTL / 3);
-                    let _ = nettest::try_http_json(
-                        port,
-                        "POST",
-                        "/v1/services/hello",
-                        Some(&body),
-                    );
+                    let _ = nettest::try_http_json(port, "POST", "/v1/services/hello", Some(&body));
                 }
             })
             .expect("spawn the hello heartbeat");
@@ -544,7 +586,11 @@ impl NetworkShapeCluster {
     /// node `idx`'s captured stdout+stderr — for a failing test to preserve
     /// evidence before the cluster tempdir (and the logs in it) is dropped.
     pub fn log_path(&self, idx: usize) -> PathBuf {
-        self.nodes[idx].as_ref().expect("node not running").log.clone()
+        self.nodes[idx]
+            .as_ref()
+            .expect("node not running")
+            .log
+            .clone()
     }
 
     /// one json-lines rpc against node `idx` — the NetworkShapeCluster
@@ -766,6 +812,14 @@ impl NetworkShapeCluster {
     }
 }
 
+/// the dev-shape node.toml of a LONE node, rooted at `dir` — the same literal
+/// [`Cluster::config_path`] writes, with a free `rpc_listen` and NOTHING behind
+/// it. What a pure-CLI test points a workspace verb at to exercise the
+/// node-is-not-running path without spawning a node.
+pub fn minimal_dev_shape_toml(dir: &std::path::Path) -> String {
+    Cluster::new(&[1], &[1]).config_toml(0, dir)
+}
+
 impl Cluster {
     /// lay out a cluster: `peer_ids` is the full authorized mesh (index 0 is
     /// the bootstrapper), `validator_ids` the consensus subset.
@@ -810,6 +864,16 @@ impl Cluster {
     pub(crate) fn config_path(&self, idx: usize) -> PathBuf {
         let id = self.peer_ids[idx];
         let path = self.dir.path().join(format!("node{id}.toml"));
+        std::fs::write(&path, self.config_toml(idx, self.dir.path())).expect("write node config");
+        self.write_service_grants(idx);
+        path
+    }
+
+    /// the node.toml body [`Cluster::config_path`] writes, rooted at `root`
+    /// (the cluster's own tempdir for a spawned node). Pure, so a pure-CLI
+    /// test can borrow the same dev shape without a cluster on disk.
+    fn config_toml(&self, idx: usize, root: &std::path::Path) -> String {
+        let id = self.peer_ids[idx];
         let mut cfg = String::new();
         cfg.push_str(&format!("id = {id}\n"));
         cfg.push_str(&format!("listen = \"127.0.0.1:{}\"\n", self.p2p_ports[idx]));
@@ -819,14 +883,11 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
+        cfg.push_str(&format!("modules = {FIXTURES:?}\n"));
         cfg.push_str(&self.peer_addrs_toml());
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
-            self.dir
-                .path()
-                .join(format!("storage-{id}"))
-                .to_str()
-                .unwrap()
+            root.join(format!("storage-{id}")).to_str().unwrap()
         ));
         cfg.push_str(&format!(
             "rpc_listen = \"127.0.0.1:{}\"\n",
@@ -850,9 +911,7 @@ impl Cluster {
             cfg.push_str(line);
             cfg.push('\n');
         }
-        std::fs::write(&path, cfg).expect("write node config");
-        self.write_service_grants(idx);
-        path
+        cfg
     }
 
     /// Write (or remove) the workspace `services.toml` the node reads at boot:
@@ -887,7 +946,7 @@ impl Cluster {
             let _ = std::fs::remove_file(&path);
             return;
         }
-        let mut file = "version = 1\n".to_string();
+        let mut file = String::new();
         for (position, (kind, tags)) in granted.iter().enumerate() {
             let announced = tags
                 .iter()
@@ -919,7 +978,8 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}.log"));
         let out = std::fs::File::create(&log).expect("create node log");
         let err = out.try_clone().expect("clone node log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .arg("run")
             .arg("--config")
             .arg(&cfg)
@@ -934,15 +994,22 @@ impl Cluster {
 
     /// spawn node `idx`'s compute daemon, when it has a grant to act under.
     ///
-    /// Waits for the node's app surface FIRST, and that is not politeness: the
-    /// daemon's opening move is a `/v1/services/hello` POST whose failure is
-    /// deliberately fatal (`run_service`: "the FIRST hello must land ... a build
-    /// mismatch or a down node is a loud exit, not a silent spin"). Only the
-    /// query lane retries. Launching both processes in the same breath therefore
-    /// killed the daemon outright whenever it won the race to the socket —
-    /// observed as `FATAL: POST http://…/v1/services/hello` — which is a
-    /// coin-flip, not a test. An operator starts a service against a node that
-    /// is already up, and so does this.
+    /// Waits for the node to PUBLISH ITS MESH IDENTITY first, and that is not
+    /// politeness: the daemon's opening move is a `/v1/services/hello` POST
+    /// whose failure is deliberately fatal (`run_service`: "the FIRST hello
+    /// must land ... a build mismatch or a down node is a loud exit, not a
+    /// silent spin"). Only the query lane retries. Launching both processes in
+    /// the same breath therefore killed the daemon outright whenever it won the
+    /// race to the socket — observed as `FATAL: POST http://…/v1/services/hello`
+    /// — which is a coin-flip, not a test. An operator starts a service against
+    /// a node that is already up, and so does this.
+    ///
+    /// "app surface listening" is the WRONG marker for it and used to be the one
+    /// waited on: the node binds its HTTP listener well before the boundary
+    /// status carries a `public_key`, so the daemon could reach a node that was
+    /// up and still read `public_key: ""` — exiting with `FATAL: this node has
+    /// not published a mesh identity yet`. `validator::run` logs the publish as
+    /// its own once-per-boot fact precisely so this wait has a seam to hold.
     ///
     /// `--config` points it at the SAME dev-shape config the node reads (a dev
     /// workspace is its `storage_dir`, which does not contain the config file,
@@ -951,7 +1018,7 @@ impl Cluster {
         if self.compute_grant.is_none() {
             return;
         }
-        self.wait_marker(idx, "app surface listening", Duration::from_secs(90));
+        self.wait_marker(idx, "mesh identity published", Duration::from_secs(90));
         let id = self.peer_ids[idx];
         let cfg = self.config_path(idx);
         let log = self.dir.path().join(format!("compute{id}.log"));
@@ -979,15 +1046,20 @@ impl Cluster {
     ///
     /// Called EXPLICITLY rather than folded into [`Self::spawn`] (where the
     /// compute daemon rides along) because a daemon's FIRST hello must LAND:
-    /// the node's http surface has to be listening before the daemon starts,
-    /// and only the test knows when it has waited for that.
+    /// the node has to have PUBLISHED ITS MESH IDENTITY before the daemon
+    /// starts — a listening http surface is not enough, see [`Self::spawn_compute`]
+    /// — and only the test knows when it has waited for that. Any caller that
+    /// waited on committed state has already cleared it: the identity goes out
+    /// in the startup snapshot, before the first block.
     pub fn spawn_service(&mut self, idx: usize, kind: &str) {
         let id = self.peer_ids[idx];
         // One grant per kind is the file's rule and one daemon per kind is the
         // operator's: a second `service run <kind>` beside the same node would
         // be two processes sharing one grant, which is a test bug, not a
         // scenario. Refuse it here, where the cause is visible.
-        let already_running = self.services[idx].iter().any(|service| service.kind == kind);
+        let already_running = self.services[idx]
+            .iter()
+            .any(|service| service.kind == kind);
         let compute_rides_along = kind == "compute" && self.compute_grant.is_some();
         assert!(
             !already_running && !compute_rides_along,
@@ -1041,7 +1113,12 @@ impl Cluster {
             if let Some(rest) = find_marker(&text, marker) {
                 return rest;
             }
-            let exited = service.proc.child.try_wait().expect("poll service").is_some();
+            let exited = service
+                .proc
+                .child
+                .try_wait()
+                .expect("poll service")
+                .is_some();
             if exited || Instant::now() >= deadline {
                 let verb = if exited { "exited" } else { "timed out" };
                 panic!(
@@ -1148,6 +1225,7 @@ impl Cluster {
         cfg.push_str(&format!("namespace = {:?}\n", self.namespace));
         cfg.push_str(&format!("peer_seeds = {:?}\n", self.peer_ids));
         cfg.push_str(&format!("validator_seeds = {:?}\n", self.validator_ids));
+        cfg.push_str(&format!("modules = {FIXTURES:?}\n"));
         cfg.push_str(&self.peer_addrs_toml());
         cfg.push_str(&format!(
             "storage_dir = {:?}\n",
@@ -1163,12 +1241,21 @@ impl Cluster {
             cfg.push_str(&format!("wireguard_listen = \"127.0.0.1:{}\"\n", ports[0]));
             cfg.push_str(&format!("invite_listen = \"127.0.0.1:{}\"\n", ports[3]));
         }
+        // the joiner runs the same node.toml a member does — including whatever
+        // the test appended. Skipping it made a joiner silently diverge from the
+        // cluster it was joining (a hermetic `primary_coordinator = "none"` on
+        // the members, and a joiner still dialing the live public coordinator).
+        for line in &self.extra_toml {
+            cfg.push_str(line);
+            cfg.push('\n');
+        }
         std::fs::write(&path, cfg).expect("write joiner config");
 
         let log = self.dir.path().join(format!("node{id}.log"));
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
-        let child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .arg("run")
             .arg("--config")
             .arg(&path)
@@ -1240,7 +1327,8 @@ impl Cluster {
         let log = self.dir.path().join(format!("node{id}-sync.log"));
         let out = std::fs::File::create(&log).expect("create joiner log");
         let err = out.try_clone().expect("clone joiner log handle");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape")).arg("node")
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .arg("node")
             .arg("run")
             .arg("--config")
             .arg(&cfg)
@@ -1282,9 +1370,16 @@ impl Cluster {
     pub fn wait_marker(&mut self, idx: usize, marker: &str, timeout: Duration) -> String {
         // (in-seam refactor: the loop body is shared with the compute-daemon
         // twin below, so it moved to `await_marker` verbatim.)
-        match await_marker(self.nodes[idx].as_mut().expect("node is running"), marker, timeout) {
+        match await_marker(
+            self.nodes[idx].as_mut().expect("node is running"),
+            marker,
+            timeout,
+        ) {
             Ok(rest) => rest,
-            Err(why) => panic!("node {why} without printing {marker:?};\n{}", self.all_log_tails(60)),
+            Err(why) => panic!(
+                "node {why} without printing {marker:?};\n{}",
+                self.all_log_tails(60)
+            ),
         }
     }
 
@@ -1292,7 +1387,7 @@ impl Cluster {
     ///
     /// The compute plane is a SEPARATE PROCESS with its own failure domain, and
     /// without this the suite has no eye on it at all: a daemon that exits at
-    /// boot — an unconfigured `[sandbox]`, a podman it cannot probe, a hello that
+    /// boot — an unconfigured `[sandbox]`, a `/dev/kvm` it cannot open, a hello that
     /// raced its node — leaves a cluster that looks perfectly healthy, because
     /// the node is. The suite then waits out a three-minute convergence budget
     /// and fails on whatever unrelated predicate it happened to be holding,
@@ -1483,7 +1578,67 @@ impl Cluster {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> (u16, serde_json::Value) {
-        http_request(self.http_ports[idx], method, path, body)
+        let bytes = body
+            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+            .unwrap_or_default();
+        let (status, raw) = self.http_bytes(idx, method, path, "application/json", &bytes);
+        (
+            status,
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// the raw-bytes twin of [`Self::http`], carrying this node's operator
+    /// credential. EVERY mutating `/v1` route refuses a caller that presents
+    /// neither that nor a user signature, and a harness driving a node it owns
+    /// is exactly the local operator the credential names.
+    pub fn http_bytes(
+        &self,
+        idx: usize,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let token = self.operator_token(idx);
+        nettest::try_http_bytes_with(
+            self.http_ports[idx],
+            method,
+            path,
+            content_type,
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &token)],
+            body,
+        )
+        .expect("app-surface request")
+    }
+
+    /// node `idx`'s operator credential, read out of the workspace the node
+    /// minted it into at boot — the same file a real local daemon reads.
+    pub fn operator_token(&self, idx: usize) -> String {
+        noded::admin::read_operator_token(&self.workspace(idx))
+            .expect("the node minted an operator credential")
+    }
+
+    /// the `GIT_CONFIG_*` environment a push at node `idx`'s smart-HTTP
+    /// surface must carry.
+    ///
+    /// `git-receive-pack` refuses a push that proves nothing (#1292): it takes
+    /// git's own push certificate, or this node's operator credential. A
+    /// harness pushing at a node it spawned IS its operator. `GIT_CONFIG_*`
+    /// rather than `git -c`, exactly as `ops/dogfood-forge.sh` sets it — an
+    /// argv is world-readable through /proc, and this is a secret.
+    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
+        git_push_env_for(&self.workspace(idx))
+    }
+
+    /// a duckfs transport for node `idx` whose writes it admits.
+    pub fn files(&self, idx: usize) -> duckfs_client::http::HttpNode {
+        let token = self.operator_token(idx);
+        duckfs_client::http::HttpNode::new(self.http_base(idx)).with_write_auth(
+            std::sync::Arc::new(move |_method, _path, _body| {
+                vec![(noded::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
+            }),
+        )
     }
 
     /// GET a raw TEXT body from node `idx`'s app surface — for non-json
@@ -1499,20 +1654,41 @@ impl Cluster {
         format!("http://127.0.0.1:{}", self.http_ports[idx])
     }
 
-    /// every running node's log tail — the panic payload that makes a stalled
-    /// mesh diagnosable from a CI failure alone.
+    /// Every log this cluster owns: each node's, AND each service daemon's —
+    /// the panic payload that makes a stalled mesh diagnosable from a CI
+    /// failure alone.
+    ///
+    /// The daemons are not decoration. A dispatch/agent e2e fails on a
+    /// PREDICATE the node's own log cannot explain — "no provider announced its
+    /// tags", "nobody bid" — because the decision was the daemon's and the node
+    /// only ever saw its silence. Those logs live in a `TempDir` that Drop
+    /// removes as the panic unwinds, so a tail that skips them throws away the
+    /// only copy.
     pub fn all_log_tails(&self, lines: usize) -> String {
-        self.nodes
-            .iter()
-            .flatten()
-            .map(|n| {
-                let text = std::fs::read_to_string(&n.log).unwrap_or_default();
-                format!(
-                    "--- node #{} log tail ---\n{}",
-                    n.id,
-                    log_tail(&text, lines)
-                )
-            })
+        let nodes = self.nodes.iter().flatten().map(|n| {
+            let text = std::fs::read_to_string(&n.log).unwrap_or_default();
+            format!("--- node #{} log tail ---\n{}", n.id, log_tail(&text, lines))
+        });
+        let riding = self.daemons.iter().flatten().map(|d| {
+            let text = std::fs::read_to_string(&d.log).unwrap_or_default();
+            format!(
+                "--- node #{} compute daemon log tail ---\n{}",
+                d.id,
+                log_tail(&text, lines)
+            )
+        });
+        let explicit = self.services.iter().flatten().map(|s| {
+            let text = std::fs::read_to_string(&s.proc.log).unwrap_or_default();
+            format!(
+                "--- node #{} {} daemon log tail ---\n{}",
+                s.proc.id,
+                s.kind,
+                log_tail(&text, lines)
+            )
+        });
+        nodes
+            .chain(riding)
+            .chain(explicit)
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1526,6 +1702,24 @@ impl Cluster {
         );
         reply["status"].clone()
     }
+}
+
+/// the `GIT_CONFIG_*` environment carrying the operator credential minted into
+/// `workspace` — one implementation for both cluster shapes.
+fn git_push_env_for(workspace: &Path) -> [(String, String); 3] {
+    let token = noded::admin::read_operator_token(workspace)
+        .expect("the node minted an operator credential");
+    [
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "http.extraHeader".to_string(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            format!("{}: {token}", noded::admin::ADMIN_TOKEN_HEADER),
+        ),
+    ]
 }
 
 fn command_output(out: &std::process::Output) -> String {
@@ -1562,32 +1756,35 @@ pub fn http_text_request(port: u16, path: &str) -> (u16, String) {
 // compute daemon needs a `[sandbox]` table (without one the daemon exits at
 // boot) AND needs to know whether this host can honour it — and the two answers
 // have to agree. They were separately copied into two test binaries, which is
-// how one of them ended up gating on `podman version` while the other gated on
-// the product's own predicate.
+// how one of them ended up gating on a runtime's version string while the other
+// gated on the product's own predicate.
 
-/// The default image a sandboxed run executes in: the SMALLEST one that proves
-/// execution end to end, since a script provider's container command is the
-/// executor itself and all it needs of an image is a `/bin/sh` for its shebang.
-///
-/// Size is not cosmetic — each compute daemon keeps its OWN private podman graph
-/// root, so a three-node cluster pulls this three times, into three empty
-/// stores, on every run. busybox is ~4 MB where `node:22-slim` is ~200 MB. A
-/// provider script that needs more than busybox (a `node` runtime, say) passes
-/// its own image to [`sandbox_toml`].
-pub const SANDBOX_IMAGE: &str = "docker.io/library/busybox:stable";
-
-/// the `[sandbox]` table a cluster node boots with, isolating every run into
-/// `image`. Appended LAST to [`Cluster::extra_toml`] — nothing may follow a toml
-/// table header.
+/// the `[sandbox]` table a cluster node boots with. Appended LAST to
+/// [`Cluster::extra_toml`] — nothing may follow a toml table header.
 ///
 /// It says only HOW a run is isolated. WHETHER this node runs any is
 /// [`Cluster::compute_grant`]; the daemon needs both, and refuses to boot
 /// without the table.
-pub fn sandbox_toml(image: &str) -> Vec<String> {
+///
+/// Every node in a cluster names the SAME two images, and that is now free
+/// rather than expensive: the guest kernel and rootfs are read-only and shared,
+/// so N nodes attach one copy. The container backend gave each daemon its own
+/// graph root, which meant a three-node cluster pulled its image three times
+/// into three empty stores on every run — the reason that helper took an image
+/// argument and defaulted to the smallest one that could work.
+///
+/// The runtime is the platform's own hypervisor flavor — the same choice
+/// [`guest_backend`] probes with — so the daemon this table boots is the one
+/// the capability gate just proved can run.
+pub fn sandbox_toml() -> Vec<String> {
+    let dir =
+        std::env::var("DUCKTAPE_GUEST_DIR").unwrap_or_else(|_| guest_dir().display().to_string());
+    let runtime = provider_host::Vmm::platform_default().config_token();
     vec![
         "[sandbox]".into(),
-        "runtime = \"podman\"".into(),
-        format!("image = {image:?}"),
+        format!("runtime = {runtime:?}"),
+        format!("kernel = {:?}", format!("{dir}/vmlinux")),
+        format!("rootfs = {:?}", format!("{dir}/rootfs.ext4")),
         "cores = 0".into(),
         "mem_gb = 0".into(),
     ]
@@ -1596,25 +1793,38 @@ pub fn sandbox_toml(image: &str) -> Vec<String> {
 /// Can this host isolate a run the way the compute daemon demands? `Some(why)`
 /// = no.
 ///
-/// Asks the PRODUCT'S OWN predicate rather than `podman version`, and the
-/// difference is not academic: podman on `PATH` is one of four things the Podman
-/// backend requires (`pasta` for the netns, `nft` + `nsenter` for the egress
-/// firewall). A box with a portable podman install has the binary on `PATH` and
-/// its helpers only inside the install prefix — `podman version` says yes, the
-/// daemon exits `FATAL: sandbox: pasta is not executable`, and a suite gated on
-/// the weaker question runs anyway and FAILS instead of skipping. Gating on
+/// Asks the PRODUCT'S OWN predicate rather than a weaker proxy, and the
+/// difference is not academic. `firecracker` on `PATH` is one of several things
+/// the backend needs — `/dev/kvm` must OPEN read-write for this process (a host
+/// can list the kvm group and still get EACCES until the next login), `mke2fs`
+/// and `debugfs` must exist, and the guest images must be built. A suite gated
+/// on the weaker question runs anyway and FAILS instead of skipping. Gating on
 /// `probe()` means a suite skips when, and only when, a real node would refuse
 /// to serve compute.
-///
-/// The image is irrelevant to the answer (`probe` checks tooling, never pulls),
-/// so this takes none.
 pub fn unsandboxable_host() -> Option<String> {
-    provider_host::SandboxBackend::Podman {
-        image: SANDBOX_IMAGE.into(),
-        socket: PathBuf::new(),
+    guest_backend().probe().err()
+}
+
+/// the backend an e2e node is configured with: the guest artifacts
+/// `ops/build-guest-rootfs.sh` produces, overridable for a box that keeps them
+/// somewhere else.
+pub fn guest_backend() -> provider_host::SandboxBackend {
+    let vmm = provider_host::Vmm::platform_default();
+    let dir = std::env::var("DUCKTAPE_GUEST_DIR").map_or_else(|_| guest_dir(), PathBuf::from);
+    provider_host::SandboxBackend::MicroVm {
+        vmm,
+        kernel: dir.join("vmlinux"),
+        rootfs: dir.join("rootfs.ext4"),
+        // the operator's own installed CLIs, exactly as a real node resolves
+        // them: an e2e run execs what this box actually has.
+        executors: workspace_config::executor_dir().expect("executor dir"),
     }
-    .probe()
-    .err()
+}
+
+/// where the guest artifacts live by default — the same answer
+/// `workspace-config::default_guest_dir` gives `node init`.
+pub fn guest_dir() -> std::path::PathBuf {
+    workspace_config::default_guest_dir().expect("guest dir")
 }
 
 /// `Some(())` = this test cannot run here and the caller must return; `None` =
@@ -1668,7 +1878,7 @@ fn await_marker(proc: &mut NodeProc, marker: &str, timeout: Duration) -> Result<
 /// there is something new to read.
 ///
 /// **It is not purely event-driven, and the difference matters.**
-/// `bin/noded/src/stream.rs` also emits a byte-identical heartbeat on a 3s
+/// `crates/noded/src/stream.rs` also emits a byte-identical heartbeat on a 3s
 /// `tokio::time::interval`, and nothing in the frame distinguishes the two — so
 /// this is a ≤3s poll that additionally wakes per block. What it buys over the
 /// 300ms client-side spin it replaces is real but bounded: it cannot fire early
@@ -1735,4 +1945,154 @@ pub fn unhex(s: &str) -> Vec<u8> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("valid hex"))
         .collect()
+}
+
+// ---- the USER lane: user-signed frames and identity accounts -----------------
+//
+// `Cluster::submit` rides the rpc, which re-signs every op with the NODE's key:
+// its committed origin is the node, and a node key is never on an Identity
+// account. Anything a user does — founding an account, claiming a handle,
+// publishing a route, registering or granting a credential, scheduling a run —
+// is attributed through `OfKey(origin)`, so it has to arrive as a frame the
+// USER signed, over `/v1/submit/frame`. These helpers are that lane.
+
+/// a frame's `seq` is an ordering/dedup tie-breaker (any u64); one process-wide
+/// counter keeps every frame a suite signs distinct from every other.
+static FRAME_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// the budget for one user-lane op to finalize and become readable elsewhere.
+const USER_LANE_FINALIZE: Duration = Duration::from_secs(60);
+
+/// POST one frame `user` signed over `(target, payload)` to node `idx`'s
+/// `/v1/submit/frame` and return (status, body). The frame's verified signer
+/// becomes the op's `Origin::External`; the validator answers once the op's
+/// block commits, so a same-node read right after sees it.
+pub fn try_submit_frame(
+    cluster: &Cluster,
+    idx: usize,
+    user: &ed25519::PrivateKey,
+    target: &str,
+    payload: &[u8],
+) -> (u16, serde_json::Value) {
+    let seq = FRAME_SEQ.fetch_add(1, Ordering::Relaxed);
+    let frame = node::encode_frame(
+        user,
+        seq,
+        &sdk::Msg {
+            target: target.into(),
+            payload: payload.to_vec(),
+        },
+    );
+    let (status, body) = nettest::http_bytes(
+        cluster.http_ports[idx],
+        "POST",
+        "/v1/submit/frame",
+        "application/octet-stream",
+        &frame,
+    );
+    (
+        status,
+        serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+/// [`try_submit_frame`], asserting the lane accepted and committed the op.
+pub fn submit_frame(
+    cluster: &Cluster,
+    idx: usize,
+    user: &ed25519::PrivateKey,
+    target: &str,
+    payload: &[u8],
+) {
+    let (status, body) = try_submit_frame(cluster, idx, user, target, payload);
+    assert_eq!(
+        status, 200,
+        "user-signed {target} frame via node idx {idx} rejected: {body}"
+    );
+}
+
+/// `OfKey(key)` on node `idx`: the account `key` belongs to. `None` covers both
+/// a rejected query and "no account" — all a poll needs to tell apart is
+/// "resolved" from "not (yet)".
+pub fn account_of_key(cluster: &Cluster, idx: usize, key: &[u8]) -> Option<identity::AccountView> {
+    let bytes = cluster.query(
+        idx,
+        "identity",
+        &identity::encode_query(&identity::IdentityQuery::OfKey { key: key.to_vec() }),
+    )?;
+    match identity::decode_reply(&bytes).ok()? {
+        identity::IdentityReply::Account(account) => account,
+        identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => None,
+    }
+}
+
+/// `KeyGen(key)` on node `idx`: how many times `key` has been admitted
+/// anywhere — the generation an add-key consent for it must sign.
+pub fn key_gen(cluster: &Cluster, idx: usize, key: &[u8]) -> Option<u64> {
+    let bytes = cluster.query(
+        idx,
+        "identity",
+        &identity::encode_query(&identity::IdentityQuery::KeyGen { key: key.to_vec() }),
+    )?;
+    match identity::decode_reply(&bytes).ok()? {
+        identity::IdentityReply::Gen(generation) => Some(generation),
+        identity::IdentityReply::Account(_) | identity::IdentityReply::Accounts(_) => None,
+    }
+}
+
+/// found an Identity account for `user` through node `idx` — `Create` as a
+/// user-signed frame — and wait until `OfKey(user)` resolves to it there.
+/// Returns the account number (1 for the first account a cluster founds).
+pub fn create_account(
+    cluster: &Cluster,
+    idx: usize,
+    user: &ed25519::PrivateKey,
+    name: &str,
+) -> u64 {
+    submit_frame(
+        cluster,
+        idx,
+        user,
+        "identity",
+        &identity::encode_msg(&identity::testkit::create(name)),
+    );
+    let key = user.public_key().as_ref().to_vec();
+    poll_until(
+        &format!("account {name:?} to found"),
+        USER_LANE_FINALIZE,
+        || account_of_key(cluster, idx, &key),
+    )
+    .number
+}
+
+/// admit `new_key` into `member`'s account through node `idx`: `member`
+/// consents at `new_key`'s CURRENT generation, and the JOINING key signs the
+/// `AddKey` frame (the op's origin is the key being admitted). Waits until
+/// `OfKey(new_key)` resolves there and returns the account as it then reads.
+pub fn add_key(
+    cluster: &Cluster,
+    idx: usize,
+    member: &ed25519::PrivateKey,
+    new_key: &ed25519::PrivateKey,
+) -> identity::AccountView {
+    let joining = new_key.public_key().as_ref().to_vec();
+    let generation = poll_until("the joining key's generation", USER_LANE_FINALIZE, || {
+        key_gen(cluster, idx, &joining)
+    });
+    submit_frame(
+        cluster,
+        idx,
+        new_key,
+        "identity",
+        &identity::encode_msg(&identity::testkit::add_ed25519_key(
+            member,
+            &cluster.namespace,
+            &joining,
+            generation,
+            None,
+        )),
+    );
+    poll_until("the joining key to resolve", USER_LANE_FINALIZE, || {
+        account_of_key(cluster, idx, &joining)
+    })
 }

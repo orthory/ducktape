@@ -27,7 +27,6 @@ use noded::{GatewayFailure, GatewayJob, GatewayResponse, NodeCommand};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-const BIND_RETRY: Duration = Duration::from_secs(3);
 const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// Idle ceiling between BODY reads from a loopback upstream. A live SSE feed
 /// emits events/keepalives well inside this; a silent-forever upstream would
@@ -47,6 +46,11 @@ pub struct SpawnConfig {
     pub planes: data_plane::PlaneMonitor,
     pub commands: mpsc::Sender<NodeCommand>,
     pub workspace: PathBuf,
+    /// The ports this node's OWN surfaces answer on (rpc, browser gateway,
+    /// app-surface http), as bound at boot. A loopback route aimed at one of
+    /// them is refused: it would proxy the mesh into this node's
+    /// unauthenticated `/v1`.
+    pub node_api_ports: Vec<u16>,
 }
 
 fn proxy_flow() -> FlowId {
@@ -60,6 +64,9 @@ pub struct GatewayPlane;
 
 impl crate::overlay_book::Plane for GatewayPlane {
     const SERVICE: Service = Service::Gateway;
+}
+
+impl crate::overlay_book::StreamPlane for GatewayPlane {
     fn flow() -> FlowId {
         proxy_flow()
     }
@@ -78,6 +85,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         planes,
         commands,
         workspace,
+        node_api_ports,
     } = config;
     let slot: PlaneSlot = Arc::new(OnceLock::new());
     let own_node: [u8; 32] = me.as_ref().try_into().expect("ed25519 keys are 32 bytes");
@@ -88,6 +96,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         let slot = Arc::clone(&slot);
         let commands = commands.clone();
         let client_workspace = workspace.clone();
+        let client_ports = node_api_ports.clone();
         let permits = Arc::new(tokio::sync::Semaphore::new(16));
         tokio::spawn(async move {
             while let Some(job) = jobs.recv().await {
@@ -97,6 +106,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                 let slot = Arc::clone(&slot);
                 let commands = commands.clone();
                 let workspace = client_workspace.clone();
+                let node_api_ports = client_ports.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     match job {
@@ -117,13 +127,18 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                     let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
                                     let serve_commands = commands.clone();
                                     let serve_workspace = workspace.clone();
+                                    let serve_ports = node_api_ports.clone();
                                     let head_for_server = head.clone();
                                     let body_for_server = body.clone();
                                     tokio::spawn(async move {
+                                        let scope = LoopbackScope {
+                                            workspace: &serve_workspace,
+                                            node_api_ports: &serve_ports,
+                                            own_node: &own_node,
+                                        };
                                         serve_proxy_stream(
                                             &serve_commands,
-                                            &serve_workspace,
-                                            &own_node,
+                                            &scope,
                                             &own_node,
                                             head_for_server,
                                             Some(body_for_server),
@@ -165,16 +180,15 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                                 let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
                                 let serve_commands = commands.clone();
                                 let serve_workspace = workspace.clone();
+                                let serve_ports = node_api_ports.clone();
                                 tokio::spawn(async move {
-                                    serve_ws(
-                                        &serve_commands,
-                                        &serve_workspace,
-                                        &own_node,
-                                        &own_node,
-                                        &head,
-                                        server_end,
-                                    )
-                                    .await;
+                                    let scope = LoopbackScope {
+                                        workspace: &serve_workspace,
+                                        node_api_ports: &serve_ports,
+                                        own_node: &own_node,
+                                    };
+                                    serve_ws(&serve_commands, &scope, &own_node, &head, server_end)
+                                        .await;
                                 });
                                 caller_ws_pump(caller_end, to_browser, from_browser).await;
                             } else {
@@ -203,7 +217,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
             service: Service::Gateway,
             pacing: StreamPacing::Shared(pacer),
             policy: StreamPolicy { accept_backlog: 16 },
-            retry: BIND_RETRY,
+            retry: crate::overlay_book::BIND_RETRY,
         };
         let (plane, service) = match bind_stream_plane(spec, factory, book).await {
             Ok(bound) => bound,
@@ -236,6 +250,7 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
             };
             let commands = commands.clone();
             let workspace = workspace.clone();
+            let node_api_ports = node_api_ports.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 if hello.intent != gateway::PROXY_INTENT {
@@ -257,14 +272,18 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                         return;
                     }
                 };
+                let scope = LoopbackScope {
+                    workspace: &workspace,
+                    node_api_ports: &node_api_ports,
+                    own_node: &own_node,
+                };
                 // A WebSocket upgrade is long-lived; it owns the stream and
                 // writes its own responses, so it bypasses the one-shot timeout.
                 if head.upgrade {
-                    serve_ws(&commands, &workspace, &own_node, &requester.0, &head, stream).await;
+                    serve_ws(&commands, &scope, &requester.0, &head, stream).await;
                     return;
                 }
-                serve_proxy_stream(&commands, &workspace, &own_node, &requester.0, head, None, stream)
-                    .await;
+                serve_proxy_stream(&commands, &scope, &requester.0, head, None, stream).await;
             });
         }
     });
@@ -307,6 +326,15 @@ async fn proxy_remote(
     .map_err(|_| GatewayFailure::Unavailable("gateway publisher timed out".into()))?
 }
 
+/// What serving a route needs of THIS node, shared by the HTTP proxy and the
+/// WebSocket upgrade: the workspace the loopback route map lives in, the
+/// ports this node's own surfaces answer on, and this node's key.
+struct LoopbackScope<'a> {
+    workspace: &'a Path,
+    node_api_ports: &'a [u16],
+    own_node: &'a [u8; 32],
+}
+
 /// One proxied HTTP exchange over a frame-capable stream (the overlay socket
 /// or the self-serve duplex). `body`: `Some` when the caller already holds the
 /// request body (self-serve); `None` reads `head.body_len` bytes off the
@@ -314,8 +342,7 @@ async fn proxy_remote(
 /// response HEAD; the body drain streams beyond it.
 async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     commands: &mpsc::Sender<NodeCommand>,
-    workspace: &Path,
-    own_node: &[u8; 32],
+    scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: gateway::ProxyRequestHead,
     body: Option<Vec<u8>>,
@@ -336,7 +363,7 @@ async fn serve_proxy_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 body
             }
         };
-        serve_current(commands, workspace, own_node, caller_node, &head, &body).await
+        serve_current(commands, scope, caller_node, &head, &body).await
     })
     .await
     .unwrap_or_else(|_| {
@@ -400,8 +427,7 @@ async fn proxy_remote_ws(
 
 async fn serve_current(
     commands: &mpsc::Sender<NodeCommand>,
-    workspace: &Path,
-    own_node: &[u8; 32],
+    scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
     body: &[u8],
@@ -412,8 +438,8 @@ async fn serve_current(
             "gateway proxy: request body length mismatch".into(),
         ));
     }
-    let record = resolve_route(commands, &head.account_id, &head.name).await?;
-    if record.statement.publisher_node.as_slice() != own_node {
+    let record = resolve_route(commands, head.account_id, &head.name).await?;
+    if record.statement.publisher_node.as_slice() != scope.own_node {
         return Err(GatewayFailure::Forbidden(
             "gateway request does not name this publisher".into(),
         ));
@@ -424,49 +450,37 @@ async fn serve_current(
         ));
     }
     revalidate_route_authority(commands, &record).await?;
-    let caller = account_of_node(commands, caller_node).await?;
+    let caller = caller_account(commands, head, &record.statement).await?;
     let route = record
         .statement
         .route
         .as_ref()
         .expect("resolve_route rejects tombstones");
-    if !gateway::audience_allows(
-        &route.policy.audience,
-        &record.statement.account_id,
-        &caller.account_id,
-    ) {
+    if !gateway::audience_allows(&route.policy.audience, record.statement.account_id, caller) {
         return Err(GatewayFailure::Forbidden(
-            "caller account is outside the signed route audience".into(),
+            "caller is outside the signed route audience".into(),
         ));
     }
     match &route.target {
         gateway::RouteTarget::DuckFs { .. } => {
-            serve_duckfs(commands, own_node, head, &record).await
+            serve_duckfs(commands, scope.own_node, head, &record).await
         }
         gateway::RouteTarget::LoopbackHttp => {
-            proxy_loopback(
-                workspace,
-                caller_node,
-                &caller.account_id,
-                head,
-                body,
-                &record,
-            )
-            .await
+            proxy_loopback(scope, caller_node, caller, head, body, &record).await
         }
     }
 }
 
 async fn resolve_route(
     commands: &mpsc::Sender<NodeCommand>,
-    account_id: &[u8],
+    account_id: u64,
     name: &gateway::RouteName,
 ) -> Result<gateway::RouteRecord, GatewayFailure> {
     let reply = query(
         commands,
         "gateway",
         gateway::encode_query(&gateway::GatewayQuery::Get {
-            account_id: account_id.to_vec(),
+            account_id,
             name: name.clone(),
         }),
     )
@@ -491,35 +505,85 @@ async fn resolve_route(
     }
 }
 
-async fn account_of_node(
+/// How far a caller proof's timestamp may sit from this node's clock. A proof
+/// is minted per request by the app, so a generous window costs nothing but
+/// bounds a captured proof's replay life.
+const CALLER_POP_FRESHNESS_SECS: u64 = 30;
+
+/// The account a request acts FOR, or `None` when it carries no user proof.
+///
+/// A mesh peer is a node, and a node is never an account: the caller's
+/// account comes ONLY from the user proof-of-possession the app stamped on
+/// the request (`x-duck-user-key/-ts/-sig`, carried in the head as
+/// [`gateway::UserPop`]). The proof binds the key to THIS route, method, path
+/// and a fresh timestamp under [`gateway::GATEWAY_CALLER_NS`], and verifies
+/// with the scheme identity stores for that key. A present-but-bad proof is a
+/// refusal, never a downgrade to anonymous.
+async fn caller_account(
     commands: &mpsc::Sender<NodeCommand>,
-    node: &[u8; 32],
-) -> Result<identity::AccountView, GatewayFailure> {
+    head: &gateway::ProxyRequestHead,
+    statement: &gateway::RouteStatement,
+) -> Result<Option<u64>, GatewayFailure> {
+    let Some(pop) = &head.user_pop else {
+        return Ok(None);
+    };
     let reply = query(
         commands,
         "identity",
-        identity::encode_query(&identity::IdentityQuery::OfNode {
-            node_key: node.to_vec(),
+        identity::encode_query(&identity::IdentityQuery::OfKey {
+            key: pop.key.clone(),
         }),
     )
     .await?;
-    match identity::decode_reply(&reply) {
-        Ok(identity::IdentityReply::Account(Some(account)))
-            if account
-                .nodes
-                .iter()
-                .any(|candidate| candidate.node_key.as_slice() == node) =>
-        {
-            Ok(account)
+    let account = match identity::decode_reply(&reply) {
+        Ok(identity::IdentityReply::Account(Some(account))) => account,
+        Ok(identity::IdentityReply::Account(None)) => {
+            return Err(GatewayFailure::Forbidden(
+                "gateway caller key belongs to no Identity account".into(),
+            ));
         }
-        Ok(identity::IdentityReply::Account(_)) => Err(GatewayFailure::Forbidden(
-            "gateway caller node has no current Identity account".into(),
-        )),
-        Ok(_) => Err(GatewayFailure::Unavailable(
-            "unexpected Identity caller reply".into(),
-        )),
-        Err(error) => Err(GatewayFailure::Unavailable(error)),
+        Ok(identity::IdentityReply::Accounts(_)) | Ok(identity::IdentityReply::Gen(_)) => {
+            return Err(GatewayFailure::Unavailable(
+                "unexpected Identity caller reply".into(),
+            ));
+        }
+        Err(error) => return Err(GatewayFailure::Unavailable(error)),
+    };
+    let Some(scheme) = account
+        .keys
+        .iter()
+        .find(|key| key.pubkey == pop.key)
+        .map(|key| key.scheme)
+    else {
+        return Err(GatewayFailure::Unavailable(
+            "Identity key index disagrees with its account record".into(),
+        ));
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let fresh = now.abs_diff(pop.ts) <= CALLER_POP_FRESHNESS_SECS;
+    if !fresh {
+        return Err(GatewayFailure::Forbidden(
+            "gateway caller proof is stale".into(),
+        ));
     }
+    let preimage = gateway::caller_pop_preimage(
+        &statement.publisher_node,
+        statement.account_id,
+        &statement.name,
+        head.method,
+        &head.path_and_query,
+        pop.ts,
+    );
+    let verifies = scheme.verify(&pop.key, gateway::GATEWAY_CALLER_NS, &preimage, &pop.sig);
+    if !verifies {
+        return Err(GatewayFailure::Forbidden(
+            "gateway caller proof does not verify".into(),
+        ));
+    }
+    Ok(Some(account.number))
 }
 
 async fn revalidate_route_authority(
@@ -531,7 +595,7 @@ async fn revalidate_route_authority(
         commands,
         "identity",
         identity::encode_query(&identity::IdentityQuery::Get {
-            account_id: statement.account_id.clone(),
+            number: statement.account_id,
         }),
     )
     .await?;
@@ -542,7 +606,7 @@ async fn revalidate_route_authority(
                 "gateway route account no longer exists".into(),
             ));
         }
-        Ok(_) => {
+        Ok(identity::IdentityReply::Accounts(_)) | Ok(identity::IdentityReply::Gen(_)) => {
             return Err(GatewayFailure::Unavailable(
                 "unexpected Identity route-authority reply".into(),
             ));
@@ -550,30 +614,25 @@ async fn revalidate_route_authority(
         Err(error) => return Err(GatewayFailure::Unavailable(error)),
     };
     let authorization = &record.authorization;
-    let signer_is_current = account.member_keys.iter().any(|member| {
-        member.kind == identity::KeyKind::Ed25519 && member.pubkey == authorization.signer
-    });
-    let node_is_current = account
-        .nodes
+    // the signer must STILL be a member, and it verifies with the scheme the
+    // account records for it — a removed key's routes stop serving.
+    let signer_scheme = account
+        .keys
         .iter()
-        .any(|node| node.node_key == statement.publisher_node);
-    let proof = identity::MemberProof::Signature {
-        sig: authorization.signature.clone(),
-    };
+        .find(|key| key.pubkey == authorization.signer)
+        .map(|key| key.scheme);
     let preimage =
         gateway::route_signing_preimage(statement).map_err(GatewayFailure::Unavailable)?;
-    if account.account_id != statement.account_id
-        || !signer_is_current
-        || !node_is_current
-        || !identity::verify_authority(
-            identity::KeyKind::Ed25519,
+    let signature_verifies = signer_scheme.is_some_and(|scheme| {
+        scheme.verify(
             &authorization.signer,
-            None,
             gateway::GATEWAY_ROUTE_NS,
             &preimage,
-            &proof,
+            &authorization.signature,
         )
-    {
+    });
+    let account_matches = account.number == statement.account_id;
+    if !account_matches || !signature_verifies {
         return Err(GatewayFailure::Forbidden(
             "gateway route authority is no longer current".into(),
         ));
@@ -581,10 +640,51 @@ async fn revalidate_route_authority(
     Ok(())
 }
 
-async fn proxy_loopback(
-    workspace: &Path,
+/// the refusal a route aimed at this node's own API earns — a stable token,
+/// the reply detail and the log reason alike.
+const ROUTE_TARGETS_NODE_API: &str = "route_targets_node_api";
+
+/// Resolve a loopback route's upstream port — the ONE seam both the HTTP
+/// proxy and the WebSocket upgrade dial through. A loopback route may name
+/// any local daemon EXCEPT this node's own surfaces: proxying the mesh into
+/// `/v1` (or upgrading into `/v1/ws/...`) hands every member this node's
+/// unauthenticated API (submit as this node, mint invites, log-filter).
+fn loopback_port(
+    scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
-    caller_account: &[u8],
+    head: &gateway::ProxyRequestHead,
+) -> Result<u16, GatewayFailure> {
+    // one process-wide latch keyed on the cause: a flood from one route hides
+    // another route's FIRST refusal until the next Nth hit. the logged line
+    // carries route + caller, so the count reads per cause, not per route.
+    static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
+    let routes =
+        crate::gateway_routes::load(scope.workspace).map_err(GatewayFailure::Unavailable)?;
+    let port = routes.port(&head.name).ok_or_else(|| {
+        GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
+    })?;
+    let targets_node_api = scope.node_api_ports.contains(&port);
+    if !targets_node_api {
+        return Ok(port);
+    }
+    if let Some(attempts) = REFUSED.hit(ROUTE_TARGETS_NODE_API) {
+        tracing::warn!(
+            target: "ducktape::gateway",
+            caller = %hex_bytes(caller_node),
+            route = %head.name.local_key(),
+            upgrade = head.upgrade,
+            reason = ROUTE_TARGETS_NODE_API,
+            attempts,
+            "gateway route REFUSED — its loopback upstream is this node's own API port"
+        );
+    }
+    Err(GatewayFailure::Forbidden(ROUTE_TARGETS_NODE_API.into()))
+}
+
+async fn proxy_loopback(
+    scope: &LoopbackScope<'_>,
+    caller_node: &[u8; 32],
+    caller_account: Option<u64>,
     head: &gateway::ProxyRequestHead,
     body: &[u8],
     record: &gateway::RouteRecord,
@@ -594,10 +694,7 @@ async fn proxy_loopback(
         .route
         .as_ref()
         .expect("current route is live");
-    let routes = crate::gateway_routes::load(workspace).map_err(GatewayFailure::Unavailable)?;
-    let port = routes.port(&head.name).ok_or_else(|| {
-        GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
-    })?;
+    let port = loopback_port(scope, caller_node, head)?;
     // Connect + per-read deadlines only: a TOTAL timeout would kill long
     // streamed (SSE) bodies, but a silent-forever upstream must not pin its
     // accept permit — the idle read timeout reclaims it. The head is still
@@ -616,17 +713,21 @@ async fn proxy_loopback(
         .request(method, url)
         .header(reqwest::header::ACCEPT_ENCODING, "identity")
         .header(reqwest::header::USER_AGENT, "Ducktape-Gateway/1")
-        .header("x-duck-caller-account", hex_bytes(caller_account))
         .header("x-duck-caller-node", hex_bytes(caller_node))
         .header(
             "x-duck-route-account",
-            hex_bytes(&record.statement.account_id),
+            record.statement.account_id.to_string(),
         )
         .header("x-duck-route-label", head.name.local_key())
         .header(
             "x-duck-route-revision",
             record.statement.revision.to_string(),
         );
+    // the caller ACCOUNT is stamped only when a user proof established one;
+    // an upstream that reads it can tell "anonymous peer" from "account 12".
+    if let Some(account) = caller_account {
+        upstream = upstream.header("x-duck-caller-account", account.to_string());
+    }
     for header in &head.headers {
         // Strip hop-by-hop / forwarding / identity headers and never let a
         // caller header shadow a proxy-minted x-duck-* (decode already rejects
@@ -827,12 +928,14 @@ async fn serve_duckfs(
             "manifest does not match the signed hash".into(),
         ));
     }
-    let manifest: gateway::RouteManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|error| GatewayFailure::Unavailable(format!("manifest is not valid json: {error}")))?;
+    let manifest: gateway::RouteManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            GatewayFailure::Unavailable(format!("manifest is not valid json: {error}"))
+        })?;
     gateway::validate_manifest(&manifest).map_err(GatewayFailure::Forbidden)?;
 
-    let file =
-        gateway::manifest_file_for_path(&manifest, &head.path_and_query).map_err(GatewayFailure::NotFound)?;
+    let file = gateway::manifest_file_for_path(&manifest, &head.path_and_query)
+        .map_err(GatewayFailure::NotFound)?;
     // Serve-time cap: the file table is off consensus, so the signed response
     // cap is enforced here rather than at admission.
     if file.size > route.policy.max_response_bytes {
@@ -1006,17 +1109,18 @@ async fn query(
 /// routes cannot upgrade.
 async fn authorize_ws(
     commands: &mpsc::Sender<NodeCommand>,
-    workspace: &Path,
-    own_node: &[u8; 32],
+    scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
 ) -> Result<String, GatewayFailure> {
     gateway::validate_proxy_request_head(head).map_err(GatewayFailure::Invalid)?;
     if !head.upgrade {
-        return Err(GatewayFailure::Invalid("gateway proxy: not an upgrade".into()));
+        return Err(GatewayFailure::Invalid(
+            "gateway proxy: not an upgrade".into(),
+        ));
     }
-    let record = resolve_route(commands, &head.account_id, &head.name).await?;
-    if record.statement.publisher_node.as_slice() != own_node {
+    let record = resolve_route(commands, head.account_id, &head.name).await?;
+    if record.statement.publisher_node.as_slice() != scope.own_node {
         return Err(GatewayFailure::Forbidden(
             "gateway request does not name this publisher".into(),
         ));
@@ -1027,19 +1131,15 @@ async fn authorize_ws(
         ));
     }
     revalidate_route_authority(commands, &record).await?;
-    let caller = account_of_node(commands, caller_node).await?;
+    let caller = caller_account(commands, head, &record.statement).await?;
     let route = record
         .statement
         .route
         .as_ref()
         .expect("resolve_route rejects tombstones");
-    if !gateway::audience_allows(
-        &route.policy.audience,
-        &record.statement.account_id,
-        &caller.account_id,
-    ) {
+    if !gateway::audience_allows(&route.policy.audience, record.statement.account_id, caller) {
         return Err(GatewayFailure::Forbidden(
-            "caller account is outside the signed route audience".into(),
+            "caller is outside the signed route audience".into(),
         ));
     }
     if !route.policy.allow_upgrade || !matches!(route.target, gateway::RouteTarget::LoopbackHttp) {
@@ -1047,10 +1147,7 @@ async fn authorize_ws(
             "route does not permit a WebSocket upgrade".into(),
         ));
     }
-    let routes = crate::gateway_routes::load(workspace).map_err(GatewayFailure::Unavailable)?;
-    let port = routes.port(&head.name).ok_or_else(|| {
-        GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
-    })?;
+    let port = loopback_port(scope, caller_node, head)?;
     Ok(format!("ws://127.0.0.1:{port}{}", head.path_and_query))
 }
 
@@ -1059,15 +1156,14 @@ async fn authorize_ws(
 /// `101` `ResponseHead` then pumps `WsFrame`/`WsClose` both ways until close.
 async fn serve_ws<S>(
     commands: &mpsc::Sender<NodeCommand>,
-    workspace: &Path,
-    own_node: &[u8; 32],
+    scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
     mut stream: S,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let url = match authorize_ws(commands, workspace, own_node, caller_node, head).await {
+    let url = match authorize_ws(commands, scope, caller_node, head).await {
         Ok(url) => url,
         Err(failure) => {
             let _ = write_frame(&mut stream, &failure_frame(&failure)).await;
@@ -1108,9 +1204,15 @@ async fn serve_ws<S>(
 async fn ws_pump<S, U>(stream: S, upstream: U)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    U: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>>
-        + futures::Sink<tokio_tungstenite::tungstenite::Message, Error = tokio_tungstenite::tungstenite::Error>
-        + Unpin
+    U: futures::Stream<
+            Item = Result<
+                tokio_tungstenite::tungstenite::Message,
+                tokio_tungstenite::tungstenite::Error,
+            >,
+        > + futures::Sink<
+            tokio_tungstenite::tungstenite::Message,
+            Error = tokio_tungstenite::tungstenite::Error,
+        > + Unpin
         + Send
         + 'static,
 {
@@ -1470,10 +1572,12 @@ mod tests {
     async fn streamed_response_arrives_and_zero_cap_is_unbounded() {
         use tokio::io::AsyncWriteExt as _;
         let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
-        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let head = gateway::ProxyResponseHead {
+            status: 200,
+            headers: vec![],
+        };
         let big = vec![0xABu8; 5 * 1024 * 1024]; // > the old 4 MiB buffered clamp
-        let mut frames =
-            gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
+        let mut frames = gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
         for chunk in big.chunks(gateway::MAX_CHUNK_BYTES) {
             frames.extend(
                 gateway::encode_frame(&gateway::ProxyFrame::BodyChunk(chunk.to_vec())).unwrap(),
@@ -1497,9 +1601,11 @@ mod tests {
     async fn running_cap_aborts_mid_stream() {
         use tokio::io::AsyncWriteExt as _;
         let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
-        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
-        let mut frames =
-            gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
+        let head = gateway::ProxyResponseHead {
+            status: 200,
+            headers: vec![],
+        };
+        let mut frames = gateway::encode_frame(&gateway::ProxyFrame::ResponseHead(head)).unwrap();
         for _ in 0..4 {
             frames.extend(
                 gateway::encode_frame(&gateway::ProxyFrame::BodyChunk(vec![0u8; 1024])).unwrap(),
@@ -1522,7 +1628,10 @@ mod tests {
                 }
             }
         }
-        assert!(aborted, "exceeding the running cap must surface an error item");
+        assert!(
+            aborted,
+            "exceeding the running cap must surface an error item"
+        );
         assert!(seen <= 2048);
     }
 
@@ -1534,10 +1643,7 @@ mod tests {
             scrub_cookie_domain("s=1; Path=/; Domain=.duck; HttpOnly"),
             "s=1; Path=/; HttpOnly"
         );
-        assert_eq!(
-            scrub_cookie_domain("s=1; domain=other.duck"),
-            "s=1"
-        );
+        assert_eq!(scrub_cookie_domain("s=1; domain=other.duck"), "s=1");
         // Whitespace and casing around the attribute name must not sneak a
         // Domain through — a browser trims these and honors the attribute.
         assert_eq!(
@@ -1628,7 +1734,10 @@ mod tests {
         // A body larger than one chunk is split into multiple BodyChunk frames
         // and reassembled exactly.
         let big = vec![7u8; gateway::MAX_CHUNK_BYTES * 2 + 100];
-        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let head = gateway::ProxyResponseHead {
+            status: 200,
+            headers: vec![],
+        };
         let (_, got_body) = round_trip(head, big.clone(), (gateway::MAX_CHUNK_BYTES * 3) as u64)
             .await
             .unwrap();
@@ -1636,7 +1745,10 @@ mod tests {
 
         // A body past the caller's RUNNING cap is rejected mid-stream (the
         // head has already arrived; the failure surfaces from the body pump).
-        let head = gateway::ProxyResponseHead { status: 200, headers: vec![] };
+        let head = gateway::ProxyResponseHead {
+            status: 200,
+            headers: vec![],
+        };
         let capped = round_trip(head, vec![1u8; 5000], 1000).await;
         assert!(matches!(capped, Err(GatewayFailure::Unavailable(_))));
     }
@@ -1664,15 +1776,12 @@ mod tests {
         });
 
         let publisher = [2u8; 32];
-        let caller = [3u8; 32];
         let member = ed25519::PrivateKey::from_seed(44);
         let route = signed_route(&member, publisher, gateway::RouteAudience::Network, true);
-        let owner = account(vec![1; 32], publisher, &member);
-        let caller_view = account(vec![9; 32], caller, &ed25519::PrivateKey::from_seed(55));
+        let owner = account(1, &member);
 
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
-            version: 1,
             routes: vec![crate::gateway_routes::LocalRoute {
                 name: gateway::RouteName::named("api"),
                 port,
@@ -1684,13 +1793,13 @@ mod tests {
         )
         .unwrap();
 
-        // Fake node actor: route → publisher authority → caller account.
+        // Fake node actor: route → publisher authority. no caller read: the
+        // peer carries no user proof, and a `Network` route admits it anyway.
         let (commands, mut requests) = mpsc::channel(4);
         tokio::spawn(async move {
             let replies: Vec<Vec<u8>> = vec![
                 gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
                 identity::encode_reply(&identity::IdentityReply::Account(Some(owner))),
-                identity::encode_reply(&identity::IdentityReply::Account(Some(caller_view))),
             ];
             for bytes in replies {
                 let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
@@ -1702,7 +1811,7 @@ mod tests {
 
         let (mut client, server) = tokio::io::duplex(4096);
         let head = gateway::ProxyRequestHead {
-            account_id: vec![1; 32],
+            account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 4,
             method: gateway::RouteMethod::Get,
@@ -1710,10 +1819,16 @@ mod tests {
             headers: vec![],
             body_len: 0,
             upgrade: true,
+            user_pop: None,
         };
         let workspace_path = workspace.path().to_path_buf();
         tokio::spawn(async move {
-            serve_ws(&commands, &workspace_path, &publisher, &caller, &head, server).await;
+            let scope = LoopbackScope {
+                workspace: &workspace_path,
+                node_api_ports: &[],
+                own_node: &publisher,
+            };
+            serve_ws(&commands, &scope, &[3u8; 32], &head, server).await;
         });
 
         // The upgrade is acknowledged with a 101, then a frame round-trips
@@ -1811,10 +1926,17 @@ mod tests {
         let publisher = [2u8; 32];
         let member = ed25519::PrivateKey::from_seed(44);
         let route = signed_route(&member, publisher, gateway::RouteAudience::Owner, true);
-        let owner = account(vec![1; 32], publisher, &member);
+        // an Owner audience admits only a proven member: the socket carries
+        // the member's own proof over the upgrade path.
+        let pop = user_pop(
+            &member,
+            &route.statement,
+            gateway::RouteMethod::Get,
+            "/socket",
+        );
+        let owner = account(1, &member);
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
-            version: 1,
             routes: vec![crate::gateway_routes::LocalRoute {
                 name: gateway::RouteName::named("api"),
                 port,
@@ -1844,7 +1966,7 @@ mod tests {
         // caller_ws_pump over a local duplex.
         let (server_end, caller_end) = tokio::io::duplex(64 * 1024);
         let head = gateway::ProxyRequestHead {
-            account_id: vec![1; 32],
+            account_id: 1,
             name: gateway::RouteName::named("api"),
             revision: 4,
             method: gateway::RouteMethod::Get,
@@ -1852,10 +1974,16 @@ mod tests {
             headers: vec![],
             body_len: 0,
             upgrade: true,
+            user_pop: Some(pop),
         };
         let workspace_path = workspace.path().to_path_buf();
         tokio::spawn(async move {
-            serve_ws(&commands, &workspace_path, &publisher, &publisher, &head, server_end).await;
+            let scope = LoopbackScope {
+                workspace: &workspace_path,
+                node_api_ports: &[],
+                own_node: &publisher,
+            };
+            serve_ws(&commands, &scope, &[3u8; 32], &head, server_end).await;
         });
         let (to_browser_tx, mut to_browser_rx) = tokio::sync::mpsc::channel(8);
         let (from_browser_tx, from_browser_rx) = tokio::sync::mpsc::channel(8);
@@ -1877,8 +2005,9 @@ mod tests {
     fn admission_is_service_flow_and_member_scoped() {
         use data_plane::AdmissionPolicy as _;
         let signer = ed25519::PrivateKey::from_seed(99);
-        let book = OverlayBook::new("test".into());
-        book.set_peers(std::iter::once(&signer.public_key()));
+        let book = OverlayBook::new(crate::overlay_book::OverlayPeers::new("test".into()));
+        book.peers()
+            .set_peers(std::iter::once(&signer.public_key()));
         let peer = PeerId(signer.public_key().as_ref().try_into().unwrap());
         assert!(book.permits(peer, Service::Gateway, proxy_flow()));
         assert!(!book.permits(peer, Service::StateSync, proxy_flow()));
@@ -1893,9 +2022,8 @@ mod tests {
         allow_upgrade: bool,
     ) -> gateway::RouteRecord {
         let statement = gateway::RouteStatement {
-            version: 1,
             chain_id: "test".into(),
-            account_id: vec![1; 32],
+            account_id: 1,
             name: gateway::RouteName::named("api"),
             publisher_node: publisher.to_vec(),
             revision: 4,
@@ -1926,24 +2054,45 @@ mod tests {
         }
     }
 
-    fn account(id: Vec<u8>, node: [u8; 32], member: &ed25519::PrivateKey) -> identity::AccountView {
+    fn account(number: u64, member: &ed25519::PrivateKey) -> identity::AccountView {
         identity::AccountView {
-            account_id: id,
-            display_name: None,
-            avatar: None,
-            bio: None,
-            nonce: 0,
-            member_keys: vec![identity::MemberKeyView {
+            number,
+            name: "someone".into(),
+            keys: vec![identity::KeyView {
+                scheme: identity::KeyScheme::Ed25519,
                 pubkey: member.public_key().as_ref().to_vec(),
-                kind: identity::KeyKind::Ed25519,
                 label: None,
                 added_at: 0,
             }],
-            nodes: vec![identity::NodeView {
-                node_key: node.to_vec(),
-                label: None,
-            }],
+            avatar: None,
+            bio: None,
             updated_at: 0,
+        }
+    }
+
+    /// a fresh user proof for `head`'s route/method/path, signed by `user`.
+    fn user_pop(
+        user: &ed25519::PrivateKey,
+        statement: &gateway::RouteStatement,
+        method: gateway::RouteMethod,
+        path: &str,
+    ) -> gateway::UserPop {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let preimage = gateway::caller_pop_preimage(
+            &statement.publisher_node,
+            statement.account_id,
+            &statement.name,
+            method,
+            path,
+            ts,
+        );
+        gateway::UserPop {
+            key: user.public_key().as_ref().to_vec(),
+            ts,
+            sig: keyscheme::testkit::ed25519_proof(user, gateway::GATEWAY_CALLER_NS, &preimage),
         }
     }
 
@@ -1958,11 +2107,14 @@ mod tests {
             let request = String::from_utf8_lossy(&request[..read]);
             assert!(request.starts_with("POST /items?source=duck HTTP/1.1\r\n"));
             let lower = request.to_ascii_lowercase();
-            // The mesh-verified caller identity is injected; Cookie now flows
-            // end to end (v1 stripped it); a caller-set x-duck-* never appears
-            // (it is rejected at decode and stripped at forward).
-            assert!(lower.contains("x-duck-caller-account: "));
-            assert_eq!(lower.matches("x-duck-caller-account:").count(), 1);
+            // The mesh-verified caller NODE is injected; the caller ACCOUNT is
+            // not — this peer carried no user proof, so the upstream sees an
+            // anonymous peer rather than a fabricated account. Cookie flows end
+            // to end (v1 stripped it); a caller-set x-duck-* never appears (it
+            // is rejected at decode and stripped at forward).
+            assert!(lower.contains("x-duck-caller-node: 0303"));
+            assert!(!lower.contains("x-duck-caller-account"));
+            assert!(lower.contains("x-duck-route-account: 1\r\n"));
             assert!(lower.contains("content-type: application/json"));
             assert!(lower.contains("cookie: session=abc"));
             assert!(request.ends_with("{\"name\":\"quack\"}"));
@@ -1976,7 +2128,6 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
-            version: 1,
             routes: vec![crate::gateway_routes::LocalRoute {
                 name: gateway::RouteName::named("api"),
                 port,
@@ -2007,30 +2158,27 @@ mod tests {
             };
             assert_eq!(target, "identity");
             let _ = reply.send(Ok(identity::encode_reply(
-                &identity::IdentityReply::Account(Some(account(vec![1; 32], publisher, &member))),
+                &identity::IdentityReply::Account(Some(account(1, &member))),
             )));
 
-            let NodeCommand::Query { target, reply, .. } = requests.next().await.unwrap() else {
-                panic!("caller account query");
-            };
-            assert_eq!(target, "identity");
-            let caller_member = ed25519::PrivateKey::from_seed(55);
-            let _ = reply.send(Ok(identity::encode_reply(
-                &identity::IdentityReply::Account(Some(account(
-                    vec![9; 32],
-                    caller,
-                    &caller_member,
-                ))),
-            )));
+            // no third read: a peer without a user proof is an anonymous
+            // caller, and identity is never asked about a node.
+            assert!(
+                requests.next().await.is_none(),
+                "the proxy asked identity about a caller that carried no user proof"
+            );
         });
         let body = br#"{"name":"quack"}"#;
         let response = serve_current(
             &commands,
-            workspace.path(),
-            &publisher,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
             &caller,
             &gateway::ProxyRequestHead {
-                account_id: vec![1; 32],
+                account_id: 1,
                 name: gateway::RouteName::named("api"),
                 revision: 4,
                 method: gateway::RouteMethod::Post,
@@ -2047,6 +2195,7 @@ mod tests {
                 ],
                 body_len: body.len() as u64,
                 upgrade: false,
+                user_pop: None,
             },
             body,
         )
@@ -2068,6 +2217,286 @@ mod tests {
         assert_eq!(set_cookie.value, "sid=xyz");
     }
 
+    /// A request that carries a VALID user proof acts as that user's account:
+    /// the proxy resolves the key through identity, verifies the proof against
+    /// this route/method/path, and stamps the DECIMAL account number for the
+    /// upstream — the one way an account ever reaches a loopback app.
+    #[tokio::test]
+    async fn a_valid_user_pop_stamps_the_caller_account() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            let lower = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(lower.contains("x-duck-caller-account: 9\r\n"), "{lower}");
+            assert_eq!(lower.matches("x-duck-caller-account:").count(), 1);
+            socket
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            routes: vec![crate::gateway_routes::LocalRoute {
+                name: gateway::RouteName::named("api"),
+                port,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+
+        let publisher = [2u8; 32];
+        let caller_node = [3u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let user = ed25519::PrivateKey::from_seed(55);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, false);
+        let pop = user_pop(
+            &user,
+            &route.statement,
+            gateway::RouteMethod::Get,
+            "/whoami",
+        );
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { target, reply, .. } = requests.next().await.unwrap() else {
+                panic!("route query");
+            };
+            assert_eq!(target, "gateway");
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(Some(route.clone())),
+            ))));
+            let NodeCommand::Query { target, reply, .. } = requests.next().await.unwrap() else {
+                panic!("publisher authority query");
+            };
+            assert_eq!(target, "identity");
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member))),
+            )));
+            // the caller's key, resolved ONLY because a proof was presented.
+            let NodeCommand::Query { target, req, reply } = requests.next().await.unwrap() else {
+                panic!("caller key query");
+            };
+            assert_eq!(target, "identity");
+            let identity::IdentityQuery::OfKey { key } = identity::decode_query(&req).unwrap()
+            else {
+                panic!("the caller is resolved by key");
+            };
+            assert_eq!(key, user.public_key().as_ref().to_vec());
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(9, &user))),
+            )));
+        });
+        let response = serve_current(
+            &commands,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
+            &caller_node,
+            &gateway::ProxyRequestHead {
+                account_id: 1,
+                name: gateway::RouteName::named("api"),
+                revision: 4,
+                method: gateway::RouteMethod::Get,
+                path_and_query: "/whoami".into(),
+                headers: vec![],
+                body_len: 0,
+                upgrade: false,
+                user_pop: Some(pop),
+            },
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.head.status, 204);
+    }
+
+    /// A proof that does not verify (signed for another path) is a REFUSAL,
+    /// never a downgrade to an anonymous peer — otherwise a forged header
+    /// would cost nothing.
+    #[tokio::test]
+    async fn a_bad_user_pop_is_refused_not_ignored() {
+        let workspace = tempfile::tempdir().unwrap();
+        let publisher = [2u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let user = ed25519::PrivateKey::from_seed(55);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, false);
+        let pop = user_pop(
+            &user,
+            &route.statement,
+            gateway::RouteMethod::Get,
+            "/elsewhere",
+        );
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!()
+            };
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(Some(route)),
+            ))));
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!()
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member))),
+            )));
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!()
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(9, &user))),
+            )));
+        });
+        let error = serve_current(
+            &commands,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
+            &[3u8; 32],
+            &gateway::ProxyRequestHead {
+                account_id: 1,
+                name: gateway::RouteName::named("api"),
+                revision: 4,
+                method: gateway::RouteMethod::Get,
+                path_and_query: "/whoami".into(),
+                headers: vec![],
+                body_len: 0,
+                upgrade: false,
+                user_pop: Some(pop),
+            },
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::Forbidden(ref why) if why.contains("proof does not verify")),
+            "{error:?}"
+        );
+    }
+
+    /// A member may map a loopback route to any local daemon — except this
+    /// node's own surfaces. A route to the node's http/rpc port would proxy
+    /// the whole mesh into the unauthenticated `/v1`, so it is refused before
+    /// a single upstream byte moves, with the reason token as the detail.
+    #[tokio::test]
+    async fn a_route_to_the_nodes_own_api_port_is_refused() {
+        let (workspace, commands, publisher, head) = own_api_port_fixture(false, "/v1/status");
+        let error = serve_current(
+            &commands,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[8845, NODE_HTTP_PORT],
+                own_node: &publisher,
+            },
+            &[3u8; 32],
+            &head,
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::Forbidden(ref why) if why == ROUTE_TARGETS_NODE_API),
+            "{error:?}"
+        );
+    }
+
+    /// The WebSocket upgrade resolves the same loopback port through the same
+    /// seam, so an `allow_upgrade` route aimed at the node's own port is
+    /// refused before the `ws://` dial — `/v1/ws/...` is not reachable either.
+    #[tokio::test]
+    async fn an_upgrade_route_to_the_nodes_own_api_port_is_refused() {
+        let (workspace, commands, publisher, head) = own_api_port_fixture(true, "/v1/ws/logs");
+        let error = authorize_ws(
+            &commands,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[8845, NODE_HTTP_PORT],
+                own_node: &publisher,
+            },
+            &[3u8; 32],
+            &head,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::Forbidden(ref why) if why == ROUTE_TARGETS_NODE_API),
+            "{error:?}"
+        );
+    }
+
+    /// the node's own http port in the own-port refusal tests.
+    const NODE_HTTP_PORT: u16 = 8844;
+
+    /// The shared setup of every own-port refusal test: a workspace whose one
+    /// loopback route ("api") aims at [`NODE_HTTP_PORT`], a signed
+    /// network-audience route record, a query stub answering the route then
+    /// the publisher's authority, and the request head the test dials with —
+    /// so a refusal test is its scope, its call, and its assertion.
+    fn own_api_port_fixture(
+        upgrade: bool,
+        path_and_query: &str,
+    ) -> (
+        tempfile::TempDir,
+        mpsc::Sender<NodeCommand>,
+        [u8; 32],
+        gateway::ProxyRequestHead,
+    ) {
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            routes: vec![crate::gateway_routes::LocalRoute {
+                name: gateway::RouteName::named("api"),
+                port: NODE_HTTP_PORT,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+
+        let publisher = [2u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Network, upgrade);
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("route query");
+            };
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(Some(route)),
+            ))));
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("publisher authority query");
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member))),
+            )));
+        });
+        let head = gateway::ProxyRequestHead {
+            account_id: 1,
+            name: gateway::RouteName::named("api"),
+            revision: 4,
+            method: gateway::RouteMethod::Get,
+            path_and_query: path_and_query.into(),
+            headers: vec![],
+            body_len: 0,
+            upgrade,
+            user_pop: None,
+        };
+        (workspace, commands, publisher, head)
+    }
+
     #[tokio::test]
     async fn owner_only_route_denies_remote_account_before_loopback() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2087,27 +2516,19 @@ mod tests {
                 panic!()
             };
             let _ = reply.send(Ok(identity::encode_reply(
-                &identity::IdentityReply::Account(Some(account(vec![1; 32], publisher, &member))),
-            )));
-            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
-                panic!()
-            };
-            let caller_member = ed25519::PrivateKey::from_seed(55);
-            let _ = reply.send(Ok(identity::encode_reply(
-                &identity::IdentityReply::Account(Some(account(
-                    vec![9; 32],
-                    caller,
-                    &caller_member,
-                ))),
+                &identity::IdentityReply::Account(Some(account(1, &member))),
             )));
         });
         let error = serve_current(
             &commands,
-            workspace.path(),
-            &publisher,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
             &caller,
             &gateway::ProxyRequestHead {
-                account_id: vec![1; 32],
+                account_id: 1,
                 name: gateway::RouteName::named("api"),
                 revision: 4,
                 method: gateway::RouteMethod::Get,
@@ -2115,6 +2536,7 @@ mod tests {
                 headers: vec![],
                 body_len: 0,
                 upgrade: false,
+                user_pop: None,
             },
             &[],
         )
@@ -2153,9 +2575,8 @@ mod tests {
         };
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         let statement = gateway::RouteStatement {
-            version: 1,
             chain_id: "test".into(),
-            account_id: vec![1; 32],
+            account_id: 1,
             name: gateway::RouteName::apex(),
             publisher_node: publisher.to_vec(),
             revision: 1,
@@ -2173,6 +2594,7 @@ mod tests {
                 },
             }),
         };
+        let pop = user_pop(&member, &statement, gateway::RouteMethod::Head, "/");
         let route = gateway::RouteRecord {
             authorization: gateway::MemberAuthorization {
                 signer: member.public_key().as_ref().to_vec(),
@@ -2186,15 +2608,15 @@ mod tests {
             },
             statement,
         };
-        let owner = account(vec![1; 32], publisher, &member);
+        let owner = account(1, &member);
         let manifest_path = gateway_path(&publisher, "_apex", gateway::MANIFEST_FILE);
         let file_path = gateway_path(&publisher, "_apex", "index.html");
         let manifest_len = manifest_bytes.len() as u64;
         let manifest_b64 = STANDARD.encode(&manifest_bytes);
         let actual_b64 = STANDARD.encode(actual);
         let actual_len = actual.len() as u64;
-        // Ordered replies: route → identity ×2 → refs → manifest stat/read →
-        // file stat/read.
+        // Ordered replies: route → identity (authority) → identity (the
+        // caller's proof) → refs → manifest stat/read → file stat/read.
         let replies: Vec<Vec<u8>> = vec![
             gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
             identity::encode_reply(&identity::IdentityReply::Account(Some(owner.clone()))),
@@ -2226,11 +2648,14 @@ mod tests {
         });
         serve_current(
             &commands,
-            Path::new("."),
-            &publisher,
+            &LoopbackScope {
+                workspace: Path::new("."),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
             &publisher,
             &gateway::ProxyRequestHead {
-                account_id: vec![1; 32],
+                account_id: 1,
                 name: gateway::RouteName::apex(),
                 revision: 1,
                 method: gateway::RouteMethod::Head,
@@ -2238,6 +2663,8 @@ mod tests {
                 headers: vec![],
                 body_len: 0,
                 upgrade: false,
+                // an `Owner` route: only the owner's own user proof admits.
+                user_pop: Some(pop),
             },
             &[],
         )
@@ -2247,11 +2674,21 @@ mod tests {
     #[tokio::test]
     async fn duckfs_head_verifies_signed_bytes_before_returning_no_body() {
         let mut response = serve_content_head(b"safe", b"safe").await.unwrap();
-        assert!(noded::collect_body(&mut response.body).await.unwrap().is_empty());
+        assert!(
+            noded::collect_body(&mut response.body)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(response.head.status, 200);
 
         let mut empty = serve_content_head(b"", b"").await.unwrap();
-        assert!(noded::collect_body(&mut empty.body).await.unwrap().is_empty());
+        assert!(
+            noded::collect_body(&mut empty.body)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let error = serve_content_head(b"safe", b"evil").await.unwrap_err();
         assert!(matches!(error, GatewayFailure::Forbidden(_)));

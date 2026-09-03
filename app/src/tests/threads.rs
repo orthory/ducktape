@@ -85,8 +85,11 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     assert!(chat.contains(
         "keyed thread_message in messages by=thread_message.view_key w=fill gap=3.0 virtual-row=44.0"
     ));
+    // No hand revision in the key: since ui #783 the rail's `lazy` keys on the
+    // compiler-owned revision of `thread_messages` itself, so a writer that
+    // forgets to bump anything can no longer leave stale pixels behind.
     assert!(chat.contains(
-        "lazy thread_messages by thread_messages_revision, active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, loading as cached_thread_messages"
+        "lazy thread_messages by active_channel, active_thread_seq, thread_target_seq, thread_selected_seq as cached_thread_messages"
     ));
     // A `lazy` subtree reads nothing but its dependency, so the quiet arm can
     // only exist because the rows that read SCREEN state — the search target
@@ -134,9 +137,7 @@ fn thread_messages_mirror_the_main_action_system() {
     // Confirmation is the pending dot disappearing, so the card needs no
     // timer or animation prop. (`card` starts right after the component name,
     // so the signature is its head.)
-    assert!(
-        card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool, disabled:bool)")
-    );
+    assert!(card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool)"));
     // `menu_open` cannot be `selected` here: in the rail `selected` marks the
     // deep-link TARGET reply, not the row whose action card is open.
     let chat_screen_rail = inlined(include_str!("../ui/screens/chat.ice"));
@@ -157,9 +158,11 @@ fn thread_messages_mirror_the_main_action_system() {
         "overlay when=(thread_selected_seq > 0 && thread_message_action != MessageAction.toolbar)"
     ));
     assert!(thread.contains("dismiss=emit(clear_thread_message_selection) backdrop=transparent"));
-    assert!(thread.contains(
-        "box w=fill h=fill pt=block_action_menu_y(thread_pointer_y, thread_height) align-x=end align-y=start"
-    ));
+    // Same shape as the stream menu: the layer is the menu, the gap above it
+    // dismisses (see design.rs for why a fill layer hides the backdrop).
+    assert!(!thread.contains("box w=fill h=fill pt=block_action_menu_y"));
+    assert!(thread.contains("mouse press=emit(clear_thread_message_selection)"));
+    assert!(thread.contains("space w=fill h=block_action_menu_y(thread_pointer_y, thread_height)"));
     assert!(thread.contains("mouse press-at=thread_pointer_pressed"));
     // same seat as the message list — the rail measures itself
     assert!(thread.contains("sensor show=thread_resized resize=thread_resized"));

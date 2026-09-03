@@ -64,6 +64,8 @@ struct BridgeDevice {
     /// packet, which is exactly a full NIC ring — TCP retransmits, datagram
     /// lanes tolerate loss by contract.
     tx: mpsc::Sender<Vec<u8>>,
+    /// packets that full ring shed — counted and reported, never silent.
+    tx_dropped: std::sync::atomic::AtomicU64,
 }
 
 struct BridgeRxToken(Vec<u8>);
@@ -77,7 +79,10 @@ impl RxToken for BridgeRxToken {
     }
 }
 
-struct BridgeTxToken<'a>(&'a mpsc::Sender<Vec<u8>>);
+struct BridgeTxToken<'a> {
+    tx: &'a mpsc::Sender<Vec<u8>>,
+    dropped: &'a std::sync::atomic::AtomicU64,
+}
 
 impl TxToken for BridgeTxToken<'_> {
     fn consume<R, F>(self, len: usize, f: F) -> R
@@ -86,7 +91,11 @@ impl TxToken for BridgeTxToken<'_> {
     {
         let mut pkt = vec![0u8; len];
         let result = f(&mut pkt);
-        let _ = self.0.try_send(pkt);
+        // a closed channel is the device gone (backend shutting down), not a
+        // shed packet.
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(pkt) {
+            super::device::note_drop(self.dropped, "stack_tx_ring_full");
+        }
         result
     }
 }
@@ -96,13 +105,22 @@ impl Device for BridgeDevice {
     type TxToken<'a> = BridgeTxToken<'a>;
 
     fn receive(&mut self, _: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.rx
-            .pop_front()
-            .map(|pkt| (BridgeRxToken(pkt), BridgeTxToken(&self.tx)))
+        self.rx.pop_front().map(|pkt| {
+            (
+                BridgeRxToken(pkt),
+                BridgeTxToken {
+                    tx: &self.tx,
+                    dropped: &self.tx_dropped,
+                },
+            )
+        })
     }
 
     fn transmit(&mut self, _: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(BridgeTxToken(&self.tx))
+        Some(BridgeTxToken {
+            tx: &self.tx,
+            dropped: &self.tx_dropped,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -335,6 +353,7 @@ impl VirtualStack {
         let mut device = BridgeDevice {
             rx: VecDeque::new(),
             tx: to_device,
+            tx_dropped: std::sync::atomic::AtomicU64::new(0),
         };
         // TCP initial sequence numbers and similar want per-boot randomness;
         // RandomState is seeded from OS entropy per process, no rng dep.

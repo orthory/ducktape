@@ -2,7 +2,7 @@
 //!
 //! The real compute plane is a STANDALONE DAEMON now
 //! (`ducktape service run compute`), so this binary constructs no provider set,
-//! no podman service and no dispatch pool: the reactor seam below carries only
+//! and no dispatch pool: the reactor seam below carries only
 //! the `DUCKTAPE_NODED_ECHO_ORACLE` stand-in the daemon e2e drives, and a
 //! release build carries nothing at all.
 
@@ -42,11 +42,23 @@ impl host::worker::Worker for EchoWorker {
         let Ok(work) = dispatch::decode_work_spec(&request.spec) else {
             return Ok(host::worker::WorkOutcome::NotMine);
         };
-        Ok(host::worker::WorkOutcome::Handled(Some(sdk::Msg {
-            target: "saga".into(),
-            payload: saga::encode_msg(&saga::SagaMsg::OracleResult {
-                saga_id: request.saga_id,
-                attempt: request.attempt,
+        let saga::WorkerRequest {
+            saga_id,
+            attempt,
+            assignee,
+            ..
+        } = request;
+        // the saga guest runs the STRICT lease policy, so this walks the same
+        // bid-then-work lane a real compute node does: an UNASSIGNED request is
+        // an announcement, claimed with `Accept` (the module then re-emits the
+        // work order naming the winner), and only the assignee's own result
+        // lands. the daemon commits every follow-up under `ORACLE_ORIGIN`, so
+        // that is the key this worker holds its leases under.
+        let follow = match assignee.as_deref() {
+            None => saga::SagaMsg::Accept { saga_id, attempt },
+            Some(noded::ORACLE_ORIGIN) => saga::SagaMsg::OracleResult {
+                saga_id,
+                attempt,
                 // the runs module accepts only ducktape_runner_result wrappers
                 // (the flat-payload tolerance is gone) — wrap the echo like a
                 // real provider result.
@@ -64,7 +76,13 @@ impl host::worker::Worker for EchoWorker {
                 .to_string()
                 .into_bytes()),
                 usage: None,
-            }),
+            },
+            // an order another node won is not this worker's to answer.
+            Some(_) => return Ok(host::worker::WorkOutcome::NotMine),
+        };
+        Ok(host::worker::WorkOutcome::Handled(Some(sdk::Msg {
+            target: "saga".into(),
+            payload: saga::encode_msg(&follow),
         })))
     }
 }

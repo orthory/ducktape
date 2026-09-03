@@ -1,5 +1,6 @@
 use super::*;
 use ::forge;
+use std::net::IpAddr;
 
 /// One forge repo row: the module's committed name and head.
 #[derive(Clone, Debug, Default, Hash, PartialEq)]
@@ -527,19 +528,13 @@ fn sync_forge_mirror(endpoint: &str, repo: &str) -> Result<git2::Repository, Str
     Ok(mirror)
 }
 
-/// `<key-root>/forge-remote/<endpoint-slug>/<repo>` — the key root is the same
-/// resolution order the user key uses (`DUCKTAPE_HOME`, then `~/.ducktape`).
+/// `<key-root>/forge-remote/<endpoint-slug>/<repo>` — the key root IS the root
+/// the user key resolves through, [`ducktape_home::root`].
 fn forge_mirror_dir(endpoint: &str, repo: &str) -> Result<PathBuf, String> {
     if repo.is_empty() || repo.contains('/') || repo.contains('\\') || repo.starts_with('.') {
         return Err(format!("invalid forge repo name {repo:?}"));
     }
-    let root = match std::env::var_os("DUCKTAPE_HOME") {
-        Some(home) => PathBuf::from(home),
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join(".ducktape"))
-            .ok_or_else(|| "cannot locate a home for the forge mirror".to_string())?,
-    };
+    let root = ducktape_home::root()?;
     let slug: String = endpoint
         .chars()
         .map(|character| match character.is_ascii_alphanumeric() {
@@ -617,6 +612,11 @@ pub struct BlobView {
     pub truncated: bool,
     pub binary: bool,
     pub lines: i64,
+    /// The blob is a decoded picture in the forge surface's slot
+    /// (`picture.rs`), drawn at `width` × `height`; `text` is empty.
+    pub picture: bool,
+    pub width: i64,
+    pub height: i64,
 }
 
 pub(crate) fn tree_data(
@@ -674,6 +674,9 @@ pub(crate) fn blob_view(reply: serde_json::Value, repo: String) -> Result<BlobVi
         truncated: blob.truncated,
         binary: blob.binary,
         lines,
+        picture: false,
+        width: 0,
+        height: 0,
     })
 }
 
@@ -699,25 +702,377 @@ pub async fn forge_tree(
     .map_err(app_error)
 }
 
-/// Read one bounded file preview at the tree's exact revision on the node.
+/// Read one file at the tree's exact revision on the node: a picture (by
+/// path — `picture_path`) pages its bytes through `blob_bytes` and decodes
+/// into the forge surface's slot; anything else is the bounded text preview.
 pub async fn forge_blob(
     rpc: String,
     repo: String,
     rev: String,
     path: String,
+    net: String,
 ) -> Result<BlobView, AppError> {
     async {
         let client = rpc_client(&rpc)?;
-        let query = serde_json::json!({ "blob": {
-            "repo": &repo,
-            "rev": &rev,
-            "path": &path,
-        }});
-        let reply = client.query("forge", &query).await?;
-        blob_view(reply, repo)
+        match super::picture::picture_path(path.clone()) {
+            true => forge_picture(&client, repo, rev, path).await,
+            false => forge_text(&client, repo, rev, path, &net).await,
+        }
     }
     .await
     .map_err(app_error)
+}
+
+async fn forge_text(
+    client: &RpcClient,
+    repo: String,
+    rev: String,
+    path: String,
+    net: &str,
+) -> Result<BlobView, String> {
+    let query = serde_json::json!({ "blob": {
+        "repo": &repo,
+        "rev": &rev,
+        "path": &path,
+    }});
+    let reply = client.query("forge", &query).await?;
+    let view = blob_view(reply, repo)?;
+    let illustrated = markdown_path(&view.path) && !view.binary;
+    if illustrated {
+        load_inline_pictures(client, &view, net).await;
+    }
+    Ok(view)
+}
+
+/// Page one blob's bytes in through `blob_bytes` (1 MiB pages to eof).
+/// Page 1 asks by the caller's rev (a branch name or an oid); every later
+/// page asks by the exact oid page 1 answered, so a branch that moves
+/// mid-read cannot hand back pages of two different commits — and that exact
+/// oid is returned. `None` bytes: the object is past the byte cap — by the
+/// size the node announces (it refuses an object past its own paged cap with
+/// an empty final page, and the two caps are one number) or by what arrived.
+/// An empty blob is `Some(empty)`, not a refusal.
+async fn forge_blob_bytes(
+    client: &RpcClient,
+    repo: &str,
+    rev: &str,
+    path: &str,
+) -> Result<(String, Option<Vec<u8>>), String> {
+    use super::picture::MAX_PICTURE_BYTES;
+    let mut bytes = Vec::new();
+    let mut rev = rev.to_owned();
+    loop {
+        let query = serde_json::json!({ "blob_bytes": {
+            "repo": repo,
+            "rev": &rev,
+            "path": path,
+            "offset": bytes.len() as u64,
+            "len": forge::MAX_BLOB_PAGE_BYTES as u64,
+        }});
+        let reply: serde_json::Value = client.query("forge", &query).await?;
+        let page = reply
+            .get("blob_bytes")
+            .cloned()
+            .ok_or_else(|| "the requested file was not found".to_string())?;
+        let page: forge::BlobBytesReply =
+            serde_json::from_value(page).map_err(|error| error.to_string())?;
+        rev = page.rev;
+        let chunk = super::storage::base64_decode(&page.b64).unwrap_or_default();
+        bytes.extend_from_slice(&chunk);
+        let announced_past_cap = page.size > MAX_PICTURE_BYTES as i64;
+        let past_cap = announced_past_cap || bytes.len() > MAX_PICTURE_BYTES;
+        if past_cap {
+            return Ok((rev, None));
+        }
+        let done = page.eof || chunk.is_empty();
+        if done {
+            return Ok((rev, Some(bytes)));
+        }
+    }
+}
+
+/// A picture blob: page it in, decode it off the runtime, park the handle.
+/// A refused or over-cap object and a body that does not decode all land on
+/// the binary plate with the reason as its line, never a failed load.
+async fn forge_picture(
+    client: &RpcClient,
+    repo: String,
+    rev: String,
+    path: String,
+) -> Result<BlobView, String> {
+    use super::picture::{FORGE_SURFACE, MAX_PICTURE_BYTES, store_picture};
+    let (rev, bytes) = forge_blob_bytes(client, &repo, &rev, &path).await?;
+    let Some(bytes) = bytes else {
+        let note = format!(
+            "This picture is larger than the {} MiB preview limit.",
+            MAX_PICTURE_BYTES >> 20
+        );
+        return Ok(binary_blob(repo, rev, path, note));
+    };
+    match store_picture(FORGE_SURFACE, path.clone(), bytes).await {
+        Ok((width, height)) => Ok(BlobView {
+            repo,
+            rev,
+            path,
+            text: String::new(),
+            truncated: false,
+            binary: false,
+            lines: 0,
+            picture: true,
+            width: i64::from(width),
+            height: i64::from(height),
+        }),
+        Err(reason) => Ok(binary_blob(
+            repo,
+            rev,
+            path,
+            format!("This picture did not decode: {reason}."),
+        )),
+    }
+}
+
+/// Fetch the pictures a Markdown blob embeds and park them under the
+/// document, keyed by the image URL as written, for `forge_markdown`'s
+/// viewer. Best effort, in document order, the first `MAX_INLINE_PICTURES`:
+/// an image that does not resolve, fetch or decode simply keeps its alt text.
+/// ponytail: fetched before the text lands, so a README with eight large
+/// pictures shows late; split into its own lane if that is ever felt.
+async fn load_inline_pictures(client: &RpcClient, view: &BlobView, net: &str) {
+    use super::picture::{MAX_INLINE_PICTURES, decode_off_thread, park_inline_pictures};
+    let mut wanted: Vec<String> = Vec::new();
+    for item in iced::widget::markdown::parse(&view.text) {
+        let iced::widget::markdown::Item::Image { url, .. } = item else {
+            continue;
+        };
+        let seen = wanted.contains(&url);
+        if !seen {
+            wanted.push(url);
+        }
+    }
+    wanted.truncate(MAX_INLINE_PICTURES);
+    // Side by side, not one after another: a web picture answers on a remote
+    // host's clock, and eight of them in a row would stack eight timeouts in
+    // front of the README.
+    let fetches = wanted.into_iter().map(|url| async move {
+        let bytes = inline_picture_bytes(client, view, &url, net).await?;
+        let picture = decode_off_thread(bytes).await.ok()?;
+        Some((url, picture))
+    });
+    let pictures = iced::futures::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    park_inline_pictures(view.path.clone(), pictures);
+}
+
+/// Where an image URL's bytes live, by the duck:// module table: a
+/// `duck://forge/<repo>/blob/<path>[@rev]` is that repo's committed file, a
+/// `duck://files/...` is the attachment in duckfs, a bare relative path is
+/// this repo's file beside the document at the document's own commit, and a
+/// web URL is one capped GET. Every other kind — a page or channel ref, a
+/// malformed duck URI — has no bytes to fetch.
+///
+/// Scoped by `net`, the connected chain id, exactly as the open plane is: a
+/// citation whose `?net=` names another network addresses another store, so
+/// it draws nothing rather than this network's object of the same name.
+async fn inline_picture_bytes(
+    client: &RpcClient,
+    view: &BlobView,
+    url: &str,
+    net: &str,
+) -> Option<Vec<u8>> {
+    use super::duck_uri::{DuckKind, resolve_duck_link};
+    use super::picture::resolve_repo_path;
+    let link = resolve_duck_link(url.to_owned(), net.to_owned());
+    match link.kind {
+        DuckKind::ForgeBlob => forge_blob_bytes(client, &link.repo, &link.rev, &link.path)
+            .await
+            .ok()
+            .and_then(|(_, bytes)| bytes),
+        DuckKind::Files => super::storage::files_read_all(client, &link.path)
+            .await
+            .ok()
+            .flatten(),
+        DuckKind::Unknown => {
+            let path = resolve_repo_path(&view.path, url)?;
+            forge_blob_bytes(client, &view.repo, &view.rev, &path)
+                .await
+                .ok()
+                .and_then(|(_, bytes)| bytes)
+        }
+        DuckKind::Web => web_picture_bytes(url).await,
+        // A citation from another network, and the kinds that name no bytes.
+        DuckKind::ForeignNetwork
+        | DuckKind::Page
+        | DuckKind::ForgeRepo
+        | DuckKind::ForgeItem
+        | DuckKind::Channel
+        | DuckKind::ChannelMessage => None,
+    }
+}
+
+/// How long a web picture may take, end to end. Shorter than the RPC
+/// client's 30 s on purpose: the README's text waits on this, and a remote
+/// host is nobody's to trust.
+const WEB_PICTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// One GET for a web picture, bounded by `MAX_PICTURE_BYTES` before the body
+/// is read (the announced length) and while it streams (an unannounced or
+/// lying one), and by `WEB_PICTURE_TIMEOUT`. `None` for any refusal — the
+/// image keeps its alt text, never an error. A README names the URL and the
+/// reader's machine makes the request, so the host is gated first
+/// ([`blocked_picture_host`]): the reader's own machine, its link, and
+/// nowhere/everywhere are not a picture's address, on the first hop or any
+/// redirect.
+pub async fn web_picture_bytes(url: &str) -> Option<Vec<u8>> {
+    let url = reqwest::Url::parse(url).ok()?;
+    let allowed = picture_host_allowed(&url).await;
+    if !allowed {
+        return None;
+    }
+    fetch_picture_bytes(url).await
+}
+
+/// The GET itself, after the host gate. The app's one HTTP client for the
+/// open web, built once; the node's RPC client stays the node's.
+/// ponytail: no cache across documents and no per-host limit — a README
+/// re-fetches its pictures on every open; add a byte-keyed cache when felt.
+pub(crate) async fn fetch_picture_bytes(url: reqwest::Url) -> Option<Vec<u8>> {
+    use super::picture::MAX_PICTURE_BYTES;
+    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            // A redirect is re-gated by what its URL spells: an IP literal
+            // or `localhost`. ponytail: a hop to a NAME that resolves to a
+            // blocked address is not re-resolved here (the policy is sync);
+            // resolve hops too if that is ever the concern.
+            let policy = reqwest::redirect::Policy::custom(|attempt| {
+                let literal_blocked = host_literal(attempt.url()).is_some_and(blocked_picture_host);
+                let name_is_localhost = attempt
+                    .url()
+                    .domain()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("localhost"));
+                let hop_blocked = literal_blocked || name_is_localhost;
+                match hop_blocked {
+                    true => attempt.stop(),
+                    false => attempt.follow(),
+                }
+            });
+            reqwest::Client::builder()
+                .timeout(WEB_PICTURE_TIMEOUT)
+                .redirect(policy)
+                .build()
+                .ok()
+        })
+        .as_ref()?;
+    let mut response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let announced_past_cap = response
+        .content_length()
+        .is_some_and(|length| length > MAX_PICTURE_BYTES as u64);
+    if announced_past_cap {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        let streamed_past_cap = bytes.len() + chunk.len() > MAX_PICTURE_BYTES;
+        if streamed_past_cap {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes)
+}
+
+/// Whether a web picture may be asked of `url`'s host: an IP literal is
+/// judged as written, a name by every address it resolves to — one blocked
+/// address refuses the name (`localhost` and a metadata alias both land
+/// here). A name that does not resolve is refused too: there is nothing to
+/// fetch from.
+async fn picture_host_allowed(url: &reqwest::Url) -> bool {
+    if let Some(ip) = host_literal(url) {
+        return !blocked_picture_host(ip);
+    }
+    let Some(name) = url.domain() else {
+        return false;
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let Ok(addresses) = tokio::net::lookup_host((name, port)).await else {
+        return false;
+    };
+    let mut resolved = false;
+    for address in addresses {
+        resolved = true;
+        if blocked_picture_host(address.ip()) {
+            return false;
+        }
+    }
+    resolved
+}
+
+/// The host as an IP literal, if that is how the URL spells it (`[::1]`
+/// keeps its brackets in `host_str`).
+fn host_literal(url: &reqwest::Url) -> Option<IpAddr> {
+    url.host_str()?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
+}
+
+/// An address a README may not point the reader's machine at: the machine
+/// itself, its link (cloud metadata answers on 169.254.169.254), nothing,
+/// or everyone. Private ranges stay ALLOWED on purpose — a team's forge and
+/// the pictures beside its READMEs live on a LAN, and refusing them would
+/// refuse the product's own shape.
+pub(crate) fn blocked_picture_host(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unicast_link_local()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| blocked_picture_host(IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// The binary plate's line: the loader's reason when it gave one (a picture
+/// past the cap or one that did not decode), else the generic one.
+pub fn binary_note(text: &str) -> String {
+    match text.is_empty() {
+        true => "This is not text — the reader shows no preview for it.".to_owned(),
+        false => text.to_owned(),
+    }
+}
+
+/// The binary plate with `note` as its line — why the reader shows no
+/// preview, in the reader's words.
+fn binary_blob(repo: String, rev: String, path: String, note: String) -> BlobView {
+    BlobView {
+        repo,
+        rev,
+        path,
+        text: note,
+        truncated: false,
+        binary: true,
+        lines: 0,
+        picture: false,
+        width: 0,
+        height: 0,
+    }
 }
 
 /// True when one live update invalidates forge state: a folded forge op, a
@@ -881,12 +1236,14 @@ pub fn code_theme(dark: bool) -> iced::highlighter::Theme {
     }
 }
 
-/// The forge blob reader: numbered gutter + syntect-highlighted code, one row
-/// per line. Replaces the Ice `ForgeCodeLine` loop — token colour needs
-/// per-span inks, which Ice's named-token text nodes cannot carry, so the
-/// whole surface renders here (the `agent_markdown` idiom). Colours are the
-/// app palette's stable code roles (`rail`, `forge_gutter_ink`,
-/// `strong_ink` in `theme.ice`), matched per appearance like `AgentMarkdown`.
+/// The forge blob reader: numbered gutter + syntect-highlighted code, one
+/// paragraph each at the same row pitch, and the code one drag-selectable
+/// across lines ([`CodeSelect`]). Replaces the Ice `ForgeCodeLine` loop —
+/// token colour needs per-span inks, which Ice's named-token text nodes
+/// cannot carry, so the whole surface renders here (the `agent_markdown`
+/// idiom). Colours are the app palette's stable code roles (`rail`,
+/// `forge_gutter_ink`, `strong_ink` in `theme.ice`), matched per appearance
+/// like `AgentMarkdown`.
 ///
 /// EAGER ON PURPOSE. This extern once wrapped its surface in a raw
 /// `iced::widget::lazy` — the app's ONLY use of iced's own Lazy, a boundary
@@ -894,7 +1251,7 @@ pub fn code_theme(dark: bool) -> iced::highlighter::Theme {
 /// for every code blob while the same tree passed the headless probes. The
 /// memo boundary lives at the Ice mount now (`lazy … by` in
 /// screens/forge.ice), the projection idiom every other cached surface here
-/// already uses, so the tokenize + row build still runs only when the blob,
+/// already uses, so the tokenize + paragraph build still runs only when the blob,
 /// path, or appearance moves. `BlobView.text` is read-capped at 64 KiB
 /// upstream, which bounds the one-time build; the screen's scroll pane owns
 /// scrolling.
@@ -904,9 +1261,10 @@ pub fn forge_code(source: String, path: String, dark: bool) -> iced::Element<'st
 
 fn code_surface(source: &str, path: &str, dark: bool) -> iced::Element<'static, ()> {
     use iced::Length;
-    use iced::alignment::{Horizontal, Vertical};
+    use iced::advanced::text::{LineHeight, Span};
+    use iced::alignment::Horizontal;
     use iced::highlighter::{Settings, Stream};
-    use iced::widget::{column, container, rich_text, row, span, text};
+    use iced::widget::{container, row, text};
 
     let (rail, gutter_ink, plain_ink) = match dark {
         true => (
@@ -920,14 +1278,13 @@ fn code_surface(source: &str, path: &str, dark: bool) -> iced::Element<'static, 
             iced::Color::from_rgb8(0x3a, 0x39, 0x34),
         ),
     };
-    let mono = iced::Font::with_name("Geist Mono");
     // An empty blob must say so: zero rows is a zero-height, invisible
     // surface, and a pane that renders nothing is unreportable.
     if source.is_empty() {
         return container(
             text("This file is empty.")
                 .size(CODE_SIZE)
-                .font(mono)
+                .font(CODE_FONT)
                 .color(gutter_ink),
         )
         .padding(iced::Padding::ZERO.left(13.0))
@@ -937,48 +1294,953 @@ fn code_surface(source: &str, path: &str, dark: bool) -> iced::Element<'static, 
         theme: code_theme(dark),
         token: code_token(path),
     });
-    let rows = source.lines().enumerate().map(|(index, line)| {
-        let spans: Vec<iced::widget::text::Span<'static, ()>> = stream
-            .highlight_line(line)
-            .map(|(range, highlight)| {
-                span(line[range].to_string())
-                    .color(highlight.color().unwrap_or(plain_ink))
-                    .font(mono)
-            })
-            .collect();
-        stream.commit();
-        let number = container(
-            text((index + 1).to_string())
-                .size(CODE_SIZE)
-                .font(mono)
-                .color(gutter_ink)
-                .width(Length::Fill)
-                .align_x(Horizontal::Right),
-        )
-        .width(CODE_GUTTER_WIDTH)
-        .height(CODE_ROW_HEIGHT)
-        .padding(iced::Padding::ZERO.right(12.0))
-        .align_y(Vertical::Center)
-        .style(move |_| iced::widget::container::Style {
-            background: Some(rail.into()),
-            ..Default::default()
-        });
-        let code = container(rich_text(spans).size(CODE_SIZE))
+    // The gutter is one numbers paragraph at the plate's row pitch; the plate
+    // is one drag-selectable paragraph of the highlighted lines.
+    let lines: Vec<Vec<Span<'static, (), iced::Font>>> = source
+        .lines()
+        .map(|line| {
+            let spans = stream
+                .highlight_line(line)
+                .map(|(range, highlight)| {
+                    Span::new(line[range].to_string()).color(highlight.color().unwrap_or(plain_ink))
+                })
+                .collect();
+            stream.commit();
+            spans
+        })
+        .collect();
+    let numbers = (1..=lines.len())
+        .map(|number| number.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = CodeSelect::new(lines, READER_METRICS, Some(plain_ink), Length::Fill);
+    let gutter = container(
+        text(numbers)
+            .size(CODE_SIZE)
+            .font(CODE_FONT)
+            .color(gutter_ink)
+            .line_height(LineHeight::Absolute(CODE_ROW_HEIGHT.into()))
             .width(Length::Fill)
-            .height(CODE_ROW_HEIGHT)
-            .padding(iced::Padding::ZERO.left(13.0))
-            .align_y(Vertical::Center)
-            .clip(true);
-        row![number, code].width(Length::Fill).into()
+            .align_x(Horizontal::Right),
+    )
+    .width(CODE_GUTTER_WIDTH)
+    .padding(iced::Padding::ZERO.right(12.0))
+    .style(move |_| iced::widget::container::Style {
+        background: Some(rail.into()),
+        ..Default::default()
     });
-    column(rows).width(Length::Fill).into()
+    let code = container(code)
+        .width(Length::Fill)
+        .padding(iced::Padding::ZERO.left(13.0))
+        .clip(true);
+    row![gutter, code].width(Length::Fill).into()
+}
+
+const CODE_FONT: iced::Font = iced::Font::with_name("Geist Mono");
+
+/// The renderer's paragraph by its concrete name: the plate needs the
+/// cosmic-text buffer under it, because `Paragraph::hit_test` answers with
+/// the byte index INSIDE the hit line and drops the line — right for one
+/// line of text, wrong for a file of them.
+type CodeParagraph = iced::advanced::graphics::text::Paragraph;
+
+/// Which document's selection a run of text takes part in, and where it sits
+/// in that document's reading order. A Markdown document is many widgets — a
+/// heading, a paragraph, a list item, a code plate are each their own run —
+/// and a drag crosses them, so neither end of the selection is one run's to
+/// hold: they share the one in [`drag`], and each answers only how much of
+/// ITSELF that selection covers. A run built on its own — the forge reader's
+/// whole blob — is a document of one, keyed by its own text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectPlace {
+    doc: u64,
+    ordinal: usize,
+}
+
+impl SelectPlace {
+    /// The `ordinal`th run of the document keyed `doc`, in reading order.
+    pub fn block(doc: u64, ordinal: usize) -> Self {
+        Self { doc, ordinal }
+    }
+}
+
+/// The window's open selection, ACROSS the runs it covers.
+/// `ui_lang_runtime::selection` already says which surface the window is
+/// showing a selection on; this says where that selection runs inside it,
+/// which a Markdown document cannot keep in any one widget.
+///
+/// A document is keyed by its own text, so two documents spelling the same
+/// bytes on screen at once show one selection twice. That is the whole cost
+/// of not threading an identity down through iced's Markdown viewer.
+mod drag {
+    use super::SelectPlace;
+    use std::cell::{Cell, RefCell};
+
+    /// One end of a selection: which run, and the byte offset inside it.
+    type Spot = (usize, usize);
+
+    #[derive(Clone, Copy)]
+    struct Drag {
+        doc: u64,
+        token: u64,
+        held: bool,
+        anchor: Spot,
+        cursor: Spot,
+        /// Bumped where a selection ENDS — a press starting another one, or
+        /// Escape letting this one go. A run's quads are drawn only while they
+        /// carry the current revision, so a run the event walk reaches before
+        /// the run that ended it cannot go on painting what it was showing:
+        /// the press that collapses a selection is delivered to the runs in
+        /// reading order, and the one it lands in is rarely the first.
+        revision: u64,
+    }
+
+    thread_local! {
+        static OPEN: Cell<Drag> = const {
+            Cell::new(Drag {
+                doc: 0,
+                token: 0,
+                held: false,
+                anchor: (0, 0),
+                cursor: (0, 0),
+                revision: 0,
+            })
+        };
+        /// The copy being built: every run the selection covers appends its
+        /// own words as the key walk reaches it — reading order — and the run
+        /// holding the far end takes the whole thing to the clipboard.
+        static COPY: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+
+    /// Take the window's selection for `place`, anchored at `offset`.
+    pub fn open(place: SelectPlace, offset: usize) {
+        let spot = (place.ordinal, offset);
+        OPEN.set(Drag {
+            doc: place.doc,
+            token: ui_lang_runtime::selection::claim(),
+            held: true,
+            anchor: spot,
+            cursor: spot,
+            revision: OPEN.get().revision + 1,
+        });
+    }
+
+    /// Whether the selection the window is showing is this run's document's.
+    pub fn shows(place: SelectPlace) -> bool {
+        let open = OPEN.get();
+        open.doc == place.doc && ui_lang_runtime::selection::holds(open.token)
+    }
+
+    /// Whether the pointer is still down on it.
+    pub fn held(place: SelectPlace) -> bool {
+        shows(place) && OPEN.get().held
+    }
+
+    /// Which revision of the selection the runs must be painting.
+    pub fn revision() -> u64 {
+        OPEN.get().revision
+    }
+
+    /// Move the far end into `place` at `offset`. No new revision: the runs
+    /// whose share of the selection this moves refresh their own quads in the
+    /// same event walk.
+    pub fn reach(place: SelectPlace, offset: usize) {
+        let mut open = OPEN.get();
+        open.cursor = (place.ordinal, offset);
+        OPEN.set(open);
+    }
+
+    /// Take the document from its first byte through `place`'s `offset`.
+    /// Ctrl+A reaches the document's END because EVERY run runs this as the
+    /// key walk reaches it: the last one to run leaves the far end at its own
+    /// end, and each run before it painted itself full on the way past. No
+    /// new revision, for the same reason `reach` opens none — the walk that
+    /// moves the selection refreshes every run it moves.
+    pub fn all(place: SelectPlace, offset: usize) {
+        let mut open = OPEN.get();
+        open.anchor = (0, 0);
+        open.cursor = (place.ordinal, offset);
+        OPEN.set(open);
+    }
+
+    /// Let the pointer go; the selection stays.
+    pub fn release() {
+        let mut open = OPEN.get();
+        open.held = false;
+        OPEN.set(open);
+    }
+
+    /// Let the selection go.
+    pub fn clear() {
+        let mut open = OPEN.get();
+        open.held = false;
+        open.revision += 1;
+        OPEN.set(open);
+        ui_lang_runtime::selection::clear();
+    }
+
+    /// The selection's near and far end, in reading order.
+    fn ends() -> (Spot, Spot) {
+        let open = OPEN.get();
+        (open.anchor.min(open.cursor), open.anchor.max(open.cursor))
+    }
+
+    /// How much of `place`'s `len` bytes the selection covers. `None` where
+    /// the window is showing another document's selection, or this run is
+    /// outside the one it is showing. The range can be EMPTY on purpose: a
+    /// run the selection ends at the very start of is inside it and covers
+    /// nothing, and a copy still walks through it to reach the runs after.
+    pub fn part(place: SelectPlace, len: usize) -> Option<std::ops::Range<usize>> {
+        if !shows(place) {
+            return None;
+        }
+        let (start, end) = ends();
+        let inside = start.0 <= place.ordinal && place.ordinal <= end.0;
+        if !inside {
+            return None;
+        }
+        let from = match place.ordinal == start.0 {
+            true => start.1.min(len),
+            false => 0,
+        };
+        let to = match place.ordinal == end.0 {
+            true => end.1.min(len),
+            false => len,
+        };
+        (from <= to).then_some(from..to)
+    }
+
+    /// Whether the selection starts in this run — where a copy starts over.
+    pub fn starts_at(place: SelectPlace) -> bool {
+        let (start, _) = ends();
+        shows(place) && start.0 == place.ordinal
+    }
+
+    /// Whether it ends in this run — where a copy is taken to the clipboard.
+    pub fn ends_at(place: SelectPlace) -> bool {
+        let (_, end) = ends();
+        shows(place) && end.0 == place.ordinal
+    }
+
+    /// Start a copy over.
+    pub fn copy_open() {
+        COPY.with_borrow_mut(String::clear);
+    }
+
+    /// Add one run's words to it, a line apart from the run before.
+    pub fn copy_add(words: &str) {
+        COPY.with_borrow_mut(|copy| {
+            let joins_a_run = !copy.is_empty() && !words.is_empty();
+            if joins_a_run {
+                copy.push('\n');
+            }
+            copy.push_str(words);
+        });
+    }
+
+    /// Take the whole thing.
+    pub fn copy_take() -> String {
+        COPY.with_borrow_mut(std::mem::take)
+    }
+}
+
+/// One selectable run of text, the state every selectable surface here
+/// shares: a paragraph laid out like the drawn one (for the code plate it IS
+/// the drawn one), the run's place in its document, and the quads.
+#[derive(Default)]
+struct SelectState {
+    key: u64,
+    place: SelectPlace,
+    paragraph: CodeParagraph,
+    /// The quads for the part of the document's selection this run covers,
+    /// paragraph-relative, and the revision they were built at. Refreshed
+    /// where the selection or the bounds move (`update`, `layout`) and never
+    /// in `draw`, so a scroll with a selection open costs nothing extra.
+    highlight: Vec<iced::Rectangle>,
+    revision: u64,
+}
+
+impl SelectState {
+    /// The part of the document's selection this run covers, the empty range
+    /// included — which a copy walking to the runs after needs, and a
+    /// highlight does not.
+    fn part(&self, text: &SelectText) -> Option<std::ops::Range<usize>> {
+        let part = drag::part(self.place, text.content.len())?;
+        text.content.get(part.clone()).is_some().then_some(part)
+    }
+
+    fn range(&self, text: &SelectText) -> Option<std::ops::Range<usize>> {
+        self.part(text).filter(|part| !part.is_empty())
+    }
+
+    /// Whether the quads may be drawn: this run's share of the selection the
+    /// window is showing, built for the run it is showing now.
+    fn is_painting(&self) -> bool {
+        drag::shows(self.place) && self.revision == drag::revision()
+    }
+
+    /// The byte offset under a paragraph-relative point. cosmic-text already
+    /// lands a point above the first line on it, one below the last on its
+    /// end, and one past a line's right edge on that line's end — the clamps
+    /// a drag needs, within a run and across them both.
+    fn hit(&self, point: iced::Point, text: &SelectText) -> Option<usize> {
+        let cursor = self.paragraph.buffer().hit(point.x, point.y)?;
+        let line_start = text.line_starts.get(cursor.line).copied()?;
+        Some(line_start + cursor.index)
+    }
+
+    /// One quad per laid-out line the selection touches, read off its
+    /// glyphs: the run of the first glyph that ends inside the selection
+    /// through the last that starts inside it. A line the selection only
+    /// passes the newline of (an empty line, or a start exactly at a line's
+    /// end) has no such glyphs and draws nothing.
+    fn reselect(&mut self, text: &SelectText) {
+        self.highlight.clear();
+        self.revision = drag::revision();
+        let Some(range) = self.range(text) else {
+            return;
+        };
+        for run in self.paragraph.buffer().layout_runs() {
+            let Some(&line_start) = text.line_starts.get(run.line_i) else {
+                continue;
+            };
+            let low = range.start.saturating_sub(line_start);
+            let high = range.end.saturating_sub(line_start);
+            let first = run.glyphs.iter().find(|glyph| glyph.end > low);
+            let last = run.glyphs.iter().rev().find(|glyph| glyph.start < high);
+            let (Some(first), Some(last)) = (first, last) else {
+                continue;
+            };
+            let right = last.x + last.w;
+            if right <= first.x {
+                continue;
+            }
+            self.highlight.push(iced::Rectangle::new(
+                iced::Point::new(first.x, run.line_top),
+                iced::Size::new(right - first.x, run.line_height),
+            ));
+        }
+    }
+
+    /// A (re)laid-out paragraph: a new key drops the old text's quads, whose
+    /// offsets meant other text — and a document is keyed by its own text, so
+    /// the selection that indexed it is nobody's document's now. The same key
+    /// keeps them and refreshes them where the bounds moved.
+    fn relayout<Link>(
+        &mut self,
+        key: u64,
+        place: SelectPlace,
+        text: iced::advanced::text::Text<
+            &[iced::advanced::text::Span<'_, Link, iced::Font>],
+            iced::Font,
+        >,
+        select: &SelectText,
+    ) {
+        use iced::advanced::text::{Difference, Paragraph as _, Text};
+        self.place = place;
+        let other_text = self.key != key;
+        if other_text {
+            self.paragraph = CodeParagraph::with_spans(text);
+            self.key = key;
+            self.highlight.clear();
+            return;
+        }
+        let probe = Text {
+            content: (),
+            bounds: text.bounds,
+            size: text.size,
+            line_height: text.line_height,
+            font: text.font,
+            align_x: text.align_x,
+            align_y: text.align_y,
+            shaping: text.shaping,
+            wrapping: text.wrapping,
+        };
+        match self.paragraph.compare(probe) {
+            Difference::None => {}
+            Difference::Bounds => {
+                self.paragraph.resize(text.bounds);
+                self.reselect(select);
+            }
+            Difference::Shape => {
+                self.paragraph = CodeParagraph::with_spans(text);
+                self.reselect(select);
+            }
+        }
+    }
+
+    /// The selection's own input: a press takes the window's selection and
+    /// anchors the drag here, a move reaches the far end through here, Ctrl+A
+    /// takes the whole document, Ctrl+C copies it, Escape lets go.
+    fn update<Message>(
+        &mut self,
+        text: &SelectText,
+        event: &iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+    ) {
+        use iced::advanced::clipboard;
+        use iced::keyboard;
+        use iced::mouse;
+        match event {
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let Some(position) = cursor.position_in(layout.bounds()) else {
+                    return;
+                };
+                let Some(offset) = self.hit(position, text) else {
+                    return;
+                };
+                drag::open(self.place, offset);
+                self.reselect(text);
+                shell.request_redraw();
+            }
+            iced::Event::Mouse(mouse::Event::CursorMoved { .. }) if drag::held(self.place) => {
+                // THE FAR END IS TAKEN BY EVERY RUN THE POINTER IS AT OR PAST,
+                // in reading order, so the last one to take it is the run the
+                // pointer is in: a run above the pointer hits its own end —
+                // cosmic-text clamps a point below the last line there — which
+                // is exactly how much of that run the selection covers. A run
+                // below the pointer leaves the end alone and only repaints the
+                // share the runs around it moved.
+                //
+                // The cursor is LANDED first because a drag owns the pointer
+                // wherever it goes: a scroller hands the content it is not
+                // under a levitating cursor, which has no position at all, and
+                // a Markdown code block is a plate inside its own horizontal
+                // scroller — a drag running past one could never reach into
+                // it, and the block would drop out of a selection that covers
+                // the paragraphs on both sides of it.
+                let pointer = cursor.land().position_from(layout.position());
+                let past_the_top =
+                    pointer.filter(|point| point.y >= 0.0 || self.place.ordinal == 0);
+                let before = self.range(text);
+                if let Some(offset) = past_the_top.and_then(|point| self.hit(point, text)) {
+                    drag::reach(self.place, offset);
+                }
+                let settled = self.range(text) == before && self.revision == drag::revision();
+                if settled {
+                    return;
+                }
+                self.reselect(text);
+                shell.request_redraw();
+            }
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if drag::held(self.place) =>
+            {
+                drag::release();
+            }
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) if drag::shows(self.place) && modifiers.command() => {
+                match key.to_latin(*physical_key) {
+                    Some('a') => {
+                        drag::all(self.place, text.content.len());
+                        self.reselect(text);
+                        shell.capture_event();
+                        shell.request_redraw();
+                    }
+                    Some('c') => {
+                        let Some(part) = self.part(text) else {
+                            return;
+                        };
+                        if drag::starts_at(self.place) {
+                            drag::copy_open();
+                        }
+                        drag::copy_add(&text.content[part]);
+                        if drag::ends_at(self.place) {
+                            let copy = drag::copy_take();
+                            let copied = !copy.is_empty();
+                            if copied {
+                                clipboard.write(clipboard::Kind::Standard, copy);
+                            }
+                        }
+                        shell.capture_event();
+                    }
+                    _ => {}
+                }
+            }
+            iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                ..
+            }) if drag::shows(self.place) => {
+                drag::clear();
+                self.highlight.clear();
+                shell.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
+    /// The highlight wash under the text, clipped to what is on screen.
+    fn draw(
+        &self,
+        renderer: &mut iced::Renderer,
+        bounds: iced::Rectangle,
+        clip: iced::Rectangle,
+        ink: iced::Color,
+    ) {
+        use iced::advanced::Renderer as _;
+        if !self.is_painting() {
+            return;
+        }
+        let translation = bounds.position() - iced::Point::ORIGIN;
+        let wash = ink.scale_alpha(0.28);
+        for quad in &self.highlight {
+            let Some(quad) = (*quad + translation).intersection(&clip) else {
+                continue;
+            };
+            renderer.fill_quad(
+                iced::advanced::renderer::Quad {
+                    bounds: quad,
+                    ..Default::default()
+                },
+                wash,
+            );
+        }
+    }
+}
+
+/// The text a selection indexes: the exact string the spans spell, byte
+/// for byte, and the byte offset of each line's first character — what
+/// turns the buffer's (line, index) cursor into one offset and back.
+struct SelectText {
+    content: String,
+    line_starts: Vec<usize>,
+}
+
+impl SelectText {
+    fn new(content: String) -> Self {
+        let line_starts = std::iter::once(0)
+            .chain(content.match_indices('\n').map(|(at, _)| at + 1))
+            .collect();
+        Self {
+            content,
+            line_starts,
+        }
+    }
+}
+
+/// The text layout a code plate draws with: a pinned size and row pitch in
+/// the code font, no wrapping.
+#[derive(Clone, Copy)]
+pub struct CodeMetrics {
+    pub size: iced::Pixels,
+    pub line_height: iced::advanced::text::LineHeight,
+    pub font: iced::Font,
+}
+
+/// The reader's metrics, pinned to `DiffRow`'s by the shape lint.
+const READER_METRICS: CodeMetrics = CodeMetrics {
+    size: iced::Pixels(CODE_SIZE),
+    line_height: iced::advanced::text::LineHeight::Absolute(iced::Pixels(CODE_ROW_HEIGHT)),
+    font: CODE_FONT,
+};
+
+fn code_text<C>(
+    content: C,
+    bounds: iced::Size,
+    metrics: CodeMetrics,
+) -> iced::advanced::text::Text<C, iced::Font> {
+    use iced::advanced::text::{Alignment, Shaping, Text, Wrapping};
+    Text {
+        content,
+        bounds,
+        size: metrics.size,
+        line_height: metrics.line_height,
+        font: metrics.font,
+        align_x: Alignment::Left,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: Shaping::Advanced,
+        wrapping: Wrapping::None,
+    }
+}
+
+/// A code plate: highlighted lines as one paragraph that can be dragged
+/// across, like every plain Ice `text` in the app (ducktape-ui wraps those in
+/// `selectable_text`; this is the same contract for per-span inks, which
+/// that wrapper's plain `Text` cannot carry). It takes the window's
+/// selection through `ui_lang_runtime::selection`, so a drag here quiets any
+/// other highlight and vice versa; Ctrl+A takes the document, Ctrl+C copies
+/// it, Escape lets go. The forge reader and Markdown code blocks both draw
+/// it — the reader's plate is its own document, a Markdown code block is one
+/// block of the document around it ([`CodeSelect::at`]).
+pub struct CodeSelect {
+    /// Identity of the lines and their inks: a new key rebuilds the
+    /// paragraph and drops the old text's selection.
+    key: u64,
+    /// Where the plate sits in the document whose selection it takes part
+    /// in — a document of one until [`CodeSelect::at`] says otherwise.
+    place: SelectPlace,
+    text: SelectText,
+    spans: Vec<iced::advanced::text::Span<'static, (), iced::Font>>,
+    /// The ink for spans without one; `None` takes the theme's text colour.
+    ink: Option<iced::Color>,
+    metrics: CodeMetrics,
+    width: iced::Length,
+}
+
+impl CodeSelect {
+    /// One plate from per-line spans, newline spans between the lines, so a
+    /// drag runs across rows and a copy carries the line breaks. `content` is
+    /// the exact text the spans spell, byte for byte: the selection's
+    /// offsets index it.
+    pub fn new<'a, Link>(
+        lines: impl IntoIterator<Item = impl AsRef<[iced::advanced::text::Span<'a, Link, iced::Font>]>>,
+        metrics: CodeMetrics,
+        ink: Option<iced::Color>,
+        width: iced::Length,
+    ) -> Self {
+        use iced::advanced::text::Span;
+        use std::hash::{Hash as _, Hasher as _};
+        let mut content = String::new();
+        let mut spans = Vec::new();
+        let mut hasher = std::hash::DefaultHasher::new();
+        for (index, line) in lines.into_iter().enumerate() {
+            if index > 0 {
+                content.push('\n');
+                spans.push(Span::new("\n"));
+            }
+            for span in line.as_ref() {
+                content.push_str(&span.text);
+                span.color
+                    .map(|color| [color.r, color.g, color.b, color.a].map(f32::to_bits))
+                    .hash(&mut hasher);
+                spans.push(
+                    Span::new(span.text.to_string())
+                        .color_maybe(span.color)
+                        .font_maybe(span.font),
+                );
+            }
+        }
+        content.hash(&mut hasher);
+        let key = hasher.finish();
+        Self {
+            key,
+            place: SelectPlace::block(key, 0),
+            text: SelectText::new(content),
+            spans,
+            ink,
+            metrics,
+            width,
+        }
+    }
+
+    /// Put the plate in a document, where a drag runs on past it: a Markdown
+    /// code block is one of its document's blocks, and the selection crosses
+    /// into the paragraphs around it.
+    pub fn at(mut self, place: SelectPlace) -> Self {
+        self.place = place;
+        self
+    }
+}
+
+impl<Message> iced::advanced::Widget<Message, iced::Theme, iced::Renderer> for CodeSelect {
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<SelectState>()
+    }
+
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(SelectState::default())
+    }
+
+    fn size(&self) -> iced::Size<iced::Length> {
+        iced::Size::new(self.width, iced::Length::Shrink)
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        _renderer: &iced::Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        use iced::advanced::text::Paragraph as _;
+        let state = tree.state.downcast_mut::<SelectState>();
+        iced::advanced::layout::sized(limits, self.width, iced::Length::Shrink, |limits| {
+            let text = code_text(self.spans.as_slice(), limits.max(), self.metrics);
+            state.relayout(self.key, self.place, text, &self.text);
+            state.paragraph.min_bounds()
+        })
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        event: &iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        _renderer: &iced::Renderer,
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        _viewport: &iced::Rectangle,
+    ) {
+        let state = tree.state.downcast_mut::<SelectState>();
+        state.update(&self.text, event, layout, cursor, clipboard, shell);
+    }
+
+    fn mouse_interaction(
+        &self,
+        _tree: &iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        _viewport: &iced::Rectangle,
+        _renderer: &iced::Renderer,
+    ) -> iced::mouse::Interaction {
+        match cursor.is_over(layout.bounds()) {
+            true => iced::mouse::Interaction::Text,
+            false => iced::mouse::Interaction::default(),
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        renderer: &mut iced::Renderer,
+        _theme: &iced::Theme,
+        style: &iced::advanced::renderer::Style,
+        layout: iced::advanced::Layout<'_>,
+        _cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        use iced::advanced::text::Renderer as _;
+        let bounds = layout.bounds();
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
+        let ink = self.ink.unwrap_or(style.text_color);
+        let state = tree.state.downcast_ref::<SelectState>();
+        state.draw(renderer, bounds, clip, ink);
+        renderer.fill_paragraph(&state.paragraph, bounds.position(), ink, clip);
+    }
+}
+
+impl<'a, Message: 'a> From<CodeSelect> for iced::Element<'a, Message> {
+    fn from(code: CodeSelect) -> Self {
+        Self::new(code)
+    }
+}
+
+/// A rich text run that can be dragged across — iced's own `Rich` draws it
+/// (inline-code plates, link inks, link clicks all stay its), and a shadow
+/// paragraph laid out with the same spans, size, font and bounds answers
+/// where the glyphs are. A drag runs on past the run's edge into the rest of
+/// its document ([`SelectPlace`]); a run standing on its own is a document of
+/// one, and stops there like the app's plain Ice `text`.
+pub struct SelectRich<'a, Message> {
+    key: u64,
+    /// Where the run sits in its document — see [`CodeSelect::at`].
+    place: SelectPlace,
+    child: iced::Element<'a, Message>,
+    text: SelectText,
+    spans: std::sync::Arc<[iced::advanced::text::Span<'static, String, iced::Font>]>,
+    size: iced::Pixels,
+}
+
+impl<'a, Message: 'a> SelectRich<'a, Message> {
+    /// `rich` must be the `Rich` built from `spans` at `size` in the
+    /// renderer's default font — the shadow paragraph mirrors those.
+    pub fn new(
+        rich: iced::widget::text::Rich<'a, String, Message>,
+        spans: std::sync::Arc<[iced::advanced::text::Span<'static, String, iced::Font>]>,
+        size: iced::Pixels,
+    ) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        let content: String = spans.iter().map(|span| span.text.as_ref()).collect();
+        let mut hasher = std::hash::DefaultHasher::new();
+        (&content, size.0.to_bits()).hash(&mut hasher);
+        let key = hasher.finish();
+        Self {
+            key,
+            place: SelectPlace::block(key, 0),
+            child: rich.into(),
+            text: SelectText::new(content),
+            spans,
+            size,
+        }
+    }
+
+    /// Put the run in a document — see [`CodeSelect::at`].
+    pub fn at(mut self, place: SelectPlace) -> Self {
+        self.place = place;
+        self
+    }
+}
+
+impl<Message> iced::advanced::Widget<Message, iced::Theme, iced::Renderer>
+    for SelectRich<'_, Message>
+{
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        iced::advanced::widget::tree::Tag::of::<SelectState>()
+    }
+
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        iced::advanced::widget::tree::State::new(SelectState::default())
+    }
+
+    fn children(&self) -> Vec<iced::advanced::widget::Tree> {
+        vec![iced::advanced::widget::Tree::new(&self.child)]
+    }
+
+    fn diff(&self, tree: &mut iced::advanced::widget::Tree) {
+        tree.children[0].diff(&self.child);
+    }
+
+    fn size(&self) -> iced::Size<iced::Length> {
+        self.child.as_widget().size()
+    }
+
+    fn size_hint(&self) -> iced::Size<iced::Length> {
+        self.child.as_widget().size_hint()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        renderer: &iced::Renderer,
+        limits: &iced::advanced::layout::Limits,
+    ) -> iced::advanced::layout::Node {
+        use iced::advanced::text::{Alignment, LineHeight, Renderer as _, Shaping, Text, Wrapping};
+        let node = self
+            .child
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits);
+        // The same `Text` `Rich::layout` lays its spans out with, bounds
+        // included — it reads `limits.max()` before sizing, as this does.
+        let text = Text {
+            content: self.spans.as_ref(),
+            bounds: limits.max(),
+            size: self.size,
+            line_height: LineHeight::default(),
+            font: renderer.default_font(),
+            align_x: Alignment::Default,
+            align_y: iced::alignment::Vertical::Top,
+            shaping: Shaping::Advanced,
+            wrapping: Wrapping::default(),
+        };
+        let state = tree.state.downcast_mut::<SelectState>();
+        state.relayout(self.key, self.place, text, &self.text);
+        node
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn iced::advanced::widget::Operation,
+    ) {
+        self.child
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut iced::advanced::widget::Tree,
+        event: &iced::Event,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        viewport: &iced::Rectangle,
+    ) {
+        self.child.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        let state = tree.state.downcast_mut::<SelectState>();
+        state.update(&self.text, event, layout, cursor, clipboard, shell);
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+        renderer: &iced::Renderer,
+    ) -> iced::mouse::Interaction {
+        let own = self.child.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        );
+        let over_a_link = own != iced::mouse::Interaction::default();
+        match (over_a_link, cursor.is_over(layout.bounds())) {
+            (true, _) => own,
+            (false, true) => iced::mouse::Interaction::Text,
+            (false, false) => own,
+        }
+    }
+
+    fn draw(
+        &self,
+        tree: &iced::advanced::widget::Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &iced::advanced::renderer::Style,
+        layout: iced::advanced::Layout<'_>,
+        cursor: iced::mouse::Cursor,
+        viewport: &iced::Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        if let Some(clip) = bounds.intersection(viewport) {
+            let state = tree.state.downcast_ref::<SelectState>();
+            state.draw(renderer, bounds, clip, style.text_color);
+        }
+        self.child.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut iced::advanced::widget::Tree,
+        layout: iced::advanced::Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &iced::Rectangle,
+        translation: iced::Vector,
+    ) -> Option<iced::advanced::overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
+        self.child.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a, Message: 'a> From<SelectRich<'a, Message>> for iced::Element<'a, Message> {
+    fn from(rich: SelectRich<'a, Message>) -> Self {
+        Self::new(rich)
+    }
 }
 
 /// Whether a tree path names a Markdown document the reader renders as a
 /// document rather than line-numbers. Extension-based on purpose: the wire's
 /// `binary` flag only separates text from bytes, and forge carries no
 /// language field — the path is the one discriminator the app holds.
-pub fn markdown_path(path: String) -> bool {
+pub fn markdown_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.ends_with(".md") || lower.ends_with(".markdown")
 }
@@ -990,7 +2252,7 @@ pub fn markdown_path(path: String) -> bool {
 /// lands on it. An empty Forge screen that does not say so is a dead end: it
 /// tells the reader a repo "appears here once it is created" and names no way
 /// to create one.
-pub fn forge_push_command(rpc: String) -> String {
+pub fn forge_push_command(rpc: &str) -> String {
     let endpoint = rpc.trim_end_matches('/');
     // `my-repo`, not `NAME`: `forge::norm_repo` accepts `[a-z0-9._-]` only, so
     // an uppercase placeholder pasted verbatim 404s the ref advertisement and
@@ -998,7 +2260,7 @@ pub fn forge_push_command(rpc: String) -> String {
     format!("git remote add ducktape {endpoint}/forge/my-repo && git push ducktape main")
 }
 
-pub fn diff_lines(diff: String) -> Vec<DiffLine> {
+pub fn diff_lines(diff: &str) -> Vec<DiffLine> {
     // A patch line has no durable id. Reusing content/occurrence across two
     // patch revisions can move focus to an identical line's comment button,
     // while line-number keys can move it to unrelated content. Namespace the
@@ -1233,8 +2495,19 @@ pub fn drop_forge_comment(
 /// The staged list is at the module's per-review cap, so the composer must
 /// refuse to take another. The literal lives HERE and nowhere in `.ice`, so the
 /// gate and the module's own limit cannot drift apart.
-pub fn forge_comment_cap_reached(staged: Vec<ForgeDraftComment>) -> bool {
+pub fn forge_comment_cap_reached(staged: &[ForgeDraftComment]) -> bool {
     staged.len() >= forge::MAX_REVIEW_COMMENTS
+}
+
+/// The directory a committed path sits in, in the forge tree's own spelling:
+/// the repository root is `""` (what `forge_tree` is asked for and echoes
+/// back), never `/` — that is duckfs's root (`fs_parent`), and a tree reply
+/// for `/` would not match the `""` the browser waits on.
+pub fn forge_parent(path: String) -> String {
+    match path.rsplit_once('/') {
+        Some((dir, _)) => dir.to_string(),
+        None => String::new(),
+    }
 }
 
 /// The reader header's path, gated on the directory AND revision the file
@@ -1243,24 +2516,28 @@ pub fn forge_comment_cap_reached(staged: Vec<ForgeDraftComment>) -> bool {
 /// (Another repository is another component instance — the call site keys
 /// on the repo, so cross-repo staleness cannot arise.)
 pub fn forge_file_header(
-    opened_dir: String,
-    opened_rev: String,
-    dir: String,
-    rev: String,
-    path: String,
+    opened_dir: &str,
+    opened_rev: &str,
+    dir: &str,
+    rev: &str,
+    path: &str,
 ) -> String {
     let same_place = opened_dir == dir;
     let same_commit = opened_rev == rev;
-    if same_place && same_commit { path } else { String::new() }
+    if same_place && same_commit {
+        path.to_owned()
+    } else {
+        String::new()
+    }
 }
 
 /// The label a picked-but-unstaged line wears above the composer, empty when no
 /// line is picked — the composer keys its whole visibility on this.
-pub fn forge_comment_target(path: String, line: String, side: String) -> String {
+pub fn forge_comment_target(path: &str, line: &str, side: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
-    comment_anchor(&path, &line, &side)
+    comment_anchor(path, line, side)
 }
 
 /// `src/main.rs:14 (new)` — the one place the anchor string is spelled, shared
@@ -1362,23 +2639,27 @@ fn hunk_span(line: &str) -> Option<HunkSpan> {
 }
 
 /// The tracker's Pull requests / Issues split.
-pub fn filter_forge_items(items: Vec<ForgeItem>, tab: crate::ForgeTab) -> Vec<ForgeItem> {
+pub fn filter_forge_items(items: &[ForgeItem], tab: crate::ForgeTab) -> Vec<ForgeItem> {
     let kind = match tab {
         crate::ForgeTab::Code => return Vec::new(),
         crate::ForgeTab::Pulls => "pr",
         crate::ForgeTab::Issues => "issue",
     };
-    items.into_iter().filter(|item| item.kind == kind).collect()
+    items
+        .iter()
+        .filter(|item| item.kind == kind)
+        .cloned()
+        .collect()
 }
 
 /// The tab count chips — open work only: a PR counts until it merges, an
 /// issue until it closes.
-pub fn forge_open_count(items: Vec<ForgeItem>, kind: String) -> i64 {
+pub fn forge_open_count(items: &[ForgeItem], kind: &str) -> i64 {
     count_i64(
         items
             .iter()
             .filter(|item| item.kind == kind)
-            .filter(|item| match kind.as_str() {
+            .filter(|item| match kind {
                 "pr" => item.state != "merged",
                 _ => item.state == "open",
             })
@@ -1397,7 +2678,7 @@ pub fn forge_stats(files: i64, additions: i64, deletions: i64) -> String {
 }
 
 /// The merged-state banner: the short merge oid plus the branch line.
-pub fn forge_merge_note(merge_oid: String, branches: String) -> String {
+pub fn forge_merge_note(merge_oid: &str, branches: &str) -> String {
     let short: String = merge_oid.chars().take(8).collect();
     match branches.is_empty() {
         true => format!("Merged as {short}"),
@@ -1406,8 +2687,8 @@ pub fn forge_merge_note(merge_oid: String, branches: String) -> String {
 }
 
 /// A review verdict key as its timeline verb.
-pub fn verdict_label(verdict: String) -> String {
-    match verdict.as_str() {
+pub fn verdict_label(verdict: &str) -> String {
+    match verdict {
         "approve" => "approved".into(),
         "request_changes" => "requested changes".into(),
         _ => "commented".into(),
@@ -1418,11 +2699,11 @@ pub fn verdict_label(verdict: String) -> String {
 pub fn verdict_pick_label(
     current: crate::ForgeReviewVerdict,
     key: crate::ForgeReviewVerdict,
-    label: String,
+    label: &str,
 ) -> String {
     match current == key {
         true => format!("● {label}"),
-        false => label,
+        false => label.to_owned(),
     }
 }
 

@@ -11,6 +11,11 @@ state
   fs_preview_text = ""
   fs_preview_truncated = false
   fs_preview_binary = false
+  fs_preview_picture = false
+  fs_preview_width:i64 = 0
+  fs_preview_height:i64 = 0
+  // A `duck://files` deep link's file, opened once its directory is listed.
+  fs_focus_path = ""
   fs_history:[FsSnapshot] = []
   fs_new_name = ""
   fs_delete_target = ""

@@ -7,21 +7,12 @@ version.workspace = true
 # and hook notifications on one host-injected merkle store.
 #
 # the consensus state machine, wire types, and sdk::Module impl always compile
-# (they are the surface the wasm guest ports compile). the OFF-consensus
-# media submodules ride the `native` feature: the voice/video engines (tokio,
-# opus, the data plane) and the call-socket wire codec that only serving
-# binaries speak. the pure index decision core (src/index.rs) compiles
-# EVERYWHERE — it is what the index guest wraps. `default-features = false`
-# is therefore FULL consensus behavior plus the index core, minus the media
-# planes.
+# (they are the surface the wasm guest ports compile), and the pure index
+# decision core (src/index.rs) compiles EVERYWHERE — it is what the index
+# guest wraps. the call media planes are NOT here: they are the off-consensus
+# `media-service` crate (crates/services/media), which chat's membership
+# drives but never depends on.
 [features]
-default = ["native"]
-native = [
-  "dep:data-plane",
-  "dep:opus-rs",
-  "dep:thiserror",
-  "dep:tokio",
-]
 # the wasm consensus port (src/guest.rs): the store-backed dispatch shell over
 # guest-adapter. non-default and wasm-only — enabled solely by the
 # guest-builder's synthesized cdylib workspace, never by the native gate.
@@ -51,12 +42,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # the logical-key -> store-key hash (sha256); the store itself is injected.
 sha2 = { workspace = true }
-# voice submodule (crates/modules/apps/chat/src/voice): real-time media over the data
-# plane's datagram class. Off-consensus — no qmdb, no root-hash.
-data-plane = { workspace = true, optional = true }
-opus-rs = { workspace = true, optional = true }
-thiserror = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["rt", "time", "sync", "macros"], optional = true }
 
 [dev-dependencies]
 host = { workspace = true }
@@ -66,6 +51,3 @@ sdk-testkit = { workspace = true }
 statesync = { workspace = true }
 commonware-runtime = { workspace = true }
 tempfile = "3"
-tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "test-util"] }
-# the voice e2e proofs drive the data plane's deterministic sim transport.
-data-plane = { workspace = true, features = ["sim"] }

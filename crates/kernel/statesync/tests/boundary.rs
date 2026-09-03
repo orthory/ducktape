@@ -240,6 +240,7 @@ fn tip_coords_roundtrip_over_the_wire() {
                 residents: vec![vec![3u8; 32]],
             },
         ],
+        build: Some("test-build-dirty".into()),
     };
     let bytes = encode_response(&SyncResponse::TipCoords(coords.clone()));
     let SyncResponse::TipCoords(back) = decode_response(&bytes).unwrap() else {
@@ -247,10 +248,12 @@ fn tip_coords_roundtrip_over_the_wire() {
     };
     assert_eq!(back, coords);
 
-    // empty sets ride the same wire — a fresh net has no residents yet.
+    // empty sets ride the same wire — a fresh net has no residents yet — and
+    // so does a server that cannot name its own build.
     let bare = TipCoords {
         residents: Vec::new(),
         has_floor: false,
+        build: None,
         ..coords
     };
     let bytes = encode_response(&SyncResponse::TipCoords(bare.clone()));

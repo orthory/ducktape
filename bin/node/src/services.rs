@@ -23,7 +23,6 @@ use sha2::{Digest as _, Sha256};
 use crate::config;
 
 pub const FILE_NAME: &str = "services.toml";
-const FORMAT_VERSION: u8 = 1;
 
 /// the first-party service kinds. Defined in `noded` because both the node's
 /// own surfaces (the ws service link) and this CLI must name them.
@@ -47,52 +46,33 @@ fn daemon_for(kind: &str) -> Option<Daemon> {
     }
 }
 
-/// where one service kind keeps its private podman state: storage root, runroot
-/// and egress hooks.
-///
-/// Per-service roots rather than one shared service, and that is a
-/// failure-domain decision, not tidiness: [`provider_host::PodmanService`]
-/// supervises the service child with `kill_on_drop`, so one service between two
-/// daemons would die with whichever started it and take the other's live
-/// containers along — exactly the coupling separate processes exist to remove.
-/// The honest cost is two image stores: an image both services use is pulled
-/// into each.
-pub(crate) fn podman_data_dir(service: &config::ServiceConfig, kind: &str) -> PathBuf {
-    service.storage_dir.join("services").join(kind)
-}
+// `podman_data_dir` lived here: the per-service storage root, runroot and hooks
+// directory a private podman service needed, kept per-kind so two daemons did
+// not share a `kill_on_drop` service child. There is no service child now — a
+// run's VMM is a child of the daemon that started it — so two daemons share no
+// state at all rather than carefully sharing none.
 
-/// this service's OWN sandbox backend, with its socket named.
+/// this service's OWN sandbox backend.
 ///
-/// The socket lives in the RUNTIME dir, not under the data dir: a unix socket
-/// path is capped near 108 bytes and a workspace path is unbounded, so deriving
-/// one from the other is a latent `bind: invalid argument` on any host with a
-/// slightly long home or network name.
-///
-/// Non-Podman backends (Tart) are returned unchanged — a Tart run clones and
-/// deletes a VM per run, so there is no service, no socket and no shared root.
-pub(crate) fn podman_backend(
+/// A pass-through now that every run gets its own microVM: the configured
+/// kernel and rootfs ARE the backend, and there is no per-service socket to
+/// name because there is no daemon to name it for. The container backend
+/// re-rooted the socket here, into the runtime dir rather than the data dir,
+/// because a unix socket path is capped near 108 bytes while a workspace path
+/// is unbounded. That trap did not disappear — [`provider_host::MicroVm::boot`]
+/// carries it for the per-run vsock path instead.
+pub(crate) fn sandbox_backend(
     service: &config::ServiceConfig,
-    kind: &str,
 ) -> Result<provider_host::SandboxBackend, String> {
     // the fix is already IN the file this complains about: `node init` writes
     // the whole `[sandbox]` block commented out, so "uncomment it" is a real
     // instruction rather than a spec to go and look up.
-    let backend = service.sandbox.clone().ok_or_else(|| {
+    service.sandbox.clone().ok_or_else(|| {
         format!(
             "no [sandbox] table in node.toml: this host has no configured way to isolate a run \
              — uncomment the [sandbox] block at the end of {}/node.toml, then restart the node",
             service.workspace.display()
         )
-    })?;
-    let provider_host::SandboxBackend::Podman { image, .. } = backend else {
-        return Ok(backend);
-    };
-    Ok(provider_host::SandboxBackend::Podman {
-        image,
-        socket: provider_host::PodmanService::socket_path(
-            &podman_data_dir(service, kind),
-            kind,
-        ),
     })
 }
 
@@ -220,30 +200,19 @@ impl ServiceGrant {
     }
 }
 
-/// the whole `services.toml`.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// the whole `services.toml`. `deny_unknown_fields` is the schema guard: a
+/// file this build does not understand is refused outright (no version field,
+/// no migrations — the remedy is re-granting the services).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Services {
-    pub version: u8,
     /// the grants, kind-sorted and unique. `[[service]]` in the file.
     #[serde(default, rename = "service")]
     pub grants: Vec<ServiceGrant>,
 }
 
-impl Default for Services {
-    fn default() -> Self {
-        Self {
-            version: FORMAT_VERSION,
-            grants: Vec::new(),
-        }
-    }
-}
-
 impl Services {
     fn validate(&self) -> Result<(), String> {
-        if self.version != FORMAT_VERSION {
-            return Err(format!("services: unsupported format version {}", self.version));
-        }
         let mut previous: Option<&str> = None;
         for grant in &self.grants {
             if !kind_is_well_formed(&grant.kind) {
@@ -347,8 +316,7 @@ pub fn load(workspace: &Path) -> Result<Services, String> {
         }
         Err(error) => return Err(format!("read {path:?}: {error}")),
     };
-    let services: Services =
-        toml::from_str(&text).map_err(|error| format!("{path:?}: {error}"))?;
+    let services: Services = toml::from_str(&text).map_err(|error| format!("{path:?}: {error}"))?;
     services.validate()?;
     Ok(services)
 }
@@ -634,7 +602,10 @@ fn render_build(daemon: Option<&str>, node: Option<&str>) -> String {
     };
     match Skew::between(daemon, Some(node)) {
         Skew::Matched | Skew::Unknown => daemon.to_string(),
-        Skew::Skewed => format!("{daemon} {}", paint(YELLOW, &format!("(this node: {node})"))),
+        Skew::Skewed => format!(
+            "{daemon} {}",
+            paint(YELLOW, &format!("(this node: {node})"))
+        ),
     }
 }
 
@@ -655,7 +626,10 @@ fn render_status(rows: &[ServiceRow], node_build: Option<&str>) -> String {
             paint(row.state.style(), row.state.label()),
         ));
         let fields = [
-            ("instance", row.instance.as_deref().unwrap_or("-").to_string()),
+            (
+                "instance",
+                row.instance.as_deref().unwrap_or("-").to_string(),
+            ),
             ("version", row.version.as_deref().unwrap_or("-").to_string()),
             ("build", render_build(row.build.as_deref(), node_build)),
             ("offers", join_or_dash(&row.capabilities)),
@@ -702,12 +676,59 @@ fn render_enable_summary(plan: &EnablePlan) -> String {
         ("node", format!("{} · {}", plan.chain_id, plan.node_hex8())),
         ("status", signaling),
         ("offers", offered_list(|offer| &offer.capabilities)),
-        ("grant scopes", paint(RED, &offered_list(|offer| &offer.scopes))),
+        (
+            "grant scopes",
+            paint(RED, &offered_list(|offer| &offer.scopes)),
+        ),
     ];
     let mut out = String::new();
     for (name, value) in rows {
         out.push_str(&format!("  {} {value}\n", column(name, 13, DIM)));
     }
+    out.push_str(&render_reconsent_diff(plan));
+    out
+}
+
+/// The re-consent half of the consent screen: what this enable would CHANGE
+/// about a grant that already stands. Empty for a first grant.
+///
+/// A diff rather than a list because that is the whole question being asked —
+/// the operator already consented to most of this, and what deserves their
+/// attention is the tag that was not there before. Rendered from the two
+/// records, so it says exactly what the file is about to become.
+fn render_reconsent_diff(plan: &EnablePlan) -> String {
+    let Some(previous) = &plan.previous else {
+        return String::new();
+    };
+    let had: std::collections::BTreeSet<&str> =
+        previous.capabilities.iter().map(String::as_str).collect();
+    let has: std::collections::BTreeSet<&str> =
+        plan.grant.capabilities.iter().map(String::as_str).collect();
+    let mut out = format!(
+        "\n  {} is already enabled as {}\n",
+        paint(BOLD, &plan.kind),
+        previous.display_id()
+    );
+    if had == has {
+        out.push_str(&format!(
+            "  {}\n",
+            paint(
+                DIM,
+                "the offered set is unchanged — re-consenting changes nothing"
+            )
+        ));
+        return out;
+    }
+    out.push_str("  the offered set has CHANGED since you consented:\n\n");
+    for tag in has.union(&had) {
+        let (mark, styled) = match (has.contains(tag), had.contains(tag)) {
+            (true, false) => ("+", paint(GREEN, &format!("{tag}  (new)"))),
+            (false, true) => ("-", paint(RED, &format!("{tag}  (no longer installed)"))),
+            _ => (" ", paint(DIM, tag)),
+        };
+        out.push_str(&format!("    {mark} {styled}\n"));
+    }
+    out.push('\n');
     out
 }
 
@@ -807,9 +828,11 @@ impl WorkspaceArgs {
             // `list_workspaces` yields the node.toml PATH, not the directory —
             // this verb family wants the workspace that CONTAINS it.
             1 => Ok(config::resolve_network(&workspaces.swap_remove(0).0)?.0),
-            0 => Err("no workspace: found one with `ducktape node init --name <name>` \
+            0 => Err(
+                "no workspace: found one with `ducktape node init --name <name>` \
                       or `ducktape node join <invite>`"
-                .into()),
+                    .into(),
+            ),
             _ => Err(format!(
                 "several workspaces are registered — pick one with -n:\n{}",
                 workspaces
@@ -836,7 +859,7 @@ pub(crate) struct ReadArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct KindArgs {
-    /// the service kind (`compute`)
+    /// the service kind (`compute`, `agent`, `airlock`)
     #[arg(value_name = "KIND")]
     kind: String,
     #[command(flatten)]
@@ -845,7 +868,7 @@ pub(crate) struct KindArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct RunArgs {
-    /// the service kind to run (`compute`)
+    /// the service kind to run (`compute`, `agent`, `airlock`)
     #[arg(value_name = "KIND")]
     kind: String,
     #[command(flatten)]
@@ -885,7 +908,7 @@ impl RunArgs {
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct EnableArgs {
-    /// the service kind (`compute`)
+    /// the service kind (`compute`, `agent`, `airlock`)
     #[arg(value_name = "KIND")]
     kind: String,
     #[command(flatten)]
@@ -942,9 +965,9 @@ fn read_catalog(workspace: &Path) -> Result<Catalog, crate::node_http::ReadFailu
     use crate::node_http::ReadFailure;
     let base = config::http_base_in(workspace).map_err(ReadFailure::Rejected)?;
     let body = crate::node_http::get_json(&base, "/v1/services")?;
-    let signaling = body.get("signaling").ok_or_else(|| {
-        ReadFailure::Rejected("/v1/services carries no `signaling` field".into())
-    })?;
+    let signaling = body
+        .get("signaling")
+        .ok_or_else(|| ReadFailure::Rejected("/v1/services carries no `signaling` field".into()))?;
     Ok(Catalog {
         signaling: serde_json::from_value(signaling.clone())
             .map_err(|e| ReadFailure::Rejected(format!("unexpected /v1/services shape: {e}")))?,
@@ -1053,6 +1076,10 @@ pub(crate) struct EnablePlan {
     pub node_id: [u8; 32],
     /// the reviewed hello, when the daemon is currently signaling.
     pub offered: Option<noded::services::Signaling>,
+    /// the grant this kind already holds, when this enable is a RE-CONSENT.
+    /// `None` is a first grant. What makes the consent screen a diff rather
+    /// than a list, and what `commit_enable` replaces in place.
+    pub(crate) previous: Option<ServiceGrant>,
     /// the grant this enable would mint. Decided here — minting is randomness
     /// and a clock read, not a write — so the commit below is purely two
     /// writers in order (announce, then persist) with nothing left to decide.
@@ -1088,7 +1115,13 @@ pub(crate) fn plan_enable(
     service: &config::ServiceConfig,
     node_id: [u8; 32],
 ) -> Result<EnablePlan, String> {
-    plan_enable_from(workspace, kind, service, node_id, catalog_now(workspace).signaling)
+    plan_enable_from(
+        workspace,
+        kind,
+        service,
+        node_id,
+        catalog_now(workspace).signaling,
+    )
 }
 
 /// The decide half, with the signaling catalog SUPPLIED rather than fetched.
@@ -1109,14 +1142,16 @@ fn plan_enable_from(
             "{kind:?} is not a service kind (1..32 chars of [a-z0-9-])"
         ));
     }
-    // re-enabling would mint a SECOND id for the same kind while the first is
-    // still recorded as live consent. One grant per kind: disable first.
-    if let Some(existing) = load(workspace)?.grant(kind) {
-        return Err(format!(
-            "{kind} is already enabled as {} — `ducktape service disable {kind}` first",
-            existing.display_id()
-        ));
-    }
+    // an existing grant is RE-CONSENT, not a refusal: the operator installs an
+    // executor and runs `enable` again to offer it. One grant per kind still
+    // holds — the id, its nonce and the standing it carries are kept, and only
+    // the reviewed set is re-minted (`remint_grant`), so re-consenting never
+    // mints a second id for a kind that already has live standing.
+    //
+    // It used to refuse with "disable first", which made widening a grant a
+    // revoke-and-regrant: a window with no consent on chain, a new instance id
+    // for every added CLI, and the announce retracted and re-placed in between.
+    let previous = load(workspace)?.grant(kind).cloned();
     // the grant is minted FROM a reviewed hello, so there must BE one. A
     // grant invented for an absent daemon would record no offered tags and no
     // requested scopes — the consent screen would show nothing and the
@@ -1130,7 +1165,10 @@ fn plan_enable_from(
                  start it first: ducktape service run {kind}"
             )
         })?;
-    let grant = mint_grant(kind, node_id, &offered);
+    let grant = match &previous {
+        Some(standing) => remint_grant(standing, &offered),
+        None => mint_grant(kind, node_id, &offered),
+    };
     // REFUSE here if the registry could not take what these grants imply.
     //
     // Bounded against the WIDEST set the grants could ever produce — every
@@ -1140,7 +1178,11 @@ fn plan_enable_from(
     // pass, and the union would cross the cap later when `agent` started, with
     // no verb running to refuse it and no way for the watcher to do anything
     // but announce a truncated set or nothing at all.
+    // the prospective set REPLACES a re-consented kind rather than pushing a
+    // second grant for it — the file is unique-and-sorted by kind, and a
+    // doubled kind would both fail `validate` and double-count against the cap.
     let mut prospective = load(workspace)?.grants;
+    prospective.retain(|existing| existing.kind != grant.kind);
     prospective.push(grant.clone());
     crate::announce::announced_set(
         &prospective,
@@ -1153,6 +1195,7 @@ fn plan_enable_from(
         chain_id: service.chain_id.clone(),
         node_id,
         offered: Some(offered),
+        previous,
         grant,
         capacity: service.sandbox_capacity.clone(),
     })
@@ -1167,6 +1210,25 @@ fn mint_grant(kind: &str, node_id: [u8; 32], offered: &noded::services::Signalin
         kind: kind.to_string(),
         instance: config::hex_bytes(&mint_instance(&node_id, kind, &nonce)),
         nonce: config::hex_bytes(&nonce),
+        granted_unix: now_unix(),
+        capabilities: offered.capabilities.clone(),
+        scopes: offered.scopes.clone(),
+    }
+}
+
+/// Re-mint a grant this kind ALREADY holds against a freshly reviewed hello.
+///
+/// The identity is kept — same instance id, same nonce — because the standing
+/// is the same standing: work already placed on `compute#3f9a1c02` still names
+/// a grant that exists, and a run in flight is not orphaned by the operator
+/// offering one more CLI. Only the reviewed set moves, and `granted_unix`
+/// moves with it: that field is the consent-epoch marker, and this IS a new
+/// consent.
+fn remint_grant(previous: &ServiceGrant, offered: &noded::services::Signaling) -> ServiceGrant {
+    ServiceGrant {
+        kind: previous.kind.clone(),
+        instance: previous.instance.clone(),
+        nonce: previous.nonce.clone(),
         granted_unix: now_unix(),
         capabilities: offered.capabilities.clone(),
         scopes: offered.scopes.clone(),
@@ -1207,11 +1269,15 @@ pub(crate) fn commit_enable(
     plan: &EnablePlan,
 ) -> Result<u64, String> {
     let mut services = load(workspace)?;
-    let position = services
+    // REPLACE on a re-consent, insert on a first grant — one record per kind
+    // either way, which is what `Services::validate` enforces on the next load.
+    match services
         .grants
         .binary_search_by(|existing| existing.kind.as_str().cmp(&plan.kind))
-        .unwrap_or_else(|position| position);
-    services.grants.insert(position, plan.grant.clone());
+    {
+        Ok(standing) => services.grants[standing] = plan.grant.clone(),
+        Err(position) => services.grants.insert(position, plan.grant.clone()),
+    }
     // derived HERE, from the grants as they stand now — not carried down from
     // the plan. A human may have sat on the consent prompt for a while, and
     // another `enable` on this node could have landed in the meantime;
@@ -1225,7 +1291,7 @@ pub(crate) fn commit_enable(
     )
     .map_err(|refusal| format!("{} was not enabled: {refusal}", plan.kind))?;
     save(workspace, &services)?;
-    let height = crate::announce::submit(base, &announce).map_err(|error| {
+    let height = crate::announce::submit(base, workspace, &announce).map_err(|error| {
         format!(
             "{} is granted but NOT announced, so nothing will be placed on it yet — this node \
              retries every {}s until it lands: {error}",
@@ -1323,9 +1389,10 @@ fn run_service(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
     // execution loop, so a long run never lets the node's catalog entry lapse
     // and report the daemon absent.
     let beat_base = base.clone();
+    let watch = HelloWatch::new(&kind, &service, node_key);
     std::thread::Builder::new()
         .name("service-hello".into())
-        .spawn(move || heartbeat(&beat_base, &hello, skew))?;
+        .spawn(move || heartbeat(&beat_base, hello, watch, skew))?;
 
     match serve_kind(&kind, &workspace, service, &base, node_key)? {
         // nothing to execute (an ungranted kind, or a kind with no first-party
@@ -1412,9 +1479,8 @@ pub(crate) type Stop = std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
 /// ordering that matters exists in ONE place: the handlers are installed before
 /// `body` is even constructed, which is what closes the window in which a
 /// default-disposition SIGTERM kills a daemon that has already published a
-/// gateway route or started a `podman system service`. That orphaned service
-/// child outlives its owner at ppid 1, still answering on its socket, with its
-/// containers still running — the defect this exists to prevent. Copying the
+/// gateway route — a route file outliving its owner, pointing at a port
+/// anything may then bind, is the defect this exists to prevent. Copying the
 /// ordering into three `serve` fns is how two of them drift; a body cannot get
 /// it wrong here, because it never touches it.
 ///
@@ -1447,19 +1513,14 @@ where
 
 /// Install the stop handlers NOW and return a future that waits on them: SIGTERM
 /// is what systemd and a killed shell send, SIGINT is Ctrl-C, and SIGHUP is a
-/// dropped ssh session or a closed terminal. SIGHUP must run the same teardown:
-/// the podman service child sits in its OWN process group (so Ctrl-C cannot kill
-/// it before the container sweep), which also means the terminal's HUP no longer
-/// reaches it — without this arm, a hangup would kill the daemon at default
-/// disposition and leave the detached podman running indefinitely.
+/// dropped ssh session or a closed terminal. All three run the same teardown —
+/// a daemon that dies at signal default leaves its published gateway route
+/// pointing at a port anything may then bind.
 ///
 /// The split matters. `signal()` installs the handler when it is CALLED; the
 /// future it returns only waits. Building that future lazily inside a `select!`
 /// would leave a window between the daemon publishing something and the first
-/// poll in which a SIGTERM takes its DEFAULT disposition — killing the process
-/// with a live gateway route pointing at a port anything may then bind, or with
-/// a `podman system service` child that survives at ppid 1 with its containers
-/// still running.
+/// poll in which a SIGTERM takes its DEFAULT disposition.
 ///
 /// It must also be called INSIDE a runtime: `signal()` PANICS outside a reactor
 /// rather than returning `Err`, so hoisting this out of
@@ -1467,27 +1528,22 @@ where
 /// compile-time complaint.
 ///
 /// SIGKILL is deliberately NOT covered, and cannot be: nothing runs on a
-/// `kill -9`, so the service child and its containers survive it. The answer
-/// there is the next start of the same kind — `PodmanService::claim` reaps the
-/// podman service recorded under a root nobody holds any more, and each daemon's
-/// boot sweep ([`Sweep::CrashOrphans`]) removes its label-scoped containers over
-/// the new socket on the same graph root. That path must keep working; it is the
-/// only one a SIGKILL has.
+/// `kill -9`. What survives it is only the route file, which the next start of
+/// the same kind reclaims. A run's guest does NOT survive it — the VMM is a
+/// child of this process, so the kernel takes it down with the daemon. That is
+/// the whole reason the container era's orphan sweep is gone rather than
+/// ported.
 ///
-/// A handler that will not install is NOT fatal, but it is not harmless either:
-/// the daemon then dies at signal default with no teardown, and because podman
-/// is in its own process group the service survives that death — the SIGKILL
-/// shape, cleaned up only by the next start of this kind ([`PodmanService::
-/// claim`]'s reap plus the boot sweep). The future parks so the daemon keeps
-/// owning the process.
+/// A handler that will not install is NOT fatal: the daemon then dies at signal
+/// default with no teardown, which is the SIGKILL shape above. The future parks
+/// so the daemon keeps owning the process.
 ///
 /// The other half is deliberately NOT closed, and should stay open: tokio's
 /// handlers remain installed after these `Signal`s drop, so a SECOND SIGTERM
 /// arriving during a teardown is swallowed and SIGKILL is the operator's only
-/// escape. A teardown is one file write or one container sweep — a hang there
-/// means an unwritable workspace or a wedged podman, which is the real problem —
-/// and a SIGTERM-count escalation is not worth its complexity. Do not "finish"
-/// this.
+/// escape. A teardown is one file write — a hang there means an unwritable
+/// workspace, which is the real problem — and a SIGTERM-count escalation is not
+/// worth its complexity. Do not "finish" this.
 fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
     use tokio::signal::unix::{SignalKind, signal};
     let armed = (
@@ -1512,122 +1568,12 @@ fn arm_stop_requested() -> impl std::future::Future<Output = ()> {
     }
 }
 
-/// Why a daemon is sweeping the containers carrying its own instance label —
-/// the ONE discriminant the report below branches on. The two ends of a daemon's
-/// life mean DIFFERENT things and must not be logged as one: a boot sweep
-/// destroys work a crash left running, a stop sweep is routine hygiene.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Sweep {
-    /// At BOOT. Whatever still carries this instance's label survived a death
-    /// that ran no code (SIGKILL, the OOM killer, power loss) — the stop path
-    /// leaves none. It is DESTROYED, not resumed: there is no attach path in
-    /// this tree, and a run's output lane, broker endpoint and provisioned
-    /// workspace all died with the process that owned them. The saga's lease
-    /// timeout re-leases the attempt and it executes again from the start, so
-    /// this is lost work and says so.
-    CrashOrphans,
-    /// At STOP. Our own live containers, taken down before the podman service
-    /// that hosts them — routine, and the reason a later boot can assume
-    /// anything it finds is an orphan.
-    Teardown,
-}
-
-/// What a finished sweep is worth saying. Decided here, written by
-/// [`sweep_own_containers`] — so the boot/stop distinction is checkable without
-/// a podman socket.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub(crate) enum SweepReport {
-    /// nothing carried the label: the ordinary boot, and every clean stop that
-    /// had no session running.
-    Quiet,
-    /// a crash left containers behind and their work is gone with them.
-    Destroyed(usize),
-    /// this daemon's own containers, removed on the way out.
-    Removed(usize),
-    /// the sweep itself failed. Never fatal — at boot it costs a stale
-    /// container, at stop it leaves one for the next boot to destroy.
-    Failed(String),
-}
-
-/// Decide what to say about a sweep. Pure: one discriminant, one match.
-pub(crate) fn sweep_report(sweep: Sweep, outcome: Result<usize, String>) -> SweepReport {
-    let removed = match outcome {
-        Ok(removed) => removed,
-        Err(error) => return SweepReport::Failed(error),
-    };
-    let swept_nothing = removed == 0;
-    if swept_nothing {
-        return SweepReport::Quiet;
-    }
-    match sweep {
-        Sweep::CrashOrphans => SweepReport::Destroyed(removed),
-        Sweep::Teardown => SweepReport::Removed(removed),
-    }
-}
-
-/// Remove every container carrying this instance's label, over this daemon's own
-/// podman socket.
-///
-/// The ONE sweep both daemons use, at both ends of their life — compute and
-/// agent differed only in the noun in their log line, which is not worth two
-/// copies of a rule about destroying an operator's work.
-///
-/// Best-effort by construction: a sweep failure is a line, never a boot failure
-/// and never a failed stop.
-pub(crate) async fn sweep_own_containers(
-    backend: &provider_host::SandboxBackend,
-    grant: &ServiceGrant,
-    sweep: Sweep,
-) {
-    let provider_host::SandboxBackend::Podman { socket, .. } = backend else {
-        // Tart clones and deletes a VM per run; there is no label to sweep.
-        return;
-    };
-    let label = provider_host::managed_label(&grant.display_id());
-    // Bounded: `reap_by_label` has no timeout of its own, and a wedged podman
-    // socket must not hang the stop path forever — the second Ctrl-C is
-    // deliberately swallowed (see `arm_stop_requested`), so a hang here would
-    // leave SIGKILL, which orphans the detached podman group, as the only exit.
-    // 30s is load-stated: podman's default stop grace is 10s per container and
-    // one daemon's label rarely covers more than a couple of live runs, while a
-    // WEDGED socket answers nothing at any deadline — past 30s the bound costs
-    // only stop latency. Expiry maps to `SweepReport::Failed`, which both ends
-    // of the daemon's life already declare non-fatal.
-    const SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
-    let sweep_future = provider_host::reap_by_label(socket, &label);
-    let outcome = match tokio::time::timeout(SWEEP_BUDGET, sweep_future).await {
-        Ok(outcome) => outcome,
-        Err(_elapsed) => Err(format!(
-            "sweep did not finish within {}s — podman socket not answering",
-            SWEEP_BUDGET.as_secs()
-        )),
-    };
-    match sweep_report(sweep, outcome) {
-        SweepReport::Quiet => {}
-        // a crash destroyed work: once per boot, and the operator's runs are
-        // what was lost, so it is not an `info`.
-        SweepReport::Destroyed(removed) => tracing::warn!(
-            target: "ducktape::service",
-            instance = %grant.display_id(),
-            removed,
-            reason = "crash_orphans_destroyed",
-            "containers left by an earlier death were removed, not resumed — their work re-executes from the start"
-        ),
-        SweepReport::Removed(removed) => tracing::info!(
-            target: "ducktape::service",
-            instance = %grant.display_id(),
-            removed,
-            reason = "own_containers_removed",
-            "this instance's containers were removed before its sandbox service stopped"
-        ),
-        SweepReport::Failed(error) => tracing::warn!(
-            target: "ducktape::service",
-            instance = %grant.display_id(),
-            reason = "container_sweep_failed",
-            "could not sweep this instance's containers: {error}"
-        ),
-    }
-}
+// The container-sweep machinery (`Sweep`, `SweepReport`, `sweep_own_containers`)
+// lived here. It is deleted, not ported: it existed because a crashed daemon
+// left containers running under a podman service at ppid 1, so a successor had
+// to find and destroy them by label. A microVM's VMM is a child of the daemon
+// and dies with it — including on SIGKILL, which is the case the sweep was
+// written for. There is nothing left behind to sweep.
 
 /// the grant scopes a kind's daemon actually exercises — what the consent
 /// screen shows and what `service status` lists.
@@ -1681,9 +1627,7 @@ fn offered_capabilities(
     node_key: &[u8; 32],
 ) -> Result<Vec<String>, String> {
     match daemon_for(kind) {
-        Some(Daemon::Compute) | Some(Daemon::Agent) => {
-            discover_executors(kind, service, node_key)
-        }
+        Some(Daemon::Compute) | Some(Daemon::Agent) => discover_executors(kind, service, node_key),
         Some(Daemon::Airlock) | None => Ok(Vec::new()),
     }
 }
@@ -1700,16 +1644,13 @@ fn discover_executors(
     service: &config::ServiceConfig,
     node_key: &[u8; 32],
 ) -> Result<Vec<String>, String> {
-    let backend = podman_backend(service, kind)?;
+    let backend = sandbox_backend(service)?;
     // the same precondition the node's own boot enforces — a daemon must not
     // advertise tags it has no runnable sandbox for.
-    backend.probe().map_err(|error| format!("sandbox: {error}"))?;
-    let providers = provider_host::discover(
-        node_key,
-        None,
-        backend,
-        kind,
-    )?;
+    backend
+        .probe()
+        .map_err(|error| format!("sandbox: {error}"))?;
+    let providers = provider_host::discover(node_key, None, backend, kind)?;
     Ok(providers.capabilities())
 }
 
@@ -1754,13 +1695,17 @@ fn send_hello(base: &str, hello: &noded::services::Hello) -> Result<Skew, String
         &serde_json::to_value(hello).unwrap(),
     )
     .map_err(|error| error.to_string())?;
-    Ok(Skew::between(&hello.build, body.get("build").and_then(|v| v.as_str())))
+    Ok(Skew::between(
+        &hello.build,
+        body.get("build").and_then(|v| v.as_str()),
+    ))
 }
 
-/// Whether the daemon and the node it signals to are the same build. ONE
-/// discriminant so the latch below compares states rather than juggling flags.
+/// Whether two build stamps are the same build. ONE discriminant so the
+/// latches that compare them (the service heartbeat below; the mesh peer's
+/// stamp in `replica::park`) compare states rather than juggling flags.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Skew {
+pub(crate) enum Skew {
     /// same stamp on both sides.
     Matched,
     /// the two stamps differ — the ordinary dev loop (rebuild the node, leave
@@ -1772,7 +1717,7 @@ enum Skew {
 }
 
 impl Skew {
-    fn between(mine: &str, theirs: Option<&str>) -> Skew {
+    pub(crate) fn between(mine: &str, theirs: Option<&str>) -> Skew {
         let unknown = noded::services::UNKNOWN_BUILD;
         let Some(theirs) = theirs.filter(|it| *it != unknown) else {
             return Skew::Unknown;
@@ -1891,13 +1836,134 @@ fn offer_enable(
     }
 }
 
+/// What the heartbeat needs to re-derive its hello, and the clock it decides
+/// on: the executors directory's newest mtime — the SAME signal
+/// [`provider_host::executor_image::ensure`] rebuilds the guest image from, so
+/// what a node ANNOUNCES and what its guest can EXEC can never disagree about
+/// whether a CLI was installed.
+struct HelloWatch {
+    kind: String,
+    service: config::ServiceConfig,
+    node_key: [u8; 32],
+    clock: ExecutorsClock,
+}
+
+/// The staleness clock alone: a directory and the newest mtime last seen in it.
+///
+/// Separate from [`HelloWatch`] because THIS is the decision — "did the
+/// operator's executors change?" — and it is answerable without a sandbox
+/// backend, a node key, or a running daemon, which is what makes it testable.
+struct ExecutorsClock {
+    dir: Option<std::path::PathBuf>,
+    seen: Option<std::time::SystemTime>,
+}
+
+impl ExecutorsClock {
+    /// `dir` is `None` for a backend with no executors directory; the clock
+    /// then never reports a move.
+    fn new(dir: Option<std::path::PathBuf>) -> Self {
+        let seen = dir.as_deref().and_then(newest_mtime_of);
+        Self { dir, seen }
+    }
+
+    /// Has the directory changed since the last look? Marks the new state, so
+    /// one move is reported once.
+    fn moved(&mut self) -> bool {
+        let Some(dir) = self.dir.as_deref() else {
+            return false;
+        };
+        let newest = newest_mtime_of(dir);
+        let moved = newest != self.seen;
+        self.seen = newest;
+        moved
+    }
+}
+
+impl HelloWatch {
+    /// Build the watch beside the hello that was just derived, so the clock
+    /// starts at the mtime that hello was read at.
+    fn new(kind: &str, service: &config::ServiceConfig, node_key: [u8; 32]) -> Self {
+        let dir = match sandbox_backend(service) {
+            Ok(provider_host::SandboxBackend::MicroVm { executors, .. }) => Some(executors),
+            // no [sandbox] table and the bare test backend both mean there is
+            // no directory to watch. A daemon that got this far already has
+            // whatever set it will ever offer.
+            _ => None,
+        };
+        Self {
+            kind: kind.to_string(),
+            service: service.clone(),
+            node_key,
+            clock: ExecutorsClock::new(dir),
+        }
+    }
+
+    /// Re-derive `hello` IF the executors directory moved since the last look.
+    /// A plain `stat` of the directory's entries per beat; the probe and the
+    /// PATH walk behind `discover_hello` run only on a real change, which also
+    /// keeps `sandbox_backend_ready` a lifecycle event rather than a per-beat
+    /// log bomb.
+    fn refresh(&mut self, hello: &mut noded::services::Hello) {
+        if !self.clock.moved() {
+            return;
+        }
+        // a discovery that fails leaves the last good hello standing: the
+        // executors dir is mid-install, or the sandbox went unprobeable for a
+        // moment. Retracting on a transient read would flap the announce.
+        let derived = match discover_hello(&self.kind, &self.service, &self.node_key) {
+            Ok(derived) => derived,
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::service",
+                    kind = %self.kind,
+                    reason = "rediscover_failed",
+                    "executors changed but re-discovery failed; still offering the previous \
+                     set: {error}"
+                );
+                return;
+            }
+        };
+        if derived.capabilities == hello.capabilities {
+            return;
+        }
+        tracing::info!(
+            target: "ducktape::service",
+            kind = %self.kind,
+            offering = %summarize_capabilities(&self.kind, &derived.capabilities),
+            "the executors directory changed — offering a new set"
+        );
+        *hello = derived;
+    }
+}
+
+/// [`provider_host::executor_image::newest_mtime`], with a read error folded
+/// into `None`: an unreadable directory is not a reason to stop beating, and
+/// the next beat looks again.
+fn newest_mtime_of(dir: &std::path::Path) -> Option<std::time::SystemTime> {
+    provider_host::executor_image::newest_mtime(dir)
+        .ok()
+        .flatten()
+}
+
 /// Keep the signal alive until the process is stopped.
 ///
 /// A failed beat is not fatal: the node may be restarting, and the entry simply
 /// ages out and returns. Logged on the first failure and every 30th after it,
 /// carrying the attempt count — an unconditional warn here would be a log bomb
 /// on a node that stays down.
-fn heartbeat(base: &str, hello: &noded::services::Hello, initial: Skew) -> ! {
+///
+/// The hello is RE-DERIVED whenever the executors directory changes, so
+/// `ducktape agent install`/uninstall on a running node reaches the node's
+/// catalog within one beat. It used to be computed once at startup and re-sent
+/// verbatim forever, which left a daemon announcing an executor it no longer
+/// carries until someone restarted the process — the node lying about what it
+/// can run, in the direction that strands a buyer's run.
+fn heartbeat(
+    base: &str,
+    mut hello: noded::services::Hello,
+    mut watch: HelloWatch,
+    initial: Skew,
+) -> ! {
     const LOG_EVERY: u64 = 30;
     let mut failures: u64 = 0;
     // seeded from the startup beat, so skew is named once at startup and then
@@ -1906,7 +1972,8 @@ fn heartbeat(base: &str, hello: &noded::services::Hello, initial: Skew) -> ! {
     note_skew(&hello.kind, &mut skew, initial);
     loop {
         std::thread::sleep(HEARTBEAT);
-        match send_hello(base, hello) {
+        watch.refresh(&mut hello);
+        match send_hello(base, &hello) {
             Ok(observed) => {
                 if failures > 0 {
                     tracing::info!(target: "ducktape::service", kind = %hello.kind, "signal restored");
@@ -1950,7 +2017,10 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plan = plan_enable(&workspace, &args.kind, &service, node_id)?;
 
     write_err(&render_enable_summary(&plan))?;
-    let question = format!("Enable {} on this node?", plan.kind);
+    let question = match &plan.previous {
+        Some(standing) => format!("Re-consent and keep {}?", standing.display_id()),
+        None => format!("Enable {} on this node?", plan.kind),
+    };
     if !crate::tty::confirm(&question, crate::tty::stdin_is_tty(), args.yes)? {
         write_err("not enabled\n")?;
         return Ok(());
@@ -1962,8 +2032,12 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
     // instance id and nothing else; the prose goes to stderr.
     println!("{}", plan.grant.display_id());
     write_err(&format!(
-        "{} enabled {} · {}\n",
+        "{} {} {} · {}\n",
         paint(GREEN, ServiceState::Enabled.glyph()),
+        match plan.previous {
+            Some(_) => "grant updated",
+            None => "enabled",
+        },
         plan.grant.display_id(),
         announced_line(&chain_id, height),
     ))?;
@@ -1973,6 +2047,10 @@ fn enable(args: EnableArgs) -> Result<(), Box<dyn std::error::Error>> {
         // prints — and it read its grant once at startup, so the process that
         // is up right now still executes nothing. "start it with" was advice
         // for a situation that cannot occur on this line.
+        //
+        // It is printed on a re-consent too, and for the same reason: the
+        // SERVING half reads the grant at startup (`serve_kind`), so a widened
+        // grant is announced before the running process will execute it.
         write_err(&format!(
             "  restart the daemon to pick the grant up: ^C, then ducktape service run {}\n",
             plan.kind
@@ -2024,7 +2102,7 @@ fn disable(args: KindArgs) -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|refusal| format!("{kind} was not disabled: {refusal}"))?;
     save(&workspace, &services)?;
-    let height = crate::announce::submit(&base, &announce).map_err(|error| {
+    let height = crate::announce::submit(&base, &workspace, &announce).map_err(|error| {
         format!(
             "{kind}'s grant is revoked but the announce was NOT retracted — this node retries \
              every {}s until it lands: {error}",
@@ -2062,6 +2140,49 @@ fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
+    /// A daemon used to compute its hello ONCE and re-send it verbatim until
+    /// the process was restarted, so `ducktape agent install`/uninstall on a
+    /// running node never reached the node's catalog. This is the clock that
+    /// unfroze it — and the asserts avoid the wall clock entirely (an empty
+    /// directory and a populated one differ as `None` vs `Some`, whatever the
+    /// filesystem's mtime granularity is).
+    #[test]
+    fn the_executors_clock_reports_a_change_once_and_a_quiet_directory_never() {
+        let dir = std::env::temp_dir().join(format!("dt-exec-clock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+
+        let mut clock = ExecutorsClock::new(Some(dir.clone()));
+        assert!(
+            !clock.moved(),
+            "an unchanged directory is quiet — this runs every beat"
+        );
+
+        std::fs::write(dir.join("codex"), b"#!/bin/sh\n").expect("install an executor");
+        assert!(clock.moved(), "an install is a move");
+        assert!(
+            !clock.moved(),
+            "and it is reported ONCE — a re-derive per beat would re-probe forever"
+        );
+
+        std::fs::remove_file(dir.join("codex")).expect("uninstall it");
+        assert!(
+            clock.moved(),
+            "an uninstall is a move too: this is the direction that strands a buyer's run"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bare test backend has no executors directory. A clock with nothing
+    /// to watch must never claim a move, or the daemon would re-probe forever.
+    #[test]
+    fn a_clock_with_no_directory_never_moves() {
+        let mut clock = ExecutorsClock::new(None);
+        assert!(!clock.moved());
+        assert!(!clock.moved());
+    }
+
     fn row(kind: &str) -> ServiceRow {
         ServiceRow {
             kind: kind.into(),
@@ -2093,7 +2214,10 @@ mod tests {
 
         // a kind this node HAS heard of, just not that one: name what there is.
         let wrong = only_kind(all(), Some("airlock")).expect_err("not on this node");
-        assert!(wrong.contains("agent") && wrong.contains("compute"), "{wrong}");
+        assert!(
+            wrong.contains("agent") && wrong.contains("compute"),
+            "{wrong}"
+        );
 
         // nothing at all: the only useful answer is how to start it.
         let empty = only_kind(Vec::new(), Some("compute")).expect_err("nothing here");
@@ -2164,8 +2288,8 @@ mod tests {
     /// while the production ordering was broken.
     ///
     /// The body raises a REAL SIGTERM at this process the moment it starts, i.e.
-    /// at the first instant a daemon could have published a route or started a
-    /// `podman system service`. Delete the arming and the default disposition
+    /// at the first instant a daemon could have published a route or booted a
+    /// run's VM. Delete the arming and the default disposition
     /// ends the test binary right there; hoist it out of `block_on` and
     /// `signal()` panics for want of a reactor. It then returns only because the
     /// armed handler is WIRED into the stop the body was handed — `also_stop` is
@@ -2187,8 +2311,8 @@ mod tests {
 
     /// The shape, guarded where a comment cannot reach: every daemon must ENTER
     /// through [`serve_until_stopped`]. One that builds its own runtime again is
-    /// one whose `podman system service` outlives it at ppid 1 — and no test
-    /// above would notice, because the arming it skipped still works.
+    /// one whose gateway route outlives it — and no test above would notice,
+    /// because the arming it skipped still works.
     #[test]
     fn every_daemon_enters_through_the_one_armed_entry() {
         for (daemon, source) in [
@@ -2207,30 +2331,26 @@ mod tests {
         }
     }
 
-    /// The two ends of a daemon's life are not the same event, and the log is
-    /// the only place an operator learns which one happened. A boot sweep
-    /// DESTROYS work a crash left running; a stop sweep is hygiene. Reporting
-    /// both as "reaped orphans" is what told a reader their in-flight run had
-    /// been re-adopted when it had been deleted and re-executed.
+    /// A daemon must not leave a run alive behind it, and under the microVM
+    /// backend that is a property of the code rather than of a sweep: the VMM
+    /// is spawned `kill_on_drop`, so it dies with the daemon — including on a
+    /// SIGKILL, which is the case the deleted sweep existed for.
+    ///
+    /// Guarded by parsing the source because there is no way to observe it from
+    /// a unit test: the alternative is a hardware test that SIGKILLs a daemon
+    /// and looks for stray `firecracker` processes, which is what this replaces.
     #[test]
-    fn a_boot_sweep_destroys_work_and_a_stop_sweep_does_not() {
-        assert_eq!(
-            sweep_report(Sweep::CrashOrphans, Ok(2)),
-            SweepReport::Destroyed(2),
-            "containers found at boot are lost work, not resumed work"
-        );
-        assert_eq!(
-            sweep_report(Sweep::Teardown, Ok(2)),
-            SweepReport::Removed(2),
-            "containers we take down on the way out are routine"
-        );
-        // nothing to say either way, which is the ordinary boot and most stops.
-        assert_eq!(sweep_report(Sweep::CrashOrphans, Ok(0)), SweepReport::Quiet);
-        assert_eq!(sweep_report(Sweep::Teardown, Ok(0)), SweepReport::Quiet);
-        // a sweep that could not run says so instead of claiming an empty one.
-        assert_eq!(
-            sweep_report(Sweep::Teardown, Err("no socket".into())),
-            SweepReport::Failed("no socket".into())
+    fn a_runs_vmm_cannot_outlive_the_daemon_that_spawned_it() {
+        let source = include_str!("../../../crates/services/sandbox/src/microvm.rs");
+        let (_, after_spawn) = source
+            .split_once("Command::new(&vmm_path)")
+            .expect("the VMM spawn");
+        let (args, _) = after_spawn.split_once(".spawn()").expect("spawn call");
+        assert!(
+            args.contains("kill_on_drop(true)"),
+            "the VMM must die with the daemon: without kill_on_drop a SIGKILLed \
+             daemon leaves a guest holding its whole memory footprint, with no \
+             successor able to find it"
         );
     }
 
@@ -2314,7 +2434,10 @@ mod tests {
             vec![hello_offering("compute", &["Claude Sonnet"])],
         )
         .expect_err("an illegal tag must refuse the plan");
-        assert!(error.contains("Claude Sonnet"), "the offending tag is named: {error}");
+        assert!(
+            error.contains("Claude Sonnet"),
+            "the offending tag is named: {error}"
+        );
     }
 
     #[test]
@@ -2359,6 +2482,101 @@ mod tests {
         assert_eq!(plan.grant.capabilities, vec!["codex".to_string()]);
     }
 
+    /// #1242's consent half. `agent install` widens what a host CAN run;
+    /// `announced_set` intersects the live hello with the GRANT, so the new tag
+    /// stays unannounced until the operator consents to it again. `enable` used
+    /// to refuse a kind that already had a grant ("disable first"), which made
+    /// that a revoke-and-regrant: a window with no consent on chain and a new
+    /// instance id for every added CLI.
+    #[test]
+    fn re_enabling_re_consents_in_place_and_keeps_the_instance_id() {
+        let (dir, service) = planning_workspace(&[("compute", &["claude"])]);
+        let standing = load(dir.path())
+            .expect("the fixture wrote a grant")
+            .grant("compute")
+            .cloned()
+            .expect("compute is granted");
+
+        let plan = plan_enable_from(
+            dir.path(),
+            "compute",
+            &service,
+            NODE_A,
+            // the operator has since installed codex, and removed nothing.
+            vec![hello_offering("compute", &["claude", "codex"])],
+        )
+        .expect("a second enable is a RE-CONSENT, not a refusal");
+
+        assert_eq!(
+            plan.previous.as_ref().map(|p| p.display_id()),
+            Some(standing.display_id()),
+            "the screen is a diff against the grant that already stands"
+        );
+        assert_eq!(
+            plan.grant.instance, standing.instance,
+            "the id is KEPT — work already placed on it still names a live grant"
+        );
+        assert_eq!(
+            plan.grant.nonce, standing.nonce,
+            "and so is the nonce the id is reproducible from"
+        );
+        assert_eq!(
+            plan.grant.capabilities,
+            vec!["claude".to_string(), "codex".to_string()],
+            "the newly installed executor is what the re-consent is FOR"
+        );
+    }
+
+    /// The diff is the question being asked, so it must name the new tag — and
+    /// the dropped one, which is the direction that strands a buyer's run.
+    #[test]
+    fn the_re_consent_screen_marks_what_changed_in_both_directions() {
+        let (dir, service) = planning_workspace(&[("compute", &["aider", "claude"])]);
+        let plan = plan_enable_from(
+            dir.path(),
+            "compute",
+            &service,
+            NODE_A,
+            vec![hello_offering("compute", &["claude", "codex"])],
+        )
+        .expect("re-consent plans");
+
+        // through the same adapter a pipe gets, so the asserts read the TEXT
+        // rather than tripping over the per-tag styling.
+        let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
+        assert!(screen.contains("already enabled as"), "{screen}");
+        assert!(
+            screen.contains("+ codex  (new)"),
+            "the added tag is marked: {screen}"
+        );
+        assert!(
+            screen.contains("- aider  (no longer installed)"),
+            "the tag that went away is marked, and says why: {screen}"
+        );
+        assert!(
+            screen.contains("  claude\n"),
+            "an unchanged tag rides along unmarked: {screen}"
+        );
+    }
+
+    /// Re-running `enable` with nothing installed or removed must not read as a
+    /// change — the operator should see "nothing to do", not a diff of one.
+    #[test]
+    fn re_consenting_an_unchanged_set_says_so() {
+        let (dir, service) = planning_workspace(&[("compute", &["claude"])]);
+        let plan = plan_enable_from(
+            dir.path(),
+            "compute",
+            &service,
+            NODE_A,
+            vec![hello_offering("compute", &["claude"])],
+        )
+        .expect("re-consent plans");
+        let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
+        assert!(screen.contains("unchanged"), "{screen}");
+        assert!(!screen.contains("CHANGED"), "{screen}");
+    }
+
     /// A file the registry would refuse must not LOAD, which means it fails the
     /// node's boot rather than only its announce.
     ///
@@ -2371,7 +2589,6 @@ mod tests {
     #[test]
     fn a_file_the_registry_would_refuse_does_not_load() {
         let over_cap = Services {
-            version: FORMAT_VERSION,
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
                 instance: "aa".repeat(32),
@@ -2391,7 +2608,6 @@ mod tests {
         );
 
         let illegal = Services {
-            version: FORMAT_VERSION,
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
                 instance: "aa".repeat(32),
@@ -2415,7 +2631,6 @@ mod tests {
         // so the test above pins the bound rather than a file that could never
         // load: one under the cap is fine.
         let ok = Services {
-            version: FORMAT_VERSION,
             grants: vec![ServiceGrant {
                 kind: "compute".into(),
                 instance: "aa".repeat(32),
@@ -2425,7 +2640,8 @@ mod tests {
                 scopes: Vec::new(),
             }],
         };
-        ok.validate().expect("63 executors + the kind tag is exactly the cap");
+        ok.validate()
+            .expect("63 executors + the kind tag is exactly the cap");
     }
 
     /// Consent lands on DISK before it lands on chain, in both verbs.
@@ -2439,8 +2655,9 @@ mod tests {
     /// that interval benign: the watcher then agrees with the verb.
     #[test]
     fn both_verbs_persist_before_they_announce() {
-        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
-            .expect("this file");
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
+                .expect("this file");
         for (verb, marker) in [
             ("commit_enable", "pub(crate) fn commit_enable("),
             ("disable", "fn disable(args: KindArgs)"),
@@ -2450,7 +2667,9 @@ mod tests {
                 .nth(1)
                 .and_then(|rest| rest.split("\nfn ").next())
                 .unwrap_or_else(|| panic!("{verb} has a body"));
-            let saved = body.find("save(").unwrap_or_else(|| panic!("{verb} persists"));
+            let saved = body
+                .find("save(")
+                .unwrap_or_else(|| panic!("{verb} persists"));
             let announced = body
                 .find("announce::submit(")
                 .unwrap_or_else(|| panic!("{verb} announces"));
@@ -2472,8 +2691,9 @@ mod tests {
     /// hello, and the `service list` row that would have said why.
     #[test]
     fn neither_half_of_enabling_may_abort_the_daemon() {
-        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
-            .expect("this file");
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/services.rs"))
+                .expect("this file");
         let body = source
             .split("fn offer_enable(")
             .nth(1)
@@ -2804,7 +3024,10 @@ mod tests {
         // skewed daemon out of the catalog entirely, so it could not be seen.
         let mut live = signaling("compute");
         live.build = "0.0.0-ancient".into();
-        let rows = rows(&[live], &[grant("compute", mint_instance(&NODE_A, "compute", &NONCE))]);
+        let rows = rows(
+            &[live],
+            &[grant("compute", mint_instance(&NODE_A, "compute", &NONCE))],
+        );
         assert_eq!(rows[0].state, ServiceState::Enabled);
         assert_eq!(rows[0].build.as_deref(), Some("0.0.0-ancient"));
     }
@@ -2854,7 +3077,10 @@ mod tests {
         // every input separates: node, kind and nonce each change the id.
         assert_ne!(mine, mint_instance(&NODE_B, "compute", &NONCE));
         assert_ne!(mine, mint_instance(&NODE_A, "storage", &NONCE));
-        assert_ne!(mine, mint_instance(&NODE_A, "compute", &[4u8; GRANT_NONCE_LEN]));
+        assert_ne!(
+            mine,
+            mint_instance(&NODE_A, "compute", &[4u8; GRANT_NONCE_LEN])
+        );
 
         // the domain prefix is real: the id is NOT a bare sha256 of the parts.
         let mut undomained = Sha256::new();
@@ -2925,7 +3151,6 @@ mod tests {
         assert!(grant_for(dir.path(), COMPUTE_KIND).unwrap().is_none());
 
         let services = Services {
-            version: FORMAT_VERSION,
             grants: vec![
                 grant("compute", mint_instance(&NODE_A, "compute", &NONCE)),
                 grant("storage", mint_instance(&NODE_A, "storage", &NONCE)),
@@ -2976,12 +3201,29 @@ mod tests {
             node_id: NODE_A,
             grant: mint_grant("compute", NODE_A, &offered),
             capacity: Default::default(),
+            previous: None,
+            offered: Some(offered.clone()),
+        };
+        // the same screen on a RE-CONSENT: the diff is styled per tag, so it
+        // is the shape most likely to leak an escape into a pipe.
+        let reconsent = EnablePlan {
+            previous: Some(grant("compute", NODE_A)),
             offered: Some(offered),
+            ..EnablePlan {
+                kind: "compute".into(),
+                chain_id: "ducktape#a1b2c3d4".into(),
+                node_id: NODE_A,
+                grant: mint_grant("compute", NODE_A, &signaling("compute")),
+                capacity: Default::default(),
+                previous: None,
+                offered: None,
+            }
         };
         let rendered = [
             render_list(&rows),
             render_status(&rows, Some("node-build-1")),
             render_enable_summary(&plan),
+            render_enable_summary(&reconsent),
             render_list(&[]),
             render_status(&[], None),
         ];
@@ -3022,7 +3264,10 @@ mod tests {
             .map(|row| paint(row.state.style(), row.state.glyph()))
             .collect();
         assert_eq!(
-            styles.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            styles
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
             3,
             "signaling / enabled / enabled-but-absent must be visually distinct"
         );
@@ -3113,7 +3358,6 @@ mod tests {
         save(
             dir.path(),
             &Services {
-                version: FORMAT_VERSION,
                 grants: vec![minted.clone()],
             },
         )
@@ -3196,11 +3440,7 @@ mod tests {
 
         // unsorted / duplicate kinds
         let duplicate = Services {
-            version: FORMAT_VERSION,
-            grants: vec![
-                grant("compute", [1u8; 32]),
-                grant("compute", [2u8; 32]),
-            ],
+            grants: vec![grant("compute", [1u8; 32]), grant("compute", [2u8; 32])],
         };
         assert!(duplicate.validate().is_err());
 
@@ -3209,19 +3449,17 @@ mod tests {
         short.instance.truncate(10);
         assert!(
             Services {
-                version: FORMAT_VERSION,
                 grants: vec![short],
             }
             .validate()
             .is_err()
         );
 
-        // an unknown key never parses silently
-        std::fs::write(&path, "version = 1\nsurprise = true\n").unwrap();
+        // an unknown key never parses silently — the retired version field
+        // included.
+        std::fs::write(&path, "surprise = true\n").unwrap();
         assert!(load(dir.path()).is_err());
-
-        // a future format version is a loud refusal, not a shrug
-        std::fs::write(&path, "version = 2\n").unwrap();
+        std::fs::write(&path, "version = 1\n").unwrap();
         assert!(load(dir.path()).is_err());
     }
 }

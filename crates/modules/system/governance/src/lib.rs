@@ -10,10 +10,12 @@
 //!
 //! ## why authorship is trustworthy
 //!
-//! the ordered lane verifies every frame's ed25519 signature before the host
-//! sees it, so `Origin::External(pubkey)` here is AUTHENTICATED. validator mode
-//! keys ballots directly; share mode deterministically resolves that node key
-//! to its Identity account, so no validator can forge another principal's vote.
+//! the ordered lane verifies every frame's signature before the host sees it,
+//! so `Origin::External(pubkey)` here is AUTHENTICATED. validator mode keys
+//! ballots by that node key directly; share mode deterministically resolves
+//! the origin key to its Identity account (`OfKey`), so no key can forge
+//! another principal's vote. a node key is never an account: no node is bound
+//! to one, and no account fans out to nodes.
 //!
 //! ## determinism
 //!
@@ -186,35 +188,14 @@ struct Electorate {
 
 /// who a verified frame origin speaks for (see [`Governance::resolve_actor`]).
 enum Actor {
-    /// the origin is a member key of this Identity account: it acts for every
-    /// node the account has bound (ballots stay NODE-keyed — one account
-    /// owning three electorate nodes casts three node ballots, the exact
-    /// power it held when each node voted for itself).
-    Account {
-        account_id: Vec<u8>,
-        nodes: Vec<Vec<u8>>,
-    },
-    /// the origin is no account member — it acts as itself, a node key.
-    Node(Vec<u8>),
-}
-
-impl Actor {
-    /// the node keys this actor may cast ballots as / claim standing through.
-    fn nodes(&self) -> &[Vec<u8>] {
-        match self {
-            Actor::Account { nodes, .. } => nodes,
-            Actor::Node(node) => std::slice::from_ref(node),
-        }
-    }
-
-    /// the id recorded as a proposal's `proposer` — stable across whichever
-    /// member key of an account signed.
-    fn principal(&self) -> &[u8] {
-        match self {
-            Actor::Account { account_id, .. } => account_id,
-            Actor::Node(node) => node,
-        }
-    }
+    /// the origin is a member key of Identity account `number`: in share mode
+    /// it casts that account's ONE ballot, whichever of the account's keys
+    /// signed.
+    Account { number: u64 },
+    /// the origin belongs to no account — it acts as itself, a node key, and
+    /// only a validator-mode electorate can seat it (by the origin bytes the
+    /// caller already holds, so the variant carries nothing).
+    Node,
 }
 
 /// one settled invite redemption — the single-use record plus the audit
@@ -236,8 +217,8 @@ pub struct Governance {
     /// genesis wiring — identical on every node; `None` (a net without the code
     /// registry wired) rejects those proposals at the door, deterministically.
     code_registry_id: Option<ModuleId>,
-    /// the Identity account registry used in account-share mode (member-key
-    /// ballots resolve to accounts and their bound nodes through it).
+    /// the Identity account registry used in account-share mode (an origin
+    /// key resolves to its account number through `OfKey`).
     identity_id: ModuleId,
     /// the acl submit-policy table `SetAclPolicy` proposals write. genesis
     /// wiring — identical on every node; `None` (a net without the module)
@@ -372,7 +353,8 @@ impl Governance {
         Ok(self.load(PROPOSAL_ROSTER_KEY).await?.unwrap_or_default())
     }
 
-    async fn shares(&self) -> Result<Option<BTreeMap<Vec<u8>, u64>>, Error> {
+    /// the share registry: account number → shares.
+    async fn shares(&self) -> Result<Option<BTreeMap<u64, u64>>, Error> {
         Ok(self
             .load::<Vec<ShareAllocation>>(SHARES_KEY)
             .await?
@@ -384,11 +366,11 @@ impl Governance {
             }))
     }
 
-    fn stage_shares(&mut self, shares: &BTreeMap<Vec<u8>, u64>) {
+    fn stage_shares(&mut self, shares: &BTreeMap<u64, u64>) {
         let allocations: Vec<ShareAllocation> = shares
             .iter()
             .map(|(account_id, shares)| ShareAllocation {
-                account_id: account_id.clone(),
+                account_id: *account_id,
                 shares: *shares,
             })
             .collect();
@@ -413,44 +395,31 @@ impl Governance {
         }
     }
 
-    /// resolve the verified frame origin to a governance ACTOR (ADR A1, the
-    /// account-signed lane): an origin that is a MEMBER KEY of an Identity
-    /// account acts for that account — its ballots are the account's bound
-    /// nodes. an origin that is no account member acts as ITSELF (a node key):
-    /// a validator node remains a first-class governance actor (its own
-    /// automation, upgrade tooling, self-serving ops), so node principals are
-    /// part of the current actor model.
+    /// resolve the verified frame origin to a governance ACTOR through the ONE
+    /// resolver, `OfKey`: a key of an Identity account acts for that account;
+    /// any other key acts as ITSELF, a node key. only share mode reads this —
+    /// validator mode seats node keys with no identity read at all.
     async fn resolve_actor(&self, ctx: &dyn Ctx, origin: &[u8]) -> Result<Actor, Error> {
-        // an origin that is no account member — including a network with no
-        // identity module at all (an identity query error means the module is
-        // absent, so no accounts exist) — acts as its own node key. a real
-        // network always genesis-wires identity, so the error arm is only
-        // reachable in the identity-less test hosts.
-        let resolved = self
-            .identity_account(
-                ctx,
-                IdentityQuery::OfMember {
-                    member_key: origin.to_vec(),
-                },
-            )
-            .await
-            .unwrap_or(None);
-        match resolved {
+        let query = IdentityQuery::OfKey {
+            key: origin.to_vec(),
+        };
+        match self.identity_account(ctx, query).await? {
             Some(account) => Ok(Actor::Account {
-                account_id: account.account_id,
-                nodes: account.nodes.into_iter().map(|n| n.node_key).collect(),
+                number: account.number,
             }),
-            None => Ok(Actor::Node(origin.to_vec())),
+            None => Ok(Actor::Node),
         }
     }
 
-    /// the Identity ACCOUNT a submitter speaks for in account (share) mode: a
-    /// member key resolves to its own account; a node key resolves through its
-    /// committed `BindNode`.
-    async fn account_principal(&self, ctx: &dyn Ctx, submitter: &[u8]) -> Result<Vec<u8>, Error> {
+    /// the Identity account a submitter speaks for in account (share) mode.
+    /// a key that belongs to no account has no share-mode standing: a node
+    /// key is never an account.
+    async fn submitter_account(&self, ctx: &dyn Ctx, submitter: &[u8]) -> Result<u64, Error> {
         match self.resolve_actor(ctx, submitter).await? {
-            Actor::Account { account_id, .. } => Ok(account_id),
-            Actor::Node(node) => self.account_of_node(ctx, &node).await,
+            Actor::Account { number } => Ok(number),
+            Actor::Node => Err(Error::Module(
+                "submitter key belongs to no Identity account".into(),
+            )),
         }
     }
 
@@ -470,44 +439,26 @@ impl Governance {
             .await?;
         match identity_decode_reply(&reply).map_err(Error::Module)? {
             IdentityReply::Account(account) => Ok(account),
-            other => Err(Error::Module(format!(
-                "identity answered an account query with {other:?}"
-            ))),
+            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+                Err(Error::Module("unexpected identity reply".into()))
+            }
         }
     }
 
-    async fn account_of_node(&self, ctx: &dyn Ctx, node_key: &[u8]) -> Result<Vec<u8>, Error> {
-        self.identity_account(
-            ctx,
-            IdentityQuery::OfNode {
-                node_key: node_key.to_vec(),
-            },
-        )
-        .await?
-        .map(|account| account.account_id)
-        .ok_or_else(|| Error::Module("submitter node is not bound to an Identity account".into()))
-    }
-
-    async fn require_account(&self, ctx: &dyn Ctx, account_id: &[u8]) -> Result<(), Error> {
-        if self
-            .identity_account(
-                ctx,
-                IdentityQuery::Get {
-                    account_id: account_id.to_vec(),
-                },
-            )
+    async fn require_account(&self, ctx: &dyn Ctx, number: u64) -> Result<(), Error> {
+        let exists = self
+            .identity_account(ctx, IdentityQuery::Get { number })
             .await?
-            .is_some()
-        {
-            Ok(())
-        } else {
-            Err(Error::Module(
+            .is_some();
+        if !exists {
+            return Err(Error::Module(
                 "share allocation names no existing Identity account".into(),
-            ))
+            ));
         }
+        Ok(())
     }
 
-    fn total_power(powers: &BTreeMap<Vec<u8>, u64>) -> Result<u64, Error> {
+    fn total_power<K>(powers: &BTreeMap<K, u64>) -> Result<u64, Error> {
         let total = powers.values().try_fold(0u64, |sum, power| {
             sum.checked_add(*power)
                 .ok_or_else(|| Error::Module("total governance shares overflow u64".into()))
@@ -547,74 +498,50 @@ impl Governance {
             let shares = self.shares().await?.ok_or_else(|| {
                 Error::Module("account-share mode has no configured registry".into())
             })?;
-            let account_id = self.account_principal(ctx, submitter).await?;
-            if !shares.contains_key(&account_id) {
+            let number = self.submitter_account(ctx, submitter).await?;
+            let holds_shares = shares.contains_key(&number);
+            if !holds_shares {
                 return Err(Error::Module(
                     "submitter account holds no governance shares".into(),
                 ));
             }
             let total = Self::total_power(&shares)?;
+            let powers = shares
+                .into_iter()
+                .map(|(number, shares)| (identity::account_principal(number), shares))
+                .collect();
             return Ok((
-                account_id,
+                identity::account_principal(number),
                 Electorate {
                     voter_kind: VoterKind::Account,
                     rule: Self::threshold_rule(total, action, true),
-                    powers: shares,
+                    powers,
                 },
             ));
         }
 
-        // validator mode (the default): ballots stay NODE-keyed — N
-        // validators = N votes. the module-side ACL (A1): the submitter must
-        // hold member standing. a submitter that is DIRECTLY a member node acts
-        // as itself with NO identity read (a validator's own key, and any host
-        // without an identity module); only a non-member origin is resolved as
-        // an account member key through its committed `BindNode`s.
+        // validator mode (the default): ballots are NODE-keyed — N validators
+        // = N votes — and the submitter must ITSELF be a member node, with no
+        // identity read (a node key is never an account, and an account never
+        // fans out to nodes).
         let members = self.members(ctx).await?;
-        let proposer = if members.iter().any(|member| member == submitter) {
-            submitter.to_vec()
-        } else {
-            let actor = self.resolve_actor(ctx, submitter).await?;
-            if !actor.nodes().iter().any(|node| members.contains(node)) {
-                return Err(Error::Module(
-                    "submitter holds no validator-set standing (no member node bound to it)".into(),
-                ));
-            }
-            actor.principal().to_vec()
-        };
+        let submitter_is_member = members.iter().any(|member| member == submitter);
+        if !submitter_is_member {
+            return Err(Error::Module(
+                "submitter is not a validator-set member node".into(),
+            ));
+        }
         let powers: BTreeMap<Vec<u8>, u64> =
             members.into_iter().map(|member| (member, 1)).collect();
         let total = Self::total_power(&powers)?;
         Ok((
-            proposer,
+            submitter.to_vec(),
             Electorate {
                 voter_kind: VoterKind::ValidatorNode,
                 rule: Self::threshold_rule(total, action, false),
                 powers,
             },
         ))
-    }
-
-    /// the node ballots one submitter casts against a NODE-keyed electorate: a
-    /// submitter that is directly in the electorate casts its own (no identity
-    /// read); otherwise it is resolved as an account member key and casts EVERY
-    /// bound node still in the electorate. empty ⇒ the submitter has no standing.
-    async fn node_ballots(
-        &self,
-        ctx: &dyn Ctx,
-        submitter: &[u8],
-        eligible: &dyn Fn(&[u8]) -> bool,
-    ) -> Result<Vec<Vec<u8>>, Error> {
-        if eligible(submitter) {
-            return Ok(vec![submitter.to_vec()]);
-        }
-        let actor = self.resolve_actor(ctx, submitter).await?;
-        Ok(actor
-            .nodes()
-            .iter()
-            .filter(|node| eligible(node))
-            .cloned()
-            .collect())
     }
 
     /// the CURRENT resident set (valset's staged-over-committed projection) —
@@ -667,7 +594,7 @@ impl Governance {
             allocations: shares
                 .iter()
                 .map(|(account_id, shares)| ShareAllocation {
-                    account_id: account_id.clone(),
+                    account_id: *account_id,
                     shares: *shares,
                 })
                 .collect(),
@@ -699,11 +626,11 @@ impl Governance {
                             "initial share allocations must be positive".into(),
                         ));
                     }
-                    self.require_account(ctx, &allocation.account_id).await?;
-                    if normalized
+                    self.require_account(ctx, allocation.account_id).await?;
+                    let duplicate = normalized
                         .insert(allocation.account_id, allocation.shares)
-                        .is_some()
-                    {
+                        .is_some();
+                    if duplicate {
                         return Err(Error::Module(
                             "initial share allocation contains a duplicate account".into(),
                         ));
@@ -724,12 +651,12 @@ impl Governance {
                         "account shares must be at most {MAX_SAFE_SHARES}"
                     )));
                 }
-                self.require_account(ctx, account_id).await?;
+                self.require_account(ctx, *account_id).await?;
                 let mut after = current.clone();
                 if *shares == 0 {
                     after.remove(account_id);
                 } else {
-                    after.insert(account_id.clone(), *shares);
+                    after.insert(*account_id, *shares);
                 }
                 if after.len() > MAX_SHARE_ACCOUNTS {
                     return Err(Error::Module(format!(
@@ -840,8 +767,9 @@ impl Governance {
                         .into(),
                 ));
             }
-            let well_formed_target =
-                !target.is_empty() && target.trim() == target && target.len() <= acl::MAX_TARGET_LEN;
+            let well_formed_target = !target.is_empty()
+                && target.trim() == target
+                && target.len() <= acl::MAX_TARGET_LEN;
             if !well_formed_target {
                 return Err(Error::Module(format!(
                     "acl target must be a non-empty, untrimmed module id of at most {} bytes",
@@ -920,41 +848,23 @@ impl Governance {
         }
         let submitter = Self::external_origin(ctx)?;
         let electorate = &proposal.electorate;
-        // the ballots this op casts, by the proposal's frozen principal kind.
-        let voters: Vec<Vec<u8>> = match electorate.voter_kind {
-            // node-keyed ballots (N validators = N votes): a submitter in the
-            // frozen electorate casts its own; an account member's op casts
-            // EVERY bound node still in the electorate — the same power the
-            // account held when each node voted for itself.
-            VoterKind::ValidatorNode => {
-                let voters = self
-                    .node_ballots(ctx, &submitter, &|node| {
-                        electorate.powers.contains_key(node)
-                    })
-                    .await?;
-                if voters.is_empty() {
-                    return Err(Error::Module(
-                        "submitter is not a member of this proposal's frozen electorate".into(),
-                    ));
-                }
-                voters
-            }
+        // the ONE ballot this op casts, by the proposal's frozen principal
+        // kind: a node key is its own ballot (N validators = N votes); an
+        // account key casts its account's ballot — however many keys the
+        // account has, re-voting overwrites the same principal.
+        let voter = match electorate.voter_kind {
+            VoterKind::ValidatorNode => submitter,
             VoterKind::Account => {
-                let principal = self.account_principal(ctx, &submitter).await?;
-                if !electorate.powers.contains_key(&principal) {
-                    return Err(Error::Module(
-                        "submitter is not a member of this proposal's frozen electorate".into(),
-                    ));
-                }
-                vec![principal]
+                identity::account_principal(self.submitter_account(ctx, &submitter).await?)
             }
         };
-        // Re-voting overwrites by frozen principal. Two nodes bound to one
-        // account therefore cast the same-direction ballots together, and an
-        // account (share) principal stays one ballot regardless of node count.
-        for voter in voters {
-            proposal.votes.insert(voter, approve);
+        let in_electorate = electorate.powers.contains_key(&voter);
+        if !in_electorate {
+            return Err(Error::Module(
+                "voter is not in the frozen electorate".into(),
+            ));
         }
+        proposal.votes.insert(voter, approve);
         self.store_proposal(&proposal_id, &proposal)
     }
 
@@ -1101,9 +1011,9 @@ impl Governance {
                         // opened. Settle cleanly; initialization is one-time.
                         proposal.status = ProposalStatus::Rejected;
                     } else {
-                        let shares: BTreeMap<Vec<u8>, u64> = allocations
+                        let shares: BTreeMap<u64, u64> = allocations
                             .iter()
-                            .map(|a| (a.account_id.clone(), a.shares))
+                            .map(|a| (a.account_id, a.shares))
                             .collect();
                         if Self::total_power(&shares).is_err() {
                             proposal.status = ProposalStatus::Rejected;
@@ -1121,7 +1031,7 @@ impl Governance {
                     if *shares == 0 {
                         after.remove(account_id);
                     } else {
-                        after.insert(account_id.clone(), *shares);
+                        after.insert(*account_id, *shares);
                     }
                     if after.len() > MAX_SHARE_ACCOUNTS || Self::total_power(&after).is_err() {
                         proposal.status = ProposalStatus::Rejected;
@@ -1198,7 +1108,7 @@ impl Governance {
             .map_err(|e| Error::Module(format!("token signature: {e}")))?;
         let proof_sig = ed25519::Signature::decode(proof.as_slice())
             .map_err(|e| Error::Module(format!("join proof: {e}")))?;
-        // EVERY invite is bearer (the targeted form was dropped — see the join ADR): there is
+        // EVERY invite is bearer (the targeted form was dropped): there is
         // no target lock. The join proof below binds the redemption to
         // whichever key presents it, and the nonce set makes that
         // exactly-once — that is the whole containment story.
@@ -1319,8 +1229,16 @@ impl Module for Governance {
                 proof,
                 expires_unix_secs,
             } => {
-                self.handle_redeem(ctx, issuer, nonce, token_sig, joiner, proof, expires_unix_secs)
-                    .await
+                self.handle_redeem(
+                    ctx,
+                    issuer,
+                    nonce,
+                    token_sig,
+                    joiner,
+                    proof,
+                    expires_unix_secs,
+                )
+                .await
             }
         }
     }
@@ -1350,15 +1268,15 @@ impl Module for Governance {
                     .map(|p| Self::view_of(&proposal_id, &p)),
             ))),
             GovQuery::Redemption { nonce } => {
-                let view = self
-                    .load::<Redemption>(&red_key(&nonce))
-                    .await?
-                    .map(|r| RedemptionView {
-                        nonce: nonce.clone(),
-                        joiner: r.joiner,
-                        issuer: r.issuer,
-                        height: r.height,
-                    });
+                let view =
+                    self.load::<Redemption>(&red_key(&nonce))
+                        .await?
+                        .map(|r| RedemptionView {
+                            nonce: nonce.clone(),
+                            joiner: r.joiner,
+                            issuer: r.issuer,
+                            height: r.height,
+                        });
                 Ok(encode_reply(&GovReply::Redemption(view)))
             }
             GovQuery::Shares => Ok(encode_reply(&GovReply::Shares(self.shares_view().await?))),

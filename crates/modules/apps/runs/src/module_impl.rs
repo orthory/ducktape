@@ -51,10 +51,6 @@ impl Ctx for BudgetCtx<'_, '_> {
         self.inner.emit_event(event);
     }
 
-    fn relay(&self) -> Option<&sdk::Relay> {
-        self.inner.relay()
-    }
-
     fn set_output(&mut self, bytes: Vec<u8>) {
         self.inner.set_output(bytes);
     }

@@ -22,9 +22,9 @@
 //!
 //! What is left below the pty is exactly this crate: a provider set, a bounded
 //! map of live `InteractiveSession`s, one pump task each, and a wall-clock
-//! reaper. That is also precisely the podman-touching part, which is the point:
-//! after the carve the node process constructs no provider set, no
-//! `PodmanService` and no pty.
+//! reaper. That is also precisely the sandbox-touching part, which is the
+//! point: after the carve the node process constructs no provider set and no
+//! pty.
 //!
 //! ## the failure domain
 //!
@@ -42,8 +42,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use provider_host::{
-    AirlockConfig, CredentialKind, InteractiveSession, Provider, ProviderSet, ResolvedCredential,
-    RunContext, WorkRef,
+    AirlockConfig, InteractiveSession, Provider, ProviderSet, ResolvedCredential, RunContext,
+    WorkRef,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -78,8 +78,8 @@ struct Inner {
     /// optional: a daemon with no runnable sandbox refuses to start, so "no
     /// sandbox" is a state only the node can be in (no daemon attached).
     providers: ProviderSet,
-    /// this host's canonical execution id — podman lifecycle cleanup scopes
-    /// container reaping to it.
+    /// this host's canonical execution id — a run's directories are named from
+    /// it, so two nodes sharing one user never collide.
     executing_node: String,
     /// per-session workdirs are created under here (the provider mounts one rw
     /// into the container; the fresh mount namespace fences the rest off), and
@@ -192,7 +192,7 @@ enum Drive {
 }
 
 impl Sessions {
-    /// build the plane. `executing_node` is this host's podman lifecycle id and
+    /// build the plane. `executing_node` is this host's run-scoping id and
     /// `events` is the daemon's link to its node.
     pub fn new(
         providers: ProviderSet,
@@ -351,9 +351,9 @@ impl Sessions {
             .map_err(|detail| (wire::Refusal::SpawnFailed, detail))?;
         let ctx = RunContext {
             agent_id: Some(spec.provider.clone()),
-            // podman requires the executing-node id for lifecycle scoping.
+            // the executing-node id scopes this run's directories.
             executing_node: Some(self.0.executing_node.clone()),
-            // a fresh per-session workdir, mounted rw into the container and
+            // a fresh per-session workdir, carried into the sandbox rw and
             // removed when `home` drops.
             workdir_override: Some(home.path()),
             limits: spec.limits,
@@ -577,10 +577,7 @@ async fn reaper_fires(lifetime: Duration, cancel: oneshot::Receiver<()>) -> bool
 pub fn credential_wire(resolved: &ResolvedCredential) -> wire::Credential {
     wire::Credential {
         name: resolved.name.clone(),
-        kind: match resolved.kind {
-            CredentialKind::Claude => wire::CredentialKind::Claude,
-            CredentialKind::Codex => wire::CredentialKind::Codex,
-        },
+        kind: resolved.kind,
         authority: resolved.authority.clone(),
         via: resolved.via.clone(),
         seal_pk: resolved.seal_pk,
@@ -600,10 +597,7 @@ fn airlock_config(credential: wire::Credential) -> AirlockConfig {
     AirlockConfig::self_host(
         &ResolvedCredential {
             name: credential.name,
-            kind: match credential.kind {
-                wire::CredentialKind::Claude => CredentialKind::Claude,
-                wire::CredentialKind::Codex => CredentialKind::Codex,
-            },
+            kind: credential.kind,
             authority: credential.authority,
             via: credential.via,
             seal_pk: credential.seal_pk,
@@ -628,8 +622,8 @@ pub fn discover(
 mod tests {
     use super::*;
 
-    /// a provider that spawns a pty on a plain host `cat` — no podman, no
-    /// broker, no image — so the session LIFECYCLE (which is what owns the
+    /// a provider that spawns a pty on a plain host `cat` — no VM, no broker,
+    /// no guest image — so the session LIFECYCLE (which is what owns the
     /// workdir) is exercisable without a sandbox. `spawns = false` is the
     /// spawn-failure arm.
     struct StubProvider {
@@ -748,31 +742,5 @@ mod tests {
         let (tx, rx) = oneshot::channel::<()>();
         drop(tx);
         assert!(!reaper_fires(Duration::from_secs(1), rx).await);
-    }
-
-    #[test]
-    fn the_credential_mirror_keeps_both_vendor_arms() {
-        // a silent mis-map here would send a Claude session to a Codex gateway.
-        for (wire_kind, expected) in [
-            (wire::CredentialKind::Claude, CredentialKind::Claude),
-            (wire::CredentialKind::Codex, CredentialKind::Codex),
-        ] {
-            let resolved = ResolvedCredential {
-                name: "c".into(),
-                kind: expected,
-                authority: "a".into(),
-                via: "http://v".into(),
-                seal_pk: [7u8; 32],
-            };
-            let expected_config = AirlockConfig::self_host(&resolved, WorkRef::Direct);
-            let built = airlock_config(wire::Credential {
-                name: "c".into(),
-                kind: wire_kind,
-                authority: "a".into(),
-                via: "http://v".into(),
-                seal_pk: [7u8; 32],
-            });
-            assert_eq!(built, expected_config);
-        }
     }
 }

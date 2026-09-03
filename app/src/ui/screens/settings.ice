@@ -4,7 +4,7 @@
 // `screens/roster.ice` for the screen contract: no app state is reachable from
 // here, so every reading is a prop and every act leaves as a named event that
 // `view.ice` routes back to the handler of the same name.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_id:str, bind account_name_draft:str, account_renaming:bool, account_bound:bool, account_members:i64, account_nodes:i64, appearance:Appearance, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:Appearance, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
   emits
     select_shell_tab(ShellTab)
     reconnect()
@@ -13,6 +13,19 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     lock_session
     account_name_draft_changed(str)
     account_rename_submit()
+    account_create_draft_changed(str)
+    account_create_submit()
+    account_key_draft_changed(str)
+    account_key_label_draft_changed(str)
+    account_key_add_submit()
+    account_join_draft_changed(str)
+    account_key_join_submit()
+    account_key_remove(str)
+    account_passkey_submit()
+    account_passkey_desktop()
+    account_ceremony_cancel()
+    account_wallet_submit()
+    account_login_submit()
     copy_to_clipboard(str, str)
     settings_clear_tabs()
     forget_workspace_submit()
@@ -262,27 +275,29 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     Badge.Outline label=member_tier(members_rows)
                   if empty(member_tier(members_rows)) && members_answered
                     Badge.Outline label="standing unknown"
-                // The key line says WHICH keypair this is and that it lives
-                // on this device — the custody clause the artifact carries.
+                // The number line says WHICH account this key belongs to and
+                // that the key lives on this device — the custody clause the
+                // artifact carries.
                 row
                   with
                     w=fill
                     gap=5.0
                     align=center
-                  text account_id
+                  text account_number
                     with
                       size=10.5
                       wrap=none
                       font=code_medium
                       @text-hint
-                  // The separator belongs to the KEY, which an unbound account
-                  // does not have: `load_account` answers "" for every field
-                  // until one is bound, and drawn unconditionally the dot led
-                  // the line — `· validator keypair on this device`. Every
-                  // other separator in the console is gated by the run it
-                  // introduces (forge.ice's repo-count dot says so in its own
-                  // comment); this one was the exception.
-                  if !empty(account_id)
+                  // The separator belongs to the NUMBER, which a key outside
+                  // every account does not have: `load_account` answers "" for
+                  // every field until the key belongs to one, and drawn
+                  // unconditionally the dot led the line — `· validator
+                  // keypair on this device`. Every other separator in the
+                  // console is gated by the run it introduces (forge.ice's
+                  // repo-count dot says so in its own comment); this one was
+                  // the exception.
+                  if !empty(account_number)
                     text "·"
                       with
                         size=10.5
@@ -331,16 +346,92 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                       h=28.0
                       p=5.0
                       @secondary_action
-                // ACCOUNT FACTS, ONLY WHEN THERE IS AN ACCOUNT. Unbound,
-                // `load_account` returns zeros for every field, and the card
-                // printed `0 keys 0 nodes` one line under "· validator keypair
-                // on this device" — a count of the account's keys read as a
-                // count of this device's, and the two contradicted each other
-                // in the same card. `account_bound` is the fact that tells
-                // them apart, and it was already in state gating Rename.
-                if account_bound
+                // NO ACCOUNT YET: this key founds one, or joins one another
+                // device minted a ticket for. Both are user-signed frames;
+                // both need the signing seat, so they wait on `password`.
+                if !account_exists
+                  row
+                    with
+                      w=fill
+                      h=28.0
+                      gap=5.0
+                      align=center
+                    input "" #account-create <-> account_create_draft
+                      with
+                        label="Account name"
+                        change=emit(account_create_draft_changed, _)
+                        hint="name your account…"
+                        disabled=account_busy
+                        w=150.0
+                        p=5.0
+                        text-size=13.0
+                        line-h=1.2
+                        @control
+                      active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                      hovered bg=elevated border=fg/21
+                      disabled bg=muted_bg/54 value=muted
+                    button "Create account" -> emit(account_create_submit)
+                      with
+                        disabled=(account_busy || empty(password) || empty(trim(account_create_draft)))
+                        h=28.0
+                        p=5.0
+                        @secondary_action
+                  row
+                    with
+                      w=fill
+                      h=28.0
+                      gap=5.0
+                      align=center
+                    input "" #account-join <-> account_join_draft
+                      with
+                        label="Add-key ticket"
+                        change=emit(account_join_draft_changed, _)
+                        hint="paste a ticket from a member device…"
+                        disabled=account_busy
+                        w=150.0
+                        p=5.0
+                        text-size=13.0
+                        line-h=1.2
+                        @control
+                      active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                      hovered bg=elevated border=fg/21
+                      disabled bg=muted_bg/54 value=muted
+                    button "Join" -> emit(account_key_join_submit)
+                      with
+                        disabled=(account_busy || empty(password) || empty(trim(account_join_draft)))
+                        h=28.0
+                        p=5.0
+                        @secondary_action
+                  // …or a passkey registered on a member device consents in
+                  // the browser — no ticket to carry across.
+                  row
+                    with
+                      w=fill
+                      h=28.0
+                      gap=5.0
+                      align=center
+                    text "…or let a passkey from another device admit this one."
+                      with
+                        w=fill
+                        size=12.0
+                        @text-meta
+                    button "Log in with a passkey" -> emit(account_login_submit)
+                      with
+                        disabled=(account_busy || empty(password))
+                        h=28.0
+                        p=5.0
+                        @secondary_action
+                // ACCOUNT FACTS, ONLY WHEN THERE IS AN ACCOUNT. With the key
+                // in no account, `load_account` returns zeros for every field,
+                // and the card printed `0 keys` one line under "· validator
+                // keypair on this device" — a count of the account's keys
+                // read as a count of this device's, and the two contradicted
+                // each other in the same card. `account_exists` is the fact
+                // that tells them apart, and it was already in state gating
+                // Rename.
+                if account_exists
                   row gap=8.0 align=center
-                    text account_members
+                    text account_keys
                       with
                         size=12.0
                         wrap=none
@@ -351,24 +442,171 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                         size=12.5
                         wrap=none
                         @text-meta
-                    text account_nodes
-                      with
-                        size=12.0
-                        wrap=none
-                        font=code
-                        @text-meta
-                    text "nodes"
-                      with
-                        size=12.5
-                        wrap=none
-                        @text-meta
                     space w=fill
-                    button "Copy key" -> emit(copy_to_clipboard, account_id, "Key copied")
+                    button "Copy number" -> emit(copy_to_clipboard, account_number, "Number copied")
                       with
-                        disabled=empty(account_id)
+                        disabled=empty(account_number)
                         h=28.0
                         p=7.0
                         @secondary_action
+        // THE ACCOUNT'S KEYS — every device, wallet or passkey on it. A row
+        // per association; `Remove` is member-gated by the module and
+        // last-key-gated here (`account_keys <= 1`) so the card never offers
+        // the one removal consensus refuses.
+        if account_exists
+          col w=fill gap=9.0
+            GroupLabel label="ACCOUNT KEYS"
+            GroupCard
+              col w=fill
+                for row in account_key_rows
+                  box
+                    with
+                      w=fill
+                      px=15.0
+                      py=11.0
+                    row
+                      with
+                        w=fill
+                        gap=10.0
+                        align=center
+                      Badge.Outline label=row.scheme
+                      col
+                        with
+                          w=fill
+                          gap=2.0
+                          clip=true
+                        if !empty(row.label)
+                          text row.label
+                            with
+                              size=12.5
+                              wrap=none
+                              @text-fg
+                        if empty(row.label)
+                          text "(unlabeled)"
+                            with
+                              size=12.5
+                              wrap=none
+                              @text-muted
+                        text row.pubkey
+                          with
+                            size=10.5
+                            wrap=none
+                            font=code
+                            @text-hint
+                      button "Remove" -> emit(account_key_remove, row.pubkey)
+                        with
+                          disabled=(account_busy || empty(password) || account_keys <= 1)
+                          h=26.0
+                          p=5.0
+                          @secondary_action
+                // ADD A DEVICE: paste the other device's key, mint the ticket
+                // it joins with (`ducktape account key add`, in the app).
+                box
+                  with
+                    w=fill
+                    px=15.0
+                    py=13.0
+                  col w=fill gap=7.0
+                    text "Add a device"
+                      with
+                        size=12.5
+                        wrap=none
+                        @text-accent_fg
+                    row
+                      with
+                        w=fill
+                        gap=7.0
+                        align=center
+                      input "" #account-key <-> account_key_draft
+                        with
+                          label="Other device's public key"
+                          change=emit(account_key_draft_changed, _)
+                          hint="paste its ed25519 key (hex)…"
+                          disabled=account_busy
+                          w=fill
+                          p=5.0
+                          text-size=12.5
+                          line-h=1.2
+                          @control
+                        active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                        hovered bg=elevated border=fg/21
+                        disabled bg=muted_bg/54 value=muted
+                      input "" #account-key-label <-> account_key_label_draft
+                        with
+                          label="Key label"
+                          change=emit(account_key_label_draft_changed, _)
+                          hint="label…"
+                          disabled=account_busy
+                          w=120.0
+                          p=5.0
+                          text-size=12.5
+                          line-h=1.2
+                          @control
+                        active bg=elevated border=fg/16 value=fg placeholder=muted selection=fg/18 border-w=1.0 r=7.0
+                        hovered bg=elevated border=fg/21
+                        disabled bg=muted_bg/54 value=muted
+                      button "Mint ticket" -> emit(account_key_add_submit)
+                        with
+                          disabled=(account_busy || empty(password) || empty(trim(account_key_draft)))
+                          h=28.0
+                          p=5.0
+                          @secondary_action
+                    // …or a passkey: from the phone (the card shows a QR),
+                    // or in this computer's browser; or an Ethereum wallet
+                    // in the browser. Each signs its own admission (the
+                    // label above names it).
+                    row
+                      with
+                        w=fill
+                        gap=7.0
+                        align=center
+                      text "…or a passkey:"
+                        with
+                          w=fill
+                          size=12.0
+                          @text-meta
+                      button "On your phone" #account-passkey-qr -> emit(account_passkey_submit)
+                        with
+                          disabled=(account_busy || empty(password))
+                          h=28.0
+                          p=5.0
+                          @secondary_action
+                      button "In this browser" -> emit(account_passkey_desktop)
+                        with
+                          disabled=(account_busy || empty(password))
+                          h=28.0
+                          p=5.0
+                          @secondary_action
+                      button "Link a wallet" -> emit(account_wallet_submit)
+                        with
+                          disabled=(account_busy || empty(password))
+                          h=28.0
+                          p=5.0
+                          @secondary_action
+                    CeremonyPlate #account-ceremony
+                      with
+                        phase=account_ceremony_phase
+                        qr=account_ceremony_qr
+                        detail=account_ceremony_detail
+                        left=account_ceremony_left
+                      forward
+                        account_ceremony_cancel
+                    if !empty(account_ticket)
+                      row
+                        with
+                          w=fill
+                          gap=7.0
+                          align=center
+                        text "Ticket minted — paste it on the other device."
+                          with
+                            w=fill
+                            size=12.0
+                            @text-meta
+                        button "Copy ticket" -> emit(copy_to_clipboard, account_ticket, "Ticket copied")
+                          with
+                            h=26.0
+                            p=5.0
+                            @secondary_action
         col w=fill gap=9.0
           GroupLabel label="IDENTITY KEY"
           GroupCard

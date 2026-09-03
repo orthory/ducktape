@@ -29,24 +29,25 @@ pub fn fs_entry_named(entries: Vec<FsEntry>, path: String) -> FsEntry {
 
 /// Directory rows prepared with the listing so the keyed sidebar does not
 /// filter and clone the full entry list while building every frame.
-pub fn fs_directories(entries: Vec<FsEntry>) -> Vec<FsEntry> {
+pub fn fs_directories(entries: &[FsEntry]) -> Vec<FsEntry> {
     entries
-        .into_iter()
+        .iter()
         .filter(|entry| entry.kind == "dir")
+        .cloned()
         .collect()
 }
 
 /// What is under this crumb, counted. Ice cannot filter a list by field, so the
 /// crumb bar's two counts are pure folds over the listing it is already drawn
 /// beside — never a second `files_ls`.
-pub fn fs_dir_count(entries: Vec<FsEntry>) -> i64 {
+pub fn fs_dir_count(entries: &[FsEntry]) -> i64 {
     count_i64(entries.iter().filter(|entry| entry.kind == "dir").count())
 }
 
 /// Everything that is not a directory. `files_ls` publishes one `kind` per row
 /// and the browser draws exactly two shapes, so the complement IS the file
 /// count — no third bucket can hide here.
-pub fn fs_file_count(entries: Vec<FsEntry>) -> i64 {
+pub fn fs_file_count(entries: &[FsEntry]) -> i64 {
     count_i64(entries.iter().filter(|entry| entry.kind != "dir").count())
 }
 
@@ -57,13 +58,13 @@ pub fn fs_file_count(entries: Vec<FsEntry>) -> i64 {
 /// that directory's tally, printed under the new one's name. Same rule as the
 /// register subtitles in backend/shell.rs: say nothing rather than something
 /// false.
-pub fn fs_counts_summary(connected: bool, listed: bool, entries: Vec<FsEntry>) -> String {
+pub fn fs_counts_summary(connected: bool, listed: bool, entries: &[FsEntry]) -> String {
     if !connected || !listed || entries.is_empty() {
         return String::new();
     }
-    let file_count = fs_file_count(entries.clone());
-    let files = plural(file_count, "file".into(), "files".into());
-    let dirs = plural(fs_dir_count(entries), "dir".into(), "dirs".into());
+    let file_count = fs_file_count(entries);
+    let files = plural(file_count, "file", "files");
+    let dirs = plural(fs_dir_count(entries), "dir", "dirs");
     format!("{files} · {dirs}")
 }
 
@@ -91,6 +92,11 @@ pub struct FsPreview {
     pub text: String,
     pub truncated: bool,
     pub binary: bool,
+    /// The body is a decoded picture in the Files surface's slot
+    /// (`picture.rs`), drawn at `width` × `height`; `text` is empty.
+    pub picture: bool,
+    pub width: i64,
+    pub height: i64,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -180,7 +186,9 @@ pub fn size_label(bytes: i64) -> String {
     }
 }
 
-/// Read a file's head bytes for the preview pane (64 KiB window).
+/// Read a file for the preview pane. A picture (by path — `picture_path`)
+/// pages its whole body in and decodes it into the Files surface's slot;
+/// anything else reads a 64 KiB head.
 pub async fn files_preview(
     rpc: String,
     path: String,
@@ -188,35 +196,131 @@ pub async fn files_preview(
 ) -> Result<FsPreview, HydrationError> {
     async {
         let rpc = rpc_client(&rpc)?;
-        let reply = rpc
-            .files_get("read", &[("path", path.as_str()), ("len", "65536")])
-            .await?;
-        let b64 = reply["b64"].as_str().unwrap_or_default();
-        let eof = reply["eof"].as_bool().unwrap_or(true);
-        let bytes = base64_decode(b64).unwrap_or_default();
-        let (text, binary) = match String::from_utf8(bytes.clone()) {
-            Ok(text)
-                if !text
-                    .chars()
-                    .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') =>
-            {
-                (text, false)
-            }
-            _ => (format!("{} binary bytes", bytes.len()), true),
-        };
-        Ok(FsPreview {
-            generation,
-            path,
-            text,
-            truncated: !eof,
-            binary,
-        })
+        match super::picture::picture_path(path.clone()) {
+            true => files_picture(&rpc, path, generation).await,
+            false => files_text(&rpc, path, generation).await,
+        }
     }
     .await
     .map_err(|message: String| HydrationError {
         generation,
         message: user_error(message),
     })
+}
+
+/// The text preview: the first 64 KiB, branded binary on a control byte.
+async fn files_text(
+    rpc: &RpcClient,
+    path: String,
+    generation: i64,
+) -> Result<FsPreview, String> {
+    let reply = rpc
+        .files_get("read", &[("path", path.as_str()), ("len", "65536")])
+        .await?;
+    let b64 = reply["b64"].as_str().unwrap_or_default();
+    let eof = reply["eof"].as_bool().unwrap_or(true);
+    let bytes = base64_decode(b64).unwrap_or_default();
+    let (text, binary) = match String::from_utf8(bytes.clone()) {
+        Ok(text)
+            if !text
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t' && c != '\r') =>
+        {
+            (text, false)
+        }
+        _ => (format!("{} binary bytes", bytes.len()), true),
+    };
+    Ok(FsPreview {
+        generation,
+        path,
+        text,
+        truncated: !eof,
+        binary,
+        picture: false,
+        width: 0,
+        height: 0,
+    })
+}
+
+/// The picture preview: page the whole file through the 1 MiB `read` lane
+/// (the checkout's `read_all` shape), decode off the runtime, park the handle.
+/// A file past the byte cap or one that does not decode falls back to the
+/// binary plate with the reason as its line — never a global error.
+async fn files_picture(
+    rpc: &RpcClient,
+    path: String,
+    generation: i64,
+) -> Result<FsPreview, String> {
+    use super::picture::{FILES_SURFACE, MAX_PICTURE_BYTES, store_picture};
+    let Some(bytes) = files_read_all(rpc, &path).await? else {
+        let note = format!(
+            "picture larger than the {} MiB preview limit",
+            MAX_PICTURE_BYTES >> 20
+        );
+        return Ok(binary_preview(generation, path, note));
+    };
+    let size = bytes.len();
+    match store_picture(FILES_SURFACE, path.clone(), bytes).await {
+        Ok((width, height)) => Ok(FsPreview {
+            generation,
+            path,
+            text: String::new(),
+            truncated: false,
+            binary: false,
+            picture: true,
+            width: i64::from(width),
+            height: i64::from(height),
+        }),
+        Err(reason) => Ok(binary_preview(
+            generation,
+            path,
+            format!("{size} binary bytes · did not decode: {reason}"),
+        )),
+    }
+}
+
+/// Page one duckfs file in whole through the `read` lane (1 MiB pages to eof
+/// — the checkout's `read_all` shape). `None`: past the picture byte cap,
+/// not assembled.
+pub(crate) async fn files_read_all(rpc: &RpcClient, path: &str) -> Result<Option<Vec<u8>>, String> {
+    use super::picture::MAX_PICTURE_BYTES;
+    // The `read` lane's own page cap (duckfs `MAX_READ_BYTES`); the node clamps
+    // anything larger, so asking for exactly it is one round-trip per MiB.
+    let page_len = (1024 * 1024).to_string();
+    let mut bytes = Vec::new();
+    loop {
+        let offset = bytes.len().to_string();
+        let reply = rpc
+            .files_get(
+                "read",
+                &[("path", path), ("offset", offset.as_str()), ("len", page_len.as_str())],
+            )
+            .await?;
+        let page = base64_decode(reply["b64"].as_str().unwrap_or_default()).unwrap_or_default();
+        let eof = reply["eof"].as_bool().unwrap_or(true);
+        bytes.extend_from_slice(&page);
+        let past_cap = bytes.len() > MAX_PICTURE_BYTES;
+        if past_cap {
+            return Ok(None);
+        }
+        let done = eof || page.is_empty();
+        if done {
+            return Ok(Some(bytes));
+        }
+    }
+}
+
+fn binary_preview(generation: i64, path: String, text: String) -> FsPreview {
+    FsPreview {
+        generation,
+        path,
+        text,
+        truncated: false,
+        binary: true,
+        picture: false,
+        width: 0,
+        height: 0,
+    }
 }
 
 /// The committed snapshot window, newest first.
@@ -460,13 +564,11 @@ pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// A child path under the current directory.
+/// A child path under the current directory (`/` is the root, never "").
 pub fn fs_child(path: String, name: String) -> String {
     let name = name.trim().trim_matches('/');
-    if path.is_empty() {
-        return format!("/{name}");
-    }
-    format!("{path}/{name}")
+    let dir = path.trim_end_matches('/');
+    format!("{dir}/{name}")
 }
 
 /// Minimal base64 (standard alphabet, padded) — the files read lane's wire.
@@ -493,10 +595,11 @@ pub(crate) fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// The breadcrumb path one level up ("" at the root).
+/// The breadcrumb path one level up. The root is `/` — duckfs only accepts
+/// absolute paths, and "" earned a 400 from the node on every root open.
 pub fn fs_parent(path: String) -> String {
     match path.rfind('/') {
-        Some(0) | None => String::new(),
+        Some(0) | None => "/".to_string(),
         Some(cut) => path[..cut].to_string(),
     }
 }

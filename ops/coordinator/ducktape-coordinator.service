@@ -2,10 +2,9 @@
 #
 # Runs bin/coordinator (STUN reflexive + rendezvous; never carries peer
 # traffic). It is NOT a validator, holds NO key material, serves NO state, and
-# NEVER decrypts —
-# see docs/superpowers/specs/2026-07-05-private-cutover-coordinator-design.md.
-# The hardening below makes those invariants structural: a dynamic throwaway
-# user, an empty capability set, a read-only filesystem, and no secrets on disk.
+# NEVER decrypts. The hardening below makes those invariants structural: a dynamic throwaway
+# user, one capability (binding the 443 relay lane), a read-only filesystem,
+# and no secrets on disk.
 [Unit]
 Description=Ducktape private-cutover coordinator (untrusted STUN/rendezvous)
 Documentation=https://github.com/orthory/ducktape/blob/dev/docs/deploy/coordinator.md
@@ -27,9 +26,12 @@ RestartSec=2
 # ---- least privilege ----------------------------------------------------
 # Ephemeral, on-the-fly user/group: nothing to compromise, no home, no shell.
 DynamicUser=yes
-# 3478 > 1024, so binding it needs NO privileged-port capability. Drop them all.
-CapabilityBoundingSet=
-AmbientCapabilities=
+# ONE capability: the TCP relay lane binds 443, and every joiner derives its
+# first-contact fallback as <this host>:443 (bin/node/src/replica/wiring.rs,
+# `coordinator_relays`) — a unit that cannot bind it ships a coordinator whose
+# metrics say `relay=off` while every joiner assumes on. UDP 3478 needs none.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 # Stateless: no state/config/cache/log dirs, no writable paths at all.
 ProtectSystem=strict

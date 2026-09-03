@@ -12,7 +12,7 @@ name = "coordinator"
 path = "src/main.rs"
 
 [dependencies]
-nat-traversal = { workspace = true }
+nat-traversal = { workspace = true, features = ["runtime"] }
 tokio = { workspace = true, features = ["net", "rt", "macros", "time"] }
 # reading the PUBLIC genesis valset out of network.toml (--genesis-set). No
 # secret, no node-crate dependency: a local GenesisPin struct + hex decode.
@@ -20,6 +20,11 @@ commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
 serde = { workspace = true }
 toml = "0.8"
+# The coordinator's whole log sink. It has no LogRing and no node-crate
+# dependency, so it installs its own stderr subscriber rather than inverting
+# that boundary to reuse `noded::log`.
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "process", "io-util"] }

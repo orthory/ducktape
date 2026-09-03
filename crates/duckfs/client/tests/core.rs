@@ -1,10 +1,10 @@
-//! the pure core: chunk hashing byte-identical to the module, and the versioned
-//! `.duckfs` index (atomic save, round-trip, future-version rejection).
+//! the pure core: chunk hashing byte-identical to the module, and the
+//! `.duckfs` index (atomic save, round-trip, unknown-schema rejection).
 
 use std::collections::BTreeMap;
 
 use duckfs_client::chunk::{chunk_ids, file_object_id};
-use duckfs_client::index::{EntryKind, INDEX_VERSION, Index, IndexEntry};
+use duckfs_client::index::{EntryKind, Index, IndexEntry};
 use duckfs_core::objects::{FileObj, object_id};
 use duckfs_core::{CHUNK_SIZE, Kind};
 
@@ -88,28 +88,23 @@ fn index_round_trips_and_rejects_future_versions() {
     idx.save(dir.path()).unwrap();
     let loaded = Index::load(dir.path()).unwrap();
     assert_eq!(loaded, idx, "save -> load is a faithful round-trip");
-    assert_eq!(loaded.version, INDEX_VERSION);
 
-    // a future-version index fails loudly with a re-checkout remedy — the client
-    // never silently misreads a schema it was not built for.
+    // A document must carry every current field. Missing fields are not an
+    // older shape to upgrade in place; the checkout must be rebuilt, and the
+    // parse error names the re-checkout remedy.
     let index_file = dir.path().join(".duckfs").join("index.json");
-    std::fs::write(&index_file, br#"{"version":99}"#).unwrap();
-    let err = Index::load(dir.path()).unwrap_err();
-    assert!(
-        err.to_string().contains("re-checkout"),
-        "the version-mismatch error advises a re-checkout: {err}"
-    );
-
-    // A v1 document must carry every current field. Missing fields are not an
-    // older shape to upgrade in place; the checkout must be rebuilt.
     std::fs::write(
         &index_file,
-        br#"{"version":1,"prefix":"/shared/ws","node":"http://node:8080"}"#,
+        br#"{"prefix":"/shared/ws","node":"http://node:8080"}"#,
     )
     .unwrap();
     let err = Index::load(dir.path()).unwrap_err();
     assert!(
         matches!(err, duckfs_client::index::IndexError::Parse(_)),
-        "an incomplete v1 index must not receive removed defaults: {err}"
+        "an incomplete index must not receive removed defaults: {err}"
+    );
+    assert!(
+        err.to_string().contains("re-checkout"),
+        "the parse error advises a re-checkout: {err}"
     );
 }

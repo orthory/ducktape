@@ -411,6 +411,62 @@ fn oversized_actions_fail_the_run_deterministically() {
 }
 
 #[test]
+fn an_over_cap_action_set_is_refused_not_truncated() {
+    // the COUNT peer of the test above, and the reason normalization no longer
+    // truncates: a response carrying one action past the cap must fail the run
+    // BY NAME — in the breadcrumb and in the chat reply the run posts — instead
+    // of silently losing its tail and delivering a partial action set the agent
+    // never sees dropped.
+    let over_cap = MAX_ACTIONS_PER_RUN + 1;
+    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_TASKS_CREATE]);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    let actions = (0..over_cap)
+        .map(|n| AgentAction::CreateTask {
+            task_id: format!("t{n}"),
+            title: format!("task {n}"),
+        })
+        .collect();
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run_id, Ok(response(&["on it"], actions))),
+    )
+    .unwrap();
+    commit(&mut m);
+
+    let cap_sentence = format!("{over_cap} actions exceed the cap of {MAX_ACTIONS_PER_RUN}");
+    let breadcrumbs: Vec<String> = ctx
+        .events
+        .iter()
+        .map(|e| String::from_utf8_lossy(&e.payload).into_owned())
+        .collect();
+    assert!(
+        breadcrumbs.iter().any(|b| b.contains(&cap_sentence)),
+        "the validator's own count check is reachable: {breadcrumbs:?}"
+    );
+    let posted = ctx
+        .chat_msgs()
+        .into_iter()
+        .filter_map(|msg| match msg {
+            ChatMsg::PostMessage { blocks, .. } => Some(format!("{blocks:?}")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        posted.iter().any(|text| text.contains(&cap_sentence)),
+        "the reply says the action set was refused for exceeding the cap: {posted:?}"
+    );
+    assert!(
+        ctx.task_msgs().is_empty(),
+        "an over-cap set delivers NO action — never the first eight"
+    );
+}
+
+#[test]
 fn code_blocks_survive_normalization_into_chat_blocks() {
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
     let raw = r#"{"reply_blocks":[{"id":"b1","kind":"paragraph","text":"hello"},{"kind":"code","lang":"rust","text":"fn main() {}"},{"kind":"Alien","text":"dropped"},{"kind":"paragraph","text":"  "}],"actions":[]}"#;

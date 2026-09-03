@@ -25,12 +25,17 @@ tracing = { workspace = true }
 sdk = { workspace = true }
 host = { workspace = true }
 thiserror = { workspace = true }
-# op frames are ed25519-SIGNED: encode signs, decode verifies, so the host's
-# Origin::External is authenticated authorship.
+# op frames are SIGNED: encode signs (ed25519, the node/device key), decode
+# verifies under the frame's declared scheme, so the host's Origin::External
+# is authenticated authorship under any scheme a key can carry.
+keyscheme = { workspace = true }
 commonware-cryptography = { workspace = true }
-commonware-codec = { workspace = true }
 
 [dev-dependencies]
+# the `log_file` rotation tests open real files in an isolated dir.
+tempfile = { workspace = true }
+# non-ed25519 frame proofs in tests/frame_schemes.rs.
+keyscheme = { workspace = true, features = ["testkit"] }
 # a SELF dev-dependency (the `data-plane` pattern): `tests/submit_decoded.rs`
 # opens with `#![cfg(feature = "sim")]` and `sim` is off by default, so
 # `cargo test -p node` compiled it to `running 0 tests` — a green that proved

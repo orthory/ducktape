@@ -1,20 +1,17 @@
-//! the versioned `.duckfs/index.json` — git's index discipline for duckfs.
+//! the `.duckfs/index.json` — git's index discipline for duckfs.
 //!
 //! a checkout writes this beside the materialized tree; status/commit read it as
 //! the base state (the snapshot the working copy descends from, plus a per-path
 //! hash/size/mtime record). it is a private, OS-side artifact — never consensus
-//! state — so the format is a plain versioned json document, saved atomically
+//! state — so the format is a plain json document, saved atomically
 //! (`tmp` → rename) so a crash mid-write never leaves a half-written index.
+//! there is no version field (flag-day rule: no migrations) — an index this
+//! build cannot parse is rebuilt by re-checkout, never upgraded in place.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-
-/// the on-disk index format version. bumped only on a breaking layout change; a
-/// client refuses any other version with a re-checkout remedy rather than
-/// misread a schema it was not built for.
-pub const INDEX_VERSION: u32 = 1;
 
 /// the per-checkout state directory, at the root of the materialized tree.
 pub const DUCKFS_DIR: &str = ".duckfs";
@@ -58,7 +55,6 @@ pub struct IndexEntry {
 /// path keyed by its absolute duckfs path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Index {
-    pub version: u32,
     /// the snapshot per-path CAS commits against; `None` on a checkout of the
     /// empty filesystem (first commit will pass `base_snapshot: None`).
     pub base_snapshot: Option<String>,
@@ -69,20 +65,19 @@ pub struct Index {
     pub entries: BTreeMap<String, IndexEntry>,
 }
 
-/// index errors are plain (no `files:` prefix — that prefix is the module's; this
-/// is client-side). the version mismatch names the re-checkout remedy the spec
-/// prescribes ("the client re-checks out").
+/// index errors are plain (no `files:` prefix — that prefix is the module's;
+/// this is client-side). a parse failure's remedy is the spec's re-checkout
+/// ("the client re-checks out") — an unparseable index is rebuilt, never
+/// upgraded in place.
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
     #[error("duckfs: index io: {0}")]
     Io(String),
-    #[error("duckfs: index is not valid json: {0}")]
-    Parse(String),
     #[error(
-        "duckfs: index version {found} is unsupported (this client writes v{expected}); \
+        "duckfs: index is not valid for this client ({0}); \
          re-checkout the directory to rebuild it"
     )]
-    Version { found: u32, expected: u32 },
+    Parse(String),
 }
 
 impl Index {
@@ -94,7 +89,6 @@ impl Index {
         base_snapshot: Option<String>,
     ) -> Self {
         Index {
-            version: INDEX_VERSION,
             base_snapshot,
             prefix: prefix.into(),
             node: node.into(),
@@ -112,27 +106,10 @@ impl Index {
         Index::dir(root).join(INDEX_FILE)
     }
 
-    /// load and validate the index at `<root>/.duckfs/index.json`. the version is
-    /// checked BEFORE a full parse so a future schema fails with the re-checkout
-    /// remedy instead of an opaque deserialize error over unfamiliar fields.
+    /// load and validate the index at `<root>/.duckfs/index.json`. any schema
+    /// this build cannot parse fails with the re-checkout remedy.
     pub fn load(root: &Path) -> Result<Index, IndexError> {
         let bytes = std::fs::read(Index::path(root)).map_err(|e| IndexError::Io(e.to_string()))?;
-
-        // version-probe first: `{"version":N}` alone must route to the version
-        // error, never a missing-field parse error.
-        #[derive(Deserialize)]
-        struct VersionProbe {
-            version: u32,
-        }
-        let probe: VersionProbe =
-            serde_json::from_slice(&bytes).map_err(|e| IndexError::Parse(e.to_string()))?;
-        if probe.version != INDEX_VERSION {
-            return Err(IndexError::Version {
-                found: probe.version,
-                expected: INDEX_VERSION,
-            });
-        }
-
         serde_json::from_slice(&bytes).map_err(|e| IndexError::Parse(e.to_string()))
     }
 

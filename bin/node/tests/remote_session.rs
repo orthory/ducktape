@@ -4,14 +4,15 @@
 //! running a scripted child (`cat`, standing in for a provider so the test needs
 //! no real API), forwards a keystroke line over the INPUT lane, and observes the
 //! echoed bytes fan back onto the guest node's own `term:<id>` topic. Then the
-//! guest closes the session and the host reaps the container.
+//! guest closes the session and the host tears the VM down.
 //!
 //! Every wait is on the system's own events — a committed-state query, a log
 //! marker, or the next ws frame — never a fixed sleep.
 //!
-//! Requires a working Podman (the interactive plane exists only on a sandboxed node):
-//! the test SKIPS loudly when podman is absent, exactly like the crate's other
-//! live-podman integration tests. The credential/airlock swap is proven by the
+//! Requires a bootable microVM (the interactive plane exists only on a
+//! sandboxed node): `/dev/kvm` open to this process and the guest images built.
+//! The test SKIPS loudly when they are absent, exactly like the crate's other
+//! live sandbox integration tests. The credential/airlock swap is proven by the
 //! airlock e2e; the echo provider declares no broker, so the seeded credential
 //! here only exercises the host's admission gate, not a live upstream.
 //!
@@ -29,14 +30,16 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::{Cluster, hex, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{
+    Cluster, create_account, hex, poll_until, sandbox_toml, serial, skip_unless_sandboxed,
+    submit_frame,
+};
 use commonware_cryptography::{Signer as _, ed25519};
 use futures::{SinkExt as _, StreamExt as _};
 use gateway::{
     CredentialKind, CredentialRecord, DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply,
     MemberAuthorization, SetCredentialStatement, set_credential_preimage,
 };
-use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth};
 use serde_json::json;
 use tokio::runtime::Runtime;
 use tokio_tungstenite::tungstenite::Message;
@@ -47,30 +50,11 @@ const FINALIZE: Duration = Duration::from_secs(60);
 /// bound (container cold-start + the mesh hop); a deadline, not a poll.
 const ECHO: Duration = Duration::from_secs(120);
 
-/// the image the scripted echo provider runs in: this suite's child is driven
-/// through a pty, so it keeps the fuller `node` base rather than the harness
-/// default.
-const SANDBOX_IMAGE: &str = "docker.io/library/node:22-slim";
+// The scripted echo provider used to name its own container image. Every node
+// now boots the same shared guest rootfs, so what a run can execute is decided
+// when that image is built (ops/build-guest-rootfs.sh), not per suite.
 
-fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
-    identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
-}
-
-fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<AccountView> {
-    let bytes = cluster.query(
-        reader,
-        "identity",
-        &identity::encode_query(&IdentityQuery::OfNode {
-            node_key: node.to_vec(),
-        }),
-    )?;
-    match identity::decode_reply(&bytes).ok()? {
-        IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) => None,
-    }
-}
-
-fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<Vec<u8>> {
+fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
@@ -159,20 +143,16 @@ args = []
 /// `secret` is the guest node's own 0600 service-link token: `term:` is a
 /// workspace-gated topic, so without it the subscribe is refused and this
 /// connection has nothing to send a keystroke on.
-async fn drive_and_observe_echo(
-    port: u16,
-    session_id: &str,
-    topic: &str,
-    secret: &str,
-) -> bool {
+async fn drive_and_observe_echo(port: u16, session_id: &str, topic: &str, secret: &str) -> bool {
     let url = format!("ws://127.0.0.1:{port}/v1/ws");
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("guest ws connect");
 
-    let subscribe =
-        json!({ "op": "subscribe", "topics": [topic], "token": secret }).to_string();
-    ws.send(Message::Text(subscribe)).await.expect("ws subscribe");
+    let subscribe = json!({ "op": "subscribe", "topics": [topic], "token": secret }).to_string();
+    ws.send(Message::Text(subscribe))
+        .await
+        .expect("ws subscribe");
 
     // the input handler needs the ADMITTED handle registered, so wait for the
     // ack before forwarding a keystroke.
@@ -225,9 +205,10 @@ async fn await_term_ended(port: u16, topic: &str, secret: &str) -> bool {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("guest ws connect");
-    let subscribe =
-        json!({ "op": "subscribe", "topics": [topic], "token": secret }).to_string();
-    ws.send(Message::Text(subscribe)).await.expect("ws subscribe");
+    let subscribe = json!({ "op": "subscribe", "topics": [topic], "token": secret }).to_string();
+    ws.send(Message::Text(subscribe))
+        .await
+        .expect("ws subscribe");
 
     while let Some(frame) = ws.next().await {
         let Ok(Message::Text(text)) = frame else {
@@ -263,11 +244,11 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     // node's whole lifetime.
     let spec_dir = echo_spec_dir();
 
-    // two real WireGuard nodes: guest (0) directs, host (1) sandboxes. Both run a
-    // Podman terminal plane; only the host carries the echo provider.
+    // two real WireGuard nodes: guest (0) directs, host (1) sandboxes. Both run
+    // a terminal plane; only the host carries the echo provider.
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    cluster.extra_toml = sandbox_toml(SANDBOX_IMAGE);
+    cluster.extra_toml = sandbox_toml();
     cluster.env[1] = vec![(
         "DUCKTAPE_CAPABILITY_DIR".into(),
         spec_dir.path().display().to_string(),
@@ -300,76 +281,76 @@ fn guest_drives_a_scripted_child_on_the_host_over_the_forwarded_lane() {
     let guest_node = Cluster::identity(0);
     let host_node = Cluster::identity(1);
 
-    // bind the guest node to the guest account. The HOST no longer derives a
-    // creator account at all — whether the credential may be drawn on is the
-    // lender's decision, made against the account the lender's node stamps on the
-    // gateway hop, which is the HOST's. What this binding still buys is the
-    // publisher→owner tie the gateway module needs for the record below, and the
-    // `.duck` handle the host resolves as the airlock authority.
+    // the guest USER founds an account through the guest node. The HOST derives
+    // no creator account at all — whether the credential may be drawn on is the
+    // lender's decision, made against the work a session points at. What this
+    // account still buys is the owner the gateway module ties the record below
+    // to, and the `.duck` handle the host resolves as the airlock authority.
     //
-    // So this test no longer proves an admission decision about the guest. What
+    // So this test proves no admission decision about the guest's ACCOUNT. What
     // it does prove is the half that survives: a peer-created session spawns,
     // streams, and is input-gated to its creator node.
-    cluster.submit(
-        0,
-        "identity",
-        &identity::encode_msg(&IdentityMsg::BindNode {
-            authorizer: bind_auth(&guest, &cluster.namespace, &guest_node),
-        }),
-    );
-    poll_until("guest identity binding", FINALIZE, || {
-        account_of_node(&cluster, 1, &guest_node)
-            .filter(|account| account.account_id == guest.public_key().as_ref())
+    let guest_account = create_account(&cluster, 0, &guest, "guest");
+    poll_until("the guest account to reach the host", FINALIZE, || {
+        common::account_of_key(&cluster, 1, guest.public_key().as_ref())
     });
 
     // the guest registers a `.duck` handle — the owner-airlock authority the host
     // resolves for the credential (unused by the broker-less echo provider, but
     // the admission path resolves it).
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &guest,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("guest".into()),
         }),
     );
     poll_until("guest handle resolves", FINALIZE, || {
-        resolve_handle(&cluster, 1, "guest")
-            .filter(|account| account.as_slice() == guest.public_key().as_ref())
+        resolve_handle(&cluster, 1, "guest").filter(|account| *account == guest_account)
     });
 
-    // seed a credential the guest owns on committed gateway state — submitted via
-    // the guest node so its origin is the guest node (the publisher the module
-    // ties to the owner account).
+    // seed a credential the guest's account owns on committed gateway state —
+    // a user-signed frame, so its origin is a member of the owner account.
     let record = CredentialRecord {
         name: "guest-fable-1".into(),
-        owner_account: guest.public_key().as_ref().to_vec(),
+        owner_account: guest_account,
         publisher_node: guest_node.clone(),
         kind: CredentialKind::Claude,
         seal_pk: [9; 32],
         grants: Default::default(),
     };
     let credential = signed_set_credential(&guest, &cluster.namespace, record);
-    cluster.submit(0, "gateway", &gateway::encode_msg(&credential));
+    submit_frame(
+        &cluster,
+        0,
+        &guest,
+        "gateway",
+        &gateway::encode_msg(&credential),
+    );
     poll_until("credential is committed", FINALIZE, || {
         credential_present(&cluster, 1, "guest-fable-1")
     });
 
     // THE HOST DECIDES WHOSE WORK IT RUNS — the other half of the handshake.
     //
-    // The credential grant above is the GUEST saying who may draw on it. This is
+    // The credential above is the GUEST saying what may be drawn on. This is
     // node 1 saying it will run node 0's work at all. Work admission landed in
     // "a host decides whose work it runs" (2026-07-26), which taught
     // `sched_pinned_run` to write this policy but not this suite — and this
-    // suite could not notice, because it was skipped for want of the podman
-    // sandbox tools and libtest counts a skip as `ok`. Without it the host
+    // suite could not notice, because it was skipped for want of the sandbox's
+    // host prerequisites and libtest counts a skip as `ok`. Without it the host
     // answers 502 `work_not_admitted`.
     //
-    // Written as the FILE the operator (and `ducktape node work admit`)
-    // produces, not through the writer, and re-read on every decision — so it
-    // lands with no restart.
+    // A directed create arrives over the MESH, vouched for as a peer NODE and
+    // carrying no user proof — and a node is never an account, so no account
+    // list admits it: only `anyone` does. Written as the FILE the operator (and
+    // `ducktape node work admit anyone`) produces, not through the writer, and
+    // re-read on every decision — so it lands with no restart.
     std::fs::write(
         cluster.workspace(1).join("work-admit.toml"),
-        format!("admit = [\"{}\"]\n", hex(guest.public_key().as_ref())),
+        "admit = [\"anyone\"]\n",
     )
     .expect("write work-admit.toml");
 
@@ -471,25 +452,37 @@ fn a_parked_joiner_serves_the_terminal_plane() {
     let _serial = serial();
     let mut cluster = common::NetworkShapeCluster::new();
     let chain_id = cluster.init_founder("term-parked-joiner");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", READY);
 
     let invite = cluster.invite();
     let friend_key_hex = cluster.join_friend(&invite);
-    assert_eq!(friend_key_hex.len(), 64, "join prints the friend's pubkey hex");
+    assert_eq!(
+        friend_key_hex.len(),
+        64,
+        "join prints the friend's pubkey hex"
+    );
     cluster.spawn(1);
     // the regression: pre-fix, a joiner never wired the plane, so this marker
     // never appeared and every create answered the plane-missing 503.
     cluster.wait_marker(1, "terminal_plane_ready", READY);
 
-    let (status, body) = common::http_request(
-        cluster.http_ports[1],
+    // creating a session MUTATES this node, so the request carries the node's
+    // own operator credential — the harness spawned it, so it is its operator.
+    let (status, body) = cluster.http(
+        1,
         "POST",
         "/v1/term/sessions",
         Some(&json!({ "agent": "echo" })),
     );
-    assert_eq!(status, 503, "no agent service is attached, so the create refuses: {body}");
+    assert_eq!(
+        status, 503,
+        "no agent service is attached, so the create refuses: {body}"
+    );
     assert!(
         body["error"]
             .as_str()

@@ -2,9 +2,10 @@
 //!
 //! The provider child never receives the operator's API/OAuth credential.
 //! Only this host process reads it, and serves a single-run loopback endpoint
-//! the child dials with an unrelated random bearer. Podman binds
-//! loopback; Tart binds the host side of its private NAT so the VM can reach it
-//! by a guest-only hostname.
+//! the child dials with an unrelated random bearer. LOOPBACK for every run
+//! there is: a guest has no network device at all and reaches this over a vsock
+//! tunnel terminating on a host-owned socket, so it dials `127.0.0.1` exactly
+//! as a local child would and the broker never binds past loopback.
 //!
 //! Two wire shapes ship: the OpenAI Responses API (`codex exec`, aimed by argv)
 //! and the Anthropic Messages API (`claude`, aimed by env — see
@@ -296,41 +297,23 @@ pub struct BrokerEndpoint {
     pub control_token: String,
 }
 
-/// how the provider child reaches this run's broker — which drives BOTH the
-/// bind address and the `base_url` the child is handed.
+/// The broker always binds LOOPBACK and always hands the child a loopback URL.
 ///
-/// `Loopback` is a same-netns child that shares the host's loopback: only the
-/// test-only Bare host, which runs the executor directly with no container.
-/// bind `127.0.0.1`, hand it `http://127.0.0.1:<port>`.
-///
-/// `HostGateway(host)` is a child in a SEPARATE netns that reaches the host only
-/// through a gateway name in its `/etc/hosts` — a Tart VM guest (`ducktape-host`)
-/// or a private-netns Podman container (`host.containers.internal`, which every
-/// Podman run now uses). The broker binds a routable interface and the base_url
-/// names the gateway. The opaque per-run bearer still gates it; binding beyond
-/// loopback is the reachability cost of the stronger network isolation.
-#[derive(Clone, Copy)]
-pub enum Reachability {
-    Loopback,
-    HostGateway(&'static str),
-}
+/// There used to be a second shape here, for a child in its own netns reaching
+/// the host through a gateway name in its `/etc/hosts`
+/// (`host.containers.internal`). It went with the container backend, and the
+/// microVM does not bring it back: a guest has NO network device at all, and
+/// reaches this broker over a vsock tunnel that terminates on a socket the host
+/// process owns. So the guest dials `127.0.0.1:<port>` exactly as a local child
+/// would — it never learns the far end is outside the VM, and the broker never
+/// has to bind past loopback to be reachable.
+const BROKER_BIND: std::net::Ipv4Addr = std::net::Ipv4Addr::LOCALHOST;
 
-impl Reachability {
-    fn bind(self) -> std::net::Ipv4Addr {
-        match self {
-            Self::Loopback => std::net::Ipv4Addr::LOCALHOST,
-            Self::HostGateway(_) => std::net::Ipv4Addr::UNSPECIFIED,
-        }
-    }
-
-    /// `suffix` is `/v1` for codex (base points at the provider root) and `""`
-    /// for Anthropic (Claude Code appends `/v1/messages` to `ANTHROPIC_BASE_URL`).
-    fn base_url(self, addr: std::net::SocketAddr, suffix: &str) -> String {
-        match self {
-            Self::Loopback => format!("http://{addr}{suffix}"),
-            Self::HostGateway(host) => format!("http://{host}:{}{suffix}", addr.port()),
-        }
-    }
+/// the `base_url` the child is handed. `suffix` is `/v1` for codex (base points
+/// at the provider root) and `""` for Anthropic (Claude Code appends
+/// `/v1/messages` to `ANTHROPIC_BASE_URL`).
+fn broker_base_url(addr: std::net::SocketAddr, suffix: &str) -> String {
+    format!("http://{addr}{suffix}")
 }
 
 pub struct RunBroker {
@@ -345,21 +328,7 @@ impl RunBroker {
     /// `None` the operator's local Codex credential proxies to the provider.
     pub async fn start(airlock: Option<AirlockConfig>) -> Result<Self, String> {
         let (auth, url) = resolve_codex_upstream(airlock).await?;
-        Self::start_codex(auth, url, Reachability::Loopback).await
-    }
-
-    pub async fn start_for_tart(airlock: Option<AirlockConfig>) -> Result<Self, String> {
-        let (auth, url) = resolve_codex_upstream(airlock).await?;
-        Self::start_codex(auth, url, Reachability::HostGateway("ducktape-host")).await
-    }
-
-    /// a private-netns Podman container reaches the loopback host only via the
-    /// `host.containers.internal` gateway podman adds to its `/etc/hosts`.
-    pub async fn start_for_podman_private(
-        airlock: Option<AirlockConfig>,
-    ) -> Result<Self, String> {
-        let (auth, url) = resolve_codex_upstream(airlock).await?;
-        Self::start_codex(auth, url, Reachability::HostGateway("host.containers.internal")).await
+        Self::start_codex(auth, url).await
     }
 
     /// Test-only: a broker whose upstream is a dead port. `testkit` exposes it
@@ -367,14 +336,11 @@ impl RunBroker {
     /// it); it is compiled OUT of any build that doesn't ask for the feature.
     #[cfg(any(test, feature = "testkit"))]
     pub async fn start_for_test() -> Self {
-        Self::start_with(
-            UpstreamCredential {
-                bearer: "unused".into(),
-                account_id: None,
-                url: "http://127.0.0.1:1/responses".into(),
-            },
-            Reachability::Loopback,
-        )
+        Self::start_with(UpstreamCredential {
+            bearer: "unused".into(),
+            account_id: None,
+            url: "http://127.0.0.1:1/responses".into(),
+        })
         .await
         .unwrap()
     }
@@ -382,18 +348,13 @@ impl RunBroker {
     /// host-path convenience for tests: wrap a literal credential and serve. The
     /// live path goes through [`Self::start`]/[`resolve_codex_upstream`].
     #[cfg(any(test, feature = "testkit"))]
-    async fn start_with(upstream: UpstreamCredential, reach: Reachability) -> Result<Self, String> {
+    async fn start_with(upstream: UpstreamCredential) -> Result<Self, String> {
         let responses_url = upstream.url.clone();
-        Self::start_codex(CodexAuth::Host(upstream), responses_url, reach).await
+        Self::start_codex(CodexAuth::Host(upstream), responses_url).await
     }
 
-    async fn start_codex(
-        auth: CodexAuth,
-        responses_url: String,
-        reach: Reachability,
-    ) -> Result<Self, String> {
-        let bind = reach.bind();
-        let listener = tokio::net::TcpListener::bind((bind, 0))
+    async fn start_codex(auth: CodexAuth, responses_url: String) -> Result<Self, String> {
+        let listener = tokio::net::TcpListener::bind((BROKER_BIND, 0))
             .await
             .map_err(|e| format!("bind run-scoped provider broker: {e}"))?;
         let addr = listener
@@ -450,7 +411,7 @@ impl RunBroker {
             // url/token are minted PER-INVOCATION by begin_invocation (rotated),
             // so they are empty placeholders here.
             endpoint: BrokerEndpoint {
-                base_url: reach.base_url(addr, "/v1"),
+                base_url: broker_base_url(addr, "/v1"),
                 run_bearer,
                 control_url: String::new(),
                 control_token: String::new(),
@@ -1087,7 +1048,7 @@ const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"; 
 /// round-trip.
 const OAUTH_EXPIRY_SKEW_MS: u64 = 60_000;
 
-/// The Anthropic upstream credential — THE SWAPPABLE KNOB (design §ToS). The
+/// The Anthropic upstream credential — THE SWAPPABLE KNOB. The
 /// operator has chosen the subscription path; making the compliant Console
 /// API-key path the only one is a one-line change to which arm [`from_host`]
 /// returns, and nothing downstream changes. The child never sees any of this.
@@ -1273,9 +1234,11 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
         AirlockTrust::PinnedSealPk(pk) => *pk,
     };
     // The session names the CREDENTIAL and the WORK it draws for, and nothing
-    // else. On a lending gateway the grant subject is the account the owner's
-    // node vouched for when this request made the hop — this side does not get to
-    // name one, and the token that comes back carries no identity either.
+    // else. On a lending gateway the only identity on the hop is the NODE the
+    // owner's proxy vouched for; the grant subject is the account whose
+    // user-signed frame submitted the work, resolved lender-side from that
+    // pointer — this side does not get to name one, and the token that comes
+    // back carries no identity either.
     //
     // A handshake failure is named for WHAT failed, before any credentialed
     // request. Every distinguishable cause has its own reason: the lender's
@@ -1421,7 +1384,7 @@ impl SessionRefusal {
     /// body falls back to what the STATUS means — never to a guess.
     fn of_gateway_refusal(refusal: &SessionRefusedBy) -> Self {
         match refusal.reason.as_str() {
-            "caller_account_unverified" => Self::CallerUnverified,
+            "caller_node_unverified" => Self::CallerUnverified,
             _unnamed => Self::of_status(refusal.status),
         }
     }
@@ -1455,7 +1418,7 @@ impl SessionRefusal {
             Self::Unreachable => "airlock_gateway_unreachable",
             Self::Absent => "airlock_route_or_credential_absent",
             Self::NotGranted => "credential_not_granted",
-            Self::CallerUnverified => "airlock_caller_account_unverified",
+            Self::CallerUnverified => "airlock_caller_node_unverified",
             Self::AuthorityUnavailable => "airlock_grant_authority_unavailable",
             Self::Refused => "airlock_gateway_refused",
             Self::Malformed => "airlock_gateway_malformed_response",
@@ -1475,15 +1438,12 @@ enum AirlockGateway {
     Remote { handle: String, via: String },
 }
 
-/// capability-host's OWN vendor tag for a credential — a MIRROR of the gateway
-/// module's `CredentialKind`. Kept separate on purpose: this crate must not
-/// depend on the gateway module crate, so the node maps between the two at the
-/// boundary when it resolves a record into a [`ResolvedCredential`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CredentialKind {
-    Claude,
-    Codex,
-}
+/// Which vendor a credential is for: the airlock contract's own vocabulary,
+/// shared by the lender, this borrower, and the session daemons. The gateway
+/// module's on-chain record carries its own codec tag for the same choice;
+/// the node maps that onto this at the boundary when it resolves a record
+/// into a [`ResolvedCredential`] — services never depend on the module crate.
+pub use airlock::wire::CredentialKind;
 
 /// A credential name resolved from consensus (the on-chain gateway record) into
 /// everything the broker needs to reach the owner's self-host gateway: WHERE it
@@ -1812,43 +1772,19 @@ async fn oauth_refresh(
 }
 
 impl RunBroker {
-    /// start the Anthropic Messages broker for a Podman run (loopback).
+    /// start the Anthropic Messages broker for a run.
     /// `airlock` is the per-run credential source (a self-host resolution); when
     /// `None` the env boundary then a host credential decide the upstream.
     pub async fn start_anthropic(airlock: Option<AirlockConfig>) -> Result<Self, String> {
         let (auth, url) = resolve_anthropic_upstream(airlock).await?;
-        Self::start_anthropic_with(auth, Reachability::Loopback, url).await
-    }
-
-    /// start it for a Tart guest — bind the host gateway the guest reaches as
-    /// `ducktape-host`.
-    pub async fn start_anthropic_for_tart(
-        airlock: Option<AirlockConfig>,
-    ) -> Result<Self, String> {
-        let (auth, url) = resolve_anthropic_upstream(airlock).await?;
-        Self::start_anthropic_with(auth, Reachability::HostGateway("ducktape-host"), url).await
-    }
-
-    /// start it for a private-netns Podman container (`host.containers.internal`).
-    pub async fn start_anthropic_for_podman_private(
-        airlock: Option<AirlockConfig>,
-    ) -> Result<Self, String> {
-        let (auth, url) = resolve_anthropic_upstream(airlock).await?;
-        Self::start_anthropic_with(
-            auth,
-            Reachability::HostGateway("host.containers.internal"),
-            url,
-        )
-        .await
+        Self::start_anthropic_with(auth, url).await
     }
 
     async fn start_anthropic_with(
         auth: AnthropicAuth,
-        reach: Reachability,
         messages_url: String,
     ) -> Result<Self, String> {
-        let bind = reach.bind();
-        let listener = tokio::net::TcpListener::bind((bind, 0))
+        let listener = tokio::net::TcpListener::bind((BROKER_BIND, 0))
             .await
             .map_err(|e| format!("bind run-scoped anthropic broker: {e}"))?;
         let addr = listener
@@ -1897,7 +1833,7 @@ impl RunBroker {
                 // NO `/v1` suffix: ANTHROPIC_BASE_URL is the API ROOT and Claude
                 // Code appends `/v1/messages` itself (unlike codex, whose argv
                 // appends `/responses` to a `…/v1` base).
-                base_url: reach.base_url(addr, ""),
+                base_url: broker_base_url(addr, ""),
                 run_bearer,
                 // the Anthropic broker has no idle-control plane — unused.
                 control_url: String::new(),
@@ -2273,16 +2209,17 @@ mod tests {
         (status, body)
     }
 
+    /// The broker binds LOOPBACK and hands out a loopback URL, for every run
+    /// there is. A guest has no network device at all — it reaches this over a
+    /// vsock tunnel terminating on a socket the host process owns — so binding
+    /// past loopback would widen the broker's reachability and buy nothing.
     #[tokio::test]
-    async fn tart_broker_uses_the_guest_nat_hostname() {
-        let broker = RunBroker::start_with(
-            UpstreamCredential {
-                bearer: "unused".into(),
-                account_id: None,
-                url: "http://127.0.0.1:1/responses".into(),
-            },
-            Reachability::HostGateway("ducktape-host"),
-        )
+    async fn the_broker_is_only_ever_reachable_on_loopback() {
+        let broker = RunBroker::start_with(UpstreamCredential {
+            bearer: "unused".into(),
+            account_id: None,
+            url: "http://127.0.0.1:1/responses".into(),
+        })
         .await
         .unwrap();
         let invocation = broker.begin_invocation();
@@ -2290,7 +2227,9 @@ mod tests {
             invocation
                 .endpoint
                 .base_url
-                .starts_with("http://ducktape-host:")
+                .starts_with("http://127.0.0.1:"),
+            "{}",
+            invocation.endpoint.base_url
         );
     }
 
@@ -2312,14 +2251,11 @@ mod tests {
         let upstream_task = tokio::spawn(async move {
             axum::serve(listener, upstream).await.unwrap();
         });
-        let broker = RunBroker::start_with(
-            UpstreamCredential {
-                bearer: "host-secret-never-in-child".into(),
-                account_id: Some("acct-1".into()),
-                url: format!("http://{addr}/responses"),
-            },
-            Reachability::Loopback,
-        )
+        let broker = RunBroker::start_with(UpstreamCredential {
+            bearer: "host-secret-never-in-child".into(),
+            account_id: Some("acct-1".into()),
+            url: format!("http://{addr}/responses"),
+        })
         .await
         .unwrap();
         let invocation = broker.begin_invocation();
@@ -2471,9 +2407,7 @@ mod tests {
         auth: AnthropicAuth,
         url: String,
     ) -> RunBroker {
-        RunBroker::start_anthropic_with(auth, Reachability::Loopback, url)
-            .await
-            .unwrap()
+        RunBroker::start_anthropic_with(auth, url).await.unwrap()
     }
 
     #[tokio::test]
@@ -2718,35 +2652,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_tart_broker_uses_the_guest_nat_hostname() {
+    async fn the_anthropic_base_url_is_loopback_with_no_v1_suffix() {
         let broker = RunBroker::start_anthropic_with(
             AnthropicAuth::ApiKey("unused".into()),
-            Reachability::HostGateway("ducktape-host"),
             "http://127.0.0.1:1/v1/messages".into(),
         )
         .await
         .unwrap();
-        // the guest reaches the host by name, and there is NO /v1 suffix (Claude
-        // Code appends /v1/messages to ANTHROPIC_BASE_URL itself).
-        assert!(broker.endpoint.base_url.starts_with("http://ducktape-host:"));
+        assert!(broker.endpoint.base_url.starts_with("http://127.0.0.1:"));
+        // NO /v1 suffix: Claude Code appends /v1/messages to
+        // ANTHROPIC_BASE_URL itself, unlike codex's `…/v1` base.
         assert!(!broker.endpoint.base_url.ends_with("/v1"));
-    }
-
-    #[tokio::test]
-    async fn anthropic_private_netns_podman_uses_host_containers_internal() {
-        let broker = RunBroker::start_anthropic_with(
-            AnthropicAuth::ApiKey("unused".into()),
-            Reachability::HostGateway("host.containers.internal"),
-            "http://127.0.0.1:1/v1/messages".into(),
-        )
-        .await
-        .unwrap();
-        assert!(
-            broker
-                .endpoint
-                .base_url
-                .starts_with("http://host.containers.internal:")
-        );
     }
 
     #[test]
@@ -2769,14 +2685,11 @@ mod tests {
 
     #[tokio::test]
     async fn idle_control_is_separately_authenticated_idempotent_and_rotated() {
-        let broker = RunBroker::start_with(
-            UpstreamCredential {
-                bearer: "unused".into(),
-                account_id: None,
-                url: "http://127.0.0.1:1/responses".into(),
-            },
-            Reachability::Loopback,
-        )
+        let broker = RunBroker::start_with(UpstreamCredential {
+            bearer: "unused".into(),
+            account_id: None,
+            url: "http://127.0.0.1:1/responses".into(),
+        })
         .await
         .unwrap();
         let mut first = broker.begin_invocation();
@@ -2864,14 +2777,11 @@ mod tests {
 
     #[tokio::test]
     async fn idle_control_bounds_seconds_cumulative_requests_and_body() {
-        let broker = RunBroker::start_with(
-            UpstreamCredential {
-                bearer: "unused".into(),
-                account_id: None,
-                url: "http://127.0.0.1:1/responses".into(),
-            },
-            Reachability::Loopback,
-        )
+        let broker = RunBroker::start_with(UpstreamCredential {
+            bearer: "unused".into(),
+            account_id: None,
+            url: "http://127.0.0.1:1/responses".into(),
+        })
         .await
         .unwrap();
         let invocation = broker.begin_invocation();
@@ -2948,14 +2858,11 @@ mod tests {
 
     #[tokio::test]
     async fn idle_control_reports_hard_cap_truncation() {
-        let broker = RunBroker::start_with(
-            UpstreamCredential {
-                bearer: "unused".into(),
-                account_id: None,
-                url: "http://127.0.0.1:1/responses".into(),
-            },
-            Reachability::Loopback,
-        )
+        let broker = RunBroker::start_with(UpstreamCredential {
+            bearer: "unused".into(),
+            account_id: None,
+            url: "http://127.0.0.1:1/responses".into(),
+        })
         .await
         .unwrap();
         let invocation = broker.begin_invocation();
@@ -3125,7 +3032,7 @@ mod tests {
             matches!(auth, AnthropicAuth::Airlock(_)),
             "airlock config must yield the Airlock arm"
         );
-        let broker = RunBroker::start_anthropic_with(auth, Reachability::Loopback, messages_url)
+        let broker = RunBroker::start_anthropic_with(auth, messages_url)
             .await
             .unwrap();
 
@@ -3216,10 +3123,9 @@ mod tests {
             token: "sess-tok".into(),
             keys,
         });
-        let broker =
-            RunBroker::start_anthropic_with(auth, Reachability::Loopback, format!("{via}/v1/messages"))
-                .await
-                .unwrap();
+        let broker = RunBroker::start_anthropic_with(auth, format!("{via}/v1/messages"))
+            .await
+            .unwrap();
 
         let resp = reqwest::Client::new()
             .post(format!("{}/v1/messages", broker.endpoint.base_url))
@@ -3362,17 +3268,17 @@ mod tests {
     }
 
     /// Like [`boot_self_host_gateway`] but with the co-hosted-lending grant gate
-    /// wired: a session opens only when the account equals `granted`. This is the
-    /// production self-host mode (`user cred add` builds an always-gated
-    /// gateway), so a broker that fails to send the account 403s here before any
-    /// credentialed request. The reserved account `wedged` stands in for a lender
-    /// whose node did not answer the grant query at all.
+    /// wired: a session opens only when the vouched caller node equals
+    /// `granted_node`. This is the production self-host mode (`user cred add`
+    /// builds an always-gated gateway), so a session the gate cannot place 403s
+    /// here before any credentialed request. The reserved node `wedged` stands
+    /// in for a lender whose node did not answer the grant query at all.
     ///
     /// Served BEHIND a stand-in for the node's gateway proxy, because that is
     /// the only way production reaches a lending gateway — and the gate keys on
-    /// the account that proxy VOUCHED for, not on the one the request claims.
-    /// `verified_caller` is what the proxy saw; passing it separately from the
-    /// broker's own `rc.account` is what lets a test drive the two apart.
+    /// the node that proxy VOUCHED for, never on anything the request claims.
+    /// `vouched_node` is what the proxy saw; passing it separately from
+    /// `granted_node` is what lets a test drive the two apart.
     async fn boot_grant_gated_gateway(
         upstream: &str,
         seal_kp: airlock::seal::SealKeypair,
@@ -3381,18 +3287,18 @@ mod tests {
             airlock::wire::CredentialKind,
             airlock::wire::CredentialPayload,
         )>,
-        granted: Vec<u8>,
-        verified_caller: Vec<u8>,
+        granted_node: Vec<u8>,
+        vouched_node: Vec<u8>,
         max_requests: u32,
     ) -> String {
         let check: airlock::server::GrantCheck = std::sync::Arc::new(move |question| {
-            let granted = granted.clone();
+            let granted_node = granted_node.clone();
             Box::pin(async move {
-                let account = question.caller;
-                if account == b"wedged" {
+                let caller_node = question.caller_node;
+                if caller_node == b"wedged" {
                     return airlock::server::GrantAnswer::Undetermined;
                 }
-                if account == granted {
+                if caller_node == granted_node {
                     return airlock::server::GrantAnswer::Granted;
                 }
                 airlock::server::GrantAnswer::Refused
@@ -3414,7 +3320,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(vendor, "self-host");
-        let app = airlock::testkit::behind_gateway_proxy(app, &verified_caller);
+        let app = airlock::testkit::behind_gateway_proxy(app, &vouched_node);
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -3429,8 +3335,9 @@ mod tests {
     /// self-host gateway (what `user cred add` always builds): the sealed session
     /// opens, the credential is swapped in, and the reply comes back.
     ///
-    /// It admits because the gateway's proxy vouched for an account the grant
-    /// names — nothing the broker sent. The broker names no account at all; it
+    /// It admits because the lender's own authority found a grant for the
+    /// caller the gateway's proxy vouched for — nothing the broker sent. The
+    /// broker names no account at all; it
     /// cannot, since `SessionRequest` carries none. This test formerly asserted
     /// the opposite ("only because the broker names the granted account in
     /// `account_b64`"), and that field was the credential-theft defect.
@@ -3518,7 +3425,7 @@ mod tests {
             AnthropicAuth::airlock(AirlockConfig::self_host(&rc, WorkRef::Direct))
                 .await
                 .expect("a granted account opens the gated session");
-        let broker = RunBroker::start_anthropic_with(auth, Reachability::Loopback, messages_url)
+        let broker = RunBroker::start_anthropic_with(auth, messages_url)
             .await
             .unwrap();
         let resp = reqwest::Client::new()
@@ -3581,7 +3488,7 @@ mod tests {
             AnthropicAuth::airlock(AirlockConfig::self_host(&rc, WorkRef::Direct))
                 .await
                 .expect("the first session opens");
-        let broker = RunBroker::start_anthropic_with(auth, Reachability::Loopback, messages_url)
+        let broker = RunBroker::start_anthropic_with(auth, messages_url)
             .await
             .unwrap();
         let ask = || async {
@@ -3695,13 +3602,13 @@ mod tests {
         let named = |status, reason: &str| {
             R::of_gateway_refusal(&SessionRefusedBy { status, reason: reason.into() })
         };
-        assert_eq!(named(403, "caller_account_unverified"), R::CallerUnverified);
+        assert_eq!(named(403, "caller_node_unverified"), R::CallerUnverified);
         assert_eq!(named(403, "credential_not_granted"), R::NotGranted);
         // a node's proxy in the path answers with prose, not a token.
         assert_eq!(named(502, "loopback upstream refused the connection"), R::Unreachable);
         // and the tag is what the chain actually carries.
         let unvouched: anyhow::Error =
-            SessionRefusedBy { status: 403, reason: "caller_account_unverified".into() }.into();
+            SessionRefusedBy { status: 403, reason: "caller_node_unverified".into() }.into();
         assert_eq!(R::of(&unvouched), R::CallerUnverified);
 
         // past the response boundary there is no status to read, so the client
@@ -3813,7 +3720,7 @@ mod tests {
         );
         let (auth, messages_url) = AnthropicAuth::airlock(cfg).await.unwrap();
         assert!(matches!(auth, AnthropicAuth::Airlock(_)));
-        let broker = RunBroker::start_anthropic_with(auth, Reachability::Loopback, messages_url)
+        let broker = RunBroker::start_anthropic_with(auth, messages_url)
             .await
             .unwrap();
         let resp = reqwest::Client::new()
@@ -3949,9 +3856,7 @@ mod tests {
         );
         let (auth, responses_url) = CodexAuth::airlock(cfg).await.unwrap();
         assert!(matches!(auth, CodexAuth::Airlock(_)));
-        let broker = RunBroker::start_codex(auth, responses_url, Reachability::Loopback)
-            .await
-            .unwrap();
+        let broker = RunBroker::start_codex(auth, responses_url).await.unwrap();
         // codex posts `/responses` to a base that already ends in `/v1`.
         let resp = reqwest::Client::new()
             .post(format!("{}/responses", broker.endpoint.base_url))

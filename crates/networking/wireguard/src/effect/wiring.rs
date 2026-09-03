@@ -1,72 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 
 use crate::{AllowedIp, TunnelInstallPlan, ValidatorIdentity, X25519PublicKey};
-use defguard_wireguard_rs::{InterfaceConfiguration, key::Key, net::IpAddrMask, peer::Peer};
 
 use crate::effect::WireGuardEffect;
-
-/// Apply a validated `TunnelInstallPlan` through a `WireGuardEffect`,
-/// bringing up (or replacing) the local WireGuard interface for this one
-/// peer relationship.
-///
-/// `peer_endpoint_override`, when set, replaces the plan's statically
-/// advertised `peer_endpoint` with a different address before applying —
-/// this is how a punched path gets wired in without touching
-/// the crate root's validated plan: the caller passes the hole-punch's
-/// resolved reflexive address
-/// (`nat_traversal::punch::PunchPlan::peer_reflexive` in the simulated rig;
-/// a real `NatClient` observation in production). `None` uses the plan's
-/// own advertised endpoint unchanged (the direct, no-NAT-surprises case).
-pub fn apply_tunnel_plan<E: WireGuardEffect>(
-    effect: &mut E,
-    ifname: impl Into<String>,
-    private_key_base64: impl Into<String>,
-    listen_port: u16,
-    plan: &TunnelInstallPlan,
-    peer_endpoint_override: Option<SocketAddr>,
-) -> Result<(), E::Error> {
-    let overrides = peer_endpoint_override
-        .map(|addr| BTreeMap::from([(plan.peer_identity(), addr)]))
-        .unwrap_or_default();
-    apply_tunnel_plans(
-        effect,
-        ifname,
-        private_key_base64,
-        listen_port,
-        std::slice::from_ref(plan),
-        &overrides,
-    )
-}
-
-/// The full-mesh form of [`apply_tunnel_plan`]: ONE interface carrying every
-/// validated peer relationship, with per-peer endpoint overrides — each peer
-/// resolves independently (this one punched, that one direct), so the
-/// override is keyed by the peer's identity rather than applied
-/// interface-wide. A peer absent from `endpoint_overrides` keeps its plan's
-/// advertised endpoint.
-pub fn apply_tunnel_plans<E: WireGuardEffect>(
-    effect: &mut E,
-    ifname: impl Into<String>,
-    private_key_base64: impl Into<String>,
-    listen_port: u16,
-    plans: &[TunnelInstallPlan],
-    endpoint_overrides: &BTreeMap<ValidatorIdentity, SocketAddr>,
-) -> Result<(), E::Error> {
-    let local_interface_ips: Vec<AllowedIp> = plans
-        .iter()
-        .flat_map(|plan| plan.local_interface_ips().iter().copied())
-        .collect();
-    let peers = plan_peer_configs(plans, endpoint_overrides);
-    apply_peer_tunnels(
-        effect,
-        ifname,
-        private_key_base64,
-        listen_port,
-        &local_interface_ips,
-        &peers,
-    )
-}
 
 /// Reduce validated plans to the plain [`PeerTunnelConfig`] parts —
 /// the plan-independent form a caller can merge with peers from OTHER
@@ -96,57 +36,139 @@ pub fn plan_peer_configs(
 /// One peer relationship expressed as plain parts rather than a validated
 /// `TunnelInstallPlan` — everything a WireGuard peer entry needs, already
 /// resolved.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, BorshSchema)]
 pub struct PeerTunnelConfig {
     pub wireguard_public_key: X25519PublicKey,
     /// `None` for an endpoint-less peer (it advertises no dialable address):
     /// the entry is installed without an endpoint and WireGuard waits for the
     /// peer's own authenticated initiation, then roams to its source.
+    #[borsh(schema(with_funcs(
+        declaration = "crate::wire_schema::option_socket_addr::declaration",
+        definitions = "crate::wire_schema::option_socket_addr::definitions"
+    )))]
     pub endpoint: Option<SocketAddr>,
     pub allowed_ips: Vec<AllowedIp>,
     pub keepalive_seconds: Option<u16>,
 }
 
-/// The tunnel MTU every applied interface gets: the conventional WireGuard
-/// value (1500 minus WG overhead), and the same constant the userspace
-/// backend's smoltcp host is built on. `None` would leave a TUN at the
-/// kernel's 1500 — every full-size inner packet then rides a FRAGMENTED
-/// outer UDP datagram on a 1500-MTU underlay, and overruns the userspace
-/// stack's device MTU on mixed tun↔socket pairs (phase-4 bench,
-/// docs/adr/2026-07-07-userspace-overlay-net.mdx).
-pub const TUNNEL_MTU: u32 = 1420;
+/// The full desired state of the ONE overlay interface, as the effect
+/// layer receives it: own private key and listen port, own overlay
+/// addresses, and every peer relationship. `WireGuardEffect::apply` is
+/// create-or-replace at this level.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InterfaceConfig {
+    pub name: String,
+    /// this node's static X25519 private key.
+    pub private_key: [u8; 32],
+    pub listen_port: u16,
+    /// this node's own overlay addresses, deduplicated in first-seen order.
+    pub addresses: Vec<AllowedIp>,
+    pub peers: Vec<PeerTunnelConfig>,
+}
+
+/// `Debug` redacts the private key: an applied config is exactly the kind
+/// of value that lands in a log line or a test failure message.
+impl std::fmt::Debug for InterfaceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InterfaceConfig")
+            .field("name", &self.name)
+            .field("private_key", &"<redacted>")
+            .field("listen_port", &self.listen_port)
+            .field("addresses", &self.addresses)
+            .field("peers", &self.peers)
+            .finish()
+    }
+}
+
+/// First-and-every-100th gate for a backend refusal a PEER can drive. Every
+/// mesh change re-applies the peer set — an epoch apply, an adopted record, an
+/// invite install — so a wedged backend plus a peer that keeps re-advertising
+/// would warn on every one of them until the 4096-line ring holds nothing
+/// else, evicting the context the refusal was worth reading in. The count IS
+/// the diagnosis: `occurrences=3000` says wedged, not flaky. A free function
+/// over the caller's own counter rather than a type: this crate compiles into
+/// the netstack wasm guest and owes it no machinery.
+fn latched(counter: &AtomicU64) -> Option<u64> {
+    const EVERY: u64 = 100;
+    let occurrences = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    (occurrences == 1 || occurrences.is_multiple_of(EVERY)).then_some(occurrences)
+}
 
 /// The parts-level core both appliers share: ONE interface (own overlay
 /// addresses, listen port, private key) carrying every peer relationship.
-/// [`apply_tunnel_plans`] reduces validated plans to these parts; a mesh
+/// [`plan_peer_configs`] reduces validated plans to these parts; a mesh
 /// restored from persisted state (whose plans were validated in a PREVIOUS
 /// process life and are re-derived, not re-validated) calls this directly.
 pub fn apply_peer_tunnels<E: WireGuardEffect>(
     effect: &mut E,
     ifname: impl Into<String>,
-    private_key_base64: impl Into<String>,
+    private_key: [u8; 32],
     listen_port: u16,
     local_interface_ips: &[AllowedIp],
     peers: &[PeerTunnelConfig],
 ) -> Result<(), E::Error> {
-    let config = interface_config(
-        ifname,
-        private_key_base64,
-        listen_port,
-        local_interface_ips,
-        peers,
-    );
-    effect.create_interface()?;
+    let config = interface_config(ifname, private_key, listen_port, local_interface_ips, peers);
+    if let Err(err) = effect.create_interface() {
+        static CREATE_FAILED: AtomicU64 = AtomicU64::new(0);
+        if let Some(occurrences) = latched(&CREATE_FAILED) {
+            tracing::warn!(
+                target: "ducktape::dataplane",
+                event = "overlay_interface_refused",
+                reason = "create_failed",
+                interface = %config.name,
+                listen_port,
+                error = ?err,
+                occurrences,
+                "the tunnel backend refused to create the overlay interface"
+            );
+        }
+        return Err(err);
+    }
     if let Err(err) = effect.apply(&config) {
         // `create_interface` already stood up the interface; don't leave it
-        // behind just because this config was rejected (e.g. a malformed
-        // private key). The `remove_interface` outcome is
+        // behind just because this config was rejected (a listen port the
+        // backend cannot bind). The `remove_interface` outcome is
         // secondary to the `apply` failure that's actually being reported,
         // so it's intentionally dropped rather than allowed to shadow it.
         let _ = effect.remove_interface();
+        static APPLY_REJECTED: AtomicU64 = AtomicU64::new(0);
+        if let Some(occurrences) = latched(&APPLY_REJECTED) {
+            tracing::warn!(
+                target: "ducktape::dataplane",
+                event = "overlay_interface_refused",
+                reason = "apply_rejected",
+                interface = %config.name,
+                listen_port,
+                peers = config.peers.len(),
+                error = ?err,
+                occurrences,
+                "the tunnel backend refused the interface config — interface torn back down"
+            );
+        }
         return Err(err);
     }
+    // bring-up happens once per interface life; the peer census is the fact an
+    // operator needs when a member is unreachable — an endpoint-less peer
+    // cannot be dialed, it can only dial in.
+    tracing::info!(
+        target: "ducktape::dataplane",
+        event = "overlay_interface_up",
+        interface = %config.name,
+        listen_port,
+        addresses = config.addresses.len(),
+        peers = config.peers.len(),
+        endpointless = endpointless(&config.peers),
+        "overlay interface configured"
+    );
     Ok(())
+}
+
+/// Peers installed with no endpoint: WireGuard cannot dial them, it can only
+/// wait for their own initiation and roam to its source. The count is the
+/// difference between "the mesh is up" and "the mesh is up but half of it can
+/// never be reached from here".
+fn endpointless(peers: &[PeerTunnelConfig]) -> usize {
+    peers.iter().filter(|peer| peer.endpoint.is_none()).count()
 }
 
 /// Re-apply the full peer set to an interface that is ALREADY live — the
@@ -160,61 +182,65 @@ pub fn apply_peer_tunnels<E: WireGuardEffect>(
 pub fn update_peer_tunnels<E: WireGuardEffect>(
     effect: &mut E,
     ifname: impl Into<String>,
-    private_key_base64: impl Into<String>,
+    private_key: [u8; 32],
     listen_port: u16,
     local_interface_ips: &[AllowedIp],
     peers: &[PeerTunnelConfig],
 ) -> Result<(), E::Error> {
-    let config = interface_config(
-        ifname,
-        private_key_base64,
-        listen_port,
-        local_interface_ips,
-        peers,
+    let config = interface_config(ifname, private_key, listen_port, local_interface_ips, peers);
+    if let Err(err) = effect.apply(&config) {
+        // Unlike bring-up there is nothing to unwind: the interface stays live
+        // on its PREVIOUS peer set, so the delta this call carried (a new
+        // standby tunnel, a re-advertised endpoint) is silently not installed.
+        static PEERS_REJECTED: AtomicU64 = AtomicU64::new(0);
+        if let Some(occurrences) = latched(&PEERS_REJECTED) {
+            tracing::warn!(
+                target: "ducktape::dataplane",
+                event = "overlay_peers_refused",
+                reason = "apply_rejected",
+                interface = %config.name,
+                peers = config.peers.len(),
+                error = ?err,
+                occurrences,
+                "the tunnel backend refused a peer-set re-apply — the live interface keeps its previous peers"
+            );
+        }
+        return Err(err);
+    }
+    tracing::debug!(
+        target: "ducktape::dataplane",
+        event = "overlay_peers_applied",
+        interface = %config.name,
+        peers = config.peers.len(),
+        endpointless = endpointless(&config.peers),
+        "re-applied the peer set to the live interface"
     );
-    effect.apply(&config)
+    Ok(())
 }
 
 /// The shared config assembly: ONE interface (own overlay addresses, listen
 /// port, private key) carrying every peer relationship.
 fn interface_config(
     ifname: impl Into<String>,
-    private_key_base64: impl Into<String>,
+    private_key: [u8; 32],
     listen_port: u16,
     local_interface_ips: &[AllowedIp],
     peers: &[PeerTunnelConfig],
-) -> InterfaceConfiguration {
+) -> InterfaceConfig {
     // every peer relationship carries the same local side — dedup while
     // preserving first-seen order.
     let mut seen = BTreeSet::new();
-    let addresses: Vec<IpAddrMask> = local_interface_ips
+    let addresses = local_interface_ips
         .iter()
-        .filter(|route| seen.insert((route.addr, route.cidr)))
-        .map(|route| IpAddrMask::new(route.addr, route.cidr))
+        .filter(|route| seen.insert(**route))
+        .copied()
         .collect();
-    let peers = peers
-        .iter()
-        .map(|cfg| {
-            let mut peer = Peer::new(Key::new(cfg.wireguard_public_key.0));
-            peer.endpoint = cfg.endpoint;
-            peer.persistent_keepalive_interval = cfg.keepalive_seconds;
-            peer.set_allowed_ips(
-                cfg.allowed_ips
-                    .iter()
-                    .map(|route| IpAddrMask::new(route.addr, route.cidr))
-                    .collect(),
-            );
-            peer
-        })
-        .collect();
-    InterfaceConfiguration {
+    InterfaceConfig {
         name: ifname.into(),
-        prvkey: private_key_base64.into(),
+        private_key,
+        listen_port,
         addresses,
-        port: listen_port,
-        peers,
-        mtu: Some(TUNNEL_MTU),
-        fwmark: None,
+        peers: peers.to_vec(),
     }
 }
 
@@ -223,11 +249,20 @@ mod tests {
     use super::*;
     use crate::*;
     use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
-    use defguard_wireguard_rs::net::IpAddrMask;
     use std::net::{IpAddr, Ipv4Addr};
 
     fn id(sk: &PrivateKey) -> ValidatorIdentity {
         ValidatorIdentity::try_from(sk.public_key().as_ref()).unwrap()
+    }
+
+    /// A wedged backend refuses on every mesh change; the line must survive as
+    /// a first-and-every-100th sample carrying its own count, not as a flood.
+    #[test]
+    fn a_repeating_refusal_logs_first_then_every_hundredth() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(latched(&counter), Some(1));
+        let loud: Vec<u64> = (2..=200).filter_map(|_| latched(&counter)).collect();
+        assert_eq!(loud, vec![100, 200]);
     }
 
     fn xkey(byte: u8) -> X25519PublicKey {
@@ -378,7 +413,7 @@ mod tests {
 
     /// a minimal two-validator handshake, direct (no relay), yielding the
     /// INITIATOR's (a's) validated install plan and a's own listen port —
-    /// everything `apply_tunnel_plan` needs.
+    /// everything `apply_peer_tunnels` needs.
     fn two_party_plan() -> (TunnelInstallPlan, u16) {
         let a = PrivateKey::from_seed(1);
         let b = PrivateKey::from_seed(2);
@@ -405,6 +440,28 @@ mod tests {
             .unwrap()
             .port;
         (plan, listen)
+    }
+
+    /// the production two-step for one plan: reduce it to parts, then ONE
+    /// `apply_peer_tunnels` — exactly the composition the orchestrator runs.
+    fn apply_plan(
+        fake: &mut crate::effect::FakeWireGuardEffect,
+        listen: u16,
+        plan: &TunnelInstallPlan,
+        override_addr: Option<SocketAddr>,
+    ) -> Result<(), crate::effect::FakeWireGuardEffectError> {
+        let overrides = override_addr
+            .map(|addr| BTreeMap::from([(plan.peer_identity(), addr)]))
+            .unwrap_or_default();
+        let peers = plan_peer_configs(std::slice::from_ref(plan), &overrides);
+        apply_peer_tunnels(
+            fake,
+            "ducktape-wg0",
+            [7u8; 32],
+            listen,
+            plan.local_interface_ips(),
+            &peers,
+        )
     }
 
     /// a's validated plans toward BOTH b and c — the full-mesh shape: one
@@ -460,15 +517,7 @@ mod tests {
         let mut fake = crate::effect::FakeWireGuardEffect::default();
         let override_addr: SocketAddr = "203.0.113.9:51820".parse().unwrap();
 
-        apply_tunnel_plan(
-            &mut fake,
-            "ducktape-wg0",
-            "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
-            listen,
-            &plan,
-            Some(override_addr),
-        )
-        .unwrap();
+        apply_plan(&mut fake, listen, &plan, Some(override_addr)).unwrap();
 
         assert_eq!(fake.create_calls, 1);
         assert_eq!(fake.applied.len(), 1);
@@ -476,58 +525,34 @@ mod tests {
         // The interface's own addresses must come from the plan's local
         // side (`local_interface_ips`), not the peer's allowed IPs — mixing
         // these up would install the peer's /32 as this host's interface
-        // address and silently break the tunnel while `apply_tunnel_plan`
-        // still reports success.
-        assert_eq!(
-            applied.addresses,
-            plan.local_interface_ips()
-                .iter()
-                .map(|r| IpAddrMask::new(r.addr, r.cidr))
-                .collect::<Vec<_>>()
-        );
+        // address and silently break the tunnel while the apply still
+        // reports success.
+        assert_eq!(applied.addresses, plan.local_interface_ips().to_vec());
         assert_eq!(applied.peers.len(), 1);
         let peer = &applied.peers[0];
-        assert_eq!(
-            peer.public_key.as_array(),
-            plan.peer_wireguard_public_key().0
-        );
+        assert_eq!(peer.wireguard_public_key, plan.peer_wireguard_public_key());
         assert_eq!(peer.endpoint, Some(override_addr));
-        assert_eq!(
-            peer.allowed_ips,
-            plan.allowed_ips()
-                .iter()
-                .map(|r| IpAddrMask::new(r.addr, r.cidr))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(peer.allowed_ips, plan.allowed_ips().to_vec());
     }
 
     #[test]
     fn removes_the_interface_it_just_created_when_apply_is_rejected() {
         // Mirrors a real run where `create_interface` succeeds but the
-        // backend then rejects the config — e.g. an
-        // `InterfaceConfiguration.prvkey` failing to decode to a 32-byte
-        // key. `apply_tunnel_plan` must not leave that interface behind.
+        // backend then rejects the config (a listen port it cannot bind).
+        // `apply_peer_tunnels` must not leave that interface behind.
         let (plan, listen) = two_party_plan();
         let mut fake = crate::effect::FakeWireGuardEffect {
             reject_next_apply: true,
             ..Default::default()
         };
 
-        let err = apply_tunnel_plan(
-            &mut fake,
-            "ducktape-wg0",
-            "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
-            listen,
-            &plan,
-            None,
-        )
-        .unwrap_err();
+        let err = apply_plan(&mut fake, listen, &plan, None).unwrap_err();
 
         assert_eq!(err, crate::effect::FakeWireGuardEffectError::Rejected);
         assert_eq!(fake.create_calls, 1);
         assert_eq!(
             fake.remove_calls, 1,
-            "apply_tunnel_plan must tear down the interface it created when apply fails"
+            "apply_peer_tunnels must tear down the interface it created when apply fails"
         );
         assert!(fake.applied.is_empty());
     }
@@ -537,15 +562,7 @@ mod tests {
         let (plan, listen) = two_party_plan();
         let mut fake = crate::effect::FakeWireGuardEffect::default();
 
-        apply_tunnel_plan(
-            &mut fake,
-            "ducktape-wg0",
-            "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
-            listen,
-            &plan,
-            None,
-        )
-        .unwrap();
+        apply_plan(&mut fake, listen, &plan, None).unwrap();
 
         assert_eq!(
             fake.applied[0].peers[0].endpoint,
@@ -564,15 +581,7 @@ mod tests {
         let base = plan_peer_configs(std::slice::from_ref(&plan_ab), &BTreeMap::new());
         let local = plan_ab.local_interface_ips().to_vec();
 
-        apply_peer_tunnels(
-            &mut fake,
-            "ducktape-wg0",
-            "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
-            listen,
-            &local,
-            &base,
-        )
-        .unwrap();
+        apply_peer_tunnels(&mut fake, "ducktape-wg0", [7u8; 32], listen, &local, &base).unwrap();
 
         let grown: Vec<PeerTunnelConfig> = base
             .iter()
@@ -582,15 +591,7 @@ mod tests {
                 &BTreeMap::new(),
             ))
             .collect();
-        update_peer_tunnels(
-            &mut fake,
-            "ducktape-wg0",
-            "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
-            listen,
-            &local,
-            &grown,
-        )
-        .unwrap();
+        update_peer_tunnels(&mut fake, "ducktape-wg0", [7u8; 32], listen, &local, &grown).unwrap();
 
         assert_eq!(
             fake.create_calls, 1,
@@ -618,7 +619,7 @@ mod tests {
         let err = update_peer_tunnels(
             &mut fake,
             "ducktape-wg0",
-            "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
+            [7u8; 32],
             listen,
             plan.local_interface_ips(),
             &peers,
@@ -631,7 +632,7 @@ mod tests {
 
     #[test]
     fn plan_peer_configs_matches_the_applied_reduction() {
-        // `apply_tunnel_plans` and a caller composing over
+        // the `plan_peer_configs` + `apply_peer_tunnels` two-step and a caller composing over
         // `plan_peer_configs` must produce the same peer entries — the
         // orchestrator merges these parts with record-derived peers, and a
         // drift here would mean the merged apply diverges from the plan-only
@@ -671,13 +672,14 @@ mod tests {
         // only c resolved through the nat client; b stays on its advert.
         let overrides = BTreeMap::from([(plan_ac.peer_identity(), punched)]);
 
-        apply_tunnel_plans(
+        let peers = plan_peer_configs(&[plan_ab.clone(), plan_ac.clone()], &overrides);
+        apply_peer_tunnels(
             &mut fake,
             "ducktape-wg0",
-            "cHJpdmF0ZS1rZXktYmFzZTY0LXBsYWNlaG9sZGVy",
+            [7u8; 32],
             listen,
-            &[plan_ab.clone(), plan_ac.clone()],
-            &overrides,
+            plan_ab.local_interface_ips(),
+            &peers,
         )
         .unwrap();
 
@@ -686,18 +688,11 @@ mod tests {
         let applied = &fake.applied[0];
         // a's own overlay address appears ONCE — every plan carries the same
         // local side and `from_plan` dedupes it.
-        assert_eq!(
-            applied.addresses,
-            plan_ab
-                .local_interface_ips()
-                .iter()
-                .map(|r| IpAddrMask::new(r.addr, r.cidr))
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(applied.addresses, plan_ab.local_interface_ips().to_vec());
         assert_eq!(applied.peers.len(), 2);
         assert_eq!(
-            applied.peers[0].public_key.as_array(),
-            plan_ab.peer_wireguard_public_key().0
+            applied.peers[0].wireguard_public_key,
+            plan_ab.peer_wireguard_public_key()
         );
         assert_eq!(
             applied.peers[0].endpoint,
@@ -705,8 +700,8 @@ mod tests {
             "peer absent from the override map keeps its advertised endpoint"
         );
         assert_eq!(
-            applied.peers[1].public_key.as_array(),
-            plan_ac.peer_wireguard_public_key().0
+            applied.peers[1].wireguard_public_key,
+            plan_ac.peer_wireguard_public_key()
         );
         assert_eq!(applied.peers[1].endpoint, Some(punched));
     }

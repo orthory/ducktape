@@ -1,22 +1,65 @@
 //! The operator CLI's thin HTTP client for a node's `/v1` surface: one
-//! `submit` and one `query` primitive, shared by every `user`/`agent` verb so
-//! the `{target, payload}` / `{target, query}` shapes and the receipt/error
-//! handling live in exactly one place instead of being re-inlined per verb.
+//! `submit`, one `submit_frame` and one `query` primitive, shared by every
+//! `user`/`account`/`agent` verb so the `{target, payload}` / `{target, query}`
+//! shapes and the receipt/error handling live in exactly one place instead of
+//! being re-inlined per verb.
 //!
-//! Both hit the frameless lanes: `/v1/submit` stamps the NODE's key as the op
-//! origin (valid when the node is bound to the account the op mutates), and
-//! `/v1/query` reads committed module state.
+//! `/v1/submit` is the frameless lane: it stamps the NODE's key as the op
+//! origin, so only node-authored ops (announces, node-level governance) go
+//! there. Every USER-authored op — an identity, gateway or saga op that must be
+//! attributed to an account — is a frame the user key signed, POSTed verbatim
+//! to `/v1/submit/frame`; its verified signer is the op's origin. `/v1/query`
+//! reads committed module state.
 
-/// Submit one module op over `/v1/submit` `{target, payload}` and return the
-/// commit height from the receipt. A non-2xx status carries the node's
-/// rejection string.
+/// Submit one NODE-AUTHORED module op over `/v1/submit` `{target, payload}` and
+/// return the commit height from the receipt. A non-2xx status carries the
+/// node's rejection string.
+///
+/// `workspace` is the node's own directory, and reading this boot's operator
+/// credential out of it is how the request authenticates: the route refuses a
+/// caller that presents neither that nor a user signature, and an announce IS
+/// the node's op — no user key would be the right actor for it. An unreadable
+/// credential is not a reason to give up early; the node's own 401 names it
+/// far better than a guess here would.
 pub(crate) fn submit(
     base: &str,
+    workspace: &std::path::Path,
     target: &str,
     payload: &serde_json::Value,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let body = post(base, "/v1/submit", &serde_json::json!({ "target": target, "payload": payload }))?;
-    serde_json::from_str::<serde_json::Value>(&body)
+    let operator = noded::admin::read_operator_token(workspace).ok();
+    let body = post_with(
+        base,
+        "/v1/submit",
+        &serde_json::json!({ "target": target, "payload": payload }),
+        operator.as_deref(),
+    )?;
+    receipt_height(&body)
+}
+
+/// Submit one ALREADY-SIGNED op frame (the exact bytes `node::encode_frame`
+/// produced — see `userkey_cli::user_frame`) over `/v1/submit/frame` and
+/// return the commit height. The frame's verified signer becomes the op's
+/// `Origin::External`, which is what lets an account's key act for itself.
+pub(crate) fn submit_frame(base: &str, frame: &[u8]) -> Result<u64, Box<dyn std::error::Error>> {
+    const PATH: &str = "/v1/submit/frame";
+    let resp = reqwest::blocking::Client::new()
+        .post(format!("{base}{PATH}"))
+        .header("content-type", "application/octet-stream")
+        .body(frame.to_vec())
+        .send()
+        .map_err(|error| transport_failure(PATH, &error).to_string())?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!("{PATH} rejected ({status}): {text}").into());
+    }
+    receipt_height(&text)
+}
+
+/// the `height` of a `SubmitReceipt` body — both submit lanes answer with one.
+fn receipt_height(body: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v["height"].as_u64())
         .ok_or_else(|| format!("unexpected submit receipt: {body}").into())
@@ -29,8 +72,26 @@ pub(crate) fn query(
     target: &str,
     query: serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let body = post(base, "/v1/query", &serde_json::json!({ "target": target, "query": query }))?;
+    let body = post(
+        base,
+        "/v1/query",
+        &serde_json::json!({ "target": target, "query": query }),
+    )?;
     Ok(serde_json::from_str(&body)?)
+}
+
+/// This node's own consensus key, read from `/v1/status`.
+///
+/// Every data-plane signature is BOUND to it ([`noded::signed_req`]), so one
+/// minted for this node can never be replayed against another node the same key
+/// acts on. It comes from the node ITSELF rather than from a local workspace,
+/// which is what lets a signed verb work against a node this host holds no
+/// config for.
+pub(crate) fn node_public_key(base: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let status = get_json(base, "/v1/status").map_err(|failure| failure.to_string())?;
+    Ok(crate::config::unhex(
+        status["public_key"].as_str().unwrap_or_default(),
+    )?)
 }
 
 /// Why a node-local read did not produce an answer.
@@ -98,7 +159,7 @@ fn why_unanswered(error: &reqwest::Error) -> Unanswered {
 }
 
 /// Turn a failed `send()` into what to tell the operator. The one `match`.
-fn transport_failure(path: &str, error: &reqwest::Error) -> ReadFailure {
+pub(crate) fn transport_failure(path: &str, error: &reqwest::Error) -> ReadFailure {
     match why_unanswered(error) {
         Unanswered::NoAnswer => ReadFailure::Unreachable,
         // the url is deliberately not echoed: it adds nothing a reader can act
@@ -126,8 +187,9 @@ pub(crate) fn get_json(base: &str, path: &str) -> Result<serde_json::Value, Read
             "{path} rejected ({status}): {text}"
         )));
     }
-    serde_json::from_str(&text)
-        .map_err(|error| ReadFailure::Rejected(format!("{path} returned undecodable JSON: {error}")))
+    serde_json::from_str(&text).map_err(|error| {
+        ReadFailure::Rejected(format!("{path} returned undecodable JSON: {error}"))
+    })
 }
 
 /// POST one node-local JSON surface and return the decoded reply (the `/v1`
@@ -147,13 +209,28 @@ fn post(
     path: &str,
     body: &serde_json::Value,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    post_with(base, path, body, None)
+}
+
+/// [`post`] carrying the node's operator credential — what a MUTATING route
+/// wants from a caller that acts as the node rather than as a person.
+fn post_with(
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+    operator_token: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     // the SAME classifier the read lane uses: `submit`/`query` are how every
     // `user`/`agent`/`cred` verb reaches the node, and a down node used to
     // surface here as a raw `POST http://…: error sending request for url (…)`
     // while `service list` — one function away — said "the node is not running".
-    let resp = reqwest::blocking::Client::new()
+    let mut request = reqwest::blocking::Client::new()
         .post(format!("{base}{path}"))
-        .json(body)
+        .json(body);
+    if let Some(token) = operator_token {
+        request = request.header(noded::admin::ADMIN_TOKEN_HEADER, token);
+    }
+    let resp = request
         .send()
         .map_err(|error| transport_failure(path, &error).to_string())?;
     let status = resp.status();
@@ -291,9 +368,8 @@ mod tests {
             let (mut conn, _) = listener.accept().expect("the client connects");
             let mut scratch = [0u8; 1024];
             let _ = conn.read(&mut scratch);
-            let _ = conn.write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nnope",
-            );
+            let _ = conn
+                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 4\r\n\r\nnope");
         });
 
         let failure = get_json(&base, "/v1/status").expect_err("a 500 is an error");

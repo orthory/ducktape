@@ -3,6 +3,11 @@
 //! `-n/--network <chain-id>` selector find it. pure-CLI: no node is booted,
 //! no socket is bound — `DUCKTAPE_HOME` points every run at a temp registry.
 
+// `node init` hashes a directory of `<id>.component.wasm` into the descriptor,
+// so a CLI test that founds a network needs one: the harness owns THE path to
+// the checked-in set (`common::FIXTURES`).
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -11,6 +16,7 @@ fn ducktape(home: &Path, args: &[&str]) -> std::process::Output {
         .arg("node")
         .args(args)
         .env("DUCKTAPE_HOME", home)
+        .env("DUCKTAPE_MODULES_DIR", common::FIXTURES)
         .output()
         .expect("run ducktape")
 }
@@ -69,13 +75,14 @@ fn same_name_founds_two_distinct_registry_workspaces() {
 }
 
 /// init a workspace with the child's PATH pinned to `path_dir`, returning the
-/// generated node.toml and the workspace dir — the seam that makes compute
-/// detection hermetic: the probe only checks executability on PATH, it never
-/// runs the binary.
+/// generated node.toml and the workspace dir — the half of compute detection a
+/// test owns: the probe only checks executability on PATH, it never runs the
+/// binary.
 fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::path::PathBuf) {
     let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(["node", "init", "--name", name, "--primary-coordinator", "none"])
         .env("DUCKTAPE_HOME", home)
+        .env("DUCKTAPE_MODULES_DIR", common::FIXTURES)
         .env("PATH", path_dir)
         .output()
         .expect("run ducktape");
@@ -92,41 +99,58 @@ fn init_with_path(home: &Path, name: &str, path_dir: &Path) -> (String, std::pat
     (toml, workspace)
 }
 
-/// fresh-workspace compute detection: the platform adapter's runtime on PATH
-/// (a fake executable — podman on Linux, tart on macOS) makes a flagless init
-/// write a LIVE `[sandbox]` table while granting no service at all; an empty
-/// PATH keeps today's commented example.
+/// fresh-workspace compute detection: `node init` writes a live `[sandbox]`
+/// table exactly when this HOST can start the platform adapter, and grants no
+/// service either way.
+///
+/// Whether the host can is not a test's to decide. Detection asks
+/// `SandboxBackend::probe_adapter` (workspace-config `detect_platform_sandbox`),
+/// and that opens `/dev/kvm` — an input no child `PATH` takes away, and one no
+/// probe should let a test fake. Asserting that a fake `firecracker` on `PATH`
+/// always refuses therefore pinned the HOST, not the code: red on every
+/// KVM-capable box, green only where the machine happened to be incapable. The
+/// oracle is the node's own `sandbox` verb instead, run over the SAME `PATH` —
+/// the one answer to "can this host isolate a run" that cannot drift from what
+/// detection asked. The agreement between the table init writes and the backend
+/// it probes is pinned by workspace-config's
+/// `the_written_table_and_the_probed_backend_name_one_runtime`.
 #[test]
-fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
+fn init_writes_the_sandbox_table_exactly_when_the_host_can_start_the_adapter() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    // the probe wants the platform adapter AND its hard deps executable on
-    // PATH, so the fake dir carries the full set — detection only writes a
-    // table the boot probe would accept. Podman's deps are `pasta` (the netns
-    // backend) plus `nft` + `nsenter` (the egress firewall the createRuntime
-    // hook installs); see `SandboxBackend::probe`.
-    let (runtime, fake_bins): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        ("tart", &["tart"])
-    } else {
-        ("podman", &["podman", "pasta", "nft", "nsenter"])
-    };
+    // an executable named like the adapter, and its hard deps beside it: PATH
+    // is the only half of the probe a test owns.
     let bins = tempfile::tempdir().expect("fake bin dir");
-    for bin in fake_bins {
+    for bin in ["firecracker", "mke2fs", "debugfs", "nft"] {
         let fake = bins.path().join(bin);
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write fake runtime");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
             .expect("mark fake runtime executable");
     }
+    detection_follows_the_host(bins.path());
 
+    // ...and with nothing on PATH at all: no runtime to resolve, so the answer
+    // is the commented example on any host that does not ship one in a
+    // standard bin dir.
+    let empty = tempfile::tempdir().expect("empty PATH dir");
+    detection_follows_the_host(empty.path());
+}
+
+/// init a fresh workspace with `PATH` pinned to `path_dir`, then ask the same
+/// binary — over that same `PATH` — what this host can do. A live table must
+/// also be the one `platform_sandbox` describes, under this run's own
+/// `DUCKTAPE_HOME`.
+fn detection_follows_the_host(path_dir: &Path) {
     let home = tempfile::tempdir().expect("tempdir");
-    let (toml, workspace) = init_with_path(home.path(), "computed", bins.path());
-    assert!(toml.contains("\n[sandbox]"), "live table written:\n{toml}");
-    assert!(
-        toml.contains(&format!("runtime = \"{runtime}\"")),
-        "the platform adapter is chosen:\n{toml}"
+    let (toml, workspace) = init_with_path(home.path(), "computed", path_dir);
+    let table_is_live = toml.contains("\n[sandbox]");
+    let host_can_isolate = host_verdict(home.path(), path_dir);
+    assert_eq!(
+        table_is_live, host_can_isolate,
+        "init's table must follow the host probe:\n{toml}"
     );
-    // detection never opts the node into publishing capacity: the table says
-    // only HOW a run would be isolated. Announcing needs a compute grant,
+    // detection never opts the node into publishing capacity either way: the
+    // table says only HOW a run is isolated. Announcing needs a compute grant,
     // which init cannot mint (there is no daemon signaling yet), so a fresh
     // workspace carries no services.toml at all.
     assert!(
@@ -134,13 +158,40 @@ fn flagless_init_detects_the_platform_runtime_into_a_live_sandbox_table() {
         "a fresh workspace grants no service"
     );
 
-    let empty = tempfile::tempdir().expect("empty PATH dir");
-    let home = tempfile::tempdir().expect("tempdir");
-    let (toml, _) = init_with_path(home.path(), "bare", empty.path());
+    if !table_is_live {
+        assert!(
+            toml.contains("#[sandbox]"),
+            "a host that cannot isolate keeps the commented example:\n{toml}"
+        );
+        return;
+    }
+    let kernel = home.path().join("guest").join("vmlinux");
     assert!(
-        toml.contains("#[sandbox]") && !toml.contains("\n[sandbox]"),
-        "no runtime on PATH keeps the commented example:\n{toml}"
+        toml.contains(&format!("kernel = \"{}\"", kernel.display())),
+        "a live table names this run's own guest dir:\n{toml}"
     );
+}
+
+/// `ducktape node sandbox` prints one live line about the machine —
+/// `host ok` / `host NO` — from the very `probe_adapter` detection calls.
+/// Its exit status is about the WORKSPACE (an unbuilt image refuses), so only
+/// the verdict line is read.
+fn host_verdict(home: &Path, path_dir: &Path) -> bool {
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "sandbox"])
+        .env("DUCKTAPE_HOME", home)
+        .env("PATH", path_dir)
+        .output()
+        .expect("run ducktape node sandbox");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let probed_green = stdout.contains("host       ok");
+    let probed_red = stdout.contains("host       NO");
+    assert!(
+        probed_green != probed_red,
+        "one host verdict, or this oracle is a coin flip:\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    probed_green
 }
 
 /// Run any family, not just `node`.
@@ -148,6 +199,7 @@ fn ducktape_raw(home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_ducktape"))
         .args(args)
         .env("DUCKTAPE_HOME", home)
+        .env("DUCKTAPE_MODULES_DIR", common::FIXTURES)
         .output()
         .expect("run ducktape")
 }
@@ -210,4 +262,228 @@ fn one_registered_workspace_needs_no_selector_in_any_family() {
         "an ambiguous registry names its candidates: {stderr}"
     );
     assert!(stderr.contains("-n"), "and the flag that picks one: {stderr}");
+}
+
+/// `--modules <dir>` is how a founder pins its genesis wasm set: every
+/// component in the directory is hashed INTO the descriptor and copied into
+/// `<workspace>/modules`, the bundle the node seeds its blobstore from at boot.
+/// The copy and the hash must be the same bytes, or the node refuses its own
+/// workspace on the next start.
+#[test]
+fn init_writes_module_hashes_and_the_bundle() {
+    use sha2::Digest as _;
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "init", "--name", "bundled", "--primary-coordinator", "none", "--dir"])
+        .arg(&ws)
+        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+        .arg(common::FIXTURES)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let d = workspace_config::NetworkDescriptor::load(&ws.join("network.toml")).unwrap();
+    let ids: Vec<&str> = d.modules.iter().map(|m| m.id.as_str()).collect();
+    let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    want.sort_unstable();
+    assert_eq!(ids, want);
+    for m in &d.modules {
+        let component = ws.join("modules").join(format!("{}.component.wasm", m.id));
+        let bytes = std::fs::read(&component).expect("the bundle carries every hashed component");
+        assert_eq!(workspace_config::hex_bytes(&sha2::Sha256::digest(&bytes)), m.code_hash);
+    }
+}
+
+/// re-founding a workspace from ITS OWN bundle — the flow the "delete the file
+/// to re-found from scratch" refusal invites — points `--modules` at the very
+/// directory `init` seeds. `std::fs::copy(p, p)` returns `Ok(0)` and TRUNCATES
+/// on Linux, so a blind copy would zero every component AFTER hashing it: init
+/// reports success and the node refuses its first boot against bytes that no
+/// longer exist. Bytes, not existence, is what this asserts.
+#[test]
+fn re_founding_from_its_own_bundle_keeps_the_components() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let found = |modules: &Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+            .args(["node", "init", "--name", "refound", "--primary-coordinator", "none", "--dir"])
+            .arg(&ws)
+            .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+            .arg(modules)
+            .output()
+            .expect("run ducktape")
+    };
+    let out = found(Path::new(common::FIXTURES));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let bundle = ws.join("modules");
+    std::fs::remove_file(ws.join("network.toml")).expect("un-found the network");
+    let out = found(&bundle);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    let d = workspace_config::NetworkDescriptor::load(&ws.join("network.toml")).unwrap();
+    assert!(!d.modules.is_empty());
+    for m in &d.modules {
+        let name = format!("{}.component.wasm", m.id);
+        assert_eq!(
+            std::fs::read(bundle.join(&name)).expect("read the re-founded component"),
+            std::fs::read(Path::new(common::FIXTURES).join(&name))
+                .expect("read the fixture component"),
+            "{name} did not survive a re-found from its own bundle"
+        );
+    }
+}
+
+fn assert_ok(out: &std::process::Output, what: &str) {
+    assert!(
+        out.status.success(),
+        "{what} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// the pre-genesis co-validator ceremony up to the paste: found under
+/// `<tmp>/founder`, mint `<tmp>/joiner`'s identity, `admit` it, mint the
+/// refreshed invite. Returns the joiner dir and the blob the member joins with.
+fn found_and_admit(tmp: &Path) -> (std::path::PathBuf, String) {
+    let founder = tmp.join("founder");
+    let joiner = tmp.join("joiner");
+    let founder_config = founder.join("node.toml");
+    let out = ducktape(
+        tmp,
+        &[
+            "init",
+            "--name",
+            "covalidators",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+            founder.to_str().unwrap(),
+            "--listen",
+            "127.0.0.1:0",
+            "--advertised",
+            "127.0.0.1:1",
+        ],
+    );
+    assert_ok(&out, "init");
+    let out = ducktape(tmp, &["key", "--dir", joiner.to_str().unwrap()]);
+    assert_ok(&out, "key");
+    let joiner_key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let out = ducktape(
+        tmp,
+        &[
+            "admit",
+            &joiner_key,
+            "--config",
+            founder_config.to_str().unwrap(),
+        ],
+    );
+    assert_ok(&out, "admit");
+    let out = ducktape(
+        tmp,
+        &["invite", "--config", founder_config.to_str().unwrap()],
+    );
+    assert_ok(&out, "invite");
+    let blob = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (joiner, blob)
+}
+
+/// a pre-genesis co-validator: `admit`ted by the founder, it `join`s as a
+/// MEMBER and boots straight into genesis — where a missing component is a
+/// refusal and there is no peer to fetch one from. So a member join seeds
+/// `<joiner>/modules` from the managed dir (`DUCKTAPE_MODULES_DIR` here), the
+/// same bytes the descriptor hashes; a non-member join writes no bundle.
+#[test]
+fn a_member_join_bundles_the_genesis_components() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (joiner, blob) = found_and_admit(tmp.path());
+    let out = ducktape(
+        tmp.path(),
+        &["join", &blob, "--dir", joiner.to_str().unwrap()],
+    );
+    assert_ok(&out, "join");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is a member"),
+        "the admitted key joins as a member:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let d = workspace_config::NetworkDescriptor::load(&joiner.join("network.toml")).unwrap();
+    assert!(!d.modules.is_empty());
+    for m in &d.modules {
+        let name = format!("{}.component.wasm", m.id);
+        assert_eq!(
+            std::fs::read(joiner.join("modules").join(&name)).expect("the member's bundle"),
+            std::fs::read(Path::new(common::FIXTURES).join(&name)).expect("the fixture"),
+            "{name} in the member's bundle is not the founder's component"
+        );
+    }
+}
+
+/// a managed dir whose component is NOT the one the founder hashed is refused
+/// by module name at `join` — not by a genesis root mismatch at first boot.
+#[test]
+fn a_member_join_refuses_a_component_that_is_not_the_genesis_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (joiner, blob) = found_and_admit(tmp.path());
+    let tampered = tmp.path().join("tampered");
+    std::fs::create_dir_all(&tampered).unwrap();
+    let d =
+        workspace_config::NetworkDescriptor::load(&tmp.path().join("founder").join("network.toml"))
+            .unwrap();
+    for m in &d.modules {
+        let name = format!("{}.component.wasm", m.id);
+        std::fs::copy(
+            Path::new(common::FIXTURES).join(&name),
+            tampered.join(&name),
+        )
+        .unwrap();
+    }
+    let victim = &d.modules[0].id;
+    let victim_file = tampered.join(format!("{victim}.component.wasm"));
+    let mut bytes = std::fs::read(&victim_file).unwrap();
+    bytes.push(0);
+    std::fs::write(&victim_file, bytes).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "join", &blob, "--dir", joiner.to_str().unwrap()])
+        .env("DUCKTAPE_HOME", tmp.path())
+        .env("DUCKTAPE_MODULES_DIR", &tampered)
+        .output()
+        .expect("run ducktape");
+    assert!(
+        !out.status.success(),
+        "a tampered component must refuse the join"
+    );
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains(&format!("module {victim}")),
+        "the refusal names the module: {err}"
+    );
+    assert!(
+        err.contains("install-node"),
+        "the refusal names the remedy: {err}"
+    );
+    assert!(
+        !joiner.join("modules").exists(),
+        "a refused join seeds no bundle"
+    );
+}
+
+/// a bundle missing a component is named by the file the operator has to go
+/// look for — not by a hash mismatch three boots later.
+#[test]
+fn init_names_the_missing_component() {
+    let tmp = tempfile::tempdir().unwrap();
+    let empty = tmp.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "init", "--name", "x", "--primary-coordinator", "none", "--dir"])
+        .arg(tmp.path().join("ws"))
+        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+        .arg(&empty)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("acl.component.wasm"));
 }

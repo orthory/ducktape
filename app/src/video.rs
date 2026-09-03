@@ -1,8 +1,16 @@
-//! The huddle's camera leg: capture → intra-only JPEG → the call socket's
-//! video frames, and inbound peer frames → decode → the tile strip.
+//! The huddle's video leg: capture → intra-only JPEG → the call socket's
+//! video frames, and inbound peer frames → decode → the tile strip and the
+//! stage.
+//!
+//! TWO SOURCES, ONE STREAM. A participant occupies one video flow and one
+//! tile, and the beacon's `camera_on`/`sharing` pair says which of the two the
+//! far end is looking at — so [`Source`] is one discriminant and starting
+//! either source ends the other. The camera is a device (`nokhwa`); the screen
+//! is a root-window grab over X11 (`x11rb`, already in this binary under
+//! winit — see [`ScreenSource`] for why not the portal).
 //!
 //! CODEC v1 IS BASELINE JPEG, EVERY FRAME A KEYFRAME. The wire (ws
-//! `chat::call_wire` and the mesh fragmentation in `chat::video`) treats the
+//! `media_service::call_wire` and the mesh fragmentation in `media_service::video`) treats the
 //! encoded bytes as opaque and both ends of the webview leg are THIS app, so
 //! the client picks the codec. Pure-Rust JPEG keeps the build free of C
 //! toolchains on every platform; intra-only means a lost frame costs nothing
@@ -16,28 +24,37 @@
 // deliberate (q60 VGA at 60 fps ≈ 2-4 MB/s per sender); wire the RateHint →
 // (fps, quality) ladder when a real WAN leg complains.
 //
-//! THREADING mirrors the audio leg: one OS thread owns the nokhwa camera
-//! (not `Send`), polls the camera toggle, opens the device only while it is
-//! on, and dies with the session's shutdown sender. Decoded peer frames land
-//! in a global store the `call_video_tiles` extern component reads; the strip
-//! is a SELF-REDRAWING widget that repaints its own window at the capture
-//! cadence — no app message, no view rebuild, no other window woken.
+//! THREADING mirrors the audio leg: one OS thread owns the open source (the
+//! nokhwa camera is not `Send`), follows the toggle, holds a source only while
+//! it is the one asked for, and dies with the session's shutdown sender.
+//! Decoded peer frames land in a global store the `call_video_tiles` and
+//! `call_video_stage` extern components read; both are SELF-REDRAWING widgets
+//! that repaint their own window at the capture cadence — no app message, no
+//! view rebuild, no other window woken.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use chat::call_wire::{CapturedFrame, PeerFrame};
+use media_service::call_wire::{CapturedFrame, PeerFrame};
 use iced::{Element, Rectangle, Size};
 
-/// Toggle/shutdown poll while no camera is open. With a camera open the loop
-/// paces itself at the NEGOTIATED MODE'S OWN RATE instead — the local preview
-/// runs at camera-native fps, decoupled from what the wire carries.
+mod live_surface;
+
+/// Toggle/shutdown poll while no source is open. WITH A CAMERA OPEN THE LOOP
+/// KEEPS NO CLOCK AT ALL: `Camera::frame()` blocks until the device has the
+/// next frame, so the camera itself is the pace. A screen grab has nothing to
+/// block on and takes [`SCREEN_INTERVAL`] instead — see [`capture_thread`].
 const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(40);
 /// The wire's send floor: at most one encoded frame per this interval
 /// (~60 fps). A camera slower than this just sends every frame; a faster one
 /// is thinned to it. Display and preview are NOT gated by this.
 const WIRE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// A screen share's frame rate — the pace of a pull, not of a device: nothing
+/// blocks on a grab, so this interval IS the rate. Shared screens are read,
+/// not watched: ~10/s tracks a scroll and a typed line without spending a
+/// camera's bandwidth on a mostly-still picture.
+const SCREEN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 /// The fixed v1 encode quality (see the ponytail note above).
 const JPEG_QUALITY: u8 = 60;
 /// Tile width in the strip; height follows the frame's aspect.
@@ -53,6 +70,13 @@ const CAPTURE_PIXEL_BUDGET: u32 = 640 * 480;
 /// exact boundary: at 512·1024 px a frame's RGBA equals 2 MiB, takes the
 /// async path, and is not drawn the frame its handle first appears.
 const TILE_PIXEL_BUDGET: u32 = 512 * 1024 - 1;
+/// A shared screen's capture ceiling — the TILE budget, not the camera's,
+/// because legibility is the whole point of a screen and the receiver cannot
+/// hold more than this anyway (it would halve it again on arrival). A 1080p
+/// desktop lands at 960×540: a shared editor is readable, a 4K one is not.
+// ponytail: one halving of whatever the desktop is. The way past it is a
+// codec that carries a still screen cheaply (delta frames), not a bigger JPEG.
+const SCREEN_PIXEL_BUDGET: u32 = TILE_PIXEL_BUDGET;
 
 /// One 2×2 box-average pass over an interleaved `CHANNELS`-per-pixel image;
 /// odd edges clamp their second sample. Repeated until a budget holds — a
@@ -124,21 +148,77 @@ fn store() -> &'static Mutex<VideoStore> {
     })
 }
 
-static CAMERA_ON: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn camera_enabled() -> bool {
-    CAMERA_ON.load(Ordering::Relaxed)
+/// What the video leg is sending, if anything.
+///
+/// ONE DISCRIMINANT, because the camera and the screen are two SOURCES for one
+/// STREAM, never two streams: a participant occupies one video flow and one
+/// tile, and the beacon's `camera_on`/`sharing` pair says which of the two the
+/// far end is looking at. Starting a share therefore stops the camera, and
+/// turning the camera on stops the share — there is no state where both are
+/// true, so no state where the two could disagree about what the peer sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    Off,
+    Camera,
+    Screen,
 }
 
-/// Flip the camera. The capture thread notices the flag on its next tick;
-/// the beacon rides the call module's control channel.
-pub fn call_set_camera(on: bool) -> bool {
-    CAMERA_ON.store(on, Ordering::Relaxed);
-    if !on {
-        store().lock().expect("video store").preview = None;
+impl Source {
+    fn code(self) -> u8 {
+        match self {
+            Source::Off => 0,
+            Source::Camera => 1,
+            Source::Screen => 2,
+        }
     }
+
+    fn of(code: u8) -> Self {
+        match code {
+            1 => Source::Camera,
+            2 => Source::Screen,
+            _ => Source::Off,
+        }
+    }
+}
+
+static SOURCE: AtomicU8 = AtomicU8::new(0);
+
+pub(crate) fn source() -> Source {
+    Source::of(SOURCE.load(Ordering::Relaxed))
+}
+
+/// Both readings of the video source, because a toggle moves BOTH: the view
+/// draws a camera button and a share button, and starting either one ends the
+/// other.
+#[derive(Clone, Debug, Default, Hash, PartialEq)]
+pub struct VideoSource {
+    pub camera: bool,
+    pub sharing: bool,
+}
+
+/// Point the video leg at `next`. The capture thread notices on its next pass
+/// (it holds no device it is not currently asked for); the beacon rides the
+/// call module's control channel.
+fn use_source(next: Source) -> VideoSource {
+    SOURCE.store(next.code(), Ordering::Relaxed);
+    // The outgoing preview belongs to the source that is ending — a camera
+    // still on screen under a "sharing" beacon is a lie for one frame.
+    store().lock().expect("video store").preview = None;
     crate::call::beacon_state();
-    on
+    VideoSource {
+        camera: next == Source::Camera,
+        sharing: next == Source::Screen,
+    }
+}
+
+/// Turn the camera on or off. On ends any screen share.
+pub fn call_use_camera(on: bool) -> VideoSource {
+    use_source(if on { Source::Camera } else { Source::Off })
+}
+
+/// Start or stop sharing the screen. Starting one turns the camera off.
+pub fn call_use_screen(on: bool) -> VideoSource {
+    use_source(if on { Source::Screen } else { Source::Off })
 }
 
 /// Clear everything at session end — the next session must not open on the
@@ -147,7 +227,7 @@ pub(crate) fn reset() {
     let mut store = store().lock().expect("video store");
     store.peers.clear();
     store.preview = None;
-    CAMERA_ON.store(false, Ordering::Relaxed);
+    SOURCE.store(Source::Off.code(), Ordering::Relaxed);
 }
 
 /// A peer's encoded frame off the call socket: decode and store. Runs on a
@@ -162,6 +242,13 @@ pub(crate) fn store_peer_frame(frame: PeerFrame) {
         .expect("video store")
         .peers
         .insert(peer, tile);
+}
+
+/// Drop a peer's last frame: they left the huddle, or their beacon says the
+/// source behind it is off. Frames only ever arrive, so nothing else would
+/// ever take one down.
+pub(crate) fn forget_peer(node: &str) {
+    store().lock().expect("video store").peers.remove(node);
 }
 
 fn hex_of(key: &[u8; 32]) -> String {
@@ -193,27 +280,92 @@ fn decode_frame(data: &[u8]) -> Option<TileFrame> {
     })
 }
 
-/// Encode one captured RGB frame to the wire's opaque bytes. Public for the
-/// unit round-trip; the capture thread is its only product caller.
-pub(crate) fn encode_frame(rgb: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
+/// Encode one captured RGBA frame to the wire's opaque bytes (the encoder
+/// ignores the alpha channel). Public for the unit round-trip; the capture
+/// thread is its only product caller.
+///
+/// RGBA, NOT RGB, BECAUSE THE PREVIEW IS RGBA. The camera is decoded once,
+/// into the layout the renderer wants, and the wire copy borrows that — the
+/// arrangement this replaced decoded to RGB and then rebuilt a whole second
+/// RGBA image per frame, on the capture thread, in the gap between two frames.
+pub(crate) fn encode_frame(rgba: &[u8], width: u16, height: u16) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let encoder = jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY);
     encoder
-        .encode(rgb, width, height, jpeg_encoder::ColorType::Rgb)
+        .encode(rgba, width, height, jpeg_encoder::ColorType::Rgba)
         .ok()?;
-    if out.len() > chat::video::MAX_FRAME_BYTES {
-        return None;
+    if out.len() <= media_service::video::MAX_FRAME_BYTES {
+        return Some(out);
     }
-    Some(out)
+    // OVER THE MESH CAP, so this frame cannot be sent as it is — and a source
+    // that overruns once overruns every frame, which is a stream that stops
+    // dead with no error anywhere. A busy screen is exactly that source (a
+    // detailed desktop at 960×540 out-compresses nothing), so trade its
+    // resolution rather than its liveness: half the size, one more try.
+    let (small, width, height) = halve::<4>(rgba, u32::from(width), u32::from(height));
+    let mut out = Vec::new();
+    let encoder = jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY);
+    encoder
+        .encode(
+            &small,
+            width as u16,
+            height as u16,
+            jpeg_encoder::ColorType::Rgba,
+        )
+        .ok()?;
+    (out.len() <= media_service::video::MAX_FRAME_BYTES).then_some(out)
 }
 
-/// The local preview mirror of a frame we just sent.
-pub(crate) fn store_preview(rgb: &[u8], width: u32, height: u32) {
-    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-    for pixel in rgb.chunks_exact(3) {
-        rgba.extend_from_slice(pixel);
-        rgba.push(0xff);
+/// How the self-view is ARRIVING: frames stored, and the worst and total gap
+/// between consecutive ones in microseconds.
+///
+/// Stutter is a distribution, not a rate — a preview averaging 30 fps with one
+/// 200 ms hole in it is the complaint, and an average alone cannot see the
+/// hole. These are the three numbers that can: count says how many frames the
+/// capture source actually delivered, `worst_gap_us` is the hole, and
+/// `total_gap_us / (count - 1)` is what the mean should have been.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PreviewPace {
+    pub frames: u64,
+    pub worst_gap_us: u64,
+    pub total_gap_us: u64,
+}
+
+static PREVIEW_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREVIEW_WORST_GAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREVIEW_TOTAL_GAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PREVIEW_LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// The self-view's delivery, for this process's life.
+#[cfg(test)]
+pub(crate) fn preview_pace() -> PreviewPace {
+    PreviewPace {
+        frames: PREVIEW_FRAMES.load(Ordering::Relaxed),
+        worst_gap_us: PREVIEW_WORST_GAP_US.load(Ordering::Relaxed),
+        total_gap_us: PREVIEW_TOTAL_GAP_US.load(Ordering::Relaxed),
     }
+}
+
+/// Fold one arrival into the pace above. The gap is measured HERE, where the
+/// frame lands in the store — the last point that belongs to capture and the
+/// first the surface can read, so a slow encode or a stalled device shows up
+/// and a busy renderer does not.
+fn note_preview_arrival() {
+    let now = std::time::Instant::now();
+    PREVIEW_FRAMES.fetch_add(1, Ordering::Relaxed);
+    let mut last = PREVIEW_LAST.lock().expect("preview pace");
+    if let Some(previous) = last.replace(now) {
+        let gap = now.duration_since(previous).as_micros() as u64;
+        PREVIEW_TOTAL_GAP_US.fetch_add(gap, Ordering::Relaxed);
+        PREVIEW_WORST_GAP_US.fetch_max(gap, Ordering::Relaxed);
+    }
+}
+
+/// The local preview: the camera's own pixels, taking ownership of the frame
+/// the capture pass decoded.
+pub(crate) fn store_preview(rgba: Vec<u8>, width: u32, height: u32) {
+    note_preview_arrival();
     store().lock().expect("video store").preview = Some(TileFrame {
         width,
         height,
@@ -221,108 +373,297 @@ pub(crate) fn store_preview(rgb: &[u8], width: u32, height: u32) {
     });
 }
 
-/// The camera thread body: poll the toggle, hold the device only while on,
-/// capture at the camera's native rate, thin the encode to the wire ceiling,
-/// hand frames to the session pump. Ends when `shutdown` drops (the
-/// session's own teardown chain).
-pub(crate) fn camera_thread(
+/// Open the camera, or say why. 640×480 AT ITS HIGHEST FRAME RATE — the size
+/// this module has always documented. `AbsoluteHighestFrameRate` alone meant
+/// "highest frame rate, then the HIGHEST resolution" (nokhwa-core `types.rs`),
+/// so a 720p/1080p webcam negotiated a mode whose q60 JPEG overran the mesh's
+/// ~126 KiB `MAX_FRAME_BYTES` and whose RGBA blew iced's 2 MiB upload cliff —
+/// both read as blinking. A camera with no VGA mode falls back to that same
+/// request and the capture shrink brings its frames onto the identical budget.
+///
+/// A refusal turns the toggle back off and surfaces as "live · camera: …"
+/// through the status fold; the caller has nothing to decide.
+fn open_camera(
+    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+) -> Option<nokhwa::Camera> {
+    use nokhwa::pixel_format::RgbAFormat;
+    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
+
+    let vga = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::HighestResolution(
+        Resolution::new(640, 480),
+    ));
+    let any = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+    match nokhwa::Camera::new(CameraIndex::Index(0), vga)
+        .or_else(|_| nokhwa::Camera::new(CameraIndex::Index(0), any))
+        .and_then(|mut device| device.open_stream().map(|()| device))
+    {
+        Ok(device) => Some(device),
+        Err(error) => {
+            refuse_source(events, format!("camera: {error}"));
+            None
+        }
+    }
+}
+
+/// A source that will not open: say why on the session's status line, and put
+/// the toggle back where the user can see it is off. The capture thread has
+/// nothing left to decide.
+fn refuse_source(
+    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+    message: String,
+) {
+    let _ = events.unbounded_send(crate::call::CallEvent {
+        kind: "live".into(),
+        message,
+        ..crate::call::CallEvent::default()
+    });
+    SOURCE.store(Source::Off.code(), Ordering::Relaxed);
+}
+
+/// The screen source: one X11 connection, and a full-desktop grab per frame.
+///
+/// X11 AND PURE RUST ON PURPOSE. `x11rb` is already in this binary (winit
+/// draws through it), so the desktop costs no new dependency, no C toolchain
+/// and no build-time system library — which the portal/pipewire route would
+/// cost on every machine that builds this app, to buy a Wayland path this app
+/// cannot use anyway: iced is built here with the `x11` feature and no
+/// `wayland`, so the app itself is an X client.
+// ponytail: the WHOLE root window, so a multi-head desktop shares every head
+// at once — a per-monitor or per-window picker is the obvious next step and
+// wants a picker UI, not a different capture.
+struct ScreenSource {
+    connection: x11rb::rust_connection::RustConnection,
+    root: x11rb::protocol::xproto::Window,
+}
+
+impl ScreenSource {
+    fn open() -> Result<Self, String> {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::ImageOrder;
+
+        // A WAYLAND SESSION'S X SERVER IS XWAYLAND, and its root window holds
+        // X clients only — a grab there is a black rectangle with this app's
+        // own windows in it, never the desktop. Refusing says that; sharing it
+        // would be a lie the sharer cannot see (they see their own screen).
+        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return Err("screen sharing needs an X11 session, and this one is Wayland".into());
+        }
+        let (connection, screen) =
+            x11rb::connect(None).map_err(|error| format!("no X display ({error})"))?;
+        let setup = connection.setup();
+        let root = setup
+            .roots
+            .get(screen)
+            .ok_or_else(|| "the X display named no screen".to_string())?
+            .root;
+        // The one pixel layout `grab` reads: 32 bits per pixel, little-endian,
+        // which is every TrueColor desktop this app runs on. Anything else is
+        // refused rather than shipped as swapped colour.
+        let depth = setup
+            .roots
+            .get(screen)
+            .map(|screen| screen.root_depth)
+            .unwrap_or_default();
+        let bits = setup
+            .pixmap_formats
+            .iter()
+            .find(|format| format.depth == depth)
+            .map(|format| format.bits_per_pixel);
+        let packed_bgrx = bits == Some(32) && setup.image_byte_order == ImageOrder::LSB_FIRST;
+        if !packed_bgrx {
+            return Err(format!(
+                "this display's {depth}-bit pixel layout is not one screen sharing can read"
+            ));
+        }
+        Ok(ScreenSource { connection, root })
+    }
+
+    /// One grab, RGBA, already inside the wire budget.
+    fn grab(&self) -> Result<(Vec<u8>, u32, u32), String> {
+        use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat};
+
+        // The geometry is re-read per frame: a resolution change mid-share
+        // would otherwise grab a rectangle the root no longer has.
+        let geometry = self
+            .connection
+            .get_geometry(self.root)
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|error| error.to_string())?;
+        let image = self
+            .connection
+            .get_image(
+                ImageFormat::Z_PIXMAP,
+                self.root,
+                0,
+                0,
+                geometry.width,
+                geometry.height,
+                u32::MAX,
+            )
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|error| error.to_string())?;
+        let (mut pixels, width, height) = shrink_to_budget::<4>(
+            image.data,
+            u32::from(geometry.width),
+            u32::from(geometry.height),
+            SCREEN_PIXEL_BUDGET,
+        );
+        // X hands back BGRX; the renderer and the encoder both read RGBA. The
+        // swap runs AFTER the shrink, over the small image.
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.swap(0, 2);
+            pixel[3] = 0xff;
+        }
+        Ok((pixels, width, height))
+    }
+}
+
+/// What the capture thread currently HOLDS, which follows [`Source`] one pass
+/// behind it — a device is opened when the toggle asks for it and dropped the
+/// moment it is not what is asked for.
+// Half a kilobyte of X11 connection in the largest variant, held once, on one
+// thread, for as long as a share lasts — boxing it would trade a pointer chase
+// per frame for nothing anyone can measure.
+#[allow(clippy::large_enum_variant)]
+enum Open {
+    None,
+    Camera(nokhwa::Camera),
+    Screen(ScreenSource),
+}
+
+impl Open {
+    fn is(&self, source: Source) -> bool {
+        match self {
+            Open::None => source == Source::Off,
+            Open::Camera(_) => source == Source::Camera,
+            Open::Screen(_) => source == Source::Screen,
+        }
+    }
+}
+
+fn open_source(
+    source: Source,
+    events: &iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
+) -> Open {
+    match source {
+        Source::Off => Open::None,
+        Source::Camera => open_camera(events).map_or(Open::None, Open::Camera),
+        Source::Screen => match ScreenSource::open() {
+            Ok(screen) => Open::Screen(screen),
+            Err(reason) => {
+                refuse_source(events, format!("share: {reason}"));
+                Open::None
+            }
+        },
+    }
+}
+
+/// One frame from whatever is open, RGBA and inside its source's budget. An
+/// error is the source having stopped answering; the loop drops it and the
+/// reopen says why if it cannot come back.
+fn grab(open: &mut Open) -> Result<(Vec<u8>, u32, u32), String> {
+    use nokhwa::pixel_format::RgbAFormat;
+
+    match open {
+        Open::None => Err("nothing is open".into()),
+        Open::Camera(device) => {
+            // Blocks until the device has a frame: this IS the loop's clock.
+            let frame = device.frame().map_err(|error| error.to_string())?;
+            let decoded = frame
+                .decode_image::<RgbAFormat>()
+                .map_err(|error| error.to_string())?;
+            let (width, height) = (decoded.width(), decoded.height());
+            Ok(shrink_to_budget::<4>(
+                decoded.into_raw(),
+                width,
+                height,
+                CAPTURE_PIXEL_BUDGET,
+            ))
+        }
+        Open::Screen(screen) => screen.grab(),
+    }
+}
+
+/// The capture thread body: follow the source toggle, hold a device only while
+/// it is the one asked for, thin the encode to the wire ceiling, hand frames to
+/// the session pump. Ends when `shutdown` drops (the session's own teardown
+/// chain).
+///
+/// THE OPEN SOURCE IS THE CLOCK, AND IT IS THE ONLY ONE. `Camera::frame()`
+/// blocks until the device has the next frame, so a loop that reads it
+/// back-to-back runs at exactly the negotiated rate, self-correcting, forever.
+/// The version this replaced ALSO slept a frame interval before that blocking
+/// read: a whole period of waiting, and then a wait for the frame after it.
+/// The driver's buffers filled while we slept, every pass then took the oldest
+/// one, and the self-view arrived a frame late and in bursts — the stutter, in
+/// a preview that never touches the network or the codec. A screen grab is the
+/// other shape: nothing to wait on, so the wait IS the frame rate — and for
+/// that reason it is a DEADLINE the grab's own cost comes out of, not a nap
+/// laid end to end with it.
+pub(crate) fn capture_thread(
     frames: tokio::sync::mpsc::UnboundedSender<CapturedFrame>,
     shutdown: std::sync::mpsc::Receiver<()>,
     events: iced::futures::channel::mpsc::UnboundedSender<crate::call::CallEvent>,
 ) {
-    use nokhwa::pixel_format::RgbFormat;
-    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType, Resolution};
-
-    // The open device plus its native frame interval — the pace the loop
-    // holds while it runs.
-    let mut camera: Option<(nokhwa::Camera, std::time::Duration)> = None;
+    let mut open = Open::None;
     let started = std::time::Instant::now();
-    // The cadence is a rolling deadline: each pass waits only for whatever
-    // remains of the interval after the previous pass's work, so decode +
-    // encode time comes out of the interval instead of stretching it. A pass
-    // that overruns waits zero (recv_timeout still polls the channel) and the
-    // loop runs flat out at its real speed.
-    let mut next_capture = std::time::Instant::now();
-    // The wire thinning clock — see WIRE_INTERVAL.
+    // The wire thinning clock — see WIRE_INTERVAL. The only other clock.
     let mut last_sent: Option<std::time::Instant> = None;
+    // The screen's next grab is a DEADLINE, not a nap — see the pace below.
+    let mut next_grab = std::time::Instant::now();
     loop {
-        let wait = next_capture.saturating_duration_since(std::time::Instant::now());
-        // The shutdown sender dropping is the session ending.
-        match shutdown.recv_timeout(wait) {
+        // The shutdown sender dropping is the session ending, and what this
+        // waits is the open source's own pace.
+        //
+        // A SCREEN'S INTERVAL IS A PERIOD, NOT A NAP. Grabbing a 1280×800 root
+        // window, shrinking it and encoding it costs ~45 ms; sleeping the full
+        // interval on top of that made a 10 fps share arrive at 6.8 (measured:
+        // 146 ms mean between frames for a 100 ms interval). Waiting only what
+        // is LEFT of the period puts the cost inside the frame instead of
+        // after it, and a grab slower than the period simply runs flat out —
+        // never a catch-up burst, because the deadline cannot fall behind now.
+        let pace = match &open {
+            Open::None => IDLE_POLL,
+            Open::Camera(_) => std::time::Duration::ZERO,
+            Open::Screen(_) => next_grab.saturating_duration_since(std::time::Instant::now()),
+        };
+        match shutdown.recv_timeout(pace) {
             Ok(()) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
-        // The idle pace; a pulled frame below re-arms at the camera's rate.
-        next_capture = std::time::Instant::now() + IDLE_POLL;
-        if !camera_enabled() {
-            if camera.take().is_some() {
-                // Device released the moment the toggle goes off.
-            }
+        next_grab = (next_grab + SCREEN_INTERVAL).max(std::time::Instant::now());
+        let wanted = source();
+        if wanted == Source::Off {
+            // The device is released the moment the toggle goes off, and the
+            // idle pace above becomes the toggle poll.
+            open = Open::None;
             continue;
         }
-        if camera.is_none() {
-            // 640×480 AT ITS HIGHEST FRAME RATE — the size this module has
-            // always documented. `AbsoluteHighestFrameRate` alone meant
-            // "highest frame rate, then the HIGHEST resolution" (nokhwa-core
-            // `types.rs`), so a 720p/1080p webcam negotiated a mode whose q60
-            // JPEG overran the mesh's ~126 KiB `MAX_FRAME_BYTES` and whose
-            // RGBA blew iced's 2 MiB upload cliff — both read as blinking.
-            // A camera with no VGA mode falls back to that same request and
-            // the shrink below brings its frames onto the identical budget.
-            let vga = RequestedFormat::new::<RgbFormat>(RequestedFormatType::HighestResolution(
-                Resolution::new(640, 480),
-            ));
-            let any =
-                RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-            match nokhwa::Camera::new(CameraIndex::Index(0), vga)
-                .or_else(|_| nokhwa::Camera::new(CameraIndex::Index(0), any))
-                .and_then(|mut device| device.open_stream().map(|()| device))
-            {
-                Ok(device) => {
-                    // NATIVE CADENCE: the loop runs at the negotiated mode's
-                    // own rate, so the preview is as smooth as the camera —
-                    // the wire is thinned separately by WIRE_INTERVAL. The
-                    // clamp only guards a driver reporting 0 (or nonsense).
-                    let rate = device.frame_rate().clamp(1, 240);
-                    let native = std::time::Duration::from_secs_f64(1.0 / f64::from(rate));
-                    camera = Some((device, native));
-                }
-                Err(error) => {
-                    // Surfaces as "live · camera: …" through the status fold.
-                    let event = crate::call::CallEvent {
-                        kind: "live".into(),
-                        message: format!("camera: {error}"),
-                        ..crate::call::CallEvent::default()
-                    };
-                    let _ = events.unbounded_send(event);
-                    CAMERA_ON.store(false, Ordering::Relaxed);
-                    continue;
-                }
-            }
+        if !open.is(wanted) {
+            // Whatever was open is dropped HERE, by the assignment — a device
+            // is never held for a source nobody asked for.
+            open = open_source(wanted, &events);
+            continue;
         }
-        let Some((device, native_interval)) = camera.as_mut() else {
+        let Ok((rgba, width, height)) = grab(&mut open) else {
+            // A source that stopped answering must not spin this loop: drop
+            // it, and the reopen above says why if it cannot come back.
+            open = Open::None;
             continue;
         };
-        next_capture = std::time::Instant::now() + *native_interval;
-        let Ok(frame) = device.frame() else {
-            continue;
-        };
-        let Ok(decoded) = frame.decode_image::<RgbFormat>() else {
-            continue;
-        };
-        let (width, height) = (decoded.width(), decoded.height());
-        let rgb = decoded.into_raw();
-        let (rgb, width, height) = shrink_to_budget::<3>(rgb, width, height, CAPTURE_PIXEL_BUDGET);
-        // The preview mirrors EVERY captured frame, before and regardless of
-        // the wire: the self-view has no bandwidth to respect, and a frame
-        // the encoder refuses (over the mesh cap) must not freeze it.
-        store_preview(&rgb, width, height);
+        // The wire's copy only BORROWS the frame, so it is taken first and the
+        // preview then takes ownership: the self-view mirrors every captured
+        // frame regardless of the wire — it has no bandwidth to respect, and a
+        // frame the encoder refuses (over the mesh cap) must not freeze it.
         let wire_due = last_sent.is_none_or(|at| at.elapsed() >= WIRE_INTERVAL);
-        if !wire_due {
-            continue;
-        }
-        let Some(encoded) = encode_frame(&rgb, width as u16, height as u16) else {
+        let encoded = wire_due
+            .then(|| encode_frame(&rgba, width as u16, height as u16))
+            .flatten();
+        store_preview(rgba, width, height);
+        let Some(encoded) = encoded else {
             continue;
         };
         last_sent = Some(std::time::Instant::now());
@@ -347,44 +688,165 @@ pub(crate) fn camera_thread(
 /// per frame. Zero tiles parks the clock; frames cannot appear without a
 /// camera beacon riding the call control channel first, and that roster
 /// message redraws the window once, which re-arms it.
-pub fn call_video_tiles() -> Element<'static, ()> {
-    ui_lang_runtime::live_surface(
+///
+/// `staged` names the frame the stage above is already showing whole (see
+/// [`call_video_stage`]), and the strip leaves it out: the same desktop
+/// Cover-cropped into a 128×96 plate beside its full-size self is not a second
+/// view of anything, it is a smear of somebody's wallpaper.
+pub fn call_video_tiles(staged: &str) -> Element<'_, ()> {
+    live_surface::live_surface(
         REDRAW_INTERVAL,
-        |width| Size::new(width, grid_height(tile_count(), grid_columns(width))),
-        || tile_count() as u64,
-        || tile_count() > 0,
-        paint_tiles,
+        move |width| Size::new(width, grid_height(tile_count(staged), grid_columns(width))),
+        move || tile_count(staged) as u64,
+        move || tile_count(staged) > 0,
+        move |renderer, bounds, viewport| paint_tiles(staged, renderer, bounds, viewport),
     )
     .into()
+}
+
+/// The stage the panel mounts above the strip while someone is sharing a
+/// screen: ONE frame, as large as the panel is wide, whole.
+///
+/// A SHARED SCREEN IS NOT A FACE. The strip's plates are a fixed 4:3 crop —
+/// the right treatment for a person, and useless for a desktop, which is
+/// 16:9 or wider and whose whole content is the point. So the stage takes its
+/// height from the frame's own aspect and draws it CONTAINED: every pixel the
+/// sharer sees, none of them cropped, none of them stretched.
+///
+/// `peer` is the sharer's node key, or [`SELF_STAGE`] when this device is the
+/// one sharing — seeing your own share is how you know what you published.
+pub fn call_video_stage(peer: &str) -> Element<'_, ()> {
+    live_surface::live_surface(
+        REDRAW_INTERVAL,
+        move |width| Size::new(width, stage_height(peer, width)),
+        // Layout follows the ASPECT and nothing else: a new frame of the same
+        // shape (every frame, ten times a second) must not invalidate layout.
+        // Packed, not arithmetic: the width comes off a PEER'S frame, and a
+        // multiply wide enough to be readable is a multiply a peer can
+        // overflow.
+        move || {
+            stage_frame(peer).map_or(0, |(width, height, _)| {
+                u64::from(width) << 32 | u64::from(height)
+            })
+        },
+        move || stage_frame(peer).is_some(),
+        move |renderer, bounds, viewport| paint_stage(peer, renderer, bounds, viewport),
+    )
+    .into()
+}
+
+/// The stage's stand-in for "the screen this device is sharing" — a sentinel
+/// no node key can collide with (they are 64 hex characters).
+pub const SELF_STAGE: &str = "you";
+
+/// The staged frame's size and handle: a peer's by node key, or the local
+/// preview under [`SELF_STAGE`]. `pub(crate)` for the live huddle lane, which
+/// asks the store the same question the stage does: is this peer's picture
+/// here yet?
+pub(crate) fn stage_frame(peer: &str) -> Option<(u32, u32, iced::widget::image::Handle)> {
+    let store = store().lock().expect("video store");
+    let frame = match peer {
+        SELF_STAGE => store.preview.as_ref(),
+        key => store.peers.get(key),
+    }?;
+    Some((frame.width, frame.height, frame.handle.clone()))
+}
+
+/// The height that gives `width` the frame's own aspect. No frame yet is no
+/// stage: zero, so the panel reserves nothing for a picture that may never
+/// arrive (a sharer whose first frame is still crossing).
+fn stage_height(peer: &str, width: f32) -> f32 {
+    stage_frame(peer).map_or(0.0, |(frame_width, frame_height, _)| {
+        width * frame_height as f32 / frame_width.max(1) as f32
+    })
+}
+
+fn paint_stage(peer: &str, renderer: &mut iced::Renderer, bounds: Rectangle, viewport: &Rectangle) {
+    use iced::advanced::image::Renderer as _;
+
+    let Some((width, height, handle)) = stage_frame(peer) else {
+        return;
+    };
+    let Some(clip) = bounds.intersection(viewport) else {
+        return;
+    };
+    // Contain, not cover: the height above already follows the aspect, so this
+    // only matters for the frame or two after a resolution change — and a
+    // shared screen with its edges cut off is the one thing this must not do.
+    let scale = (bounds.width / width.max(1) as f32).min(bounds.height / height.max(1) as f32);
+    let drawn = Size::new(width as f32 * scale, height as f32 * scale);
+    let drawing = Rectangle {
+        x: bounds.x + (bounds.width - drawn.width) / 2.0,
+        y: bounds.y + (bounds.height - drawn.height) / 2.0,
+        width: drawn.width,
+        height: drawn.height,
+    };
+    renderer.draw_image(
+        iced::advanced::image::Image {
+            handle,
+            filter_method: iced::widget::image::FilterMethod::default(),
+            rotation: iced::Radians(0.0),
+            border_radius: 8.0.into(),
+            opacity: 1.0,
+            snap: true,
+        },
+        drawing,
+        clip,
+    );
 }
 
 /// Displayed tile plate: fixed 4:3, the frame Cover-cropped onto it, wrapped
 /// into rows on the strip's width.
 const TILE_HEIGHT: f32 = 96.0;
 const TILE_GAP: f32 = 8.0;
-/// The paint ceiling while any tile is live (~60 Hz): high enough for a
-/// native-rate preview and full-rate peers; frames that didn't change
-/// between beats are Arc-cached handles the renderer draws for free.
-const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// How soon after painting a live tile the surface asks to be painted again.
+///
+/// SHORTER THAN ANY DISPLAY'S FRAME, ON PURPOSE — this is not a target rate,
+/// it is "there is always a repaint owed". The window presents on vsync, so
+/// what a beat longer than a refresh period buys is a beat that drifts against
+/// it: ask again 16 ms after a frame the compositor showed 16.7 ms apart and
+/// every few frames the request lands a hair too late, waits a whole extra
+/// refresh, and shows the same picture twice — a periodic hitch on a preview
+/// whose pixels arrived on time. At 4 ms the redraw is always already owed and
+/// each vsync paints the newest camera frame in hand, which is as close to
+/// "straight from the camera" as a composited window gets.
+///
+/// It costs the huddle's own window a paint pass per refresh and no other
+/// window anything (that is what `live_surface` is for), and it parks
+/// completely when no tile is live.
+const REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(4);
 
-fn tile_count() -> usize {
+fn tile_count(staged: &str) -> usize {
     let store = store().lock().expect("video store");
-    store.peers.len() + usize::from(store.preview.is_some())
+    let peers = store
+        .peers
+        .keys()
+        .filter(|node| node.as_str() != staged)
+        .count();
+    let previewing = store.preview.is_some() && staged != SELF_STAGE;
+    peers + usize::from(previewing)
 }
 
 /// Peers in stable key order, the local preview last — the same order the
-/// row-based strip always drew. `Handle` is `Bytes`-backed (Arc) and its
-/// `Id` survives the clone, so each entry is a refcount bump that keeps
-/// pointing at the renderer's cached upload.
-fn tiles_snapshot() -> Vec<(u32, u32, iced::widget::image::Handle)> {
+/// row-based strip always drew, minus whatever the stage is showing whole.
+/// `Handle` is `Bytes`-backed (Arc) and its `Id` survives the clone, so each
+/// entry is a refcount bump that keeps pointing at the renderer's cached
+/// upload.
+fn tiles_snapshot(staged: &str) -> Vec<(u32, u32, iced::widget::image::Handle)> {
     let store = store().lock().expect("video store");
-    let mut ordered: Vec<(&String, &TileFrame)> = store.peers.iter().collect();
+    let mut ordered: Vec<(&String, &TileFrame)> = store
+        .peers
+        .iter()
+        .filter(|(node, _)| node.as_str() != staged)
+        .collect();
     ordered.sort_by(|a, b| a.0.cmp(b.0));
     let mut tiles: Vec<_> = ordered
         .into_iter()
         .map(|(_, frame)| (frame.width, frame.height, frame.handle.clone()))
         .collect();
-    if let Some(preview) = &store.preview {
+    if staged != SELF_STAGE
+        && let Some(preview) = &store.preview
+    {
         tiles.push((preview.width, preview.height, preview.handle.clone()));
     }
     tiles
@@ -404,11 +866,16 @@ fn grid_height(count: usize, columns: usize) -> f32 {
     rows as f32 * TILE_HEIGHT + (rows - 1) as f32 * TILE_GAP
 }
 
-fn paint_tiles(renderer: &mut iced::Renderer, bounds: Rectangle, viewport: &Rectangle) {
+fn paint_tiles(
+    staged: &str,
+    renderer: &mut iced::Renderer,
+    bounds: Rectangle,
+    viewport: &Rectangle,
+) {
     use iced::advanced::image::Renderer as _;
 
     let columns = grid_columns(bounds.width);
-    for (index, (width, height, handle)) in tiles_snapshot().into_iter().enumerate() {
+    for (index, (width, height, handle)) in tiles_snapshot(staged).into_iter().enumerate() {
         let cell = Rectangle {
             x: bounds.x + (index % columns) as f32 * (TILE_WIDTH + TILE_GAP),
             y: bounds.y + (index / columns) as f32 * (TILE_HEIGHT + TILE_GAP),
@@ -449,13 +916,15 @@ mod tests {
     #[test]
     fn encode_decode_round_trips_a_synthetic_frame() {
         // A 64×48 gradient: encode must fit the mesh cap and decode back to
-        // the same dimensions with RGBA pixels.
+        // the same dimensions with RGBA pixels. Capture is RGBA end to end now
+        // — the camera decodes once, into the layout the renderer wants — and
+        // the encoder drops the alpha it is handed.
         let (width, height) = (64u16, 48u16);
-        let rgb: Vec<u8> = (0..u32::from(width) * u32::from(height))
-            .flat_map(|i| [(i % 251) as u8, (i % 83) as u8, (i % 199) as u8])
+        let rgba: Vec<u8> = (0..u32::from(width) * u32::from(height))
+            .flat_map(|i| [(i % 251) as u8, (i % 83) as u8, (i % 199) as u8, 0xff])
             .collect();
-        let encoded = encode_frame(&rgb, width, height).expect("encode");
-        assert!(encoded.len() < chat::video::MAX_FRAME_BYTES);
+        let encoded = encode_frame(&rgba, width, height).expect("encode");
+        assert!(encoded.len() < media_service::video::MAX_FRAME_BYTES);
         let tile = decode_frame(&encoded).expect("decode");
         assert_eq!((tile.width, tile.height), (64, 48));
         assert!(matches!(
@@ -484,12 +953,12 @@ mod tests {
         assert_eq!((w, h, pixels.len()), (64, 48, 64 * 48 * 3));
     }
 
-    /// One global store, so this stays ONE test — and it carries the blink's
-    /// property: a stored frame owns ONE renderer handle, so every view
-    /// rebuild between two captures reads the same id and the renderer keeps
-    /// its upload. Only a new frame is a new id.
+    /// One global store AND one global source, so this stays ONE test, in
+    /// sequence — and it carries the blink's property: a stored frame owns ONE
+    /// renderer handle, so every view rebuild between two captures reads the
+    /// same id and the renderer keeps its upload. Only a new frame is a new id.
     #[test]
-    fn the_store_folds_frames_and_resets_clean() {
+    fn the_store_folds_frames_and_the_source_is_one_choice() {
         let preview_id = || {
             store()
                 .lock()
@@ -498,17 +967,48 @@ mod tests {
                 .as_ref()
                 .map(|frame| frame.handle.id())
         };
+        // "" is "nothing is staged" — the strip's ordinary reading.
         reset();
-        assert_eq!(tile_count(), 0);
-        store_preview(&[10, 20, 30], 1, 1);
-        assert_eq!(tile_count(), 1);
+        assert_eq!(tile_count(""), 0);
+        store_preview(vec![10, 20, 30, 0xff], 1, 1);
+        assert_eq!(tile_count(""), 1);
         let first = preview_id().expect("preview");
         assert_eq!(first, preview_id().expect("preview"));
-        store_preview(&[40, 50, 60], 1, 1);
+        store_preview(vec![40, 50, 60, 0xff], 1, 1);
         assert_ne!(first, preview_id().expect("preview"));
+
+        // The staged frame is the local preview under the sentinel, and its
+        // height carries the frame's aspect — a 2:1 frame in a 100px column is
+        // 50px tall, never a 4:3 plate's crop.
+        store_preview(vec![0xff; 8], 2, 1);
+        assert!(stage_frame(SELF_STAGE).is_some());
+        assert_eq!(stage_height(SELF_STAGE, 100.0), 50.0);
+        assert!(stage_frame("a-peer-nobody-sent").is_none());
+        assert_eq!(stage_height("a-peer-nobody-sent", 100.0), 0.0);
+        // ...and what the stage shows whole, the strip leaves out, so a
+        // desktop is not also a cropped plate beside itself.
+        assert_eq!(tile_count(SELF_STAGE), 0);
+        assert!(tiles_snapshot(SELF_STAGE).is_empty());
+        assert_eq!(tiles_snapshot("").len(), 1);
+
+        // ONE SOURCE: starting either one ends the other, and either one off
+        // is off — there is no state where both are live.
+        let camera = call_use_camera(true);
+        assert_eq!(source(), Source::Camera);
+        assert!(camera.camera && !camera.sharing);
+        let screen = call_use_screen(true);
+        assert_eq!(source(), Source::Screen);
+        assert!(screen.sharing && !screen.camera);
+        // ...and the outgoing source's last frame goes with it, so the tile
+        // strip cannot paint a camera under a "sharing" beacon.
+        assert!(preview_id().is_none());
+        let off = call_use_screen(false);
+        assert_eq!(source(), Source::Off);
+        assert!(!off.camera && !off.sharing);
+
         reset();
         assert!(preview_id().is_none());
-        assert!(!camera_enabled());
+        assert_eq!(source(), Source::Off);
     }
 
     /// The strip's whole layout contract: columns floor on width and never

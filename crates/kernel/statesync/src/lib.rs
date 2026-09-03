@@ -122,7 +122,7 @@ pub const INDEX_OPS_BATCH_LEN: usize = 512;
 
 /// fixed bytes prepended to every authenticated statesync request and reply:
 /// requester(32) + proof(64) + request id(8).
-pub const RPC_AUTHED_HEADER_LEN: usize = 32 + 64 + 8;
+pub const RPC_HEADER_LEN: usize = 32 + 64 + 8;
 
 /// how many boundary captures a server retains. more than one lets a second
 /// joiner start syncing without invalidating the first joiner's in-flight
@@ -363,7 +363,37 @@ pub enum SyncRequest {
         offset: u64,
         len: u64,
     },
+    /// ask a peer to PRODUCE the git objects a forge branch head needs, and
+    /// answer with the digest of the pack it staged — the catch-up lane for a
+    /// node whose committed head runs ahead of its objects.
+    ///
+    /// the blob lanes above fetch bytes a peer already HOLDS, keyed by the
+    /// digest consensus pinned. that is exact but brittle: pack bytes are not
+    /// reproducible, so only a node holding that very pack can answer, and a
+    /// head whose pack no node kept can never be explained. this lane asks for
+    /// the OBJECTS instead — any peer that materialized `head` can build them
+    /// — and the answer needs no trust: the requester installs the pack (which
+    /// re-hashes every object) and then demands the full closure of `head`,
+    /// an oid consensus already committed. a lying peer fails that check.
+    ///
+    /// `bases` are the requester's own on-disk heads, so the answer is bounded
+    /// to what actually moved. the pack itself travels over
+    /// [`SyncRequest::BlobRange`] like any other large artifact.
+    ForgeObjects {
+        repo: String,
+        head: [u8; FORGE_OID_LEN],
+        bases: Vec<[u8; FORGE_OID_LEN]>,
+    },
 }
+
+/// a raw git sha1 oid — forge's object format, and the only oid width this
+/// lane carries. named here so the codec's bounds read as intent.
+pub const FORGE_OID_LEN: usize = 20;
+
+/// the most on-disk heads a [`SyncRequest::ForgeObjects`] may name. the bases
+/// only narrow the answer, so a requester never needs many; the cap is what
+/// stops a forged count from driving a large allocation.
+pub const MAX_FORGE_BASES: usize = 64;
 
 impl SyncRequest {
     /// the request's kind as a wire-stable snake_case label — the
@@ -380,6 +410,7 @@ impl SyncRequest {
             Self::Blob { .. } => "blob",
             Self::BlobInfo { .. } => "blob_info",
             Self::BlobRange { .. } => "blob_range",
+            Self::ForgeObjects { .. } => "forge_objects",
         }
     }
 }
@@ -412,6 +443,18 @@ pub struct TipCoords {
     /// snapshots the server derives from committed valset state, so a parked
     /// joiner tracks the identical window every member tracks.
     pub mesh_window: Vec<MeshWindowEntry>,
+    /// the SERVING node's build stamp — the same string it reports as
+    /// `/v1/status .version`'s stamp half. `None` when that node could not
+    /// identify its own build (a source tarball, a checkout without `.git`),
+    /// which is a silence, never a claim.
+    ///
+    /// a DIAGNOSTIC, and it rides this lane precisely because the lane is
+    /// unauthenticated by construction: the poller renders it on its peers
+    /// view and may warn that the two builds differ, and NOTHING admits,
+    /// refuses, gates or votes on it. two ducktape builds whose consensus
+    /// logic has drifted still finalize together and their roots still
+    /// silently diverge — this only makes the drift nameable.
+    pub build: Option<String>,
 }
 
 /// one mesh-generation snapshot as carried on the sync wire. statesync-local
@@ -474,6 +517,13 @@ pub enum SyncResponse {
     BlobRange {
         bytes: Option<Vec<u8>>,
     },
+    /// the [`SyncRequest::ForgeObjects`] answer: the digest of the pack this
+    /// node staged for the asked head, `None` when it cannot build one (it
+    /// does not hold that head's objects either). the requester pulls the
+    /// bytes over the ranged blob lane and verifies them against the head.
+    ForgeObjects {
+        digest: Option<[u8; 32]>,
+    },
 }
 
 impl SyncResponse {
@@ -489,6 +539,7 @@ impl SyncResponse {
             Self::Blob { .. } => "Blob",
             Self::BlobInfo { .. } => "BlobInfo",
             Self::BlobRange { .. } => "BlobRange",
+            Self::ForgeObjects { .. } => "ForgeObjects",
             Self::Error(_) => "Error",
         }
     }
@@ -579,6 +630,15 @@ pub fn encode_request(req: &SyncRequest) -> Vec<u8> {
             out.extend_from_slice(&offset.to_le_bytes());
             out.extend_from_slice(&len.to_le_bytes());
         }
+        SyncRequest::ForgeObjects { repo, head, bases } => {
+            out.push(9u8);
+            wire::put_str(&mut out, repo);
+            out.extend_from_slice(head);
+            out.extend_from_slice(&(bases.len() as u32).to_le_bytes());
+            for base in bases {
+                out.extend_from_slice(base);
+            }
+        }
     }
     out
 }
@@ -625,6 +685,21 @@ pub fn decode_request(bytes: &[u8]) -> Result<SyncRequest, WireError> {
             offset: wire::take_u64(&mut buf)?,
             len: wire::take_u64(&mut buf)?,
         },
+        9 => {
+            let repo = wire::take_str(&mut buf)?;
+            let head = wire::take_array::<FORGE_OID_LEN>(&mut buf)?;
+            let count = wire::take_u32(&mut buf)? as usize;
+            if count > MAX_FORGE_BASES {
+                return Err(WireError::Codec(format!(
+                    "forge base count {count} exceeds the {MAX_FORGE_BASES} cap"
+                )));
+            }
+            let mut bases = Vec::with_capacity(count);
+            for _ in 0..count {
+                bases.push(wire::take_array::<FORGE_OID_LEN>(&mut buf)?);
+            }
+            SyncRequest::ForgeObjects { repo, head, bases }
+        }
         other => return Err(WireError::BadTag("SyncRequest", other)),
     };
     wire::expect_empty(buf)?;
@@ -759,6 +834,16 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 None => out.push(0),
             }
         }
+        SyncResponse::ForgeObjects { digest } => {
+            out.push(11u8);
+            match digest {
+                Some(d) => {
+                    out.push(1);
+                    out.extend_from_slice(d);
+                }
+                None => out.push(0),
+            }
+        }
         SyncResponse::TipCoords(c) => {
             out.push(7u8);
             out.extend_from_slice(&c.height.to_le_bytes());
@@ -787,6 +872,13 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                     wire::put_bytes(&mut out, r);
                 }
             }
+            match &c.build {
+                Some(build) => {
+                    out.push(1);
+                    wire::put_str(&mut out, build);
+                }
+                None => out.push(0),
+            }
         }
     }
     out
@@ -794,7 +886,7 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
 
 /// exact encoded body length of a Frames response.
 ///
-/// Add RPC_AUTHED_HEADER_LEN for the complete mesh message. Saturating
+/// Add RPC_HEADER_LEN for the complete mesh message. Saturating
 /// arithmetic makes an impossible aggregate overflow fail closed at any
 /// caller comparing the result with a transport budget.
 pub fn encoded_frames_response_len(frames: &[FinalizedFrame]) -> usize {
@@ -823,7 +915,7 @@ pub fn encoded_frames_response_len(frames: &[FinalizedFrame]) -> usize {
 /// serve path that binary-searches this against a transport budget can never
 /// pick a prefix the real encode then overflows.
 ///
-/// Add RPC_AUTHED_HEADER_LEN for the complete mesh message. Saturating
+/// Add RPC_HEADER_LEN for the complete mesh message. Saturating
 /// arithmetic makes an impossible aggregate overflow fail closed.
 pub fn encoded_index_ops_response_len(rows: &[(String, Vec<u8>)]) -> usize {
     const TAG_LEN: usize = 1;
@@ -1081,6 +1173,11 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                     residents,
                 });
             }
+            let build = match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_str(&mut buf)?),
+                t => return Err(WireError::BadTag("tip build presence", t)),
+            };
             SyncResponse::TipCoords(TipCoords {
                 height,
                 root_hash,
@@ -1091,6 +1188,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 has_floor,
                 generation,
                 mesh_window,
+                build,
             })
         }
         8 => SyncResponse::Blob {
@@ -1114,27 +1212,34 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 t => return Err(WireError::BadTag("blob range presence", t)),
             },
         },
+        11 => SyncResponse::ForgeObjects {
+            digest: match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_array::<32>(&mut buf)?),
+                t => return Err(WireError::BadTag("forge objects presence", t)),
+            },
+        },
         other => return Err(WireError::BadTag("SyncResponse", other)),
     };
     wire::expect_empty(buf)?;
     Ok(resp)
 }
 
-/// the ed25519 signing namespace for the statesync standing proof (ADR §5.1).
+/// the ed25519 signing namespace for the statesync standing proof.
 /// a client signs this namespace over the network's genesis namespace bytes
 /// ONCE at construction; every request carries the result as its proof.
 pub const SYNC_AUTH_NAMESPACE: &[u8] = b"ducktape-statesync-auth-v1";
 
-/// the AUTHENTICATED rpc envelope (ADR §5.1 fail-closed, flag day — the
-/// unauthenticated `encode_rpc` is gone): `requester(32) ‖ proof(64) ‖
+/// the AUTHENTICATED rpc envelope (fail-closed):
+/// `requester(32) ‖ proof(64) ‖
 /// id(8 LE) ‖ body`. the codec only FRAMES bytes; the caller produces the
 /// proof ([`sign_sync_proof`]) and the server verifies it ([`verify_sync_proof`])
 /// against committed standing. `id` is requester-local (correlates replies).
 /// server replies reuse the same frame with the auth fields zero-filled — the
 /// client gates replies by transport peer and root-verifies payloads, so a
 /// reply's requester/proof are never inspected.
-pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(RPC_AUTHED_HEADER_LEN + body.len());
+pub fn encode_rpc(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RPC_HEADER_LEN + body.len());
     out.extend_from_slice(requester);
     out.extend_from_slice(proof);
     out.extend_from_slice(&id.to_le_bytes());
@@ -1146,7 +1251,7 @@ pub fn encode_rpc_authed(requester: &[u8; 32], proof: &[u8; 64], id: u64, body: 
 /// errors `Truncated` on any buffer shorter than the 32+64+8 fixed header.
 // the 4-tuple mirrors the fixed wire layout; a named type would just indirect it.
 #[allow(clippy::type_complexity)]
-pub fn decode_rpc_authed(bytes: &[u8]) -> Result<(&[u8; 32], &[u8; 64], u64, &[u8]), WireError> {
+pub fn decode_rpc(bytes: &[u8]) -> Result<(&[u8; 32], &[u8; 64], u64, &[u8]), WireError> {
     let (requester, rest) = bytes
         .split_first_chunk::<32>()
         .ok_or(WireError::Truncated)?;
@@ -1516,6 +1621,11 @@ impl SyncServer {
             | SyncRequest::BlobRange { .. } => {
                 return Err("blob requests are answered by the host layer".into());
             }
+            // likewise the forge object lane: the host builds the pack from
+            // its own git substrate, which this server cannot see.
+            SyncRequest::ForgeObjects { .. } => {
+                return Err("forge object requests are answered by the host layer".into());
+            }
             SyncRequest::Frames {
                 after_height,
                 up_to_height,
@@ -1704,6 +1814,10 @@ impl SyncServer {
                     has_floor: coords.floor_cert.is_some(),
                     generation: coords.generation,
                     mesh_window: coords.mesh_window.clone(),
+                    // this crate is not a node and holds no build stamp: the
+                    // node's own state owner answers the detection lane (and
+                    // fills the stamp) before a request reaches here.
+                    build: None,
                 }))
             }
         }
@@ -1792,18 +1906,6 @@ pub async fn fetch_manifest<C: SyncClient>(client: &C) -> Result<Manifest, SyncE
     }
 }
 
-/// fetch the serving peer's tip coordinates — the detection lane: membership,
-/// epoch, and height without capturing a boundary. action taken on the answer
-/// (ascension, promotion) re-fetches a full [`Manifest`] and verifies its
-/// floor certificate.
-pub async fn fetch_tip_coords<C: SyncClient>(client: &C) -> Result<TipCoords, SyncError> {
-    match client.request(SyncRequest::TipCoords).await? {
-        SyncResponse::TipCoords(c) => Ok(c),
-        SyncResponse::Error(e) => Err(SyncError::Server(e)),
-        other => Err(SyncError::UnexpectedResponse(other.kind_name())),
-    }
-}
-
 /// fetch a captured module's full snapshot payload, chunk by chunk.
 pub async fn fetch_snapshot<C: SyncClient>(
     client: &C,
@@ -1847,6 +1949,10 @@ pub async fn fetch_snapshot<C: SyncClient>(
 /// and the higher floor is the honest one to inherit), `None` when the source
 /// claims complete coverage from genesis.
 ///
+/// `after` RESUMES the walk: rows must ascend strictly past it, so a caller
+/// that already holds a contiguous feed names its own end and pulls only the
+/// delta above it. `None` walks from the source's own beginning.
+///
 /// # trust
 ///
 /// these rows are NOT consensus-verified — the derived tier has no root by
@@ -1879,6 +1985,7 @@ pub async fn fetch_index_ops<C, W>(
     client: &C,
     module: &str,
     boundary: u64,
+    after: Option<(u64, u32)>,
     mut write: W,
 ) -> Result<Option<u64>, SyncError>
 where
@@ -1889,7 +1996,7 @@ where
         module: module.to_string(),
         reason,
     };
-    let mut cursor: Option<(u64, u32)> = None;
+    let mut cursor = after;
     let mut floor: Option<u64> = None;
     loop {
         let resp = client
@@ -2230,9 +2337,55 @@ mod tests {
                 after: None,
             },
             SyncRequest::Blob { digest: [7u8; 32] },
+            SyncRequest::ForgeObjects {
+                repo: "ducktape".into(),
+                head: [9u8; FORGE_OID_LEN],
+                bases: vec![[1u8; FORGE_OID_LEN], [2u8; FORGE_OID_LEN]],
+            },
+            SyncRequest::ForgeObjects {
+                repo: String::new(),
+                head: [9u8; FORGE_OID_LEN],
+                bases: Vec::new(),
+            },
         ] {
             let bytes = encode_request(&req);
             assert_eq!(decode_request(&bytes).unwrap(), req);
+        }
+    }
+
+    /// the base list is attacker-chosen, so its count must be capped BEFORE
+    /// it sizes an allocation — and a truncated tail must reject rather than
+    /// decode a short list.
+    #[test]
+    fn forge_object_request_rejects_an_oversized_base_count() {
+        let mut framed = encode_request(&SyncRequest::ForgeObjects {
+            repo: "demo".into(),
+            head: [9u8; FORGE_OID_LEN],
+            bases: Vec::new(),
+        });
+        let count_at = framed.len() - 4;
+        framed[count_at..].copy_from_slice(&(MAX_FORGE_BASES as u32 + 1).to_le_bytes());
+        assert!(decode_request(&framed).is_err(), "count past the cap");
+
+        let mut truncated = encode_request(&SyncRequest::ForgeObjects {
+            repo: "demo".into(),
+            head: [9u8; FORGE_OID_LEN],
+            bases: vec![[1u8; FORGE_OID_LEN]],
+        });
+        truncated.truncate(truncated.len() - 1);
+        assert!(decode_request(&truncated).is_err(), "short base tail");
+    }
+
+    #[test]
+    fn forge_object_response_round_trips_hit_and_miss() {
+        for resp in [
+            SyncResponse::ForgeObjects {
+                digest: Some([3u8; 32]),
+            },
+            SyncResponse::ForgeObjects { digest: None },
+        ] {
+            let bytes = encode_response(&resp);
+            assert_eq!(decode_response(&bytes).unwrap(), resp);
         }
     }
 
@@ -2423,19 +2576,19 @@ mod tests {
     fn rpc_envelope_round_trips() {
         let requester = [7u8; 32];
         let proof = [9u8; 64];
-        let framed = encode_rpc_authed(&requester, &proof, 99, b"body");
-        let (r, p, id, body) = decode_rpc_authed(&framed).unwrap();
+        let framed = encode_rpc(&requester, &proof, 99, b"body");
+        let (r, p, id, body) = decode_rpc(&framed).unwrap();
         assert_eq!(r, &requester);
         assert_eq!(p, &proof);
         assert_eq!(id, 99);
         assert_eq!(body, b"body");
-        assert_eq!(framed.len(), RPC_AUTHED_HEADER_LEN + body.len());
+        assert_eq!(framed.len(), RPC_HEADER_LEN + body.len());
         // anything shorter than the 32+64+8 fixed header is Truncated.
         assert!(
-            decode_rpc_authed(&framed[..32 + 64 + 7]).is_err(),
+            decode_rpc(&framed[..32 + 64 + 7]).is_err(),
             "short envelope rejects"
         );
-        assert!(decode_rpc_authed(&[]).is_err(), "empty rejects");
+        assert!(decode_rpc(&[]).is_err(), "empty rejects");
     }
 
     #[test]

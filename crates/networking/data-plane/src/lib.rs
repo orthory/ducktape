@@ -58,7 +58,9 @@ pub use transport::{DataPlaneTransport, PeerId, TransportError};
 pub use wire::{Hello, MAX_DATAGRAM, MAX_DATAGRAM_PAYLOAD};
 
 /// The compile-time service registry: every data-plane consumer claims one
-/// id here. Wire-stable — never renumber, only append.
+/// id here, contiguous from 1. the ids and the derived well-known ports are
+/// cross-node facts, so all nodes must run the same registry — a mismatch is
+/// a mixed-binary skew, not something the wire tolerates.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Service {
@@ -67,59 +69,41 @@ pub enum Service {
     /// Real-time voice channels (chat module).
     Voice = 2,
     /// Real-time camera video (chat module): encoded frames fragmented
-    /// across datagrams — see `chat::video` for the frame layer.
+    /// across datagrams — see `media_service::video` for the frame layer.
     Video = 3,
-    // 4 is a permanent tombstone for the removed DuckDNS Web plane.
-    // 5 is reserved for PromiseNet. Never reuse either suffix.
     /// Gateway reverse-proxy requests. The overlay authenticates both
     /// nodes; signed routes bind account authority, target, and access policy.
-    Gateway = 6,
+    Gateway = 4,
     /// Live agent run output between member nodes. Observability only: final
     /// run state and usage remain consensus facts.
-    AgentTelemetry = 7,
+    AgentTelemetry = 5,
     /// Module-code distribution: content-addressed code artifacts (wasm
     /// components, quack capsules) pushed to members before a governance
     /// code-swap proposal and pulled on miss. Consensus pins the 32-byte
     /// hash; this plane only ever moves the self-verifying bytes.
-    ModuleCode = 8,
+    ModuleCode = 6,
     /// Live interactive-terminal-session output between member nodes: the raw
     /// output ring and the ordered command log, so a member on another node
     /// streams the session. Observability only, like `AgentTelemetry` — the
     /// session itself stays node-local and off consensus.
-    TermSession = 9,
+    TermSession = 7,
 }
 
 impl Service {
-    /// The well-known overlay port a service's STREAM listener binds (see
-    /// `docs/adr/2026-07-07-per-use-data-plane.mdx`): planes are per-use, so
+    /// The well-known overlay port a service's STREAM listener binds:
+    /// planes are per-use, so
     /// the service registry doubles as the port registry — two planes can
     /// never collide on a bind, and both ends derive the dial port with no
     /// signaling. Fixed ports are safe because every plane binds a specific
     /// member `/128`, never a wildcard. Wire-stable — never renumber.
     pub const fn overlay_stream_port(self) -> u16 {
-        match self {
-            Service::StateSync => 45801,
-            Service::Voice => 45802,
-            Service::Video => 45803,
-            Service::Gateway => 45806,
-            Service::AgentTelemetry => 45807,
-            Service::ModuleCode => 45808,
-            Service::TermSession => 45809,
-        }
+        45800 + self as u16
     }
 
     /// The well-known overlay port for the service's DATAGRAM socket — the
     /// stream port's sibling range, same registry discipline.
     pub const fn overlay_datagram_port(self) -> u16 {
-        match self {
-            Service::StateSync => 45901,
-            Service::Voice => 45902,
-            Service::Video => 45903,
-            Service::Gateway => 45906,
-            Service::AgentTelemetry => 45907,
-            Service::ModuleCode => 45908,
-            Service::TermSession => 45909,
-        }
+        45900 + self as u16
     }
 }
 
@@ -131,10 +115,10 @@ impl TryFrom<u8> for Service {
             1 => Ok(Service::StateSync),
             2 => Ok(Service::Voice),
             3 => Ok(Service::Video),
-            6 => Ok(Service::Gateway),
-            7 => Ok(Service::AgentTelemetry),
-            8 => Ok(Service::ModuleCode),
-            9 => Ok(Service::TermSession),
+            4 => Ok(Service::Gateway),
+            5 => Ok(Service::AgentTelemetry),
+            6 => Ok(Service::ModuleCode),
+            7 => Ok(Service::TermSession),
             other => Err(other),
         }
     }

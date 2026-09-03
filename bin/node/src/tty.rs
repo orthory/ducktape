@@ -35,7 +35,10 @@ pub(crate) fn confirm(question: &str, is_tty: bool, assume_yes: bool) -> Result<
         .map_err(|error| format!("read confirmation: {error}"))?;
     // an empty line takes the capitalized default (yes); only an explicit no
     // declines, so a typo never silently grants anything.
-    Ok(!matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no"))
+    Ok(!matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "n" | "no"
+    ))
 }
 
 /// RAII: restore the saved `termios` on drop (covers normal return AND a panic

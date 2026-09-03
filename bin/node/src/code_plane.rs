@@ -19,19 +19,18 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use data_plane::{
-    AddressBook, AdmissionPolicy, BulkPacer, DataPlaneTransport, FlowId, PeerId, Service,
-    SocketFactory, StreamPacing, StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
+    BulkPacer, DataPlaneTransport, FlowId, PeerId, Service, SocketFactory, StreamPacing,
+    StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
 };
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::constants::MAX_MODULE_CODE_BYTES;
-use crate::voice_plane::MediaPeers;
+use crate::overlay_book::{BIND_RETRY, OverlayBook, OverlayPeers, Plane, StreamPlane};
 
 const INTENT_PUSH: u8 = 1;
 const INTENT_PULL: u8 = 2;
@@ -52,10 +51,29 @@ const STAGING_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 /// its own; this only reaps a peer that accepts and then goes silent.
 const PUSH_TIMEOUT: Duration = Duration::from_secs(600);
 
-const RETRY: Duration = Duration::from_secs(3);
+/// one fan-out OPEN: a dial over the userspace stack has no SYN timeout
+/// (`overlay-net/src/userspace/stack.rs`, `new_tcp_socket` sets none), so a
+/// DEAD peer would otherwise hold the whole push until `PUSH_TIMEOUT` reaps
+/// it. this bound is what turns that peer into a receipt the operator can
+/// read before proposing (spec decision 2-B) instead of a ten-minute stall.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn code_flow() -> FlowId {
     FlowId::derive(b"ducktape:module-code:v1")
+}
+
+/// the module-code plane's tag for the shared [`OverlayBook`]: default-deny
+/// admission scoped to the service + code flow.
+struct CodePlane;
+
+impl Plane for CodePlane {
+    const SERVICE: Service = Service::ModuleCode;
+}
+
+impl StreamPlane for CodePlane {
+    fn flow() -> FlowId {
+        code_flow()
+    }
 }
 
 fn kind_cap(kind: u8) -> Option<u64> {
@@ -75,36 +93,6 @@ const RESULT_STAGE_FAILED: u8 = 2;
 const PULL_SERVING: u8 = 0;
 const PULL_MISS: u8 = 1;
 
-struct CodeBook {
-    peers: Arc<MediaPeers>,
-}
-
-impl AddressBook for CodeBook {
-    fn datagram_addr(&self, peer: PeerId) -> Option<SocketAddr> {
-        Some(SocketAddr::new(
-            self.peers.overlay_ip(&peer.0),
-            Service::ModuleCode.overlay_datagram_port(),
-        ))
-    }
-
-    fn stream_addr(&self, peer: PeerId) -> Option<SocketAddr> {
-        Some(SocketAddr::new(
-            self.peers.overlay_ip(&peer.0),
-            Service::ModuleCode.overlay_stream_port(),
-        ))
-    }
-
-    fn peer_at(&self, src: std::net::IpAddr) -> Option<PeerId> {
-        self.peers.peer_at(src)
-    }
-}
-
-impl AdmissionPolicy for CodeBook {
-    fn permits(&self, peer: PeerId, service: Service, flow: FlowId) -> bool {
-        service == Service::ModuleCode && flow == code_flow() && self.peers.contains(peer)
-    }
-}
-
 /// bind the service in the background, draining the admin RPC's stage
 /// requests (the daemon surface owns the sender — see
 /// `noded::NodeHandle::with_code_stage`).
@@ -112,7 +100,7 @@ impl AdmissionPolicy for CodeBook {
 pub(crate) fn spawn(
     label: String,
     factory: Arc<dyn SocketFactory>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     me: [u8; 32],
     pacer: BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -126,11 +114,9 @@ pub(crate) fn spawn(
             service: Service::ModuleCode,
             pacing: StreamPacing::Shared(pacer),
             policy: StreamPolicy { accept_backlog: 16 },
-            retry: RETRY,
+            retry: BIND_RETRY,
         };
-        let book = Arc::new(CodeBook {
-            peers: Arc::clone(&peers),
-        });
+        let book = OverlayBook::<CodePlane>::new(Arc::clone(&peers));
         let (plane, service) = match bind_stream_plane(spec, factory, book).await {
             Ok(bound) => bound,
             Err(error) => {
@@ -327,7 +313,7 @@ async fn serve_pull<S: AsyncRead + AsyncWrite + Unpin>(
 /// concurrently and reports per-peer receipts.
 async fn stage_loop<T: DataPlaneTransport>(
     service: Arc<StreamService<T>>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     me: PeerId,
     blobs: blobstore::BlobHandle,
     mut requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
@@ -338,14 +324,16 @@ async fn stage_loop<T: DataPlaneTransport>(
             let service = Arc::clone(&service);
             let blobs = blobs.clone();
             async move {
-                let status =
-                    match tokio::time::timeout(PUSH_TIMEOUT, push_peer(service, peer, req.kind, req.digest, blobs))
-                        .await
-                    {
-                        Ok(Ok(status)) => return receipt(peer, status, true),
-                        Ok(Err(reason)) => reason,
-                        Err(_) => "push timed out".into(),
-                    };
+                let status = match tokio::time::timeout(
+                    PUSH_TIMEOUT,
+                    push_peer(service, peer, req.kind, req.digest, blobs),
+                )
+                .await
+                {
+                    Ok(Ok(status)) => return receipt(peer, status, true),
+                    Ok(Err(reason)) => reason,
+                    Err(_) => "push timed out".into(),
+                };
                 receipt(peer, status, false)
             }
         });
@@ -374,10 +362,21 @@ async fn push_peer<T: DataPlaneTransport>(
     let len = blobs
         .chunk_len(&digest)
         .ok_or_else(|| "artifact not resident locally".to_string())?;
-    let mut stream = service
-        .open(peer, code_flow(), INTENT_PUSH, encode_push_meta(kind, &digest, len))
-        .await
-        .map_err(|e| format!("open failed: {e}"))?;
+    let opened = tokio::time::timeout(
+        OPEN_TIMEOUT,
+        service.open(
+            peer,
+            code_flow(),
+            INTENT_PUSH,
+            encode_push_meta(kind, &digest, len),
+        ),
+    )
+    .await;
+    let mut stream = match opened {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return Err(format!("open failed: {e}")),
+        Err(_elapsed) => return Err("open timed out".into()),
+    };
     let mut ack = [0u8; 9];
     stream
         .read_exact(&mut ack)
@@ -448,15 +447,15 @@ fn decode_pull_meta(meta: &[u8]) -> Option<([u8; 32], u64)> {
 mod tests {
     use super::*;
     use commonware_cryptography::{Signer as _, ed25519};
-    use data_plane::{DataPlane, PlaneConfig};
     use data_plane::sim::{LinkModel, SimNet};
+    use data_plane::{DataPlane, PlaneConfig};
 
-    fn two_peer_net() -> (PeerId, PeerId, Arc<MediaPeers>, SimNet) {
+    fn two_peer_net() -> (PeerId, PeerId, Arc<OverlayPeers>, SimNet) {
         let key_a = ed25519::PrivateKey::from_seed(1).public_key();
         let key_b = ed25519::PrivateKey::from_seed(2).public_key();
         let a = PeerId(key_a.as_ref().try_into().unwrap());
         let b = PeerId(key_b.as_ref().try_into().unwrap());
-        let peers = MediaPeers::new("code-plane-test".into());
+        let peers = OverlayPeers::new("code-plane-test".into());
         peers.set_peers([&key_a, &key_b].into_iter());
         let net = SimNet::new();
         net.set_link(
@@ -476,9 +475,11 @@ mod tests {
         net: &SimNet,
         a: PeerId,
         b: PeerId,
-        peers: &Arc<MediaPeers>,
-    ) -> (Arc<StreamService<impl DataPlaneTransport>>, Arc<StreamService<impl DataPlaneTransport>>)
-    {
+        peers: &Arc<OverlayPeers>,
+    ) -> (
+        Arc<StreamService<impl DataPlaneTransport>>,
+        Arc<StreamService<impl DataPlaneTransport>>,
+    ) {
         let config = PlaneConfig {
             bulk_bytes_per_sec: 50_000_000,
             bulk_burst_bytes: 256 * 1024,
@@ -486,9 +487,7 @@ mod tests {
         let plane = |id: PeerId| {
             DataPlane::new(
                 net.endpoint(id),
-                Arc::new(CodeBook {
-                    peers: Arc::clone(peers),
-                }),
+                OverlayBook::<CodePlane>::new(Arc::clone(peers)),
                 config,
             )
         };

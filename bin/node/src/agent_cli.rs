@@ -1,16 +1,48 @@
-//! `ducktape agent` — remote/interactive sandboxed provider sessions.
+//! `ducktape agent` — remote/interactive sandboxed provider sessions, plus the
+//! two run-control verbs.
 //!
-//! Two verbs, one credential+targeting story:
+//! Two session verbs, one credential+targeting story:
 //!
-//! - `agent pty [<provider>] [--host-node <name>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
-//!   attaches THIS terminal to a Podman-sandboxed provider running on a host
+//! - `agent pty [<provider>] [--host-node <hex>] [--cred <name>] [--cpu <n>] [--mem <gb>]`
+//!   attaches THIS terminal to a provider running in a microVM on a host
 //!   node (default: this node). The CLI talks ONLY to its own node's ws surface
 //!   (`/v1/ws`); the node does the cross-node mesh. Raw terminal mode + resize
 //!   forwarding make it feel like ssh.
-//! - `agent sched [<provider>] --cred <name> [--host-node <name>] [--cpu] [--mem] -- "<prompt>"`
+//! - `agent sched [<provider>] --cred <name> [--host-node <hex>] [--cpu] [--mem] -- "<prompt>"`
 //!   submits a durable, node-pinned headless run (a `saga::SagaMsg::Trigger`)
-//!   and prints its run id. The target may be offline now and execute on
-//!   reconnect — that durability is the point.
+//!   as a frame the USER key signs, and prints its run id. The saga's origin is
+//!   the user key, so the lender attributes the run to the user's account
+//!   (`OfKey`) when the pinned node asks to draw on `--cred`. The target may be
+//!   offline now and execute on reconnect — that durability is the point.
+//!
+//! Two run-control verbs — `agent cancel <run-id>` and `agent reassign <run-id>
+//! [--attempt N]` — act on a run of EITHER lane, and the id itself picks which:
+//!
+//! - an id inside the signing key's own saga namespace ([`saga::owns_id`]) is a
+//!   `sched` run, the one an operator can create here, so cancel/reassign are
+//!   `SagaMsg::Cancel`/`SagaMsg::Reassign`. Cancel is the useful one: `agent
+//!   sched` PINS its saga to the target node (`pinned_assignee`), and saga
+//!   refuses to reassign a pinned saga outright — there is no other provider to
+//!   move it to. Reassign on this lane can only fence an attempt;
+//! - anything else is a `runs` turn claim from the chat- and jobs-driven lane,
+//!   so they are `RunsMsg::CancelRun`/`RunsMsg::ReassignRun`. Both act there.
+//!
+//! The operator holding a run id has no reason to know which module minted it,
+//! and the two id spaces are disjoint, so the CLI asks the id rather than the
+//! operator. Both ride the same user-signed frame lane `sched` uses, and neither
+//! pre-checks who may act: the module decides on every validator — runs admits
+//! the run's creator or the agent's owner, saga only the recorded trigger origin
+//! — and its refusal sentence is what comes back.
+//!
+//! What the lanes do NOT share is how a no-op reads. Runs REFUSES an id it does
+//! not hold (`unknown run: …`); saga is deliberately SILENT for a finished,
+//! unknown or foreign saga, so a `sched` control op that lands prints
+//! "submitted", never "accepted".
+//!
+//! Which is also how the wrong `--key` reads: a `sched` id in ANOTHER key's
+//! namespace is not this key's to control, so it takes the runs lane and comes
+//! back `unknown run: ext:<hex>…`. That sentence means "not your run", not "no
+//! such run" — sign with the key that submitted the `agent sched`.
 //!
 //! `<provider>` is optional when `--cred` names a credential: the registry
 //! record's kind decides what to launch; an explicit provider contradicting the
@@ -18,22 +50,24 @@
 //!
 //! TWO addressing inputs, deliberately two names. `--node`/`-n`/`DUCKTAPE_NODE`
 //! (the shared [`NodeAddr`] group) say which node this CLI DIALS — an http base.
-//! `--host-node` says which PEER runs the work: a display name → account → node
-//! key, or a raw 64-hex node key, erroring with candidates when an account
-//! operates several nodes. They are different types; spelling both `--node`
-//! is what made the flag mean two things.
+//! `--host-node` says which PEER runs the work: its raw 64-hex node key. They
+//! are different types; spelling both `--node` is what made the flag mean two
+//! things.
 //!
 //! Program output stays `println!` (a CLI's stdout is not logging); the pty
 //! passthrough writes raw provider bytes straight to stdout.
 
 use std::collections::BTreeMap;
+use std::io::BufRead;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use commonware_cryptography::Signer as _;
 
 use crate::cli_args::NodeAddr;
 use crate::config::{self, hex_bytes};
-use crate::cred_cli::{ProviderArg, query_node};
+use crate::cred_cli::{ProviderArg, VerbCtx, query_node};
+use crate::userkey_cli::{load_user_signer, user_frame};
 
 type AgentResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -46,6 +80,10 @@ pub(crate) struct AgentArgs {
     cmd: AgentCmd,
     #[command(flatten)]
     addr: NodeAddr,
+    /// path to the user key file that signs a `sched`, `cancel` or `reassign`
+    /// submit (defaults to the keystore's active wallet)
+    #[arg(long, value_name = "PATH", global = true)]
+    key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -54,15 +92,54 @@ pub(crate) enum AgentCmd {
     Pty(PtyArgs),
     /// submit a durable headless run pinned to a node; prints its run id
     Sched(SchedArgs),
+    /// install the agent CLIs this host's guest image lends to runs
+    Install(crate::executors::InstallArgs),
+    /// cancel a pending run — a `sched` run of your own, or a `runs` turn
+    /// whose creator or agent owner you are
+    Cancel(CancelArgs),
+    /// fence this attempt and move a pending `runs` turn to another provider
+    /// (a `sched` run is PINNED to its node and cannot be moved — cancel it
+    /// and submit a new one instead)
+    Reassign(ReassignArgs),
+}
+
+// EVERY run id both control verbs take carries literal 0x1f separators, so it
+// is COPIED, never typed: a `sched` id is `ext:<hex>\x1fsched\x1f<hex>` (what
+// `agent sched` printed), a runs turn claim is
+// `chat\x1f<channel>\x1f<anchor>\x1f<agent>` or
+// `job\x1f<job>\x1f<agent>\x1f<height>` (what the app's run list and the
+// `pending_runs` query print). Typing one into bash needs `$'…\x1f…'` quoting.
+#[derive(Debug, clap::Args)]
+pub(crate) struct CancelArgs {
+    /// the run's id: the id `agent sched` printed, or a pending `runs` turn
+    /// claim — 0x1f-separated, so quote it: $'chat\x1fgeneral\x1f3\x1fbot'
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+}
+
+#[derive(Debug, clap::Args)]
+pub(crate) struct ReassignArgs {
+    /// the run's id: the id `agent sched` printed, or a pending `runs` turn
+    /// claim — 0x1f-separated, so quote it: $'chat\x1fgeneral\x1f3\x1fbot'
+    #[arg(value_name = "RUN_ID")]
+    run_id: String,
+    /// the attempt to FENCE: the run's current attempt, 0 until it has been
+    /// reassigned once — and on the runs lane (`RUN_MAX_ATTEMPTS = 2`) the only
+    /// one a turn can move. A stale number is a deterministic no-op by design
+    /// (that is what stops a delayed click from revoking a newer assignment),
+    /// and a no-op still commits, so the printed height names the fence, not a
+    /// move.
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    attempt: u32,
 }
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct PtyArgs {
     /// provider to launch (`claude`|`codex`); optional when `--cred` names one
     provider: Option<ProviderArg>,
-    /// host node to RUN on: a display name or a raw 64-hex node key
-    /// (omitted = this node). NOT `--node`, which is the http base this CLI dials.
-    #[arg(long = "host-node", value_name = "NAME")]
+    /// host node to RUN on: its raw 64-hex node key (omitted = this node).
+    /// NOT `--node`, which is the http base this CLI dials.
+    #[arg(long = "host-node", value_name = "HEX")]
     host_node: Option<String>,
     /// credential name to serve the session (required for a cross-node host)
     #[arg(long, value_name = "NAME")]
@@ -85,11 +162,11 @@ pub(crate) struct SchedArgs {
     /// this run only, until the run reaches a terminal status.
     #[arg(long, value_name = "NAME")]
     cred: String,
-    /// node to PIN the run to: a display name or a raw 64-hex node key
-    /// (omitted = this node). NOT `--node`, which is the http base this CLI dials.
-    /// The pin is what scopes the `--cred` draw — it is the only node that may
-    /// present this run as its reason for opening a session.
-    #[arg(long = "host-node", value_name = "NAME")]
+    /// node to PIN the run to: its raw 64-hex node key (omitted = this node).
+    /// NOT `--node`, which is the http base this CLI dials. The pin is what
+    /// scopes the `--cred` draw — it is the only node that may present this run
+    /// as its reason for opening a session.
+    #[arg(long = "host-node", value_name = "HEX")]
     host_node: Option<String>,
     /// cpu-cores demand (minimum 2)
     #[arg(long, value_name = "CORES", value_parser = at_least_the_sandbox_floor)]
@@ -104,44 +181,40 @@ pub(crate) struct SchedArgs {
 
 /// Refuse a core count no sandbox will accept, AT SUBMIT.
 ///
-/// `--cpu 1` used to be accepted here, accepted by placement, and accepted by
-/// the lease — and refused only by the spawn, on the executing box, with
-/// `Tart requires at least 2 cores, got 1`. That is the most expensive possible
-/// place to find out: it burns every `RUN_MAX_ATTEMPTS` retry and fails the
-/// saga, having told the submitter nothing they could have acted on.
+/// A zero-core run is accepted by placement and by the lease, and refused only
+/// by the spawn on the executing box — the most expensive possible place to
+/// find out, because it burns every `RUN_MAX_ATTEMPTS` retry and fails the saga
+/// having told the submitter nothing they could act on.
 ///
-/// The floor is the shipped one ([`provider_host::TART_MIN_CORES`]), not a
-/// number invented here, so it cannot drift from the backend that enforces it.
-///
-/// ponytail: ONE floor for every backend, and podman would in fact run a
-/// single-core guest. Announcing a per-backend floor in the capability set is
-/// the fuller fix and a wire change; a flat floor costs a configuration nobody
-/// wants and removes a class of run that can only ever fail late.
+/// The floor is 1: a VM is BUILT at a size, so zero vCPUs is not a smaller
+/// machine — it is not a machine.
 fn at_least_the_sandbox_floor(value: &str) -> Result<u64, String> {
     let cores: u64 = value
         .parse()
         .map_err(|_| format!("{value:?} is not a number of cores"))?;
-    let floor = provider_host::TART_MIN_CORES;
-    if cores < floor {
-        return Err(format!(
-            "a sandboxed run needs at least {floor} cores (a macOS/Tart executor \
-             refuses fewer, and the run would fail on its host after taking a lease) \
-             — try --cpu {floor}"
-        ));
+    if cores == 0 {
+        return Err("a sandboxed run needs at least 1 core — try --cpu 1".to_string());
     }
     Ok(cores)
 }
 
 pub(crate) fn run(args: AgentArgs) -> AgentResult {
-    let AgentArgs { cmd, addr } = args;
-    let base = addr.resolve()?;
+    let AgentArgs { cmd, addr, key } = args;
+    let ctx = VerbCtx { addr, key };
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    // `install` fills a directory on THIS host and talks to no node, so the
+    // address ladder is resolved per-verb rather than up front — a machine
+    // with no workspace yet must still be able to install its executors.
     match cmd {
         // pty takes the whole group, not just the resolved base: attaching needs
         // the node's WORKSPACE too (its 0600 service-link token admits the
         // session's ws topic), and only the ladder knows which workspace the
         // address it just resolved belongs to.
-        AgentCmd::Pty(pty) => cmd_pty(pty, &base, &addr),
-        AgentCmd::Sched(sched) => cmd_sched(sched, &base),
+        AgentCmd::Pty(pty) => cmd_pty(pty, &ctx.http_base()?, &ctx.addr),
+        AgentCmd::Sched(sched) => cmd_sched(sched, &ctx, &mut stdin),
+        AgentCmd::Install(install) => crate::executors::run(install),
+        AgentCmd::Cancel(cancel) => cmd_cancel(cancel, &ctx, &mut stdin),
+        AgentCmd::Reassign(reassign) => cmd_reassign(reassign, &ctx, &mut stdin),
     }
 }
 
@@ -154,14 +227,20 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
     // this secret, so a workspace we cannot read is a session we could never
     // attach to — and failing here costs no container.
     let secret = workspace_secret(addr)?;
+    // spawning a pty MUTATES this node (a process, a container, a guest VM), so
+    // the create and close carry a credential like every other mutation. This
+    // CLI acts as the operator of the node it just addressed, and the proof is
+    // the same directory read the ws topic already needs.
+    let operator = workspace_operator(addr);
     let provider = resolve_provider(base, args.provider, args.cred.as_deref())?;
     let host_hex = match args.host_node.as_deref() {
-        Some(name) => Some(hex_bytes(&resolve_host_node(base, name)?)),
+        Some(hex) => Some(hex_bytes(&host_node_key(hex)?)),
         None => None,
     };
 
     let created = create_session(
         base,
+        operator.as_deref(),
         provider.token(),
         host_hex.as_deref(),
         args.cred.as_deref(),
@@ -177,8 +256,7 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
         .enable_all()
         .build()
         .map_err(|e| format!("attach runtime: {e}"))?;
-    let outcome =
-        runtime.block_on(attach(base, &created.session_id, &created.topic, &secret));
+    let outcome = runtime.block_on(attach(base, &created.session_id, &created.topic, &secret));
     // `shutdown_background`, NOT drop: the attach loop's stdin forwarder reads
     // `tokio::io::stdin()`, which parks a BLOCKING thread on `read(0)`. On a real
     // tty that read never returns, and `abort()` cannot interrupt an OS-level
@@ -190,7 +268,7 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
 
     // Best-effort close (idempotent host-side; the 4 h wall-clock + kill-on-drop
     // are the backstops if it never lands).
-    let _ = close_session(base, &created.session_id);
+    let _ = close_session(base, operator.as_deref(), &created.session_id);
     outcome
 }
 
@@ -205,6 +283,7 @@ struct Created {
 /// `a cross-node session requires --cred`, …) come back verbatim.
 fn create_session(
     base: &str,
+    operator: Option<&str>,
     provider: &str,
     node_hex: Option<&str>,
     cred: Option<&str>,
@@ -225,11 +304,14 @@ fn create_session(
         body["mem_gb"] = serde_json::Value::Number(mem_gb.into());
     }
 
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{base}/v1/term/sessions"))
-        .json(&body)
-        .send()
-        .map_err(|e| format!("POST {base}/v1/term/sessions: {e}"))?;
+    let resp = with_operator(
+        reqwest::blocking::Client::new()
+            .post(format!("{base}/v1/term/sessions"))
+            .json(&body),
+        operator,
+    )
+    .send()
+    .map_err(|e| format!("POST {base}/v1/term/sessions: {e}"))?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -247,12 +329,30 @@ fn create_session(
     Ok(Created { session_id, topic })
 }
 
-fn close_session(base: &str, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    reqwest::blocking::Client::new()
-        .post(format!("{base}/v1/term/sessions/{session_id}/close"))
-        .send()
-        .map_err(|e| format!("close session: {e}"))?;
+fn close_session(
+    base: &str,
+    operator: Option<&str>,
+    session_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    with_operator(
+        reqwest::blocking::Client::new()
+            .post(format!("{base}/v1/term/sessions/{session_id}/close")),
+        operator,
+    )
+    .send()
+    .map_err(|e| format!("close session: {e}"))?;
     Ok(())
+}
+
+/// attach the node's operator credential when this host could read it.
+fn with_operator(
+    request: reqwest::blocking::RequestBuilder,
+    operator: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    match operator {
+        Some(token) => request.header(noded::admin::ADMIN_TOKEN_HEADER, token),
+        None => request,
+    }
 }
 
 /// Attach this terminal to the session's ws output topic and forward keystrokes
@@ -366,7 +466,6 @@ async fn attach(base: &str, session_id: &str, topic: &str, secret: &str) -> Agen
     }
 }
 
-
 /// the tty window size (cols, rows), or an 80x24 fallback when the ioctl fails.
 fn window_size(fd: i32) -> (u16, u16) {
     // SAFETY: `ws` is fully written by a successful ioctl; on failure we ignore it.
@@ -381,24 +480,28 @@ fn window_size(fd: i32) -> (u16, u16) {
 // sched — a node-pinned durable saga trigger
 // ============================================================================
 
-fn cmd_sched(args: SchedArgs, base: &str) -> AgentResult {
+fn cmd_sched(args: SchedArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
+    let base = &ctx.http_base()?;
     let provider = resolve_provider(base, args.provider, Some(&args.cred))?;
     let tag = provider.token();
 
     let target = match args.host_node.as_deref() {
-        Some(name) => resolve_host_node(base, name)?.to_vec(),
+        Some(hex) => host_node_key(hex)?.to_vec(),
         None => own_node_key(base)?,
     };
     preflight_provider(base, &target, tag)?;
 
+    // the USER key signs the trigger: the saga's origin is what the lender
+    // resolves to an account (`OfKey`) when the pinned node draws on `--cred`,
+    // and a node key is on no account. Unlocked before the id is composed —
+    // the id lives under the SIGNER's namespace.
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let origin = sdk::Origin::External(user.public_key().as_ref().to_vec());
     let dispatch_id = fresh_dispatch_id();
-    // saga's id space is namespaced per trigger origin, and `/v1/submit`
-    // re-signs with THIS node's key — so the run's id lives under this node's
-    // own actor namespace and no other member can create or squat it.
-    let saga_id = saga::namespaced_id(
-        &sdk::Origin::External(own_node_key(base)?),
-        &format!("sched\u{1f}{dispatch_id}"),
-    );
+    // saga's id space is namespaced per trigger origin, so the run's id lives
+    // under this user key's own actor namespace and no other member can
+    // create or squat it.
+    let saga_id = saga::namespaced_id(&origin, &format!("sched\u{1f}{dispatch_id}"));
     let payload =
         compute_service::envelope::compose_headless(&saga_id, &args.prompt, Some(&args.cred))
             .into_bytes();
@@ -432,7 +535,7 @@ fn cmd_sched(args: SchedArgs, base: &str) -> AgentResult {
         pinned_assignee: Some(target),
     };
 
-    submit(base, "saga", serde_json::to_value(&trigger)?)?;
+    crate::node_http::submit_frame(base, &user_frame(&user, "saga", saga::encode_msg(&trigger)))?;
     println!("{saga_id}");
     Ok(())
 }
@@ -462,28 +565,12 @@ fn preflight_provider(base: &str, target: &[u8], tag: &str) -> AgentResult {
     Ok(())
 }
 
-/// One `POST /v1/submit` `{target, payload}` — the module reply/receipt on
-/// success, the node's rejection string on failure.
-fn submit(base: &str, target: &str, payload: serde_json::Value) -> AgentResult {
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{base}/v1/submit"))
-        .json(&serde_json::json!({ "target": target, "payload": payload }))
-        .send()
-        .map_err(|e| format!("POST {base}/v1/submit: {e}"))?;
-    let status = resp.status();
-    let text = resp.text().unwrap_or_default();
-    if !status.is_success() {
-        return Err(error_field(&text).into());
-    }
-    Ok(())
-}
-
 /// A fresh dispatch id: 32 random bytes as 64 hex chars — what
 /// `run-output:<id>` keys on.
 ///
 /// The WIDTH is a wire contract, not a taste call. A run's live output reaches
 /// the node's ring through the ws `run_output` frame, whose admission gate
-/// (`bin/noded/src/stream.rs`) accepts an id of EXACTLY 64 ascii-hex and drops
+/// (`crates/noded/src/stream.rs`) accepts an id of EXACTLY 64 ascii-hex and drops
 /// anything else with `reason = "malformed_run_id"`; the agent data plane's
 /// `valid_event` enforces the same shape before forwarding a line to a peer.
 /// `runs::dispatch_id_for` — the chat-driven lane's id — is a hex sha256 and so
@@ -499,9 +586,163 @@ fn fresh_dispatch_id() -> String {
 }
 
 // ============================================================================
-// shared resolution
+// cancel / reassign — run control, on whichever module holds the id
 // ============================================================================
 
+/// Which module holds the run an operator named. The two id spaces are
+/// disjoint, so the ID decides and the operator never has to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlLane {
+    /// a `runs` turn claim — the chat- and jobs-driven agent turns.
+    Runs,
+    /// a saga the SIGNING key triggered: what `agent sched` printed. A saga id
+    /// in anyone else's namespace is not this key's to control, so it takes the
+    /// `runs` lane and earns that lane's honest `unknown run` refusal rather
+    /// than saga's silent foreign-origin no-op.
+    Sched,
+}
+
+/// The two run-control ops, before the lane names the module that takes them.
+#[derive(Debug, Clone, Copy)]
+enum ControlVerb {
+    Cancel,
+    Reassign { attempt: u32 },
+}
+
+fn cmd_cancel(args: CancelArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
+    println!(
+        "{}",
+        submit_control(ctx, stdin, ControlVerb::Cancel, &args.run_id)?
+    );
+    Ok(())
+}
+
+fn cmd_reassign(args: ReassignArgs, ctx: &VerbCtx, stdin: &mut impl BufRead) -> AgentResult {
+    let verb = ControlVerb::Reassign {
+        attempt: args.attempt,
+    };
+    println!("{}", submit_control(ctx, stdin, verb, &args.run_id)?);
+    Ok(())
+}
+
+/// Submit one run-control op as a frame the USER key signs, and answer with the
+/// sentence the operator reads.
+///
+/// The user key is the whole authorization: the frame's verified signer becomes
+/// the op's `Origin::External`, and the holding module admits only the right
+/// origins — runs the run's creator or the agent's owner
+/// (`crates/modules/apps/runs/src/admin.rs`, `controlled_dispatch_id`), saga the
+/// recorded trigger origin. This CLI deliberately pre-checks NEITHER — a second
+/// gate here could only drift from the one that actually decides, and the
+/// module's refusal sentence reaches the operator verbatim through the submit
+/// lane's error.
+fn submit_control(
+    ctx: &VerbCtx,
+    stdin: &mut impl BufRead,
+    verb: ControlVerb,
+    run_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let base = ctx.http_base()?;
+    let user = load_user_signer(&ctx.key_path()?, stdin)?;
+    let origin = sdk::Origin::External(user.public_key().as_ref().to_vec());
+    let lane = control_lane(&origin, run_id);
+    let height = crate::node_http::submit_frame(&base, &control_frame(&user, lane, verb, run_id))?;
+    Ok(control_outcome(lane, verb, run_id, height))
+}
+
+/// The lane a run id belongs to, asked of the id and the key that signs for it.
+fn control_lane(origin: &sdk::Origin, run_id: &str) -> ControlLane {
+    let is_this_keys_saga = saga::owns_id(origin, run_id);
+    if is_this_keys_saga {
+        ControlLane::Sched
+    } else {
+        ControlLane::Runs
+    }
+}
+
+/// The frame one control verb submits: the lane names the module, the verb the
+/// op, and the USER key signs either way.
+fn control_frame(
+    user: &commonware_cryptography::ed25519::PrivateKey,
+    lane: ControlLane,
+    verb: ControlVerb,
+    run_id: &str,
+) -> Vec<u8> {
+    match (lane, verb) {
+        (ControlLane::Runs, ControlVerb::Cancel) => user_frame(
+            user,
+            "runs",
+            runs::encode_msg(&runs::RunsMsg::CancelRun {
+                run_id: run_id.to_string(),
+            }),
+        ),
+        (ControlLane::Runs, ControlVerb::Reassign { attempt }) => user_frame(
+            user,
+            "runs",
+            runs::encode_msg(&runs::RunsMsg::ReassignRun {
+                run_id: run_id.to_string(),
+                attempt,
+            }),
+        ),
+        (ControlLane::Sched, ControlVerb::Cancel) => user_frame(
+            user,
+            "saga",
+            saga::encode_msg(&saga::SagaMsg::Cancel {
+                saga_id: run_id.to_string(),
+            }),
+        ),
+        (ControlLane::Sched, ControlVerb::Reassign { attempt }) => user_frame(
+            user,
+            "saga",
+            saga::encode_msg(&saga::SagaMsg::Reassign {
+                saga_id: run_id.to_string(),
+                attempt,
+            }),
+        ),
+    }
+}
+
+/// What a committed run-control op prints — the sentence says exactly what the
+/// block agreed to and no more, which differs per lane and per verb.
+///
+/// "accepted", never "cancelled": this block is where the module TOOK the op and
+/// told the dispatch plane. The run ends a block later, when the plane's
+/// `Err("cancelled")` delivery prunes the entry and posts the agent's ⚠ reply —
+/// and an already-delivered run accepts the very same op as a deterministic
+/// no-op. Claiming the run is over here would be a sentence the chain has not
+/// agreed to yet.
+///
+/// A `sched` op only ever says "submitted": saga answers an unknown, finished or
+/// foreign saga with a SILENT no-op rather than an error, so a committed frame
+/// there proves the chain read the op, not that it moved anything. Reassign says
+/// which attempt it fenced for the same reason — a stale attempt commits and
+/// changes nothing on either lane, and a LIVE `sched` saga never reaches this
+/// sentence at all: it is pinned, so saga refuses the reassign outright and the
+/// operator reads that refusal instead.
+fn control_outcome(lane: ControlLane, verb: ControlVerb, run_id: &str, height: u64) -> String {
+    match (lane, verb) {
+        (ControlLane::Runs, ControlVerb::Cancel) => format!(
+            "cancel accepted for run {run_id} at height {height} \
+             (a run whose turn was already taken cancels nothing)"
+        ),
+        (ControlLane::Runs, ControlVerb::Reassign { attempt }) => format!(
+            "reassign accepted for run {run_id} at height {height}, fencing attempt {attempt} \
+             (a stale attempt moves nothing)"
+        ),
+        (ControlLane::Sched, ControlVerb::Cancel) => format!(
+            "cancel submitted for sched run {run_id} at height {height} \
+             (a finished or unknown run is a silent no-op)"
+        ),
+        (ControlLane::Sched, ControlVerb::Reassign { attempt }) => format!(
+            "reassign submitted for sched run {run_id} at height {height}, fencing attempt \
+             {attempt} (a pinned, finished or stale run moves nothing)"
+        ),
+    }
+}
+
+// ============================================================================
+// shared resolution
+// ============================================================================
 
 /// the service-link secret of the node this CLI is dialling — what its ws
 /// surface admits a session's `term:<id>` topic against.
@@ -517,6 +758,17 @@ fn workspace_secret(addr: &NodeAddr) -> Result<String, Box<dyn std::error::Error
         .workspace()
         .map_err(|why| format!("attaching a pty needs this node's workspace: {why}"))?;
     noded::services::read_link_token(&workspace).map_err(Into::into)
+}
+
+/// this boot's operator credential for the node being addressed — the second
+/// thing behind that same 0600 directory, and what a MUTATING `/v1` route wants
+/// from a caller acting as the node's operator rather than as an account.
+///
+/// `None` rather than an error: an unreadable credential surfaces as the node's
+/// own 401, which names it precisely, instead of a guess made one layer early.
+fn workspace_operator(addr: &NodeAddr) -> Option<String> {
+    let workspace = addr.workspace().ok()?;
+    noded::admin::read_operator_token(&workspace).ok()
 }
 
 /// This node's own 32-byte mesh key, from `/v1/status`'s `public_key`.
@@ -599,55 +851,12 @@ fn credential_hint(base: &str) -> String {
     }
 }
 
-/// Resolve a `--node` target to a 32-byte node key: a raw 64-hex key is used
-/// directly; a display name resolves through identity to its account's node,
-/// erroring with candidates when the account operates several.
-fn resolve_host_node(base: &str, name: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    if let Some(key) = decode_node_key(name) {
-        return Ok(key);
-    }
-    let query = identity::IdentityQuery::All {
-        from: 0,
-        limit: u64::MAX,
-    };
-    let value = query_node(base, "identity", serde_json::to_value(&query)?)?;
-    let accounts = match serde_json::from_value::<identity::IdentityReply>(value)? {
-        identity::IdentityReply::Accounts(accounts) => accounts,
-        other => return Err(format!("unexpected identity reply: {other:?}").into()),
-    };
-    let matches: Vec<&identity::AccountView> = accounts
-        .iter()
-        .filter(|account| account.display_name.as_deref() == Some(name))
-        .collect();
-    let account = match matches.as_slice() {
-        [only] => only,
-        [] => {
-            return Err(format!("no account named {name:?} (nor a valid 64-hex node key)").into());
-        }
-        many => {
-            return Err(format!(
-                "account name {name:?} is ambiguous across {} accounts",
-                many.len()
-            )
-            .into());
-        }
-    };
-    match account.nodes.as_slice() {
-        [only] => decode_node_key_bytes(&only.node_key),
-        [] => Err(format!("account {name:?} has no bound node").into()),
-        many => {
-            let candidates = many
-                .iter()
-                .map(|node| format!("  {}", hex_bytes(&node.node_key)))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(format!(
-                "account {name:?} operates {} nodes — pass one by hex node key:\n{candidates}",
-                many.len()
-            )
-            .into())
-        }
-    }
+/// The `--host-node` target as a 32-byte node key. Hex only: no node is bound
+/// to an account, so a name cannot resolve to one — `ducktape node peers`
+/// lists the keys.
+fn host_node_key(text: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    decode_node_key(text)
+        .ok_or_else(|| format!("--host-node must be a 64-hex node key, not {text:?}").into())
 }
 
 /// Decode a 64-hex string to 32 bytes, or `None` when it is not one.
@@ -657,11 +866,6 @@ fn decode_node_key(text: &str) -> Option<[u8; 32]> {
     }
     let bytes = config::unhex(text).ok()?;
     <[u8; 32]>::try_from(bytes).ok()
-}
-
-fn decode_node_key_bytes(bytes: &[u8]) -> Result<[u8; 32], Box<dyn std::error::Error>> {
-    <[u8; 32]>::try_from(bytes)
-        .map_err(|_| format!("bound node key is not 32 bytes ({} bytes)", bytes.len()).into())
 }
 
 /// `http(s)://host:port` → `ws(s)://host:port/v1/ws`, the node's own ws surface.
@@ -764,19 +968,29 @@ mod tests {
         assert_ne!(id, fresh_dispatch_id(), "a fresh id is fresh");
     }
 
-    /// `sched` composes the run's saga id under the SUBMITTING node's own actor
-    /// namespace, because `/v1/submit` re-signs with that key and saga refuses a
-    /// trigger for anybody else's namespace. Composing a bare `sched\x1f<id>`
-    /// here (what this used to do) would make every scheduled run reject.
+    /// `sched` composes the run's saga id under the SIGNING user key's own
+    /// actor namespace, because the frame's verified signer is the trigger's
+    /// origin and saga refuses a trigger for anybody else's namespace.
+    /// Composing a bare `sched\x1f<id>` here would make every scheduled run
+    /// reject; composing it under the NODE key (what this used to do) would
+    /// too, now that the node no longer re-signs the submit.
     #[test]
-    fn a_sched_saga_id_is_owned_by_the_submitting_node() {
-        let node = sdk::Origin::External(vec![0xAB; 32]);
-        let id = saga::namespaced_id(&node, &format!("sched\u{1f}{}", fresh_dispatch_id()));
-        assert!(saga::owns_id(&node, &id), "saga would refuse {id:?}");
+    fn a_sched_saga_id_is_owned_by_the_signing_user_key() {
+        let user = sdk::Origin::External(vec![0xAB; 32]);
+        let id = saga::namespaced_id(&user, &format!("sched\u{1f}{}", fresh_dispatch_id()));
+        assert!(saga::owns_id(&user, &id), "saga would refuse {id:?}");
         assert!(
             !saga::owns_id(&sdk::Origin::Module("dispatch".into()), &id),
             "and it belongs to nobody else"
         );
+    }
+
+    #[test]
+    fn host_node_is_hex_only() {
+        let hex = "ab".repeat(32);
+        assert_eq!(host_node_key(&hex).unwrap(), [0xab; 32]);
+        let err = host_node_key("alice").unwrap_err().to_string();
+        assert!(err.contains("64-hex node key"), "{err}");
     }
 
     #[test]
@@ -836,7 +1050,9 @@ mod tests {
         })
         .to_string();
         assert!(!is_term_ended(&chunk));
-        assert!(!is_term_ended(&serde_json::json!({ "type": "heartbeat" }).to_string()));
+        assert!(!is_term_ended(
+            &serde_json::json!({ "type": "heartbeat" }).to_string()
+        ));
     }
 
     /// The node's refusal must END the attach, not be swallowed.
@@ -908,6 +1124,160 @@ mod tests {
         assert_eq!(resize["op"], "term_resize");
         assert_eq!(resize["cols"], 120);
         assert_eq!(resize["rows"], 40);
+    }
+
+    /// The RUN ID picks the module, and the USER key signs either way — the
+    /// authority check on both lanes IS the frame's verified origin. Getting the
+    /// lane wrong is not a cosmetic slip: `CancelRun` on a `sched` id walks
+    /// `controlled_dispatch_id` to an entry that was never minted and answers
+    /// "unknown run", which is exactly the hole this verb exists to close.
+    #[test]
+    fn the_run_id_picks_the_module_and_the_user_key_signs_the_op() {
+        use commonware_codec::DecodeExt as _;
+        let user = commonware_cryptography::ed25519::PrivateKey::decode([3u8; 32].as_slice())
+            .expect("a 32-byte seed");
+        let signer = sdk::Origin::External(user.public_key().as_ref().to_vec());
+        let turn_claim = "chat\u{1f}general\u{1f}3\u{1f}bot";
+        // exactly what `agent sched` printed: saga's namespaced id under the
+        // signing key's own actor string.
+        let sched_run = saga::namespaced_id(&signer, "sched\u{1f}deadbeef");
+
+        assert_eq!(control_lane(&signer, turn_claim), ControlLane::Runs);
+        assert_eq!(control_lane(&signer, &sched_run), ControlLane::Sched);
+        // another key's saga is not this key's to control: it takes the runs
+        // lane, where an id nobody holds is REFUSED rather than silently
+        // swallowed by saga's foreign-origin no-op.
+        let stranger = sdk::Origin::External(vec![9u8; 32]);
+        assert_eq!(
+            control_lane(&signer, &saga::namespaced_id(&stranger, "sched\u{1f}x")),
+            ControlLane::Runs
+        );
+
+        let submitted = |verb, run_id: &str| {
+            let lane = control_lane(&signer, run_id);
+            let frame = control_frame(&user, lane, verb, run_id);
+            let (origin, msg) = node::decode_frame(&frame).expect("the frame verifies");
+            assert_eq!(origin, signer, "the module admits by ORIGIN");
+            (msg.target, msg.payload)
+        };
+
+        let (target, payload) = submitted(ControlVerb::Cancel, turn_claim);
+        assert_eq!(target, "runs");
+        assert_eq!(
+            runs::decode_msg(&payload),
+            Ok(runs::RunsMsg::CancelRun {
+                run_id: turn_claim.to_string()
+            })
+        );
+        let (target, payload) = submitted(ControlVerb::Reassign { attempt: 2 }, turn_claim);
+        assert_eq!(target, "runs");
+        assert_eq!(
+            runs::decode_msg(&payload),
+            Ok(runs::RunsMsg::ReassignRun {
+                run_id: turn_claim.to_string(),
+                attempt: 2
+            })
+        );
+
+        let (target, payload) = submitted(ControlVerb::Cancel, &sched_run);
+        assert_eq!(target, "saga", "a sched run lives in saga, not runs");
+        assert_eq!(
+            saga::decode_msg(&payload),
+            Ok(saga::SagaMsg::Cancel {
+                saga_id: sched_run.clone()
+            })
+        );
+        let (target, payload) = submitted(ControlVerb::Reassign { attempt: 1 }, &sched_run);
+        assert_eq!(target, "saga");
+        assert_eq!(
+            saga::decode_msg(&payload),
+            Ok(saga::SagaMsg::Reassign {
+                saga_id: sched_run,
+                attempt: 1
+            })
+        );
+    }
+
+    /// What a COMMITTED control op is allowed to claim. Every sentence here
+    /// prints at a height the chain agreed to, and the failure mode is claiming
+    /// more than that height proves.
+    ///
+    /// "accepted", never "cancelled" — the run ends a block later, on the
+    /// dispatch plane's delivery. And every lane that can commit a no-op says
+    /// so: runs cancels nothing when the turn was already taken, saga is
+    /// deliberately silent for a finished, unknown or foreign saga, and a
+    /// pinned `sched` saga cannot be reassigned at all. The refusal path needs
+    /// no case here — the module's own sentence rides the submit lane's error
+    /// verbatim, which is `node_http::submit_frame`'s contract and its tests.
+    #[test]
+    fn a_committed_control_op_claims_only_what_its_height_proves() {
+        let run_id = "chat\u{1f}general\u{1f}3\u{1f}bot";
+
+        let cancel = control_outcome(ControlLane::Runs, ControlVerb::Cancel, run_id, 42);
+        assert!(
+            cancel.starts_with(&format!("cancel accepted for run {run_id} at height 42")),
+            "{cancel}"
+        );
+        assert!(cancel.contains("cancels nothing"), "{cancel}");
+        // saga swallows an unknown, finished or foreign cancel WITHOUT an
+        // error, so a committed sched frame proves the chain read the op and
+        // nothing more. Saying "accepted" there would be the CLI inventing a
+        // verdict the block never reached.
+        let sched = control_outcome(ControlLane::Sched, ControlVerb::Cancel, run_id, 42);
+        assert!(sched.contains("submitted"), "{sched}");
+        assert!(!sched.contains("accepted"), "{sched}");
+        // reassign names the attempt it fenced on either lane: a stale one
+        // commits and moves nothing, and the operator cannot tell from a bare
+        // height.
+        for lane in [ControlLane::Runs, ControlLane::Sched] {
+            let line = control_outcome(lane, ControlVerb::Reassign { attempt: 3 }, run_id, 42);
+            assert!(line.contains("attempt 3"), "{line}");
+        }
+        // a `sched` reassign must never promise a move: every `agent sched`
+        // saga is pinned, and saga refuses a pinned reassign outright.
+        let pinned = control_outcome(
+            ControlLane::Sched,
+            ControlVerb::Reassign { attempt: 0 },
+            run_id,
+            42,
+        );
+        assert!(pinned.contains("pinned"), "{pinned}");
+    }
+
+    /// a Parser wrapper so the tests exercise the derived verb SHAPE the same
+    /// way `main.rs`'s integrator will.
+    #[derive(clap::Parser)]
+    struct TestAgentCli {
+        #[command(flatten)]
+        args: AgentArgs,
+    }
+
+    /// `--attempt` defaults to 0 — the run's FIRST attempt, and the only one a
+    /// reassignment can move (`RUN_MAX_ATTEMPTS = 2`, so attempt 1 answers
+    /// "reassignment attempts exhausted"). A wrong default is the worst
+    /// failure this verb has: saga treats a stale attempt as a deterministic
+    /// no-op, so the operator would read "accepted" and watch the run carry on.
+    #[test]
+    fn reassign_fences_the_first_attempt_unless_told_otherwise() {
+        use clap::Parser as _;
+        let reassign = |argv: &[&str]| {
+            let cli = TestAgentCli::try_parse_from(argv).expect("the verb parses");
+            match cli.args.cmd {
+                AgentCmd::Reassign(args) => args,
+                other => panic!("expected reassign, got {other:?}"),
+            }
+        };
+        let default = reassign(&["agent", "reassign", "run-1"]);
+        assert_eq!(default.run_id, "run-1");
+        assert_eq!(default.attempt, 0);
+        assert_eq!(
+            reassign(&["agent", "reassign", "run-1", "--attempt", "1"]).attempt,
+            1
+        );
+
+        let cancel =
+            TestAgentCli::try_parse_from(["agent", "cancel", "run-1"]).expect("the verb parses");
+        assert!(matches!(cancel.args.cmd, AgentCmd::Cancel(args) if args.run_id == "run-1"));
     }
 
     #[test]

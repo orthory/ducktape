@@ -49,6 +49,22 @@ on forge_repo_loaded(next)
   forge_repo_phase = ForgePhase.ready
   forge_branches = next.branches
   forge_items = next.items
+  // A deep link's second step: the repo is open, now its item or its file.
+  // The file goes to the code browser itself — only it knows the tree
+  // revision the reader's header gates on.
+  match forge_focus_kind(forge_focus_number, forge_focus_path)
+    ForgeFocus.idle
+      return if true
+    ForgeFocus.item
+      let number = forge_focus_number
+      forge_focus_number = 0
+      run every duck_echo_i64(number) -> forge_open_item _ | external_url_failed _
+    ForgeFocus.blob
+      let path = forge_focus_path
+      let rev = forge_focus_rev
+      forge_focus_path = ""
+      forge_focus_rev = ""
+      slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, network_chain_id, path, rev) at forge_repo
 
 on forge_repo_failed(cause)
   return if cause.generation != forge_generation
@@ -59,6 +75,9 @@ on forge_open_item(number)
   return if !connected || empty(forge_repo)
   invalidate lane=forge_discussion
   forge_item_number = number
+  // The highlight belongs to the item it was landed on; the one-shot
+  // `forge_focus_seq` survives this open — it is THIS open's landing.
+  forge_linked_note = none
   error = ""
   forge_item_phase = ForgePhase.loading
   forge_review_verdict = ForgeReviewVerdict.comment
@@ -114,6 +133,15 @@ on forge_discussion_loaded(next)
   return if next.channel_id != forge_item_channel
   forge_discussion = next.messages
   forge_discussion_members = next.members
+  // A deep link's `#seq` lands here, once: the note is picked out of the list and
+  // the item's page scrolls to that row — by its key in the Discussion's
+  // keyed column, landing on the row's measured top (a seq the list does not
+  // hold scrolls nowhere; the linked-note card above the list still shows it).
+  return if forge_focus_seq == 0
+  let landed = forge_focus_seq
+  forge_linked_note = linked_note(forge_discussion, landed)
+  forge_focus_seq = 0
+  task widget scroll-to-key #workspace-tabs/content/forge/item-detail landed window=window_target(console_win)
 
 on forge_discussion_failed(cause)
   error = cause.message
@@ -283,6 +311,8 @@ on forge_close_item
   invalidate lane=forge_discussion
   forge_generation = forge_generation + 1
   forge_item_number = 0
+  forge_linked_note = none
+  forge_focus_seq = 0
   forge_item_phase = ForgePhase.idle
   forge_item_diff = ""
   forge_item_channel = ""

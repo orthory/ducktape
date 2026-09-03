@@ -21,8 +21,34 @@ use files::{
     decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
     encode_query as files_encode_query, objects::object_id, to_hex,
 };
+use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 const CONVERGE: Duration = Duration::from_secs(180);
+
+/// a create for `task_id`; NOT an upsert — `tasks` refuses a duplicate id
+/// (`task_board.rs:77-80`). That rejection is ISOLATED, not fatal: the op's
+/// stage rolls back and it is recorded `Rejected` while the block still seals
+/// (`host/src/lib.rs:237`, `:283`). So a duplicate never applies and never
+/// announces itself — `write_and_confirm` spins to its timeout, or passes
+/// VACUOUSLY when the re-created title happens to match the surviving one.
+/// Every call site here has to carry a fresh id.
+fn task_create(task_id: &str, title: &str) -> Vec<u8> {
+    encode_task_msg(&TaskMsg::CreateTask {
+        task_id: task_id.into(),
+        title: title.into(),
+    })
+}
+
+fn task_title(cluster: &NetworkShapeCluster, idx: usize, task_id: &str) -> Option<String> {
+    let req = encode_task_query(&TaskQuery::Get {
+        task_id: task_id.into(),
+    });
+    let reply = cluster.query(idx, "tasks", &req)?;
+    match decode_task_reply(&reply) {
+        Ok(TaskReply::Task(task)) => task.map(|t| t.title),
+        _ => None,
+    }
+}
 
 #[test]
 fn network_shape_joiner_parks_until_promote() {
@@ -41,7 +67,7 @@ fn network_shape_joiner_parks_until_promote() {
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
     // In the manual flow, the pubkey travels out-of-band
-    // and no lobby announce happens — the tokened flavor has its own e2e
+    // and no first-contact intro happens — the tokened flavor has its own e2e
     // (join_request_e2e).
     let invite = cluster.invite();
     let friend_key = cluster.join_friend_manual(&invite);
@@ -92,8 +118,6 @@ fn network_shape_joiner_parks_until_promote() {
 /// halted) would be invisible to CI without the liveness assertions below.
 #[test]
 fn promoted_resident_seats_in_process_and_serves() {
-    use directory::{DirMsg, DirQuery, DirReply};
-
     let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
@@ -123,57 +147,17 @@ fn promoted_resident_seats_in_process_and_serves() {
     // the network the seat lands in is LIVE end to end: a write
     // finalized through the founder becomes readable from the promoted
     // friend's own surface…
-    cluster.submit(
-        0,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "post-promote-founder".into(),
-            value: "landed".into(),
-        }),
-    );
+    cluster.submit(0, "tasks", &task_create("post-promote-founder", "landed"));
     poll_until(
         "the promoted friend to serve the founder's write",
         CONVERGE,
-        || {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "post-promote-founder".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .and_then(|r| match r {
-                DirReply::Value(Some(v)) if v == "landed" => Some(()),
-                _ => None,
-            })
-        },
+        || task_title(&cluster, 1, "post-promote-founder").filter(|t| t == "landed"),
     );
     // …and the promoted friend's own ordered lane finalizes into the widened
     // quorum (a halted founder can never land this).
-    cluster.submit(
-        1,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "post-promote-friend".into(),
-            value: "landed".into(),
-        }),
-    );
+    cluster.submit(1, "tasks", &task_create("post-promote-friend", "landed"));
     poll_until("the founder to serve the friend's write", CONVERGE, || {
-        cluster
-            .query(
-                0,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "post-promote-friend".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .and_then(|r| match r {
-                DirReply::Value(Some(v)) if v == "landed" => Some(()),
-                _ => None,
-            })
+        task_title(&cluster, 0, "post-promote-friend").filter(|t| t == "landed")
     });
 }
 
@@ -432,7 +416,6 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
 ///
 #[test]
 fn staged_admission_resident_presyncs_then_promotes_warm() {
-    use directory::{DirMsg, DirQuery, DirReply};
     use valset::{ValsetQuery, ValsetReply};
 
     let _serial = serial();
@@ -457,32 +440,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         }
     };
 
-    // A DIRECTORY WRITE BEFORE ANYONE JOINS: the resident below never sees
+    // A TASKS WRITE BEFORE ANYONE JOINS: the resident below never sees
     // this block as a frame — it arrives inside the synced boundary, with the
     // op feed that carried it long gone. The join-seam op-row backfill (spec
     // §7) is the only reason it can ever be in the resident's own feed.
-    cluster.submit(
-        0,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "pre-join".into(),
-            value: "written".into(),
-        }),
-    );
+    cluster.submit(0, "tasks", &task_create("pre-join", "written"));
     poll(
         "the pre-join write to finalize on the founder",
-        Box::new(|| {
-            cluster
-                .query(
-                    0,
-                    "directory",
-                    &directory::encode_query(&DirQuery::Get {
-                        key: "pre-join".into(),
-                    }),
-                )
-                .and_then(|raw| directory::decode_reply(&raw).ok())
-                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "written"))
-        }),
+        Box::new(|| task_title(&cluster, 0, "pre-join").is_some_and(|t| t == "written")),
     );
 
     // ---- invite → park → resident grant ------------------------------------
@@ -537,9 +502,9 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the resident to serve rpc status",
         Box::new(|| {
-        let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
-        st["ok"] == serde_json::json!(true)
-            && st["status"]["height"].as_u64().is_some_and(|h| h > 0)
+            let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
+            st["ok"] == serde_json::json!(true)
+                && st["status"]["height"].as_u64().is_some_and(|h| h > 0)
         }),
     );
     //     …module reads answer from the RESIDENT's surface (the tier split is
@@ -547,14 +512,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the resident to serve valset reads",
         Box::new(|| {
-        cluster
-            .query(1, "valset", &valset::encode_query(&ValsetQuery::Residents))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
+            cluster
+                .query(1, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
                 .is_some_and(|r| {
                     matches!(
-                r,
-                ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
-                    )
+                    r,
+                    ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
+                        )
                 })
         }),
     );
@@ -574,11 +539,8 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         1,
         serde_json::json!({
             "cmd": "submit",
-            "target": "directory",
-            "payload_hex": common::hex(&directory::encode_msg(&DirMsg::Set {
-                key: "resident-writes".into(),
-                value: "landed".into(),
-            })),
+            "target": "tasks",
+            "payload_hex": common::hex(&task_create("resident-writes", "landed")),
         }),
     );
     assert_eq!(
@@ -590,43 +552,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     the boundary that carries it…
     poll(
         "the resident to serve its own relayed write",
-        Box::new(|| {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "resident-writes".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "landed"))
-        }),
+        Box::new(|| task_title(&cluster, 1, "resident-writes").is_some_and(|t| t == "landed")),
     );
     //     …and the follow is CONTINUOUS: a value the founder finalizes now
     //     becomes readable through the resident within a few boundaries.
-    cluster.submit(
-        0,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "resident-follow".into(),
-            value: "fresh".into(),
-        }),
-    );
+    cluster.submit(0, "tasks", &task_create("resident-follow", "fresh"));
     poll(
         "the resident to serve the followed write",
-        Box::new(|| {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "resident-follow".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "fresh"))
-        }),
+        Box::new(|| task_title(&cluster, 1, "resident-follow").is_some_and(|t| t == "fresh")),
     );
     //     …and the DERIVED tier follows the boundary too: the explorer
     //     records the followed boundary (an honest boundary row — verified
@@ -636,14 +569,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         Box::new(|| {
             let (status, body) =
                 common::http_request(cluster.http_ports[1], "GET", "/v1/blocks", None);
-        status == 200
-            && body["blocks"].as_array().is_some_and(|rows| {
-                rows.iter().any(|b| {
-                    b["hash"] == serde_json::json!("")
-                        && b["height"].as_u64().is_some_and(|h| h > 0)
-                        && !b["commit_hash"].as_str().unwrap_or_default().is_empty()
+            status == 200
+                && body["blocks"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|b| {
+                        b["hash"] == serde_json::json!("")
+                            && b["height"].as_u64().is_some_and(|h| h > 0)
+                            && !b["commit_hash"].as_str().unwrap_or_default().is_empty()
+                    })
                 })
-            })
         }),
     );
     //     …and /v1/index/* answers from healthy read models WITH pre-join
@@ -659,61 +592,64 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the resident index to report folding watermarks over a backfilled feed",
         Box::new(|| {
-        let (status, index_status) =
-            common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
-        let watermark = index_status["modules"]["directory"].as_u64().unwrap_or(0);
-        let floor = index_status["backfilled"]["directory"].as_u64();
-        // the founder is the sync source and has folded from genesis, so it
-        // has no floor of its own to compose in: the joiner's clears outright.
-        status == 200
-            && index_status["poisoned"] == serde_json::json!(false)
-            && watermark > 0
-            && floor.is_none()
+            let (status, index_status) =
+                common::http_request(cluster.http_ports[1], "GET", "/v1/index/status", None);
+            let watermark = index_status["modules"]["tasks"].as_u64().unwrap_or(0);
+            let floor = index_status["backfilled"]["tasks"].as_u64();
+            // the founder is the sync source and has folded from genesis, so it
+            // has no floor of its own to compose in: the joiner's clears outright.
+            // STRONGER than it was under `directory`: that tenant had no index
+            // guest, so `explorer.rs:340-356` cleared the floor for free
+            // (`folds == false`); `tasks` folds through a real mapper, so
+            // `floor.is_none()` now depends on the fold reaching the
+            // backfilled rows.
+            status == 200
+                && index_status["poisoned"] == serde_json::json!(false)
+                && watermark > 0
+                && floor.is_none()
         }),
     );
     //     and the op feed BELOW that boundary is really there — the whole
     //     point of clearing the floor. The pre-join write finalized before
     //     this node existed, so nothing but the backfill can have put it in
-    //     THIS node's `/v1/index/directory/ops`.
+    //     THIS node's `/v1/index/tasks/ops`.
     let (status, ops) = common::http_request(
         cluster.http_ports[1],
         "GET",
-        "/v1/index/directory/ops?limit=100",
+        "/v1/index/tasks/ops?limit=100",
         None,
     );
     assert_eq!(status, 200, "resident op feed: {ops}");
+    // the row carries the submitted payload verbatim (`index.rs:222-226`), so
+    // the predicate reads through `encode_task_msg`'s `WorkMsg::Task` envelope.
     assert!(
-        ops["ops"]
-            .as_array()
-            .is_some_and(|rows| rows.iter().any(|r| r["payload"]["set"]["key"]
-                == serde_json::json!("pre-join"))),
+        ops["ops"].as_array().is_some_and(|rows| rows.iter().any(
+            |r| r["payload"]["task"]["create_task"]["task_id"] == serde_json::json!("pre-join")
+        )),
         "a cleared floor promises pre-boundary rows are really there: {ops}"
     );
 
     // (3) quorum untouched: kill the resident; the founder keeps finalizing.
-    cluster.kill(1);
-    cluster.submit(
-        0,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "resident-down-liveness".into(),
-            value: "alive".into(),
-        }),
+    //     ONE wait, on the op this suite cares about. this used to carry a
+    //     SECOND wait — "let the resident apply one more block, which syncs
+    //     that seal" — because a `Record::Seal` was a plain WAL append while a
+    //     `Backing::Store` tenant (`tasks` is one) had already committed the
+    //     block durably, so a SIGKILL between the two left the store at a root
+    //     no retained seal vouched for and recovery fail-stopped `Error::Torn`.
+    //     the seal now fsyncs where it is written, so the tip is durable the
+    //     moment it is sealed and the second wait is gone. it staying gone is
+    //     the process-level regression proof: restore the window and this kill
+    //     tears again, exactly as it did at heights 43 and 94.
+    cluster.submit(0, "tasks", &task_create("pre-kill-quiesce", "folded"));
+    poll(
+        "the resident to fold the last op before the kill",
+        Box::new(|| task_title(&cluster, 1, "pre-kill-quiesce").is_some_and(|t| t == "folded")),
     );
+    cluster.kill(1);
+    cluster.submit(0, "tasks", &task_create("resident-down-liveness", "alive"));
     poll(
         "a finalized op with the resident down",
-        Box::new(|| {
-        cluster
-            .query(
-                0,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "resident-down-liveness".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(_))))
-        }),
+        Box::new(|| task_title(&cluster, 0, "resident-down-liveness").is_some()),
     );
 
     // (4) a restarted resident parks straight back into resident mode — the
@@ -744,10 +680,10 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the revoke to clear resident standing",
         Box::new(|| {
-        cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, ValsetReply::Residents(v) if v.is_empty()))
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
+                .is_some_and(|r| matches!(r, ValsetReply::Residents(v) if v.is_empty()))
         }),
     );
     cluster.wait_marker(1, "joining: awaiting redemption", CONVERGE);
@@ -772,39 +708,21 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     poll(
         "the re-grant to restore resident standing",
         Box::new(|| {
-        cluster
-            .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
-            .and_then(|raw| valset::decode_reply(&raw).ok())
+            cluster
+                .query(0, "valset", &valset::encode_query(&ValsetQuery::Residents))
+                .and_then(|raw| valset::decode_reply(&raw).ok())
                 .is_some_and(|r| {
                     matches!(
-                r,
-                ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
-                    )
+                    r,
+                    ValsetReply::Residents(v) if v == vec![common::unhex(&friend_key)]
+                        )
                 })
         }),
     );
-    cluster.submit(
-        0,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "post-revoke-follow".into(),
-            value: "back".into(),
-        }),
-    );
+    cluster.submit(0, "tasks", &task_create("post-revoke-follow", "back"));
     poll(
         "the re-granted resident to resume the follow",
-        Box::new(|| {
-        cluster
-            .query(
-                1,
-                "directory",
-                &directory::encode_query(&DirQuery::Get {
-                    key: "post-revoke-follow".into(),
-                }),
-            )
-            .and_then(|raw| directory::decode_reply(&raw).ok())
-            .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "back"))
-        }),
+        Box::new(|| task_title(&cluster, 1, "post-revoke-follow").is_some_and(|t| t == "back")),
     );
 
     // (7) promote: the warm resident becomes a validator through the
@@ -815,7 +733,10 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     nothing to fetch FROM); valset Join clears its resident standing.
     let (ok, out) = cluster.run_promote(&friend_key);
     assert!(ok, "promote failed:\n{out}");
-    assert!(out.contains("admitted"), "unexpected promote output:\n{out}");
+    assert!(
+        out.contains("admitted"),
+        "unexpected promote output:\n{out}"
+    );
     // no `admitted at epoch` marker here: that line is the COLD path's
     // manifest fetch, and a warm seat deliberately fetches nothing — its
     // own fold carries it straight to `promoted:`.
@@ -839,27 +760,11 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.kill(1);
     cluster.spawn(1);
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
-    cluster.submit(
-        0,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "validator-role-restart".into(),
-            value: "voting".into(),
-        }),
-    );
+    cluster.submit(0, "tasks", &task_create("validator-role-restart", "voting"));
     poll(
         "the restarted validator to restore quorum and serve the new write",
         Box::new(|| {
-            cluster
-                .query(
-                    1,
-                    "directory",
-                    &directory::encode_query(&DirQuery::Get {
-                        key: "validator-role-restart".into(),
-                    }),
-                )
-                .and_then(|raw| directory::decode_reply(&raw).ok())
-                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "voting"))
+            task_title(&cluster, 1, "validator-role-restart").is_some_and(|t| t == "voting")
         }),
     );
 
@@ -915,25 +820,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
     cluster.submit(
         0,
-        "directory",
-        &directory::encode_msg(&DirMsg::Set {
-            key: "validator-to-resident-restart".into(),
-            value: "followed".into(),
-        }),
+        "tasks",
+        &task_create("validator-to-resident-restart", "followed"),
     );
     poll(
         "the restarted resident to follow a new write",
         Box::new(|| {
-            cluster
-                .query(
-                    1,
-                    "directory",
-                    &directory::encode_query(&DirQuery::Get {
-                        key: "validator-to-resident-restart".into(),
-                    }),
-                )
-                .and_then(|raw| directory::decode_reply(&raw).ok())
-                .is_some_and(|r| matches!(r, DirReply::Value(Some(v)) if v == "followed"))
+            task_title(&cluster, 1, "validator-to-resident-restart")
+                .is_some_and(|t| t == "followed")
         }),
     );
 }

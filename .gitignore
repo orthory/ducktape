@@ -6,14 +6,19 @@
 # (screenshots + paint json) under the app crate's own target dir.
 /app/target/
 /.worktree/
+# The guest kernel and rootfs ops/build-guest-rootfs.sh builds: ~900 MB of
+# fetched-and-assembled artifacts, rebuilt from the script on any host.
+/.guest/
+# The macOS VMM shim's swiftc output (bin/duck-vz-shim/build.sh).
+/bin/duck-vz-shim/.build/
 **/*.rs.bk
 .DS_Store
 .claude/worktrees/
 .codex/worktrees/
 node_modules
-docs/dist/
-docs/.astro/
-docs/.nimbus/
+# Brainstorm specs and implementation plans are per-PR working files, never a
+# record: they stay local and die with their worktree.
+docs/superpowers/
 app/dist/
 ops/wg-smoke/*.log
 ops/wg-smoke/node*/
@@ -24,3 +29,6 @@ package-lock.json
 
 # Session handoff notes — local working state, never committed.
 HANDOFF.md
+
+# wrangler local state (ops/auth-page)
+.wrangler/

@@ -5,23 +5,19 @@ version.workspace = true
 
 [dependencies]
 arrayvec = { workspace = true }
+borsh = { workspace = true, features = ["unstable__schema"] }
 commonware-cryptography = { workspace = true }
 commonware-codec = { workspace = true }
-crossbeam-channel = { workspace = true }
-lru = { workspace = true }
+crossbeam-channel = { workspace = true, optional = true }
+lru = { workspace = true, optional = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 # io-util: the relay lane's TCP framing (read_exact/write_all) — a feature on
 # the existing tokio dep, not a new dependency.
-tokio = { workspace = true, features = ["net", "sync", "time", "io-util"] }
+tokio = { workspace = true, features = ["net", "sync", "time", "io-util"], optional = true }
 
 [dev-dependencies]
-# a SELF dev-dependency (the `data-plane` pattern): `tests/simnat_ci.rs` imports
-# `SimNat`/`drive_simulated`, which live behind `simnat`, and carries no cfg or
-# `required-features` — so `cargo test -p nat-traversal` does not merely skip it,
-# it FAILS TO COMPILE the package. Turning the feature on for our own test build
-# makes the focused invocation work and run the suite (6 tests) instead.
-nat-traversal = { path = ".", features = ["simnat"] }
 tokio = { workspace = true, features = [
     "net",
     "rt",
@@ -33,8 +29,18 @@ tokio = { workspace = true, features = [
 ] }
 
 [features]
-simnat = []
+default = ["runtime"]
+# The coordinator, client, and relay runtime: everything that owns a socket
+# or a clock. Off, the crate is its pure wire + auth surface — what the
+# netstack machine consumes, natively and on wasm32.
+runtime = ["dep:tokio", "dep:crossbeam-channel", "dep:lru"]
+simnat = ["runtime"]
 
 [[bench]]
 name = "coordinator_hot_path"
 harness = false
+required-features = ["runtime"]
+
+[[test]]
+name = "punch_e2e"
+required-features = ["runtime"]

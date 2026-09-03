@@ -32,19 +32,20 @@ pub struct DuckDnsName {
     pub handle: String,
 }
 
-/// The stable result of resolving one account name. Node selection is
-/// deliberately absent and must go through Identity plus peer management.
+/// The stable result of resolving one account name: the account NUMBER. Node
+/// selection is deliberately absent and must go through Identity plus peer
+/// management.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAccount {
-    pub account_id: Vec<u8>,
+    pub account_id: u64,
 }
 
-/// One optional human-readable alias for an Identity account. AccountId is
-/// authority; `handle` is only a mutable presentation key.
+/// One optional human-readable alias for an Identity account. The account
+/// number is authority; `handle` is only a mutable presentation key.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HandleRegistration {
     pub handle: String,
-    pub account_id: Vec<u8>,
+    pub account_id: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

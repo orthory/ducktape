@@ -26,26 +26,32 @@ The tree groups by function into three layers — module / kernel / networking:
 
 | Path | Contents |
 | --- | --- |
-| `crates/kernel/` | The platform: `sdk` (module contract + codec), `host` (submit/execute loop, root-hash composition, the `host::worker` non-deterministic-effect seam), `node` (ordered replication), `consensus` (commonware Simplex BFT orderer), `statesync`, `recovery`, `indexer` (derived read-model tier), `blobstore` (node-local op-receipt byte store — like `indexer`, never in any root), `wasm-host` (pinned wasmtime runtime for hot-swappable module components) |
-| `crates/networking/` | The netstack: host-side transport infra only — `wireguard`, `nat-traversal`, `reachability`, `data-plane`, `overlay-net`. Owns no consensus module |
+| `crates/kernel/` | The platform: `sdk` (module contract + codec), `sdk-testkit` (dev-only `TestCtx`/`MemStore` doubles for the sdk traits), `host` (submit/execute loop, root-hash composition, the `host::worker` non-deterministic-effect seam), `node` (ordered replication), `consensus` (commonware Simplex BFT orderer), `statesync`, `recovery`, `indexer` (derived read-model tier), `index-guest` (the index-mapper guest contract the indexer and per-module mappers share), `blobstore` (node-local op-receipt byte store — like `indexer`, never in any root), `wasm-host` (pinned wasmtime runtime for hot-swappable module components), `module-guest` (the `ducktape:module` WIT world every wasm module implements), `keyscheme` (the closed set of signature schemes a ducktape key can carry, and the one verifier every signed artifact dispatches through) |
+| `crates/networking/` | The netstack: host-side transport infra only — `wireguard`, `nat-traversal`, `reachability`, `data-plane`, `overlay-net`, plus the sans-I/O reachability core `netstack-machine` (pure event-in/effects-out state machine), `netstack-scenarios` (its frozen golden lifecycle traces) and `netstack-wasm` (the wasmtime embedding of the `ducktape:netstack` world). Owns no consensus module |
 | `crates/modules/` | **Consensus modules and nothing else** — every crate under `system/` or `apps/` implements `sdk::Module`. Module = onchain, service = offchain; a crate that holds no consensus state belongs in `kernel/`, `services/`, or beside `airlock`/`duckdns` |
-| `crates/modules/system/` | System modules: `kv` (byte-KV), `valset` (ed25519 validator membership), `governance`, `identity`, `lifecycle` (module code registry), `saga` (deterministic async continuations), `capability`, `dispatch`, `tagging`, `gateway` (the merged name→AccountId→route module, which absorbed the on-chain half of `duckdns`) |
-| `crates/modules/apps/` | Product modules: `forge` (git-backed project state), `pages` (documents), `chat`, `agent` (LLM-run orchestrator), `runs`, `tasks`, `vaults`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes; wraps `duckfs`) |
-| `crates/services/` | Off-chain service crates — the host-side executors that serve a consensus module without being one: `compute` (the dispatch WorkSpec pool/ledger/gate), `provider` (executor spec layer + the `CliProvider` run loop), `sandbox` (node-private podman, egress firewall, backend probe), `broker` (run-scoped credential loopback + airlock client), `agent` (interactive pty daemon), `airlock` (the credential-LENDING gateway: node-local store + router, no TEE) |
+| `crates/modules/system/` | System modules: `kv` (byte-KV), `valset` (ed25519 validator membership), `governance`, `identity`, `lifecycle` (module code registry), `saga` (deterministic async continuations), `capability`, `dispatch`, `tagging`, `acl` (the submit-policy federation: which standing a target module requires of an external submitter), `gateway` (the merged name→AccountId→route module, which absorbed the on-chain half of `duckdns`) |
+| `crates/modules/apps/` | Product modules: `forge` (git-backed project state), `pages` (documents), `chat`, `agent` (LLM-run orchestrator), `runs`, `tasks`, `inbox` (per-member notification queues), `automations` (rules over chat hooks), `files` (consensus manifests, node-local bytes; wraps `duckfs`) |
+| `crates/services/` | Off-chain service crates — the host-side executors that serve a consensus module without being one: `compute` (the dispatch WorkSpec pool/ledger/gate), `provider` (executor spec layer + the `CliProvider` run loop), `sandbox` (the per-run microVM, egress firewall, backend probe), `broker` (run-scoped credential loopback + airlock client), `agent` (interactive pty daemon), `airlock` (the credential-LENDING gateway: node-local store + router, no TEE), `media` (the huddle voice/video/screen-share planes, off consensus, riding the overlay) |
 | `crates/airlock/` | The two-party execution/auth contract (`client`/`server`/`verify`/`testkit` features). Not a module and not one party's crate: the lender service, the borrower broker and the enclave binary all consume it |
-| `crates/duckdns/` | The `.duck` account naming library — hostname grammar, handle registry, wire types, canonical state codec. Not a module: the `gateway` module embeds it for the on-chain half, and `node`/`noded`/`simnode`/`demo` validate names host-side |
+| `crates/duckdns/` | The `.duck` account naming library — hostname grammar, handle registry, wire types, canonical state codec. Not a module: the `gateway` module embeds it for the on-chain half, and `node`/`noded`/`simnode` validate names host-side |
 | `crates/duckfs/` | The versioned-filesystem engine: `core` (pure, wasm-ready — the `files` module wraps it), `disk`, `client` (OS-side) |
+| `crates/noded/`, `crates/rpc-client/`, `crates/workspace-config/` | The node's host-side libraries: `noded` (the embedded host behind http/ws — status cell, log ring, service catalog, projection), `rpc-client` (bounded async client for the public `/v1` surface), `workspace-config` (node.toml/network.toml shapes, `DUCKTAPE_HOME`, identity files, invites) |
+| `crates/keystore/`, `crates/authpage/`, `crates/run-envelope/` | `keystore` (the device keystore: named encrypted user keys + the `active` wallet pointer), `authpage` (the client half of the `auth.ducktape.industries` WebAuthn relying-party page; the page itself is `ops/auth-page/`), `run-envelope` (the run payload's magic and the headless composer that stamps it) |
+| `crates/topology/` | ONE source for the module id universe, its wiring, its genesis-config schema and the named genesis selections (`production`, sim, demo) every composer draws from |
 | `crates/guests/` | Shared wasm-port infra only: `guest-adapter` (the `ducktape:module` world binding every port shares), the wasm32 dep stubs, and the kernel-fixture test guests. Every module carries its own port (`src/guest.rs` behind the `guest` feature) and `bin/guest-builder` synthesizes the packaging — no per-module crate lives here |
-| `crates/examples/` | Reference modules: `directory` (also bin/node's liveness canary), `greeter` (types-only composition example) |
+| `crates/examples/` | Reference modules: `directory` (the first wasm port; a test tenant, in no genesis set), `greeter` (types-only composition example) |
+| `crates/testing/` | `nettest` — the raw-HTTP-over-TCP test client, collision-safe port allocation and coarse event poll every node/daemon/sim integration harness shares |
+| `crates/design/` | The desktop app's font identity and type scale (shared tokens come from `ducktape-ui`) |
 | `crates/labs/` | Quarantined experimental modules (`evm`, `multisig`): in-tree and tested but registered by NO genesis set, kept as a standalone crate EXCLUDED from the workspace so its heavy deps (revm, alloy) never tax the shipping build — gated via `make labs-gate` |
-| `bin/` | Runnable binaries: `node` (the unified `ducktape` CLI: validator plus `fs`/`mcp` families), `noded` (app-facing daemon), `simnode` (deterministic /v1 twin), `demo` (in-process walkthrough), `coordinator` (STUN rendezvous), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool) |
+| `bin/` | Runnable binaries: `node` (the unified `ducktape` CLI: `node run` plus every operator family — `node`, `user`, `account`, `wallet`, `gateway`, `fs`, `service`, `agent`, `module`, `mcp`), `noded` (`noded-bin`: the throwaway dev daemon with temp storage), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous + the TCP first-contact relay), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool), `duck-guest-init` (PID 1 inside a run's microVM), `duck-vz-shim` (the macOS Virtualization.framework VMM shim, Swift) |
 | `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/design` is its design system |
-| `docs/` | Nimbus documentation site (human and agent tracks) |
+| `ops/` | Operator scripts, the node and coordinator systemd units, the sandbox guest image builder, the hosted auth page — see `ops/README.md` |
+| `docs/` | Operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`) and the few records code cites by path (`records/`) |
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
 and codecs — at its own crate root; those wire types plus host-routed queries
-are the only legal cross-module surface. `kv` and `vaults` remain as crates but
-are no longer registered in the production genesis module set.
+are the only legal cross-module surface. `kv` remains as a crate but is no
+longer registered in the production genesis module set.
 
 ### Layer contracts
 
@@ -53,16 +59,10 @@ Every layer boundary is a small trait, and each obeys the same three rules: the
 contract lives at its crate root (opening the crate shows it first); every trait
 ships a sim/test arm in the same crate — behind feature `sim` where the double
 carries a build cost; and this table is the map from each boundary to its real
-and swappable arms. Rationale and the full seam designs are in
-[`docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md`](docs/superpowers/specs/2026-07-21-layer-contract-standardization-design.md)
-(lands with PR #718). Rows tagged "(this campaign)" are the seams being added
-now; their PRs are open and unmerged. Rows tagged "(C-stage)" come from the
-block-apply reassembly campaign
-([`docs/superpowers/specs/2026-07-22-c-stage-simnode-reassembly-design.md`](docs/superpowers/specs/2026-07-22-c-stage-simnode-reassembly-design.md)):
-not swappable-arm traits but single shared paths that replace the old
-validator/noded/simnode triplication (block projection, worker reactor, genesis
-topology) plus the scripted-stepping ordering arm; their stacked PRs #724–#728
-are open and unmerged.
+and swappable arms. The last four rows are not swappable-arm traits but single
+shared paths that replaced the old validator/noded/simnode triplication (block
+projection, worker reactor, genesis topology) plus the scripted-stepping
+ordering arm.
 
 | Contract (trait · crate) | Real arm(s) | Sim / test arm | Consumers |
 | --- | --- | --- | --- |
@@ -71,18 +71,18 @@ are open and unmerged.
 | `host::worker::Worker` · `crates/kernel/host` | `DispatchPool` | `MockOracle`, `FlakyOracle`, `EchoWorker` | host non-deterministic-effect dispatch |
 | `SyncClient` · `crates/kernel/statesync` | four fetch clients | `ChannelClient`, `StoreClient`, `LiarClient` | statesync joiner / backfill engine |
 | `DataPlaneTransport` · `crates/networking/data-plane` | `OverlaySockets` | `SimEndpoint` (feature `sim`) | overlay demux + acceptor loops |
-| `WireGuardEffect` · `crates/networking/wireguard` | defguard, userspace | `FakeWireGuardEffect` | mesh bring-up (bin/node boot) |
+| `WireGuardEffect` · `crates/networking/wireguard` | userspace | `FakeWireGuardEffect` | mesh bring-up (bin/node boot) |
 | commonware runtime `E` (`Clock` / `Storage` / `Rng`) | `tokio::Context` | `deterministic::Runner` | host, node, statesync |
 | `ObjectStore` · `crates/duckfs/core` | `DiskStore` | `MemStore` | `files` module, duckfs client |
-| `Blobs` · `blobstore` — (this campaign, PR #716 — unmerged) | `BlobHandle` (disk) | `MemBlobs` | bin/node blob_fetch/relay_runtime/explorer, statesync serve |
-| `RefsStore` · `crates/duckfs/core` — (this campaign, PR #715 — unmerged) | `DiskRefs` | `MemRefs` | `files` module (`Files<S, R>`) |
-| `MeshCarrier` · `crates/kernel/consensus` — (this campaign, PR #719 — unmerged) | `DiscoveryMesh` (wraps the `authenticated::discovery` Network) | `SimMesh` (feature `sim`, wraps `simulated::Network`) | bin/node validator engine, in-process cluster test |
-| commonware `Clock` seam (`context.current()`) + source-parsing lint · bin/node, statesync — (this campaign, PR #720 — unmerged) | `tokio::Context` | `deterministic::Runner` | validator run/drain/ingress, statesync monitor |
-| `TestCtx` (`sdk::Ctx`) + `MemStore` (`sdk::MerkleStore`) · `crates/kernel/sdk-testkit` — (this campaign, PR #718/#721 — unmerged) | host runtime `Ctx`, `QmdbStore` | `TestCtx`, `MemStore` | module unit tests (runs, automations, files, governance, …) |
-| `projection::project_block` · `noded` — (C-stage, PR #724 — unmerged) | one shared block-projection path (RootOp assembly + `block_row` bytes + index feed + stream publish) | golden test pins `block_row` bytes across old/new paths | validator drain, replica park, noded submit lane, simnode — **flag day (PR #728): a rejected op now journals a block, validator parity** |
-| `Orderer` — scripted-stepping seam · `crates/kernel/node` — (C-stage, PR #725 — unmerged) | — (sim-only arm) | `StepOrderer` + `StepHandle` (FIFO; release-one / release-all) | simnode actor (`OrderedNode<StepOrderer>`) |
-| `worker::drive` · `crates/kernel/host` — (C-stage, PR #726 — unmerged) | one shared reactor loop (offer events, budget rounds, follow-up `Msg`s + Nudge tail) | unit test on budget / Nudge behavior | validator drain, noded submit lane, simnode auto mode |
-| `ModuleTopology` · `crates/kernel/host` — (C-stage, PR #727 — unmerged) | one genesis topology (ordered id set, wiring edges, genesis-config values; subsets `production` / `sim_base` / `sim_valset` / `demo`) | `genesis_registry_matches_module_ids` + subset derivation tests | node `ProductionModules` (wasm), simnode (native), demo |
+| `Blobs` · `blobstore` | `BlobHandle` (disk) | `MemBlobs` | bin/node blob_fetch/relay_runtime/explorer, statesync serve |
+| `RefsStore` · `crates/duckfs/core` | `DiskRefs` | `MemRefs` | `files` module (`Files<S, R>`) |
+| `MeshCarrier` · `crates/kernel/consensus` | `DiscoveryMesh` (wraps the `authenticated::discovery` Network) | `SimMesh` (feature `sim`, wraps `simulated::Network`) | bin/node validator engine, in-process cluster test |
+| commonware `Clock` seam (`context.current()`) + source-parsing lint · bin/node, statesync | `tokio::Context` | `deterministic::Runner` | validator run/drain/ingress, statesync monitor |
+| `TestCtx` (`sdk::Ctx`) + `MemStore` (`sdk::MerkleStore`) · `crates/kernel/sdk-testkit` | host runtime `Ctx`, `QmdbStore` | `TestCtx`, `MemStore` | module unit tests (runs, automations, files, governance, …) |
+| `projection::project_block` · `noded` | one shared block-projection path (RootOp assembly + `block_row` bytes + index feed + stream publish) | golden test pins `block_row` bytes | validator drain, replica park, noded submit lane, simnode — a rejected op journals a block, validator parity |
+| `Orderer` — scripted-stepping seam · `crates/kernel/node` | — (sim-only arm) | `StepOrderer` + `StepHandle` (FIFO; release-one / release-all) | simnode actor (`OrderedNode<StepOrderer>`) |
+| `worker::drive` · `crates/kernel/host` | one shared reactor loop (offer events, budget rounds, follow-up `Msg`s + Nudge tail) | unit test on budget / Nudge behavior | validator drain, noded submit lane, simnode auto mode |
+| `ModuleTopology` · `crates/topology` | one genesis topology (ordered id set, wiring edges, genesis-config values; named selections `production` / sim / demo) | `genesis_registry_matches_module_ids` + subset derivation tests | node `ProductionModules` (wasm), simnode (native), the dev-demo seed |
 
 ## Quick Start
 
@@ -90,13 +90,6 @@ Run the workspace tests:
 
 ```sh
 cargo test --workspace
-```
-
-Run the in-process super-app demo — registers the platform and product modules
-together and shows their roots moving under one composed root-hash:
-
-```sh
-cargo run -p demo
 ```
 
 Run the real-socket cluster e2e — REAL node processes over localhost TCP,
@@ -112,7 +105,7 @@ Run the joiner state-sync proof — a fresh joiner rebuilds every module and
 lands on the source root-hash:
 
 ```sh
-cargo test -p demo --test network_joiner_full
+cargo test -p node-bin --test network_joiner_full
 ```
 
 Run everything the repo can verify locally (the wasm-artifact drift gate, the
@@ -134,8 +127,9 @@ target/release/coordinator --listen 0.0.0.0:3478
 
 ### Build wasm module components (guest-builder)
 
-Prerequisites (same as always): `rustup target add wasm32-unknown-unknown` and
-`cargo install wasm-tools`.
+Prerequisite: `cargo install wasm-tools`. The wasm32 target is not one of them
+— `rust-toolchain.toml` lists it, so rustup installs it with the pinned
+channel.
 
 Day to day you don't invoke the tool — `make wasm-modules` rebuilds every
 module component (and refreshes the kernel test fixtures), and
@@ -173,37 +167,60 @@ is `skills/module-dev/SKILL.md`.
 
 ## Run a node
 
-Three binaries plus the desktop app are runnable:
+Install the `ducktape` operator CLI into `~/.cargo/bin` (and the module
+component set into `~/.ducktape/modules`, which `node init` founds a network
+from); on macOS this also builds the Ice `.app`/`.dmg` and installs
+`Ducktape.app` into `~/Applications`:
 
-- **`node-bin`** (the `ducktape` daemon) — the networked node that serves the
-  module HTTP/WebSocket surface. Release build with `make node`; run a
-  throwaway dev daemon with temporary storage:
+```sh
+make install
+```
 
-  ```sh
-  cargo run -p noded                        # http://127.0.0.1:8844, temp storage
-  # add -- --storage <dir> for persistent module state
-  ```
+Then the path `ducktape --help` prints — every line runs as written on a
+machine with one network on it:
 
-  A browser or any HTTP client dials `http://127.0.0.1:8844` by default; the
-  node exposes the same module contracts the rest of the platform speaks.
+```sh
+ducktape node init --name mynet     # found your own network here
+ducktape node join <invite>         # ...or join someone else's
+ducktape node run                   # start it (^C checkpoints and exits)
+ducktape wallet new <you>           # mint your user key
+ducktape account create --name <you>
+                                    # found your account on it (signed by that key)
+ducktape node status                # height + root hash of the running node
+```
+
+Genesis reads each module's `<id>.component.wasm` from `$DUCKTAPE_MODULES_DIR`,
+else `<ducktape home>/modules` — `$DUCKTAPE_HOME` when set, else `~/.ducktape`
+(or `--modules <dir>`); an incomplete bundle is refused by name at startup.
+
+Then, to run agents on it: `ducktape service run compute` offers this host's
+sandbox, `ducktape user cred add claude` logs a provider in, and
+`ducktape agent pty claude` attaches a terminal to a sandboxed agent. Each
+verb's own `--help` carries the rest; `ducktape node list` shows every network
+this machine is registered on and `-n <chain-id>` picks one when there is more
+than one. The node serves `http://127.0.0.1:8844` (`/v1`, loopback only) and
+the listeners in `docs/deploy/node-service.md`, which is also the systemd
+recipe for keeping it up; `docs/deploy/backup-and-keys.md` says which files to
+copy before a node is promoted to a validator seat.
+
+Also runnable:
+
+- **`noded-bin`** (dev-only) — a throwaway single-process daemon with
+  temporary storage, for driving the `/v1` surface without a workspace:
+  `cargo run -p noded-bin` (`http://127.0.0.1:8844`; `-- --storage <dir>` for
+  persistent state, `-- --modules <dir>` for another component bundle). Not
+  a network node: it has no identity, no mesh and no invites.
 
 - **`simnode`** — a deterministic in-process twin of the node's `/v1` surface
   (`bin/simnode`), used by the test lanes; embed it in any crate's tests via
   `simnode::boot`.
 
-- **`coordinator`** — the untrusted UDP rendezvous (see the operator path
-  above).
+- **`coordinator`** — the untrusted UDP rendezvous + TCP first-contact relay
+  (see the operator path above and `docs/deploy/coordinator.md`).
 
 - **`ducktape-app`** (`app/`) — the native Iced desktop client for Chat and
-  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`; it
-  dials `DUCKTAPE_NODE`, else `http://127.0.0.1:8844`. See `app/README.md`.
-
-Install the `ducktape` operator CLI into `~/.cargo/bin`; on macOS this also
-builds the Ice `.app`/`.dmg` and installs `Ducktape.app` into `~/Applications`:
-
-```sh
-make install
-```
+  Pages, its UI declared in `app/src/ui/*.ice`. `cargo run -p ducktape-app`;
+  `app/README.md` states which node it dials and which key it signs with.
 
 Seed a local "demo" network preloaded with sample data — chat channels and
 messages, a tasks board, pages, a registered agent, an inbox note, an
@@ -216,28 +233,7 @@ make demo-seed
 
 ## Documentation
 
-The docs are a separate Nimbus project under `docs/` (package manager: Bun), so
-Rust verification and docs verification stay decoupled:
-
-```sh
-cd docs
-bun install
-bun run docs:check   # docs gate
-bun run dev          # local preview
-```
-
-Pages are split by reader (human vs. coding agent) under
-`docs/src/content/docs/en`.
-
-## Status
-
-The platform spine is checked in and verified: the module contract, host
-registry, global root-hash, ordered node path, commonware Simplex orderer,
-the saga async seam, and several root-backed product modules, plus state
-sync for QMDB-backed, forge, and snapshot-style modules.
-
-Still open — mostly live orchestration: network-backed module sync from a
-running node, dynamic valset wiring around epoch cutover, snapshot-at-height
-serving, and product depth for chat, agent, and tasks. See
-[implementation status](docs/src/content/docs/en/human/reference/implementation-status.mdx)
-and [what is left](docs/src/content/docs/en/human/roadmap/what-is-left.mdx).
+`docs/` holds operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`)
+and the few records code cites by path (`records/`); `docs/README.md` is the
+index. There is no docs site and no decision-record system: the code and its
+comments are the record.

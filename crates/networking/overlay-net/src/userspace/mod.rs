@@ -1,5 +1,4 @@
-//! the userspace overlay backend — ADR phase 1
-//! (docs/adr/2026-07-07-userspace-overlay-net.mdx): the TUN-less data plane.
+//! the userspace overlay backend: the TUN-less data plane.
 //!
 //! three layers, one per module, wired together by
 //! [`effect::UserspaceWireGuardEffect`]:
@@ -14,10 +13,10 @@
 //!   [`sockets`].
 //! - [`effect`] — the orchestration boundary: `WireGuardEffect`
 //!   (`create_interface` / `apply` / `remove_interface`), so the
-//!   reachability orchestrator, epoch cutover, standby pre-warm, and cold
+//!   reachability executor, epoch cutover, standby pre-warm, and cold
 //!   restart drive this backend exactly as they drive the TUN one.
 //!
-//! and two consumer-facing faces over the stack (ADR phase 2), both fed by
+//! and two consumer-facing faces over the stack, both fed by
 //! the effect's published [`stack::StackSlot`]:
 //!
 //! - [`seam`] — the commonware-runtime face: the `Virtual` arm of the

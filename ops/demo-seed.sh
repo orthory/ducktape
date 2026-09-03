@@ -18,12 +18,22 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# no wasm is embedded in the binary: founding hashes THIS directory of
+# <id>.component.wasm into the descriptor. the checkout's committed set, so a
+# demo seed never depends on the operator's ~/.ducktape/modules.
+MODULES="$REPO_ROOT/crates/kernel/host/tests/fixtures"
 ID="${DEMO_WORKSPACE_ID:-demo}"
-DUCK="$HOME/.ducktape"
+# The SAME root the CLI resolves (`wallet::duck_root`) and the app resolves
+# (`duck_home`). Hardcoding `$HOME` split the two under DUCKTAPE_HOME: the
+# guard below and the gateway's signing key looked at `$HOME/.ducktape/keys`
+# while `wallet new` minted into `$DUCKTAPE_HOME/keys`, so a second run died
+# on "already exists" and the gateway signed with the wrong key.
+DUCK="${DUCKTAPE_HOME:-$HOME/.ducktape}"
 WSDIR="$DUCK/workspaces/$ID"
 REG="$DUCK/registry.json"
 ORIGIN="demo"   # external author stamped on seeded ops (chat rejects an empty author)
-USERKEY="$DUCK/user.key"          # the app signs writes with THIS local key
+USERKEY="$DUCK/keys/demo.key"     # the app signs writes with THIS local key
 DEMO_PASSWORD="${DEMO_KEY_PASSWORD:-ducktape}"  # unlock password for the demo identity
 
 log(){ printf '\033[36m[demo-seed]\033[0m %s\n' "$*"; }
@@ -62,6 +72,7 @@ WGP="$(bun -e 'const s=await Bun.udpSocket({port:0});process.stdout.write(String
 #                        the app reboots from) fully local.
 INIT_ERR="$(mktemp)"
 if ! CHAIN="$("$NODE_BIN" node init --name "$ID" --dir "$WSDIR" \
+  --modules "$MODULES" \
   --listen "127.0.0.1:$P1" --advertised "127.0.0.1:$P1" \
   --http "127.0.0.1:$P2" --rpc "127.0.0.1:$P3" --gateway 127.0.0.1:0 \
   --primary-coordinator none \
@@ -95,21 +106,18 @@ JS
 log "registered '$ID' (chain $CHAIN) — set as active workspace"
 
 # ── 3b. user identity ──────────────────────────────────────────
-# The app signs every write (send a message, add a reaction, edit, create a
-# channel) with a local user key it READS from $HOME/.ducktape/user.key — it
-# never mints one itself. Without it, the demo is read-only: the first reaction
-# fails with "cannot read local user key". Provision one so the demo is
-# writable out of the box. Channels are `open`, so any identity may post — no
-# membership step is needed. An EXISTING key is never overwritten (it may be
-# your real identity); we only report how to unlock it.
+# The app signs writes with a wallet from the keystore. The demo gets its
+# OWN named wallet ("demo", password $DEMO_PASSWORD) so the seed always
+# holds the signing password: the old "existing key, unknown password,
+# routes skipped" branch cannot happen. The user's other wallets are
+# untouched; the seed never flips the active pointer — the app's wallet
+# list is where the demo identity gets picked.
 if [ -e "$USERKEY" ]; then
-  KEY_PROVISIONED=0
-  log "user key already present at $USERKEY — unlock it with its own password"
+  log "demo wallet already present at $USERKEY"
 else
-  printf '%s\n' "$DEMO_PASSWORD" | "$NODE_BIN" user key init --out "$USERKEY" >/dev/null \
-    || die "could not create the demo user key at $USERKEY"
-  KEY_PROVISIONED=1
-  log "created a demo user identity at $USERKEY (password: $DEMO_PASSWORD)"
+  printf '%s\n' "$DEMO_PASSWORD" | "$NODE_BIN" wallet new demo >/dev/null \
+    || die "could not mint the demo wallet"
+  log "minted the demo wallet (password: $DEMO_PASSWORD)"
 fi
 
 # ── 4. start the node, wait for its http surface ───────────────
@@ -139,19 +147,32 @@ kill "$SVC_PID" 2>/dev/null; wait "$SVC_PID" 2>/dev/null
 if [ -f "$WSDIR/services.toml" ]; then
   log "compute granted — agent runs available"
 else
-  log "compute NOT granted (no usable container runtime?) — see $WSDIR/service.log;"
+  # The reason is in service.log and nowhere else; guessing at it ("no usable
+  # container runtime?") sends the reader hunting for the wrong thing — the
+  # usual cause is a node.toml with no live [sandbox] table, not a missing VMM.
+  log "compute NOT granted:"
+  tail -n 3 "$WSDIR/service.log" 2>/dev/null | sed 's/^/    /'
+  log "  full log: $WSDIR/service.log"
   log "  the demo still runs, just without agent runs. Grant it later with:"
   log "  ducktape service run compute --workspace $WSDIR"
 fi
 
 # ── 5. seed ops ────────────────────────────────────────────────
+# Every mutating /v1 route wants a credential: either a per-request user
+# signature or this node's own operator credential, minted 0600 into the
+# workspace at boot. The seeder acts as the node's operator, so it presents
+# that one — a bare curl is no longer a way in.
+OPERATOR="$(cat "$WSDIR/admin.token" 2>/dev/null)" \
+  || die "the node minted no operator credential at $WSDIR/admin.token"
+[ -n "$OPERATOR" ] || die "the node minted no operator credential at $WSDIR/admin.token"
 N=0
 submit(){ # submit <module> <payload-json>
   N=$((N+1))
   local body resp code
   body=$(bun -e 'const [target,payload,origin]=process.argv.slice(1);console.log(JSON.stringify({target,payload:JSON.parse(payload),origin}))' "$1" "$2" "$ORIGIN") \
     || die "op #$N ($1): payload is not valid json"
-  resp=$(curl -s -w $'\n%{http_code}' "$URL/v1/submit" -H 'content-type: application/json' -d "$body")
+  resp=$(curl -s -w $'\n%{http_code}' "$URL/v1/submit" -H 'content-type: application/json' \
+    -H "x-ducktape-admin-token: $OPERATOR" -d "$body")
   code=${resp##*$'\n'}
   [ "$code" = "200" ] || die "op #$N ($1) rejected [$code]: ${resp%$'\n'*}"
 }
@@ -159,12 +180,12 @@ submit(){ # submit <module> <payload-json>
 log "seeding modules…"
 
 # pages — the Pages surface: a welcome page with a few blocks
-submit pages '{"create_page":{"page_id":"welcome","title":"Welcome to Ducktape","parent":null}}'
+submit pages '{"create_page":{"page_id":"welcome","title":"Welcome to Ducktape"}}'
 submit pages '{"insert_block":{"parent":"welcome","after":null,"block":{"id":"w-h","kind":"heading2","text":"This is a demo network"}}}'
 submit pages '{"insert_block":{"parent":"welcome","after":"w-h","block":{"id":"w-p","kind":"paragraph","text":"Everything here was preloaded by make demo-seed. Poke around — chat, tasks, pages, agents."}}}'
 submit pages '{"insert_block":{"parent":"welcome","after":"w-p","block":{"id":"w-t1","kind":"todo","text":"Open the general channel"}}}'
 submit pages '{"insert_block":{"parent":"welcome","after":"w-t1","block":{"id":"w-t2","kind":"todo","text":"Check the tasks board"}}}'
-submit pages '{"create_page":{"page_id":"runbook","title":"Team Runbook","parent":null}}'
+submit pages '{"create_page":{"page_id":"runbook","title":"Team Runbook"}}'
 submit pages '{"insert_block":{"parent":"runbook","after":null,"block":{"id":"rb-p","kind":"paragraph","text":"How we ship: branch off dev, PR, review, merge."}}}'
 
 # chat — channels + messages + a reaction + an agent mention
@@ -187,7 +208,7 @@ submit tasks '{"task":{"update_status":{"task_id":"t2","status":"in_progress"}}}
 submit tasks '{"task":{"update_status":{"task_id":"t3","status":"done"}}}'
 
 # agent — register a demo agent, watch general for @mentions, then mention it
-submit agent '{"register_agent":{"agent_id":"quackbot","display_name":"Quackbot","capability":"mock-llm-1","prompt_hash":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"allowed_actions":["chat.post","tasks.create"]}}'
+submit agent '{"register_agent":{"agent_id":"quackbot","display_name":"Quackbot","capability":"mock-llm-1","recipe_hash":[7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7],"allowed_actions":["chat.post","tasks.create"]}}'
 submit runs '{"watch_channel":{"channel_id":"general","policy":"mention"}}'
 submit chat '{"post_message":{"channel_id":"general","message_id":"g4","blocks":[{"paragraph":[{"text":"hey ","marks":[]},{"text":"@quackbot","marks":[{"mention":{"agent":{"module":"runs","agent_id":"quackbot"}}}]},{"text":" can you follow up?","marks":[]}]}],"thread":null,"as_agent":null}}'
 
@@ -206,30 +227,20 @@ submit automations '{"create_rule":{"rule_id":"deploy-watch","trigger":{"channel
 #   • site — a NETWORK-hosted static app, served from DuckFS by consensus
 #   • app  — a USER-hosted app the gateway proxies to a node-local server
 #   • board — the network-visible kanban reference app
-# Sign the routes with the identity we just provisioned. When the key already
-# existed, we don't hold its password, so pass an empty one — the helper then
-# fails to sign and routes are skipped (non-fatal); chat/tasks/pages are already
-# durable regardless.
+# Sign the routes with the demo wallet the seed itself minted — the seed
+# always holds its password, so the sign step always runs (though failure is
+# non-fatal; chat/tasks/pages are already durable regardless).
 GATEWAY_ROUTES=3
-GATEWAY_PW=""
-[ "${KEY_PROVISIONED:-0}" -eq 1 ] && GATEWAY_PW="$DEMO_PASSWORD"
+GATEWAY_PW="$DEMO_PASSWORD"
 bun "$SCRIPT_DIR/demo-gateway.mjs" "$URL" "$NODE_BIN" "$WSDIR" "$CHAIN" "$ID" "$USERKEY" "$GATEWAY_PW"
 gateway_status=$?
 # Route publishing is a demo garnish — its failure never kills the seed. The
 # core workspace (chat, tasks, pages, identity) is committed before this runs.
 case "$gateway_status" in
   0) ;;
-  # name the LIKELY cause here too, not just in the closing banner: an operator
-  # reading the log tail should not have to reach the end to learn that an
-  # empty signing password (an existing key we hold no password for) is the
-  # overwhelmingly common reason, not helper drift.
   *)
     GATEWAY_ROUTES=0
-    if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
-      log "gateway routes skipped (exit $gateway_status) — see $WSDIR/seed.log"
-    else
-      log "gateway routes skipped (exit $gateway_status) — demo-seed holds no password for the existing $USERKEY, so the helper signed with an empty one; see $WSDIR/seed.log"
-    fi
+    log "gateway routes skipped (exit $gateway_status) — see $WSDIR/seed.log"
     ;;
 esac
 
@@ -243,47 +254,20 @@ cat <<EOF
 $(printf '\033[32m[demo-seed] done.\033[0m')
 Open the Ducktape app and it boots into the "$ID" workspace, preloaded.
 
-To WRITE (send a message, add a reaction, edit): the app signs with your local
-user key, so unlock it once — open the connection panel (bottom-left of the
-sidebar), type the key password, and click Connect.
-EOF
+To WRITE (send a message, add a reaction, edit): the app signs with a wallet
+from your keystore. The launch window opens on the wallet list — pick the
+"demo" row, type its password into that row, and Unlock. That also makes it
+the active wallet, so the next launch opens on it.
 
-if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
-cat <<EOF
-  key password: $DEMO_PASSWORD   (a fresh demo identity demo-seed just created)
+  wallet: demo   password: $DEMO_PASSWORD
 
 EOF
-else
-cat <<EOF
-  key password: (your existing $USERKEY — demo-seed left it untouched)
-
-EOF
-fi
 
 if [ "$GATEWAY_ROUTES" -eq 0 ]; then
 cat <<EOF
 Gateway web apps were not published — see $WSDIR/seed.log for the exact
 rejection. This is a demo garnish only: chat, tasks, pages and your identity are
 all live.
-$(if [ "${KEY_PROVISIONED:-0}" -eq 1 ]; then
-cat <<'INNER'
-
-demo-seed minted this key and signed with it, so this is not a key problem —
-the route helper is out of step with the current gateway/duckdns wire.
-INNER
-else
-cat <<INNER
-
-Almost certainly your key, not the helper: demo-seed did not create $USERKEY, so
-it does not hold your password and passed an empty one — the helper cannot sign
-the routes with that. A raw-hex PLAINTEXT key fails here for the same reason, and
-is the same thing that makes the app refuse in-app writes with only the Settings
-PLAINTEXT warning to point at it.
-
-Re-run against a workspace with no user key (or move $USERKEY aside) to get the
-routes; nothing else in the seed depends on them.
-INNER
-fi)
 EOF
 else
 cat <<EOF

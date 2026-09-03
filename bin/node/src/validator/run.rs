@@ -5,7 +5,7 @@
 
 mod drain;
 mod ingress;
-mod sync;
+pub(crate) mod sync;
 
 use commonware_cryptography::{Signer, ed25519};
 use commonware_runtime::Clock;
@@ -18,18 +18,18 @@ use crate::reachability_plane::GateOutcomes;
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
-use crate::{lobby, relay_runtime, voice_plane};
+use crate::{join_gate, overlay_book, relay_runtime};
 
 pub(super) type ValidatorNode = node::OrderedNode<
     consensus::SimplexOrderer,
     recovery::Recovery<commonware_runtime::tokio::Context>,
 >;
 
-/// a join gate held open awaiting its `Redeem` frame's consensus fate (ADR
-/// §3.2). the member submitted the redemption and holds the joiner's outcome
+/// a join gate held open awaiting its `Redeem` frame's consensus fate. the
+/// member submitted the redemption and holds the joiner's outcome
 /// keyed by the frame id until `on_drain` resolves it into `gate_outcomes` —
 /// the settle-then-answer seam, mirroring `pending_relays`. no mesh `peer`
-/// rides here any more (join ADR §4): the answer goes back over the tunnel
+/// rides here any more: the answer goes back over the tunnel
 /// doorbell, read from the shared map on the joiner's next retransmit.
 struct GatePending {
     /// the joiner key: clears the `gating` in-flight index and keys the
@@ -37,13 +37,13 @@ struct GatePending {
     joiner: Vec<u8>,
     /// the packed coord cap to deliver on `Admitted` (private coordination).
     cap: Option<Vec<u8>>,
-    /// answer `Busy` (non-terminal) once past this instant (§3.2 timeout).
+    /// answer `Busy` (non-terminal) once past this instant (the settle timeout).
     deadline: std::time::SystemTime,
 }
 
 /// write a resolved gate outcome where the intro doorbell reads it — the
-/// shared map the joiner's next retransmit is answered from (join ADR §4).
-fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: lobby::IntroReply) {
+/// shared map the joiner's next retransmit is answered from.
+fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: join_gate::IntroReply) {
     outcomes
         .lock()
         .expect("gate outcomes lock")
@@ -76,11 +76,13 @@ pub(super) fn publish_boundary_status(
         })
         .collect();
     status.publish(noded::NodeStatus {
-        version: env!("CARGO_PKG_VERSION").into(),
+        version: crate::build_version(),
         root_hash: crate::util::hex(&node.root_hash()),
         height: node.finalized().map(|f| f.height).unwrap_or(0),
         modules,
         public_key: status_public_key.into(),
+        // the cell overlays the boot-wired chain id on every read.
+        chain_id: String::new(),
         operations: metrics.operational_status(),
     });
 }
@@ -100,19 +102,19 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
     pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     pub(super) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
-    pub(super) media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
+    pub(super) media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) relay_tx: super::MeshSender,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
-    /// the join GATE's forward lane from the intro doorbell (join ADR §4):
+    /// the join GATE's forward lane from the intro doorbell:
     /// verified gate requests the reachability plane rang through.
-    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<lobby::GateForward>,
+    pub(super) gate_fwd_rx: tokio::sync::mpsc::Receiver<join_gate::GateForward>,
     /// a never-sending clone of the forward lane's sender, held so the select
     /// arm stays PENDING (instead of None-spinning) when no reachability
     /// plane was wired to ring the doorbell.
-    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    pub(super) gate_fwd_keepalive: tokio::sync::mpsc::Sender<join_gate::GateForward>,
     /// where the drain writes each settled gate outcome; the doorbell reads
     /// it on the joiner's next retransmit.
     pub(super) gate_outcomes: GateOutcomes,
@@ -156,13 +158,13 @@ struct ValidatorRuntime<'a> {
     mesh_window: crate::mesh_window::MeshWindowTracker,
     mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
     gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
-    media_peers: Option<std::sync::Arc<voice_plane::MediaPeers>>,
+    media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     relay_tx: super::MeshSender,
     gate_outcomes: GateOutcomes,
-    _gate_fwd_keepalive: tokio::sync::mpsc::Sender<lobby::GateForward>,
+    _gate_fwd_keepalive: tokio::sync::mpsc::Sender<join_gate::GateForward>,
     next_seq: u64,
     prev_ckpt: (Option<u64>, u64),
     signer: ed25519::PrivateKey,
@@ -208,6 +210,12 @@ struct ValidatorRuntime<'a> {
     /// blocks alone cannot express what a checkpoint COSTS the loop, and
     /// the loop is what answers `/v1/query` and SIGTERM (#1018).
     checkpoint_not_before: std::time::SystemTime,
+    /// the composed root-hash recorded by the last manifest THIS loop wrote —
+    /// the change gate for the periodic checkpoint. `None` until the first
+    /// write, so a fresh boot re-anchors on its first cadence hit. See
+    /// `checkpoint_due`: an idle chain's nop blocks must not buy a full
+    /// re-encode of the manifest already on disk (#1308).
+    last_written_root: Option<sdk::StateRoot>,
     last_reach_view: Option<u64>,
     last_flush: std::time::SystemTime,
     pending_retarget: Option<reachability::MeshEpochEvent>,
@@ -363,12 +371,12 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // module notes, which is the honest diagnostic on a node whose daemon is
     // not running.
     //
-    // PODMAN IS NOT THE NODE'S ANY MORE. Both planes that used to need it are
-    // out of process: compute serves dispatch work and agent serves interactive
-    // ptys, and each daemon starts its OWN node-private podman service under its
-    // own root (`<storage>/services/<kind>/podman`). Separate roots are what make
-    // them separate failure domains — one daemon restarting can no longer take
-    // the other's containers down with a shared `kill_on_drop` service child.
+    // THE SANDBOX IS NOT THE NODE'S ANY MORE. Both planes that used to need it
+    // are out of process: compute serves dispatch work and agent serves
+    // interactive ptys. Each run's VMM is a child of the daemon that booted it,
+    // so the daemons share no sandbox state at all — a restart of one cannot
+    // reach the other's runs, which is what makes them separate failure
+    // domains without any per-service root to keep apart.
     let workers: Vec<Box<dyn host::worker::Worker>> = Vec::new();
     // the CODE readiness self-signaller for pending code swaps — verifies (or
     // fetches) the committed component bytes and emits one truthful
@@ -469,6 +477,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         join_requests,
         blocks_since_checkpoint,
         checkpoint_not_before,
+        last_written_root: None,
         last_reach_view,
         last_flush,
         pending_retarget,
@@ -533,7 +542,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
                 }
             }
             fwd = gate_fwd_rx.recv().fuse() => {
-                // the intro doorbell rang the GATE through the tunnel (§4).
+                // the intro doorbell rang the GATE through the tunnel.
                 // `None` cannot spin here: `gate_fwd_keepalive` holds the
                 // channel open even when no plane was wired.
                 if let Some(fwd) = fwd {
@@ -609,5 +618,7 @@ async fn graceful_checkpoint(
             let _ = node.sink_mut().write_manifest(&manifest).await;
         }
     }
-    let _ = node.sink_mut().sync().await;
+    // no trailing sync: every record the sink writes — pin, pre_apply, seal,
+    // cutover — fsyncs where it is written, and `write_manifest` syncs the
+    // journal before it puts. there is nothing buffered left to barrier.
 }

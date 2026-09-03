@@ -29,7 +29,7 @@
 // the very defect the body just lost: you had to CLICK the title to edit it.
 // As line 0 it needs no control at all, and Enter at its end / Backspace at the
 // body's start are ordinary text edits that cross the boundary for free.
-component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:MutationPhase, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, block_autosave_status:AutosaveStatus, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], commented_block_hits:[str], caret_comment_target:str, active_thread_target:str, active_thread_anchor:str, orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_rows:[PageCommentThreadRow], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
+component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:MutationPhase, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, block_autosave_status:AutosaveStatus, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], commented_block_hits:[str], caret_comment_target:str, active_thread_target:str, active_thread_anchor:str, orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_rows:[PageCommentThreadRow], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -52,6 +52,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
     close_block_comment_thread()
     load_more_block_comments()
     post_block_comment_submit()
+    copy_to_clipboard(str, str)
   row w=fill h=fill
     box
       with
@@ -189,10 +190,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                 // clip=true` is the bound: the box takes the row's slack and
                 // cuts the draw at its edge, the same shape the channel name
                 // sits in in chat.ice.
-                box
-                  with
-                    w=fill
-                    clip=true
+                box w=fill clip=true
                   text active_page_title
                     with
                       size=13.5
@@ -288,6 +286,31 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                   active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                   hovered bg=fg/8 text=fg border=fg/10
                   pressed bg=fg/12 text=fg
+                // A page id is a uuid, so this button is the only way a
+                // member gets a page's address out of the app at all. The
+                // link it copies names the network it belongs to.
+                button -> emit(copy_to_clipboard, duck_page_link(active_page, network_chain_id), "Page link copied")
+                  with
+                    label="Copy page link"
+                    disabled=empty(active_page)
+                    w=28.0
+                    h=28.0
+                    p=0.0
+                    @icon_action
+                  box
+                    with
+                      w=fill
+                      h=fill
+                      align-x=center
+                      align-y=center
+                    Icon
+                      with
+                        name="link"
+                        tone="label"
+                        px=14.0
+                  active bg=transparent text=muted r=7.0
+                  hovered bg=fg/10 text=fg
+                  pressed bg=fg/15
                 // The trigger STAYS a trigger: arming opens the named
                 // confirm dialog below — it must never swap the red
                 // button in under the same cursor.
@@ -426,10 +449,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                         h=24.0
                         p=0.0
                         @icon_action
-                      text "×"
-                        with
-                          size=12.5
-                          font=ui
+                      text "×" size=12.5 font=ui
                       active bg=transparent text=muted r=6.0
                       hovered bg=fg/8 text=fg
                       pressed bg=fg/12
@@ -481,26 +501,6 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                   w=fill
                   h=fill
                   gap=8.0
-                if !empty(page_search_hits)
-                  box
-                    with
-                      w=fill
-                      h=148.0
-                      p=5.0
-                      bg=elevated
-                      border=fg/8
-                      border-w=1.0
-                      r=9.0
-                    scroll
-                      with
-                        dir=vertical
-                        w=fill
-                        h=fill
-                      col w=fill gap=1.0
-                        for hit in page_search_hits
-                          PageSearchResult hit=hit
-                            forward
-                              open_page_search_hit
                 // A REFUSED (or fence-held) WRITE SAYS SO, IN THE DOCUMENT.
                 // An untouched buffer was rolled back to the canonical text by
                 // the time this paints; a buffer the user kept typing into is
@@ -626,6 +626,49 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                         active bg=transparent text=fg border=transparent border-w=1.0 r=7.0
                         hovered bg=fg/4 text=fg border=fg/7
                         pressed bg=fg/8 text=fg
+          // THE HITS FLOAT, A SIBLING STACK LAYER FOR THE SAME REASONS AS THE
+          // ZERO-HIT PLATE BELOW — and it needed them just as badly. Nested in
+          // the document arm it was a row in the document COLUMN, so
+          // `live_resynced` emptying `active_page` under a standing answer took
+          // the whole thing down: the input, the ×, and the hits themselves,
+          // leaving "No page selected" over a search nobody could see or
+          // dismiss. Hoisted, the answer survives that arrival and a hit is the
+          // way back into a document.
+          //
+          // Declared AFTER the document arm for the stack's paint order (see
+          // the plate below), and it is the same opaque card it always was —
+          // `bg=elevated` over live text. `connected` is carried here now that
+          // no ancestor supplies it; the hits alone still gate the rest, since
+          // every handler that drops them drops the standing query with them.
+          if connected && !empty(page_search_hits)
+            box
+              with
+                w=fill
+                h=fill
+                pl=22.0
+                pr=40.0
+                pt=26.0
+                align-y=start
+              box
+                with
+                  w=fill
+                  max-w=766.0
+                  h=148.0
+                  p=5.0
+                  bg=elevated
+                  border=fg/8
+                  border-w=1.0
+                  r=9.0
+                scroll
+                  with
+                    dir=vertical
+                    w=fill
+                    h=fill
+                  col w=fill gap=1.0
+                    for hit in page_search_hits
+                      PageSearchResult hit=hit
+                        forward
+                          open_page_search_hit
           // NOTHING MATCHED — A STACK LAYER, NOT A ROW IN THE DOCUMENT COLUMN,
           // AND DECLARED AFTER THE DOCUMENT ARM: a stack draws its layers in
           // declaration order, first at the BOTTOM, so above the document this
@@ -646,9 +689,10 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
           // ON THE QUERY, NOT ON A FLAG: this field is enter-to-submit and
           // two-way bound, so a keystroke runs no handler and only
           // `trim(draft) == query` can retire the plate as the user types.
-          // `!page_searching` covers the round trip; `page_search_failed`
+          // That comparison is `search_answer_stands`, shared with chat and the
+          // explorer — it carries the round trip too, and `page_search_failed`
           // drops the query.
-          if connected && empty(page_search_hits) && !page_searching && !empty(page_search_query) && trim(page_search_draft) == page_search_query
+          if connected && empty(page_search_hits) && search_answer_stands(page_search_query, page_search_draft, page_searching)
             box
               with
                 w=fill
@@ -782,10 +826,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                           align-x=center
                           @text-muted
                     for comment_row in block_comment_rows
-                      PageCommentThreadButton
-                        with
-                          thread=comment_row.thread
-                          anchor=comment_row.anchor
+                      PageCommentThreadButton thread=comment_row.thread anchor=comment_row.anchor
                         forward
                           open_block_comment_thread
                     if block_comment_threads_has_more

@@ -20,11 +20,27 @@
 
 ## Internal Skills
 
-- Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`).
+- Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`,
+  `module-dev`). Nothing else lives there: a prompt for an agent running
+  inside a network is product, not a runbook.
 - `.claude/skills` and `.codex/skills` both point to the shared `skills/` directory.
 - Keep assistant-facing repository guidance in this file; `CLAUDE.md` links here so both assistants read the same instructions.
 - Workflow helpers are user-global, not repo-tracked; the branching and
   delivery rules below still bind assistant work in this repo.
+
+## Docs Are Not a Record
+
+- There is no decision-record system: no ADRs, no plan/spec archive, no docs
+  site. The code, its comments, the skills, and git history are the record. A
+  comment states its rule outright; it never cites a document for it.
+- Specs and plans the brainstorming/writing-plans workflow writes under
+  `docs/superpowers/` are local working files: the directory is gitignored and
+  nothing under it ships in a PR. When the PR merges the plan is done and the
+  file is garbage, like its worktree.
+- `docs/` holds only what an operator executes (`deploy/`, `dogfood.md`,
+  `sandbox-macos.md`) and the few records code or a skill cites by path
+  (`records/`); `docs/README.md` is the index. A record nothing cites is
+  deleted, not archived.
 
 ## Branching and Delivery
 
@@ -96,8 +112,20 @@
   countable.
 - Turn one plane up on a LIVE node rather than restarting it — a restart destroys
   the wedged state you restarted to look at:
-  `curl -XPOST localhost:$PORT/v1/log-filter -d 'info,ducktape::join=debug'`
-- Doctrine and phased rollout: `docs/superpowers/plans/2026-07-14-logging-doctrine.md`.
+  `ducktape node log-filter 'info,ducktape::join=debug' -n <chain-id>`
+  (the route MUTATES the process — a `trace` filter fills the disk — so it takes
+  a credential like every other mutating `/v1` route: the verb signs with the
+  active wallet key, and a bare `curl` needs
+  `-H "x-ducktape-admin-token: $(cat <workspace>/admin.token)"`.)
+- The index engine (fluent31) and the index guests running inside it log
+  through the same subscriber, under the engine's crate-path targets
+  (`fluent31::db`, `fluent31::compaction`, `fluent31::trigger`, `fluent31::wasm`),
+  every line naming its store (`db{dir=…}`). Its `info` is lifecycle-level
+  (open, close, flush, compaction, value-log GC, a module or trigger added or
+  removed); its `warn` includes a fold run failing with its backoff, a wasm
+  trap, and a write stall beginning. A guest's `log` calls are `debug` under
+  `fluent31::wasm::guest` and stay silent until that one target is turned up
+  (`fluent31::wasm::guest=debug`, via `RUST_LOG` or the live filter route).
 
 ## Rust Gates
 

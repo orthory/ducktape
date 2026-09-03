@@ -1,23 +1,23 @@
 use super::*;
 use capability::{CapabilityQuery, CapabilityReply};
 use gateway::{CredentialKind, GatewayQuery, GatewayReply};
-use identity::{AccountView, IdentityQuery, IdentityReply};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, renderer};
 use iced::futures::SinkExt as _;
 use iced::{Element, Length, Rectangle, Size, Subscription, Theme, mouse};
-use ui_lang_components::ui::terminal;
 use saga::{SagaQuery, SagaReply, SagaStatus, SagaView};
-use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use tokio_tungstenite::tungstenite::Message;
+use ui_lang_components::ui::terminal;
 
 const AGENT_CONTEXT_ROWS: usize = 32;
 const AGENT_CONTEXT_BYTES: usize = 48 * 1024;
 const LINK_TOKEN_BYTES: u64 = 4 * 1024;
 const MAX_ACTIVITY_ROWS: usize = 32;
-const RUNNER_RESULT_VERSION: u64 = 1;
+/// the fixed value of the `ducktape_runner_result` magic key — part of the
+/// wrapper's self-identifying token, never a version.
+const RUNNER_RESULT_MARKER: u64 = 1;
 /// The unpicked host: the run executes on the node the app is connected to.
 /// `app/src/ui/state/shell.ice` seeds the picker with this exact string, which
 /// a test below pins.
@@ -77,12 +77,50 @@ pub struct AgentHostNodesData {
     pub rows: Vec<AgentHostNode>,
 }
 
+/// ONE launch identity, because the CLI only ever asked one question.
+/// `agent_cli::resolve_provider` derives the provider from `--cred`'s
+/// registered kind and REFUSES an explicit provider that contradicts it — so a
+/// screen that asks for a provider AND a credential is asking the operator to
+/// answer a question the credential already answered, and to keep the two
+/// answers consistent by hand.
+///
+/// `credential` is empty on exactly one kind of row: a provider nobody has
+/// registered a credential for. That row is still a real choice — a create
+/// with no `cred` is the node's LOCAL path (`term::create_route`) — but it can
+/// only ever open a terminal here, never a durable run.
+#[derive(Clone, Debug, Hash, PartialEq)]
+pub struct AgentIdentity {
+    pub label: String,
+    pub provider: String,
+    pub credential: String,
+}
+
+/// One turn of the durable conversation.
+///
+/// `steps` is what the run DID — the reasoning, commands and tool calls its
+/// provider streamed while it worked. They used to live in one screen-wide list
+/// that was drawn only while the run was in flight and cleared by the next
+/// prompt, so the record of an agent's work was destroyed at the exact moment
+/// it became reviewable. They belong to the turn.
+///
+/// `status` is "" on a prompt, and on an answer one of:
+///   * `done` — the saga committed a result, `body` is it.
+///   * `failed` — the run failed or was refused, `body` is why.
+///   * `detached` — the run is STILL GOING and this app stopped watching.
+///     `body` is empty; `saga_id` is how to get back to it.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentChatEntry {
     pub id: i64,
     pub role: String,
     pub body: String,
     pub provider: String,
+    pub status: String,
+    pub saga_id: String,
+    pub steps: Vec<AgentActivity>,
+    /// The fold's label, computed once WITH the steps. A view expression that
+    /// derived it would hand the whole step list across the extern ABI — a deep
+    /// clone of the turn's work on every frame of every turn.
+    pub steps_label: String,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq)]
@@ -136,8 +174,18 @@ pub async fn start_agent_terminal(
     let working_directory =
         std::env::current_dir().map_err(|error| AppError::from(error.to_string()))?;
     let title = format!("{} · raw session", provider_title(provider));
+    // The pty is the app's LAST subprocess, so it is also the last place a
+    // missing `ducktape` on disk can surface — and the widget's own refusal
+    // ("Could not start Claude · raw session: No such file or directory")
+    // names the session, not the install. Say which program was not there;
+    // `user_error` turns this into the one install sentence.
     let session = terminal::spawn_session(program, args, working_directory, title.clone())
-        .map_err(|error| AppError::from(error.message))?;
+        .map_err(|error| {
+            AppError::from(format!(
+                "could not start the ducktape agent terminal: {}",
+                error.message
+            ))
+        })?;
 
     Ok(AgentTerminalStarted {
         session: AgentTerminalSession(session),
@@ -159,6 +207,13 @@ pub fn agent_terminal_surface(session: &AgentTerminalSession) -> Element<'static
 /// uses the app palette's stable text roles directly.
 pub fn agent_markdown(source: String, dark: bool) -> Element<'static, String> {
     Element::new(AgentMarkdown::new(&source, dark))
+}
+
+/// The forge reader's Markdown: the same surface as [`agent_markdown`], plus
+/// the document's in-repo pictures (parked by `forge_blob` under `doc`)
+/// drawn in place of their alt text.
+pub fn forge_markdown(source: String, doc: String, dark: bool) -> Element<'static, String> {
+    Element::new(AgentMarkdown::new(&source, dark).with_doc(doc))
 }
 
 pub fn focus_agent_terminal(session: AgentTerminalSession) -> iced::Task<()> {
@@ -199,24 +254,60 @@ pub async fn load_agent_credentials(
     })
 }
 
-pub fn agent_credential_names(rows: Vec<AgentCredential>, provider: String) -> Vec<String> {
-    rows.into_iter()
-        .filter(|row| row.provider == provider)
-        .map(|row| row.name)
-        .collect()
+/// Every way this operator can launch an agent, in one list: a row per
+/// registered credential, then a row per provider that has none. The second
+/// group is what keeps a credential-less operator able to open a local
+/// terminal at all — the screen's only entry point before anyone has run
+/// `ducktape user cred add`.
+pub fn agent_identities(rows: Vec<AgentCredential>) -> Vec<AgentIdentity> {
+    let credentialled = rows.iter().map(|row| AgentIdentity {
+        label: format!("{} · {}", row.name, provider_title(&row.provider)),
+        provider: row.provider.clone(),
+        credential: row.name.clone(),
+    });
+    let bare = ["codex", "claude"]
+        .into_iter()
+        .filter(|provider| !rows.iter().any(|row| row.provider == *provider))
+        .map(|provider| AgentIdentity {
+            label: format!("{} · no credential", provider_title(provider)),
+            provider: provider.into(),
+            credential: String::new(),
+        });
+    credentialled.chain(bare).collect()
 }
 
-pub fn agent_credential_choice(
-    rows: Vec<AgentCredential>,
-    provider: String,
-    current: String,
-) -> String {
-    let names = agent_credential_names(rows, provider);
-    if names.iter().any(|name| name == &current) {
-        current
-    } else {
-        names.into_iter().next().unwrap_or_default()
+pub fn agent_identity_options(rows: Vec<AgentIdentity>) -> Vec<String> {
+    rows.into_iter().map(|row| row.label).collect()
+}
+
+/// Keep the operator's pick when the fresh list still carries it, else fall to
+/// the first row. A credential that was revoked between two visits must not
+/// leave the screen pointing at a name the gateway no longer serves.
+pub fn agent_identity_choice(rows: Vec<AgentIdentity>, current: String) -> String {
+    let kept = rows.iter().any(|row| row.label == current);
+    if kept {
+        return current;
     }
+    rows.into_iter()
+        .next()
+        .map(|row| row.label)
+        .unwrap_or_default()
+}
+
+pub fn agent_identity_provider(rows: Vec<AgentIdentity>, label: String) -> String {
+    identity_row(&rows, &label)
+        .map(|row| row.provider.clone())
+        .unwrap_or_default()
+}
+
+pub fn agent_identity_credential(rows: Vec<AgentIdentity>, label: String) -> String {
+    identity_row(&rows, &label)
+        .map(|row| row.credential.clone())
+        .unwrap_or_default()
+}
+
+fn identity_row<'a>(rows: &'a [AgentIdentity], label: &str) -> Option<&'a AgentIdentity> {
+    rows.iter().find(|row| row.label == label)
 }
 
 /// The COMPUTE band's other half: WHICH peer can run the work. The capability
@@ -235,23 +326,9 @@ pub async fn load_agent_host_nodes(
         let CapabilityReply::All(registry) = reply else {
             return Err("the capability registry returned the wrong reply".into());
         };
-        let reply: IdentityReply = client
-            .query(
-                "identity",
-                &IdentityQuery::All {
-                    from: 0,
-                    limit: u64::MAX,
-                },
-            )
-            .await
-            .map_err(String::from)?;
-        let IdentityReply::Accounts(accounts) = reply else {
-            return Err("the identity module returned the wrong reply".into());
-        };
-        let names = node_account_names(&accounts);
         let mut rows = registry
             .into_iter()
-            .filter_map(|(node, tags)| host_node_row(&names, &node, tags))
+            .filter_map(|(node, tags)| host_node_row(&node, tags))
             .collect::<Vec<_>>();
         rows.sort_by(|left, right| left.label.cmp(&right.label));
         Ok(AgentHostNodesData { generation, rows })
@@ -263,12 +340,79 @@ pub async fn load_agent_host_nodes(
     })
 }
 
-/// The picker's rows: the local default first, then one row per announcing
-/// peer. The empty list is still one row, so "this node" is always reachable.
-pub fn agent_host_node_options(rows: Vec<AgentHostNode>) -> Vec<String> {
-    std::iter::once(LOCAL_HOST_NODE.to_string())
-        .chain(rows.iter().map(host_node_option))
+/// The picker's rows: the local default first, then the peers this run could
+/// ACTUALLY reach. Two filters, both of them the node's own admission rules
+/// said back to the operator before they can trip over them:
+///
+///   * a peer that does not announce the picked provider is refused at submit
+///     by `agent_cli::preflight_provider` ("the target node advertises no codex
+///     provider"). The picker knew — it holds the announcement — and offered
+///     the row anyway.
+///   * with no credential there is no cross-node run at all: `term::create_route`
+///     answers 400 "a cross-node session requires --cred", and `agent sched`
+///     takes `--cred` as a required flag. So a bare-provider identity gets the
+///     local row and nothing else.
+///
+/// The empty list is still one row, so "this node" is always reachable.
+pub fn agent_host_node_options(
+    rows: Vec<AgentHostNode>,
+    provider: String,
+    credential: String,
+) -> Vec<String> {
+    let local = std::iter::once(LOCAL_HOST_NODE.to_string());
+    if credential.trim().is_empty() {
+        return local.collect();
+    }
+    local
+        .chain(
+            rows.iter()
+                .filter(|row| row.providers.contains(&provider))
+                .map(host_node_option),
+        )
         .collect()
+}
+
+/// What picking a peer COSTS, in the operator's own terms. The CLI states it on
+/// `--cred`: "THIS RUN LETS THAT NODE SPEND YOUR SUBSCRIPTION — the lender
+/// admits the executing node on YOUR grant, for this credential and this run
+/// only". A bare dropdown labelled HOST said none of that.
+pub fn agent_host_grant_note(host_node: &str, credential: &str) -> String {
+    let picked = host_node.trim();
+    let local = picked.is_empty() || picked == LOCAL_HOST_NODE;
+    if local || credential.trim().is_empty() {
+        return String::new();
+    }
+    format!("{picked} runs this work and spends {credential} for it — this run only.")
+}
+
+/// The one line the header carries once the pickers are folded away: who runs
+/// it, on whose account, and where. NOT a `*_summary`: it folds the operator's
+/// own two picks, not rows a live node delivered, so it has nothing to be
+/// honest about when the node is down — with nothing picked it already says so.
+pub fn agent_run_line(identity: &str, host_node: &str) -> String {
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return "No agent selected".into();
+    }
+    let host = host_node.trim();
+    let where_it_runs = if host.is_empty() {
+        LOCAL_HOST_NODE
+    } else {
+        host
+    };
+    format!("{identity} · {where_it_runs}")
+}
+
+/// Keep the picked peer while the narrowed list still offers it, else fall back
+/// to the local row. Every input that narrows the list — a new identity, a
+/// registry read that dropped a peer — runs through here, so the picker can
+/// never sit on a label its own options no longer carry.
+pub fn agent_host_node_choice(options: Vec<String>, current: String) -> String {
+    let kept = options.contains(&current);
+    if kept {
+        return current;
+    }
+    LOCAL_HOST_NODE.into()
 }
 
 /// The `--host-node` value behind a picked row. The local default — and any
@@ -281,35 +425,19 @@ pub fn agent_host_node_key(rows: Vec<AgentHostNode>, option: String) -> String {
         .unwrap_or_default()
 }
 
-/// The ONE spelling of a picker row — who runs it, and what it announced — so
-/// the option list and the reverse lookup above cannot drift apart.
+/// The ONE spelling of a picker row — WHO runs it — so the option list and the
+/// reverse lookup above cannot drift apart. The announcement it used to append
+/// ("alice · codex, claude") is gone with the filter that made it redundant:
+/// every row the picker now offers announces the provider that is picked.
 fn host_node_option(row: &AgentHostNode) -> String {
-    format!("{} · {}", row.label, row.providers.join(", "))
-}
-
-/// node key -> the display name of the account that bound it. Accounts without
-/// a name contribute nothing, so their nodes fall back to a short key.
-fn node_account_names(accounts: &[AccountView]) -> HashMap<Vec<u8>, String> {
-    accounts
-        .iter()
-        .filter_map(|account| Some((account, account.display_name.clone()?)))
-        .flat_map(|(account, name)| {
-            account
-                .nodes
-                .iter()
-                .map(move |node| (node.node_key.clone(), name.clone()))
-        })
-        .collect()
+    row.label.clone()
 }
 
 /// A registry row becomes a pick only when it announces a provider this app can
 /// launch — the same provider set the argv builders accept, so the picker can
-/// never offer a host the run would bounce off.
-fn host_node_row(
-    names: &HashMap<Vec<u8>, String>,
-    node: &[u8],
-    tags: Vec<String>,
-) -> Option<AgentHostNode> {
+/// never offer a host the run would bounce off. A node is labelled by its
+/// short key: no account is bound to a node.
+fn host_node_row(node: &[u8], tags: Vec<String>) -> Option<AgentHostNode> {
     let providers = tags
         .into_iter()
         .filter(|tag| agent_provider(tag).is_ok())
@@ -318,10 +446,7 @@ fn host_node_row(
         return None;
     }
     let key = hex_encode(node);
-    let label = names
-        .get(node)
-        .cloned()
-        .unwrap_or_else(|| short_label(&key));
+    let label = short_label(&key);
     Some(AgentHostNode {
         key,
         label,
@@ -329,36 +454,83 @@ fn host_node_row(
     })
 }
 
-pub fn agent_provider_label(provider: String) -> String {
-    provider_title(&provider).into()
+pub fn agent_provider_label(provider: &str) -> String {
+    provider_title(provider).into()
 }
 
-pub fn agent_provider_initial(provider: String) -> String {
-    match provider.as_str() {
+pub fn agent_provider_initial(provider: &str) -> String {
+    match provider {
         "codex" => "C".into(),
         "claude" => "A".into(),
         _ => "?".into(),
     }
 }
 
-pub fn agent_credential_caption(provider: String, credential: String) -> String {
-    let credential = credential.trim();
-    if credential.is_empty() {
-        format!(
-            "Runs on {} · no credential selected",
-            provider_title(&provider)
-        )
-    } else {
-        format!("Runs on {} · {credential}", provider_title(&provider))
-    }
-}
-
-pub fn agent_register_hint(provider: String) -> String {
+pub fn agent_register_hint(provider: &str) -> String {
     format!("Register one with `ducktape user cred add {provider}`")
 }
 
-pub fn agent_composer_hint(provider: String) -> String {
-    format!("Message {}…", provider_title(&provider))
+/// What a terminal session IS, said before it is started rather than after it
+/// surprises someone. Two truths the old copy ("keystrokes and resize events
+/// pass directly to the provider PTY") left out and an operator pays for: the
+/// session is NOT durable — no saga, no committed result, it dies with this
+/// window — and a credential-less identity takes the node's local path, where
+/// the provider has no gateway credential and will ask for a login inside the
+/// session.
+pub fn agent_terminal_note(provider: &str, credential: &str) -> String {
+    if credential.trim().is_empty() {
+        return format!(
+            "{} runs here with no credential — it will ask you to sign in inside the session.",
+            provider_title(provider)
+        );
+    }
+    format!(
+        "A sandboxed {} session. Nothing here is durable: it ends when you close it.",
+        provider_title(provider)
+    )
+}
+
+/// `7 steps · 3 commands` — the fold's own label, so a settled turn keeps the
+/// SHAPE of its work on screen even while the detail is closed.
+fn agent_steps_label(steps: &[AgentActivity]) -> String {
+    let commands = steps.iter().filter(|step| step.title == "Command").count() as i64;
+    let steps = plural(steps.len() as i64, "step", "steps");
+    if commands == 0 {
+        return steps;
+    }
+    format!("{steps} · {}", plural(commands, "command", "commands"))
+}
+
+/// The run id, short enough to sit in a line of prose and long enough to find
+/// in `ducktape` output. The dispatch half is what identifies a run; the
+/// namespace prefix in front of it is the same on every run this node submits.
+pub fn agent_run_label(saga_id: &str) -> String {
+    let dispatch = saga_id
+        .rsplit_once('\u{1f}')
+        .map_or(saga_id, |(_, dispatch)| dispatch);
+    format!("run {}", short_label(dispatch))
+}
+
+pub fn agent_composer_hint(provider: &str) -> String {
+    format!("Message {}…", provider_title(provider))
+}
+
+/// What sending actually starts, before anyone sends anything. The old copy
+/// ("the run is durable, its work streams here…") described the plumbing; this
+/// says the two things that change what an operator does: WHERE the sandbox
+/// runs, and that the answer outlives the window.
+pub fn agent_task_blurb(host_node: &str) -> String {
+    let host = host_node.trim();
+    let local = host.is_empty() || host == LOCAL_HOST_NODE;
+    if local {
+        return "Each message runs an agent in a sandbox on this node. The run survives \
+                reconnects and commits its answer to the network."
+            .into();
+    }
+    format!(
+        "Each message runs an agent in a sandbox on {host}. The run survives reconnects \
+         and commits its answer to the network."
+    )
 }
 
 pub fn agent_chat_push_user(
@@ -371,21 +543,68 @@ pub fn agent_chat_push_user(
         role: "user".into(),
         body: body.trim().to_string(),
         provider,
+        status: String::new(),
+        saga_id: String::new(),
+        steps: Vec::new(),
+        steps_label: String::new(),
     });
     entries
 }
 
-pub fn agent_chat_finish(
+/// The ONE way an assistant turn is appended — every settle, every detach and
+/// the design inspector's showcase preset go through it, so a turn cannot exist
+/// in a shape the screen has no arm for.
+pub fn agent_chat_answer(
     mut entries: Vec<AgentChatEntry>,
     body: String,
     provider: String,
+    status: String,
+    saga_id: String,
+    steps: Vec<AgentActivity>,
 ) -> Vec<AgentChatEntry> {
     entries.push(AgentChatEntry {
         id: next_chat_entry_id(&entries),
         role: "assistant".into(),
         body,
         provider,
+        status,
+        saga_id,
+        steps_label: agent_steps_label(&steps),
+        steps,
     });
+    entries
+}
+
+/// The operator stopped WATCHING; the node did not stop RUNNING. The turn is
+/// closed with the run id that reaches it again, which is the whole of what
+/// "durable" buys and what this screen used to throw away: a saga keeps
+/// executing, retries up to three times and commits its answer whether or not
+/// anyone has a socket open on it.
+pub fn agent_chat_detach(
+    entries: Vec<AgentChatEntry>,
+    provider: String,
+    saga_id: String,
+    steps: Vec<AgentActivity>,
+) -> Vec<AgentChatEntry> {
+    agent_chat_answer(
+        entries,
+        String::new(),
+        provider,
+        "detached".into(),
+        saga_id,
+        steps,
+    )
+}
+
+/// Reopening a detached turn re-enters the SAME turn — the settle that follows
+/// must land where the detached plate was, not after it.
+pub fn agent_chat_drop_detached(mut entries: Vec<AgentChatEntry>) -> Vec<AgentChatEntry> {
+    let detached = entries
+        .last()
+        .is_some_and(|entry| entry.status == "detached");
+    if detached {
+        entries.pop();
+    }
     entries
 }
 
@@ -446,30 +665,45 @@ pub fn agent_event_live(current: String, event: AgentChatEvent) -> String {
     }
 }
 
-pub fn agent_event_error(current: String, event: AgentChatEvent) -> String {
-    match event.kind.as_str() {
-        "error" => event.answer,
-        "answer" => String::new(),
-        _ => current,
-    }
-}
-
 pub fn agent_event_busy(event: AgentChatEvent) -> bool {
     !matches!(event.kind.as_str(), "answer" | "error")
 }
 
+/// A terminal event SETTLES the turn — with the answer or with the reason there
+/// isn't one. A failure used to be a banner pinned above the whole transcript,
+/// detached from the prompt that caused it and cleared by the next click; it is
+/// a property of one turn, so it lands in that turn.
 pub fn agent_event_entries(
     entries: Vec<AgentChatEntry>,
     event: AgentChatEvent,
     provider: String,
+    saga_id: String,
+    steps: Vec<AgentActivity>,
 ) -> Vec<AgentChatEntry> {
-    if event.kind != "answer" {
-        return entries;
-    }
-    agent_chat_finish(entries, event.answer, provider)
+    let status = match event.kind.as_str() {
+        "answer" => "done",
+        "error" => "failed",
+        _ => return entries,
+    };
+    agent_chat_answer(
+        entries,
+        event.answer,
+        provider,
+        status.into(),
+        saga_id,
+        steps,
+    )
 }
 
 pub fn agent_chat_prompt(entries: Vec<AgentChatEntry>) -> String {
+    // A turn that never produced an answer is not context. A `failed` entry
+    // carries the node's refusal string and a `detached` one carries nothing at
+    // all; feeding either back as "Assistant: …" teaches the next run that the
+    // agent said something it never said.
+    let entries = entries
+        .into_iter()
+        .filter(|entry| entry.role == "user" || entry.status == "done")
+        .collect::<Vec<_>>();
     let start = entries.len().saturating_sub(AGENT_CONTEXT_ROWS);
     let mut kept = Vec::new();
     let mut used = 0usize;
@@ -502,9 +736,55 @@ pub fn agent_chat_turn(
     host_node: String,
     entries: Vec<AgentChatEntry>,
 ) -> iced::futures::stream::BoxStream<'static, AgentChatEvent> {
+    chat_stream(|sender| async move {
+        run_agent_chat(&sender, rpc, provider, credential, host_node, entries).await
+    })
+}
+
+/// Re-enter a run this app already submitted, from its id alone.
+///
+/// This is what makes the word "durable" on the screen true. A saga keeps
+/// executing while nobody watches; `saga_id` carries its dispatch id
+/// ([`dispatch_id_from_saga`]), which is the whole address of both halves of a
+/// run — `run-output:<dispatch>` for the live lines and `SagaQuery::Get` for
+/// the committed result. So watching is a pure function of the id, and the
+/// second watch is the same code as the first.
+pub fn agent_chat_watch(
+    rpc: String,
+    provider: String,
+    saga_id: String,
+) -> iced::futures::stream::BoxStream<'static, AgentChatEvent> {
+    chat_stream(|sender| async move {
+        let provider = agent_provider(&provider)?;
+        sender
+            .send(AgentChatEvent {
+                id: 1,
+                kind: "status".into(),
+                title: "Reattaching".into(),
+                detail: "Reading the run this node already committed to".into(),
+                status: String::new(),
+                answer: String::new(),
+                saga_id: saga_id.clone(),
+            })
+            .await
+            .map_err(|_| "the chat view closed".to_string())?;
+        watch_agent_run(&sender, &rpc, provider, saga_id).await
+    })
+}
+
+/// The one place a run's events become a stream, and the one place a failure
+/// anywhere in one becomes the turn's `error` event.
+fn chat_stream<Run, Fut>(run: Run) -> iced::futures::stream::BoxStream<'static, AgentChatEvent>
+where
+    Run: FnOnce(tokio::sync::mpsc::Sender<AgentChatEvent>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), String>> + Send,
+{
     let (sender, receiver) = tokio::sync::mpsc::channel(64);
+    let report = sender.clone();
     tokio::spawn(async move {
-        run_agent_chat(sender, rpc, provider, credential, host_node, entries).await;
+        if let Err(message) = run(sender).await {
+            let _ = report.send(chat_error(message)).await;
+        }
     });
     iced::futures::stream::unfold(receiver, |mut receiver| async move {
         receiver.recv().await.map(|event| (event, receiver))
@@ -512,21 +792,10 @@ pub fn agent_chat_turn(
     .boxed()
 }
 
+/// Submit, then watch. The submit is everything this function does that the
+/// re-attach above cannot: once the CLI has printed a run id, the two paths are
+/// the same run and share the same watcher.
 async fn run_agent_chat(
-    sender: tokio::sync::mpsc::Sender<AgentChatEvent>,
-    rpc: String,
-    provider: String,
-    credential: String,
-    host_node: String,
-    entries: Vec<AgentChatEntry>,
-) {
-    let result = run_agent_chat_inner(&sender, rpc, provider, credential, host_node, entries).await;
-    if let Err(message) = result {
-        let _ = sender.send(chat_error(message)).await;
-    }
-}
-
-async fn run_agent_chat_inner(
     sender: &tokio::sync::mpsc::Sender<AgentChatEvent>,
     rpc: String,
     provider: String,
@@ -544,32 +813,7 @@ async fn run_agent_chat_inner(
         .send(chat_status("Scheduling", "Submitting a durable agent run"))
         .await
         .map_err(|_| "the chat view closed".to_string())?;
-    let output = tokio::process::Command::new(ducktape_binary())
-        .args(agent_sched_args(
-            &rpc, provider, credential, &host_node, &prompt,
-        ))
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(|error| format!("could not run the ducktape agent command: {error}"))?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if message.is_empty() {
-            format!("the agent command exited with {}", output.status)
-        } else {
-            clip_text(&message, 2_000)
-        });
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| "the agent command returned a non-UTF-8 run id".to_string())?;
-    let saga_id = stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .ok_or_else(|| "the agent command returned no run id".to_string())?
-        .to_string();
-    let dispatch_id = dispatch_id_from_saga(&saga_id)?;
+    let saga_id = schedule_agent_run(&rpc, provider, credential, &host_node, &prompt).await?;
     sender
         .send(AgentChatEvent {
             id: 1,
@@ -582,6 +826,17 @@ async fn run_agent_chat_inner(
         })
         .await
         .map_err(|_| "the chat view closed".to_string())?;
+    watch_agent_run(sender, &rpc, provider, saga_id).await
+}
+
+async fn watch_agent_run(
+    sender: &tokio::sync::mpsc::Sender<AgentChatEvent>,
+    rpc: &str,
+    provider: &str,
+    saga_id: String,
+) -> Result<(), String> {
+    let rpc = rpc.to_string();
+    let dispatch_id = dispatch_id_from_saga(&saga_id)?;
 
     let (_, workspace) = workspace_at(&rpc).ok_or_else(|| {
         "This node has no matching local workspace, so its agent output cannot be opened."
@@ -702,9 +957,9 @@ fn terminal_saga_event(view: SagaView, saga_id: &str) -> Option<AgentChatEvent> 
 fn agent_response_text(bytes: &[u8]) -> Result<String, String> {
     let result: AgentRunnerResult = serde_json::from_slice(bytes)
         .map_err(|error| format!("the runner result is malformed: {error}"))?;
-    if result.ducktape_runner_result != RUNNER_RESULT_VERSION {
+    if result.ducktape_runner_result != RUNNER_RESULT_MARKER {
         return Err(format!(
-            "runner result version {} is not supported",
+            "runner result marker {} is not the ducktape_runner_result magic",
             result.ducktape_runner_result
         ));
     }
@@ -845,26 +1100,133 @@ fn agent_pty_args(rpc: &str, provider: &str, credential: &str, host_node: &str) 
     args
 }
 
-fn agent_sched_args(
+/// Submit ONE durable, node-pinned run and answer its saga id.
+///
+/// The saga id is minted HERE and never read back off anything: it is
+/// `namespaced_id` over the pinning node's own actor string, so the run's
+/// address is known before the op is submitted. That is also why the trigger
+/// goes over the FRAMELESS lane — `/v1/submit` re-signs with the node's key, so
+/// the committed origin matches the namespace the id was built under. A
+/// user-signed frame would land the same run under a different actor, where
+/// nothing that later looks for it would find it.
+async fn schedule_agent_run(
     rpc: &str,
     provider: &str,
     credential: &str,
     host_node: &str,
     prompt: &str,
-) -> Vec<String> {
-    let mut args = vec![
-        "agent".into(),
-        "sched".into(),
-        provider.into(),
-        "--cred".into(),
-        credential.into(),
-        "--node".into(),
-        rpc.into(),
-    ];
-    push_host_node(&mut args, host_node);
-    args.push("--".into());
-    args.push(prompt.into());
-    args
+) -> Result<String, String> {
+    let client = rpc_client(rpc)?;
+    let own_node = hex_decode(&client.status().await?.public_key)?;
+    let target = pin_target(&own_node, host_node)?;
+    refuse_a_host_that_cannot_run_this(&client, &target, provider).await?;
+
+    let (saga_id, trigger) = compose_run_trigger(
+        &own_node,
+        target,
+        provider,
+        credential,
+        prompt,
+        fresh_dispatch_id(),
+    );
+    let payload = serde_json::to_value(&trigger)
+        .map_err(|error| format!("the run could not be composed: {error}"))?;
+    client.submit("saga", payload).await?;
+    Ok(saga_id)
+}
+
+/// Which node the run is PINNED to: the host the operator picked, else the node
+/// this app is dialling. The pin is what scopes the credential draw, so an
+/// unpicked host must mean THIS node — never "unpinned".
+fn pin_target(own_node: &[u8], host_node: &str) -> Result<Vec<u8>, String> {
+    match host_node.trim() {
+        "" => Ok(own_node.to_vec()),
+        picked => hex_decode(picked),
+    }
+}
+
+/// Build the run's saga id and the trigger that carries it. Pure: it decides,
+/// and the caller submits.
+fn compose_run_trigger(
+    own_node: &[u8],
+    target: Vec<u8>,
+    provider: &str,
+    credential: &str,
+    prompt: &str,
+    dispatch_id: String,
+) -> (String, saga::SagaMsg) {
+    let saga_id = saga::namespaced_id(
+        &sdk::Origin::External(own_node.to_vec()),
+        &format!("sched\u{1f}{dispatch_id}"),
+    );
+    let spec = dispatch::WorkSpec {
+        kind: dispatch::WORK_SPEC_KIND.to_string(),
+        dispatch_id,
+        capability: provider.to_string(),
+        payload: run_envelope::compose_headless(&saga_id, prompt, Some(credential)).into_bytes(),
+        demands: BTreeMap::new(),
+        admission: dispatch::AdmissionPolicy::Queue,
+    };
+    let trigger = saga::SagaMsg::Trigger {
+        saga_id: saga_id.clone(),
+        spec: dispatch::encode_work_spec(&spec),
+        reply_to: None,
+        reply_payload: Vec::new(),
+        deadline: None,
+        max_attempts: AGENT_RUN_MAX_ATTEMPTS,
+        lease_views: None,
+        capability: Some(provider.to_string()),
+        demands: BTreeMap::new(),
+        pinned_assignee: Some(target),
+    };
+    (saga_id, trigger)
+}
+
+/// How many times the saga re-dispatches a run before giving up. The same
+/// figure the CLI's `sched` submits — a run that dies to a transient placement
+/// failure should not need a person to notice.
+const AGENT_RUN_MAX_ATTEMPTS: u32 = 3;
+
+/// A fresh dispatch id: 32 random bytes as 64 hex chars — what
+/// `run-output:<id>` keys on, and what `dispatch_id_from_saga` reads back out
+/// of the saga id.
+fn fresh_dispatch_id() -> String {
+    let mut bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    hex_encode(&bytes)
+}
+
+/// Fail EARLY when the registry knows the target advertises no matching
+/// provider.
+///
+/// An empty announcement is NOT a failure: a node that has never announced, or
+/// is offline right now, executes the run on reconnect — that durability is
+/// the whole contract of a pinned run, so the saga is left to carry it. Only a
+/// node that announces a provider set WITHOUT this one is a mistake worth
+/// stopping for, and stopping here saves burning every retry to find out on a
+/// box nobody is watching.
+async fn refuse_a_host_that_cannot_run_this(
+    client: &RpcClient,
+    target: &[u8],
+    provider: &str,
+) -> Result<(), String> {
+    let query = capability::CapabilityQuery::Node {
+        node: target.to_vec(),
+    };
+    let reply: capability::CapabilityReply = client.query("capability", &query).await?;
+    let capability::CapabilityReply::Node(announced) = reply else {
+        return Err("the capability registry answered something unreadable".into());
+    };
+    let announces_nothing = announced.is_empty();
+    let announces_others_but_not_this =
+        !announces_nothing && !announced.iter().any(|tag| tag == provider);
+    if announces_others_but_not_this {
+        return Err(format!(
+            "That host runs no {provider} provider (it offers: {}).",
+            announced.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Where the durable run actually lives, said the way the operator picked it —
@@ -986,10 +1348,10 @@ fn agent_terminal_notice(notice: terminal::Notice) -> AgentTerminalNotice {
     }
 }
 
-
 struct AgentMarkdown {
     items: Rc<[iced::widget::markdown::Item]>,
     settings: iced::widget::markdown::Settings,
+    viewer: SelectViewer,
 }
 
 impl AgentMarkdown {
@@ -1035,11 +1397,175 @@ impl AgentMarkdown {
         Self {
             items: markdown::parse(source).collect::<Vec<_>>().into(),
             settings,
+            viewer: SelectViewer {
+                doc: None,
+                key: document_key(source),
+                blocks: std::cell::Cell::new(0),
+            },
         }
     }
 
+    /// Draw the in-repo pictures parked under `doc` (see `picture.rs`).
+    fn with_doc(mut self, doc: String) -> Self {
+        self.viewer.doc = Some(doc);
+        self
+    }
+
     fn view(&self) -> Element<'_, String> {
-        iced::widget::markdown::view(self.items.iter(), self.settings).map(|uri| uri.to_string())
+        // The blocks are numbered by the order the viewer is asked for them,
+        // which is the document's reading order — nested lists and quotes
+        // route their items back through the same viewer. `view` is built
+        // many times a frame (tag, layout, update, draw), so the count starts
+        // over here: the same document always numbers its blocks the same.
+        self.viewer.blocks.set(0);
+        iced::widget::markdown::view_with(self.items.iter(), self.settings, &self.viewer)
+    }
+}
+
+/// The Markdown surface with draggable text: every paragraph and heading
+/// behind a [`SelectRich`], every code block one [`CodeSelect`], and each of
+/// them numbered into ONE document ([`SelectPlace`]) — so a drag that starts
+/// in a heading and ends in a code block selects everything between them, and
+/// Ctrl+C copies the run whole. Lists, quotes and tables keep iced's default
+/// look and route their text back through here, which numbers their items in
+/// with the rest. An image draws the picture `forge_blob` parked under `doc`
+/// for its URL as written (relative path, `duck://files`,
+/// `duck://forge/.../blob/...`), and keeps iced's default (the alt text in a
+/// plate) for everything else — including every image when there is no
+/// document, as in the agent's answers.
+struct SelectViewer {
+    doc: Option<String>,
+    /// The document every block of this surface shares a selection in, keyed
+    /// by its own text, and the running count that gives each block its place
+    /// in reading order.
+    key: u64,
+    blocks: std::cell::Cell<usize>,
+}
+
+impl SelectViewer {
+    /// The next block's place, in reading order.
+    fn next(&self) -> SelectPlace {
+        let ordinal = self.blocks.get();
+        self.blocks.set(ordinal + 1);
+        SelectPlace::block(self.key, ordinal)
+    }
+}
+
+/// A Markdown document's selection key: its own text. Two documents spelling
+/// the same bytes on screen at once show one selection twice — the whole cost
+/// of not threading an identity down through iced's viewer.
+fn document_key(source: &str) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    source.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl<'a> iced::widget::markdown::Viewer<'a, String> for SelectViewer {
+    fn on_link_click(url: iced::widget::markdown::Uri) -> String {
+        url
+    }
+
+    fn image(
+        &self,
+        settings: iced::widget::markdown::Settings,
+        url: &'a iced::widget::markdown::Uri,
+        _title: &'a str,
+        alt: &iced::widget::markdown::Text,
+    ) -> Element<'a, String> {
+        use iced::widget::{container, rich_text};
+        let parked = self
+            .doc
+            .as_deref()
+            .and_then(|doc| super::picture::inline_picture(doc, url));
+        let Some(picture) = parked else {
+            return container(
+                rich_text(alt.spans(settings.style)).on_link_click(Self::on_link_click),
+            )
+            .padding(settings.spacing.0)
+            .class(<iced::Theme as iced::widget::markdown::Catalog>::code_block())
+            .into();
+        };
+        container(picture.element()).width(Length::Fill).into()
+    }
+
+    fn heading(
+        &self,
+        settings: iced::widget::markdown::Settings,
+        level: &'a iced::widget::markdown::HeadingLevel,
+        text: &'a iced::widget::markdown::Text,
+        index: usize,
+    ) -> Element<'a, String> {
+        use iced::widget::markdown::HeadingLevel;
+        use iced::widget::{container, rich_text};
+        let size = match level {
+            HeadingLevel::H1 => settings.h1_size,
+            HeadingLevel::H2 => settings.h2_size,
+            HeadingLevel::H3 => settings.h3_size,
+            HeadingLevel::H4 => settings.h4_size,
+            HeadingLevel::H5 => settings.h5_size,
+            HeadingLevel::H6 => settings.h6_size,
+        };
+        let spans = text.spans(settings.style);
+        let rich = rich_text(spans.clone())
+            .on_link_click(Self::on_link_click)
+            .size(size);
+        let top = match index > 0 {
+            true => settings.text_size / 2.0,
+            false => iced::Pixels::ZERO,
+        };
+        container(SelectRich::new(rich, spans, size).at(self.next()))
+            .padding(iced::padding::top(top))
+            .into()
+    }
+
+    fn paragraph(
+        &self,
+        settings: iced::widget::markdown::Settings,
+        text: &iced::widget::markdown::Text,
+    ) -> Element<'a, String> {
+        let spans = text.spans(settings.style);
+        let rich = iced::widget::rich_text(spans.clone())
+            .on_link_click(Self::on_link_click)
+            .size(settings.text_size);
+        SelectRich::new(rich, spans, settings.text_size)
+            .at(self.next())
+            .into()
+    }
+
+    fn code_block(
+        &self,
+        settings: iced::widget::markdown::Settings,
+        _language: Option<&'a str>,
+        _code: &'a str,
+        lines: &'a [iced::widget::markdown::Text],
+    ) -> Element<'a, String> {
+        use iced::widget::markdown::Catalog as _;
+        use iced::widget::{container, scrollable};
+        let metrics = CodeMetrics {
+            size: settings.code_size,
+            line_height: iced::advanced::text::LineHeight::default(),
+            font: settings.style.code_block_font,
+        };
+        let plate = CodeSelect::new(
+            lines.iter().map(|line| line.spans(settings.style)),
+            metrics,
+            None,
+            Length::Shrink,
+        )
+        .at(self.next());
+        container(
+            scrollable(container(plate).padding(settings.code_size)).direction(
+                scrollable::Direction::Horizontal(
+                    scrollable::Scrollbar::default()
+                        .width(settings.code_size / 2)
+                        .scroller_width(settings.code_size / 2),
+                ),
+            ),
+        )
+        .width(Length::Fill)
+        .padding(settings.code_size / 4)
+        .class(Theme::code_block())
+        .into()
     }
 }
 
@@ -1134,8 +1660,6 @@ impl Widget<String, Theme, iced::Renderer> for AgentMarkdown {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,32 +1678,77 @@ mod tests {
                 "team-codex",
             ]
         );
-        let sched = agent_sched_args("http://node", "claude", "team-claude", "", "hello");
-        assert_eq!(sched.last().map(String::as_str), Some("hello"));
-        assert_eq!(
-            &sched[..8],
-            [
-                "agent",
-                "sched",
-                "claude",
-                "--cred",
-                "team-claude",
-                "--node",
-                "http://node",
-                "--"
-            ]
-        );
     }
 
-    /// `--node` and `--host-node` are different questions: the first is who the
-    /// CLI dials, the second is who executes. An unpicked host must emit NO
-    /// flag — the argv above, byte for byte — or every default run silently
-    /// changes shape.
+    /// A scheduled run's ADDRESS is minted before it is submitted, and every
+    /// later half of the run reads it back out of the saga id: the live output
+    /// topic is `run-output:<dispatch>`, and the committed result is
+    /// `SagaQuery::Get(saga_id)`. This pins that round trip.
+    ///
+    /// The namespace is the pinning node's own actor string, which is why the
+    /// trigger goes over the frameless `/v1/submit` (the node re-signs, so the
+    /// committed origin matches). Submitting it as a user-signed frame instead
+    /// would land the run under a different actor, where nothing looking for it
+    /// would ever find it.
     #[test]
-    fn a_picked_host_node_is_the_only_thing_that_adds_the_flag() {
-        let peer = "b".repeat(64);
+    fn a_scheduled_run_carries_its_own_address_and_pin() {
+        let own = vec![0xaau8; 32];
+        let dispatch_id = "cd".repeat(32);
+
+        let (saga_id, trigger) = compose_run_trigger(
+            &own,
+            own.clone(),
+            "claude",
+            "team-claude",
+            "hello",
+            dispatch_id.clone(),
+        );
+        assert_eq!(dispatch_id_from_saga(&saga_id).unwrap(), dispatch_id);
+
+        let saga::SagaMsg::Trigger {
+            capability,
+            pinned_assignee,
+            max_attempts,
+            spec,
+            ..
+        } = trigger
+        else {
+            panic!("scheduling submits a Trigger");
+        };
+        assert_eq!(capability.as_deref(), Some("claude"));
+        assert_eq!(pinned_assignee.as_deref(), Some(own.as_slice()));
+        assert_eq!(max_attempts, AGENT_RUN_MAX_ATTEMPTS);
+
+        // the payload the executing host actually reads.
+        let spec = dispatch::decode_work_spec(&spec).expect("a work spec");
+        assert_eq!(spec.dispatch_id, dispatch_id);
+        assert_eq!(spec.capability, "claude");
+        let envelope: serde_json::Value = serde_json::from_slice(&spec.payload).unwrap();
+        assert_eq!(envelope["credential"], "team-claude");
+        assert_eq!(envelope["instructions"], "hello");
+        assert_eq!(envelope["run_id"], saga_id.as_str());
+    }
+
+    /// "Which node do I dial" and "which node RUNS this" are different
+    /// questions. An unpicked host means THIS node — never unpinned — because
+    /// the pin is what scopes the credential draw: a run with no assignee is a
+    /// run any host could present as its reason for spending your subscription.
+    #[test]
+    fn an_unpicked_host_pins_the_run_to_this_node() {
+        let own = vec![0xaau8; 32];
+        let peer_hex = "b".repeat(64);
+        let peer = vec![0xbbu8; 32];
+
+        for blank in ["", "   "] {
+            assert_eq!(pin_target(&own, blank).unwrap(), own);
+        }
+        assert_eq!(pin_target(&own, &peer_hex).unwrap(), peer);
+        assert_eq!(pin_target(&own, &format!("  {peer_hex}  ")).unwrap(), peer);
+        assert!(pin_target(&own, "not-a-key").is_err());
+
+        // the pty argv keeps its own flag discipline — it is still a CLI.
         assert_eq!(
-            agent_pty_args("http://node", "codex", "team-codex", &peer),
+            agent_pty_args("http://node", "codex", "team-codex", &peer_hex),
             [
                 "agent",
                 "pty",
@@ -1189,32 +1758,12 @@ mod tests {
                 "--cred",
                 "team-codex",
                 "--host-node",
-                peer.as_str(),
-            ]
-        );
-        assert_eq!(
-            agent_sched_args("http://node", "claude", "team-claude", &peer, "hello"),
-            [
-                "agent",
-                "sched",
-                "claude",
-                "--cred",
-                "team-claude",
-                "--node",
-                "http://node",
-                "--host-node",
-                peer.as_str(),
-                "--",
-                "hello",
+                peer_hex.as_str(),
             ]
         );
         for blank in ["", "   "] {
             assert!(
                 !agent_pty_args("http://node", "codex", "team-codex", blank)
-                    .contains(&"--host-node".to_string())
-            );
-            assert!(
-                !agent_sched_args("http://node", "claude", "team-claude", blank, "hello")
                     .contains(&"--host-node".to_string())
             );
         }
@@ -1231,30 +1780,76 @@ mod tests {
             providers: vec!["codex".into(), "claude".into()],
         }];
         assert_eq!(
-            agent_host_node_options(rows.clone()),
-            ["This node", "alice · codex, claude"]
+            agent_host_node_options(rows.clone(), "codex".into(), "team-codex".into()),
+            ["This node", "alice"]
         );
         assert_eq!(
-            agent_host_node_key(rows.clone(), "alice · codex, claude".into()),
+            agent_host_node_key(rows.clone(), "alice".into()),
             "a".repeat(64)
         );
-        assert_eq!(agent_host_node_key(rows.clone(), LOCAL_HOST_NODE.into()), "");
+        assert_eq!(
+            agent_host_node_key(rows.clone(), LOCAL_HOST_NODE.into()),
+            ""
+        );
         assert_eq!(agent_host_node_key(rows, "a node that left".into()), "");
     }
 
+    /// The picker cannot offer a run the node will bounce. Both refusals it used
+    /// to walk the operator into — `preflight_provider`'s "advertises no codex
+    /// provider" and `create_route`'s "a cross-node session requires --cred" —
+    /// are answered by the option list itself.
+    #[test]
+    fn the_host_picker_offers_only_peers_this_run_could_reach() {
+        let rows = vec![
+            AgentHostNode {
+                key: "a".repeat(64),
+                label: "alice".into(),
+                providers: vec!["claude".into()],
+            },
+            AgentHostNode {
+                key: "b".repeat(64),
+                label: "bo".into(),
+                providers: vec!["codex".into()],
+            },
+        ];
+        assert_eq!(
+            agent_host_node_options(rows.clone(), "codex".into(), "team-codex".into()),
+            ["This node", "bo"]
+        );
+        assert_eq!(
+            agent_host_node_options(rows.clone(), "claude".into(), "team-claude".into()),
+            ["This node", "alice"]
+        );
+        assert_eq!(
+            agent_host_node_options(rows, "codex".into(), String::new()),
+            ["This node"]
+        );
+    }
+
+    /// Picking a peer spends this operator's subscription there. The screen says
+    /// so, in the words the CLI reserves for `--cred`, and says nothing at all
+    /// about the local default — which spends nothing anyone could be surprised
+    /// by.
+    #[test]
+    fn a_peer_host_states_what_it_costs_and_the_local_one_says_nothing() {
+        assert_eq!(
+            agent_host_grant_note("alice", "team-codex"),
+            "alice runs this work and spends team-codex for it — this run only."
+        );
+        assert!(agent_host_grant_note(LOCAL_HOST_NODE, "team-codex").is_empty());
+        assert!(agent_host_grant_note("alice", "").is_empty());
+    }
+
     /// A node that announces nothing this app can launch is not a compute
-    /// choice, and an unnamed account still has to read as something.
+    /// choice, and a node reads as its short key.
     #[test]
     fn only_launchable_announcements_become_host_rows() {
         let key = vec![0xab, 0xcd, 0xef, 0x01, 0x23];
-        let names = HashMap::from([(key.clone(), "alice".to_string())]);
-        assert!(host_node_row(&names, &key, vec!["storage".into()]).is_none());
-        assert!(host_node_row(&names, &key, Vec::new()).is_none());
-        let named = host_node_row(&names, &key, vec!["codex".into(), "storage".into()]).unwrap();
-        assert_eq!((named.label.as_str(), named.providers.len()), ("alice", 1));
-        assert_eq!(named.key, "abcdef0123");
-        let unnamed = host_node_row(&HashMap::new(), &key, vec!["claude".into()]).unwrap();
-        assert_eq!(unnamed.label, "abcdef01…");
+        assert!(host_node_row(&key, vec!["storage".into()]).is_none());
+        assert!(host_node_row(&key, Vec::new()).is_none());
+        let row = host_node_row(&key, vec!["codex".into(), "storage".into()]).unwrap();
+        assert_eq!((row.label.as_str(), row.providers.len()), ("abcdef01…", 1));
+        assert_eq!(row.key, "abcdef0123");
     }
 
     /// The local row is one string in two languages: Rust rebuilds the option
@@ -1276,7 +1871,11 @@ mod tests {
     }
 
     #[test]
-    fn credentials_follow_the_selected_provider() {
+    /// ONE pick answers both halves, the way `--cred` does: the credential
+    /// names the provider. A provider with no credential still gets a row —
+    /// that row is a local terminal and nothing else — and it disappears the
+    /// moment a credential for it is registered.
+    fn one_pick_names_the_provider_and_the_credential_together() {
         let rows = vec![
             AgentCredential {
                 name: "c1".into(),
@@ -1287,38 +1886,157 @@ mod tests {
                 provider: "codex".into(),
             },
         ];
-        assert_eq!(agent_credential_names(rows.clone(), "codex".into()), ["x1"]);
+        let identities = agent_identities(rows.clone());
         assert_eq!(
-            agent_credential_choice(rows, "codex".into(), "c1".into()),
+            agent_identity_options(identities.clone()),
+            ["c1 · Claude Code", "x1 · Codex"]
+        );
+        assert_eq!(
+            agent_identity_provider(identities.clone(), "x1 · Codex".into()),
+            "codex"
+        );
+        assert_eq!(
+            agent_identity_credential(identities.clone(), "x1 · Codex".into()),
             "x1"
         );
+
+        let claude_only = agent_identities(vec![rows[0].clone()]);
+        assert_eq!(
+            agent_identity_options(claude_only.clone()),
+            ["c1 · Claude Code", "Codex · no credential"]
+        );
+        assert!(
+            agent_identity_credential(claude_only.clone(), "Codex · no credential".into())
+                .is_empty()
+        );
+        assert_eq!(
+            agent_identity_provider(claude_only, "Codex · no credential".into()),
+            "codex"
+        );
+
+        // nothing registered at all: both providers stay reachable as terminals.
+        assert_eq!(
+            agent_identity_options(agent_identities(Vec::new())),
+            ["Codex · no credential", "Claude Code · no credential"]
+        );
+    }
+
+    /// A revoked credential must not leave the screen pointing at a name the
+    /// gateway stopped serving.
+    #[test]
+    fn a_dropped_identity_falls_back_to_the_first_row() {
+        let identities = agent_identities(vec![AgentCredential {
+            name: "x1".into(),
+            provider: "codex".into(),
+        }]);
+        assert_eq!(
+            agent_identity_choice(identities.clone(), "x1 · Codex".into()),
+            "x1 · Codex"
+        );
+        assert_eq!(
+            agent_identity_choice(identities, "gone · Codex".into()),
+            "x1 · Codex"
+        );
+        assert!(agent_identity_choice(Vec::new(), "x1 · Codex".into()).is_empty());
+    }
+
+    /// A settled turn keeps the work that produced it, and a detached one keeps
+    /// the id that reaches the run again. Reopening re-enters the SAME turn:
+    /// the plate is dropped so the settle lands where it stood.
+    #[test]
+    fn a_turn_keeps_its_work_and_a_detached_run_keeps_its_id() {
+        let steps = vec![
+            AgentActivity {
+                id: 1,
+                title: "Command".into(),
+                detail: "cargo test".into(),
+                status: "done".into(),
+            },
+            AgentActivity {
+                id: 2,
+                title: "Reasoning".into(),
+                detail: "thinking".into(),
+                status: "done".into(),
+            },
+        ];
+        assert_eq!(agent_steps_label(&steps), "2 steps · 1 command");
+        assert_eq!(agent_steps_label(&[]), "0 steps");
+
+        let entries = agent_chat_push_user(Vec::new(), "do it".into(), "codex".into());
+        let saga = format!("origin/sched\u{1f}{}", "a".repeat(64));
+        let detached = agent_chat_detach(entries, "codex".into(), saga.clone(), steps.clone());
+        assert_eq!(detached.len(), 2);
+        assert_eq!(detached[1].status, "detached");
+        assert_eq!(detached[1].saga_id, saga);
+        assert_eq!(detached[1].steps_label, "2 steps · 1 command");
+        assert_eq!(agent_run_label(&saga), "run aaaaaaaa…");
+
+        let reopened = agent_chat_drop_detached(detached);
+        assert_eq!(reopened.len(), 1);
+        // idempotent: nothing trailing to drop leaves the transcript alone.
+        assert_eq!(agent_chat_drop_detached(reopened.clone()).len(), 1);
+
+        let settled = agent_event_entries(
+            reopened,
+            AgentChatEvent {
+                id: 9,
+                kind: "answer".into(),
+                title: "Done".into(),
+                detail: String::new(),
+                status: String::new(),
+                answer: "here you go".into(),
+                saga_id: saga.clone(),
+            },
+            "codex".into(),
+            saga,
+            steps.clone(),
+        );
+        assert_eq!(settled.len(), 2);
+        assert_eq!(settled[1].status, "done");
+        assert_eq!(settled[1].steps, steps);
+    }
+
+    /// A failure is a property of the turn that caused it, not a banner over
+    /// the whole transcript.
+    #[test]
+    fn a_failed_run_settles_the_turn_it_belongs_to() {
+        let entries = agent_chat_push_user(Vec::new(), "do it".into(), "codex".into());
+        let settled = agent_event_entries(
+            entries,
+            chat_error("the node refused".into()),
+            "codex".into(),
+            String::new(),
+            Vec::new(),
+        );
+        assert_eq!(settled.len(), 2);
+        assert_eq!(settled[1].status, "failed");
+        assert_eq!(settled[1].body, "the node refused");
     }
 
     #[test]
     fn conversation_prompt_keeps_roles_and_the_latest_turn() {
+        let turn = |id, role: &str, body: &str, status: &str| AgentChatEntry {
+            id,
+            role: role.into(),
+            body: body.into(),
+            provider: "codex".into(),
+            status: status.into(),
+            saga_id: String::new(),
+            steps: Vec::new(),
+            steps_label: String::new(),
+        };
         let entries = vec![
-            AgentChatEntry {
-                id: 1,
-                role: "user".into(),
-                body: "first".into(),
-                provider: "codex".into(),
-            },
-            AgentChatEntry {
-                id: 2,
-                role: "assistant".into(),
-                body: "second".into(),
-                provider: "codex".into(),
-            },
-            AgentChatEntry {
-                id: 3,
-                role: "user".into(),
-                body: "third".into(),
-                provider: "codex".into(),
-            },
+            turn(1, "user", "first", ""),
+            turn(2, "assistant", "second", "done"),
+            // a turn that never answered: its body is a refusal string, not
+            // something the agent said, so it is not context.
+            turn(3, "assistant", "the node refused", "failed"),
+            turn(4, "user", "third", ""),
         ];
         let prompt = agent_chat_prompt(entries);
         assert!(prompt.contains("User: first"));
         assert!(prompt.contains("Assistant: second"));
+        assert!(!prompt.contains("the node refused"));
         assert!(prompt.ends_with("User: third"));
     }
 

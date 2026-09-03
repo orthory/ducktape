@@ -29,9 +29,9 @@ fn forge_depth_rides_the_established_seams() {
         "run replace lane=forge_discussion load_forge_discussion(connected_rpc, forge_item_channel)"
     ));
     assert!(lifecycle.contains("return if next.channel_id != forge_item_channel"));
-    let screen = include_str!("../ui/screens/forge.ice");
-    assert!(screen.contains("return if next.path != tree_path"));
-    assert!(screen.contains("return if !empty(tree_rev) && next.rev != tree_rev"));
+    // The browse's own completion guards are behavior now, not shape:
+    // `forge_scoped_reads_do_not_call_loading_or_failure_empty` and
+    // `a_blob_for_another_file_does_not_paint_the_open_one` drive them.
     assert!(backend.contains(
         "load_forge_discussion(rpc:str, channel_id:str) -> ForgeDiscussionData ! AppError"
     ));
@@ -40,9 +40,9 @@ fn forge_depth_rides_the_established_seams() {
             "forge_tree(rpc:str, repo:str, rev:str, path:str) -> ForgeTreeData ! AppError"
         )
     );
-    assert!(
-        backend.contains("forge_blob(rpc:str, repo:str, rev:str, path:str) -> BlobView ! AppError")
-    );
+    assert!(backend.contains(
+        "forge_blob(rpc:str, repo:str, rev:str, path:str, net:str) -> BlobView ! AppError"
+    ));
     for deleted in [
         concat!("forge_", "discussion_generation"),
         concat!("forge_", "code_generation"),
@@ -235,7 +235,7 @@ fn forge_code_loaders_query_only_the_requested_tree_or_blob() {
 
     let screen = include_str!("../ui/screens/forge.ice");
     assert!(
-        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path)"),
+        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path, net)"),
         "the blob read launches from ForgeCodeBrowser's local handler"
     );
 }
@@ -273,6 +273,199 @@ fn forge_layout_keeps_repo_navigation_compact() {
         .1;
     assert!(item_body.starts_with("\n                BackToList"));
     assert_eq!(screen.matches("BackToList kind=forge_item_kind").count(), 1);
+}
+
+/// THE duck:// OPEN PLANE ADDS ADDRESSES, NEVER NAVIGATION. `open_message_link`
+/// classifies once and every kind lands on a handler a click on the screen
+/// would already reach; the two-step targets park a focus that the second
+/// step's loader-result handler consumes and clears.
+#[test]
+fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
+    let chat = include_str!("../ui/handlers/chat.ice");
+    let open = chat
+        .split_once("on open_message_link(url)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        open.contains("let link = resolve_duck_link(url, network_chain_id)")
+            && open.contains("match link.kind"),
+        "one resolve, scoped to the connected network, then one dispatch"
+    );
+    assert!(
+        open.contains("error = foreign_network_error(link.net, network_chain_id)"),
+        "a link from another network is refused by name, not opened"
+    );
+    for route in [
+        "run every open_external_url(url)",
+        "-> open_page_search_hit(_, \"\")",
+        "-> fs_open_dir _",
+        "-> forge_open_repo _",
+        "-> choose_channel _",
+        "-> open_chat_search_hit(_, link.seq, link.seq)",
+    ] {
+        assert!(open.contains(route), "a kind routes onto existing navigation: {route}");
+    }
+    assert!(!open.contains("run replace"), "the open plane owns no lane of its own");
+
+    let forge = include_str!("../ui/handlers/forge.ice");
+    let repo_loaded = forge
+        .split_once("on forge_repo_loaded(next)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        repo_loaded.contains("match forge_focus_kind(forge_focus_number, forge_focus_path)")
+            && repo_loaded.contains("-> forge_open_item _")
+            && repo_loaded.contains("slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, network_chain_id, path, rev) at forge_repo"),
+        "the repo's load consumes the forge focus"
+    );
+    let files = include_str!("../ui/handlers/files.ice");
+    let listed = files
+        .split_once("on fs_listed(next)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        listed.contains("return if empty(fs_focus_path)") && listed.contains("-> fs_open_file _"),
+        "the listing consumes the files focus"
+    );
+    let screen = include_str!("../ui/screens/forge.ice");
+    let focus_file = screen
+        .split_once("on focus_file(rpc, online, repo_now, net, path, rev)")
+        .expect("the browser's handler")
+        .1
+        .split_once("\n  on ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        focus_file.contains("tree_path = forge_parent(path)")
+            && focus_file.contains("tree_rev = keep_str(!empty(rev), rev, tree_rev)")
+            && focus_file.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, tree_path)"),
+        "a focused file first moves the tree to its directory, pinned to the link's rev"
+    );
+    assert!(
+        screen.matches("-> open_file(focus_rpc, focus_online, focus_repo, focus_net, tree_rev, tree_path, _)").count() == 1,
+        "and opens from `tree_loaded` alone — under the tree's own revision"
+    );
+
+    // The `#seq` landing: one-shot into the highlight, page scrolled to the
+    // row by its key — the seq, captured before it is retired, since a widget
+    // task must close the handler — and the highlight retired by the item's
+    // own open/close.
+    let discussion_loaded = forge
+        .split_once("on forge_discussion_loaded(next)")
+        .expect("the handler")
+        .1
+        .split_once("\non ")
+        .expect("the handler ends")
+        .0;
+    assert!(
+        discussion_loaded.contains("return if forge_focus_seq == 0")
+            && discussion_loaded.contains("let landed = forge_focus_seq")
+            && discussion_loaded
+                .contains("forge_linked_note = linked_note(forge_discussion, landed)")
+            && discussion_loaded.contains(
+                "task widget scroll-to-key #workspace-tabs/content/forge/item-detail landed"
+            ),
+        "the discussion's load lands the seq on its row"
+    );
+    let captured = discussion_loaded
+        .find("let landed = forge_focus_seq")
+        .expect("the capture");
+    let retired = discussion_loaded
+        .find("forge_focus_seq = 0")
+        .expect("the retirement");
+    assert!(
+        captured < retired,
+        "the key is captured before the seq is zeroed"
+    );
+    assert!(
+        screen.contains("scroll #item-detail") && screen.contains("match linked_note\n"),
+        "the page is addressable and the landed note is drawn once, above the list"
+    );
+    for retiring in ["on forge_open_item(number)", "on forge_close_item"] {
+        let body = forge.split_once(retiring).expect(retiring).1.split_once("\non ").expect("ends").0;
+        assert!(body.contains("forge_linked_note = none"), "{retiring} retires the landed note");
+    }
+}
+
+/// A MARKDOWN BLOB'S IN-REPO PICTURES DRAW INLINE. The reader mounts
+/// `forge_markdown` with the document's path (the plain `agent_markdown`
+/// has no document and keeps alt text), and `forge_blob` preloads a Markdown
+/// blob's pictures only — a code blob never pays for a parse.
+#[test]
+fn the_forge_reader_draws_a_markdown_blobs_pictures_inline() {
+    let screen = inlined(include_str!("../ui/screens/forge.ice"));
+    assert!(
+        screen.contains("lazy file_text by file_text, file_path, dark as cached_doc")
+            && screen
+                .contains("extern forge_markdown(cached_doc, file_path, dark) #forge-markdown"),
+        "the markdown arm mounts the document-aware adapter behind the memo boundary"
+    );
+    let loader = include_str!("../backend/forge.rs");
+    let text_loader = loader
+        .split_once("async fn forge_text(")
+        .expect("the text loader")
+        .1
+        .split_once("\nasync fn ")
+        .expect("the loader ends")
+        .0;
+    assert!(
+        text_loader.contains("markdown_path(&view.path) && !view.binary")
+            && text_loader.contains("load_inline_pictures(client, &view, net).await"),
+        "pictures preload for a markdown blob and nothing else, scoped to the network"
+    );
+    // A cited picture is an address like any other: `?net=` decides whether it
+    // is ours before a byte is read, or a body from another network draws
+    // THIS one's blob of the same name.
+    let picture_bytes = loader
+        .split_once("async fn inline_picture_bytes(")
+        .expect("the picture resolver")
+        .1
+        .split_once("\nasync fn ")
+        .expect("the resolver ends")
+        .0;
+    assert!(
+        picture_bytes.contains("resolve_duck_link(url.to_owned(), net.to_owned())")
+            && !picture_bytes.contains("classify_duck_link"),
+        "an inline picture resolves through the SCOPED entry, never the bare grammar"
+    );
+}
+
+/// THE FORGE READER DRAWS A PICTURE THROUGH THE SAME VIEWER THE FILES PREVIEW
+/// MOUNTS. `forge_blob` decides by path and parks the decoded handle under the
+/// forge surface; the screen draws it in its own arm, and neither text arm
+/// fires for it. A pick clears the previous file's picture flag before the
+/// read, as it already does for `binary`.
+#[test]
+fn the_forge_reader_draws_a_picture_through_the_viewer() {
+    let screen = inlined(include_str!("../ui/screens/forge.ice"));
+    assert!(
+        screen.contains("extern picture(\"forge\", file_path) #forge-picture"),
+        "the reader mounts the viewer"
+    );
+    assert!(
+        screen.contains("&& !file_binary && !file_picture && markdown_path(file_path)")
+            && screen.contains("&& !file_binary && !file_picture && !markdown_path(file_path)"),
+        "neither text arm fires for a picture"
+    );
+    let open_file = screen
+        .split_once("on open_file(")
+        .expect("the handler")
+        .1
+        .split_once("\n  on ")
+        .expect("the handler ends")
+        .0;
+    let cleared = open_file.find("file_picture = false").expect("the flag is cleared");
+    let read = open_file.find("run replace lane=blob").expect("the read");
+    assert!(cleared < read, "cleared before the read is issued");
 }
 
 /// Source and patch rows are one code-reading surface. The source rows render
@@ -437,7 +630,7 @@ fn forge_code_reads_are_compiler_replaced_without_ui_generations() {
     }
     let screen = inlined(include_str!("../ui/screens/forge.ice"));
     assert!(
-        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path)"),
+        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path, net)"),
         "the blob read supersedes on the component's own lane"
     );
 
@@ -576,15 +769,8 @@ fn forge_directory_navigation_retires_the_previous_file_preview() {
     // only while the browse stands where it was opened — same repository,
     // same directory, same commit. The app half of a navigation still only
     // reloads the tree.
-    let moved = |dir: &str, rev: &str| {
-        backend::forge_file_header(
-            "src".into(),
-            "1111".into(),
-            dir.into(),
-            rev.into(),
-            "src/lib.rs".into(),
-        )
-    };
+    let moved =
+        |dir: &str, rev: &str| backend::forge_file_header("src", "1111", dir, rev, "src/lib.rs");
     assert_eq!(moved("src", "1111"), "src/lib.rs");
     assert_eq!(moved("", "1111"), "", "leaving the directory retires it");
     assert_eq!(moved("src", "2222"), "", "a newer commit retires it");
@@ -608,14 +794,76 @@ fn forge_directory_navigation_retires_the_previous_file_preview() {
     assert!(state.tree_entries.is_empty(), "navigation clears the listing it left");
 }
 
+/// A BLOB ANSWERS FOR ONE FILE. The reader keeps a single in-flight path, and
+/// a completion that names another one is a superseded read landing late — the
+/// replace lane cancels most of them, but the one already in the runtime's hand
+/// still arrives. Painting it puts one file's source under another file's
+/// header.
+#[test]
+fn a_blob_for_another_file_does_not_paint_the_open_one() {
+    let (mut app, _) = Ducktape::__boot();
+    app.connected = true;
+    app.connected_rpc = "http://node".into();
+    app.forge_repo = "core".into();
+    let scope = materialized_code_browser(&mut app);
+    let _ = app.__update(Ducktape::__ice_test_message_forge_code_browser_open_file(
+        scope.clone(),
+        "http://node".into(),
+        true,
+        "core".into(),
+        String::new(),
+        "1111111111111111111111111111111111111111".into(),
+        String::new(),
+        "src/lib.rs".into(),
+    ));
+    let blob = |path: &str, text: &str| {
+        Ducktape::__ice_test_message_forge_code_browser_file_loaded(
+            scope.clone(),
+            backend::BlobView {
+                repo: "core".into(),
+                rev: "1111111111111111111111111111111111111111".into(),
+                path: path.into(),
+                text: text.into(),
+                truncated: false,
+                binary: false,
+                lines: 1,
+                picture: false,
+                width: 0,
+                height: 0,
+            },
+        )
+    };
+
+    let _ = app.__update(blob("src/main.rs", "fn main() {}"));
+    let state = app
+        .__ice_test_state_forge_code_browser(&scope)
+        .expect("instance");
+    assert!(
+        state.file_text.is_empty(),
+        "another file's blob must not paint under this file's header"
+    );
+    assert_eq!(
+        state.phase,
+        ForgeFilePhase::Loading,
+        "the read the reader is waiting for is still in flight"
+    );
+
+    let _ = app.__update(blob("src/lib.rs", "pub fn open() {}"));
+    let state = app
+        .__ice_test_state_forge_code_browser(&scope)
+        .expect("instance");
+    assert_eq!(state.file_text, "pub fn open() {}");
+    assert_eq!(state.phase, ForgeFilePhase::Ready);
+}
+
 #[test]
 fn the_file_reader_owns_its_cycle_inside_the_component() {
     // The whole browse lives in `ForgeCodeBrowser` local state. The seam
-    // tests above exercise the behavior; this lint pins the SHAPE — boot
-    // reads the root with the props the instance was mounted with, both
-    // reads run on the component's own lanes, the completions guard what
-    // they answer for, and every preview surface gates on the
-    // place-and-revision header.
+    // tests above own the behavior — including both completion guards — and
+    // this lint pins only what no run of the app can observe: that boot reads
+    // the root with the props the instance was mounted with, that both reads
+    // run on the component's own replace lanes, that every preview surface
+    // gates on the place-and-revision header, and that the app half is gone.
     let screen = include_str!("../ui/screens/forge.ice");
     let handlers = include_str!("../ui/handlers/forge.ice");
 
@@ -628,8 +876,6 @@ fn the_file_reader_owns_its_cycle_inside_the_component() {
     assert!(head.contains("run replace lane=tree forge_tree(connected_rpc, repo, \"\", \"\")"));
     assert!(head.contains("run replace lane=tree forge_tree(rpc, repo_now, tree_rev, path)"));
     assert!(head.contains("run replace lane=blob forge_blob("));
-    assert!(head.contains("return if next.path != tree_path"));
-    assert!(head.contains("return if next.path != file_path"));
     let gates = head.matches("forge_file_header(").count();
     assert!(gates >= 8, "every preview arm gates on the header, found {gates}");
     assert!(
@@ -711,5 +957,58 @@ fn forge_empty_states_name_only_routes_that_exist() {
     assert!(
         forge.contains("empty(tree_entries) && tree_born"),
         "a born empty commit does not get called unborn"
+    );
+}
+
+/// A PICTURE THAT DOES NOT DRAW SAYS WHY. The loader lands a picture past the
+/// byte cap or one that does not decode on the binary plate with the reason
+/// as the blob's `text`, and the plate's line is `binary_note(file_text)`:
+/// that reason, or the generic "not text" line for plain binary, whose
+/// `text` is empty. An empty blob is not "past the cap": the cap is judged by
+/// the size the node announces, never by an empty page.
+#[test]
+fn a_picture_that_does_not_draw_says_why_on_the_binary_plate() {
+    let backend = inlined(include_str!("../backend/forge.rs"));
+    let picture = backend
+        .split_once("async fn forge_picture(")
+        .expect("the loader")
+        .1
+        .split_once("\nasync fn ")
+        .expect("the loader ends")
+        .0;
+    assert!(
+        picture.contains("MiB preview limit.")
+            && picture.contains("Err(reason) => Ok(binary_blob(")
+            && picture.contains("did not decode: {reason}"),
+        "both failures carry their reason onto the plate"
+    );
+    let paging = backend
+        .split_once("async fn forge_blob_bytes(")
+        .expect("the pager")
+        .1
+        .split_once("\nasync fn ")
+        .expect("the pager ends")
+        .0;
+    assert!(
+        paging.contains("page.size > MAX_PICTURE_BYTES as i64")
+            && !paging.contains("bytes.is_empty()"),
+        "the cap is the announced size, so an empty blob is not called too large"
+    );
+    assert_eq!(
+        crate::backend::binary_note(""),
+        "This is not text — the reader shows no preview for it.",
+        "plain binary keeps the generic line"
+    );
+    assert_eq!(
+        crate::backend::binary_note("why"),
+        "why",
+        "a reasoned binary shows its reason"
+    );
+    let screen = inlined(include_str!("../ui/screens/forge.ice"));
+    assert!(
+        screen.contains(
+            "&& file_binary\n          ForgeCodeEmpty name=file_path note=binary_note(file_text)"
+        ),
+        "the plate's line is the note"
     );
 }

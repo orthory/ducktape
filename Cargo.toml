@@ -13,28 +13,39 @@
 #                      indexer, never in any root), wasm-host (runs a
 #                      ducktape:module component as a native sdk::Module),
 #                      module-guest (that world's WIT definition)
-#   crates/networking/ — the netstack: host-side transport infra ONLY
-#                      (wireguard, nat-traversal, reachability, data-plane,
-#                      overlay-net) — owns no consensus module
+#   crates/networking/ — the netstack: transport infra ONLY (wireguard,
+#                      nat-traversal, netstack-machine [the sans-I/O
+#                      reachability decision core, its ducktape:netstack
+#                      WIT world and the guest build of it],
+#                      netstack-scenarios [the frozen scenario suite and
+#                      golden traces every backend is held to],
+#                      netstack-wasm [the wasmtime embedding of that
+#                      world], reachability [the host executor + rendezvous
+#                      runtime], data-plane, overlay-net) — owns no
+#                      consensus module
 #   crates/modules/   — CONSENSUS MODULES AND NOTHING ELSE. every crate under
 #                      system/ or apps/ implements `sdk::Module`; anything that
 #                      does not belongs somewhere else in this list. (module =
 #                      onchain, service = offchain.)
-#   crates/modules/system/ — system modules: consensus infrastructure (kv,
-#                      valset, governance, identity, lifecycle, saga,
+#   crates/modules/system/ — system modules: consensus infrastructure (acl,
+#                      kv, valset, governance, identity, lifecycle, saga,
 #                      capability, dispatch, tagging, gateway — which absorbed
 #                      the duckdns naming library it now consumes from
 #                      crates/duckdns)
 #   crates/modules/apps/   — application modules, the product features (forge,
-#                      chat, pages, agent, runs, tasks, vaults, automations,
-#                      inbox, files)
+#                      chat, pages, agent, runs, tasks, automations, inbox,
+#                      files)
 #   crates/services/ — off-chain service crates: the host-side executors that
 #                      serve a consensus module without being one (compute —
 #                      the dispatch WorkSpec pool/ledger/gate; sandbox — the
-#                      node-local podman/egress/backend-probe muscle; broker —
+#                      microVM/egress/backend-probe muscle; broker —
 #                      the run-scoped credential loopback + airlock client;
 #                      provider — the executor spec layer + CliProvider run loop;
-#                      agent — the pty session daemon; airlock — the lender)
+#                      agent — the pty session daemon; airlock — the lender;
+#                      media — the huddle voice/video planes + call-socket wire)
+#   crates/topology/ — the module composition catalog: the id universe, its
+#                      shape/config schema and the named genesis selections
+#                      every composer draws from (pure data, no deps)
 #   crates/airlock/  — the two-party execution/auth contract (see members below)
 #   crates/duckdns/  — the `.duck` account naming library: hostname grammar,
 #                      handle registry, wire types. NOT a module — the `gateway`
@@ -51,8 +62,9 @@
 #                      carries its OWN port (src/guest.rs behind the `guest`
 #                      feature) and bin/guest-builder synthesizes the
 #                      packaging — no per-module crate lives here
-#   crates/examples/ — reference modules: directory (also bin/node's liveness
-#                      canary), greeter (the types-only composition example)
+#   crates/examples/ — reference modules: directory (the first wasm port; a test
+#                      tenant, in no genesis set), greeter (the types-only
+#                      composition example)
 #   crates/testing/  — dev-only shared test support (nettest: raw-http client,
 #                      port allocation, poll). [dev-dependencies] of the bin
 #                      integration suites ONLY; no shipping crate depends on it
@@ -61,11 +73,14 @@
 #                      genesis set. EXCLUDED from the workspace as its own
 #                      standalone crate so its heavy deps (revm, alloy) never
 #                      tax the shipping build; gated via `make labs-gate`
-#   bin/             — demo (in-process walkthrough), node (the `ducktape`
+#   crates/noded/    — the node daemon library: the /v1 http+ws surface, the
+#                      actor lane, index/blob/stream lanes and the in-process
+#                      testkit — served by bin/noded, bin/node and bin/simnode
+#   bin/             — node (the `ducktape`
 #                      CLI: validator + fs verbs + mcp server), noded (the
-#                      app-facing daemon), simnode (deterministic /v1 twin),
-#                      coordinator (STUN rendezvous), guest-builder (module →
-#                      wasm component packaging tool)
+#                      app-facing daemon process), simnode (deterministic /v1
+#                      twin), coordinator (STUN rendezvous), guest-builder
+#                      (module → wasm component packaging tool)
 # the host dispatches modules over BFT consensus and composes each authenticated
 # root into the global root-hash. cosmwasm's isolation *pattern*, native rust.
 
@@ -77,6 +92,9 @@ members = [
     "crates/kernel/node", "crates/kernel/consensus",
     "crates/kernel/statesync", "crates/kernel/recovery", "crates/kernel/indexer",
     "crates/kernel/index-guest",
+    # the closed signature-scheme set + ONE verifier: shared by the kernel
+    # frame codec (below modules) and the identity module (a module).
+    "crates/kernel/keyscheme",
     # the node-local receipt-lane byte store. platform, not a module: it holds
     # no consensus state and lands in no root — the same standing `indexer` has
     # two lines up, and the reason it left crates/modules/system/.
@@ -85,6 +103,9 @@ members = [
     # networking — the netstack (host-side infra + the modules that govern it)
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
+    "crates/networking/netstack-machine",
+    "crates/networking/netstack-scenarios",
+    "crates/networking/netstack-wasm",
     "crates/networking/reachability",
     "crates/networking/data-plane",
     "crates/networking/overlay-net",
@@ -108,9 +129,28 @@ members = [
     # duckdns — the `.duck` naming library, same standing for the same reason.
     # NOT a consensus module (no `sdk::Module`, no MODULE_ID, no guest wasm):
     # `gateway` absorbed the onchain half and embeds this registry, while
-    # node/noded/simnode/demo parse and validate `.duck` names host-side. Under
+    # node/noded/simnode parse and validate `.duck` names host-side. Under
     # crates/modules/system/ it made "modules = onchain" literally false.
     "crates/duckdns",
+    "crates/authpage",
+    # keystore — the device keystore (`keys/<name>.key` + the active pointer)
+    # and the argon2id/AEAD seal under it. Same standing, same reason: its two
+    # consumers are the CLI and the desktop app, which share nothing else. It
+    # sat inside bin/node until the app's only route to it was spawning
+    # `ducktape` over pipes, making "can the app find a binary?" a precondition
+    # for opening your own key.
+    "crates/keystore",
+    # The run envelope's schema, split from the service that READS one: the
+    # reader links provider-host and with it the microVM sandbox, which a GUI
+    # submitting a run must not.
+    "crates/run-envelope",
+    # A workspace on disk (identity, network.toml, node.toml, the invite codec)
+    # and the join ceremony that writes one. Split from bin/node because
+    # joining is the one node operation with no running node to ask.
+    "crates/workspace-config",
+    # THE ducktape home resolution, alone in a zero-dependency leaf so the
+    # light services can read it without workspace-config's graph behind it.
+    "crates/ducktape-home",
     "crates/duckfs/core",
     "crates/duckfs/disk",
     "crates/duckfs/client",
@@ -124,7 +164,6 @@ members = [
     "crates/modules/apps/agent",
     "crates/modules/apps/runs",
     "crates/modules/apps/tasks",
-    "crates/modules/apps/vaults",
     "crates/modules/apps/automations",
     "crates/modules/apps/inbox",
     "crates/modules/apps/files",
@@ -133,6 +172,7 @@ members = [
     "crates/services/airlock",
     "crates/services/broker",
     "crates/services/compute",
+    "crates/services/media",
     "crates/services/provider",
     "crates/services/sandbox",
     # examples — demo / test scaffolding modules
@@ -140,10 +180,15 @@ members = [
     # testing — dev-only shared harness helpers (raw-http client, ports,
     # poll). NOT a Module Rule surface; no shipping crate depends on it.
     "crates/testing/nettest",
+    # topology — the module composition catalog every composer draws from
+    "crates/topology",
+    # noded — the daemon library behind the /v1 surface
+    "crates/noded",
     # bin — runnable binaries
-    "bin/demo", "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
+    "bin/node", "bin/noded", "bin/simnode", "bin/coordinator",
     "bin/airlock-gateway",
     "bin/guest-builder",
+    "bin/duck-guest-init",
     # native desktop client — intentionally only Chat + Pages
     "app",
 ]
@@ -162,7 +207,7 @@ version = "0.1.0"
 clap = { version = "4.6", features = ["derive"] }
 # the logging facade. events land in `noded::LogRing` (streamed to the app's
 # Logs tab over the ws `logs` topic) AND on stderr (tee'd to daemon.log) —
-# both gated by ONE reloadable filter, see bin/noded/src/log.rs.
+# both gated by ONE reloadable filter, see crates/noded/src/log.rs.
 tracing = "0.1"
 arrayvec = "0.7"
 crossbeam-channel = "0.5"
@@ -198,13 +243,9 @@ commonware-p2p = "2026.5.0"
 commonware-parallel = "2026.5.0"
 commonware-utils = "2026.5.0"
 commonware-actor = "2026.5.0"
-defguard_wireguard_rs = "0.10.0"
-# the userspace overlay backend (overlay-net/userspace): the SAME BoringTun
-# core the TUN path already runs (defguard_wireguard_rs's fork), used sans-io
-# (`noise::Tunn`, no device layer) — wire compat between socket-mode and
-# tun-mode nodes is by construction, not by hope. version pinned to the one
-# defguard_wireguard_rs 0.10 resolves, so both paths share one build of the
-# crypto core.
+# the userspace overlay backend (overlay-net/userspace): the BoringTun noise
+# core used sans-io (`noise::Tunn`, no device layer) — WireGuard-compatible on
+# the wire by construction.
 defguard_boringtun = "0.6.5"
 # the userspace backend's virtual host: a TUN-less TCP/UDP stack terminating
 # at the node's overlay ULA, entirely in-process. `medium-ip` because the
@@ -218,6 +259,14 @@ smoltcp = { version = "0.13", default-features = false, features = [
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 base64 = "0.22"
 p256 = "0.13"
+# secp256k1 with public-key RECOVERY: an Ethereum wallet's `personal_sign`
+# proof carries r‖s‖v and no pubkey, so verify = recover + compare.
+k256 = { version = "0.13", features = ["ecdsa"] }
+# raw (un-namespaced) ed25519 for OpenSSH `SSHSIG` verification — an SSH
+# key signs the SSHSIG blob directly, never commonware's namespaced preimage.
+ed25519-dalek = "2"
+# keccak-256 for the EIP-191 personal-message digest.
+sha3 = "0.10"
 # duckfs path normalization: NFC so visually-identical names collide instead
 # of coexisting (a consensus-determinism requirement, not cosmetics).
 unicode-normalization = "0.1"
@@ -234,16 +283,20 @@ chacha20poly1305 = "0.10"
 zeroize = "1"
 
 # fluent31 — the derived read-model engine (LSM + MVCC snapshots) behind the
-# per-module indexer tier ONLY: nothing the root-hash commits to may live in it
-# (evaluated and rejected as a canonical substrate — see handoff/restart-recovery.md).
+# per-module indexer tier ONLY: nothing the root-hash commits to may live in
+# it. Every fluent31 database is a rebuildable projection of the op feed, never
+# a canonical substrate.
 # default-features = false keeps the base dep lean; the indexer crate turns the
 # `wasm` feature on — the in-database WASM layer (wasmtime) runs the per-module
 # index guests (fold triggers + view queries).
-fluent31 = { git = "https://github.com/orthory/fluent31", default-features = false }
+fluent31 = { git = "https://github.com/orthory/fluent31", rev = "f1f9a9802edf8be3c536685d8e65ccc66f9260e0", default-features = false }
 # fluent-guest — fluent31's wasm32 guest SDK. NEVER a host-side dependency:
 # only the index-guest crate's `guest` feature pulls it, and only guest-builder's
-# synthesized wasm32 workspaces ever enable that feature.
-fluent-guest = { git = "https://github.com/orthory/fluent31", default-features = false }
+# synthesized wasm32 workspaces ever enable that feature. It is compiled INTO
+# every committed index guest, so moving this rev moves their bytes: rebuild
+# each `index.wasm` (`guest-builder --index`, the Makefile's INDEX_MODULES)
+# and run `make wasm-index-check` in the same change.
+fluent-guest = { git = "https://github.com/orthory/fluent31", rev = "f1f9a9802edf8be3c536685d8e65ccc66f9260e0", default-features = false }
 # borsh — the deterministic op-row envelope on the derived tier's fold feed
 # (host encodes, index guests decode; one byte layout, no map ordering games).
 borsh = { version = "1", default-features = false, features = ["derive", "std"] }
@@ -252,10 +305,15 @@ borsh = { version = "1", default-features = false, features = ["derive", "std"] 
 # modules inside the host. pinned EXACTLY: the runtime IS the module execution
 # semantics, so it is consensus-affecting and every validator must run the
 # identical build; changing it is a binary upgrade, never a live module swap.
-wasmtime = "=46.0.1"
+wasmtime = "=46.0.3"
+# wit-bindgen — the guest-side binding generator for a crate's own component
+# port (the netstack machine's `guest` feature). Only ever compiled inside
+# guest-builder's synthesized wasm32 workspace.
+wit-bindgen = "0.57"
 
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
+keyscheme = { path = "crates/kernel/keyscheme" }
 # dev-only shared test doubles for the sdk boundary traits (TestCtx +
 # in-memory MerkleStore). MAY ONLY appear in `[dev-dependencies]` of consumers —
 # the Module Rule (modules link only sdk + wire surfaces) is untouched.
@@ -293,7 +351,6 @@ chat = { path = "crates/modules/apps/chat" }
 agent = { path = "crates/modules/apps/agent" }
 runs = { path = "crates/modules/apps/runs" }
 tasks = { path = "crates/modules/apps/tasks" }
-vaults = { path = "crates/modules/apps/vaults" }
 automations = { path = "crates/modules/apps/automations" }
 inbox = { path = "crates/modules/apps/inbox" }
 files = { path = "crates/modules/apps/files" }
@@ -302,12 +359,28 @@ agent-service = { path = "crates/services/agent" }
 airlock-service = { path = "crates/services/airlock" }
 broker-host = { path = "crates/services/broker" }
 compute-service = { path = "crates/services/compute" }
+media-service = { path = "crates/services/media" }
 provider-host = { path = "crates/services/provider" }
 sandbox-host = { path = "crates/services/sandbox" }
 # internal — cross-plane libraries: neither a consensus module nor a service.
 # duckdns is the `.duck` naming library the `gateway` module embeds and the
 # composing binaries validate names through (see the members list).
 duckdns = { path = "crates/duckdns" }
+# the device keystore, linked by both the CLI and the desktop app.
+keystore = { path = "crates/keystore" }
+# the WebAuthn RP page client (ops/auth-page): request URL, loopback callback,
+# passkey/wallet frames — shared by the CLI and the app.
+authpage = { path = "crates/authpage" }
+# the run envelope's magic + headless composer, linked by the CLI, the compute
+# service and the desktop app.
+run-envelope = { path = "crates/run-envelope" }
+# a ducktape workspace on disk + the join ceremony, linked by the CLI and the
+# desktop app.
+workspace-config = { path = "crates/workspace-config" }
+# `$DUCKTAPE_HOME` else `~/.ducktape`, resolved once for every reader of it.
+ducktape-home = { path = "crates/ducktape-home" }
+# the module composition catalog (id universe + named genesis selections).
+topology = { path = "crates/topology" }
 duckfs-core = { path = "crates/duckfs/core" }
 duckfs-disk = { path = "crates/duckfs/disk" }
 duckfs-client = { path = "crates/duckfs/client" }
@@ -316,7 +389,13 @@ directory = { path = "crates/examples/directory" }
 greeter = { path = "crates/examples/greeter" }
 # internal — types-only interface crates (the legal cross-module surface)
 wireguard = { path = "crates/networking/wireguard" }
-nat-traversal = { path = "crates/networking/nat-traversal" }
+# default-features off at the workspace level: the `runtime` feature (sockets,
+# clocks) is opted into by the host-side consumers below; the netstack
+# machine takes the pure wire surface only, natively and on wasm32.
+nat-traversal = { path = "crates/networking/nat-traversal", default-features = false }
+netstack-machine = { path = "crates/networking/netstack-machine" }
+netstack-scenarios = { path = "crates/networking/netstack-scenarios" }
+netstack-wasm = { path = "crates/networking/netstack-wasm" }
 reachability = { path = "crates/networking/reachability" }
 data-plane = { path = "crates/networking/data-plane" }
 overlay-net = { path = "crates/networking/overlay-net" }
@@ -333,6 +412,15 @@ rand_core = "0.6.4"
 # its uninhabited extern-static type is future-incompatible with Rust. Keep the
 # API/ABI identical and patch only that declaration locally.
 block = { path = "patches/block" }
+# cosmic-text 0.15.0's font fallback only matched faces at EXACTLY the
+# requested weight before falling back to re-shaping a run against every face
+# in the database. A variable font registers once at 400 and the bundled
+# emoji/CJK fallback faces are static 400s, so every semibold/bold run with a
+# non-Latin glyph paid that walk (26us -> ~3ms per emoji paragraph), and bold
+# Latin could land on a platform face instead of Geist. The patched copy
+# matches a family at its closest weight; see patches/cosmic-text/README.md
+# for the drop condition.
+cosmic-text = { path = "patches/cosmic-text" }
 
 # dev/test builds compile wasm guests through cranelift (consensus components
 # in the kernel tests, index guests at every store open). unoptimized
@@ -519,6 +607,27 @@ opt-level = 2
 opt-level = 2
 
 [profile.dev.package.softbuffer]
+opt-level = 2
+
+# The Markdown parse and the syntect pass every fenced code block pays — the
+# agent transcript, the forge reader and the Files preview all render through
+# them, and a regex engine at opt-0 is the slowest thing on that path.
+[profile.dev.package.pulldown-cmark]
+opt-level = 2
+
+[profile.dev.package.syntect]
+opt-level = 2
+
+[profile.dev.package.iced_highlighter]
+opt-level = 2
+
+[profile.dev.package.fancy-regex]
+opt-level = 2
+
+[profile.dev.package.regex-automata]
+opt-level = 2
+
+[profile.dev.package.regex-syntax]
 opt-level = 2
 
 

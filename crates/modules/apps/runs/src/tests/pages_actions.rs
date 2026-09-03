@@ -15,12 +15,12 @@ fn page_trigger_thread() -> pages::ThreadView {
             comment_ids: vec!["comment-1".into()],
         },
         comments: vec![pages::Comment {
-                id: "comment-1".into(),
-                thread_id: "thread-1".into(),
-                author: pages::AuthorRef::User(vec![4; 32]),
-                text: "@bot review".into(),
-                created_at: 1,
-                edited_at: None,
+            id: "comment-1".into(),
+            thread_id: "thread-1".into(),
+            author: pages::AuthorRef::User(vec![4; 32]),
+            text: "@bot review".into(),
+            created_at: 1,
+            edited_at: None,
             deleted: false,
         }],
     }
@@ -336,7 +336,8 @@ fn squatted_ids_and_a_crowded_target_degrade_the_comment() {
     // anyone can mint pages ids, so the deterministic thread/comment ids are
     // squattable and the target's thread list is cappable — each probe must
     // catch its case (an emitted op pages rejects would abort the block).
-    let (_, registry, run_id) = awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["*"]);
+    let (_, registry, run_id) =
+        awaiting_pages_run(&[ACTION_CHAT_POST, ACTION_PAGES_COMMENT], &["*"]);
     let rid = dispatch_id_for(&run_id);
     for (ctx, needle) in [
         (
@@ -358,7 +359,10 @@ fn squatted_ids_and_a_crowded_target_degrade_the_comment() {
         };
         let mut ctx = ctx;
         deliver(&mut m2, &mut ctx, &run_id, comment_effect("b-p"));
-        assert!(ctx.page_msgs().is_empty(), "the squatted case emits nothing");
+        assert!(
+            ctx.page_msgs().is_empty(),
+            "the squatted case emits nothing"
+        );
         assert!(
             ctx.notes().iter().any(|n| n.contains(needle)),
             "expected {needle:?} in {:?}",
@@ -419,7 +423,9 @@ fn a_pathological_channel_still_yields_a_safe_hashed_comment_id() {
     let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_PAGES_COMMENT])]);
     registry.get_mut("bot").unwrap().caps.pages_write = vec!["*".into()];
     let mut m = module().with_pages_module("pages");
-    let mut ctx = CaptureCtx::new().with_origin(user(9)).with_registry(&registry);
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(9))
+        .with_registry(&registry);
     exec(
         &mut m,
         &mut ctx,
@@ -448,7 +454,11 @@ fn a_pathological_channel_still_yields_a_safe_hashed_comment_id() {
     deliver(&mut m, &mut ctx, &run_id, comment_effect("b-p"));
 
     let msgs = ctx.page_msgs();
-    assert_eq!(msgs.len(), 1, "the comment lands despite the channel: {msgs:?}");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "the comment lands despite the channel: {msgs:?}"
+    );
     let PageMsg::AddComment {
         thread_id,
         comment_id,
@@ -487,7 +497,9 @@ fn an_unwired_pages_module_degrades_to_a_breadcrumb() {
 
     assert!(ctx.page_msgs().is_empty());
     assert!(
-        ctx.notes().iter().any(|n| n.contains("no pages module wired")),
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("no pages module wired")),
         "{:?}",
         ctx.notes()
     );
@@ -519,12 +531,19 @@ fn task_actions_keep_their_all_or_nothing_lane() {
             },
         ],
     );
-    assert!(ctx.page_msgs().is_empty(), "nothing applies on a failed run");
+    assert!(
+        ctx.page_msgs().is_empty(),
+        "nothing applies on a failed run"
+    );
     assert!(ctx.task_msgs().is_empty());
     commit(&mut m);
     let record = recent_runs(&m)
         .into_iter()
         .find(|r| r.run_id == run_id)
         .expect("a terminal record");
-    assert_eq!(record.outcome, RunOutcome::Failed, "the task lane still fails the run");
+    assert_eq!(
+        record.outcome,
+        RunOutcome::Failed,
+        "the task lane still fails the run"
+    );
 }

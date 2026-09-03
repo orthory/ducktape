@@ -36,11 +36,10 @@
 //! and it runs in the COMPUTE DAEMON's process, so "the executing node" is the
 //! node this daemon serves.
 
-use provider_host::{AirlockConfig, CredentialKind, ResolvedCredential, WorkRef};
 use compute_service::{CredentialResolver, Resolved};
 use gateway::{CredentialRecord, GatewayQuery, GatewayReply, HandleRegistration};
-use identity::{AccountView, IdentityQuery, IdentityReply};
 use noded::node_link::NodeLink;
+use provider_host::{AirlockConfig, CredentialKind, ResolvedCredential, WorkRef};
 
 /// The gateway route label the co-hosted airlock gateway registers itself under
 /// (`bin/node/src/boot/surfaces.rs`). A resolved credential's traffic is routed
@@ -76,7 +75,9 @@ impl NodeCredentialResolver {
         let bytes = self
             .query(
                 "gateway",
-                gateway::encode_query(&GatewayQuery::Credential { name: name.to_string() }),
+                gateway::encode_query(&GatewayQuery::Credential {
+                    name: name.to_string(),
+                }),
             )
             .await?;
         match gateway::decode_reply(&bytes)? {
@@ -85,23 +86,10 @@ impl NodeCredentialResolver {
         }
     }
 
-    async fn account_of_node(&self, node_key: &[u8]) -> Result<Option<AccountView>, String> {
-        let bytes = self
-            .query(
-                "identity",
-                identity::encode_query(&IdentityQuery::OfNode { node_key: node_key.to_vec() }),
-            )
-            .await?;
-        match identity::decode_reply(&bytes)? {
-            IdentityReply::Account(account) => Ok(account),
-            other => Err(format!("identity returned an unexpected reply: {other:?}")),
-        }
-    }
-
     /// The `.duck` handle registered for `account_id`, if any. Scans the handle
     /// registration listing. ponytail: single page (MAX_QUERY_LIMIT handles); a
     /// network past that needs pagination here.
-    async fn handle_of_account(&self, account_id: &[u8]) -> Result<Option<String>, String> {
+    async fn handle_of_account(&self, account_id: u64) -> Result<Option<String>, String> {
         let bytes = self
             .query(
                 "gateway",
@@ -135,15 +123,14 @@ impl NodeCredentialResolver {
         let Some(via) = self.via.clone() else {
             return Err("this node has no browser gateway to route credential traffic".into());
         };
-        let Some(owner) = self.account_of_node(&record.publisher_node).await? else {
-            return Err("credential publisher node is not bound to an account".into());
-        };
-        let Some(handle) = self.handle_of_account(&owner.account_id).await? else {
-            return Err("credential publisher has no registered duck handle".into());
+        // the record names its owning account outright; the handle is that
+        // account's, not the publishing node's.
+        let Some(handle) = self.handle_of_account(record.owner_account).await? else {
+            return Err("credential owner has no registered duck handle".into());
         };
         let resolved = ResolvedCredential {
             name: record.name.clone(),
-            kind: map_kind(record.kind),
+            kind: service_kind(record.kind),
             authority: format!("{AIRLOCK_ROUTE}.{handle}.duck"),
             via,
             seal_pk: record.seal_pk,
@@ -165,7 +152,20 @@ impl CredentialResolver for NodeCredentialResolver {
         let work = WorkRef::Saga {
             saga_id: saga_id.to_string(),
         };
-        let airlock = self.build_airlock(&record, work).await?;
+        // one line per attempt (bounded by the saga's max_attempts), because
+        // the refusal otherwise only ever appears in the saga's `error` field
+        // — which no CLI surfaces and no operator is watching.
+        let airlock = self
+            .build_airlock(&record, work)
+            .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    target: "ducktape::compute",
+                    reason = "credential_unroutable",
+                    %error,
+                    "a run's credential could not be resolved on this node"
+                );
+            })?;
         Ok(Resolved { airlock })
     }
 }
@@ -182,13 +182,17 @@ impl CredentialResolver for NodeCredentialResolver {
 ///
 /// Nor was it buying earliness. The lender's refusal lands in `start_broker`,
 /// before `invoke` spawns the sandbox and before any paid upstream call.
-fn routable(credential: &str, record: Option<CredentialRecord>) -> Result<CredentialRecord, String> {
+fn routable(
+    credential: &str,
+    record: Option<CredentialRecord>,
+) -> Result<CredentialRecord, String> {
     record.ok_or_else(|| format!("unknown credential: {credential}"))
 }
 
-/// The node owns the gateway↔capability-host credential-kind mapping, because
-/// capability-host does not depend on the gateway crate.
-fn map_kind(kind: gateway::CredentialKind) -> CredentialKind {
+/// The node owns the ONE mapping from the gateway module's on-chain credential
+/// tag to the service plane's vendor vocabulary, because no service crate
+/// depends on the gateway module crate.
+pub(crate) fn service_kind(kind: gateway::CredentialKind) -> CredentialKind {
     match kind {
         gateway::CredentialKind::Claude => CredentialKind::Claude,
         gateway::CredentialKind::Codex => CredentialKind::Codex,
@@ -200,14 +204,17 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    fn record(owner: &[u8], grants: &[&[u8]]) -> CredentialRecord {
+    const OWNER: u64 = 1;
+    const SOMEONE_ELSE: u64 = 2;
+
+    fn record(owner: u64, grants: &[u64]) -> CredentialRecord {
         CredentialRecord {
             name: "owner-claude-1".into(),
-            owner_account: owner.to_vec(),
+            owner_account: owner,
             publisher_node: b"pub-node".to_vec(),
             kind: gateway::CredentialKind::Claude,
             seal_pk: [3u8; 32],
-            grants: grants.iter().map(|g| g.to_vec()).collect::<BTreeSet<_>>(),
+            grants: grants.iter().copied().collect::<BTreeSet<_>>(),
         }
     }
 
@@ -217,7 +224,7 @@ mod tests {
     /// process cannot see that account.
     #[test]
     fn a_known_credential_resolves_without_any_account_decision() {
-        let resolved = routable("owner-claude-1", Some(record(b"owner", &[])))
+        let resolved = routable("owner-claude-1", Some(record(OWNER, &[])))
             .expect("a registered credential is routable");
         assert_eq!(resolved.name, "owner-claude-1");
         assert_eq!(resolved.seal_pk, [3u8; 32]);
@@ -229,9 +236,9 @@ mod tests {
     /// anything this side could have supplied.
     #[test]
     fn a_record_this_node_is_not_granted_still_routes() {
-        let resolved = routable("owner-claude-1", Some(record(b"owner", &[b"someone-else"])))
+        let resolved = routable("owner-claude-1", Some(record(OWNER, &[SOMEONE_ELSE])))
             .expect("routing is not authorization");
-        assert_eq!(resolved.owner_account, b"owner");
+        assert_eq!(resolved.owner_account, OWNER);
     }
 
     #[test]
@@ -242,7 +249,13 @@ mod tests {
 
     #[test]
     fn kinds_map_across_the_boundary() {
-        assert_eq!(map_kind(gateway::CredentialKind::Claude), CredentialKind::Claude);
-        assert_eq!(map_kind(gateway::CredentialKind::Codex), CredentialKind::Codex);
+        assert_eq!(
+            service_kind(gateway::CredentialKind::Claude),
+            CredentialKind::Claude
+        );
+        assert_eq!(
+            service_kind(gateway::CredentialKind::Codex),
+            CredentialKind::Codex
+        );
     }
 }

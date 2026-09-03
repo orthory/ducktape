@@ -2,8 +2,8 @@
 //! the mesh BEFORE `network.start()` — the per-epoch engine-channel bank
 //! (cert/payload/black-holed lanes), the statesync channel pair, the
 //! reachability plane's STANDBY wiring (+ the tunnel-first join race, which
-//! since join ADR §4 carries the GATE itself: the raced sealed intro is the
-//! gate request and the acked `Admitted` is the authoritative admission),
+//! carries the GATE itself: the raced sealed intro is the gate request and
+//! the acked `Admitted` is the authoritative admission),
 //! and the relay lane, ending with the `network.start()` call itself. `park`
 //! (phase 6b–6d) picks up everything this phase produced via
 //! [`ReplicaChannels`].
@@ -19,7 +19,7 @@ use recovery::{Manifest, Recovery};
 use crate::config::{self, hex_bytes};
 use crate::constants::*;
 use crate::first_contact_join;
-use crate::lobby;
+use crate::join_gate;
 use crate::reachability_plane::{ReachLaneHandback, wire_reachability_plane};
 use crate::util::fatal;
 use crate::validator::{DrainingSlot, LaneBank, LaneSlot, ReclaimableLane};
@@ -50,10 +50,9 @@ pub(super) struct ReplicaChannels {
     pub(super) reach_reclaim: Option<ReachLaneHandback>,
     pub(super) relay_tx: lookup::Sender<ed25519::PublicKey, OverlayCtx>,
     pub(super) relay_rx: lookup::Receiver<ed25519::PublicKey>,
-    /// the joiner's admission signal (join ADR §4): set by the first-contact
+    /// the joiner's admission signal: set by the first-contact
     /// task the moment a member's doorbell answers the gate with the
-    /// AUTHORITATIVE `Admitted` — the park loop reads it in place of the
-    /// retired `CHANNEL_LOBBY` gate FSM.
+    /// AUTHORITATIVE `Admitted` — the park loop reads it directly.
     pub(super) admitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(super) voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
     /// the mesh window tracker, genesis already tracked — the park loop
@@ -102,9 +101,12 @@ pub(super) async fn wire(
     overlay_slot: overlay_net::userspace::StackSlot,
 ) -> ReplicaChannels {
     if manifest.is_none() && !recovery.journal_is_empty().await {
-        fatal!(label, "recovery journal exists but the checkpoint is \
+        fatal!(
+            label,
+            "recovery journal exists but the checkpoint is \
              missing — wipe the app state and re-join (KEEP any consensus journal \
-             partitions: they are what prevents this key from double-voting)");
+             partitions: they are what prevents this key from double-voting)"
+        );
     }
     // the parked mesh identity: the GENESIS window (index 0, primary =
     // the descriptor's fingerprinted validators — byte-equal to valset's
@@ -138,8 +140,7 @@ pub(super) async fn wire(
     // a shed certificate is re-anchored by the next one's parent
     // linkage (the planner backfills the gap), so the drain never
     // blocks the peer connection.
-    let (cert_bridge_tx, cert_bridge) =
-        futures::channel::mpsc::channel::<Vec<u8>>(256);
+    let (cert_bridge_tx, cert_bridge) = futures::channel::mpsc::channel::<Vec<u8>>(256);
     // the engine-lane bank, based at the checkpoint epoch (a fresh join
     // has none — base 0). epochs BELOW the base are registered and
     // permanently black-holed, exactly the validator wiring's trick: a
@@ -152,11 +153,10 @@ pub(super) async fn wire(
         let (vote, cert, res, payload, fetch) = engine_channels(epoch);
         for ch in [vote, cert, res, payload, fetch] {
             let (_tx, mut rx) = network.register(ch, quota, MAX_BACKLOG);
-            let label: &'static str =
-                Box::leak(format!("blackhole_{ch}").into_boxed_str());
-            context.child(label).spawn(move |_ctx| async move {
-                while rx.recv().await.is_ok() {}
-            });
+            let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
+            context
+                .child(label)
+                .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
         }
     }
     let slots = (0..EPOCH_CHANNEL_BANK)
@@ -230,7 +230,7 @@ pub(super) async fn wire(
     // promotion reboot via the persisted mesh, start connected
     // instead of assembling. Without `wireguard_listen` the channel
     // just stays legal — black-hole.
-    // the joiner's TCP relay fallback endpoints (join ADR item 2), derived
+    // the joiner's TCP relay fallback endpoints, derived
     // from the SAME ambient coordinator set before it moves into the plane
     // below. empty = fallback off.
     let mut relay_endpoints: Vec<String> = Vec::new();
@@ -240,15 +240,13 @@ pub(super) async fn wire(
     // plane over the same registered channel.
     let mut reach_reclaim: Option<ReachLaneHandback> = None;
     let reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>> = {
-        let (reach_tx, mut reach_rx) =
-            network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
+        let (reach_tx, mut reach_rx) = network.register(CHANNEL_REACHABILITY, quota, MAX_BACKLOG);
         match wireguard_listen {
             Some(wg_addr) => {
                 // AMBIENT coordinator: the joiner resolves coordinated
                 // rendezvous through its OWN configured/default
                 // coordinator, NEVER one baked into the invite (the
-                // unified invite carries no coordinator address). See
-                // docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md.
+                // unified invite carries no coordinator address).
                 let coordinators: Vec<Ingress> =
                     match config::coordinator_ingress(primary_coordinator.as_deref()) {
                         Ok(Some(ingress)) => vec![ingress],
@@ -305,7 +303,7 @@ pub(super) async fn wire(
             }
         }
     };
-    // the TUNNEL-FIRST join window, which since join ADR §4 IS the join GATE:
+    // the TUNNEL-FIRST join window, which IS the join GATE:
     // an invite that carried a WireGuard bootstrap makes the tunnel the
     // join's carrier — before any p2p, (a) this node's interface gains the
     // INVITER as a peer (endpoint straight from the blob), and (b) an intro
@@ -316,7 +314,7 @@ pub(super) async fn wire(
     // candidate whose doorbell settles the gate wins and the rest are
     // cancelled. `Admitted` ⇒ standing is COMMITTED — persist the delivered
     // coord cap, delete the consumed token, and wake the park loop (the
-    // `admitted` flag). a terminal `Rejected` ⇒ exit loudly (R2). If every
+    // `admitted` flag). a terminal `Rejected` ⇒ exit loudly. If every
     // offered path is exhausted the race is HONEST-terminal (a distinct
     // exit, never a silent success). The mechanics live in
     // `first_contact_join`; this is just the glue.
@@ -359,7 +357,7 @@ pub(super) async fn wire(
                     // keypair rides along too: post-verify acks (and the
                     // coord cap inside an `Admitted`) come back SEALED to it.
                     let keypair = std::sync::Arc::new(keypair);
-                    let intro = lobby::encode_intro(&lobby::intro_request(
+                    let intro = join_gate::encode_intro(&join_gate::intro_request(
                         &signer,
                         &namespace,
                         token,
@@ -404,7 +402,11 @@ pub(super) async fn wire(
                                 token_nonce.clone(),
                                 keypair.clone(),
                                 race_label.clone(),
-                                std::time::Duration::from_secs(90),
+                                // THE join window — the same clock the inviter
+                                // prunes an uncovered invite peer on.
+                                std::time::Duration::from_millis(
+                                    reachability::INVITE_JOIN_WINDOW_MS,
+                                ),
                                 race_relay.clone(),
                             )
                             .await;
@@ -456,7 +458,7 @@ pub(super) async fn wire(
                                         }
                                     }
                                     // a CONSUMED credential must not survive to
-                                    // confuse a later boot (ADR §6): the invite
+                                    // confuse a later boot: the invite
                                     // did its one job.
                                     config::delete_invite_token(&cap_dir);
                                     race_admitted.store(
@@ -555,7 +557,7 @@ pub(super) async fn wire(
 }
 
 /// TCP/443: the relay lane's deployed port — the one port every network
-/// forwards, which is the whole reason the lane exists (join ADR item 2).
+/// forwards, which is the whole reason the lane exists.
 const RELAY_FALLBACK_PORT: u16 = 443;
 
 /// the relay endpoint derived from one coordinator ingress: SAME host,

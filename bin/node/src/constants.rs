@@ -1,8 +1,8 @@
 use std::time::Duration;
 
-// the consensus signature scheme is ed25519, the only wired variant — see
-// `consensus::ConsensusScheme`'s rekey/respawn contract for a scheme change
-// (an epoch teardown-respawn, not a constant flip).
+// the consensus signature scheme is ed25519 — see the rekey/respawn contract
+// in `crates/kernel/consensus/src/lib.rs` for a scheme change (an epoch
+// teardown-respawn, not a constant flip).
 /// the module-code fetch cap: the largest content-addressed code artifact (a
 /// wasm component today, a quack capsule tomorrow) this node will pull over
 /// the ranged blob lane or accept on the code plane. a policy bound, not a
@@ -51,7 +51,16 @@ pub(crate) const SUFFIX_CATCHUP_MAX_ITERS: usize = 8;
 pub(crate) const MAX_MESSAGE_SIZE: u32 = 1 << 21;
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= node::MAX_FRAME_BYTES + 1024);
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= duckfs_core::MAX_SYNC_REPLY_BYTES + 1024);
-/// inbound backlog before a channel applies receive backpressure.
+// (c) a qmdb module's op-batch reply (`SyncResponse::Module`), trimmed to
+// `statesync::qmdb::MAX_MODULE_REPLY_BYTES` by the serve side. the serve task
+// additionally refuses ANY over-cap response with an `Error` reply
+// (`sync::serve::encode_bounded_response`) — that is the last line; this pin
+// keeps the honest path from ever needing it.
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::qmdb::MAX_MODULE_REPLY_BYTES + 1024);
+/// inbound backlog per channel. NOT backpressure: commonware's peer actor
+/// DROPS an inbound message when the application buffer is full (it never
+/// blocks a peer), so this is a drop boundary — `relay::MAX_RELAY_BLOB_BYTES`
+/// is pinned so one offer plus every chunk of a max-size pack fits inside it.
 pub(crate) const MAX_BACKLOG: usize = 128;
 /// per-read/write deadline for every mesh socket — the OS arm gets it via
 /// `with_read_write_timeout` at boot, and it IS the overlay seam's own
@@ -77,28 +86,22 @@ pub(crate) const OPS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// the submit-relay channel: a resident-standing node ships a frame it
 /// SIGNED (its own identity key is the frame origin — authorship) to one
 /// current validator, which takes consensus custody (`submit_frame`) and
-/// answers with the frame's fate when it drains. the last free static slot
-/// below CHANNEL_STATE_SYNC; engine banks start at 9 (statics run 3–6).
-/// registered in EVERY
-/// mode like the lanes above — validators serve, residents speak, sync-only
+/// answers with the frame's fate when it drains. the static mesh lanes run
+/// 3–5; engine banks start right after them. registered in EVERY mode like
+/// the lanes above — validators serve, residents speak, sync-only
 /// black-holes.
 pub(crate) const CHANNEL_SUBMIT_RELAY: u64 = 3;
 /// the statesync rpc channel: joiners request manifests / snapshot chunks /
 /// qmdb op-ranges here; validators answer between drains.
 pub(crate) const CHANNEL_STATE_SYNC: u64 = 4;
-// channel 5 was CHANNEL_LOBBY — the retired join-gate mesh lane (a joiner
-// connected as a derived lobby identity and spoke `GateMsg` here). the join
-// protocol rides the gate over the WireGuard-tunnel intro doorbell instead
-// (docs/adr/2026-07-17-join-protocol.mdx §4). the number stays RESERVED:
-// never assign 5 to a new lane.
 /// the reachability channel: members gossip WireGuard endpoint records and
 /// signed advertisements and run the tunnel-upgrade handshake here (the
 /// `reachability` crate's staged node-driven WireGuard plane). registered in
 /// EVERY mode — an unregistered channel is a protocol violation that kills
 /// the sender's connection — and black-holed where the plane does not run.
-pub(crate) const CHANNEL_REACHABILITY: u64 = 6;
+pub(crate) const CHANNEL_REACHABILITY: u64 = 5;
 /// the park loop's poll cadence while the joiner has standing but no served
-/// boundary yet, and the join gate's per-candidate re-send tick (ADR §3.3):
+/// boundary yet, and the join gate's per-candidate re-send tick:
 /// fast, because this tick paces the first sync and the gate's warm-up resend.
 pub(crate) const JOINER_POLL: Duration = Duration::from_secs(2);
 /// a standing, SERVING resident's fallback poll. head-following is wake-driven
@@ -119,21 +122,22 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 16;
 /// production mesh would size this in minutes of views.
 pub(crate) const CUTOVER_DELAY: u64 = 3;
 /// every module in the production genesis set, in status-report order — the
-/// `production` selection of the single-source [`host::topology`]. pinned to the
-/// `host_state::ProductionModules` registry by the parity test in `host_state`;
-/// the topology's own tests pin the selection to today's 20.
+/// `production` selection of the single-source [`topology`]. pinned to the
+/// composed host's registry by the parity test in `host_state`; the
+/// topology's own tests pin the selection to today's 19 (the founder bundles
+/// each wasm tenant's component; the descriptor commits its hash).
 ///
 /// A module here is in the root-hash: every node must run it, agree on its root
 /// at every height, and keep doing so forever. Experiments therefore live
 /// unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: &[&str] = host::topology::PRODUCTION;
+pub(crate) const MODULE_IDS: &[&str] = topology::PRODUCTION;
 
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
 /// block events). mirrors the rpc bridge's stuck-node budget.
 pub(crate) const SUBMIT_HOLD: Duration = Duration::from_secs(10);
 
-/// the join gate's settle budget (ADR §3.2): a gating member holds the joiner's
+/// the join gate's settle budget: a gating member holds the joiner's
 /// pending `Admitted`/`Rejected` outcome against its submitted `Redeem` frame
 /// for this long. if the frame has not drained by then the member writes
 /// `Rejected{ Busy, terminal: false }` into the gate-outcome map and the joiner
@@ -145,9 +149,29 @@ pub(crate) const GATE_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// eager payload-relay lane, and the payload FETCH lane (the lazy catch-up
 /// backstop — a validator that missed the one-shot relay gossip for a
 /// finalized op fetches its bytes by digest instead of wedging its apply
-/// prefix forever). starts at 9, clear of the fixed mesh channels
-/// (statesync 4, retired lobby 5, reachability 6).
+/// prefix forever). starts at 6, right after the fixed mesh channels
+/// (submit-relay 3, statesync 4, reachability 5).
 pub(crate) fn engine_channels(epoch: u64) -> (u64, u64, u64, u64, u64) {
-    let base = 9 + epoch * 5;
+    let base = 6 + epoch * 5;
     (base, base + 1, base + 2, base + 3, base + 4)
 }
+
+/// how long a booting validator keeps re-asking peers for the frame above its
+/// recovered floor while the mesh is still forming. a WALL-CLOCK budget, not
+/// an attempt count: one attempt costs nothing when the link is not up yet
+/// (the send fails immediately with no recipients) but a full request timeout
+/// when it is up and the peer does not answer, so only a deadline bounds the
+/// wait either way. it has to cover a returning node re-forming its p2p and
+/// overlay links, which is seconds, not milliseconds.
+///
+/// bounded ON PURPOSE, unlike the resident's re-bootstrap loop: this runs
+/// BEFORE the engine and before the loop that answers other nodes' probes, so
+/// a whole cluster restarting at once has nobody to answer it. an unbounded
+/// wait here would deadlock that restart forever; a budget makes it cost this
+/// much, once, and the expiry says so at `warn`. the probe runs only for a
+/// validator that recovered a real height and only when some OTHER key is in
+/// its peer book, so a cold genesis start and a solo validator pay nothing.
+pub(crate) const BOOT_PROBE_BUDGET: Duration = Duration::from_secs(30);
+
+/// the pause between boot catch-up probes (see [`BOOT_PROBE_BUDGET`]).
+pub(crate) const BOOT_PROBE_INTERVAL: Duration = Duration::from_millis(250);

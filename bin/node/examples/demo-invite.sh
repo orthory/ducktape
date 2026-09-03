@@ -100,12 +100,12 @@ echo "genesis agreed: $ga"
 
 # an op submitted on the founder finalizes across the 2-validator quorum and
 # is readable on the friend.
-set_op=$(hexenc '{"set":{"key":"ceremony","value":"two members, zero seeds"}}')
-get_q=$(hexenc '{"get":{"key":"ceremony"}}')
-rpc "$A_RPC_PORT" "{\"cmd\":\"submit\",\"target\":\"directory\",\"payload_hex\":\"$set_op\"}" >/dev/null
+set_op=$(hexenc '{"task":{"create_task":{"task_id":"ceremony","title":"two members, zero seeds"}}}')
+get_q=$(hexenc '{"task":"list"}')
+rpc "$A_RPC_PORT" "{\"cmd\":\"submit\",\"target\":\"tasks\",\"payload_hex\":\"$set_op\"}" >/dev/null
 converge_ok=""
 for _ in $(seq 1 60); do
-  reply=$(rpc "$B_RPC_PORT" "{\"cmd\":\"query\",\"target\":\"directory\",\"req_hex\":\"$get_q\"}" || true)
+  reply=$(rpc "$B_RPC_PORT" "{\"cmd\":\"query\",\"target\":\"tasks\",\"req_hex\":\"$get_q\"}" || true)
   decoded=$(printf '%s' "$reply" | bun -e '
 try {
   const response = await Bun.stdin.json();

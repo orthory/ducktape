@@ -9,14 +9,12 @@ use sdk::Msg;
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
-use crate::host_reads::{
-    read_redemption_from_host, read_valset_members, read_valset_residents,
-};
+use crate::host_reads::{read_redemption_from_host, read_valset_members, read_valset_residents};
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
 };
 use crate::util::{hex, unix_ms};
-use crate::{config, lobby, relay, relay_runtime};
+use crate::{config, join_gate, relay, relay_runtime};
 
 impl ValidatorRuntime<'_> {
     async fn refresh_operations(&self, exposition: &str) {
@@ -60,6 +58,11 @@ impl ValidatorRuntime<'_> {
                 residents: hex_set(read_valset_residents(self.node.host()).await),
                 height: self.node.finalized().map(|f| f.height).unwrap_or(0),
                 epoch: Some(self.orchestrator.epoch()),
+                // a validator SERVES the detection lane and polls nobody, so
+                // it hears no peer's build stamp and reports every peer's as
+                // unknown. the poller — a parked or folding resident — is the
+                // side that learns one, and the side that warns.
+                builds: Default::default(),
             });
             self.next_ops_refresh = self.context.current() + OPS_REFRESH_INTERVAL;
         }
@@ -160,7 +163,7 @@ impl ValidatorRuntime<'_> {
             }
             RpcRequest::JoinState => {
                 // a validator is a full member — the terminal join state. the
-                // node-owned source (ADR §6): no log-marker parsing.
+                // node-owned source: no log-marker parsing.
                 RpcReply {
                     join_state: Some(JoinStateView {
                         phase: "promoted".into(),
@@ -192,7 +195,7 @@ impl ValidatorRuntime<'_> {
         let _ = reply.send(resp);
     }
 
-    /// the join gate (join ADR §4), arriving over the WireGuard-tunnel
+    /// the join gate, arriving over the WireGuard-tunnel
     /// doorbell: the reachability plane already OPENED and VERIFIED the sealed
     /// intro (V1–V5 crypto, V4 expiry) and installed the tunnel —
     /// what reaches this loop is a verified request. this runs the
@@ -202,7 +205,7 @@ impl ValidatorRuntime<'_> {
     /// into `gate_outcomes`, where the doorbell answers the joiner's next
     /// retransmit). the outcome is authoritative: `Admitted` means standing
     /// is COMMITTED, `Rejected{terminal}` means stop.
-    pub(super) async fn on_gate_forward(&mut self, fwd: lobby::GateForward) {
+    pub(super) async fn on_gate_forward(&mut self, fwd: join_gate::GateForward) {
         let Self {
             context,
             node,
@@ -238,8 +241,8 @@ impl ValidatorRuntime<'_> {
             super::settle_gate(
                 gate_outcomes,
                 joiner_bytes,
-                lobby::IntroReply::Rejected {
-                    code: lobby::RejectCode::Spent,
+                join_gate::IntroReply::Rejected {
+                    code: join_gate::RejectCode::Spent,
                     detail: "invite already redeemed — an invite admits exactly one person; \
                              ask the inviter for a fresh invite"
                         .into(),
@@ -254,13 +257,13 @@ impl ValidatorRuntime<'_> {
         // view cannot distinguish a REMOVED issuer (invite dead) from a
         // just-admitted one it has not applied yet; a terminal answer here
         // would let one lagging validator kill a healthy join. the joiner
-        // fails over to another member (§3.1 V7, PR #538 ruling).
+        // fails over to another member (V7, PR #538 ruling).
         if !members.contains(&issuer_bytes) {
             super::settle_gate(
                 gate_outcomes,
                 joiner_bytes,
-                lobby::IntroReply::Rejected {
-                    code: lobby::RejectCode::IssuerUnknown,
+                join_gate::IntroReply::Rejected {
+                    code: join_gate::RejectCode::IssuerUnknown,
                     detail: "the inviting member is not in this member's current view — if it \
                              was removed, this invite is dead (ask a current member for a fresh \
                              one); if it was just admitted, another member will redeem shortly"
@@ -278,12 +281,12 @@ impl ValidatorRuntime<'_> {
             super::settle_gate(
                 gate_outcomes,
                 joiner_bytes,
-                lobby::IntroReply::Admitted { height, cap: None },
+                join_gate::IntroReply::Admitted { height, cap: None },
             );
             return;
         }
 
-        // V6/V7/V9 pass. ONE in-flight gate per joiner key (§3.2): a duplicate
+        // V6/V7/V9 pass. ONE in-flight gate per joiner key: a duplicate
         // forward while settling (the joiner's retransmit cadence outpacing
         // consensus) re-arms nothing — no double-submit (the nonce set would
         // collapse racing submits to one grant anyway, but a second
@@ -317,11 +320,11 @@ impl ValidatorRuntime<'_> {
             None
         };
 
-        // SETTLE-THEN-ANSWER (§3.2): submit the Redeem and hold the joiner's
+        // SETTLE-THEN-ANSWER: submit the Redeem and hold the joiner's
         // outcome against the frame id. `submit` returns the FrameId; the drain
         // reports its consensus fate on `pending_gates` (Applied → Admitted,
         // Rejected → mapped code, timeout → Busy) — this handler never blocks.
-        let lobby::GateForward {
+        let join_gate::GateForward {
             issuer,
             nonce,
             token_sig,
@@ -380,13 +383,13 @@ impl ValidatorRuntime<'_> {
                 );
             }
             Err(e) => {
-                // submit failure is transient (§3.2): the joiner tries another
+                // submit failure is transient: the joiner tries another
                 // member rather than exiting.
                 super::settle_gate(
                     gate_outcomes,
                     joiner_bytes,
-                    lobby::IntroReply::Rejected {
-                        code: lobby::RejectCode::Busy,
+                    join_gate::IntroReply::Rejected {
+                        code: join_gate::RejectCode::Busy,
                         detail: format!("could not submit redemption: {e}"),
                         terminal: false,
                     },
@@ -429,14 +432,9 @@ impl ValidatorRuntime<'_> {
         } else {
             (Vec::new(), Vec::new())
         };
-        let Some(action) = validator_relay.on_message(
-            now,
-            peer,
-            msg,
-            &members_now,
-            &residents_now,
-            relay_tx,
-        ) else {
+        let Some(action) =
+            validator_relay.on_message(now, peer, msg, &members_now, &residents_now, relay_tx)
+        else {
             return;
         };
         match action {

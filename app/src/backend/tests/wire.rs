@@ -157,73 +157,170 @@ async fn a_search_that_lost_a_source_says_which_one() {
     );
 }
 
+/// The key file's own reading, WITHOUT its password — what the launch window
+/// and the identity cache both resolve through. A plaintext or garbled file is
+/// not "a key we could not open", it is not a key.
 #[test]
-fn signer_requires_the_encrypted_v1_key_format() {
-    assert_eq!(password_line("secret").unwrap(), b"secret\n");
-    assert!(password_line("").is_err());
-    assert!(password_line("bad\nsecret").is_err());
-
+fn the_identity_reads_without_the_password_and_a_non_v1_file_does_not() {
     let directory = tempfile::tempdir().unwrap();
     let key = directory.path().join("user.key");
-    std::fs::write(&key, format!("{ENCRYPTED_KEY_PREFIX}ciphertext")).unwrap();
-    require_encrypted_key(&key).unwrap();
-    std::fs::write(&key, "plaintext-key").unwrap();
-    assert!(require_encrypted_key(&key).is_err());
+    let (_, minted) = keystore::userkey::mint_user_key(&key, "password-123").unwrap();
 
-    let public_key = "ab".repeat(32);
-    assert_eq!(
-        parse_user_key_status(&format!("encrypted {public_key}\n")),
-        Some(vec![0xab; 32])
-    );
-    assert!(parse_user_key_status("absent\n").is_none());
-    assert!(parse_user_key_status(&format!("plaintext {public_key}\n")).is_none());
+    let read = keystore::userkey::read_user_key_file(&key).expect("an encrypted v1 file parses");
+    assert_eq!(read.pubkey, minted.public_key().as_ref());
+
+    std::fs::write(&key, "plaintext-key").unwrap();
+    assert!(keystore::userkey::read_user_key_file(&key).is_err());
+    let prefix = keystore::userkey::USER_KEY_ENCRYPTED_PREFIX;
+    std::fs::write(&key, format!("{prefix}not-base64!!")).unwrap();
+    assert!(keystore::userkey::read_user_key_file(&key).is_err());
 }
 
-/// THE session property on the app's side of the pipe: ONE unlock, then a
-/// frame per request line, each answering ITS OWN request in order. The child
-/// this drives is a stub, but the contract is the real one — a stray or
-/// mispaired line here would mean the app submits the frame for another
-/// operation, and the argon2id pass it skips is the whole point of the
-/// session (a per-op process paid it on every reaction tap).
+/// THE session property, now that the key opens in THIS process: ONE argon2id
+/// pass, then a real signed frame per write — each carrying its OWN payload
+/// and verifying under this device's identity.
+///
+/// The stub-child version of this test could only ever check that request and
+/// answer lines stayed paired on a pipe. `decode_frame` checks the signature,
+/// which is the property that actually matters: a frame the node accepts as
+/// authored by this key. A mispaired payload here would mean the app submits
+/// one operation's bytes under another's receipt.
 #[tokio::test(flavor = "current_thread")]
 async fn one_unlock_signs_every_request_of_the_session() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let directory = tempfile::tempdir().unwrap();
     let key = directory.path().join("user.key");
-    std::fs::write(&key, format!("{ENCRYPTED_KEY_PREFIX}ciphertext")).unwrap();
-    // The stub signer: records its unlock, then echoes each request's payload
-    // back as the frame — so the answer names the request it belongs to.
-    let unlocks = directory.path().join("unlocks");
-    let binary = directory.path().join("stub-signer");
-    std::fs::write(
-        &binary,
-        format!(
-            "#!/bin/sh\necho unlock >> {}\nread password\n\
-             while read -r target seq payload; do echo \"$payload\"; done\n",
-            unlocks.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (_, minted) = keystore::userkey::mint_user_key(&key, "password-123").unwrap();
 
-    let mut signer = super::rpc::Signer::unlock(binary, key, Zeroizing::new("secret".into()))
+    let signer = super::rpc::Signer::unlock(key.clone(), Zeroizing::new("password-123".into()))
         .await
-        .expect("the stub signer starts");
+        .expect("the minted key opens under the password that sealed it");
     for op in 0..5u8 {
-        let payload = hex_encode(&[op, op, op]);
-        let frame = signer
-            .sign(&format!("chat {op} {payload}\n"))
-            .await
-            .expect("a frame per request");
-        assert_eq!(frame, vec![op, op, op], "request {op} got another's frame");
+        let frame = signer.sign("chat", op as u64, &[op, op, op]);
+        let (origin, message) = node::decode_frame(&frame).expect("the frame verifies");
+        assert_eq!(message.target, "chat");
+        assert_eq!(
+            message.payload,
+            vec![op, op, op],
+            "request {op} got another's payload"
+        );
+        let sdk::Origin::External(author) = origin else {
+            panic!("a user-signed frame is external authorship");
+        };
+        assert_eq!(author, minted.public_key().as_ref());
     }
 
-    assert_eq!(
-        std::fs::read_to_string(&unlocks).unwrap(),
-        "unlock\n",
-        "five signed writes, one key open"
+    // A wrong password is refused, and an empty one names the locked state
+    // rather than reporting a bad key.
+    assert!(
+        super::rpc::Signer::unlock(key.clone(), Zeroizing::new("wrong-password".into()))
+            .await
+            .is_err()
     );
+    // `.map(drop)` because a `Signer` deliberately has no `Debug` — the whole
+    // point of the type is that the opened key does not get printed anywhere.
+    let locked = super::rpc::Signer::unlock(key, Zeroizing::new(String::new()))
+        .await
+        .map(drop)
+        .expect_err("an empty password cannot open anything");
+    assert!(locked.contains("locked"), "{locked}");
+}
+
+/// THE FAN-OUT SET, READ THROUGH A REAL NODE — the poll a live call session
+/// runs once a second, and the read the whole huddle rides on. Everything
+/// downstream of it is exact: the hub parses each entry with `from_hex_32` and
+/// admits that peer's media by the key it gets, so a roster row that is not 64
+/// lowercase hex characters of NODE key is a call that stays silent with
+/// nothing to see anywhere.
+///
+/// It also pins the vocabulary that made the LIVE pill unreachable once
+/// already: `HuddleEntry.user` is the kernel's BARE user id, and a comparison
+/// against any other spelling of it marks nobody as you — which here would
+/// mean fanning this device's own media at itself and never at the peer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
+    let storage = tempfile::tempdir().unwrap();
+    let sim = simnode::boot(
+        storage.path(),
+        "127.0.0.1:0".parse().unwrap(),
+        simnode::SimOpts {
+            auto: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rpc = RpcClient::new(&format!("http://{}", sim.addr())).unwrap();
+    let (me, peer) = (
+        ed25519::PrivateKey::from_seed(11),
+        ed25519::PrivateKey::from_seed(12),
+    );
+    // Two people, two nodes — the huddle's roster is (user, node) pairs, and
+    // it is the NODE half the media plane speaks.
+    let (my_node, peer_node) = ([0xa1u8; 32], [0xb2u8; 32]);
+
+    submit_test(
+        &rpc,
+        &me,
+        1,
+        "chat",
+        chat::encode_msg(&ChatMsg::CreateChannel {
+            channel_id: "eng".into(),
+            name: "Engineering".into(),
+            post_policy: PostPolicy::Open,
+        }),
+    )
+    .await;
+    submit_test(
+        &rpc,
+        &me,
+        2,
+        "chat",
+        chat::encode_msg(&ChatMsg::JoinHuddle {
+            channel_id: "eng".into(),
+            node: my_node.to_vec(),
+        }),
+    )
+    .await;
+    submit_test(
+        &rpc,
+        &peer,
+        1,
+        "chat",
+        chat::encode_msg(&ChatMsg::JoinHuddle {
+            channel_id: "eng".into(),
+            node: peer_node.to_vec(),
+        }),
+    )
+    .await;
+
+    let mine = me.public_key().as_ref().to_vec();
+    let (_channel, roster) = load_channel_facts(&rpc, "eng", Some(&mine))
+        .await
+        .expect("the huddle's channel reads back");
+    assert_eq!(roster.len(), 2, "both people are on the roster");
+    assert_eq!(
+        roster.iter().filter(|row| row.is_you).count(),
+        1,
+        "exactly one row is this device's — the id vocabulary has to match"
+    );
+
+    let nodes = huddle_recipient_nodes(roster);
+    assert_eq!(
+        nodes,
+        vec![hex_encode(&peer_node)],
+        "the fan-out is the OTHER node's key: ours in it would aim this \
+         device's media at itself, and the peer's missing from it is the \
+         silence this whole poll exists to end"
+    );
+    let admissible = nodes[0].len() == 64 && nodes[0].chars().all(|c| c.is_ascii_hexdigit());
+    assert!(
+        admissible,
+        "the hub parses a recipient with `from_hex_32`; anything else is \
+         dropped and the peer is never admitted: {}",
+        nodes[0]
+    );
+    // `shutdown`, not a drop: the handle's last executor reference cannot be
+    // dropped on this async thread (see `SimHandle::shutdown`).
+    sim.shutdown();
 }
 
 #[test]
@@ -805,19 +902,28 @@ fn a_refused_key_password_reaches_the_screen_as_a_sentence() {
 #[test]
 fn a_signed_write_records_the_block_that_took_it() {
     const RPC: &str = include_str!("../rpc.rs");
-    let signed_write = RPC
-        .split("pub(crate) async fn signed_write(")
-        .nth(1)
-        .expect("signed_write is declared")
-        .split("\n/// ")
-        .next()
-        .expect("signed_write body");
-    let submit = signed_write
+    let body = |name: &str| {
+        RPC.split(&format!("pub(crate) async fn {name}("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} is declared"))
+            .split("\n/// ")
+            .next()
+            .unwrap_or_else(|| panic!("{name} body"))
+    };
+    // a write this device signs and one a passkey/wallet signed in the
+    // browser share ONE submit funnel, so the receipt is recorded once.
+    let signed_write = body("signed_write");
+    assert!(
+        signed_write.contains("submit_raw_frame("),
+        "signed_write submits through the raw-frame funnel"
+    );
+    let funnel = body("submit_raw_frame");
+    let submit = funnel
         .find("submit_frame(")
-        .expect("signed_write submits the frame");
-    let record = signed_write
+        .expect("the funnel submits the frame");
+    let record = funnel
         .find("note_module_block(")
-        .expect("signed_write records the block its write landed in");
+        .expect("the funnel records the block its write landed in");
     assert!(
         submit < record,
         "the height is recorded from the RECEIPT, so there is nothing to \

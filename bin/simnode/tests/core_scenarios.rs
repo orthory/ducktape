@@ -9,11 +9,7 @@
 
 mod harness;
 
-use commonware_cryptography::Signer as _;
-use harness::{Sim, create_channel, ed_bind_auth, post_message};
-use identity::bind_preimage;
-
-type Ed = commonware_cryptography::ed25519::PrivateKey;
+use harness::{Sim, create, create_channel, post_message};
 
 // ── jobs: the board under consensus ordering ────────────
 
@@ -59,7 +55,10 @@ fn a_lost_claim_race_fails_deterministically() {
     );
 
     // the board holds the winner's lease.
-    let job = sim.query("tasks", serde_json::json!({ "job": { "get": { "job_id": "j1" } } }));
+    let job = sim.query(
+        "tasks",
+        serde_json::json!({ "job": { "get": { "job_id": "j1" } } }),
+    );
     assert_eq!(job["job"]["job"]["status"], "processing", "board: {job}");
     assert_eq!(job["job"]["job"]["attempt"], 1);
 }
@@ -111,8 +110,14 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
         Some("filler"),
     ); // height 13
     sim.submit_ok("tasks", reclaim, Some("scavenger")); // height 14 > deadline
-    let job = sim.query("tasks", serde_json::json!({ "job": { "get": { "job_id": "j1" } } }));
-    assert_eq!(job["job"]["job"]["status"], "pending", "reclaimed board: {job}");
+    let job = sim.query(
+        "tasks",
+        serde_json::json!({ "job": { "get": { "job_id": "j1" } } }),
+    );
+    assert_eq!(
+        job["job"]["job"]["status"], "pending",
+        "reclaimed board: {job}"
+    );
 }
 
 // ── automations: the chat-hook cascade ──────────────────
@@ -145,7 +150,7 @@ fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
 
     // a non-matching post fires nothing.
     sim.submit_ok("chat", post_message("general", "m-1", "hello world"), None);
-    let tasks = sim.query("tasks", serde_json::json!({ "task": "list" }));
+    let tasks = sim.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }));
     assert_eq!(
         tasks["task"]["tasks"].as_array().map(Vec::len),
         Some(0),
@@ -167,8 +172,11 @@ fn a_matching_post_fires_its_rule_atomically_in_the_same_block() {
     );
 
     // the task id is deterministic per (prefix, channel, seq) — m-2 is seq 2.
-    let tasks = sim.query("tasks", serde_json::json!({ "task": "list" }));
-    assert_eq!(tasks["task"]["tasks"][0]["id"], "auto-general-2", "tasks: {tasks}");
+    let tasks = sim.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }));
+    assert_eq!(
+        tasks["task"]["tasks"][0]["id"], "auto-general-2",
+        "tasks: {tasks}"
+    );
     assert_eq!(tasks["task"]["tasks"][0]["title"], "deploy requested");
 
     // the run history recorded exactly one fire.
@@ -222,86 +230,61 @@ fn a_hook_event_cannot_be_spoofed_from_outside_chat() {
 // ── identity → duckdns: origin-derived account authority ─
 
 #[test]
-fn identity_binding_gates_the_duck_handle_and_labels_are_exclusive() {
+fn an_identity_account_gates_the_duck_handle_and_labels_are_exclusive() {
     let storage = tempfile::tempdir().expect("storage dir");
     let sim = Sim::spawn(storage.path(), &["--auto"]);
-    // duckdns derives the account from the ORIGIN, which must be a 32-byte
-    // node key — the sim's origin strings become those bytes verbatim.
-    let node_a = "a".repeat(32);
-    let node_b = "b".repeat(32);
+    // the gateway resolves the account from the ORIGIN through identity's
+    // `OfKey` — the sim's origin strings become those key bytes verbatim, and
+    // a 32-byte one is a well-formed ed25519 key as far as founding goes.
+    let key_a = "a".repeat(32);
+    let key_b = "b".repeat(32);
     let set_handle =
         |handle: serde_json::Value| serde_json::json!({ "set_handle": { "handle": handle } });
 
-    // a short origin is not a node key, and an unbound node has no account.
+    // a key on no account — whatever its shape — has no handle to claim.
     let error = sim.submit_rejected("gateway", set_handle("alice".into()), Some("noded"));
     assert!(
-        error.contains("origin must be a 32-byte node key"),
+        error.contains("origin key belongs to no Identity account"),
         "{error}"
     );
-    let error = sim.submit_rejected("gateway", set_handle("alice".into()), Some(&node_a));
+    let error = sim.submit_rejected("gateway", set_handle("alice".into()), Some(&key_a));
     assert!(
-        error.contains("not bound to an Identity account"),
+        error.contains("origin key belongs to no Identity account"),
         "{error}"
     );
 
-    // found account A: the founding key consents to binding node_a (nonce 0,
-    // the sim's chain_id is empty). a forged consent must not bind.
-    let key_a = Ed::from_seed(1);
-    let preimage = bind_preimage("", node_a.as_bytes(), 0);
-    let mut forged = ed_bind_auth(&key_a, &preimage);
-    forged["proof"]["signature"]["sig"] = serde_json::json!(vec![9u8; 64]);
-    let error = sim.submit_rejected(
-        "identity",
-        serde_json::json!({ "bind_node": { "authorizer": forged } }),
-        Some(&node_a),
-    );
-    assert!(error.contains("does not verify"), "forged bind: {error}");
-    sim.submit_ok(
-        "identity",
-        serde_json::json!({ "bind_node": { "authorizer": ed_bind_auth(&key_a, &preimage) } }),
-        Some(&node_a),
-    );
+    // key_a founds account 1 (the frame signature is the possession proof on
+    // the real wire; the sim's trusted origin stands in for it here).
+    sim.submit_ok("identity", create("alice"), Some(&key_a));
 
-    // the bound node registers the handle, and resolution serves account A.
-    sim.submit_ok("gateway", set_handle("alice".into()), Some(&node_a));
+    // a member key registers the handle, and resolution serves account 1.
+    sim.submit_ok("gateway", set_handle("alice".into()), Some(&key_a));
     let resolved = sim.query(
         "gateway",
         serde_json::json!({ "resolve": { "name": { "handle": "alice" } } }),
     );
     assert_eq!(
-        resolved["resolved"]["account_id"],
-        serde_json::json!(key_a.public_key().as_ref().to_vec()),
+        resolved["resolved"]["account_id"], 1,
         "resolution: {resolved}"
     );
 
-    // account B cannot take the claimed label…
-    let key_b = Ed::from_seed(2);
-    let preimage_b = bind_preimage("", node_b.as_bytes(), 0);
-    sim.submit_ok(
-        "identity",
-        serde_json::json!({ "bind_node": { "authorizer": ed_bind_auth(&key_b, &preimage_b) } }),
-        Some(&node_b),
-    );
-    let error = sim.submit_rejected("gateway", set_handle("alice".into()), Some(&node_b));
+    // account 2 cannot take the claimed label…
+    sim.submit_ok("identity", create("bob"), Some(&key_b));
+    let error = sim.submit_rejected("gateway", set_handle("alice".into()), Some(&key_b));
     assert!(
         error.contains("already claimed by another account"),
         "label exclusivity: {error}"
     );
 
     // …until the holder releases it; then the label re-registers cleanly.
-    sim.submit_ok(
-        "gateway",
-        set_handle(serde_json::Value::Null),
-        Some(&node_a),
-    );
-    sim.submit_ok("gateway", set_handle("alice".into()), Some(&node_b));
+    sim.submit_ok("gateway", set_handle(serde_json::Value::Null), Some(&key_a));
+    sim.submit_ok("gateway", set_handle("alice".into()), Some(&key_b));
     let resolved = sim.query(
         "gateway",
         serde_json::json!({ "resolve": { "name": { "handle": "alice" } } }),
     );
     assert_eq!(
-        resolved["resolved"]["account_id"],
-        serde_json::json!(key_b.public_key().as_ref().to_vec()),
+        resolved["resolved"]["account_id"], 2,
         "re-registration: {resolved}"
     );
 }

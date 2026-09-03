@@ -108,7 +108,7 @@ pub fn bell_head(items: Vec<BellItem>) -> i64 {
 /// The row's title: the wire `kind` token said as words. The vocabulary is
 /// open — any module mints tokens — so this is a rendering, not a registry:
 /// `review_requested` reads "Review requested".
-pub fn bell_title(kind: String) -> String {
+pub fn bell_title(kind: &str) -> String {
     let words = kind.replace('_', " ");
     let mut chars = words.chars();
     match chars.next() {
@@ -117,7 +117,7 @@ pub fn bell_title(kind: String) -> String {
     }
 }
 
-pub fn bell_severity(kind: String) -> String {
+pub fn bell_severity(kind: &str) -> String {
     const WARN: &[&str] = &[
         "review_requested",
         "changes_requested",
@@ -143,11 +143,11 @@ pub fn bell_severity(kind: String) -> String {
 
 /// The worst severity among the UNREAD rows, for the bell badge's tint —
 /// `info` when nothing is unread.
-pub fn bell_worst_severity(items: Vec<BellItem>) -> String {
+pub fn bell_worst_severity(items: &[BellItem]) -> String {
     let severities: Vec<String> = items
         .iter()
         .filter(|item| !item.read)
-        .map(|item| bell_severity(item.kind.clone()))
+        .map(|item| bell_severity(&item.kind))
         .collect();
     let any_error = severities.iter().any(|severity| severity == "danger");
     let any_warning = severities.iter().any(|severity| severity == "warning");

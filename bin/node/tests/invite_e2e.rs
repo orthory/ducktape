@@ -22,7 +22,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Cluster, poll_until, serial};
-use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -30,22 +30,28 @@ const CONVERGE: Duration = Duration::from_secs(180);
 /// budget for one submitted op to finalize and become readable elsewhere.
 const FINALIZE: Duration = Duration::from_secs(60);
 
-fn dir_set(key: &str, value: &str) -> Vec<u8> {
-    encode_msg(&DirMsg::Set {
-        key: key.into(),
-        value: value.into(),
+/// a create for `task_id`; NOT an upsert — `tasks` refuses a duplicate id
+/// (`task_board.rs:77-80`). That rejection is ISOLATED, not fatal: the op's
+/// stage rolls back and it is recorded `Rejected` while the block still seals
+/// (`host/src/lib.rs:237`, `:283`). So a duplicate never applies and never
+/// announces itself — `write_and_confirm` spins to its timeout, or passes
+/// VACUOUSLY when the re-created title happens to match the surviving one.
+/// Every call site here has to carry a fresh id.
+fn task_create(task_id: &str, title: &str) -> Vec<u8> {
+    encode_task_msg(&TaskMsg::CreateTask {
+        task_id: task_id.into(),
+        title: title.into(),
     })
 }
 
-fn dir_value(cluster: &Cluster, idx: usize, key: &str) -> Option<String> {
-    let reply = cluster.query(
-        idx,
-        "directory",
-        &encode_query(&DirQuery::Get { key: key.into() }),
-    )?;
-    match decode_reply(&reply) {
-        Ok(DirReply::Value(v)) => v,
-        Err(_) => None,
+fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
+    let req = encode_task_query(&TaskQuery::Get {
+        task_id: task_id.into(),
+    });
+    let reply = cluster.query(idx, "tasks", &req)?;
+    match decode_task_reply(&reply) {
+        Ok(TaskReply::Task(task)) => task.map(|t| t.title),
+        _ => None,
     }
 }
 
@@ -105,17 +111,17 @@ fn solo_founder_invites_a_friend() {
     // THE property: consensus is live again, and only because the friend
     // votes — a 2-validator simplex finalizes nothing without both. an op
     // submitted via the FOUNDER must become readable via the FRIEND...
-    cluster.submit(0, "directory", &dir_set("from-founder", "hello"));
+    cluster.submit(0, "tasks", &task_create("from-founder", "hello"));
     let value = poll_until("founder's op to read on the friend", FINALIZE, || {
-        dir_value(&cluster, joiner, "from-founder")
+        task_title(&cluster, joiner, "from-founder")
     });
     assert_eq!(value, "hello");
 
     // ...and an op submitted via the FRIEND (whose bytes only the friend
     // holds until the relay lane gossips them) must read on the founder.
-    cluster.submit(joiner, "directory", &dir_set("from-friend", "hi back"));
+    cluster.submit(joiner, "tasks", &task_create("from-friend", "hi back"));
     let value = poll_until("friend's op to read on the founder", FINALIZE, || {
-        dir_value(&cluster, 0, "from-friend")
+        task_title(&cluster, 0, "from-friend")
     });
     assert_eq!(value, "hi back");
 
@@ -126,6 +132,74 @@ fn solo_founder_invites_a_friend() {
         cluster.status(joiner)["root_hash"],
         "founder and promoted friend disagree on state"
     );
+}
+
+/// the PROMOTION twin of `cluster_e2e::reachability_plane_converges_mesh_on_boot`.
+///
+/// A fresh-booting validator targets its reachability plane at the epoch it
+/// booted into. The in-process promotion seat wires a BRAND NEW plane — the
+/// parked node's standby plane is shut down first, deliberately — and for a
+/// while it wired that plane and never targeted it. A plane with no epoch state
+/// is a black hole in BOTH directions: it drops every inbound record and advert
+/// and sends none of its own, so phase-A assembly never completes on either
+/// side and the promoted node keeps only the pre-warm tunnels it installed
+/// while parked. On a live three-node network that read as a healthy chain from
+/// the founder alone, while every op submitted at a promoted joiner timed out
+/// awaiting finalization.
+///
+/// Nothing in the tree caught it: every promotion e2e runs on the harness's
+/// `wireguard = false` default, where the plane does not exist at all. Hence
+/// this one, which is the same flow with the plane turned on.
+#[test]
+fn a_promoted_validator_converges_the_overlay_mesh() {
+    let _serial = serial();
+    // two founding validators, so the promoted joiner has to mesh with a set
+    // it never met — the live shape, and the one a single founder cannot test.
+    let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
+    // the plane exists only with wireguard on. This line IS the regression.
+    cluster.wireguard = true;
+    // hermetic: without this every node dials the LIVE public coordinator
+    // (`DEFAULT_PRIMARY_COORDINATOR`) from inside the test.
+    cluster
+        .extra_toml
+        .push("primary_coordinator = \"none\"".into());
+    cluster.spawn(0);
+    cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
+    cluster.spawn(1);
+    for i in 0..2 {
+        cluster.wait_marker(i, "converged root_hash=", CONVERGE);
+    }
+
+    let joiner = cluster.spawn_joiner(2);
+    cluster.wait_marker(joiner, "joining:", Duration::from_secs(60));
+
+    // strict majority of 2 is 2: both incumbents run the same command, the
+    // second ballot decides and executes.
+    let friend_hex = hex(&Cluster::identity(2));
+    for member in [0usize, 1] {
+        let cfg = cluster.config_file(member);
+        let (ok, out) = cluster.run_verb(&[
+            "node",
+            "member",
+            "promote",
+            &friend_hex,
+            "--config",
+            cfg.to_str().expect("utf-8 config path"),
+        ]);
+        assert!(ok, "promote via member {member} failed:\n{out}");
+    }
+
+    for i in 0..2 {
+        cluster.wait_marker(i, "cutover complete: epoch 1", CONVERGE);
+    }
+    cluster.wait_marker(joiner, "promoted: validator at epoch 1", CONVERGE);
+
+    // THE property, and the one the seat's missing `Retarget` broke: the
+    // promoted node's plane knows its epoch, so it sends its own endpoint
+    // record, completes assembly, and installs MEMBER tunnels — not the
+    // standby pre-warm set it carried in with.
+    cluster.wait_marker(joiner, "mesh verified", CONVERGE);
+    cluster.wait_marker(joiner, "tunnels applied (config accepted", CONVERGE);
 }
 
 #[test]
@@ -171,9 +245,9 @@ fn live_quorum_admits_a_fourth_validator() {
     // it and the joiner must adopt a mid-epoch boundary plus its
     // finalization floor.
     for n in 0..5 {
-        cluster.submit(0, "directory", &dir_set(&format!("epoch2-op-{n}"), "x"));
+        cluster.submit(0, "tasks", &task_create(&format!("epoch2-op-{n}"), "x"));
         let _ = poll_until("epoch-2 filler to finalize", FINALIZE, || {
-            dir_value(&cluster, 1, &format!("epoch2-op-{n}"))
+            task_title(&cluster, 1, &format!("epoch2-op-{n}"))
         });
     }
 
@@ -185,11 +259,11 @@ fn live_quorum_admits_a_fourth_validator() {
     // the promoted validator's own op finalizes and reads on an incumbent —
     // its frame bytes start out ONLY in its store, so this proves the joiner
     // is wired into the payload relay and the vote lanes of the live epoch.
-    cluster.submit(joiner, "directory", &dir_set("from-the-fourth", "present"));
+    cluster.submit(joiner, "tasks", &task_create("from-the-fourth", "present"));
     let value = poll_until(
         "the fourth validator's op to read on node 2",
         FINALIZE,
-        || dir_value(&cluster, 2, "from-the-fourth"),
+        || task_title(&cluster, 2, "from-the-fourth"),
     );
     assert_eq!(value, "present");
 

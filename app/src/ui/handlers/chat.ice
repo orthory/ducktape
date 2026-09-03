@@ -6,8 +6,11 @@ on search_chat_submit
   return if empty(trim(chat_search_draft))
   chat_search_phase = SearchPhase.searching
   chat_search_hits = []
+  // Captured at the last place the draft and the string being sent are known
+  // to match — and sent from here, so the two cannot drift apart.
+  chat_search_query = trim(chat_search_draft)
   error = ""
-  run replace lane=chat_search search_chat(connected_rpc, "", trim(chat_search_draft)) -> chat_search_loaded _ | chat_search_failed _
+  run replace lane=chat_search search_chat(connected_rpc, "", chat_search_query) -> chat_search_loaded _ | chat_search_failed _
 
 on chat_search_loaded(next)
   chat_search_hits = next.hits
@@ -20,6 +23,9 @@ on chat_search_failed(cause)
   // search that never ran — a confident zero-result card beside the error
   // banner that says the opposite.
   chat_search_phase = SearchPhase.idle
+  // A FAILED SEARCH FOUND NOTHING BECAUSE IT NEVER RAN, so nothing may be
+  // standing for it — the float goes with the query.
+  chat_search_query = ""
   error = cause.message
 
 on clear_chat_search
@@ -27,6 +33,7 @@ on clear_chat_search
   chat_search_draft = ""
   chat_search_hits = []
   chat_search_phase = SearchPhase.idle
+  chat_search_query = ""
 
 on open_chat_search_hit(channel_id, root_seq, target_seq)
   // NO `loading` TERM. A hit clicked while another room is still loading used
@@ -50,7 +57,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // the "did my click land?" void #1059 removed from the pickers, still live on
   // the one navigation whose entire purpose is to jump somewhere else.
   active_channel = channel_id
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next_channel.name
   active_channel_archived = next_channel.archived
@@ -66,7 +73,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   // by the next `choose_channel`/`choose_dm` or by any chat-carrying resync.
   history_view = true
   messages = []
-  messages_revision = messages_revision + 1
   channel_members = []
   let post_gate_known = !active_channel_members_only
   post_refusal = keep_str(post_gate_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
@@ -83,6 +89,7 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   hydration_retry_attempt = 0
   loading = true
   chat_search_hits = []
+  chat_search_query = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = MessageAction.toolbar
@@ -93,7 +100,6 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
@@ -144,7 +150,6 @@ on choose_channel(id)
   active_channel_archived = next_channel.archived
   active_channel_members_only = next_channel.members_only
   messages = []
-  messages_revision = messages_revision + 1
   channel_members = []
   let post_gate_known = !active_channel_members_only
   post_refusal = keep_str(post_gate_known, post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key), "")
@@ -158,6 +163,7 @@ on choose_channel(id)
   hydration_retry_attempt = 0
   loading = true
   chat_search_hits = []
+  chat_search_query = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = MessageAction.toolbar
@@ -168,7 +174,6 @@ on choose_channel(id)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
@@ -210,7 +215,7 @@ on choose_dm(peer_key)
   // `active_channel` on the room she left is how the peer's face came up beside
   // that room's "Archived" badge, its "· 7 added" count and its composer
   // refusal for the several blocks a DM open takes.
-  let dm_room = dm_channel_id(settings_user_key, active_dm_peer)
+  let dm_room = dm_channel_id(account_number, active_dm_peer)
   // WITH NO USER KEY BOUND, `dm_room` IS A PHANTOM — `dm_channel_id` hashes ""
   // against the peer and answers an id no channel in the list carries, while
   // the node resolves the real one from its OWN key. That degrades to exactly
@@ -231,7 +236,6 @@ on choose_dm(peer_key)
   active_channel_archived = next_channel.archived
   active_channel_members_only = next_channel.members_only
   messages = []
-  messages_revision = messages_revision + 1
   channel_members = []
   post_refusal = ""
   has_older_history = false
@@ -243,6 +247,7 @@ on choose_dm(peer_key)
   hydration_retry_attempt = 0
   loading = true
   chat_search_hits = []
+  chat_search_query = ""
   selected_message_seq = 0
   selected_message_rev = 0
   message_action = MessageAction.toolbar
@@ -253,7 +258,6 @@ on choose_dm(peer_key)
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   thread_generation = thread_generation + 1
@@ -384,7 +388,19 @@ on join_huddle_submit
   hydration_retry_attempt = 0
   mutation_phase = MutationPhase.huddle
   error = ""
-  run every join_huddle(connected_rpc, password, active_channel) -> chat_acked _ | mutation_failed _
+  run every join_huddle(connected_rpc, password, active_channel) -> huddle_joined_ack _ | mutation_failed _
+
+// THE JOIN OPENS THE HUDDLE, because the huddle window is where the huddle IS:
+// every face, every shared screen, the mic and camera controls and Leave live
+// in it, and the header pill it docks into can show none of them. Joining and
+// then being shown a pill is how someone sits in a call watching nothing
+// happen, which is exactly what "I joined and there was no video" is. The
+// guard is `pop_huddle`'s own: a window already up is not opened twice.
+on huddle_joined_ack(_result)
+  mutation_phase = MutationPhase.idle
+  error = ""
+  return if huddle_win != none
+  task window open huddle -> huddle_opened _
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
 // HUDDLE'S channel rather than the one on screen — the same button serves the
@@ -427,7 +443,6 @@ on composer_submitted(kind, pending_body, pending_id)
           // groups under the reader's previous message instead of drawing a
           // header that vanishes the moment the settle delta replaces it.
           messages = mark_author_runs(optimistic_message(messages, pending_body, pending_id))
-          messages_revision = messages_revision + 1
           let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
           selected_message_seq = selection.seq
           selected_message_rev = selection.rev
@@ -458,7 +473,6 @@ on composer_submitted(kind, pending_body, pending_id)
           hydration_generation = hydration_generation + 1
           hydration_retry_attempt = 0
           thread_messages = optimistic_thread_message(thread_messages, pending_body, pending_id)
-          thread_messages_revision = thread_messages_revision + 1
           let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
           thread_selected_seq = selection.seq
           thread_selected_rev = selection.rev
@@ -489,7 +503,6 @@ on message_send_failed(cause)
   // still scoped to the room ON SCREEN, which is a different question.
   return if active_channel != cause.scope_id
   messages = rollback_pending_message(messages, cause.operation_id, cause.committed)
-  messages_revision = messages_revision + 1
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   return if !cause.committed
   hydration_generation = hydration_generation + 1
@@ -511,31 +524,34 @@ on chat_updated(next)
   // renamed or archived — and nothing re-pages the list to heal it.
   channels = upsert_channel_rows(channels, next.channels)
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  messages_revision = messages_revision + 1
   has_older_history = next.has_older_history || history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // A LANDING ANSWERS FOR THE PEER TOO. The DM header suppresses the `#` and
   // the channel name, so a peer that outlives the room it named leaves the room
   // on screen unnamed under someone else's face — see `dm_peer_of_channel`.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
-  // clock and one that finds her out re-takes it for the next join.
+  // clock and one that finds her out re-takes it for the next join. The load
+  // answers for the huddle only when it loaded the huddle's OWN channel —
+  // clicking a second room does not end the call she is in, and the call's
+  // media leg is subscribed on this very flag (`huddle_after_load`).
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
-  huddle_joined = huddle_self(next.huddle_roster)
-  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  let huddle = huddle_after_load(true, huddle_joined, huddle_channel, huddle_channel_name, huddle_roster, active_channel, active_channel_name, next.huddle_roster)
+  huddle_joined = huddle.joined
+  huddle_roster = huddle.roster
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
-  huddle_channel = keep_str(huddle_joined, active_channel, "")
-  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
+  huddle_channel = huddle.channel
+  huddle_channel_name = huddle.channel_name
   channel_members = next.channel_members
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
@@ -548,7 +564,6 @@ on chat_updated(next)
   // own box (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
@@ -573,7 +588,6 @@ on chat_hit_loaded(next)
   // Same fold as `chat_updated`, same loader, same reason.
   channels = upsert_channel_rows(channels, next.channels)
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  messages_revision = messages_revision + 1
   has_older_history = next.has_older_history || history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
@@ -588,25 +602,29 @@ on chat_hit_loaded(next)
   // through `choose_channel` -> `chat_updated`, which marks the room read when
   // she actually reaches the tail. The sidebar mirrors still refresh: the
   // `channels` fold above moved, even though the cursor did not.
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   active_channel = next.active_channel
   // Same landing answer as `chat_updated`: a hit in another room retires the
   // peer, a hit inside the DM keeps him.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
-  // clock and one that finds her out re-takes it for the next join.
+  // clock and one that finds her out re-takes it for the next join. The load
+  // answers for the huddle only when it loaded the huddle's OWN channel —
+  // clicking a second room does not end the call she is in, and the call's
+  // media leg is subscribed on this very flag (`huddle_after_load`).
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
-  huddle_joined = huddle_self(next.huddle_roster)
-  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  let huddle = huddle_after_load(true, huddle_joined, huddle_channel, huddle_channel_name, huddle_roster, active_channel, active_channel_name, next.huddle_roster)
+  huddle_joined = huddle.joined
+  huddle_roster = huddle.roster
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
-  huddle_channel = keep_str(huddle_joined, active_channel, "")
-  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
+  huddle_channel = huddle.channel
+  huddle_channel_name = huddle.channel_name
   channel_members = next.channel_members
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
@@ -619,7 +637,6 @@ on chat_hit_loaded(next)
   // own composer instance, words intact (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
@@ -667,37 +684,41 @@ on channel_created(next)
   invalidate lane=chat_search
   chat_search_phase = SearchPhase.idle
   chat_search_hits = []
+  chat_search_query = ""
   // A brand-new channel's latest page IS the whole channel — see
   // `chat_hit_loaded`.
   history_view = false
   channels = upsert_channel_rows(channels, next.channels)
   messages = merge_landing_messages(next.messages, messages, active_channel, next.active_channel)
-  messages_revision = messages_revision + 1
   has_older_history = next.has_older_history || history_has_older(messages)
   unread_boundary = frozen_unread_boundary(channel_reads, channels, active_channel, next.active_channel, unread_boundary)
   unread_marker_seq = first_unread_seq(messages, unread_boundary)
   channel_reads = mark_channel_read(channel_reads, next.active_channel, channel_head_seq(channels, next.active_channel))
-  rooms = chat_sidebar_rooms(channels, dm_peers, settings_user_key, channel_reads)
+  rooms = chat_sidebar_rooms(channels, dm_peers, account_number, channel_reads)
   dm_rows = chat_sidebar_dms(channels, dm_peers, channel_reads)
   // A CREATE IS A ROOM SWITCH — the line below lands her IN the new channel,
   // and the composer she was typing into stays keyed to the room she left
   // (ducktape-ui#697).
   active_channel = next.active_channel
   // Creating lands you in the new room, which is nobody's DM.
-  active_dm_peer = dm_peer_of_channel(active_dm_peer, settings_user_key, active_channel)
+  active_dm_peer = dm_peer_of_channel(active_dm_peer, account_number, active_channel)
   active_dm = dm_peer_named(dm_peers, active_dm_peer)
   active_channel_name = next.active_channel_name
   active_channel_archived = next.active_channel_archived
   active_channel_members_only = next.active_channel_members_only
   // Am I in it — see `join_huddle_submit` above. Stamp first: it reads the
   // PREVIOUS `huddle_joined`, so a refresh that finds her still in keeps the
-  // clock and one that finds her out re-takes it for the next join.
+  // clock and one that finds her out re-takes it for the next join. The load
+  // answers for the huddle only when it loaded the huddle's OWN channel —
+  // clicking a second room does not end the call she is in, and the call's
+  // media leg is subscribed on this very flag (`huddle_after_load`).
   huddle_joined_at = keep_i64(huddle_joined, huddle_joined_at, huddle_now)
-  huddle_joined = huddle_self(next.huddle_roster)
-  huddle_roster = keep_roster(huddle_joined, next.huddle_roster)
+  let huddle = huddle_after_load(true, huddle_joined, huddle_channel, huddle_channel_name, huddle_roster, active_channel, active_channel_name, next.huddle_roster)
+  huddle_joined = huddle.joined
+  huddle_roster = huddle.roster
   huddle_rows = huddle_tile_rows(huddle_roster, call_peers, call_muted)
-  huddle_channel = keep_str(huddle_joined, active_channel, "")
-  huddle_channel_name = keep_str(huddle_joined, active_channel_name, "")
+  huddle_channel = huddle.channel
+  huddle_channel_name = huddle.channel_name
   channel_members = next.channel_members
   post_refusal = post_gate(active_channel_archived, active_channel_members_only, channel_members, settings_user_key)
   selected_message_seq = next.selected_message_seq
@@ -709,7 +730,6 @@ on channel_created(next)
   // each thread's instance keeps its own words (ducktape-ui#697).
   thread_target_seq = next.thread_target_seq
   thread_messages = next.thread_messages
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = next.thread_has_more
   thread_generation = thread_generation + 1
@@ -847,12 +867,74 @@ on begin_message_edit(seq, body, rev)
   message_edit_draft = body
   task widget focus #workspace-tabs/content/chat/message-edit window=window_target(console_win)
 
+// COPY LINK CLOSES THE MENU IT WAS PRESSED IN. Every other row of the message
+// menu moves `message_action` on its way out; a bare clipboard write would
+// leave the overlay plate standing over the timeline it just addressed. Both
+// menus route here — only one of them is ever open — and the clipboard itself
+// stays the app's single site (`handlers/node.ice`), reached the one way a
+// handler reaches another.
+on copy_message_link(link)
+  message_action = MessageAction.toolbar
+  thread_message_action = MessageAction.toolbar
+  return if empty(link)
+  run every duck_echo_str(link) -> copy_to_clipboard(_, "Message link copied") | external_url_failed _
+
 // A LINK PRESS IS A HAND-OFF TO THE OS, and nothing else: no selection, no
 // draft, no rail. Same route the page renderer's link press takes
 // (`handlers/pages.ice`), and it shares that handler's two result arms.
+// THE duck:// OPEN PLANE. A clicked link goes through `resolve_duck_link`
+// ONCE — the protocol's module table plus the network scope its grammar
+// cannot check alone — and each kind maps onto navigation the app ALREADY
+// has: the handler a click on the screen itself would reach, handed the
+// link's field through an echo lane (the one way a handler reaches another).
+// A target that needs two steps (a repo, THEN its item or file; a directory,
+// THEN its file) parks a one-shot focus that `forge_repo_loaded` / `fs_listed`
+// consume. The protocol adds addresses, never navigation.
+// A LINK NAMES ITS NETWORK: one whose `?net=` digest is another network's
+// addresses a store this app is not connected to, so it opens nothing and
+// says which network it belongs to. A link with no `?net=` is the hand-typed
+// case and resolves against the connected network as written.
 on open_message_link(url)
   return if empty(url)
-  run every open_external_url(url) -> external_url_opened _ | external_url_failed _
+  let link = resolve_duck_link(url, network_chain_id)
+  match link.kind
+    DuckKind.unknown
+      error = "this link names nothing the app can open"
+    DuckKind.foreign_network
+      error = foreign_network_error(link.net, network_chain_id)
+    DuckKind.web
+      run every open_external_url(url) -> external_url_opened _ | external_url_failed _
+    DuckKind.page
+      run every duck_echo_str(link.page) -> open_page_search_hit(_, "") | external_url_failed _
+    DuckKind.files
+      fs_focus_path = link.path
+      shell_tab = ShellTab.files
+      run every duck_echo_str(fs_parent(link.path)) -> fs_open_dir _ | external_url_failed _
+    DuckKind.forge_repo
+      forge_focus_number = 0
+      forge_focus_path = ""
+      forge_focus_rev = ""
+      forge_focus_seq = 0
+      shell_tab = ShellTab.forge
+      run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
+    DuckKind.forge_item
+      forge_focus_number = link.number
+      forge_focus_path = ""
+      forge_focus_rev = ""
+      forge_focus_seq = link.seq
+      shell_tab = ShellTab.forge
+      run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
+    DuckKind.forge_blob
+      forge_focus_number = 0
+      forge_focus_path = link.path
+      forge_focus_rev = link.rev
+      forge_focus_seq = 0
+      shell_tab = ShellTab.forge
+      run every duck_echo_str(link.repo) -> forge_open_repo _ | external_url_failed _
+    DuckKind.channel
+      run every duck_echo_str(link.channel) -> choose_channel _ | external_url_failed _
+    DuckKind.channel_message
+      run every duck_echo_str(link.channel) -> open_chat_search_hit(_, link.seq, link.seq) | external_url_failed _
 
 // THE INSPECTOR IS THE FINALITY MARK'S TARGET. The shield in the hover bar and
 // the settled chip on my own bubble both land here, and both name the same
@@ -885,7 +967,6 @@ on open_thread_for(seq)
   // vec wholesale, and a load that FAILS now leaves the root standing instead
   // of a pane that stays blank until Close.
   thread_messages = thread_root_seed(messages, thread_messages, seq)
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   // A HALF-TYPED REPLY IS NOT THE PRICE OF LOOKING AT ANOTHER THREAD: each
@@ -909,7 +990,6 @@ on thread_loaded(next)
   active_thread_seq = next.root_seq
   thread_target_seq = next.target_seq
   thread_messages = merge_thread_refresh(next.messages, thread_messages, active_channel, active_channel)
-  thread_messages_revision = thread_messages_revision + 1
   let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
   thread_selected_seq = selection.seq
   thread_selected_rev = selection.rev
@@ -931,7 +1011,6 @@ on load_more_thread
 on thread_page_loaded(next)
   return if next.generation != thread_generation || !thread_loading
   thread_messages = append_thread_page(thread_messages, next.messages)
-  thread_messages_revision = thread_messages_revision + 1
   let selection = message_selection_after_window(thread_messages, thread_selected_seq, thread_selected_rev, thread_message_action, thread_edit_draft)
   thread_selected_seq = selection.seq
   thread_selected_rev = selection.rev
@@ -981,7 +1060,6 @@ on history_loaded(next)
   history_loading = false
   return if next.channel_id != active_channel
   messages = prepend_history(messages, next.messages)
-  messages_revision = messages_revision + 1
   let selection = message_selection_after_window(messages, selected_message_seq, selected_message_rev, message_action, message_edit_draft)
   selected_message_seq = selection.seq
   selected_message_rev = selection.rev
@@ -1015,7 +1093,6 @@ on close_thread
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
-  thread_messages_revision = thread_messages_revision + 1
   thread_next_reply_seq = 0
   thread_has_more = false
   thread_loading = false
@@ -1073,9 +1150,7 @@ on add_reaction_submit(emoji)
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, selected_message_seq, emoji, true)
-  messages_revision = messages_revision + 1
   thread_messages = reaction_applied(thread_messages, selected_message_seq, emoji, true)
-  thread_messages_revision = thread_messages_revision + 1
   run every add_reaction(connected_rpc, password, active_channel, selected_message_seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // One-tap reactions do NOT select the row: the tap is its own complete act,
@@ -1091,9 +1166,7 @@ on add_reaction_at(seq, emoji)
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, seq, emoji, true)
-  messages_revision = messages_revision + 1
   thread_messages = reaction_applied(thread_messages, seq, emoji, true)
-  thread_messages_revision = thread_messages_revision + 1
   run every add_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 on remove_reaction_at(seq, emoji)
@@ -1105,9 +1178,7 @@ on remove_reaction_at(seq, emoji)
   hydration_retry_attempt = 0
   error = ""
   messages = reaction_applied(messages, seq, emoji, false)
-  messages_revision = messages_revision + 1
   thread_messages = reaction_applied(thread_messages, seq, emoji, false)
-  thread_messages_revision = thread_messages_revision + 1
   run every remove_reaction(connected_rpc, password, active_channel, seq, emoji) -> reaction_acked _ | reaction_failed _
 
 // A reaction's ack has nothing to restore: the optimistic fold is already on
@@ -1164,7 +1235,6 @@ on thread_reply_send_failed(cause)
   return if active_channel != cause.scope_id
   return if !contains_pending_message(thread_messages, cause.operation_id)
   thread_messages = rollback_pending_message(thread_messages, cause.operation_id, cause.committed)
-  thread_messages_revision = thread_messages_revision + 1
   // AND IT DOES NOT MOVE THE REPLY CURSOR. A committed reply grows the loaded
   // run by exactly one row, and the fused live fold
   // already counts it when that reply's delta lands — which it does for every

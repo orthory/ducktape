@@ -5,11 +5,6 @@ own forge, register an agent over it, open an issue that references a Pages
 spec, mention the agent, and review the resulting PR, block-anchored spec
 commentary, and usage — all in the app.
 
-Background: the design spec
-([agent dogfooding loop](superpowers/specs/2026-07-10-agent-dogfooding-loop-design.md))
-and the runtime contract
-([deterministic agent runtime ADR](adr/2026-07-09-deterministic-agent-runtime.mdx)).
-
 ## 0. Prereqs
 
 - **A running node.** The dev app (`make dev`) runs a single-node workspace
@@ -18,7 +13,7 @@ and the runtime contract
   ("validator" vs "resident") the steps say so.
 - **Host `git` on `PATH`, with worktree support.** The provisioner probes
   once at construction (`git init` + `git worktree list` in a scratch dir,
-  `bin/noded/src/agent_provision/forge.rs`); a failed probe makes the forge
+  `crates/noded/src/agent_provision/forge.rs`); a failed probe makes the forge
   lane permanently unavailable, loudly. Forge repos are git-default **sha1**
   — do NOT set `init.defaultObjectFormat = sha256` host-wide; a sha256 clone
   cannot interop with the node's repos.
@@ -41,7 +36,8 @@ make dogfood-forge
 
 `ops/dogfood-forge.sh` resolves the node's HTTP base
 (`DUCKTAPE_DEV_FORGE_URL` → the active workspace's `http_listen` from
-`~/.ducktape/registry.json` + `node.toml` → `http://127.0.0.1:8844`),
+`<ducktape home>/registry.json` + `node.toml` → `http://127.0.0.1:8844`;
+the home is `$DUCKTAPE_HOME` when set, else `~/.ducktape`),
 registers a normal git remote `ducktape-dev` at `<base>/forge/ducktape`, and
 fetches `origin/dev`, pushes that exact commit to `refs/heads/main`, then reads
 the Forge ref back and requires exact OID equality. Repo creation *is* the first
@@ -60,6 +56,22 @@ browsable. Re-run `make dogfood-forge` before later agent work; a raw
 remote lives in the shared `.git/config`, visible to every worktree of this
 repo — set `FORGE_REMOTE` per worktree if you run several nodes at once.
 
+**A push must prove itself.** `git-receive-pack` takes exactly two proofs:
+git's own push certificate (`git push --signed`, whose signer becomes the
+repo's owner on chain), or the node's operator credential, which makes the
+NODE the owner. `make dogfood-forge` presents the second — it is seeding the
+node's own mirror — and a bare `git push` at a node whose `admin.token` you
+cannot read is refused. To push by hand:
+
+```sh
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
+export GIT_CONFIG_VALUE_0="x-ducktape-admin-token: $(cat <workspace>/admin.token)"
+git push ducktape-dev main
+```
+
+`GIT_CONFIG_*` rather than `git -c`: an argv is world-readable through
+`/proc`, and this is a secret.
+
 ## 2. Register the dogfood agent
 
 Two surfaces, because the register form is not yet complete:
@@ -77,14 +89,24 @@ strict no-fallback prompt path. Upload the prompt to a **validator** node
 (the one whose provider will execute); on the single-node dev workspace
 that's just your node.
 
+Both calls below MUTATE, so they carry a credential. `/v1` takes either a
+per-request user signature or this node's own operator credential — the secret
+it mints 0600 into its workspace at every boot — and a curl can only present the
+second. `<workspace>` is the directory holding `node.toml` (on the dev shape,
+the storage dir).
+
 ```sh
+OPERATOR="$(cat <workspace>/admin.token)"
+
 # 1. upload the prompt text as a blob; the receipt's digest IS the hash to pin
 curl -s <base>/v1/files/blob -X POST -H 'content-type: application/json' \
+  -H "x-ducktape-admin-token: $OPERATOR" \
   -d '"You are the dogfooding duck. Work the referenced spec."'
 # → {"digest":"<64-hex sha256>", ...}
 
 # 2. register, granting the full dogfood surface in ONE submit
-curl -s <base>/v1/submit -X POST -H 'content-type: application/json' -d '{
+curl -s <base>/v1/submit -X POST -H 'content-type: application/json' \
+  -H "x-ducktape-admin-token: $OPERATOR" -d '{
   "target": "agent",
   "payload": { "register_agent": {
     "agent_id": "dogfood",

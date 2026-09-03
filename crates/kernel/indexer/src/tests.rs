@@ -219,10 +219,13 @@ fn scan_pages_with_cursor() {
 }
 
 #[test]
-fn unknown_module_is_refused_and_poisons() {
+fn an_undeclared_modules_ops_are_skipped_not_poisoned() {
+    // a module admitted after boot (lifecycle register) has no database
+    // here: its ops write nothing, every declared module's watermark still
+    // advances past the block, and the store keeps taking writes.
     let dir = tempfile::tempdir().unwrap();
     let store = bare_store(dir.path());
-    let bad = block(
+    let admitted = block(
         1,
         vec![AppliedOp {
             module: "ghost".into(),
@@ -231,17 +234,22 @@ fn unknown_module_is_refused_and_poisons() {
             assigned: Vec::new(),
         }],
     );
+    store.apply_block(&admitted).unwrap();
+    assert!(!store.is_poisoned());
+    assert_eq!(
+        store.applied_height("chat").unwrap(),
+        1,
+        "quiet declared modules advance past the admitted module's block"
+    );
+    store
+        .apply_block(&block(2, vec![chat_op(b"{}")]))
+        .unwrap();
+    assert_eq!(store.applied_height("chat").unwrap(), 2);
+    // asked for BY NAME the undeclared id is still its own error.
     assert!(matches!(
-        store.apply_block(&bad),
+        store.view("ghost", b"count"),
         Err(Error::UnknownModule(_))
     ));
-    assert!(store.is_poisoned());
-    // writes refuse from now on; reads keep serving.
-    assert!(matches!(
-        store.apply_block(&block(2, vec![chat_op(b"{}")])),
-        Err(Error::Poisoned)
-    ));
-    assert!(store.scan("chat", b"", None, 10).is_ok());
 }
 
 // ----------------------------------------------------------------------------
@@ -827,6 +835,175 @@ fn a_backfilled_store_matches_a_store_that_saw_the_blocks() {
         joiner.backfill_height("chat").unwrap(),
         None,
         "floor cleared"
+    );
+}
+
+/// A FEED EXTENDED DOWNWARD IS ONLY HONEST AFTER A REFOLD. The floored-module
+/// seam appends rows BELOW the ones the fold already consumed — out of order
+/// by construction, because nothing may be wiped ahead of a pull that might
+/// fail — which walks the fold tip BACKWARDS: a caller that wrote at height 8
+/// would read a tip of 5 and wait forever for its own op. Re-driving the whole
+/// feed in key order is what puts the read model back in agreement with it,
+/// byte-identical to a store that watched every block go by.
+#[test]
+fn a_refold_rebuilds_the_read_model_over_a_feed_extended_downward() {
+    let live_dir = tempfile::tempdir().unwrap();
+    let joiner_dir = tempfile::tempdir().unwrap();
+    let live = mapped_store(live_dir.path());
+    let joiner = mapped_store(joiner_dir.path());
+
+    const FLOOR: u64 = 5;
+    const TIP: u64 = 10;
+    for h in 1..=TIP {
+        live.apply_block(&block(h, vec![chat_op(b"payload")]))
+            .unwrap();
+    }
+    live.wait_folds_drained().unwrap();
+
+    // the restarted resident: stamped at a checkpoint, then the journal replay
+    // folded the suffix back on top — watermark at the tip, floor at 5.
+    joiner.mark_backfilled("chat", FLOOR).unwrap();
+    for h in (FLOOR + 1)..=TIP {
+        joiner
+            .apply_block(&block(h, vec![chat_op(b"payload")]))
+            .unwrap();
+    }
+    joiner.wait_folds_drained().unwrap();
+
+    // ...and the seam pulls the history below the floor in UNDER it.
+    let below: Vec<(String, Vec<u8>)> = live
+        .scan("chat", OP_PREFIX.as_bytes(), None, 100)
+        .unwrap()
+        .entries
+        .iter()
+        .map(|(k, v)| (String::from_utf8(k.clone()).unwrap(), v.clone()))
+        .filter(|(k, _)| parse_op_key(k.as_bytes()).is_some_and(|(h, _)| h <= FLOOR))
+        .collect();
+    assert_eq!(below.len(), FLOOR as usize);
+    joiner.write_backfill_rows("chat", &below).unwrap();
+    joiner.wait_folds_drained().unwrap();
+    joiner.set_backfill_floor("chat", None).unwrap();
+    assert_eq!(
+        joiner.fold_tip("chat").unwrap(),
+        Some((FLOOR, 0)),
+        "the out-of-order fold left the tip below the feed it has"
+    );
+
+    joiner.refold("chat").unwrap();
+
+    let derived = |s: &IndexStore| {
+        s.scan("chat", b"", None, 1024)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with(META_PREFIX.as_bytes()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(derived(&live), derived(&joiner), "every key byte-identical");
+    assert_eq!(
+        joiner.view("chat", b"count").unwrap(),
+        live.view("chat", b"count").unwrap()
+    );
+    assert_eq!(
+        joiner.fold_tip("chat").unwrap(),
+        Some((TIP, 0)),
+        "and the tip vouches for the whole feed again"
+    );
+}
+
+/// A REFOLD MUST NOT LEAVE A MARKER VOUCHING FOR A KEYSPACE IT IS STILL
+/// REBUILDING. `converge_guest` writes `meta/guest` LAST for this reason: it
+/// says "this database is converged on that artifact", and a warm open that
+/// finds it matching returns early without looking at the read model at all.
+/// A refold that cleared and then crashed with the marker still in place would
+/// therefore be adopted forever — a truncated read model with a fold tip below
+/// its own feed, and nothing on the boot path to notice.
+///
+/// Pinned as a source shape because no behavioural test can see it: the window
+/// exists only between two writes inside one call, and both orders leave the
+/// same store behind when nothing crashes.
+#[test]
+fn the_refold_drops_its_guest_marker_before_clearing_and_writes_it_back_last() {
+    const SRC: &str = include_str!("lib.rs");
+    let body = SRC
+        .split("pub fn refold(")
+        .nth(1)
+        .expect("refold is declared")
+        .split("\n    /// ")
+        .next()
+        .expect("refold body");
+    let dropped = body
+        .find("delete(META_GUEST")
+        .expect("the refold drops the marker");
+    let cleared = body
+        .find("clear_derived(")
+        .expect("the refold clears the derived keyspace");
+    // `refold_feed` is the replay AND the drain — the shared tail with
+    // `converge_guest`.
+    let drained = body.find("refold_feed(").expect("the refold drains");
+    let written = body
+        .find("put(META_GUEST")
+        .expect("the refold writes the marker back");
+    assert!(
+        dropped < cleared,
+        "the marker must come down BEFORE the keyspace it vouches for"
+    );
+    assert!(
+        drained < written,
+        "and go back up only AFTER the fold has caught up with the feed"
+    );
+}
+
+/// ...AND AN INTERRUPTED ONE IS RE-RUN WHOLE. The payoff of the order above:
+/// the state a crashed refold leaves — derived keyspace cleared, no marker —
+/// is exactly the state `IndexStore::open` rebuilds from, so the truncation
+/// heals at the next boot instead of being adopted.
+#[test]
+fn an_interrupted_refold_is_re_run_whole_by_the_next_open() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = mapped_store(dir.path());
+        for h in 1..=5 {
+            store
+                .apply_block(&block(h, vec![chat_op(b"payload")]))
+                .unwrap();
+        }
+        store.wait_folds_drained().unwrap();
+        assert_eq!(store.fold_tip("chat").unwrap(), Some((5, 0)));
+
+        // the wreckage of a refold that died after its clear.
+        let db = &store.modules.get("chat").expect("chat is open").db;
+        db.delete(META_GUEST).unwrap();
+        clear_derived(db).unwrap();
+        assert_eq!(
+            store.fold_tip("chat").unwrap(),
+            None,
+            "the read model is gone, and the feed still holds every row"
+        );
+        assert_eq!(
+            store
+                .scan("chat", OP_PREFIX.as_bytes(), None, 100)
+                .unwrap()
+                .entries
+                .len(),
+            5
+        );
+    }
+
+    let reopened = mapped_store(dir.path());
+    assert_eq!(
+        reopened.fold_tip("chat").unwrap(),
+        Some((5, 0)),
+        "the next open refolded it whole"
+    );
+    assert_eq!(
+        reopened
+            .scan("chat", b"seen/", None, 100)
+            .unwrap()
+            .entries
+            .len(),
+        5,
+        "every derived row is back"
     );
 }
 

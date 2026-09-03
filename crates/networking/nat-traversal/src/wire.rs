@@ -1,8 +1,11 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use arrayvec::ArrayVec;
+use borsh::{BorshDeserialize, BorshSchema, BorshSerialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, BorshSchema,
+)]
 pub struct NodeKey(pub [u8; 32]);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,18 +68,13 @@ const TAG_LOOKUP: u8 = 4;
 const TAG_LOOKUP_RESP: u8 = 5;
 const TAG_PUNCH_SYNC: u8 = 6;
 const TAG_PUNCH: u8 = 7;
-// Tags 8 and 9 carried the retired DERP-style relay messages
-// (RelayRequest/RelayGrant). They stay reserved so a stale peer speaking the
-// old protocol decodes as BadTag here instead of aliasing a future message.
-const TAG_READVERTISE: u8 = 10;
-const TAG_AUTH_REQUEST: u8 = 11;
-// Tags 12-15 carried the retired short-invite shelf messages
-// (InvitePut/InvitePutAck/InviteGet/InviteChunk). Reserved like 8/9: a stale
-// peer decodes as BadTag instead of aliasing a future message.
-// Tags >= 16 belong to the TCP relay frames (`relay.rs`) and are NEVER valid
-// here: the PoP signing namespace is shared between UDP requests and the relay
-// intro, so byte-level disjointness of the two encodings is load-bearing — a
-// signature minted over one shape must not verify as the other.
+const TAG_READVERTISE: u8 = 8;
+const TAG_AUTH_REQUEST: u8 = 9;
+// UDP tags live below 16. Tags >= 16 belong to the TCP relay frames
+// (`relay.rs`) and are NEVER valid here: the PoP signing namespace is shared
+// between UDP requests and the relay intro, so byte-level disjointness of the
+// two encodings is load-bearing — a signature minted over one shape must not
+// verify as the other.
 
 // The tiny put/Reader encoding helpers are pub(crate) so the TCP relay frames
 // (relay.rs) share ONE encoding idiom with the UDP messages instead of
@@ -90,6 +88,7 @@ pub(crate) fn put_key<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, key: &NodeK
     put(out, &key.0);
 }
 
+#[cfg(feature = "runtime")]
 pub(crate) fn put_u16<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, value: u16) {
     put(out, &value.to_be_bytes());
 }
@@ -122,6 +121,7 @@ impl<'a> Reader<'a> {
         Self { buf, pos: 0 }
     }
     /// Bytes not yet consumed — the whole-buffer trailing-garbage check.
+    #[cfg(feature = "runtime")]
     pub(crate) fn remaining(&self) -> usize {
         self.buf.len() - self.pos
     }
@@ -140,6 +140,7 @@ impl<'a> Reader<'a> {
         k.copy_from_slice(s);
         Ok(NodeKey(k))
     }
+    #[cfg(feature = "runtime")]
     pub(crate) fn u16(&mut self) -> Result<u16, WireError> {
         let s = self.take(2)?;
         Ok(u16::from_be_bytes([s[0], s[1]]))
@@ -316,7 +317,7 @@ impl Msg {
 use crate::auth::{Authenticator, CoordCap};
 
 /// An authenticated wrapper around one request `Msg`, carrying the per-request
-/// authenticator. Wire tag 11. Only the four request shapes are wrappable.
+/// authenticator. Wire tag `TAG_AUTH_REQUEST`. Only the four request shapes are wrappable.
 ///
 /// `caller` is the authenticating identity — the key whose signer produced the
 /// PoP. The coordinator authenticates THIS key, not the inner message's key:
@@ -466,27 +467,14 @@ mod tests {
     }
 
     #[test]
-    fn retired_relay_tags_are_rejected_not_aliased() {
-        // Tags 8/9 were the DERP-style RelayRequest/RelayGrant. A stale peer
-        // still speaking the old protocol must get a clean BadTag, and the
-        // tags must never be reassigned to a new message shape.
-        let mut relay_req = vec![8u8];
-        relay_req.extend_from_slice(&[0x11; 32]);
-        assert_eq!(Msg::decode(&relay_req), Err(WireError::BadTag(8)));
-
-        let mut relay_grant = vec![9u8];
-        relay_grant.extend_from_slice(&42u64.to_be_bytes());
-        relay_grant.push(4);
-        relay_grant.extend_from_slice(&[192, 0, 2, 1]);
-        relay_grant.extend_from_slice(&4000u16.to_be_bytes());
-        assert_eq!(Msg::decode(&relay_grant), Err(WireError::BadTag(9)));
-
-        // Tags 12-15 carried the retired short-invite shelf messages — same
-        // deal: clean BadTag, never reassigned.
-        for tag in 12u8..=15 {
-            let mut stale = vec![tag];
-            stale.extend_from_slice(&[0x22; 32]);
-            assert_eq!(Msg::decode(&stale), Err(WireError::BadTag(tag)));
+    fn relay_range_tags_are_never_udp_messages() {
+        // Tags >= 16 are the TCP relay framing's namespace; the shared PoP
+        // signing namespace makes byte-level disjointness load-bearing, so
+        // every relay-range tag must decode as a clean BadTag here.
+        for tag in [16u8, 17, 32, 0xff] {
+            let mut frame = vec![tag];
+            frame.extend_from_slice(&[0x22; 32]);
+            assert_eq!(Msg::decode(&frame), Err(WireError::BadTag(tag)));
         }
     }
 
@@ -588,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_request_rejects_trailing_and_bare_msg_decode_rejects_tag_11() {
+    fn auth_request_rejects_trailing_and_bare_msg_decode_rejects_its_tag() {
         use crate::auth::sign_authenticator;
         use commonware_cryptography::{Signer as _, ed25519};
         let node = ed25519::PrivateKey::from_seed(1);
@@ -604,7 +592,7 @@ mod tests {
         .encode();
         bytes.push(0xff);
         assert_eq!(AuthRequest::decode(&bytes), Err(WireError::Trailing));
-        // A tag-11 envelope must NOT decode as a bare Msg.
+        // An auth-request envelope must NOT decode as a bare Msg.
         let clean = AuthRequest {
             caller: NodeKey([2u8; 32]),
             inner: Msg::Register {
@@ -621,6 +609,9 @@ mod tests {
             ),
         }
         .encode();
-        assert_eq!(Msg::decode(&clean), Err(WireError::BadTag(11)));
+        assert_eq!(
+            Msg::decode(&clean),
+            Err(WireError::BadTag(TAG_AUTH_REQUEST))
+        );
     }
 }

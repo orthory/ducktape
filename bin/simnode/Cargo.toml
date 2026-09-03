@@ -23,33 +23,17 @@ name = "ducktape-simnode"
 path = "src/main.rs"
 
 [dependencies]
-# the host-side qmdb store handle injected into disk-backed modules.
-statesync = { workspace = true }
 host = { workspace = true }
+# the module composition catalog this composer draws its genesis selection from.
+# NO module crate is linked here any more: every tenant of the sim's genesis is
+# a wasm component read from the modules dir and composed through
+# `noded::compose`, so the binary knows module ids, not module structs.
+topology = { workspace = true }
 sdk = { workspace = true }
-chat = { workspace = true }
-tasks = { workspace = true }
-identity = { workspace = true }
-duckdns = { workspace = true }
-gateway = { workspace = true }
-inbox = { workspace = true }
-automations = { workspace = true }
-agent = { workspace = true }
-runs = { workspace = true }
+# the two module wire codecs the echo oracle speaks: a saga worker request in,
+# a saga follow-up (bid, then result) out over a dispatch WorkSpec.
 dispatch = { workspace = true }
-tagging = { workspace = true }
 saga = { workspace = true }
-pages = { workspace = true }
-forge = { workspace = true }
-files = { workspace = true }
-# the opt-in `--with-valset` governance genesis: the KV store, the membership
-# registry, the sole authorized author of valset change, and the upgrade
-# coordinator whose registration makes the host-injected boundary tick ride.
-acl = { workspace = true }
-kv = { workspace = true }
-valset = { workspace = true }
-governance = { workspace = true }
-lifecycle = { workspace = true }
 # the node-local op-receipt blob store shared with forge + the files module.
 blobstore = { workspace = true }
 # variable-length hex decode for the `hex:` origin escape and `--with-valset`
@@ -57,7 +41,7 @@ blobstore = { workspace = true }
 duckfs-core = { workspace = true }
 # the sim installs the SAME subscriber the real node does (noded::log), so a
 # scenario sees the module breadcrumbs a wasm guest has no other way to emit.
-noded = { path = "../noded" }
+noded = { path = "../../crates/noded" }
 tracing = { workspace = true }
 # the replication layer: the sim actor runs on `OrderedNode<StepOrderer,
 # NullSink>` — the SAME apply/drain/projection engine the validator uses, with
@@ -86,6 +70,15 @@ axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 
 [dev-dependencies]
+# the module crates the SCENARIOS speak with — wire types and constants only
+# (`gateway::RouteDefinition`, `tasks::MAX_ATTEMPTS`, `governance::GovMsg`,
+# `runs::MAX_ACTIONS_PER_SESSION`, `files::Change`). a test composes the same
+# wasm genesis the binary does; these encode what it submits to it.
+files = { workspace = true }
+gateway = { workspace = true }
+governance = { workspace = true }
+runs = { workspace = true }
+tasks = { workspace = true }
 # the shared raw-http/port/poll harness helpers (was a local copy in harness/).
 nettest = { path = "../../crates/testing/nettest" }
 # the ed25519 bind-auth builder, shared from identity (was: a per-suite copy).

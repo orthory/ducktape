@@ -5,12 +5,12 @@
 mod boot;
 pub(crate) mod code_announce;
 mod engine;
-mod run;
+pub(crate) mod run;
 mod wiring;
 
 use commonware_cryptography::{Signer as _, ed25519};
-use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::Ingress;
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_runtime::Quota;
 use recovery::{Manifest, Recovery};
 
@@ -54,6 +54,7 @@ pub(crate) async fn run_validator(
     session_manager: Option<noded::TerminalSessions>,
     session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
     local_gateway_via: String,
+    node_api_ports: Vec<u16>,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     voice_requests: tokio::sync::mpsc::Receiver<noded::RealtimeSessionRequest>,
@@ -68,6 +69,7 @@ pub(crate) async fn run_validator(
     manifest: Option<Manifest>,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
+    genesis: &crate::config::GenesisModules,
 ) {
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
     tracing::info!(
@@ -97,6 +99,7 @@ pub(crate) async fn run_validator(
         &signer,
         &label,
         &mut boot_fold,
+        genesis,
     )
     .await;
 
@@ -153,7 +156,9 @@ pub(crate) async fn run_validator(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        channel_bank,
+        // mutable for the boot catch-up below: a re-bootstrap blackholes the
+        // bank below the boundary's epoch before the engine seats on it.
+        mut channel_bank,
         gateway_book,
         blob_peers,
         blob_client,
@@ -178,6 +183,8 @@ pub(crate) async fn run_validator(
         gateway_requests,
         gateway_commands.clone(),
         gateway_workspace.clone(),
+        node_api_ports,
+        forge_repo.clone(),
         blobs.clone(),
         initial_member_keys,
         initial_resident_keys,
@@ -240,6 +247,50 @@ pub(crate) async fn run_validator(
         );
     }
 
+    // THE BOOT CATCH-UP, over the co-client that rides this node's own serve
+    // lane: a validator whose floor fell out of every peer's retained journal
+    // window cannot be advanced by the engine — it would wait forever for
+    // payload bytes nobody holds — so it re-bootstraps from a peer's
+    // checkpoint here and seats at that boundary instead. a validator inside
+    // the window (and one nobody answered) keeps exactly the state `restore`
+    // recovered. see `boot::catch_up`.
+    let boot::Seat {
+        host,
+        resumed,
+        next_seq,
+        prev_ckpt,
+        member_keys,
+        participants,
+        resume_epoch,
+        pending_boot,
+    } = boot::catch_up(
+        boot::Seat {
+            host,
+            resumed,
+            next_seq,
+            prev_ckpt,
+            member_keys,
+            participants,
+            resume_epoch,
+            pending_boot,
+        },
+        &blob_client,
+        &blob_peers,
+        &context,
+        &index,
+        &mut recovery,
+        &mut channel_bank,
+        &metrics,
+        &signer,
+        &namespace,
+        &label,
+        &forge_repo,
+        &duckfs_dir,
+        blobs.clone(),
+        genesis,
+    )
+    .await;
+
     let mut epoch_spawner = engine::EpochSpawner::new(
         &context,
         oracle,
@@ -252,12 +303,14 @@ pub(crate) async fn run_validator(
     // FETCHING source for the rest of this validator's life: a committed
     // component the local store lacks is pulled from peers (ranged, verified)
     // before a boundary can fail closed on it.
-    recovery.set_code_source(std::sync::Arc::new(crate::blob_fetch::FetchingCodeSource::new(
-        blobs.clone(),
-        blob_client.clone(),
-        crate::constants::MAX_MODULE_CODE_BYTES,
-        crate::constants::BLOB_FETCH_ATTEMPTS,
-    )));
+    recovery.set_code_source(std::sync::Arc::new(
+        crate::blob_fetch::FetchingCodeSource::new(
+            blobs.clone(),
+            blob_client.clone(),
+            crate::constants::MAX_MODULE_CODE_BYTES,
+            crate::constants::BLOB_FETCH_ATTEMPTS,
+        ),
+    ));
     // the same lane, for forge's packs: a validator that was DOWN during a push
     // was not a fanout target either, so it holds a committed head whose
     // objects never arrived — see `blob_fetch::sweep_forge_packs`.
@@ -390,6 +443,9 @@ pub(crate) async fn run_promoted(
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     code_stage_requests: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
+    // forge's git substrate: the seat's serve lane builds a peer's catch-up
+    // objects off it, exactly as the fresh-boot lane does.
+    forge_repo: std::path::PathBuf,
     blobs: noded::blobs::BlobHandle,
     overlay_slot: overlay_net::userspace::StackSlot,
     bulk_pacer: data_plane::BulkPacer,
@@ -492,6 +548,7 @@ pub(crate) async fn run_promoted(
         &signer,
         &namespace,
         transport.iter().cloned().collect(),
+        forge_repo.clone(),
         blobs.clone(),
         sync_monitor,
         sync_tx,
@@ -501,7 +558,7 @@ pub(crate) async fn run_promoted(
     // the books the parked role already runs its planes over follow the
     // seat's transport union.
     if let Some(book) = &gateway_book {
-        book.set_peers(transport.iter());
+        book.peers().set_peers(transport.iter());
     }
     if let Some(book) = &media_peers {
         book.set_peers(transport.iter());
@@ -530,7 +587,8 @@ pub(crate) async fn run_promoted(
     // standby plane is already shut down (orderly — its UAPI socket is
     // unlinked), so this restore rides the persisted mesh and the seat
     // starts connected. the join doorbell now rings THIS node's gate.
-    let (gate_fwd_tx, gate_fwd_rx) = tokio::sync::mpsc::channel::<crate::lobby::GateForward>(256);
+    let (gate_fwd_tx, gate_fwd_rx) =
+        tokio::sync::mpsc::channel::<crate::join_gate::GateForward>(256);
     let gate_outcomes = GateOutcomes::default();
     let gate_fwd_keepalive = gate_fwd_tx.clone();
     let reach_cmd = match (wireguard_listen, reach_lane) {
@@ -581,6 +639,44 @@ pub(crate) async fn run_promoted(
         // (wedged standby plane) already warned at the seat.
         _ => None,
     };
+
+    // SEAT: target the plane at the epoch this node was just promoted into —
+    // the same command the fresh-boot path sends at `wiring.rs`'s
+    // "boot: target the resume epoch's member set immediately".
+    //
+    // Without it the plane runs with no epoch state, and a plane with no epoch
+    // state is a black hole in BOTH directions: it drops every inbound record
+    // and advert, and sends none of its own. The only other member-side
+    // Retarget is staged at an epoch CUTOVER (`run/drain.rs`) — and a joiner's
+    // own promotion IS the last membership change on a network that has
+    // finished growing, so nothing would ever have followed it.
+    //
+    // What that cost, measured on a live three-node network: phase-A assembly
+    // never completed on ANY node (the founder waits for member records that
+    // are never sent), so the two promoted joiners kept only the standby
+    // pre-warm tunnels they installed while parked — toward the then-members,
+    // never toward each other. Each saw exactly one peer forever, the mesh book
+    // fell through to a derived ULA for the peer it had never heard from, and
+    // its dialer failed against that address for the life of the process. With
+    // three validators the quorum is three, so every view either joiner led was
+    // nullified and every op submitted at one of them timed out awaiting
+    // finalization — a chain that looked healthy from the founder alone.
+    //
+    // `current_view` is the freshness clock adverts expire against, so it takes
+    // the later of the seat's epoch base and its app height; neither can be
+    // ahead of the boundary this seat resumed from.
+    if let Some(cmd) = &reach_cmd {
+        let _ = cmd
+            .send(reachability::ReachabilityCommand::Retarget(
+                reachability::MeshEpochEvent {
+                    epoch,
+                    members: member_keys.clone(),
+                    standbys: resident_keys.clone(),
+                    current_view: view_base.max(height),
+                },
+            ))
+            .await;
+    }
 
     // re-derive whatever the parked fold could not have indexed — the cold
     // seat's synced boundary above all; exact indexes make this a no-op.
@@ -829,7 +925,7 @@ pub(crate) struct PromotionBaton {
     /// (`None`: no wireguard — no plane on either side — or the old plane
     /// wedged past its shutdown grace and kept its lane).
     pub(crate) reach_lane: Option<MeshChannel>,
-    pub(crate) media_peers: Option<std::sync::Arc<crate::voice_plane::MediaPeers>>,
+    pub(crate) media_peers: Option<std::sync::Arc<crate::overlay_book::OverlayPeers>>,
     pub(crate) gateway_book: Option<std::sync::Arc<crate::gateway_plane::OverlayBook>>,
     pub(crate) rpc_ingress: futures::channel::mpsc::Receiver<crate::rpc::RpcJob>,
     pub(crate) http_ingress: futures::channel::mpsc::Receiver<noded::NodeCommand>,
@@ -945,10 +1041,7 @@ pub(super) struct DiscoveryMesh {
 }
 
 impl DiscoveryMesh {
-    pub(super) fn new(
-        slot: EpochChannels,
-        oracle: lookup::Oracle<ed25519::PublicKey>,
-    ) -> Self {
+    pub(super) fn new(slot: EpochChannels, oracle: lookup::Oracle<ed25519::PublicKey>) -> Self {
         let (vote, certificate, resolver, payload, fetch) = slot;
         Self {
             vote: Some(vote),
@@ -971,7 +1064,9 @@ impl consensus::MeshCarrier for DiscoveryMesh {
         self.vote.take().expect("vote channel taken once")
     }
     fn certificate(&mut self) -> MeshChannel {
-        self.certificate.take().expect("certificate channel taken once")
+        self.certificate
+            .take()
+            .expect("certificate channel taken once")
     }
     fn resolver(&mut self) -> MeshChannel {
         self.resolver.take().expect("resolver channel taken once")

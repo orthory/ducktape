@@ -47,6 +47,47 @@ pub enum OpCmd {
     /// whose work this node will execute
     #[command(subcommand)]
     Work(WorkCmd),
+    /// whether this node isolates provider runs, and turn it on
+    Sandbox(SandboxArgs),
+    /// retune a RUNNING node's tracing filter (the 3am verb)
+    LogFilter(LogFilterArgs),
+}
+
+/// `ducktape node log-filter <FILTER>` — the signed client for
+/// `POST /v1/log-filter`.
+///
+/// The route MUTATES the running process (a `trace` filter writes into an
+/// unrotated `daemon.log` as fast as the disk takes it), so it requires a
+/// user-signed request like every other mutating route. `curl` cannot mint one;
+/// this verb can.
+#[derive(Debug, clap::Args)]
+pub struct LogFilterArgs {
+    /// the tracing filter to install, e.g. `info,ducktape::join=debug`
+    #[arg(value_name = "FILTER")]
+    pub filter: String,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+    /// the user key that signs the request (default: the active wallet)
+    #[arg(long, value_name = "PATH")]
+    pub key: Option<PathBuf>,
+}
+
+/// `ducktape node sandbox` — reconcile "can this HOST isolate a run" with
+/// "does this WORKSPACE say to".
+///
+/// They are decided at different moments and can disagree for a long time
+/// without saying so: the `[sandbox]` table is written once, when `node
+/// init`/`join` probed the host, and nothing revisits it. A machine that gained
+/// its hypervisor afterwards keeps a node.toml that refuses every provider run,
+/// and the only symptom is the compute daemon's boot FATAL — after the setup
+/// steps have all reported ready.
+#[derive(Debug, clap::Args)]
+pub struct SandboxArgs {
+    /// write the table without asking (for scripts and non-interactive hosts)
+    #[arg(long)]
+    pub yes: bool,
+    #[command(flatten)]
+    pub selector: Selector,
 }
 
 /// `ducktape node work` — this node's own answer to "whose workload do I run?".
@@ -69,7 +110,7 @@ pub enum WorkCmd {
 /// one account, or the literal `anyone`.
 #[derive(Debug, clap::Args)]
 pub struct WorkTargetArgs {
-    /// a hex account id, a display name, or the literal `anyone`. `anyone`
+    /// an account number, a display name, or the literal `anyone`. `anyone`
     /// admits every network member — and lets a stranger's workload draw on
     /// every credential this node has been granted.
     pub target: String,
@@ -159,27 +200,22 @@ impl Selector {
 /// workspace's node.toml PATH for the daemon that IS the node.
 ///
 /// `--node` is an http base here and means nothing else anywhere: the `agent`
-/// family's host targeting — which PEER runs the work, a display name or a raw
-/// node key — is `--host-node`, because it is a different type of input.
-#[derive(Debug, Default, clap::Args)]
+/// family's host targeting — which PEER runs the work, a raw 64-hex node key —
+/// is `--host-node`, because it is a different type of input.
+#[derive(Debug, Default, Clone, clap::Args)]
 pub struct NodeAddr {
     /// the node's http base url (wins over -n/--network and DUCKTAPE_NODE)
     #[arg(long, value_name = "HTTP-URL", global = true)]
     pub node: Option<String>,
     /// a registered workspace's chain id — resolves to its node.toml http_listen
-    #[arg(
-        short = 'n',
-        long = "network",
-        value_name = "CHAIN-ID",
-        global = true
-    )]
+    #[arg(short = 'n', long = "network", value_name = "CHAIN-ID", global = true)]
     pub network: Option<String>,
 }
 
 /// one rung of the node-addressing ladder — ONE tagged value, so the precedence
 /// is a single ordered expression instead of a hand-written `if` chain per
 /// family. Four of those existed and disagreed about `DUCKTAPE_NODE`, so
-/// `ducktape fs`, `ducktape agent` and `ducktape user account-init` could each
+/// `ducktape fs`, `ducktape agent` and `ducktape account create` could each
 /// dial a DIFFERENT node in one shell.
 #[derive(Debug)]
 enum Rung {
@@ -380,10 +416,7 @@ impl NodeAddr {
     /// operator stated and BEFORE the registry inference. `fs` inside a checkout
     /// passes the `.duckfs` index's recorded url: more specific than "the one
     /// workspace registered on this box", less specific than a flag.
-    pub fn resolve_with(
-        &self,
-        context: impl FnOnce() -> Option<String>,
-    ) -> Result<String, String> {
+    pub fn resolve_with(&self, context: impl FnOnce() -> Option<String>) -> Result<String, String> {
         rung_base(self.ladder_rung(env_node(), context))
     }
 
@@ -483,15 +516,24 @@ pub struct InitArgs {
     /// found the network here instead of the registry default
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
+    /// directory of `<id>.component.wasm` files to found the network's genesis
+    /// wasm set from (default: $DUCKTAPE_MODULES_DIR, else <ducktape home>/modules)
+    #[arg(long, value_name = "DIR")]
+    pub modules: Option<PathBuf>,
     #[command(flatten)]
     pub plumbing: PlumbingArgs,
 }
 
 #[derive(Debug, clap::Args)]
 pub struct InviteArgs {
-    /// days until the token expires (default: 30)
-    #[arg(long, value_name = "N")]
-    pub ttl_days: Option<u64>,
+    /// days until the token expires
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = config::DEFAULT_INVITE_TTL_DAYS,
+        value_parser = clap::value_parser!(u64).range(config::INVITE_TTL_DAYS),
+    )]
+    pub ttl_days: u64,
     #[command(flatten)]
     pub selector: Selector,
 }
@@ -512,9 +554,11 @@ pub struct AdmitArgs {
 pub struct JoinCmd {
     #[command(subcommand)]
     pub query: Option<JoinQuery>,
-    /// the one-line invite blob a member minted
-    #[arg(value_name = "INVITE-BLOB")]
-    pub blob: Option<String>,
+    /// the invite blob a member minted. several shell words are joined back
+    /// together (a paste split by spaces still works); omitted entirely, the
+    /// blob is read from stdin — paste it at the prompt and press Enter.
+    #[arg(value_name = "INVITE-BLOB", num_args = 0..)]
+    pub blob: Vec<String>,
     /// materialize here instead of the registry dir named by the chain id
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
@@ -574,6 +618,31 @@ mod tests {
             node: node.map(str::to_string),
             network: network.map(str::to_string),
         }
+    }
+
+    /// `invite` without `--ttl-days` mints the ONE default every door shares,
+    /// and the flag is refused outside the ONE validated range — at parse
+    /// time, before any workspace file is touched.
+    #[test]
+    fn invite_ttl_days_defaults_and_bounds_come_from_workspace_config() {
+        #[derive(clap::Parser)]
+        struct Probe {
+            #[command(subcommand)]
+            op: OpCmd,
+        }
+        let parse = |argv: &[&str]| <Probe as clap::Parser>::try_parse_from(argv);
+        let ttl_of = |argv: &[&str]| match parse(argv).expect("parses").op {
+            OpCmd::Invite(args) => args.ttl_days,
+            other => panic!("not an invite: {other:?}"),
+        };
+
+        assert_eq!(
+            ttl_of(&["probe", "invite"]),
+            config::DEFAULT_INVITE_TTL_DAYS
+        );
+        assert_eq!(ttl_of(&["probe", "invite", "--ttl-days", "365"]), 365);
+        assert!(parse(&["probe", "invite", "--ttl-days", "0"]).is_err());
+        assert!(parse(&["probe", "invite", "--ttl-days", "366"]).is_err());
     }
 
     /// the precedence, pinned rung by rung and hermetically: only the `Flag`,
@@ -701,14 +770,18 @@ mod tests {
         let Err(why) = rung_base(chain_id) else {
             panic!("a chain id is not an http base");
         };
-        assert!(why.contains("--node"), "it names the flag that took it: {why}");
+        assert!(
+            why.contains("--node"),
+            "it names the flag that took it: {why}"
+        );
         assert!(
             why.contains("-n/--network"),
             "and the flag that should have: {why}"
         );
 
         // the env rung is the same input by another name, and says so.
-        let Err(why) = rung_base(addr(None, None).ladder_rung(Some("mynet#d0cdf950".into()), || None))
+        let Err(why) =
+            rung_base(addr(None, None).ladder_rung(Some("mynet#d0cdf950".into()), || None))
         else {
             panic!("an env chain id is not an http base either");
         };
@@ -734,7 +807,7 @@ mod tests {
 
     /// the fifth-caller guard. `DUCKTAPE_NODE` was read by three families with
     /// three different precedences, so `ducktape fs`, `ducktape agent` and
-    /// `ducktape user account-init` could each dial a different node in one
+    /// `ducktape account create` could each dial a different node in one
     /// shell. There is now exactly ONE read; a family that hand-writes its own
     /// ladder fails here instead of shipping a fourth answer.
     ///

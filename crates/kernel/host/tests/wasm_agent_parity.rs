@@ -322,8 +322,8 @@ async fn same_ops_inner(context: &deterministic::Context) {
         root_of(&wasm),
         "genesis roots diverge"
     );
-    assert!(native.resolver_backed_ids().contains("agent"));
-    assert!(wasm.resolver_backed_ids().contains("agent"));
+    assert!(native.block_durable_ids().contains("agent"));
+    assert!(wasm.block_durable_ids().contains("agent"));
 
     // ---- registration fires the hook (Registered) in the SAME block, with
     // the full runtime-identity tail carried through.

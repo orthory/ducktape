@@ -14,7 +14,7 @@
 use iced::advanced::text::{self, Highlighter};
 use iced::font::{Style as FontStyle, Weight};
 use iced::keyboard::{Key, key::Named};
-use iced::widget::text_editor::{self, Binding, Content, Edit, KeyPress};
+use iced::widget::text_editor::{self, Binding, Content, Cursor, Edit, KeyPress, Motion};
 use iced::{Border, Color, Element, Font};
 use std::hash::{Hash as _, Hasher as _};
 use std::ops::Range;
@@ -94,11 +94,24 @@ pub fn composer_submits(event: ComposerEvent) -> bool {
     matches!(event, ComposerEvent::Submit)
 }
 
+/// Put the caret at `cursor`. iced 0.14's `Content::move_to` sets the caret
+/// and touches the selection only when the cursor CARRIES one, so the plain
+/// press after a drag left the old anchor standing — and the widget's next
+/// pointer move read as a drag from it. `Move` is the one `Content` action
+/// that drops a selection; the exact caret follows it.
+pub fn move_to(document: &mut Content, cursor: Cursor) {
+    let drops_selection = cursor.selection.is_none() && document.cursor().selection.is_some();
+    if drops_selection {
+        document.perform(text_editor::Action::Move(Motion::Left));
+    }
+    document.move_to(cursor);
+}
+
 pub fn apply_composer_event(document: Content, event: ComposerEvent) -> Content {
     let mut document = document;
     match event {
         ComposerEvent::Apply(RichAction::Edit(action)) => document.perform(action),
-        ComposerEvent::Apply(RichAction::MoveTo(cursor)) => document.move_to(cursor),
+        ComposerEvent::Apply(RichAction::MoveTo(cursor)) => move_to(&mut document, cursor),
         ComposerEvent::Mark(kind) => return composer_toggle_mark(document, kind),
         ComposerEvent::Submit => {}
     }
@@ -373,6 +386,36 @@ fn url_len(rest: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use text_editor::Position;
+
+    /// A press after a drag is a fresh caret, not a drag from the old anchor:
+    /// the widget sends `MoveTo { selection: None }`, and iced's own `move_to`
+    /// would have kept the standing selection.
+    #[test]
+    fn a_caret_move_without_a_selection_drops_the_standing_one() {
+        let at = |column| Position { line: 0, column };
+        let mut document = Content::with_text("one two three");
+        document.move_to(Cursor {
+            position: at(7),
+            selection: Some(at(0)),
+        });
+        assert_eq!(document.cursor().selection, Some(at(0)));
+
+        move_to(
+            &mut document,
+            Cursor {
+                position: at(4),
+                selection: None,
+            },
+        );
+        assert_eq!(
+            document.cursor(),
+            Cursor {
+                position: at(4),
+                selection: None,
+            }
+        );
+    }
 
     fn mark_texts(line: &str) -> Vec<(&str, Inline)> {
         inline_marks(line)

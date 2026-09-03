@@ -37,8 +37,8 @@ preset ui_component_error
     error = "Connection failed"
 
 // A dense, settled turn for the inspector: it exercises the real Shell
-// composition, answer markdown, long transcript spacing, and credential footer
-// without spending a provider credential.
+// composition, answer markdown, long transcript spacing, and the composer's
+// disabled-reason line without spending a provider credential.
 preset ui_shell_showcase
   state
     shell_tab = ShellTab.shell
@@ -46,20 +46,23 @@ preset ui_shell_showcase
     loading = false
     mutation_phase = MutationPhase.idle
     error = ""
-    shell_mode = ShellMode.chat
+    shell_surface = ShellSurface.tasks
+    shell_identity = "team-codex · Codex"
     shell_provider = "codex"
-    shell_credential = ""
-    shell_chat_entries = agent_chat_finish(agent_chat_push_user([], "Explain the execution path and call out the failure boundaries.", "codex"), "## Execution path\n\nThe request becomes a durable saga, streams provider activity into this view, and commits the final answer before the turn settles.\n\n- **Scheduling** pins work to the selected compute provider.\n- **Live output** stays observational.\n- **Saga state** is the canonical result.", "codex")
+    shell_credential = "team-codex"
+    shell_chat_entries = agent_chat_answer(agent_chat_push_user([], "Explain the execution path and call out the failure boundaries.", "codex"), "## Execution path\n\nThe request becomes a durable saga, streams provider activity into this view, and commits the final answer before the turn settles.\n\n- **Scheduling** pins work to the selected compute provider.\n- **Live output** stays observational.\n- **Saga state** is the canonical result.", "codex", "done", "", [])
 
-test shell_chat_surface_contract
+test shell_task_surface_contract
   preset ui_shell_showcase
   viewport 1120 720
   mount
     ShellScreen draft<->shell_chat_draft #shell
       with
-        mode=shell_mode
+        surface=shell_surface
+        setup_open=shell_setup_open
+        identity_options=shell_identity_options
+        identity=shell_identity
         provider=shell_provider
-        credential_options=shell_credential_options
         credential=shell_credential
         host_node_options=shell_host_node_options
         host_node=shell_host_node
@@ -75,35 +78,121 @@ test shell_chat_surface_contract
         chat_status=shell_chat_status
         chat_detail=shell_chat_detail
         live=shell_chat_live
-        chat_error=shell_chat_error
         saga_id=shell_chat_saga
+        steps_open=shell_steps_open
+        detached_saga=shell_detached_saga
         connected=true
         dark=false
       events
-        shell_mode_changed -> shell_mode_changed _
-        shell_provider_changed -> shell_provider_changed _
-        shell_credential_changed -> shell_credential_changed _
+        shell_surface_changed -> shell_surface_changed _
+        shell_setup_toggled -> shell_setup_toggled
+        shell_identity_changed -> shell_identity_changed _
         shell_host_node_changed -> shell_host_node_changed _
         shell_credentials_refresh -> shell_credentials_refresh
         shell_terminal_start -> shell_terminal_start
         shell_terminal_stop -> shell_terminal_stop
         shell_composer_event -> shell_composer_event _
         shell_chat_reset -> shell_chat_reset
-        shell_chat_suggest -> shell_chat_suggest _
+        shell_chat_detach -> shell_chat_detach
+        shell_chat_reopen -> shell_chat_reopen
+        shell_chat_discard -> shell_chat_discard
+        shell_chat_steps_toggled -> shell_chat_steps_toggled _
         shell_open_link -> open_message_link _
   target transcript = #shell/root/transcript
   target composer = #shell/root/draft
+  target setup = #shell/root/setup
   expect exists transcript
   expect exists composer
   expect text "Execution path" within transcript
   expect transcript.width > 1000.0
-  capture shell_chat_light
-  dispatch shell_mode_changed(ShellMode.raw)
-  expect shell_mode == ShellMode.raw
+  // The setup is folded away once an identity is picked: the header's one
+  // summary line replaced the permanent four-control band.
+  expect missing setup
+  capture shell_tasks_light
+  dispatch shell_setup_toggled
+  expect exists setup
+  capture shell_setup_light
+  dispatch shell_setup_toggled
+  // A SWITCH IS NEVER REFUSED. This used to be gated on nothing running; the
+  // gate is gone, so the same dispatch lands whatever the tab is doing.
+  dispatch shell_surface_changed(ShellSurface.terminal)
+  expect shell_surface == ShellSurface.terminal
   expect missing transcript
-  capture shell_raw_light
-  resize 966 500
-  capture shell_raw_min_light
+  capture shell_terminal_light
+  window resize 966 500
+  capture shell_terminal_min_light
+
+// The state the old screen could not represent at all: a run this app stopped
+// watching, which the node is still executing. The plate is the address back to
+// it, and the composer is held until the operator says which way that turn ends.
+preset ui_shell_detached
+  state
+    shell_tab = ShellTab.shell
+    connected = false
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    shell_surface = ShellSurface.tasks
+    shell_identity = "team-codex · Codex"
+    shell_provider = "codex"
+    shell_credential = "team-codex"
+    shell_detached_saga = "sched-4f1c8a2b9d0e"
+    shell_chat_entries = agent_chat_detach(agent_chat_push_user([], "Rebuild the drain loop benchmark and report the regression.", "codex"), "codex", "sched-4f1c8a2b9d0e", [])
+
+test shell_detached_run_contract
+  preset ui_shell_detached
+  viewport 1120 720
+  mount
+    ShellScreen draft<->shell_chat_draft #shell
+      with
+        surface=shell_surface
+        setup_open=shell_setup_open
+        identity_options=shell_identity_options
+        identity=shell_identity
+        provider=shell_provider
+        credential=shell_credential
+        host_node_options=shell_host_node_options
+        host_node=shell_host_node
+        credentials_loading=shell_credentials_loading
+        terminal=shell_terminal
+        terminal_running=shell_terminal_running
+        terminal_busy=shell_terminal_busy
+        terminal_title=shell_terminal_title
+        terminal_error=shell_terminal_error
+        entries=shell_chat_entries
+        activity=shell_chat_activity
+        chat_busy=shell_chat_busy
+        chat_status=shell_chat_status
+        chat_detail=shell_chat_detail
+        live=shell_chat_live
+        saga_id=shell_chat_saga
+        steps_open=shell_steps_open
+        detached_saga=shell_detached_saga
+        connected=true
+        dark=false
+      events
+        shell_surface_changed -> shell_surface_changed _
+        shell_setup_toggled -> shell_setup_toggled
+        shell_identity_changed -> shell_identity_changed _
+        shell_host_node_changed -> shell_host_node_changed _
+        shell_credentials_refresh -> shell_credentials_refresh
+        shell_terminal_start -> shell_terminal_start
+        shell_terminal_stop -> shell_terminal_stop
+        shell_composer_event -> shell_composer_event _
+        shell_chat_reset -> shell_chat_reset
+        shell_chat_detach -> shell_chat_detach
+        shell_chat_reopen -> shell_chat_reopen
+        shell_chat_discard -> shell_chat_discard
+        shell_chat_steps_toggled -> shell_chat_steps_toggled _
+        shell_open_link -> open_message_link _
+  target transcript = #shell/root/transcript
+  expect exists transcript
+  expect text "Still running on the network" within transcript
+  capture shell_detached_light
+  // Discarding is what releases the composer, and it is the operator's call —
+  // never a side effect of typing.
+  dispatch shell_chat_discard
+  expect shell_detached_saga == ""
 
 test palette_escape_contract
   preset ui_palette_open
@@ -213,9 +302,7 @@ test composer_mark_glyph_wears_button_ink
   viewport 360 160
   mount
     box #surface w=fill p=24.0
-      ComposerMarks #marks
-        with
-          disabled=false
+      ComposerMarks #marks disabled=false
         events
           mark -> open_message_link _
   target code = #surface/marks/root/code
@@ -334,7 +421,7 @@ test minimum_window_layout_contract
   expect content.width > 1180.0
   expect rail.background == background.color(color.rgb8(250, 250, 248))
   expect content.background == background.color(color.rgb8(253, 253, 251))
-  resize 820 540
+  window resize 820 540
   expect rail.width ~= 74.0
   expect content.x ~= rail.right + 1.0
   expect content.width > 730.0
@@ -346,24 +433,33 @@ preset ui_launch
     hub_step = HubStep.networks
     hub_networks = []
     hub_selected = ""
+    // Ice reads extern structs but cannot construct one, so the rows come
+    // from the same `wallet_info` constructor the backend hands the list.
+    hub_wallets = [wallet_info("alice", "aabbccddeeff00112233", "encrypted", false), wallet_info("demo", "eeff0011", "encrypted", true)]
+    hub_wallet_selected = "demo"
 
-// The launch window's two load-bearing renders: the unlock ceremony's
-// password field is reachable, and an empty network list is the welcome
+// The launch window's two load-bearing renders: the wallet list's selected
+// row carries the password field, and an empty network list is the welcome
 // plate whose one CTA routes to the join flow.
-test launch_unlock_contract
+test launch_wallets_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn #hub
+    HubColumn name_draft<->welcome_name_draft #hub
       with
-        step=HubStep.unlock
-        key_state="encrypted"
+        network=""
+        phase=""
+        qr=""
+        detail=""
+        left=""
+        step=HubStep.wallets
+        wallets=hub_wallets
+        wallet_selected=hub_wallet_selected
         networks=hub_networks
         selected=""
         hidden=0
         name=""
         invite=""
-        reveal=""
         steps=provision_steps
         step_index=0
         height=-1
@@ -373,13 +469,21 @@ test launch_unlock_contract
         restore_empty=true
         join_empty=true
       events
+        pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
-        create_submit -> create_submit _
-        reveal_confirm -> reveal_confirm
+        password_submit -> password_submit _
+        phrase_written_down -> phrase_written_down
+        show_phrase_again -> show_phrase_again
+        confirm_phrase_submit -> confirm_phrase_submit _
+        welcome_create_submit -> welcome_create_submit _
+        welcome_login_submit -> welcome_login_submit
+        welcome_desktop -> welcome_desktop
+        welcome_cancel -> welcome_cancel
+        welcome_skip -> welcome_skip
         go_restore -> go_restore
         go_login -> go_login
-        restore_submit -> restore_submit _
+        restore_submit -> restore_submit _ _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
@@ -387,30 +491,156 @@ test launch_unlock_contract
         restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
+        go_wallets -> go_wallets
         join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
-  target pw = #hub/root/unlock/root/unlock-password
+  target pw = #hub/root/wallets/root/wallet-row("demo")/root/wallet-password
   expect exists pw
   dispatch go_restore
   expect hub_step == HubStep.restore
   dispatch go_login
-  expect hub_step == HubStep.unlock
+  expect hub_step == HubStep.wallets
+
+// THE WALLET LIST IS THE UNLOCK SURFACE. Every wallet on the keystore is a
+// row; the selected one — the active wallet on boot — is the only one showing
+// a password field, and picking another moves the field with the selection.
+test wallet_list_contract
+  preset ui_launch
+  viewport 520 680
+  mount
+    WalletsScreen #wallets
+      with
+        wallets=hub_wallets
+        selected=hub_wallet_selected
+        busy=false
+        error=""
+      events
+        pick_wallet -> pick_wallet _
+        unlock_submit -> unlock_submit _
+        login_skip -> login_skip
+        go_restore -> go_restore
+  target list = #wallets/root
+  target demo_pw = #wallets/root/wallet-row("demo")/root/wallet-password
+  target alice_row = #wallets/root/wallet-row("alice")/root/wallet-pick
+  target alice_pw = #wallets/root/wallet-row("alice")/root/wallet-password
+  // A secure input renders no text to read back, so the draft is asserted
+  // where it lives: the row instance's own component state.
+  target alice = #wallets/root/wallet-row("alice")
+  // the active wallet is preselected: its row is the one carrying the input.
+  expect exists demo_pw
+  expect missing alice_pw
+  expect text "demo" within list
+  expect text "alice" within list
+  // the row shows the identity it signs as, shortened, never invented.
+  expect text "aabbccddeeff0011…" within list
+  // selecting the other row moves the input there.
+  click alice_row
+  expect hub_wallet_selected == "alice"
+  expect exists alice_pw
+  expect missing demo_pw
+  click alice_pw
+  type "hunter2-hunter2"
+  expect component alice.pw == "hunter2-hunter2"
+
+// A KEYSTORE THAT COULD NOT BE READ LANDS HERE, and read-only is the way out.
+// A failed `wallet list` yields an empty list, which is the password step —
+// so this screen, not just the wallet list, has to carry `login_skip`, or
+// someone who HAS wallets is trapped on a mint screen by a missing binary.
+// The mint itself is NOT dispatched: `password_submit` seals a real key.
+test password_screen_read_only_escape_contract
+  preset ui_launch
+  viewport 480 680
+  mount
+    PasswordScreen #pw
+      with
+        busy=false
+        error="the keystore listing is unreadable"
+      events
+        password_submit -> password_submit _
+        go_restore -> go_restore
+        login_skip -> login_skip
+  target screen = #pw/root
+  target skip = #pw/root/password-skip
+  target field = #pw/root/device-password
+  target go = #pw/root/password-submit
+  expect exists field
+  expect exists go
+  expect text "the keystore listing is unreadable" within screen
+  // read-only signs as NOBODY: the label must not keep naming a wallet.
+  click skip
+  expect hub_wallet_selected == ""
+  expect hub_step == HubStep.networks
+
+// THE PHRASE SCREEN, on a FIXED mnemonic. `phrase_rows_of` is mounted rather
+// than `phrase_rows` on purpose: the live one reads the phrase a real mint is
+// holding, and a capture of THAT would put a live key's only backup into a
+// PNG. All 24 words are drawn, the grid pairs 1↔13 … 12↔24, and the one door
+// out of the screen goes to the confirm.
+test phrase_screen_shows_all_24_words
+  preset ui_launch
+  viewport 480 680
+  mount
+    PhraseScreen #phrase
+      with
+        rows=phrase_rows_of("abandon amount liar amount expire adjust cage candy arch gather drum bullet absurd math era live bid rhythm alien crouch range attend journey unaware")
+        busy=false
+      events
+        phrase_written_down -> phrase_written_down
+  target screen = #phrase/root
+  target go = #phrase/root/phrase-continue
+  expect exists go
+  expect text "abandon" within screen
+  expect text "absurd" within screen
+  expect text "unaware" within screen
+  expect text "after this ceremony, the app never shows it again" within screen
+  capture launch_phrase_light
+  click go
+  expect hub_step == HubStep.confirm
+
+// THE CONFIRM SCREEN. The prompt is the backend's sentence (Ice cannot build
+// one), the field starts empty so the Confirm button starts dead, and the way
+// past a typo is back to the phrase — which is still held until this passes.
+test confirm_screen_asks_three_words_back
+  preset ui_launch
+  viewport 480 680
+  mount
+    ConfirmPhraseScreen #confirm
+      with
+        prompt="Type words 5, 12 and 20 — in that order, separated by spaces."
+        busy=false
+        error=""
+      events
+        confirm_phrase_submit -> confirm_phrase_submit _
+        show_phrase_again -> show_phrase_again
+  target screen = #confirm/root
+  target field = #confirm/root/confirm-words
+  target back = #confirm/root/confirm-back
+  expect exists field
+  expect text "Type words 5, 12 and 20 — in that order, separated by spaces." within screen
+  capture launch_confirm_light
+  click back
+  expect hub_step == HubStep.phrase
 
 test launch_networks_empty_contract
   preset ui_launch
   viewport 480 680
   mount
-    HubColumn #hub
+    HubColumn name_draft<->welcome_name_draft #hub
       with
+        network=""
+        phase=""
+        qr=""
+        detail=""
+        left=""
         step=HubStep.networks
-        key_state="encrypted"
+        wallets=hub_wallets
+        wallet_selected=hub_wallet_selected
         networks=hub_networks
         selected=""
         hidden=0
         name=""
         invite=""
-        reveal=""
         steps=provision_steps
         step_index=0
         height=-1
@@ -420,13 +650,21 @@ test launch_networks_empty_contract
         restore_empty=true
         join_empty=true
       events
+        pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
-        create_submit -> create_submit _
-        reveal_confirm -> reveal_confirm
+        password_submit -> password_submit _
+        phrase_written_down -> phrase_written_down
+        show_phrase_again -> show_phrase_again
+        confirm_phrase_submit -> confirm_phrase_submit _
+        welcome_create_submit -> welcome_create_submit _
+        welcome_login_submit -> welcome_login_submit
+        welcome_desktop -> welcome_desktop
+        welcome_cancel -> welcome_cancel
+        welcome_skip -> welcome_skip
         go_restore -> go_restore
         go_login -> go_login
-        restore_submit -> restore_submit _
+        restore_submit -> restore_submit _ _
         pick_network -> pick_network _
         open_network_submit -> open_network_submit
         forget_network_submit -> forget_network_submit _ _
@@ -434,6 +672,7 @@ test launch_networks_empty_contract
         restore_hidden_submit -> restore_hidden_submit
         go_join -> go_join
         go_networks -> go_networks
+        go_wallets -> go_wallets
         join_network_submit -> join_network_submit
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
@@ -441,6 +680,170 @@ test launch_networks_empty_contract
   expect exists cta
   click cta
   expect hub_step == HubStep.join
+
+// The welcome step mid-ceremony: the QR the stream handed back is on screen.
+preset ui_welcome_qr
+  state
+    mutation_phase = MutationPhase.onboarding
+    onboarding_error = ""
+    hub_step = HubStep.account
+    ceremony_phase = "show_qr"
+    ceremony_qr = "https://auth.ducktape.industries/#op=get&challenge=AQID"
+    ceremony_detail = "Your phone will confirm with the passkey."
+    ceremony_left = "4:58"
+
+// A connected, signing console whose device key has no account here.
+preset ui_console_no_account
+  state
+    rpc = "http://127.0.0.1:1"
+    connected_rpc = "http://127.0.0.1:1"
+    password = "hunter2-hunter2"
+    status = "Connected"
+    connected = true
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    account_exists = false
+    account_banner_dismissed = false
+    shell_tab = ShellTab.settings
+
+// The Settings card mid-ceremony: a passkey is being registered from the
+// phone and the QR is on the card.
+preset ui_settings_qr
+  state
+    rpc = "http://127.0.0.1:1"
+    connected_rpc = "http://127.0.0.1:1"
+    password = "hunter2-hunter2"
+    status = "Connected"
+    connected = true
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    account_exists = true
+    account_busy = true
+    account_ceremony_phase = "show_qr"
+    account_ceremony_qr = "https://auth.ducktape.industries/#op=create&challenge=AQID"
+    account_ceremony_detail = "Your phone will create the passkey."
+    account_ceremony_left = "4:58"
+    shell_tab = ShellTab.settings
+
+// A signing session that just picked a network — the probe is in flight.
+preset ui_pick_probe
+  state
+    password = "hunter2-hunter2"
+    rpc = "http://127.0.0.1:1"
+    mutation_phase = MutationPhase.onboarding
+    hub_step = HubStep.networks
+
+// THE WELCOME SCREEN is where a device key with no account on the picked
+// network lands. Skipping opens the console (a window task — not asserted
+// here); a QR in state renders as a real qr node; cancel clears it.
+test welcome_screen_contract
+  preset ui_welcome_qr
+  viewport 480 680
+  mount
+    WelcomeScreen name_draft<->welcome_name_draft #welcome
+      with
+        network="demo"
+        phase=ceremony_phase
+        qr=ceremony_qr
+        detail=ceremony_detail
+        left=ceremony_left
+        busy=false
+        error=""
+      events
+        welcome_create_submit -> welcome_create_submit _
+        welcome_login_submit -> welcome_login_submit
+        welcome_desktop -> welcome_desktop
+        welcome_cancel -> welcome_cancel
+        welcome_skip -> welcome_skip
+  target screen = #welcome/root
+  target qr = #welcome/root/welcome-qr
+  target left = #welcome/root/welcome-left
+  target cancel = #welcome/root/welcome-cancel
+  target create = #welcome/root/welcome-create
+  expect exists qr
+  expect exists left
+  expect missing create
+  expect text "demo" within screen
+  click cancel
+  expect ceremony_qr == ""
+  expect ceremony_phase == ""
+  expect hub_step == HubStep.account
+  // with no ceremony in flight the doors are back, and the QR is gone.
+  expect exists create
+  expect missing qr
+
+// A network pick probes the account BEFORE the console opens: no account →
+// the welcome step; an account → straight through (window task, not
+// asserted). The probe answer is dispatched directly — the pick itself
+// launches a real `load_account`.
+test network_pick_lands_on_the_welcome_step_without_an_account
+  preset ui_pick_probe
+  dispatch account_probed(account_data_none(7))
+  expect hub_step == HubStep.account
+  expect mutation_phase == MutationPhase.idle
+  expect ceremony_phase == ""
+
+// THE BANNER: a connected console whose device key has no account says so;
+// dismiss hides it for the session. Reopening the launch window at the
+// welcome is a window task (not asserted).
+test console_banner_names_the_missing_account
+  preset ui_console_no_account
+  viewport 900 300
+  mount
+    AccountBanner #account-banner
+      with
+        connected
+        account_exists
+        dismissed=account_banner_dismissed
+        password
+      events
+        open_account_welcome -> open_account_welcome
+        dismiss_account_banner -> dismiss_account_banner
+  target banner = #account-banner/root/banner
+  target dismiss = #account-banner/root/banner/dismiss
+  expect exists banner
+  click dismiss
+  expect account_banner_dismissed == true
+  expect missing banner
+
+// The Settings card renders the ceremony's QR in place, and cancel clears it.
+test settings_card_shows_the_passkey_qr
+  preset ui_settings_qr
+  viewport 600 400
+  mount
+    CeremonyPlate #account-ceremony
+      with
+        phase=account_ceremony_phase
+        qr=account_ceremony_qr
+        detail=account_ceremony_detail
+        left=account_ceremony_left
+      events
+        account_ceremony_cancel -> account_ceremony_cancel
+  target qr = #account-ceremony/root/plate-qr
+  target left = #account-ceremony/root/plate-left
+  target cancel = #account-ceremony/root/plate-cancel
+  expect exists qr
+  expect exists left
+  click cancel
+  expect account_ceremony_qr == ""
+  expect account_busy == false
+  expect missing qr
+
+// A ceremony's steps drive the welcome: `working` swaps the QR for its line,
+// `failed` lands the message on the screen and frees the machine.
+test ceremony_steps_drive_the_welcome
+  preset ui_welcome_qr
+  dispatch ceremony_stepped(ceremony_step("working", "", "Consenting to the new key…"))
+  expect ceremony_phase == "working"
+  expect ceremony_qr == ""
+  expect ceremony_detail == "Consenting to the new key…"
+  expect mutation_phase == MutationPhase.onboarding
+  dispatch ceremony_stepped(ceremony_step("failed", "", "the phone did not answer in time"))
+  expect ceremony_phase == ""
+  expect onboarding_error == "the phone did not answer in time"
+  expect mutation_phase == MutationPhase.idle
 
 preset ui_palette_overlay
   state
@@ -559,21 +962,27 @@ test settings_keyboard_scroll_contract
       node:
         space w=1.0 h=1.0
       settings:
-        SettingsScreen account_name_draft<->account_name_draft #settings
+        SettingsScreen account_name_draft<->account_name_draft account_create_draft<->account_create_draft account_key_draft<->account_key_draft account_key_label_draft<->account_key_label_draft account_join_draft<->account_join_draft #settings
           with
             account_name
             network_name
             connected_rpc
+            account_ceremony_phase
+            account_ceremony_qr
+            account_ceremony_detail
+            account_ceremony_left
             settings_key_state
             settings_key_path
             settings_open_tabs
             members_rows
             members_answered
-            account_id
+            account_number
             account_renaming
-            account_bound
-            account_members
-            account_nodes
+            account_exists
+            account_keys
+            account_key_rows
+            account_busy
+            account_ticket
             appearance
             password
             status
@@ -585,6 +994,19 @@ test settings_keyboard_scroll_contract
             reconnect -> reconnect
             account_name_draft_changed -> account_name_draft_changed _
             account_rename_submit -> account_rename_submit
+            account_create_draft_changed -> account_create_draft_changed _
+            account_create_submit -> account_create_submit
+            account_key_draft_changed -> account_key_draft_changed _
+            account_key_label_draft_changed -> account_key_label_draft_changed _
+            account_key_add_submit -> account_key_add_submit
+            account_join_draft_changed -> account_join_draft_changed _
+            account_key_join_submit -> account_key_join_submit
+            account_key_remove -> account_key_remove _
+            account_passkey_submit -> account_passkey_submit
+            account_passkey_desktop -> account_passkey_desktop
+            account_ceremony_cancel -> account_ceremony_cancel
+            account_wallet_submit -> account_wallet_submit
+            account_login_submit -> account_login_submit
             copy_to_clipboard -> copy_to_clipboard _ _
             settings_clear_tabs -> settings_clear_tabs
             switch_network -> switch_network
@@ -720,7 +1142,6 @@ preset ui_chat_stream
     active_channel = "channel-a"
     active_channel_name = "general"
     messages = optimistic_message(messages, "The room she is looking at.", "pending-1")
-    messages_revision = messages_revision + 1
 
 // THE GATE IS THE STREAM RESET. Every room switch paints an empty loading state,
 // so the old scrollable and its offset must disappear before the selected room's
@@ -737,9 +1158,11 @@ test message_stream_reset_contract
       with
         endpoint=connected_rpc
         network_name
+        network_chain_id
         status
         block_height
         search_phase=chat_search_phase
+        search_query=chat_search_query
         search_hits=chat_search_hits
         rooms
         dm_rows
@@ -763,7 +1186,6 @@ test message_stream_reset_contract
         call_muted
         huddle_popped=false
         messages
-        messages_revision
         has_older_history
         history_view
         history_loading
@@ -776,7 +1198,6 @@ test message_stream_reset_contract
         active_thread_seq
         thread_target_seq
         thread_messages
-        thread_messages_revision
         thread_selected_seq
         thread_selected_rev
         thread_message_action
@@ -799,6 +1220,8 @@ test message_stream_reset_contract
         load_more_history -> load_more_history
         chat_scrolled -> chat_scrolled _ _ _ _
         open_message_link -> open_message_link _
+        copy_to_clipboard -> copy_to_clipboard _ _
+        copy_message_link -> copy_message_link _
         add_reaction_at -> add_reaction_at _ _
         remove_reaction_at -> remove_reaction_at _ _
         open_thread_for -> open_thread_for _
@@ -850,7 +1273,6 @@ preset ui_rich_paragraph
     // rows carry real rich spans — bold, italic, and bare-url link runs —
     // into the paragraph's `for`.
     messages = mark_author_runs(optimistic_message(optimistic_message(messages, "ship the **fix** at https://duck.example/x", "pending-rich"), "and the _second_ line lands", "pending-second"))
-    messages_revision = messages_revision + 1
 
 // A MESSAGE BODY IS ONE PARAGRAPH (ducktape-ui#639, collected by #1096). The
 // span list — plain runs, bold runs, italic runs, links — feeds ONE rich-text
@@ -872,9 +1294,11 @@ test message_body_renders_as_one_rich_paragraph
       with
         endpoint=connected_rpc
         network_name
+        network_chain_id
         status
         block_height
         search_phase=chat_search_phase
+        search_query=chat_search_query
         search_hits=chat_search_hits
         rooms
         dm_rows
@@ -898,7 +1322,6 @@ test message_body_renders_as_one_rich_paragraph
         call_muted
         huddle_popped=false
         messages
-        messages_revision
         has_older_history
         history_view
         history_loading
@@ -911,7 +1334,6 @@ test message_body_renders_as_one_rich_paragraph
         active_thread_seq
         thread_target_seq
         thread_messages
-        thread_messages_revision
         thread_selected_seq
         thread_selected_rev
         thread_message_action
@@ -934,6 +1356,8 @@ test message_body_renders_as_one_rich_paragraph
         load_more_history -> load_more_history
         chat_scrolled -> chat_scrolled _ _ _ _
         open_message_link -> open_message_link _
+        copy_to_clipboard -> copy_to_clipboard _ _
+        copy_message_link -> copy_message_link _
         add_reaction_at -> add_reaction_at _ _
         remove_reaction_at -> remove_reaction_at _ _
         open_thread_for -> open_thread_for _
@@ -968,3 +1392,229 @@ test message_body_renders_as_one_rich_paragraph
   expect no text "ship the fix at https://duck.example/x"
   expect no text "and the second line lands"
   expect missing stream
+
+preset ui_files
+  state
+    shell_tab = ShellTab.files
+    connected = true
+    // Pinned for the reason `ui_chat_stream` states at length: an empty
+    // endpoint is a fallback, not a refusal, and port 1 on loopback can hold
+    // no listener, so anything this screen launches refuses off the network.
+    connected_rpc = "http://127.0.0.1:1"
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+
+// THE CRUMB AND THE RENAME FIELD ARE TWO ROWS, MEASURED. #804's first live run
+// found `/shared` drawn straight over the "new name…" input; the write controls
+// are a separate bar under `CrumbBar` now, and this is what keeps them there —
+// the field's top edge sits at or below the crumb bar's bottom, with both boxes
+// proven to have really drawn first so the ordering cannot pass on a collapsed
+// one. 965 wide is the narrowest content pane this console can produce: the
+// window declares `min-size 1040`, less the 74px rail and the 1px rule.
+test files_write_bar_clears_the_crumb_bar
+  preset ui_files
+  viewport 965 720
+  mount
+    FilesScreen new_name<->fs_new_name draft<->fs_editor #files
+      with
+        path=fs_path
+        listed=(fs_listed_path == fs_path)
+        entries=fs_entries
+        directories=fs_directories(fs_entries)
+        connected
+        loading=fs_loading
+        preview_path=fs_preview_path
+        preview_entry=fs_preview_entry
+        delete_target=fs_delete_target
+        diff_from=fs_diff_from
+        diff=fs_diff
+        history=fs_history
+        preview_truncated=fs_preview_truncated
+        preview_binary=fs_preview_binary
+        editing=fs_editing
+        preview_text=fs_preview_text
+        dark=false
+        preview_picture=fs_preview_picture
+        preview_width=fs_preview_width
+        preview_height=fs_preview_height
+      events
+        open_message_link -> open_message_link _
+        fs_open_dir -> fs_open_dir _
+        fs_open_file -> fs_open_file _
+        fs_open_parent -> fs_open_parent
+        fs_new_name_changed -> fs_new_name_changed _
+        fs_mkdir_submit -> fs_mkdir_submit
+        fs_new_file_submit -> fs_new_file_submit
+        fs_arm_delete -> fs_arm_delete _
+        fs_disarm_delete -> fs_disarm_delete
+        fs_delete_submit -> fs_delete_submit
+        fs_close_diff -> fs_close_diff
+        fs_show_diff -> fs_show_diff _
+        fs_begin_edit -> fs_begin_edit
+        fs_cancel_edit -> fs_cancel_edit
+        fs_save_edit -> fs_save_edit
+  target crumb = #files/crumb/root
+  target field = #files/fs-new
+  expect text "/shared" within crumb
+  expect crumb.height > 40.0
+  expect field.width ~= 160.0
+  expect field.y >= crumb.bottom
+
+// AND THE BACKDROP TAKES THE POINTER. #804's other half: the palette used to be
+// a `box bg=scrim`, which tints the console and captures nothing — the rail and
+// the composer behind it stayed live and clicking the dim did nothing at all.
+// `palette_overlay_contract` above proves the field inside the layer is still
+// reachable; this proves the console underneath is NOT. The click is aimed at a
+// live control beneath the layer, and the two expectations are the whole claim:
+// its handler does not fire, and the press lands on the backdrop, which
+// dismisses. Both are established as false-then-true, so neither can pass on a
+// palette that never opened.
+test palette_backdrop_takes_the_pointer
+  preset ui_palette_overlay
+  viewport 1120 720
+  mount
+    stack w=fill h=fill
+      button "Create a channel" #beneath @primary_action -> toggle_channel_create
+      OverlayLayer draft<->channel_draft query<->palette_draft #overlays
+        with
+          create_open=false
+          members_only=false
+          busy=false
+          connected=true
+          loading=false
+          toast=""
+          tone="info"
+          open=palette_open
+          search_phase=palette_search_phase
+          chat_hits=palette_chat_hits
+          page_hits=palette_page_hits
+        events
+          toggle_channel_create -> toggle_channel_create
+          toggle_channel_create_members_only -> toggle_channel_create_members_only
+          create_channel_submit -> create_channel_submit
+          dismiss_toast -> dismiss_toast
+          close_palette -> close_palette
+          palette_changed -> palette_changed _
+          open_chat_search_hit -> open_chat_search_hit _ _ _
+          open_page_search_hit -> open_page_search_hit _ _
+  target beneath = #beneath
+  target field = #overlays/palette-input
+  expect palette_open
+  expect !channel_create_open
+  expect exists field
+  click beneath
+  expect !channel_create_open
+  expect !palette_open
+  expect missing field
+
+// The status item's rows are commands, and a chosen row reaches its handler:
+// a row index that drifts in codegen fails here, not silently in the menu bar.
+// The two stat rows are not commands — a reader reads them — and with no node
+// answering the icon is the grey one.
+// Only the launch window is up here, so the console's rows and the huddle's
+// are out of the menu — not disabled, absent.
+test tray_menu_contract
+  preset ui_offline
+  expect tray icon "../../assets/tray-offline.rgba"
+  expect tray item "No network"
+  expect tray item "Offline"
+  expect no tray command "Offline"
+  expect tray command "Open Ducktape"
+  expect tray command "Quit Ducktape"
+  expect tray item "Appearance"
+  expect no tray item "Notifications"
+  expect no tray item "Go to"
+  expect no tray item "Huddle"
+  expect no tray item "Leave huddle"
+  expect no tray item "Reconnect"
+  tray choose "Open Ducktape"
+
+preset ui_tray_live
+  state
+    connected = true
+    // A console is up: `window_target(none)` names a fresh id, which is all
+    // the console-only rows ask of the slot.
+    console_win = some(window_target(none))
+    // Refused at once, off the network — see `ui_chat_stream`. The live
+    // stream's failure writes `status` (the retry arm), which is why no test
+    // below reads the status row; `tray_menu_contract` does, offline.
+    connected_rpc = "http://127.0.0.1:1"
+    network_name = "demo"
+    bell_unread = 3
+    huddle_joined = true
+    huddle_channel_name = "general"
+    call_muted = false
+    appearance = Appearance.dark
+
+// The rows READ the state — the bell count rides the icon, the label and its
+// row; the huddle's channel names its submenu; the appearance wears its ✓ —
+// and a chosen row moves it: Mute becomes Unmute.
+test tray_menu_reads_the_state
+  preset ui_tray_live
+  expect tray icon "../../assets/tray-unread.rgba"
+  expect tray label "3"
+  expect tray item "demo"
+  expect tray item "Notifications · 3 unread"
+  expect tray item "Huddle · #general"
+  expect tray item "✓ Dark"
+  expect no tray item "✓ Light"
+  expect tray command "Mute"
+  // Not "Reconnect": the status row reads "Reconnecting…" by now (see the
+  // preset), and a text two rows carry names neither.
+  expect tray command "Copy node key"
+  expect tray item "Go to"
+  tray choose "Mute"
+  expect tray item "Unmute"
+  expect call_muted
+
+// A HUDDLE WITH A SCREEN ON THE STAGE, at the panel's narrowest. The controls
+// row is where a huddle goes wrong when it grows: this window is 320px at its
+// minimum, and the file above records `Leave` being pushed off the end of it
+// once already. A fourth source control is exactly that risk again, so the
+// contract is that the leave button still lands inside the panel.
+preset ui_huddle_sharing
+  state
+    // Deliberately NOT connected, and no `huddle_channel`: those two are the
+    // media leg's subscription gate, and a session opening under a mount test
+    // fires its own `connecting` event, which resets the very toggles this
+    // preset is setting.
+    connected = false
+    huddle_joined = true
+    huddle_channel_name = "eng"
+    call_status = "live"
+    call_muted = false
+    call_camera = false
+    call_sharing = true
+    call_video_live = true
+    huddle_stage = "you"
+
+test the_huddle_controls_survive_the_narrowest_panel
+  preset ui_huddle_sharing
+  viewport 320 640
+  mount
+    HuddlePanel #huddle
+      with
+        channel=huddle_channel_name
+        elapsed="01:20"
+        rows=huddle_rows
+        status=call_status
+        muted=call_muted
+        camera=call_camera
+        sharing=call_sharing
+        stage=huddle_stage
+        video_live=call_video_live
+      events
+        dock_huddle -> dock_huddle
+        huddle_go_channel -> huddle_go_channel
+        leave_huddle_here -> leave_huddle_here
+        toggle_call_mute -> toggle_call_mute
+        toggle_call_camera -> toggle_call_camera
+        toggle_call_screen -> toggle_call_screen
+  target panel = #huddle/root
+  target share = #huddle/root/share-stop
+  target leave = #huddle/root/leave
+  expect call_sharing
+  expect leave.x + leave.width <= panel.x + panel.width
+  expect share.width ~= 32.0
+  capture huddle_sharing_light

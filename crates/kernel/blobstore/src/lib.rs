@@ -102,11 +102,24 @@ impl BlobStore {
                     self.cache(digest, bytes);
                     return digest;
                 }
-                Err(why) => eprintln!(
-                    "[blobstore] cannot persist blob {} under {}: {why}; kept in memory only",
-                    hex(&digest),
-                    root.display()
-                ),
+                // every put after a disk fault (a full disk, most likely)
+                // lands here, several per block under the explorer projection
+                // — latched, or the fault evicts the ring that explains it.
+                Err(why) => {
+                    static PERSIST_FAILURES: Latch = Latch::new();
+                    if let Some(occurrences) = PERSIST_FAILURES.hit() {
+                        tracing::error!(
+                            target: "ducktape::blobstore",
+                            reason = "blob_persist_failed",
+                            digest = digest_prefix(&digest),
+                            root = %root.display(),
+                            bytes = bytes.len(),
+                            occurrences,
+                            error = %why,
+                            "cannot persist blob — kept in memory only"
+                        );
+                    }
+                }
             }
         }
         // no disk copy exists (pure in-memory store, or the write just
@@ -198,6 +211,30 @@ impl BlobStore {
         self.chunks.contains_key(digest) || self.disk_chunk(digest).is_some()
     }
 
+    /// drop a blob this node staged — out of the memory map, and off disk
+    /// when a root holds it. best-effort: a failed unlink leaves the blob
+    /// exactly where it was, which is the behaviour that existed before.
+    ///
+    /// the ONLY removal on this store, and deliberately a primitive rather
+    /// than a gc: nothing HERE decides what is spent. the plane that put the
+    /// bytes in does — forge releases a push pack once it has materialized
+    /// the objects, and the forge object lane releases the answer it
+    /// superseded. that keeps the crate a dumb receipt store (see the scope
+    /// note at the top) while giving its writers a way to not leak forever.
+    pub fn forget(&mut self, digest: &[u8; 32]) {
+        if let Some(bytes) = self.chunks.remove(digest) {
+            // only DISK-BACKED entries are queued and counted; a memory-only
+            // blob was never in either structure.
+            if let Some(at) = self.cache_order.iter().position(|queued| queued == digest) {
+                self.cache_order.remove(at);
+                self.cache_bytes -= bytes.len();
+            }
+        }
+        if let Some(root) = &self.root {
+            let _ = std::fs::remove_file(root.join(hex(digest)));
+        }
+    }
+
     /// the disk fallback: read `<root>/<hex>` and REVERIFY the content hash.
     /// content-addressed blobs are self-verifying — a corrupt or truncated
     /// file is treated as absent (with a warning), never served.
@@ -205,13 +242,48 @@ impl BlobStore {
         let path = self.root.as_ref()?.join(hex(digest));
         let bytes = std::fs::read(&path).ok()?;
         if sha256(&bytes) != *digest {
-            eprintln!(
-                "[blobstore] blob file {} fails its content hash; treating it as absent",
-                path.display()
-            );
+            // a corrupt file is re-read on every miss for it, so a hot blob
+            // would repeat this per request — latched, like the persist fault.
+            static HASH_MISMATCHES: Latch = Latch::new();
+            if let Some(occurrences) = HASH_MISMATCHES.hit() {
+                tracing::warn!(
+                    target: "ducktape::blobstore",
+                    reason = "blob_hash_mismatch",
+                    digest = digest_prefix(digest),
+                    bytes = bytes.len(),
+                    occurrences,
+                    "blob file fails its content hash — treated as absent"
+                );
+            }
             return None;
         }
         Some(bytes)
+    }
+}
+
+/// the first 16 hex chars of a digest: enough to find the file, never the
+/// bytes it names.
+fn digest_prefix(digest: &[u8; 32]) -> String {
+    hex(digest)[..16].to_string()
+}
+
+/// a first-and-every-Nth counter for a fault that REPEATS: the first sighting
+/// logs immediately, then every [`Latch::EVERY`]th, carrying the count. the
+/// same shape as `noded::log::Latch`, which this crate cannot link (it sits
+/// below the daemon library), keyed by the static that holds it.
+struct Latch(std::sync::atomic::AtomicU64);
+
+impl Latch {
+    const EVERY: u64 = 100;
+
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    /// `Some(occurrences)` when this occurrence should be logged.
+    fn hit(&self) -> Option<u64> {
+        let n = self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        (n == 1 || n.is_multiple_of(Self::EVERY)).then_some(n)
     }
 }
 
@@ -256,6 +328,11 @@ impl BlobHandle {
             .lock()
             .expect("blob store poisoned")
             .read_range(digest, offset, len)
+    }
+
+    /// see [`BlobStore::forget`].
+    pub fn forget(&self, digest: &[u8; 32]) {
+        self.0.lock().expect("blob store poisoned").forget(digest)
     }
 
     /// the write-through root, when persistent — where staging slots live.
@@ -511,13 +588,55 @@ mod tests {
         );
     }
 
+    /// `forget` has to release BOTH copies — the disk file and the cached
+    /// bytes — or a "released" blob keeps answering from memory and keeps
+    /// occupying the cache budget it was counted against.
+    #[test]
+    fn forget_releases_the_disk_copy_and_the_cache_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let store = BlobHandle::persistent(root.path()).unwrap();
+        let spent = store.put_chunk(b"spent".to_vec());
+        let kept = store.put_chunk(b"kept".to_vec());
+        assert!(root.path().join(hex(&spent)).exists());
+
+        store.forget(&spent);
+
+        assert!(!store.has_chunk(&spent), "gone from memory AND disk");
+        assert_eq!(store.get_chunk(&spent), None);
+        assert!(!root.path().join(hex(&spent)).exists(), "file unlinked");
+        assert_eq!(
+            store.get_chunk(&kept).as_deref(),
+            Some(b"kept".as_slice()),
+            "forgetting one blob leaves its neighbours alone"
+        );
+        // re-putting after a forget must land a fresh file, not a ghost.
+        assert_eq!(store.put_chunk(b"spent".to_vec()), spent);
+        assert!(store.has_chunk(&spent));
+    }
+
+    /// forgetting a memory-only blob (no root, so nothing was ever queued in
+    /// the eviction order) must not corrupt the cache accounting.
+    #[test]
+    fn forget_on_a_memory_only_store_drops_the_blob() {
+        let store = BlobHandle::default();
+        let digest = store.put_chunk(b"ephemeral".to_vec());
+
+        store.forget(&digest);
+
+        assert!(!store.has_chunk(&digest));
+        let next = store.put_chunk(b"after".to_vec());
+        assert_eq!(store.get_chunk(&next).as_deref(), Some(b"after".as_slice()));
+    }
+
     #[test]
     fn a_memory_only_store_never_evicts() {
         // no root: the map IS the store, so the cache budget must not apply —
         // every blob stays readable no matter how many follow it.
         let store = BlobHandle::default();
         let payload = |seed: u8| vec![seed; 1024 * 1024];
-        let digests: Vec<_> = (0..=64u8).map(|seed| store.put_chunk(payload(seed))).collect();
+        let digests: Vec<_> = (0..=64u8)
+            .map(|seed| store.put_chunk(payload(seed)))
+            .collect();
         for (seed, digest) in digests.iter().enumerate() {
             assert_eq!(
                 store.get_chunk(digest).as_deref(),

@@ -9,7 +9,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    MAX_REQUEST_BODY_BYTES, RouteAudience, RouteMethod, RouteName, RouteRecord, validate_account_id,
+    MAX_REQUEST_BODY_BYTES, RouteAudience, RouteMethod, RouteName, RouteRecord,
+    validate_account_number,
 };
 
 pub const PROXY_FLOW_DOMAIN: &[u8] = b"ducktape-gateway-proxy-v1";
@@ -88,10 +89,22 @@ pub struct ProxyHeader {
     pub value: String,
 }
 
+/// A caller's proof of possession of a user key for this one request: `sig`
+/// is `key`'s scheme-owned proof over [`crate::caller_pop_preimage`] under
+/// [`crate::GATEWAY_CALLER_NS`]. The serving node resolves `key` to its
+/// account through Identity; a head without one carries no account.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UserPop {
+    pub key: Vec<u8>,
+    pub ts: u64,
+    pub sig: Vec<u8>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyRequestHead {
-    pub account_id: Vec<u8>,
+    pub account_id: u64,
     pub name: RouteName,
     pub revision: u64,
     pub method: RouteMethod,
@@ -103,6 +116,8 @@ pub struct ProxyRequestHead {
     /// Request a WebSocket upgrade (GET, no body) on a route signed
     /// `allow_upgrade`.
     pub upgrade: bool,
+    /// The caller's user-key proof, or none (an account-less caller).
+    pub user_pop: Option<UserPop>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -137,7 +152,7 @@ pub fn decode_proxy_request_head(bytes: &[u8]) -> Result<ProxyRequestHead, Strin
 }
 
 pub fn validate_proxy_request_head(head: &ProxyRequestHead) -> Result<(), String> {
-    validate_account_id(&head.account_id)?;
+    validate_account_number(head.account_id)?;
     head.name.validate()?;
     if head.revision == 0 {
         return Err("gateway proxy: revision starts at 1".into());
@@ -280,17 +295,15 @@ pub fn header_value<'a>(headers: &'a [ProxyHeader], name: &str) -> Option<&'a st
         .map(|index| headers[index].value.as_str())
 }
 
-pub fn audience_allows(
-    audience: &RouteAudience,
-    owner_account: &[u8],
-    caller_account: &[u8],
-) -> bool {
+/// `caller` is the account the request's user proof resolved to, or `None`
+/// for a mesh peer that proved no user key. `Network` admits either.
+pub fn audience_allows(audience: &RouteAudience, owner: u64, caller: Option<u64>) -> bool {
     match audience {
-        RouteAudience::Owner => caller_account == owner_account,
-        RouteAudience::Network => !caller_account.is_empty(),
-        RouteAudience::Accounts { account_ids } => account_ids
-            .binary_search_by(|account| account.as_slice().cmp(caller_account))
-            .is_ok(),
+        RouteAudience::Owner => caller == Some(owner),
+        RouteAudience::Network => true,
+        RouteAudience::Accounts { account_ids } => {
+            caller.is_some_and(|caller| account_ids.binary_search(&caller).is_ok())
+        }
     }
 }
 
@@ -319,9 +332,8 @@ mod tests {
     fn record() -> RouteRecord {
         RouteRecord {
             statement: RouteStatement {
-                version: 1,
                 chain_id: "test".into(),
-                account_id: vec![1; 32],
+                account_id: 1,
                 name: RouteName::named("api"),
                 publisher_node: vec![2; 32],
                 revision: 7,
@@ -347,7 +359,7 @@ mod tests {
     #[test]
     fn invocation_is_record_method_revision_and_header_scoped() {
         let head = ProxyRequestHead {
-            account_id: vec![1; 32],
+            account_id: 1,
             name: RouteName::named("api"),
             revision: 7,
             method: RouteMethod::Post,
@@ -358,6 +370,11 @@ mod tests {
             }],
             body_len: 12,
             upgrade: false,
+            user_pop: Some(UserPop {
+                key: vec![5; 32],
+                ts: 1_700_000_000,
+                sig: vec![6; 64],
+            }),
         };
         let encoded = encode_proxy_request_head(&head).unwrap();
         assert_eq!(decode_proxy_request_head(&encoded).unwrap(), head);
@@ -380,7 +397,7 @@ mod tests {
     #[test]
     fn request_head_requires_the_upgrade_verdict() {
         let mut value = serde_json::to_value(ProxyRequestHead {
-            account_id: vec![1; 32],
+            account_id: 1,
             name: RouteName::named("api"),
             revision: 7,
             method: RouteMethod::Get,
@@ -388,10 +405,30 @@ mod tests {
             headers: Vec::new(),
             body_len: 0,
             upgrade: false,
+            user_pop: None,
         })
         .unwrap();
         value.as_object_mut().unwrap().remove("upgrade");
         assert!(decode_proxy_request_head(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_head_without_a_user_pop_decodes_as_an_account_less_caller() {
+        let mut value = serde_json::to_value(ProxyRequestHead {
+            account_id: 1,
+            name: RouteName::named("api"),
+            revision: 7,
+            method: RouteMethod::Get,
+            path_and_query: "/".into(),
+            headers: Vec::new(),
+            body_len: 0,
+            upgrade: false,
+            user_pop: None,
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("user_pop");
+        let head = decode_proxy_request_head(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(head.user_pop, None);
     }
 
     #[test]
@@ -477,24 +514,26 @@ mod tests {
 
     #[test]
     fn audience_is_separate_from_global_name_resolution() {
-        let owner = vec![1; 32];
-        let bob = vec![2; 32];
-        assert!(audience_allows(&RouteAudience::Owner, &owner, &owner));
-        assert!(!audience_allows(&RouteAudience::Owner, &owner, &bob));
-        assert!(audience_allows(&RouteAudience::Network, &owner, &bob));
-        assert!(audience_allows(
-            &RouteAudience::Accounts {
-                account_ids: vec![bob.clone()]
-            },
-            &owner,
-            &bob
-        ));
+        let owner = 1;
+        let bob = 2;
+        assert!(audience_allows(&RouteAudience::Owner, owner, Some(owner)));
+        assert!(!audience_allows(&RouteAudience::Owner, owner, Some(bob)));
+        assert!(!audience_allows(&RouteAudience::Owner, owner, None));
+        // any mesh peer, proven account or not.
+        assert!(audience_allows(&RouteAudience::Network, owner, Some(bob)));
+        assert!(audience_allows(&RouteAudience::Network, owner, None));
+        let explicit = RouteAudience::Accounts {
+            account_ids: vec![bob],
+        };
+        assert!(audience_allows(&explicit, owner, Some(bob)));
+        assert!(!audience_allows(&explicit, owner, Some(owner)));
+        assert!(!audience_allows(&explicit, owner, None));
     }
 
     #[test]
-    fn caller_cannot_forge_a_huge_body_len() {
+    fn caller_cannot_forge_a_huge_body_len_or_the_zero_account() {
         let head = ProxyRequestHead {
-            account_id: vec![1],
+            account_id: 1,
             name: RouteName::apex(),
             revision: 1,
             method: RouteMethod::Post,
@@ -502,10 +541,12 @@ mod tests {
             headers: vec![],
             body_len: MAX_REQUEST_BODY_BYTES + 1,
             upgrade: false,
+            user_pop: None,
         };
         assert!(validate_proxy_request_head(&head).is_err());
         let mut json = serde_json::to_value(&head).unwrap();
-        json["account_id"] = serde_json::json!(vec![1; crate::MAX_ACCOUNT_ID_BYTES + 1]);
+        json["body_len"] = serde_json::json!(0);
+        json["account_id"] = serde_json::json!(0);
         assert!(decode_proxy_request_head(&serde_json::to_vec(&json).unwrap()).is_err());
     }
 }

@@ -183,32 +183,6 @@ fn the_host_synthesizes_a_module_origin_in_exactly_one_place() {
     );
 }
 
-/// Nothing constructs an `sdk::Relay`. It was the continuation's identity
-/// slot; with the lane gone `Ctx::relay()` is `None` on every dispatch,
-/// always. The type survives only because a `crates/modules/` forwarder
-/// (`runs/src/module_impl.rs`) still names it — deleting that is a genesis
-/// flag day, so it is a separate PR. Until then this pins the type as
-/// unconstructable: a `Relay { .. }` anywhere in the kernel means the lane is
-/// being rebuilt.
-#[test]
-fn nothing_constructs_a_relay() {
-    for crate_name in ["sdk", "host", "node"] {
-        let src = kernel(crate_name);
-        let hits: Vec<String> = src
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| line.contains("Relay {") && !line.contains("pub struct Relay {"))
-            .map(|(n, line)| format!("  {crate_name}/src/lib.rs:{} {}", n + 1, line.trim()))
-            .collect();
-        assert!(
-            hits.is_empty(),
-            "an sdk::Relay is being constructed — the continuation lane is \
-             coming back:\n{}",
-            hits.join("\n"),
-        );
-    }
-}
-
 /// `encode_frame` must not regrow a continuation parameter: the composer is
 /// the other half of the lane, and a frame carries one op.
 #[test]

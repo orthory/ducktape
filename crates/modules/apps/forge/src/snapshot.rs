@@ -32,18 +32,17 @@
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use std::io::Write as _;
 
-use git2::Oid;
 use sdk::{Error, StateRoot};
 use sha2::{Digest as _, Sha256};
 
 use crate::codec::{self, Reader};
 use crate::git;
+use crate::module::{CachedPack, FORGE_SNAPSHOT_MAGIC, Forge, SNAPSHOT_CACHE_FILE, SnapshotCache};
+use crate::norm_repo;
+use crate::oid::{OID_RAW_LEN, Oid};
 use crate::refs::{RepoState, full_ref, norm_branch, open_or_init_repo};
+use crate::state::compose_state_root;
 use crate::tracker::Tracker;
-use crate::{
-    CachedPack, FORGE_SNAPSHOT_MAGIC, Forge, SNAPSHOT_CACHE_FILE, SnapshotCache,
-    compose_state_root, norm_repo,
-};
 
 /// Latest-only node-local pack memo:
 /// `FGC1 ++ repo-count ++ (name, refs/pending-key, pack)* ++ sha256(preceding)`.
@@ -82,6 +81,7 @@ impl Forge {
         // checkpoint calls this every `checkpoint_blocks` blocks on its select
         // loop; see [`SnapshotCache`] for the measurement and what it starved.
         let born: Vec<(&str, &RepoState)> = self
+            .state
             .repos
             .iter()
             .filter(|(_, s)| !s.refs.is_empty())
@@ -126,11 +126,12 @@ impl Forge {
             codec::put_bytes(&mut out, &pack.bytes);
         }
         cache.packs.retain(|name, _| {
-            self.repos
+            self.state
+                .repos
                 .get(name)
                 .is_some_and(|state| !state.refs.is_empty())
         });
-        codec::put_bytes(&mut out, &self.tracker.canonical_bytes());
+        codec::put_bytes(&mut out, &self.state.tracker.canonical_bytes());
 
         let current_keys = cache.keys();
         let disk_has_current_keys = cache.persisted_keys.as_ref() == Some(&current_keys);
@@ -168,11 +169,11 @@ impl Forge {
         SNAPSHOT_PACK_BUILDS.with(|builds| builds.set(builds.get() + 1));
 
         let repo = open_or_init_repo(&self.base, name)?;
-        let heads: Vec<Oid> = state
+        let heads: Vec<git2::Oid> = state
             .refs
             .iter()
             .filter(|(branch, _)| !state.pending().contains_key(*branch))
-            .map(|(_, oid)| *oid)
+            .map(|(_, oid)| git2::Oid::from(*oid))
             .collect();
         git::pack_closure_many(&repo, &heads).map_err(|error| Error::Module(error.to_string()))
     }
@@ -208,6 +209,7 @@ impl Forge {
             let pack = reader.take(pack_len).ok()?;
             disk_keys.push((name.clone(), key));
             let current_key = self
+                .state
                 .repos
                 .get(&name)
                 .filter(|state| !state.refs.is_empty())
@@ -227,6 +229,7 @@ impl Forge {
             return None;
         }
         let current_keys: Vec<_> = self
+            .state
             .repos
             .iter()
             .filter(|(_, state)| !state.refs.is_empty())
@@ -320,8 +323,7 @@ impl Forge {
             for _ in 0..ref_count {
                 let branch = r.str_()?;
                 norm_branch(&branch)?;
-                let oid = Oid::from_bytes(r.take(git::OID_RAW_LEN)?)
-                    .map_err(|e| Error::Module(e.to_string()))?;
+                let oid = Oid::from_bytes(r.take(OID_RAW_LEN)?)?;
                 if oid.is_zero() {
                     return Err(Error::Module(format!(
                         "forge snapshot: branch {branch} of {name} carries a zero oid"
@@ -384,7 +386,8 @@ impl Forge {
                 if parsed_repo.pending.contains_key(branch) {
                     continue;
                 }
-                git::verify_closure(&repo, *oid).map_err(|e| Error::Module(e.to_string()))?;
+                git::verify_closure(&repo, (*oid).into())
+                    .map_err(|e| Error::Module(e.to_string()))?;
             }
         }
 
@@ -392,7 +395,7 @@ impl Forge {
         // unbind every currently-committed branch the snapshot drops (durably,
         // so a restart re-adopt can't resurrect it) — dropped repos AND dropped
         // branches of surviving repos.
-        for (name, state) in &self.repos {
+        for (name, state) in &self.state.repos {
             if state.refs.is_empty() {
                 continue;
             }
@@ -415,16 +418,16 @@ impl Forge {
                 if parsed_repo.pending.contains_key(branch) {
                     continue;
                 }
-                git::update_ref(&repo, &full_ref(branch), *oid)
+                git::update_ref(&repo, &full_ref(branch), (*oid).into())
                     .map_err(|e| Error::Module(e.to_string()))?;
             }
             let mut state = RepoState::with_refs(parsed_repo.refs);
             state.adopt_pending(parsed_repo.pending);
             new_repos.insert(name, state);
         }
-        self.repos = new_repos;
-        self.tracker = tracker;
-        self.staged_tracker = None;
+        self.state.repos = new_repos;
+        self.state.tracker = tracker;
+        self.state.staged_tracker = None;
         self.persist_tracker()?;
         self.persist_pending()?;
         Ok(())

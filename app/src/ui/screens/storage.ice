@@ -7,9 +7,10 @@
 // props, interaction-local state stays here, and only application effects leave
 // as named events.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64)
   lifetime retained
   emits
+    open_message_link(str)
     fs_open_dir(str)
     fs_open_file(str)
     fs_open_parent()
@@ -37,10 +38,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
     // belong to the directory you left. The crumb has already moved, so
     // `0 files · 1 dir` beside it would be the OLD directory's tally
     // printed under the NEW directory's name.
-    CrumbBar
-      with
-        path
-        meta=fs_counts_summary(connected, listed, entries)
+    CrumbBar #crumb path meta=fs_counts_summary(connected, listed, entries)
       forward
         fs_open_dir
     // WHERE THE WRITE CONTROLS LIVE — decided here, once. The artifact's
@@ -65,15 +63,12 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
         button -> emit(fs_open_parent)
           with
             label="Parent directory"
-            disabled=(loading || empty(path))
+            disabled=(loading || path == "/")
             w=26.0
             h=26.0
             p=0.0
             @icon_action
-          text "↑"
-            with
-              size=12.5
-              font=ui
+          text "↑" size=12.5 font=ui
           active bg=surface text=muted border=card_line border-w=1.0 r=7.0
           hovered bg=elevated text=fg
           pressed bg=subtle
@@ -259,7 +254,11 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
         // crumb bar and the write bar above stay — they are how the reader
         // gets back out.
         if !connected
-          box w=fill h=fill p=22.0
+          box
+            with
+              w=fill
+              h=fill
+              p=22.0
             EmptyState
               with
                 title="Not connected"
@@ -426,7 +425,7 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                             size=12.5
                             wrap=none
                             @text-caption
-                      if !preview_binary && !editing && !preview_truncated
+                      if !preview_binary && !preview_picture && !editing && !preview_truncated
                         button "Edit" -> emit(fs_begin_edit)
                           with
                             h=22.0
@@ -478,17 +477,30 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
                                   size=12.0
                                   font=code
                                   @text-meta
-                            if !preview_binary
-                              text preview_text
+                            // The same split the forge reader makes: a
+                            // Markdown path reads as a document through the
+                            // shell's `agent_markdown`, any other text as
+                            // numbered, syntect-coloured rows through
+                            // `forge_code`. Binary-or-text is the wire's
+                            // call; markdown-vs-code is the path's.
+                            // A picture draws from the Files surface's slot
+                            // (`picture.rs`); its caption is the drawn size.
+                            if preview_picture
+                              extern picture("files", preview_path) #fs-picture
+                              text picture_caption(preview_width, preview_height)
                                 with
                                   size=12.0
-                                  font=code
-                                  @text-fg
+                                  wrap=none
+                                  @text-meta
+                            if !preview_binary && !preview_picture && markdown_path(preview_path)
+                              lazy preview_text by preview_text, preview_path, dark as cached_doc
+                                extern agent_markdown(cached_doc, dark) #fs-markdown -> emit(open_message_link, _)
+                            if !preview_binary && !preview_picture && !markdown_path(preview_path)
+                              lazy preview_text by preview_text, preview_path, dark as cached_source
+                                extern forge_code(cached_source, preview_path, dark) #fs-code
       if connected
         if !empty(preview_entry.path)
-          ObjectPanel
-            with
-              entry=preview_entry
+          ObjectPanel entry=preview_entry
 
 component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks:[ExplorerBlock], ops:[ExplorerOp], head:i64, sync_line:str)
   lifetime retained
@@ -503,6 +515,13 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
     partial = ""
     searching = false
     selected:i64 = 0
+    // THE STRING THE ZERO-HIT PLATE IS SPEAKING FOR — the query a search was
+    // actually SENT for, `""` while no answer stands. Not a flag: this box is
+    // ENTER-TO-SUBMIT and two-way bound with no `change=` route, so a keystroke
+    // writes `query` and runs no handler at all — only `trim(query) ==
+    // sent_query` can retire the plate as the reader types (the same class
+    // `page_search_query` carries on pages).
+    sent_query = ""
   on explorer_search_submit(rpc, online)
     let blocked = !online || searching || empty(trim(query))
     return if blocked
@@ -511,7 +530,10 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
     kinds = []
     partial = ""
     kind = "all"
-    run replace lane=workspace_search search_workspace(rpc, trim(query)) -> explorer_results_loaded _
+    // Captured at the last place the draft and the string being sent are known
+    // to match — and sent from here, so the two cannot drift apart.
+    sent_query = trim(query)
+    run replace lane=workspace_search search_workspace(rpc, sent_query) -> explorer_results_loaded _
   on explorer_results_loaded(next)
     hits = next.hits
     kinds = next.kinds
@@ -525,6 +547,7 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
     partial = ""
     kind = "all"
     searching = false
+    sent_query = ""
   on pick_explorer_kind(next)
     kind = next
   on select_explorer_block(height)
@@ -763,7 +786,12 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
       // "Nothing matched" is a claim about the WORKSPACE, and only the sources
       // that answered can support it. With `partial` standing, the banner above
       // already says why the screen is empty.
-      if connected && empty(hits) && !searching && !empty(trim(query)) && empty(partial)
+      //
+      // ON THE QUERY THAT WAS SENT, NOT ON THE ONE IN THE BOX: keyed on the
+      // live draft, one more keystroke after a zero-hit answer re-aimed this
+      // sentence at a string the node was never asked about.
+      // `search_answer_stands` is that comparison, shared with pages and chat.
+      if connected && empty(hits) && empty(partial) && search_answer_stands(sent_query, query, searching)
         EmptyPlate message="Nothing matched that query in this workspace." #explorer-nothing-matched
       // NOT CONNECTED IS NOT EMPTY. `connected` already disables the query box
       // above; the ledger below it still asserted "No blocks yet" off a node
@@ -813,10 +841,7 @@ component ExplorerScreen(connected_rpc:str, connected:bool, loading:bool, blocks
                   pr=10.0
                   gap=1.0
                 for block in blocks
-                  ExplorerBlockRow
-                    with
-                      block
-                      selected=(block.height == selected)
+                  ExplorerBlockRow block selected=(block.height == selected)
                     events
                       select_explorer_block -> select_explorer_block _
           box

@@ -5,8 +5,7 @@
 
 use std::path::PathBuf;
 
-use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{Signer as _, ed25519};
+use commonware_cryptography::Signer as _;
 
 use crate::cli_args::{
     AdmitArgs, InitArgs, InviteArgs, JoinCmd, JoinQuery, KeyArgs, MemberCmd, OpCmd, PubkeyArgs,
@@ -34,7 +33,48 @@ pub(super) fn run(op: OpCmd) -> CommandResult {
         OpCmd::Resident(cmd) => dispatch_resident(cmd),
         OpCmd::Member(cmd) => dispatch_member(cmd),
         OpCmd::Work(cmd) => dispatch_work(cmd),
+        OpCmd::Sandbox(args) => crate::sandbox_cli::run(args),
+        OpCmd::LogFilter(args) => cmd_log_filter(args),
     }
+}
+
+/// `ducktape node log-filter <FILTER>` — retune a RUNNING node's tracing
+/// filter, signed.
+///
+/// This verb exists because `POST /v1/log-filter` mutates the process and so
+/// requires a user signature (`noded::signed_req`), which `curl` cannot mint.
+/// The node key the signature is bound to comes from the node ITSELF
+/// (`/v1/status`), not from a local workspace, so `--node <url>` works against
+/// a node this host holds no config for.
+fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
+    let ctx = crate::cred_cli::VerbCtx {
+        addr: args.addr,
+        key: args.key,
+    };
+    let base = ctx.http_base()?;
+    let node_key = crate::node_http::node_public_key(&base)?;
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let signer = crate::userkey_cli::load_user_signer(&ctx.key_path()?, &mut stdin)?;
+
+    const PATH: &str = "/v1/log-filter";
+    let body = args.filter.into_bytes();
+    let mut request = reqwest::blocking::Client::new()
+        .post(format!("{base}{PATH}"))
+        .body(body.clone());
+    for (name, value) in noded::signed_req::request_headers(&signer, "POST", PATH, &node_key, &body)
+    {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .map_err(|error| crate::node_http::transport_failure(PATH, &error).to_string())?;
+    let status_code = response.status();
+    let text = response.text().unwrap_or_default();
+    if !status_code.is_success() {
+        return Err(format!("{PATH} rejected ({status_code}): {text}").into());
+    }
+    println!("{text}");
+    Ok(())
 }
 
 fn dispatch_work(cmd: WorkCmd) -> CommandResult {
@@ -55,9 +95,9 @@ fn work_workspace(selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Er
         .to_path_buf())
 }
 
-/// `anyone` is the literal, everything else is an account (hex id or display
-/// name — the same resolution `user cred grant` takes). A hex id resolves
-/// offline; a display name needs the node to answer.
+/// `anyone` is the literal, everything else is an account (a number or a
+/// display name — the same resolution `user cred grant` takes). A number
+/// resolves offline; a display name needs the node to answer.
 fn resolve_work_target(
     workspace: &std::path::Path,
     input: &str,
@@ -66,7 +106,7 @@ fn resolve_work_target(
         return Ok(AdmitTarget::Anyone);
     }
     let base = config::http_base_in(workspace)?;
-    Ok(AdmitTarget::Account(crate::cred_cli::resolve_account(
+    Ok(AdmitTarget::Account(crate::account_cli::resolve_account(
         &base, input,
     )?))
 }
@@ -74,16 +114,16 @@ fn resolve_work_target(
 fn cmd_work_list(args: SelectorArgs) -> CommandResult {
     let workspace = work_workspace(&args.selector)?;
     match work_admission::load(&workspace)? {
-        WorkAdmission::Owner => {
-            println!("owner only — this node runs its owner's work and its own submissions")
-        }
         WorkAdmission::Anyone => {
             println!("anyone — every network member may run a workload on this node")
         }
         WorkAdmission::Accounts(accounts) => {
-            println!("owner, plus {} admitted account(s):", accounts.len());
+            println!(
+                "this node's own submissions, plus {} admitted account(s):",
+                accounts.len()
+            );
             for account in &accounts {
-                println!("  {}", hex_bytes(account));
+                println!("  {account}");
             }
         }
     }
@@ -111,7 +151,7 @@ fn cmd_work_admit(args: WorkTargetArgs) -> CommandResult {
             );
             println!("admitted: anyone");
         }
-        AdmitTarget::Account(account) => println!("admitted: {}", hex_bytes(&account)),
+        AdmitTarget::Account(account) => println!("admitted: {account}"),
     }
     Ok(())
 }
@@ -125,14 +165,16 @@ fn cmd_work_revoke(args: WorkTargetArgs) -> CommandResult {
     let narrowing_one_from_anyone =
         current == WorkAdmission::Anyone && !matches!(target, AdmitTarget::Anyone);
     if narrowing_one_from_anyone {
-        return Err("this node admits anyone, so revoking one account changes nothing — \
+        return Err(
+            "this node admits anyone, so revoking one account changes nothing — \
                     run `ducktape node work revoke anyone` first"
-            .into());
+                .into(),
+        );
     }
     work_admission::save(&workspace, &current.without(target.clone()))?;
     match target {
         AdmitTarget::Anyone => println!("revoked: anyone"),
-        AdmitTarget::Account(account) => println!("revoked: {}", hex_bytes(&account)),
+        AdmitTarget::Account(account) => println!("revoked: {account}"),
     }
     Ok(())
 }
@@ -214,48 +256,7 @@ fn cmd_node_status(args: StatusArgs) -> CommandResult {
     };
     let root_hash = status["root_hash"].as_str().unwrap_or("");
     println!("height={height} root_hash={root_hash}");
-    // WHOSE node this is — the fact `user cred grant <account>`, `node work
-    // admit <account>` and `agent sched --host-node` all stand on, and the one
-    // an operator otherwise had to hand-write a `/v1/query` `OfNode` for.
-    // Prose only: `--json` is the rpc's status document verbatim and stays a
-    // byte-for-byte contract.
-    println!(
-        "{}",
-        account_line(&rpc_addr, resolved.signer.public_key().as_ref())
-    );
     Ok(())
-}
-
-/// The `account=` line under `node status`: this node's own account, named.
-///
-/// Best-effort, and quiet about its own failures on purpose: the node's tip is
-/// the answer `status` promises, and a chain that cannot serve an identity read
-/// must not turn a working status into an error. An UNBOUND node is not a
-/// failure at all — it is the ordinary state between `node run` and
-/// `user account-init`, and the only state with a next step worth printing.
-///
-/// `node_key` comes from the workspace this verb already resolved, NOT from the
-/// rpc status document — which carries height, root hash and module roots and
-/// has never named the node. Asking the running process would be the stricter
-/// source, but this verb opened `identity.key` two lines up to find the rpc
-/// address at all, so there is no new exposure to buy with the round trip.
-fn account_line(rpc_addr: &str, node_key: &[u8]) -> String {
-    let query = identity::encode_query(&identity::IdentityQuery::OfNode {
-        node_key: node_key.to_vec(),
-    });
-    let Ok(view) = rpc_query(rpc_addr, "identity", &query)
-        .and_then(|bytes| identity::decode_reply(&bytes).map_err(|e| e.to_string()))
-    else {
-        return "account=unknown (the identity module did not answer)".into();
-    };
-    let identity::IdentityReply::Account(Some(account)) = view else {
-        return "account=none — claim one with: ducktape user account-init --name <you>".into();
-    };
-    let id = hex_bytes(&account.account_id);
-    match account.display_name {
-        Some(name) => format!("account={name} ({})", id.get(..16).unwrap_or(&id)),
-        None => format!("account={id}"),
-    }
 }
 
 /// `peers [--config <path> | -n <chain-id>] [--json]` — the RUNNING node's
@@ -315,6 +316,15 @@ fn peer_line(
     if let Some(role) = &peer.role {
         line.push_str(&format!(" role={role}"));
     }
+    // always rendered, `unknown` included: a column that vanished when the
+    // stamp was missing would read as "same build as ours", which is exactly
+    // the silence the skew diagnostic exists to break.
+    line.push_str(&format!(
+        " build={}",
+        peer.build
+            .as_deref()
+            .unwrap_or(noded::services::UNKNOWN_BUILD)
+    ));
     match peer.connected_since_ms {
         Some(since) => {
             let for_secs = second.sampled_at_ms.saturating_sub(since) / 1000;
@@ -393,68 +403,59 @@ fn cmd_keygen(args: KeyArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// the platform's compute adapter — podman on Linux, tart on macOS — as the
-/// `[sandbox]` table generation writes (`0` = probe the host at boot) plus
-/// the probeable backend, so generation and detection share one choice.
-fn platform_sandbox() -> (config::SandboxToml, provider_host::SandboxBackend) {
-    let (runtime, image, backend) = if cfg!(target_os = "macos") {
-        ("tart", config::DEFAULT_TART_IMAGE, provider_host::SandboxBackend::Tart {
-            image: config::DEFAULT_TART_IMAGE.into(),
-        })
-    } else {
-        // the socket is left empty here: `platform_sandbox` only writes the
-        // default [sandbox] TOML at `node init`; the real socket is named by
-        // `resolve_sandbox` from the workspace when the node actually boots.
-        ("podman", config::DEFAULT_PODMAN_IMAGE, provider_host::SandboxBackend::Podman {
-            image: config::DEFAULT_PODMAN_IMAGE.into(),
-            socket: std::path::PathBuf::new(),
-        })
-    };
-    let table = config::SandboxToml {
-        runtime: runtime.into(),
-        image: image.into(),
-        cores: 0,
-        mem_gb: 0,
-    };
-    (table, backend)
-}
-
-/// fresh-workspace compute detection (`init`, `join`): the platform adapter's
-/// runtime binary on PATH ⇒ a live `[sandbox]` table, with a stderr note;
-/// absent ⇒ `None` (today's commented example).
+/// fresh-workspace compute detection with the operator note (`init`; `join`
+/// says it from the library's answer). The probe and the table it writes come
+/// from `config::platform_sandbox`, so a host can never be probed for one thing
+/// and configured for another.
 ///
 /// The table says only HOW runs would be isolated on this host — it grants
 /// nothing. Whether this node runs a compute service at all is the user's
-/// `ducktape service enable compute`, so detection can stay eager: it makes
-/// the interactive terminal plane work out of the box and leaves the compute
-/// plane dark until someone consents to it.
+/// `ducktape service enable compute`, so detection can stay eager: it makes the
+/// interactive terminal plane work out of the box and leaves the compute plane
+/// dark until someone consents to it.
 fn detect_platform_sandbox() -> Option<config::SandboxToml> {
-    let (table, backend) = platform_sandbox();
-    let Ok(runtime_path) = backend.probe() else {
-        return None;
-    };
+    let (table, found) = config::detect_platform_sandbox()?;
     eprintln!(
         "compute plane: {} found at {} — writing a live [sandbox] table \
          (announce stays off; delete the table for a consensus-only node)",
         table.runtime,
-        runtime_path.display()
+        found.display()
     );
     Some(table)
 }
 
-/// `init --name <human name> [--dir <dir>] [--listen a] [--advertised a] [--http a]
-/// [--rpc a] [--primary-coordinator host:port|none]
+/// `init --name <human name> [--dir <dir>] [--modules <dir>] [--listen a]
+/// [--advertised a] [--http a] [--rpc a] [--primary-coordinator host:port|none]
 /// [--wireguard-listen a] [--wireguard-advertised host:port] [--invite-listen a]`
 /// — found a network: mint the chain-id, write the descriptor + node config,
-/// seed the genesis validator set with this identity. Every flag is optional:
-/// the generated config defaults to a WORKING node (mesh `[::]:52200`,
-/// overlay advertise, HTTP 8844, RPC 8845, gateway, WireGuard 51820) and
-/// prints every key, so the file itself documents what to change. without
-/// `--dir` the workspace lands in the registry
+/// seed the genesis validator set with this identity, and PIN the genesis wasm
+/// set — every component in `--modules` is hashed into the descriptor and
+/// copied into `<workspace>/modules`. Every flag is optional:
+/// the generated config defaults to a WORKING node — overlay advertise, and
+/// every listener at its `config::DEFAULT_*_LISTEN` constant (mesh, HTTP,
+/// RPC, gateway, WireGuard), which is the one place those ports are written
+/// down — and prints every key, so the file itself documents what to change.
+/// without `--dir` the workspace lands in the registry
 /// (`~/.ducktape/workspaces/<chain-id>/`), where `-n <chain-id>` finds it.
 fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let name = &args.name;
     let explicit_dir = args.dir.is_some();
+    // the genesis wasm set. founding PINS it: every component is hashed into
+    // the descriptor (those hashes are IN the genesis fingerprint, so a node
+    // built against other bytes is a different network) and the same bytes are
+    // seeded into `<workspace>/modules` below.
+    //
+    // FIRST, before any directory is created: an absent or incomplete bundle is
+    // the one refusal that has nothing to do with the flags, and a founding
+    // that dies after `create_dir_all` leaves an orphan workspace holding a
+    // freshly minted `identity.key` behind on every attempt.
+    let modules_src = match args.modules {
+        Some(src) => src,
+        None => config::modules_dir()?,
+    };
+    let wasm_ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
+    let hashes = config::hash_bundle(&modules_src, &wasm_ids)
+        .map_err(|e| format!("{e} — pass --modules <dir> holding every <id>.component.wasm"))?;
     // the workspace dir: `--dir` is the explicit escape hatch; the default is
     // the registry — `~/.ducktape/workspaces/<chain-id>/` — so the network is
     // addressable by `-n <chain-id>` (run/invite/list) from the moment it is
@@ -519,14 +520,27 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         plumbing.sandbox = detect_platform_sandbox();
     }
 
+    // seed the bundle the node boots from: the SAME bytes just hashed.
+    seed_bundle(&dir, &modules_src, hashes.keys())?;
+    let mut modules = Vec::with_capacity(hashes.len());
+    for (id, hash) in &hashes {
+        // ids come from the topology today, but the descriptor codec's
+        // delimiter rule is enforced at every entry point — this is one.
+        config::validate_module_id(id)?;
+        modules.push(config::ModuleCode {
+            id: id.clone(),
+            code_hash: hex_bytes(hash),
+        });
+    }
+
     let me = key.public_key();
     let mut descriptor = config::NetworkDescriptor {
         chain_id: chain_id.clone(),
-        scheme: config::SCHEME_ED25519.into(),
         validators: vec![hex_bytes(me.as_ref())],
         bootstrap: Vec::new(),
         reach: Vec::new(),
         coordination: None,
+        modules,
     };
     if let Some(addr) = config::dialable(Some(&plumbing.advertised), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -542,6 +556,11 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         hex_bytes(me.as_ref())
     );
     eprintln!("network {chain_id} initialized in {}", dir.display());
+    eprintln!(
+        "modules: {} components bundled from {}",
+        descriptor.modules.len(),
+        modules_src.display()
+    );
     // a registry-default workspace is addressable by chain id; an explicit
     // --dir may live outside the registry, so its hints stay path-based.
     let selector = match explicit_dir {
@@ -551,6 +570,72 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("start:  ducktape node run {selector}");
     eprintln!("invite: ducktape node invite {selector}");
     println!("{chain_id}");
+    Ok(())
+}
+
+/// copy every component in `ids` from `src` into `<dir>/modules`, under the
+/// names the boot path reads (`<workspace>/modules/<id>.component.wasm`).
+///
+/// `src == <dir>/modules` — the flow init's "delete the file to re-found"
+/// refusal invites — makes source and destination the same file, and
+/// `std::fs::copy(p, p)` returns `Ok(0)` after TRUNCATING it. Those bytes are
+/// already where they belong, so the copy has nothing to do. Both paths exist
+/// by here (the bundle dir was just created, the source was just hashed), so
+/// neither `canonicalize` can fail into a false match.
+fn seed_bundle<'a>(
+    dir: &std::path::Path,
+    src: &std::path::Path,
+    ids: impl IntoIterator<Item = &'a String>,
+) -> std::io::Result<()> {
+    let bundle = dir.join("modules");
+    std::fs::create_dir_all(&bundle)?;
+    let bundle_is_the_source = src.canonicalize().ok() == bundle.canonicalize().ok();
+    if bundle_is_the_source {
+        return Ok(());
+    }
+    for id in ids {
+        std::fs::copy(
+            config::component_path(src, id),
+            config::component_path(&bundle, id),
+        )?;
+    }
+    Ok(())
+}
+
+/// a MEMBER boots straight into genesis, where `genesis_host` refuses a
+/// missing component and there is no peer to fetch one from — so a `join`
+/// that lands this identity in the validator set seeds `<dir>/modules` from
+/// the managed modules dir, every component verified against the descriptor's
+/// hash first. A non-member joiner keeps no bundle: its statesync fetches the
+/// genesis components off the mesh.
+fn bundle_member_genesis(dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let descriptor = config::NetworkDescriptor::load(&dir.join("network.toml"))?;
+    let want = descriptor.module_hashes()?;
+    let src = config::modules_dir()?;
+    let remedy = format!(
+        "a member boots from its own genesis bundle: fill {} with `make install-node`, or \
+         point $DUCKTAPE_MODULES_DIR at a directory holding this network's components, \
+         then re-run `join`",
+        src.display()
+    );
+    let ids: Vec<&str> = want.keys().map(String::as_str).collect();
+    let have = config::hash_bundle(&src, &ids).map_err(|e| format!("{e} — {remedy}"))?;
+    for (id, hash) in &want {
+        let is_the_genesis_component = have.get(id) == Some(hash);
+        if !is_the_genesis_component {
+            return Err(format!(
+                "module {id} in {} is not this network's genesis component — {remedy}",
+                src.display()
+            )
+            .into());
+        }
+    }
+    seed_bundle(dir, &src, want.keys())?;
+    eprintln!(
+        "modules: {} components bundled from {}",
+        want.len(),
+        src.display()
+    );
     Ok(())
 }
 
@@ -564,20 +649,91 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// (governance `Redeem`) — no member approval step follows. an invite grants
 /// RESIDENT standing only; submitting ops needs no invite at all.
 fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
-    // every invite is BEARER (the targeted form was dropped — see the join
-    // ADR): there is no `--target` — whoever redeems the single-use token
-    // first wins. the invite is the admission credential itself, kept off the
-    // wire by the sealed first-contact intro.
-    let ttl_days: u64 = match args.ttl_days {
-        Some(v) => v,
-        // the operator-friendly onboarding default (a LOST blob is the residual
-        // risk — single-use + sealing cover interception).
-        None => config::DEFAULT_INVITE_TTL_DAYS,
-    };
-    if ttl_days == 0 {
-        return Err("--ttl-days must be at least 1".into());
+    // every invite is BEARER (the targeted form was dropped): there is no
+    // `--target` — whoever redeems the single-use token first wins. the
+    // invite is the admission credential itself, kept off the wire by the
+    // sealed first-contact intro. `--ttl-days` defaults to and is bounded by
+    // `config::{DEFAULT_INVITE_TTL_DAYS, INVITE_TTL_DAYS}` in clap (the same
+    // numbers `/v1/invite` resolves), so the value arrives settled.
+    let (blob, notes) = mint_invite_blob(&args.selector.config_path()?, args.ttl_days)?;
+    for note in notes {
+        eprintln!("[invite] {note}");
     }
-    let cfg_path = args.selector.config_path()?;
+    println!("{blob}");
+    Ok(())
+}
+
+/// What the mint could not do, said once. A note is never a failure — an
+/// invite with no member fronts still admits a joiner through the inviter's own
+/// paths — but it changes what the blob can do, so it must reach SOMEBODY.
+///
+/// It rides back as a value rather than being printed here because this core
+/// now has two callers with opposite output surfaces: a CLI whose diagnostics
+/// are stderr, and a running daemon where `eprintln!` reaches neither the Logs
+/// tab nor `RUST_LOG`.
+pub(crate) enum InviteNote {
+    /// mesh state exists but names no other member.
+    MeshHasNoOtherMembers(std::path::PathBuf),
+    /// this member has never persisted mesh state.
+    NoMeshStateYet(std::path::PathBuf),
+    /// mesh state is present and unreadable.
+    MeshStateUnreadable(std::path::PathBuf, String),
+}
+
+impl InviteNote {
+    /// the stable snake_case token a log line counts.
+    pub(crate) fn reason(&self) -> &'static str {
+        match self {
+            InviteNote::MeshHasNoOtherMembers(_) => "invite_mesh_has_no_other_members",
+            InviteNote::NoMeshStateYet(_) => "invite_no_mesh_state",
+            InviteNote::MeshStateUnreadable(_, _) => "invite_mesh_state_unreadable",
+        }
+    }
+}
+
+impl std::fmt::Display for InviteNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InviteNote::MeshHasNoOtherMembers(path) => write!(
+                f,
+                "persisted mesh at {} holds no other members — the invite carries only the \
+                 inviter's own paths",
+                path.display()
+            ),
+            InviteNote::NoMeshStateYet(path) => write!(
+                f,
+                "no persisted mesh state at {} — the invite carries no member fronts (only the \
+                 inviter's own paths); mint again once the mesh has peers",
+                path.display()
+            ),
+            InviteNote::MeshStateUnreadable(path, why) => write!(
+                f,
+                "mesh state at {} unreadable ({why}) — the invite carries no member fronts",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// Mint one bearer invite from the workspace `cfg_path` names, answering the
+/// paste blob and whatever the mint could not do.
+///
+/// Public to the crate because the RUNNING daemon mints too: `/v1/invite` is
+/// wired to this at boot (see `boot`), so the desktop app asks the node that
+/// owns these files instead of starting a second process to race it over them.
+pub(crate) fn mint_invite_blob(
+    cfg_path: &std::path::Path,
+    ttl_days: u64,
+) -> Result<(String, Vec<InviteNote>), Box<dyn std::error::Error>> {
+    // the expiry is settled FIRST: a TTL outside the range is refused before
+    // the descriptor below is rewritten for a mint that was never going to happen.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is past the epoch")
+        .as_secs();
+    let expires = config::invite_expiry(now, ttl_days)?;
+    let mut notes = Vec::new();
+    let cfg_path = cfg_path.to_path_buf();
     let (raw, base) = config::load_node_toml(&cfg_path)?;
     let descriptor_path = base.join(&raw.network);
     let mut descriptor = config::NetworkDescriptor::load(&descriptor_path)?;
@@ -669,28 +825,19 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
         Ok(Some(mesh)) => {
             let fronts = config::fronts_from_adverts(&mesh.adverts, &own);
             if fronts.is_empty() {
-                eprintln!(
-                    "[invite] persisted mesh at {} holds no other members — the invite \
-                     carries only the inviter's own paths",
-                    mesh_state_file.display()
-                );
+                notes.push(InviteNote::MeshHasNoOtherMembers(mesh_state_file.clone()));
             }
             fronts
         }
         Ok(None) => {
-            eprintln!(
-                "[invite] no persisted mesh state at {} — the invite carries no member \
-                 fronts (only the inviter's own paths); mint again once the mesh has peers",
-                mesh_state_file.display()
-            );
+            notes.push(InviteNote::NoMeshStateYet(mesh_state_file.clone()));
             Vec::new()
         }
         Err(e) => {
-            eprintln!(
-                "[invite] mesh state at {} unreadable ({e}) — the invite carries no member \
-                 fronts",
-                mesh_state_file.display()
-            );
+            notes.push(InviteNote::MeshStateUnreadable(
+                mesh_state_file.clone(),
+                e.to_string(),
+            ));
             Vec::new()
         }
     };
@@ -705,18 +852,11 @@ fn cmd_invite(args: InviteArgs) -> Result<(), Box<dyn std::error::Error>> {
         .reach
         .retain(|hint| !hint.trim_start().starts_with("coordinated:"));
 
-    let expires = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock is past the epoch")
-        .as_secs()
-        + ttl_days * 24 * 60 * 60;
     // the expiry lives INSIDE the token (signed), not as a separate blob field.
     // every invite is bearer.
-    let token =
-        config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
+    let token = config::mint_invite_token(&key, descriptor.genesis_namespace().as_bytes(), expires);
     let blob_string = config::encode_invite(&invite_descriptor, &token, &wireguard, &fronts, &key)?;
-    println!("{blob_string}");
-    Ok(())
+    Ok((blob_string, notes))
 }
 
 /// `admit <hex pubkey> [--config node.toml]` — pre-genesis membership: add an
@@ -751,7 +891,7 @@ fn cmd_admit(args: AdmitArgs) -> Result<(), Box<dyn std::error::Error>> {
 // ---- resident accept: post-genesis admission over the local rpc -----------
 
 /// one blocking json-lines rpc round-trip against the LOCAL node.
-fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, String> {
+pub(super) fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, String> {
     use std::io::{BufRead as _, BufReader, Write as _};
     // the same calm sentence the http lane gives, for the same condition: an
     // `os error 111` with a port in it is a diagnosis nobody asked for.
@@ -775,7 +915,7 @@ fn rpc_call(addr: &str, req: &serde_json::Value) -> Result<serde_json::Value, St
 }
 
 /// query a module through the rpc; the reply's hex payload, decoded.
-fn rpc_query(addr: &str, target: &str, req: &[u8]) -> Result<Vec<u8>, String> {
+pub(super) fn rpc_query(addr: &str, target: &str, req: &[u8]) -> Result<Vec<u8>, String> {
     let reply = rpc_call(
         addr,
         &serde_json::json!({ "cmd": "query", "target": target, "req_hex": hex_bytes(req) }),
@@ -802,7 +942,7 @@ fn rpc_submit(addr: &str, target: &str, payload: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
+pub(super) fn read_members(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
     let raw = rpc_query(addr, "valset", &encode_query(&ValsetQuery::Validators))?;
     match decode_reply(&raw)? {
@@ -820,31 +960,128 @@ fn read_residents(addr: &str) -> Result<Vec<Vec<u8>>, String> {
     }
 }
 
-fn account_of_node(addr: &str, node_key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+/// the account number `key` belongs to, if any — through `OfKey`, the one
+/// resolver (a node key is never on an account).
+fn account_of_key(addr: &str, key: &[u8]) -> Result<Option<u64>, String> {
     use identity::{IdentityQuery, IdentityReply, decode_reply, encode_query};
     let raw = rpc_query(
         addr,
         "identity",
-        &encode_query(&IdentityQuery::OfNode {
-            node_key: node_key.to_vec(),
-        }),
+        &encode_query(&IdentityQuery::OfKey { key: key.to_vec() }),
     )?;
     match decode_reply(&raw)? {
-        IdentityReply::Account(account) => Ok(account.map(|account| account.account_id)),
-        other => Err(format!("expected Account, got {other:?}")),
+        IdentityReply::Account(account) => Ok(account.map(|account| account.number)),
+        IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            Err("expected an Account reply from identity".into())
+        }
     }
 }
 
-fn proposal_principal(
-    addr: &str,
-    proposal: &governance::ProposalView,
-    node_key: &[u8],
-) -> Result<Vec<u8>, String> {
-    match proposal.voter_kind {
-        governance::VoterKind::ValidatorNode => Ok(node_key.to_vec()),
-        governance::VoterKind::Account => account_of_node(addr, node_key)?
-            .ok_or_else(|| "this node is not bound to an Identity account".into()),
+fn read_shares(addr: &str) -> Result<governance::SharesView, String> {
+    use governance::{GovQuery, GovReply, decode_reply, encode_query};
+    let raw = rpc_query(addr, "governance", &encode_query(&GovQuery::Shares))?;
+    match decode_reply(&raw)? {
+        GovReply::Shares(view) => Ok(view),
+        other => Err(format!("expected Shares, got {other:?}")),
     }
+}
+
+/// WHO signs this node's governance ops, decided ONCE per ceremony from the
+/// mode the module is in. A validator-mode ballot is the node key's, over the
+/// local rpc (the node re-signs). A share-mode ballot is the active user key's
+/// ACCOUNT, and only a user-signed frame can carry that origin — so the key is
+/// unlocked here (password on stdin) and its ops go over the node's http lane
+/// as frames.
+// one per ceremony, on the stack — variant size is noise.
+#[allow(clippy::large_enum_variant)]
+pub(super) enum GovSigner {
+    Node {
+        key: Vec<u8>,
+    },
+    User {
+        key: commonware_cryptography::ed25519::PrivateKey,
+        principal: Vec<u8>,
+        http_base: String,
+    },
+}
+
+impl GovSigner {
+    /// the electorate kind this signer's ballots count under.
+    fn kind(&self) -> governance::VoterKind {
+        match self {
+            GovSigner::Node { .. } => governance::VoterKind::ValidatorNode,
+            GovSigner::User { .. } => governance::VoterKind::Account,
+        }
+    }
+
+    /// the principal a proposal records this signer's ballot under.
+    fn principal(&self) -> &[u8] {
+        match self {
+            GovSigner::Node { key } => key,
+            GovSigner::User { principal, .. } => principal,
+        }
+    }
+
+    /// submit one governance op through this signer's lane (accepted !=
+    /// finalized on the rpc lane — callers poll afterwards).
+    fn submit(&self, rpc_addr: &str, msg: &governance::GovMsg) -> Result<(), String> {
+        let payload = governance::encode_msg(msg);
+        match self {
+            GovSigner::Node { .. } => rpc_submit(rpc_addr, "governance", &payload),
+            GovSigner::User { key, http_base, .. } => crate::node_http::submit_frame(
+                http_base,
+                &crate::userkey_cli::user_frame(key, "governance", payload),
+            )
+            .map(|_height| ())
+            .map_err(|e| e.to_string()),
+        }
+    }
+}
+
+/// resolve the signer for a ceremony on the node at `cfg_path`.
+pub(super) fn gov_signer(
+    rpc_addr: &str,
+    cfg_path: &std::path::Path,
+    resolved: &config::Resolved,
+) -> Result<GovSigner, Box<dyn std::error::Error>> {
+    let shares_govern = read_shares(rpc_addr)?.active;
+    if !shares_govern {
+        return Ok(GovSigner::Node {
+            key: resolved.signer.public_key().as_ref().to_vec(),
+        });
+    }
+    let workspace = cfg_path.parent().unwrap_or(std::path::Path::new("."));
+    let http_base = config::http_base_in(workspace)?;
+    let mut stdin = std::io::BufReader::new(std::io::stdin());
+    let key =
+        crate::userkey_cli::load_user_signer(&keystore::wallet::active_user_key()?, &mut stdin)?;
+    let number = account_of_key(rpc_addr, key.public_key().as_ref())?.ok_or(
+        "shares govern this network and the active user key belongs to no Identity account — \
+         `ducktape account create` first",
+    )?;
+    Ok(GovSigner::User {
+        key,
+        principal: identity::account_principal(number),
+        http_base,
+    })
+}
+
+/// a proposal is decided by the mode frozen when it was opened; a ballot from
+/// the other mode's signer would be refused by the module, so say so here.
+fn require_frozen_kind(
+    proposal: &governance::ProposalView,
+    signer: &GovSigner,
+) -> Result<(), String> {
+    let frozen_kind_matches = proposal.voter_kind == signer.kind();
+    if frozen_kind_matches {
+        return Ok(());
+    }
+    Err(format!(
+        "proposal {} was frozen for {:?} ballots, but this node now governs by {:?} — it cannot vote on it",
+        proposal.proposal_id,
+        proposal.voter_kind,
+        signer.kind()
+    ))
 }
 
 fn proposal_progress(proposal: &governance::ProposalView, members: &[Vec<u8>]) -> (u64, u64, bool) {
@@ -949,12 +1186,19 @@ fn read_proposal(addr: &str, id: &str) -> Result<Option<governance::ProposalView
     }
 }
 
+/// the ceremony's failure when an executed proposal never leaves `Open`: the
+/// target module refused the action inside governance's `Execute` op, so the
+/// op was rejected whole. named so a verb can recognise it and say what the
+/// target's rules are.
+pub(super) const TALLY_SETTLE_TIMEOUT: &str = "timed out waiting for the tally to settle";
+
 /// poll a proposal until `pred` accepts its view, ~30s budget (ops finalize
 /// within a few pump ticks; the budget covers a mesh still forming quorum).
+/// `timed_out` is the whole failure sentence.
 fn poll_proposal(
     addr: &str,
     id: &str,
-    what: &str,
+    timed_out: &str,
     mut pred: impl FnMut(&Option<governance::ProposalView>) -> bool,
 ) -> Result<Option<governance::ProposalView>, String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -964,7 +1208,7 @@ fn poll_proposal(
             return Ok(view);
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("timed out waiting for {what}"));
+            return Err(timed_out.to_string());
         }
         std::thread::sleep(std::time::Duration::from_millis(300));
     }
@@ -974,13 +1218,15 @@ fn cast_yes_once(
     addr: &str,
     proposal_id: &str,
     opened: governance::ProposalView,
-    principal: &[u8],
+    signer: &GovSigner,
 ) -> Result<governance::ProposalView, String> {
-    use governance::{GovMsg, ProposalStatus, encode_msg};
+    use governance::{GovMsg, ProposalStatus};
 
     if opened.status != ProposalStatus::Open {
         return Ok(opened);
     }
+    require_frozen_kind(&opened, signer)?;
+    let principal = signer.principal();
     if opened
         .votes
         .iter()
@@ -989,52 +1235,81 @@ fn cast_yes_once(
         eprintln!("ballot already cast as {}", hex_bytes(principal));
         return Ok(opened);
     }
-    rpc_submit(
+    signer.submit(
         addr,
-        "governance",
-        &encode_msg(&GovMsg::Vote {
+        &GovMsg::Vote {
             proposal_id: proposal_id.into(),
             approve: true,
-        }),
+        },
     )?;
-    let proposal = poll_proposal(addr, proposal_id, "this ballot to finalize", |p| {
-        p.as_ref().is_some_and(|proposal| {
-            proposal.status != ProposalStatus::Open
-                || proposal
-                    .votes
-                    .iter()
-                    .any(|(voter, yes)| voter == principal && *yes)
-        })
-    })?
+    let proposal = poll_proposal(
+        addr,
+        proposal_id,
+        "timed out waiting for this ballot to finalize",
+        |p| {
+            p.as_ref().is_some_and(|proposal| {
+                proposal.status != ProposalStatus::Open
+                    || proposal
+                        .votes
+                        .iter()
+                        .any(|(voter, yes)| voter == principal && *yes)
+            })
+        },
+    )?
     .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
     eprintln!("ballot cast as {}", hex_bytes(principal));
     Ok(proposal)
 }
 
-/// how a driven membership ceremony left the proposal.
-enum CeremonyOutcome {
-    /// passed and executed — the set changes at the next epoch cutover.
+/// how a driven ceremony left the proposal.
+pub(super) enum CeremonyOutcome {
+    /// passed and executed. what that execution CHANGED is the caller's to
+    /// confirm: a membership set turns over at the next epoch cutover, a
+    /// module swap lands in the lifecycle registry.
     Passed,
     /// this ballot landed but the proposal's frozen threshold is outstanding.
     AwaitingBallots,
 }
 
-/// drive a governance membership ceremony for `wanted` through this eligible
-/// account's running node: adopt an existing OPEN proposal
-/// for exactly this action (else mint an unused `<id_prefix><key>:<n>` id and
-/// propose), cast a yes ballot, and execute once decidable. idempotent across
+/// the open proposal a member should JOIN rather than duplicate. the matcher
+/// decides which fields identify "the same proposal": membership verbs match
+/// the whole action, module verbs match (variant, module_id, code_hash) and
+/// ignore the activation height each member computed for itself.
+pub(super) fn open_proposal_matching<'a>(
+    views: &'a [governance::ProposalView],
+    matches: &dyn Fn(&governance::GovAction) -> bool,
+) -> Option<&'a governance::ProposalView> {
+    views
+        .iter()
+        .find(|p| p.status == governance::ProposalStatus::Open && matches(&p.action))
+}
+
+/// drive a governance proposal ceremony for `wanted` through this eligible
+/// account's running node: adopt an existing OPEN proposal `matches` accepts
+/// (else mint an unused `<id_prefix><key>:<n>` id and propose), cast a yes
+/// ballot, and execute once decidable. idempotent across
 /// members — each runs the same verb; the run landing the deciding ballot
-/// executes. shared by `resident accept` (AddResident), `member promote`
-/// (AddValidator), and `resident remove` (RemoveResident).
-fn drive_membership_ceremony(
+/// executes. shared by the membership verbs — `resident accept`
+/// (AddResident), `member promote` (AddValidator), `resident remove`
+/// (RemoveResident) — and the module verbs `module update`/`module register`
+/// (UpdateModule/RegisterModule).
+pub(super) fn drive_proposal_ceremony(
     rpc_addr: &str,
-    me_bytes: &[u8],
+    signer: &GovSigner,
     pubkey_hex: &str,
     verb: &str,
     id_prefix: &str,
     wanted: governance::GovAction,
+    matches: &dyn Fn(&governance::GovAction) -> bool,
 ) -> Result<CeremonyOutcome, Box<dyn std::error::Error>> {
-    use governance::{GovMsg, ProposalStatus, encode_msg};
+    // a matcher that rejects its own action would make every member mint a
+    // fresh proposal that no one else joins — the exact failure the matcher
+    // exists to prevent.
+    debug_assert!(
+        matches(&wanted),
+        "the matcher must accept the action it proposes"
+    );
+    use governance::{GovMsg, ProposalStatus};
     use governance::{GovQuery, GovReply, decode_reply, encode_query};
     let proposals = match decode_reply(&rpc_query(
         rpc_addr,
@@ -1044,10 +1319,7 @@ fn drive_membership_ceremony(
         GovReply::Proposals(views) => views,
         other => return Err(format!("unexpected governance reply: {other:?}").into()),
     };
-    let proposal_id = match proposals
-        .iter()
-        .find(|p| p.status == ProposalStatus::Open && p.action == wanted)
-    {
+    let proposal_id = match open_proposal_matching(&proposals, matches) {
         Some(p) => {
             eprintln!("joining open proposal {}", p.proposal_id);
             p.proposal_id.clone()
@@ -1058,19 +1330,23 @@ fn drive_membership_ceremony(
                 .map(|n| format!("{id_prefix}{prefix}:{n}"))
                 .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
                 .expect("the id space is unbounded");
-            rpc_submit(
+            signer.submit(
                 rpc_addr,
-                "governance",
-                &encode_msg(&GovMsg::Propose {
+                &GovMsg::Propose {
                     proposal_id: id.clone(),
                     action: wanted,
                     // a far horizon in consensus-time units (heights advance
                     // about one per finalized op): admission must not expire
                     // under a slow second ballot.
                     voting_period: 1_000_000,
-                }),
+                },
             )?;
-            poll_proposal(rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
+            poll_proposal(
+                rpc_addr,
+                &id,
+                "timed out waiting for the proposal to finalize",
+                |p| p.is_some(),
+            )?;
             eprintln!("proposed {id}");
             id
         }
@@ -1078,8 +1354,7 @@ fn drive_membership_ceremony(
 
     let opened = read_proposal(rpc_addr, &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
-    let principal = proposal_principal(rpc_addr, &opened, me_bytes)?;
-    let after_vote = cast_yes_once(rpc_addr, &proposal_id, opened, &principal)?;
+    let after_vote = cast_yes_once(rpc_addr, &proposal_id, opened, signer)?;
 
     // Execute only when the proposal's frozen rule says the yes power is
     // irreversible. A shortfall is the normal intermediate state, not an error.
@@ -1095,15 +1370,14 @@ fn drive_membership_ceremony(
         return Ok(CeremonyOutcome::AwaitingBallots);
     }
     if after_vote.status == ProposalStatus::Open {
-        rpc_submit(
+        signer.submit(
             rpc_addr,
-            "governance",
-            &encode_msg(&GovMsg::Execute {
+            &GovMsg::Execute {
                 proposal_id: proposal_id.clone(),
-            }),
+            },
         )?;
     }
-    let settled = poll_proposal(rpc_addr, &proposal_id, "the tally to settle", |p| {
+    let settled = poll_proposal(rpc_addr, &proposal_id, TALLY_SETTLE_TIMEOUT, |p| {
         p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
     })?
     .expect("the poll only accepts a present proposal");
@@ -1134,7 +1408,7 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         .rpc_listen
         .clone()
         .ok_or("resident accept drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
 
     let members = read_members(&rpc_addr)?;
     if members.contains(&key_bytes) {
@@ -1148,13 +1422,19 @@ fn cmd_invite_accept(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         );
         return Ok(());
     }
-    match drive_membership_ceremony(
+    let wanted = GovAction::AddResident { key: key_bytes };
+    let same_action = {
+        let wanted = wanted.clone();
+        move |a: &GovAction| *a == wanted
+    };
+    match drive_proposal_ceremony(
         &rpc_addr,
-        &me_bytes,
+        &signer,
         pubkey_hex,
         "node resident accept",
         "resident:",
-        GovAction::AddResident { key: key_bytes },
+        wanted,
+        &same_action,
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
@@ -1187,20 +1467,26 @@ fn cmd_promote(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
         .rpc_listen
         .clone()
         .ok_or("promote drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
 
     let members = read_members(&rpc_addr)?;
     if members.contains(&key_bytes) {
         eprintln!("{pubkey_hex} is already a validator — nothing to do");
         return Ok(());
     }
-    match drive_membership_ceremony(
+    let wanted = GovAction::AddValidator { key: key_bytes };
+    let same_action = {
+        let wanted = wanted.clone();
+        move |a: &GovAction| *a == wanted
+    };
+    match drive_proposal_ceremony(
         &rpc_addr,
-        &me_bytes,
+        &signer,
         pubkey_hex,
         "node member promote",
         "admit:",
-        GovAction::AddValidator { key: key_bytes },
+        wanted,
+        &same_action,
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
@@ -1239,7 +1525,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
         .rpc_listen
         .clone()
         .ok_or("resident remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
 
     let members = read_members(&rpc_addr)?;
     if members.contains(&key_bytes) {
@@ -1253,13 +1539,19 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
         eprintln!("{pubkey_hex} holds no resident standing — nothing to do");
         return Ok(());
     }
-    match drive_membership_ceremony(
+    let wanted = GovAction::RemoveResident { key: key_bytes };
+    let same_action = {
+        let wanted = wanted.clone();
+        move |a: &GovAction| *a == wanted
+    };
+    match drive_proposal_ceremony(
         &rpc_addr,
-        &me_bytes,
+        &signer,
         pubkey_hex,
         "node resident remove",
         "revoke:",
-        GovAction::RemoveResident { key: key_bytes },
+        wanted,
+        &same_action,
     )? {
         CeremonyOutcome::Passed => {
             eprintln!(
@@ -1284,7 +1576,7 @@ fn cmd_resident_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error
 /// run that lands the deciding ballot executes. the passing proposal's valset
 /// Leave schedules the epoch cutover that drops the key from the tracked set.
 fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use governance::{GovAction, GovMsg, ProposalStatus, encode_msg};
+    use governance::{GovAction, GovMsg, ProposalStatus};
 
     let pubkey_hex = &args.pubkey;
     let key = config::decode_key(pubkey_hex)?;
@@ -1297,7 +1589,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         .rpc_listen
         .clone()
         .ok_or("member remove drives the node's local rpc — set `rpc_listen` in node.toml")?;
-    let me_bytes = resolved.signer.public_key().as_ref().to_vec();
+    let signer = gov_signer(&rpc_addr, &cfg_path, &resolved)?;
 
     let members = read_members(&rpc_addr)?;
     // Inverted admission guard: nothing to remove if the key is not a member.
@@ -1334,18 +1626,22 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
                 .map(|n| format!("remove:{prefix}:{n}"))
                 .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
                 .expect("the id space is unbounded");
-            rpc_submit(
+            signer.submit(
                 &rpc_addr,
-                "governance",
-                &encode_msg(&GovMsg::Propose {
+                &GovMsg::Propose {
                     proposal_id: id.clone(),
                     action: wanted,
                     // a far horizon in consensus-time units: removal must not
                     // expire under a slow second ballot.
                     voting_period: 1_000_000,
-                }),
+                },
             )?;
-            poll_proposal(&rpc_addr, &id, "the proposal to finalize", |p| p.is_some())?;
+            poll_proposal(
+                &rpc_addr,
+                &id,
+                "timed out waiting for the proposal to finalize",
+                |p| p.is_some(),
+            )?;
             eprintln!("proposed {id}");
             id
         }
@@ -1353,8 +1649,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
 
     let opened = read_proposal(&rpc_addr, &proposal_id)?
         .ok_or_else(|| format!("proposal {proposal_id} disappeared"))?;
-    let principal = proposal_principal(&rpc_addr, &opened, &me_bytes)?;
-    let after_vote = cast_yes_once(&rpc_addr, &proposal_id, opened, &principal)?;
+    let after_vote = cast_yes_once(&rpc_addr, &proposal_id, opened, &signer)?;
 
     // Execute only once the proposal's own frozen voting rule is satisfied.
     let members = read_members(&rpc_addr)?;
@@ -1367,15 +1662,14 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     }
     if after_vote.status == ProposalStatus::Open {
-        rpc_submit(
+        signer.submit(
             &rpc_addr,
-            "governance",
-            &encode_msg(&GovMsg::Execute {
+            &GovMsg::Execute {
                 proposal_id: proposal_id.clone(),
-            }),
+            },
         )?;
     }
-    let settled = poll_proposal(&rpc_addr, &proposal_id, "the tally to settle", |p| {
+    let settled = poll_proposal(&rpc_addr, &proposal_id, TALLY_SETTLE_TIMEOUT, |p| {
         p.as_ref().is_some_and(|v| v.status != ProposalStatus::Open)
     })?
     .expect("the poll only accepts a present proposal");
@@ -1456,131 +1750,103 @@ fn cmd_member_status(args: StatusArgs) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-/// `join <invite blob> [--dir <dir>] [--listen a] [--advertised a] [--http a]
-/// [--rpc a] [--wireguard-listen a] [--wireguard-advertised host:port]
-/// [--invite-listen a]
+/// read a pasted invite blob from stdin: every line up to EOF or the first
+/// empty line after content. A terminal paste may arrive wrapped across
+/// several lines; the decoder strips the whitespace, so the lines are simply
+/// collected. The prompt goes to stderr (stdout stays program output).
+fn read_invite_blob_from_stdin() -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::IsTerminal as _;
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprintln!("paste the invite blob (wrapped lines are fine), then press Enter:");
+    }
+    let collected = collect_blob_lines(stdin.lock())?;
+    if collected.is_empty() {
+        return Err("join needs an invite blob (or a `requests`/`state` subcommand)".into());
+    }
+    Ok(collected)
+}
+
+/// gather blob lines from any reader: stop at EOF, or at the first empty line
+/// once some content has arrived (the Enter that ends an interactive paste).
+fn collect_blob_lines(reader: impl std::io::BufRead) -> std::io::Result<String> {
+    let mut collected = String::new();
+    for line in reader.lines() {
+        let line = line?;
+        let paste_finished = line.trim().is_empty() && !collected.is_empty();
+        if paste_finished {
+            break;
+        }
+        collected.push_str(line.trim());
+    }
+    Ok(collected)
+}
+
+/// `join [invite blob...] [--dir <dir>] [--listen a] [--advertised a]
+/// [--http a] [--rpc a] [--wireguard-listen a]
+/// [--wireguard-advertised host:port] [--invite-listen a]
 /// [--primary-coordinator host:port|none]` — materialize a workspace
 /// from an invite: descriptor + identity (kept across re-joins) + node
 /// config, defaulting into the registry dir named by the invite's chain id.
-/// prints this identity for the inviter's pre-genesis `admit`.
+/// With no blob argv the blob is read from stdin (interactive paste prompt,
+/// or a pipe). prints this identity for the inviter's pre-genesis `admit`.
 /// `--primary-coordinator` is node-local plumbing ONLY — it never touches
-/// the invite or the joined descriptor (the coordinator is always ambient,
-/// per docs/superpowers/specs/2026-07-08-fully-nated-inviter-design.md).
+/// the invite or the joined descriptor (the coordinator is always ambient).
 fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
-    let blob = args
-        .blob
-        .as_deref()
-        .ok_or("join needs an invite blob (or a `requests`/`state` subcommand)")?;
-    let invite = config::decode_invite(blob)?;
-    let mut descriptor = invite.descriptor.clone();
-    let explicit_dir = args.dir.is_some();
-    // same default as `init`: without `--dir` the workspace materializes in
-    // the registry under its chain id (known here from the invite), so the
-    // joined node is `-n <chain-id>`-addressable. a re-join for the same
-    // chain lands in the same dir and reuses its identity, as before.
-    let dir = match args.dir {
-        Some(dir) => dir,
-        None => config::default_workspace_dir(&descriptor.chain_id)?,
+    // argv words are rejoined (a blob pasted unquoted splits on its wrapped
+    // spaces); no argv at all reads the blob from stdin. decode strips ALL
+    // whitespace, so both paths tolerate a line-wrapped paste verbatim.
+    //
+    // READING the blob is what stays here: a terminal prompt is the CLI's
+    // business, and it is exactly what `join_workspace` refuses to know about.
+    let blob = match args.blob.is_empty() {
+        false => args.blob.concat(),
+        true => read_invite_blob_from_stdin()?,
     };
-    std::fs::create_dir_all(&dir)?;
-    // mint (or reuse) this workspace dir's identity. Every invite is bearer
-    // (invites are bearer credentials): there is no target to match, so any freshly minted
-    // key may redeem — the OOB "hand the inviter your join code first" step is
-    // gone. The redeeming key is bound by the join proof and the token is
-    // single-use, so a paste simply admits whoever runs it.
-    let (key, generated) = config::load_or_generate_identity(&dir.join("identity.key"))?;
-    let me_hex = hex_bytes(key.public_key().as_ref());
-    config::guard_join_descriptor(&dir, &descriptor)?;
-    // plumbing merges: explicit flags win, an existing node.toml's values
-    // (network shape only — a dev-seed or incomplete file aborts) survive,
-    // working defaults fill the rest. computed BEFORE anything lands on disk
-    // so a corrupt existing node.toml aborts the join without leaving a
-    // partially written dir.
     let net = &args.plumbing;
-    let fresh_workspace = !dir.join("node.toml").exists();
-    let mut plumbing = config::merged_plumbing(
-        &dir,
-        net.listen.as_deref(),
-        net.advertised.as_deref(),
-        net.http.as_deref(),
-        net.gateway.as_deref(),
-        net.rpc.as_deref(),
-        net.wireguard_listen.as_deref(),
-        net.invite_listen.as_deref(),
-        net.primary_coordinator.as_deref(),
-        net.wireguard_advertised.as_deref(),
-    )?;
-    // a FRESH joining workspace gets the same compute detection as init: the
-    // platform runtime on PATH ⇒ a live [sandbox] table (announce stays off),
-    // so agent runs and the terminal plane work without a config edit. a
-    // re-join over an existing node.toml keeps the operator's choice.
-    if fresh_workspace {
-        plumbing.sandbox = detect_platform_sandbox();
+    let overrides = config::PlumbingOverrides {
+        listen: net.listen.clone(),
+        advertised: net.advertised.clone(),
+        http: net.http.clone(),
+        gateway: net.gateway.clone(),
+        rpc: net.rpc.clone(),
+        primary_coordinator: net.primary_coordinator.clone(),
+        wireguard_listen: net.wireguard_listen.clone(),
+        wireguard_advertised: net.wireguard_advertised.clone(),
+        invite_listen: net.invite_listen.clone(),
+    };
+    let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
+    if joined.is_member {
+        bundle_member_genesis(&joined.dir)?;
     }
-    if config::invite_requires_reachability_defaults(&invite) {
-        // a WireGuard or Coordinated invite makes the reachability plane the
-        // dial path: fold the inviter's (and every offered front's) overlay
-        // ULA into this joiner's reach hints so the mesh can dial them the
-        // moment a tunnel is up.
-        {
-            let wg = &invite.wireguard;
-            let issuer_identity =
-                wireguard::ValidatorIdentity::try_from(invite.token.issuer.as_ref())
-                    .map_err(|e| format!("inviter identity: {e:?}"))?;
-            let inviter_ula =
-                wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), issuer_identity);
-            descriptor.add_reach_route(&config::ReachHint {
-                expected_key: invite.token.issuer.clone(),
-                reach: config::Reach::Direct(format!("[{inviter_ula}]:{}", wg.mesh_port)),
-            });
-        }
-        for front in &invite.fronts {
-            let Ok(member) = ed25519::PublicKey::decode(&front.member_key[..]) else {
-                continue;
-            };
-            let Ok(identity) = wireguard::ValidatorIdentity::try_from(&front.member_key[..]) else {
-                continue;
-            };
-            let ula = wireguard::ula_v6_member_addr(&descriptor.genesis_namespace(), identity);
-            descriptor.add_reach_route(&config::ReachHint {
-                expected_key: member,
-                reach: config::Reach::Direct(format!("[{ula}]:{}", front.mesh_port)),
-            });
-        }
-    }
-    descriptor.save(&dir.join("network.toml"))?;
-    // identity was minted + target-checked at the top of the join.
-    config::write_node_toml(&dir, &plumbing)?;
-    // the capability the joining node redeems automatically; a re-join with a
-    // fresh invite replaces a stale/spent one.
-    config::save_invite_token(&dir, &invite.token)?;
-    // the offered fronts, kept beside the token so `run_node` can race the
-    // whole union of first-contact paths. Empty clears any stale set.
-    config::save_invite_fronts(&dir, &invite.fronts)?;
-    {
-        // the tunnel bootstrap the joining node dials BEFORE any p2p (always
-        // present); kept beside the token so `run_node` brings the
-        // interface up first.
-        config::save_invite_wireguard(&dir, &invite.token.issuer, &invite.wireguard)?;
-        // mint the WireGuard identity NOW so the run's plane and intro
-        // announcer read one settled key file instead of racing to create it.
-        reachability::WireGuardKeypair::load_or_generate(&dir.join("wireguard.key"))
-            .map_err(|e| format!("wireguard key: {e}"))?;
+
+    if let Some(runtime) = &joined.compute_runtime {
+        eprintln!(
+            "compute plane: {runtime} found — writing a live [sandbox] table \
+             (announce stays off; delete the table for a consensus-only node)"
+        );
     }
     eprintln!(
-        "{} identity {me_hex}",
-        if generated { "generated" } else { "reusing" }
+        "{} identity {}",
+        if joined.generated {
+            "generated"
+        } else {
+            "reusing"
+        },
+        joined.identity
     );
     eprintln!(
         "workspace for {} written to {}",
-        descriptor.chain_id,
-        dir.display()
+        joined.chain_id,
+        joined.dir.display()
     );
-    let selector = match explicit_dir {
-        true => format!("--config {}/node.toml", dir.display()),
-        false => format!("-n '{}'", descriptor.chain_id),
+    // a workspace put where the operator asked is addressed by its file; one
+    // that landed in the registry is addressed by its chain id.
+    let selector = match &args.dir {
+        Some(_) => format!("--config {}/node.toml", joined.dir.display()),
+        None => format!("-n '{}'", joined.chain_id),
     };
-    if descriptor.validators.contains(&me_hex) {
+    if joined.is_member {
         eprintln!("this identity is a member — start: ducktape node run {selector}");
     } else {
         eprintln!(
@@ -1588,10 +1854,11 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
              this invite automatically: the node joins the network's VPN, syncs state, and \
              comes up as a full node. no approval step follows (minting the invite WAS the \
              approval); a member can later promote it into the quorum with \
-             `ducktape node member promote {me_hex}`."
+             `ducktape node member promote {}`.",
+            joined.identity
         );
     }
-    println!("{me_hex}");
+    println!("{}", joined.identity);
     Ok(())
 }
 
@@ -1611,6 +1878,19 @@ mod json_output_tests {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+
+    #[test]
+    fn blob_lines_join_a_wrapped_paste_and_stop_at_the_closing_enter() {
+        let pasted = "\n  \n\u{1f986}DWRlbW8j\nMGZiZGQ5\n ZTUB \n\nnot-part-of-the-blob\n";
+        let collected = super::collect_blob_lines(pasted.as_bytes()).expect("collect");
+        assert_eq!(collected, "\u{1f986}DWRlbW8jMGZiZGQ5ZTUB");
+    }
+
+    #[test]
+    fn blob_lines_are_empty_on_empty_input() {
+        let collected = super::collect_blob_lines("\n \n".as_bytes()).expect("collect");
+        assert_eq!(collected, "");
+    }
 
     fn completions() -> (String, String) {
         let bash = std::fs::read_to_string(concat!(
@@ -1698,9 +1978,7 @@ mod tests {
             .filter(|family| !family.is_hide_set())
             .map(|family| family.get_name().to_string())
             .collect::<BTreeSet<_>>();
-        top.extend(
-            ["help", "--help", "-h", "--version", "-V"].map(str::to_string),
-        );
+        top.extend(["help", "--help", "-h", "--version", "-V"].map(str::to_string));
         for (file, text) in [("ducktape.bash", &bash), ("ducktape.zsh", &zsh)] {
             let declared = declaration_tokens(text, "families");
             assert_same_tokens(file, "top level", &declared, &top, &top);
@@ -1749,6 +2027,73 @@ mod tests {
         );
     }
 
+    /// a module verb must JOIN the founder's open proposal even though every
+    /// member computed its own activation height, so the matcher — not action
+    /// equality — decides which fields identify "the same proposal".
+    #[test]
+    fn open_proposal_matching_ignores_fields_the_matcher_ignores() {
+        use super::open_proposal_matching;
+        use governance::{GovAction, ProposalStatus, ProposalView, VoterKind, VotingRule};
+        let view = |id: &str, status: ProposalStatus, action: GovAction| ProposalView {
+            proposal_id: id.into(),
+            action,
+            proposer: vec![1],
+            created_at: 0,
+            deadline: 10,
+            status,
+            votes: vec![],
+            voter_kind: VoterKind::ValidatorNode,
+            electorate: vec![],
+            voting_rule: VotingRule::Threshold { required_yes: 1 },
+        };
+        let hash = vec![7u8; 32];
+        let founders = view(
+            "module:aa:0",
+            ProposalStatus::Open,
+            GovAction::UpdateModule {
+                name: "x".into(),
+                module_id: "hello".into(),
+                // the founder computed 61; this member computes 60 below —
+                // the matcher must join anyway.
+                activation_height: 61,
+                code_hash: hash.clone(),
+            },
+        );
+        let settled = view(
+            "module:bb:0",
+            ProposalStatus::Passed,
+            GovAction::UpdateModule {
+                name: "x".into(),
+                module_id: "hello".into(),
+                activation_height: 60,
+                code_hash: hash.clone(),
+            },
+        );
+        let other = view(
+            "module:cc:0",
+            ProposalStatus::Open,
+            GovAction::RegisterModule {
+                name: "x".into(),
+                module_id: "hello".into(),
+                activation_height: 60,
+                code_hash: hash.clone(),
+            },
+        );
+        let views = vec![settled, other, founders];
+        // the second member computed height 61, not 60 — equality on the whole
+        // action would never join the founder's proposal.
+        let matches = |a: &GovAction| {
+            matches!(a, GovAction::UpdateModule { module_id, code_hash, .. }
+                if module_id == "hello" && *code_hash == hash)
+        };
+        let found = open_proposal_matching(&views, &matches).expect("the open update proposal");
+        assert_eq!(found.proposal_id, "module:aa:0");
+        let none = open_proposal_matching(&views, &|a| {
+            matches!(a, GovAction::CancelModuleUpdate { .. })
+        });
+        assert!(none.is_none());
+    }
+
     /// the grammar's own consistency check (conflicting ids, broken flatten,
     /// missing subcommand settings all panic here instead of at first use).
     #[test]
@@ -1767,6 +2112,7 @@ mod tests {
             connected: true,
             connected_since_ms: Some(1_000),
             role: Some("validator".into()),
+            build: Some("test-build".into()),
             msgs_sent: sent,
             msgs_received: 0,
             statesync: Some(noded::peers::StatesyncServeView {
@@ -1796,7 +2142,7 @@ mod tests {
         assert_eq!(
             with_baseline,
             format!(
-                "peer={} role=validator connected=11s msgs_tx=150 msgs_rx=0 \
+                "peer={} role=validator build=test-build connected=11s msgs_tx=150 msgs_rx=0 \
                  tx/s=25.0 rx/s=0.0 sync_bytes=3000 sync_B/s=1000 sync_height=230 \
                  sync_boundary=230 sync_idle=4s sync_last=tip_coords",
                 "ab".repeat(32)
@@ -1808,6 +2154,15 @@ mod tests {
         assert!(
             !without_baseline.contains("sync_B/s="),
             "{without_baseline}"
+        );
+
+        // a peer that never named a build says so — the column never goes
+        // missing, because an absent column reads as agreement.
+        let mut unstamped = second.peers[0].clone();
+        unstamped.build = None;
+        assert!(
+            peer_line(&unstamped, None, &first, &second).contains("build=unknown"),
+            "an unreported stamp renders as unknown"
         );
     }
 

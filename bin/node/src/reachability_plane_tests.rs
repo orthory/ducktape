@@ -1,7 +1,7 @@
 //! wiring-semantics tests for the inviter-side intro handler
 //! (`reachability_plane::handle_intro`): install-before-ack ordering and the
 //! no-install/no-ack refusal of junk. the intro codec is covered by
-//! `lobby::tests` and the sealed-envelope crypto by `reachability::seal::tests`
+//! `join_gate::tests` and the sealed-envelope crypto by `reachability::seal::tests`
 //! — so these inject an IDENTITY `open` (the doorbell's open is DI) and drive
 //! the post-open verify/install/ack path with plaintext bundles.
 
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use commonware_cryptography::{Signer as _, ed25519};
 
 use crate::config::mint_invite_token;
-use crate::lobby;
+use crate::join_gate;
 use crate::reachability_plane::{IntroPath, handle_intro};
 
 const BINDING: &[u8] = b"net#00000000@feedface";
@@ -41,16 +41,16 @@ fn intro_bytes() -> (Vec<u8>, ed25519::PublicKey, reachability::WireGuardKeypair
     let joiner = ed25519::PrivateKey::from_seed(2);
     let token = mint_invite_token(&issuer, BINDING, u64::MAX);
     let wg = joiner_wg_keypair();
-    let msg = lobby::intro_request(&joiner, BINDING, &token, wg.public_key().0);
-    (lobby::encode_intro(&msg), joiner.public_key(), wg)
+    let msg = join_gate::intro_request(&joiner, BINDING, &token, wg.public_key().0);
+    (join_gate::encode_intro(&msg), joiner.public_key(), wg)
 }
 
 /// open a post-verify (SEALED) ack with the joiner's WG secret and decode it.
-fn open_sealed_ack(wg: &reachability::WireGuardKeypair, sealed: &[u8]) -> lobby::IntroAck {
+fn open_sealed_ack(wg: &reachability::WireGuardKeypair, sealed: &[u8]) -> join_gate::IntroAck {
     let opened = wg
         .open_sealed(sealed)
         .expect("sealed to the joiner's WG key");
-    lobby::decode_intro_ack(&opened).expect("a decodable ack")
+    join_gate::decode_intro_ack(&opened).expect("a decodable ack")
 }
 
 #[tokio::test]
@@ -114,7 +114,7 @@ async fn a_valid_intro_installs_before_acking() {
     // the post-install ack is SEALED to the joiner's WG key — no gate hook
     // (`None`) means the reply is `Installed`.
     let ack = open_sealed_ack(&wg, &acked[0]);
-    assert!(matches!(ack.reply, lobby::IntroReply::Installed));
+    assert!(matches!(ack.reply, join_gate::IntroReply::Installed));
 }
 
 #[tokio::test]
@@ -163,8 +163,8 @@ async fn a_failed_verification_stays_silent() {
             open_identity,
             None,
             |b| {
-            store.lock().unwrap().push(b);
-            async {}
+                store.lock().unwrap().push(b);
+                async {}
             },
         )
         .await;
@@ -185,7 +185,7 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
     let joiner = ed25519::PrivateKey::from_seed(2);
     let token = mint_invite_token(&issuer, BINDING, 1); // 1970 — long expired
     let wg = joiner_wg_keypair();
-    let bytes = lobby::encode_intro(&lobby::intro_request(
+    let bytes = join_gate::encode_intro(&join_gate::intro_request(
         &joiner,
         BINDING,
         &token,
@@ -206,8 +206,8 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
         open_identity,
         None,
         |b| {
-        store.lock().unwrap().push(b);
-        async {}
+            store.lock().unwrap().push(b);
+            async {}
         },
     )
     .await;
@@ -219,7 +219,7 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
     let acked = acked.lock().unwrap();
     // the expiry gate runs POST-verify, so its refusal is sealed.
     let ack = open_sealed_ack(&wg, &acked[0]);
-    let lobby::IntroReply::Refused { detail } = ack.reply else {
+    let join_gate::IntroReply::Refused { detail } = ack.reply else {
         panic!("expected Refused, got {:?}", ack.reply);
     };
     assert!(detail.contains("expired"), "{detail}");
@@ -247,7 +247,7 @@ fn a_sealed_intro_hides_the_token_and_opens_only_for_the_member() {
     // confidentiality: the bearer token never appears in the clear — the sealed
     // datagram does not decode as an intro, and a different key cannot open it.
     assert!(
-        lobby::decode_intro(&sealed).is_err(),
+        join_gate::decode_intro(&sealed).is_err(),
         "the sealed datagram must not be a cleartext intro an observer can read"
     );
     assert!(
@@ -259,8 +259,8 @@ fn a_sealed_intro_hides_the_token_and_opens_only_for_the_member() {
     let opened = member
         .open_sealed(&sealed)
         .expect("the member opens its own sealed intro");
-    let msg = lobby::decode_intro(&opened).expect("decodes after open");
-    let verified = lobby::verify_intro(&msg, BINDING).expect("verifies end to end");
+    let msg = join_gate::decode_intro(&opened).expect("decodes after open");
+    let verified = join_gate::verify_intro(&msg, BINDING).expect("verifies end to end");
     assert_eq!(verified.joiner, joiner_pk);
     assert_eq!(verified.wg_public_key, wg_pub);
 }
@@ -289,12 +289,12 @@ async fn a_dead_plane_channel_stops_the_loop() {
 
 #[tokio::test]
 async fn a_gated_intro_forwards_once_and_answers_settled_outcomes() {
-    // the member-side gate seam (join ADR §4): the FIRST verified intro
+    // the member-side gate seam: the FIRST verified intro
     // forwards a GateForward to the run loop and acks sealed `Installed`;
     // once the loop writes an outcome into the shared map, a retransmit is
     // answered with THAT (sealed), without forwarding again.
     let (bytes, joiner_pk, wg) = intro_bytes();
-    let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::channel::<lobby::GateForward>(8);
+    let (fwd_tx, mut fwd_rx) = tokio::sync::mpsc::channel::<join_gate::GateForward>(8);
     let outcomes: crate::reachability_plane::GateOutcomes = Default::default();
     let hook = crate::reachability_plane::GateHook {
         forward: fwd_tx,
@@ -341,13 +341,13 @@ async fn a_gated_intro_forwards_once_and_answers_settled_outcomes() {
     let fwd = fwd_rx.try_recv().expect("the gate request is forwarded");
     assert_eq!(fwd.joiner, joiner_pk.as_ref().to_vec());
     let ack = open_sealed_ack(&wg, &acked.lock().unwrap()[0]);
-    assert!(matches!(ack.reply, lobby::IntroReply::Installed));
+    assert!(matches!(ack.reply, join_gate::IntroReply::Installed));
 
     // the loop settles the gate: the retransmit reads the outcome — sealed —
     // and does NOT forward again.
     outcomes.lock().unwrap().insert(
         joiner_pk.as_ref().to_vec(),
-        lobby::IntroReply::Admitted {
+        join_gate::IntroReply::Admitted {
             height: 12,
             cap: None,
         },
@@ -360,9 +360,47 @@ async fn a_gated_intro_forwards_once_and_answers_settled_outcomes() {
     let ack = open_sealed_ack(&wg, &acked.lock().unwrap()[1]);
     assert!(matches!(
         ack.reply,
-        lobby::IntroReply::Admitted {
+        join_gate::IntroReply::Admitted {
             height: 12,
             cap: None
         }
     ));
+}
+
+/// The handshake sampler's memory: an idle lapse is not a dark peer.
+///
+/// boringtun reports a session's age or NOTHING, and "nothing" covers both
+/// "never handshaked" and "the 180s session just expired". Reading it alone
+/// called every healthy tunnel DARK for the ~20s between a lapse and the
+/// keepalive that heals it — a warn per peer every REJECT_AFTER_TIME, on a
+/// mesh that was working.
+#[test]
+fn an_idle_session_lapse_is_not_a_dark_peer() {
+    use crate::reachability_plane::session_verdicts;
+    use std::time::Duration;
+
+    let peer: std::net::Ipv6Addr = "fd1f::1".parse().expect("ula");
+    let never: std::net::Ipv6Addr = "fd1f::2".parse().expect("ula");
+    let mut seen = std::collections::HashMap::new();
+    let t0 = tokio::time::Instant::now();
+
+    let live = session_verdicts(&mut seen, t0, &[(peer, Some(Duration::from_secs(170)))]);
+    assert!(live[0].live, "a session with an age is live");
+
+    // the session expires; the keepalive has not re-handshaked yet.
+    let lapsed = session_verdicts(&mut seen, t0 + Duration::from_secs(22), &[(peer, None)]);
+    assert!(lapsed[0].live, "a lapsed-but-healing session is not dark");
+    assert_eq!(lapsed[0].no_session_for, Some(Duration::from_secs(22)));
+
+    // ...but one that never comes back is exactly what this watch is for.
+    let dark = session_verdicts(&mut seen, t0 + Duration::from_secs(181), &[(peer, None)]);
+    assert!(!dark[0].live, "no session for a whole session generation is dark");
+
+    // a peer whose config applied and never handshaked at all is dark on sight.
+    let unseen = session_verdicts(&mut seen, t0, &[(never, None)]);
+    assert!(!unseen[0].live);
+    assert_eq!(
+        unseen[0].no_session_for, None,
+        "never handshaked, so there is no lapse to measure"
+    );
 }

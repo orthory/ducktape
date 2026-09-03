@@ -202,11 +202,9 @@ fn a_passing_proposal_admits_the_validator_and_direct_writes_are_refused() {
 }
 
 #[test]
-fn an_add_resident_proposal_grants_resident_standing_at_v0() {
-    // the disregarded version gate, end to end: a v0 block (see submit_as)
-    // proposes AddResident, a majority votes, and execution emits the valset
-    // Grant follow-up — resident standing lands with no protocol upgrade.
-    // before this change the Propose itself rejected below protocol version 3.
+fn an_add_resident_proposal_grants_resident_standing() {
+    // end to end: a block proposes AddResident, a majority votes, and
+    // execution emits the valset Grant follow-up — resident standing lands.
     block_on(async {
         let mut host = gov_host().await;
         let (m1, m2, friend) = (member_key(1), member_key(2), member_key(9));
@@ -715,7 +713,9 @@ fn non_members_cannot_propose_or_vote_and_minority_rejects() {
         )
         .await
         .expect_err("outsider vote must be refused");
-        assert!(matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("member")));
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("frozen electorate"))
+        );
 
         // ...one yes of two members is NOT a strict majority: not decidable
         // early, and after the deadline it rejects.

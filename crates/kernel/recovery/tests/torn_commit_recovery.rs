@@ -333,9 +333,10 @@ fn a_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
         let tip_hash = node.root_hash();
         assert_eq!(cell.borrow().counter, 1, "disk committed once");
 
-        // graceful WAL barrier, then the "crash": drop everything in memory but
-        // KEEP the disk cell (durable at post) and the storage backend (WAL).
-        node.sink_mut().sync().await.expect("sync");
+        // the "crash": drop everything in memory but KEEP the disk cell
+        // (durable at post) and the storage backend (WAL). the seals are
+        // already durable — `seal` fsyncs where it is written — so this suite
+        // needs no explicit barrier to reach a SEALED torn layout.
         drop(node);
 
         // ---- boot: reconstruct the TORN layout ------------------------------
@@ -486,7 +487,8 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
             vec![],
             None,
             pos,
-            1,)
+            1,
+        )
         .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest)
@@ -513,9 +515,8 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
             "the disk raced >= 2 blocks past the checkpoint"
         );
 
-        // graceful WAL barrier (seals durable), then the "crash": drop memory,
-        // KEEP the disk cell. NO checkpoint was written past height C.
-        node.sink_mut().sync().await.expect("sync");
+        // the "crash": drop memory, KEEP the disk cell (the seals are durable
+        // on their own). NO checkpoint was written past height C.
         drop(node);
 
         // ---- boot: the in-memory cohort rolls back to the checkpoint, the disk
@@ -529,8 +530,7 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
         let mut fanout = Fanout::new("fanout");
         fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
         let diskish = Diskish::reopen("diskish", cell.clone());
-        let mut host =
-            Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
 
         // the disk's live root matches NEITHER the checkpoint root NOR block 1's
         // post-root — it is TWO blocks past the checkpoint.
@@ -556,9 +556,18 @@ fn a_disk_substrate_two_blocks_ahead_of_the_checkpoint_recovers_cleanly() {
             "the ahead disk was left alone (no re-commit)"
         );
         // the in-memory cohort rolled forward from the WAL to the tip.
-        assert_eq!(host.query("fanout", b"k0").await.expect("q"), b"v0".to_vec());
-        assert_eq!(host.query("fanout", b"k1").await.expect("q"), b"v1".to_vec());
-        assert_eq!(host.query("fanout", b"k2").await.expect("q"), b"v2".to_vec());
+        assert_eq!(
+            host.query("fanout", b"k0").await.expect("q"),
+            b"v0".to_vec()
+        );
+        assert_eq!(
+            host.query("fanout", b"k1").await.expect("q"),
+            b"v1".to_vec()
+        );
+        assert_eq!(
+            host.query("fanout", b"k2").await.expect("q"),
+            b"v2".to_vec()
+        );
     });
 }
 
@@ -584,9 +593,8 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
 
         // GENESIS checkpoint only (height None) — nothing checkpointed after.
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest0 =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
-                .expect("capture");
+        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
+            .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest0)
             .await
@@ -612,7 +620,6 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
         let tip_hash = node.root_hash();
         assert_eq!(cell.borrow().counter, 3, "disk committed once per block");
 
-        node.sink_mut().sync().await.expect("sync");
         drop(node);
 
         // ---- boot: only the disk is ahead; every block is a pure-disk block ---
@@ -623,8 +630,7 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
         let mut fanout = Fanout::new("fanout");
         fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
         let diskish = Diskish::reopen("diskish", cell.clone());
-        let mut host =
-            Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
 
         let recovered = recovery
             .recover(&mut host, &manifest)
@@ -637,7 +643,10 @@ fn pure_disk_blocks_ahead_of_the_checkpoint_skip_cleanly() {
         assert_eq!(recovered.applied, 0, "no in-memory cohort to re-commit");
         assert_eq!(recovered.skipped, 3, "every ahead-disk block was skipped");
         assert_eq!(cell.borrow().counter, 3, "the disk was never re-committed");
-        assert_eq!(host.query("diskish", b"k2").await.expect("q"), b"v2".to_vec());
+        assert_eq!(
+            host.query("diskish", b"k2").await.expect("q"),
+            b"v2".to_vec()
+        );
     });
 }
 
@@ -662,9 +671,8 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
         .expect("genesis");
         let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest0 =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
-                .expect("capture");
+        let manifest0 = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
+            .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest0)
             .await
@@ -678,7 +686,6 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
         node.flush_batch().await.expect("flush");
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(cell.borrow().counter, 1);
-        node.sink_mut().sync().await.expect("sync");
         drop(node);
 
         // CORRUPT the durable disk: move the commit counter to a value that
@@ -693,8 +700,7 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
         let mut fanout = Fanout::new("fanout");
         fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
         let diskish = Diskish::reopen("diskish", cell.clone());
-        let mut host =
-            Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(fanout), Box::new(diskish)]).expect("genesis");
 
         // the disk root matches NOTHING recorded.
         assert_ne!(host.module_root("diskish"), manifest.root("diskish"));
@@ -708,7 +714,11 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
             "expected Error::Torn (genuine corruption), got {err:?}"
         );
         // the corrupt disk was NOT re-committed by the refused replay.
-        assert_eq!(cell.borrow().counter, 99, "the refused replay touched nothing");
+        assert_eq!(
+            cell.borrow().counter,
+            99,
+            "the refused replay touched nothing"
+        );
     });
 }
 
@@ -716,7 +726,7 @@ fn a_disk_root_matching_no_record_still_fail_stops() {
 
 /// like [`Fanout`] but a single `Set` fans the write out to BOTH `diskA` and
 /// `diskB`, so ONE block commits TWO per-block-durable disk substrates — the
-/// multi-store atomicity zone recovery must refuse.
+/// ordinary shape of an agent-run settle in the production module set.
 struct FanoutTwo {
     id: ModuleId,
     committed: BTreeMap<String, String>,
@@ -783,14 +793,18 @@ impl Module for FanoutTwo {
     }
 }
 
-/// a block that commits TWO disk substrates and crashes with the in-memory
-/// cohort rolled back to the checkpoint is a changed set spanning >1 per-block-
-/// durable substrate at mixed roots — the multi-store atomicity limit. recovery
-/// must FAIL-STOP explicitly with `Error::Torn` rather than attempt a partial
-/// selective replay (whose single-frame re-execution could read a partially-
-/// committed world). this pins the doc's "fail-stops rather than forking" claim.
+/// a SEALED block that commits TWO disk substrates and crashes with the
+/// in-memory cohort rolled back to the checkpoint. this is the ORDINARY shape
+/// in production — a run settle moves `runs` (in-memory) plus chat, tasks and
+/// dispatch, each on its own qmdb — and recovery used to refuse it outright
+/// (`durable >= 2` => `Error::Torn`), bricking the node on a routine restart.
+///
+/// the seal is the barrier that makes it safe: it is fsync'd only after the
+/// apply returned, so a sealed block's disk substrates ALL committed; the
+/// count carries no evidence of tearing. selective replay commits only the
+/// still-at-pre cohort, exactly as it does for one substrate.
 #[test]
-fn a_multi_disk_torn_block_fail_stops() {
+fn a_multi_disk_torn_block_recovers_by_committing_only_the_in_memory_cohort() {
     let executor = deterministic::Runner::default();
     executor.start(|context| async move {
         // two independent durable "disks", both survive the crash.
@@ -829,8 +843,9 @@ fn a_multi_disk_torn_block_fail_stops() {
         assert_eq!(node.drain_delivered().await.expect("drain"), 1);
         assert_eq!(cell_a.borrow().counter, 1, "diskA committed once");
         assert_eq!(cell_b.borrow().counter, 1, "diskB committed once");
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.root_hash();
 
-        node.sink_mut().sync().await.expect("sync");
         drop(node);
 
         // ---- boot: TWO disks at post, the in-memory cohort at pre ----------
@@ -854,29 +869,327 @@ fn a_multi_disk_torn_block_fail_stops() {
         assert_ne!(host.module_root("diskA"), manifest.root("diskA"));
         assert_ne!(host.module_root("diskB"), manifest.root("diskB"));
 
-        // recovery must fail-stop explicitly — NOT partially replay.
-        let err = recovery
+        // selective replay heals it: re-run the sealed frame, commit ONLY the
+        // in-memory cohort, abort BOTH durable disks.
+        let recovered = recovery
             .recover(&mut host, &manifest)
             .await
-            .expect_err("multi-disk torn block must fail-stop");
-        match err {
-            recovery::Error::Torn(msg) => assert!(
-                msg.contains("multi-store atomicity"),
-                "expected the multi-disk atomicity fail-stop, got: {msg}"
-            ),
-            other => panic!("expected recovery::Error::Torn, got {other:?}"),
-        }
+            .expect("a multi-disk torn block recovers");
 
-        // and it did NOT re-commit either disk (no op-log root move, no fork).
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(
+            recovered.root_hash, tip_hash,
+            "recomposed root-hash is byte-identical to the sealed tip"
+        );
+        assert_eq!(recovered.applied, 1, "the torn block was replayed");
+        assert_eq!(
+            host.query("fanout", b"k").await.expect("query"),
+            b"v".to_vec()
+        );
+        // neither disk was re-committed (no op-log root move, no fork).
         assert_eq!(
             cell_a.borrow().counter,
             1,
-            "diskA untouched by the refused replay"
+            "diskA left alone (no re-commit)"
         );
         assert_eq!(
             cell_b.borrow().counter,
             1,
-            "diskB untouched by the refused replay"
+            "diskB left alone (no re-commit)"
+        );
+    });
+}
+
+// ---- Containerish: the FORGE shape — per-block durable, snapshot-shaped sync -
+//
+// forge commits its refs image, packs and tracker to its OWN disk at every block
+// and reopens at that tip, yet its state-sync surface is one self-contained
+// container (`SnapshotBytes`), not a resolver lane. reading the disk cohort off
+// the sync handle left it OUT, so any block above the last checkpoint that was
+// not forge's LAST change found it at neither a pre- nor a post-root and boot
+// fail-stopped — two pushes in distinct blocks between checkpoints was enough.
+// `Module::block_durable` is the declaration that fixes it.
+
+/// per-block durable like [`Diskish`] (same survived cell, same per-commit root
+/// move) but its sync surface is `SnapshotBytes` and it declares
+/// `block_durable()` explicitly. boot does NOT install its checkpoint snapshot —
+/// it reopens the cell, exactly as the node's restore path skips every non-Map
+/// tenant.
+struct Containerish {
+    id: ModuleId,
+    cell: Cell,
+    pending: Vec<(String, String)>,
+    /// what [`Module::block_durable`] answers — the DECLARATION under test.
+    /// `false` is what the sync-handle-derived default would have said for
+    /// this shape, and what bricked forge.
+    declared_durable: bool,
+}
+
+impl Containerish {
+    fn open(id: &str, cell: Cell) -> Self {
+        Self {
+            id: id.into(),
+            cell,
+            pending: Vec::new(),
+            declared_durable: true,
+        }
+    }
+
+    /// the same substrate, silent about its durability.
+    fn undeclared(id: &str, cell: Cell) -> Self {
+        Self {
+            declared_durable: false,
+            ..Self::open(id, cell)
+        }
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl Module for Containerish {
+    fn id(&self) -> ModuleId {
+        self.id.clone()
+    }
+
+    fn root(&self) -> StateRoot {
+        let cell = self.cell.borrow();
+        digest(&[
+            b"containerish",
+            &cell.counter.to_le_bytes(),
+            &encode_map(&cell.committed),
+        ])
+    }
+
+    /// the whole state ships as ONE self-contained container — forge's handle.
+    fn state_sync_handle(&self) -> Result<StateSyncHandle, Error> {
+        Ok(StateSyncHandle::SnapshotBytes(encode_map(
+            &self.cell.borrow().committed,
+        )))
+    }
+
+    /// ...and yet it is durable on its own disk every block — which only this
+    /// declaration can say, since the sync surface above denies it.
+    fn block_durable(&self) -> bool {
+        self.declared_durable
+    }
+
+    async fn execute(&mut self, _ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
+        let (k, v) = parse_set(&msg.payload).ok_or(Error::Module("bad set".into()))?;
+        self.pending.push((k, v));
+        Ok(())
+    }
+
+    async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        let key = String::from_utf8(req.to_vec()).map_err(|_| Error::Module("bad key".into()))?;
+        Ok(self
+            .cell
+            .borrow()
+            .committed
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+            .into_bytes())
+    }
+
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut cell = self.cell.borrow_mut();
+        for (k, v) in self.pending.drain(..) {
+            cell.committed.insert(k, v);
+        }
+        cell.counter += 1;
+        Ok(())
+    }
+
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.pending.clear();
+        Ok(())
+    }
+}
+
+/// TWO container-substrate blocks above the last checkpoint (the "two forge
+/// pushes between checkpoints" shape). the substrate ends at block 2's root, so
+/// block 1 finds it at NEITHER its pre- nor its post-root: only a durable floor
+/// seeded from the disk cohort places it. before `Module::block_durable` the
+/// cohort was read off the sync handle, this module was not in it, and boot
+/// fail-stopped with `Error::Torn` — which
+/// [`an_undeclared_container_substrate_still_fail_stops`] pins, by running this
+/// same shape with the declaration withdrawn.
+#[test]
+fn a_container_shaped_disk_substrate_two_blocks_ahead_recovers_cleanly() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let cell: Cell = Rc::new(RefCell::new(DiskCell::default()));
+
+        let recovery = Recovery::open(context.child("r1"))
+            .await
+            .expect("open recovery");
+        let host = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Containerish::open("containerish", cell.clone())),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+        let signer = sk(1);
+
+        // block 0, then a REAL checkpoint at height 0.
+        node.submit(&signer, 0, set("containerish", "k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
+        let checkpoint_height = node.finalized().expect("boundary").height;
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest = Manifest::capture(
+            node.host(),
+            Some(checkpoint_height),
+            0,
+            0,
+            vec![],
+            vec![],
+            None,
+            pos,
+            1,
+        )
+        .expect("capture");
+        // and it carries NO snapshot bytes for this tenant: restore never
+        // installs them for a self-durable one, so building the container
+        // would be write amplification nothing reads back (#1308 — for forge,
+        // its whole git pack closure, on the select loop). the ROOT is still
+        // captured, and the root is what places the substrate below.
+        assert_eq!(manifest.snapshot("containerish"), None);
+        assert!(manifest.root("containerish").is_some());
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write checkpoint");
+
+        // two more blocks the checkpoint does not cover: the substrate ends TWO
+        // commits past it, at block 2's post-root.
+        node.submit(&signer, 1, set("containerish", "k1", "v1"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        node.submit(&signer, 2, set("containerish", "k2", "v2"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        let tip = node.finalized().expect("boundary");
+        let tip_hash = node.root_hash();
+        assert_eq!(cell.borrow().counter, 3, "one durable commit per block");
+
+        drop(node);
+
+        // ---- boot: reopen the cell (never install the snapshot) -------------
+        let mut recovery = Recovery::open(context.child("r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut fanout = Fanout::new("fanout");
+        fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
+        let container = Containerish::open("containerish", cell.clone());
+        let mut host = Host::genesis(vec![Box::new(fanout), Box::new(container)]).expect("genesis");
+        assert_ne!(
+            host.module_root("containerish"),
+            manifest.root("containerish"),
+            "the container substrate raced two blocks past the checkpoint"
+        );
+
+        let recovered = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect("a container-shaped disk substrate two blocks ahead recovers");
+
+        assert_eq!(recovered.height, Some(tip.height));
+        assert_eq!(recovered.root_hash, tip_hash);
+        assert_eq!(cell.borrow().counter, 3, "never re-committed");
+        assert_eq!(
+            host.query("containerish", b"k2").await.expect("q"),
+            b"v2".to_vec()
+        );
+    });
+}
+
+/// the SAME shape with the declaration withdrawn: the substrate is still
+/// per-block durable on its own disk, but a cohort that cannot see that (which
+/// is exactly what reading it off the sync handle produced for forge) has no
+/// floor to place it by, finds it at neither block 1's pre- nor its post-root,
+/// and REFUSES the boot. this is the fail-stop the fix must not have softened —
+/// recovery never waves through a state it cannot place.
+#[test]
+fn an_undeclared_container_substrate_still_fail_stops() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let cell: Cell = Rc::new(RefCell::new(DiskCell::default()));
+
+        let recovery = Recovery::open(context.child("r1"))
+            .await
+            .expect("open recovery");
+        let host = Host::genesis(vec![
+            Box::new(Fanout::new("fanout")),
+            Box::new(Containerish::undeclared("containerish", cell.clone())),
+        ])
+        .expect("genesis");
+        let mut node = OrderedNode::with_sink(host, RoundOrderer::new(), recovery);
+        let signer = sk(1);
+
+        node.submit(&signer, 0, set("containerish", "k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
+        let checkpoint_height = node.finalized().expect("boundary").height;
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest = Manifest::capture(
+            node.host(),
+            Some(checkpoint_height),
+            0,
+            0,
+            vec![],
+            vec![],
+            None,
+            pos,
+            1,
+        )
+        .expect("capture");
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write checkpoint");
+
+        // the same two uncheckpointed blocks.
+        node.submit(&signer, 1, set("containerish", "k1", "v1"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        node.submit(&signer, 2, set("containerish", "k2", "v2"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        drop(node);
+
+        let mut recovery = Recovery::open(context.child("r2"))
+            .await
+            .expect("reopen recovery");
+        let manifest = recovery.manifest().expect("decodes").expect("present");
+        let mut fanout = Fanout::new("fanout");
+        fanout.install(manifest.snapshot("fanout").expect("fanout snapshot"));
+        let mut host = Host::genesis(vec![
+            Box::new(fanout),
+            Box::new(Containerish::undeclared("containerish", cell.clone())),
+        ])
+        .expect("genesis");
+
+        let err = recovery
+            .recover(&mut host, &manifest)
+            .await
+            .expect_err("an unplaceable substrate must refuse the boot");
+        assert!(
+            matches!(err, recovery::Error::Torn(_)),
+            "expected a torn fail-stop, got {err:?}"
         );
     });
 }

@@ -25,7 +25,7 @@ pub const WILDCARD_TARGET: &str = "*";
 #[derive(
     Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq,
 )]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum Standing {
     /// the origin key holds a quorum seat (valset validators).
     Validator,
@@ -51,7 +51,7 @@ impl Standing {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AclMsg {
     /// set (or clear, with `standing: None`) one target's required submit
     /// standing. `target` is a module id or [`WILDCARD_TARGET`]. MODULE/SYSTEM
@@ -64,7 +64,7 @@ pub enum AclMsg {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AclQuery {
     /// the full committed policy table, sorted by target.
     Policy,
@@ -74,7 +74,7 @@ pub enum AclQuery {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AclReply {
     /// the committed policy entries, sorted by target (order-independent).
     Policy(Vec<(String, Standing)>),

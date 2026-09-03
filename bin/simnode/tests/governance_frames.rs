@@ -1,23 +1,24 @@
-//! account-signed governance FRAMES over the sim's real `/v1/submit/frame` wire
-//! (ADR A1, the account-signed governance lane): admit/promote/demote/leave leave
-//! the bespoke node-local re-signing lane and arrive as frames the app signs
-//! with the USER's ACCOUNT key. The governance module authorizes the verified
-//! frame origin by resolving it — via the committed `BindNode` — to the
-//! account's bound nodes and checking THEIR valset standing.
+//! signed governance FRAMES over the sim's real `/v1/submit/frame` wire (the
+//! signed governance lane): admit/promote/demote/leave leave the
+//! bespoke node-local re-signing lane and arrive as frames a key signs. In
+//! validator mode the governance module seats the verified frame origin ONLY
+//! if it is itself a validator-set member node — no identity read: a node key
+//! is never an account, and an account never fans out to nodes. So a
+//! validator's key founding an Identity account changes nothing here, and a
+//! stranger key (no seat) is refused at the module door.
 //!
 //! This is the network-level standing gate the module unit tests
 //! (`governance_shares.rs`) prove in-process: here the ops travel the exact
 //! signed-frame transport (`node::encode_frame` → POST /v1/submit/frame) a real
-//! validator verifies, authored by an account member key that is NOT any node
-//! key. A signer with no bound member node is refused at the module door.
+//! validator verifies. Account-keyed ballots are share mode's, pinned in
+//! `share_governance.rs`.
 
 mod harness;
 
 use commonware_cryptography::Signer as _;
 use commonware_cryptography::ed25519::PrivateKey;
 use governance::{GovAction, GovMsg, encode_msg as gov_encode};
-use harness::{Sim, ed_bind_auth};
-use identity::bind_preimage;
+use harness::{Sim, create};
 use sdk::Msg;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -69,39 +70,34 @@ fn gov_frame_ok(sim: &Sim, signer: &Ed, seq: u64, msg: &GovMsg) {
     assert_eq!(code, 200, "governance frame must commit: {reply}");
 }
 
-/// bind `node` (a genesis validator) to a fresh account founded by member key
-/// `account`, over the frameless setup lane — chain_id is "" in the sim.
-fn bind_node_to_account(sim: &Sim, node: &Ed, account: &Ed) {
-    let preimage = bind_preimage("", node.public_key().as_ref(), 0);
-    sim.submit_ok(
-        "identity",
-        json!({ "bind_node": { "authorizer": ed_bind_auth(account, &preimage) } }),
-        Some(origin(node).as_str()),
-    );
+/// found an Identity account for `node` (a genesis validator) — a node key is
+/// an ordinary ed25519 key, so it can — over the frameless setup lane. the
+/// point of doing so here is that validator-mode governance must NOT care.
+fn found_account(sim: &Sim, node: &Ed) {
+    sim.submit_ok("identity", create("validator"), Some(origin(node).as_str()));
 }
 
-/// The crown scenario: an account member key — bound to a validator node —
-/// drives a full admit ceremony (propose → vote → execute of an AddResident)
-/// as SIGNED FRAMES, and the resident grant lands. The account's ballot is its
-/// bound node's; the other two validators complete the majority.
+/// The crown scenario: a validator's key drives a full admit ceremony (propose
+/// → vote → execute of an AddResident) as SIGNED FRAMES, and the resident grant
+/// lands. The proposer is recorded as the NODE key even though that key founded
+/// an account; the other two validators complete the majority.
 #[test]
-fn an_account_signed_frame_admits_a_resident_through_its_bound_node_standing() {
+fn a_validator_signed_frame_admits_a_resident_and_is_recorded_as_the_node_key() {
     let storage = tempfile::tempdir().expect("storage dir");
     let (sim, validators) = governed(storage.path());
 
-    // account key K (never a node key) owns validator node[0].
-    let account = Ed::from_seed(100);
-    bind_node_to_account(&sim, &validators[0], &account);
+    // node[0]'s key founds an account — irrelevant to its validator standing.
+    found_account(&sim, &validators[0]);
 
     let newcomer = Ed::from_seed(50);
     let admit = GovAction::AddResident {
         key: newcomer.public_key().as_ref().to_vec(),
     };
 
-    // propose + vote, authored by the ACCOUNT key over the frame lane.
+    // propose + vote, authored by node[0]'s key over the frame lane.
     gov_frame_ok(
         &sim,
-        &account,
+        &validators[0],
         1,
         &GovMsg::Propose {
             proposal_id: "admit".into(),
@@ -111,7 +107,7 @@ fn an_account_signed_frame_admits_a_resident_through_its_bound_node_standing() {
     );
     gov_frame_ok(
         &sim,
-        &account,
+        &validators[0],
         2,
         &GovMsg::Vote {
             proposal_id: "admit".into(),
@@ -140,14 +136,15 @@ fn an_account_signed_frame_admits_a_resident_through_its_bound_node_standing() {
     );
     gov_frame_ok(
         &sim,
-        &account,
+        &validators[0],
         3,
         &GovMsg::Execute {
             proposal_id: "admit".into(),
         },
     );
 
-    // the proposer was recorded as the ACCOUNT, and the grant landed.
+    // the proposer was recorded as the NODE key — validator mode seats node
+    // keys with no identity read, account or not — and the grant landed.
     let proposal = sim.query(
         "governance",
         json!({ "proposal": { "proposal_id": "admit" } }),
@@ -155,18 +152,18 @@ fn an_account_signed_frame_admits_a_resident_through_its_bound_node_standing() {
     assert_eq!(proposal["proposal"]["status"], "passed", "{proposal}");
     assert_eq!(
         proposal["proposal"]["proposer"],
-        json!(account.public_key().as_ref().to_vec()),
-        "the proposal is authored by the account, not a node key: {proposal}"
+        json!(validators[0].public_key().as_ref().to_vec()),
+        "in validator mode the proposer is the node key itself: {proposal}"
     );
     let residents = sim.query("valset", json!("residents"));
     assert!(
         has_key(&residents["residents"], newcomer.public_key().as_ref()),
-        "the account-signed admit granted resident standing: {residents}"
+        "the validator-signed admit granted resident standing: {residents}"
     );
 }
 
-/// A frame signer with NO validator-set standing — no bound member node, and
-/// not a validator itself — is refused at the governance door.
+/// A frame signer that is not a validator-set member node is refused at the
+/// governance door — in validator mode there is no other way in.
 #[test]
 fn a_frame_from_a_key_without_standing_is_refused() {
     let storage = tempfile::tempdir().expect("storage dir");
@@ -192,29 +189,28 @@ fn a_frame_from_a_key_without_standing_is_refused() {
     );
     let err = reply["error"].as_str().unwrap_or_default();
     assert!(
-        err.contains("standing"),
-        "the refusal names the missing standing: {reply}"
+        err.contains("not a validator-set member node"),
+        "the refusal names the missing seat: {reply}"
     );
 }
 
-/// A bound account can also LEAVE (self-remove one of its validator nodes) via a
-/// signed frame; with the remaining two validators approving, the set shrinks.
+/// A validator can also demote a peer via a signed frame; with node[0] and
+/// node[1] approving, the set shrinks.
 #[test]
-fn an_account_signed_frame_demotes_a_validator() {
+fn a_validator_signed_frame_demotes_a_validator() {
     let storage = tempfile::tempdir().expect("storage dir");
     let (sim, validators) = governed(storage.path());
 
-    let account = Ed::from_seed(101);
-    bind_node_to_account(&sim, &validators[0], &account);
+    found_account(&sim, &validators[0]);
 
-    // demote validator[2] (a RemoveValidator proposal). account (node[0]) +
-    // node[1] approve → 2 of 3.
+    // demote validator[2] (a RemoveValidator proposal). node[0] + node[1]
+    // approve → 2 of 3.
     let demote = GovAction::RemoveValidator {
         key: validators[2].public_key().as_ref().to_vec(),
     };
     gov_frame_ok(
         &sim,
-        &account,
+        &validators[0],
         1,
         &GovMsg::Propose {
             proposal_id: "demote".into(),
@@ -224,7 +220,7 @@ fn an_account_signed_frame_demotes_a_validator() {
     );
     gov_frame_ok(
         &sim,
-        &account,
+        &validators[0],
         2,
         &GovMsg::Vote {
             proposal_id: "demote".into(),
@@ -242,7 +238,7 @@ fn an_account_signed_frame_demotes_a_validator() {
     );
     gov_frame_ok(
         &sim,
-        &account,
+        &validators[0],
         3,
         &GovMsg::Execute {
             proposal_id: "demote".into(),

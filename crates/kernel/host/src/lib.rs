@@ -37,7 +37,6 @@ use sdk::{
 };
 use sha2::{Digest, Sha256};
 
-pub mod topology;
 pub mod worker;
 
 /// compute the global root-hash over `modules` — the composition consensus
@@ -344,6 +343,28 @@ pub struct ModuleSnapshot {
     pub state_sync: StateSyncHandle,
 }
 
+/// what [`CapturePayloads::InMemoryCohort`] reports for the disk cohort.
+const SELF_DURABLE_NO_PAYLOAD: &str =
+    "per-block durable on its own disk: this capture materializes no payload for it";
+
+/// which modules a capture MATERIALIZES payload bytes for. every module's
+/// root and the composed root-hash are captured either way — this decides only
+/// whose `state_sync_handle` is asked, and asking is what costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturePayloads {
+    /// every module's: the boundary a JOINER installs the whole registry from.
+    All,
+    /// the in-memory cohort's only. a [`Module::block_durable`] module commits
+    /// to its OWN disk every block and reopens from it at boot — a checkpoint
+    /// restore installs nothing for one — so materializing its container is a
+    /// full re-encode of state the manifest never reads back. forge's is its
+    /// whole git pack closure, built on the consensus select loop and fsync'd
+    /// into every checkpoint (#1308). such a module is reported
+    /// [`StateSyncHandle::Unsupported`]: this capture holds no payload for it,
+    /// which is what the field means to every reader of a capture.
+    InMemoryCohort,
+}
+
 /// one module that could NOT prepare a sync surface at this boundary. its
 /// committed root is still known — `root()` is pure and cannot fail — so the
 /// boundary stays describable; only this module's transfer surface is missing.
@@ -616,17 +637,16 @@ impl Host {
     /// pending-swap clear reconstruct byte-for-byte on every node (never a
     /// respawn side-effect, invisible to replay). keyed purely on committed
     /// lifecycle state + `height`: injected iff the committed module holds an
-    /// armed swap (ready + height reached). idempotent — the first block
+    /// armed swap ([`lifecycle::ScheduledSwap::armed_at`] — readiness latched
+    /// before `height`, floor reached). idempotent — the first block
     /// at/after `H` clears it, so later blocks inject nothing. ABSENT until
     /// the module is registered (the query errors → `None`), so the drain is
     /// byte-identical on a net without the module.
     async fn pending_lifecycle_advance(&self, height: u64) -> Option<Msg> {
         let swap_armed = self.lifecycle_module_status().await.is_some_and(|modules| {
-            modules.iter().any(|m| {
-                m.pending
-                    .as_ref()
-                    .is_some_and(|p| p.ready && height >= p.activation_height)
-            })
+            modules
+                .iter()
+                .any(|m| m.pending.as_ref().is_some_and(|p| p.armed_at(height)))
         });
         swap_armed.then(|| Msg {
             target: LIFECYCLE_MODULE_ID.into(),
@@ -673,8 +693,9 @@ impl Host {
     /// module is absent / its reply is unreadable — the shared out-of-block
     /// committed read behind [`Host::pending_lifecycle_advance`] and
     /// [`Host::realize_module_swaps`] (a missing registry is never an error,
-    /// just nothing to do).
-    async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
+    /// just nothing to do). `pub` for the node's restore/sync composers, which
+    /// adopt the modules the registry admitted after genesis.
+    pub async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
         let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
         let bytes = self.query(LIFECYCLE_MODULE_ID, &req).await.ok()?;
         match lifecycle::decode_reply(&bytes).ok()? {
@@ -704,20 +725,30 @@ impl Host {
     /// to `root()`, so a swap keeps the module's state and the root-hash is
     /// byte-continuous across it.
     ///
-    /// keyed PURELY on committed registry state + `height`, so it reconstructs
-    /// identically on every path that advances a node to a committed state — live
-    /// drain, recovery replay, state-sync catch-up — and is idempotent: it
-    /// compares [`Module::code_hash`] and re-instantiates a component only on an
-    /// actual change. run it BEFORE applying block `height`, so that block's
-    /// dispatches execute on the code the registry designates for `height`.
+    /// keyed PURELY on committed registry state + `height` — the code the
+    /// registry designates FOR `height` ([`lifecycle::code_at`]) — so it
+    /// reconstructs identically on every path that advances a node to a
+    /// committed state: live drain, recovery replay, state-sync catch-up. it
+    /// is idempotent: it compares [`Module::code_hash`] and re-instantiates a
+    /// component only on an actual change. run it BEFORE applying block
+    /// `height`, so that block's dispatches execute on the code the registry
+    /// designates for `height`.
     ///
-    /// the target hash for a module at `height` is a pending hash that has reached
-    /// activation (`activation_height <= height`), else its committed ACTIVE hash
-    /// — the SAME predicate lifecycle's `Advance` arm-check applies, so this
-    /// out-of-block realization and the in-block commit never disagree on the arm
-    /// set. reading ACTIVE (not only the armed pending) is what lets a state-sync
-    /// joiner — which installs post-activation state with no pending left to arm —
-    /// reconcile to the live code instead of forking on stale genesis code.
+    /// the target hash for a module at `height` is a pending hash that has
+    /// armed (`ScheduledSwap::armed_at` — the SAME predicate
+    /// lifecycle's `Advance` applies, so this out-of-block realization and the
+    /// in-block flip never disagree on the arm set; on the live drain the
+    /// registry sits at `height - 1` and this is the read that precedes the
+    /// flip), else the latest ACTIVATION at or before `height`. the registry is
+    /// disk-durable and reopens AHEAD of a crash-restart replay — active =
+    /// whatever landed last, pending gone — so the tip cannot say which code
+    /// sealed a replayed block; the activation history can, and a replay that
+    /// spans a swap moves the module back to the pre-swap code and forward
+    /// again at the swap block. a state-sync joiner (post-activation state,
+    /// nothing pending) reads the same last activation and reconciles its
+    /// genesis code to the live one instead of forking. a module whose first
+    /// activation is past `height` seats its first code; one registered but
+    /// never activated is nothing to realize.
     ///
     /// FAIL-CLOSED: a designated hash whose bytes this node lacks, or bytes whose
     /// sha256 does not match the committed hash, is a hard error (the node cannot
@@ -732,48 +763,36 @@ impl Host {
             return Ok(());
         };
         for m in modules {
-            // the SAME arm predicate as lifecycle::handle_advance (height >=
-            // activation_height): pending-if-armed, else the committed active hash.
-            let target = match m.pending {
-                // the SAME arm predicate as lifecycle: ready (full byte receipt,
-                // latched in committed state) AND the height floor reached.
-                Some(p) if p.ready && height >= p.activation_height => p.code_hash,
-                _ => m.active_code_hash,
+            let Some(target) = lifecycle::code_at(&m, height) else {
+                continue; // registered, never activated — nothing to realize.
             };
             // only reconcile a module this node actually runs AS a hot-swappable
             // component: a native module (no `code_hash`) is nothing to realize —
             // its registry entry is a genesis concern. an id absent from the
-            // registry whose committed target is NON-empty is a post-genesis
-            // ADMISSION this boundary must realize by instantiating the module
-            // from its verified bytes; an empty target is an admission not yet
-            // armed.
+            // registry is a post-genesis ADMISSION this boundary must realize by
+            // instantiating the module from its verified bytes.
             let current = match self.registry.get(&m.module_id) {
                 Some(module) => match module.code_hash() {
                     Some(current) => Some(current),
                     None => continue, // native module — genesis concern.
                 },
-                None => {
-                    if target.is_empty() {
-                        continue;
-                    }
-                    None // admission to realize below.
-                }
+                None => None, // admission to realize below.
             };
-            if current.as_ref() == Some(&target) {
+            if current.as_deref() == Some(target) {
                 continue; // already on the designated code — idempotent no-op.
             }
-            let bytes = src.fetch(&target).await.ok_or_else(|| {
+            let bytes = src.fetch(target).await.ok_or_else(|| {
                 Error::Module(format!(
                     "code bytes absent for module {} (hash {}) — fail-closed",
                     m.module_id,
-                    hex32(&target),
+                    hex32(target),
                 ))
             })?;
             if sha256(&bytes) != target {
                 return Err(Error::Module(format!(
                     "code bytes for module {} do not match committed hash {} — fail-closed",
                     m.module_id,
-                    hex32(&target),
+                    hex32(target),
                 )));
             }
             match current {
@@ -816,6 +835,13 @@ impl Host {
         self.registry.get(id).map(|m| m.root())
     }
 
+    /// the sha256 of the component a registered module currently RUNS, or
+    /// `None` for a native module (no swappable code) and for an unknown id.
+    /// per-node realization state, never part of `root()`.
+    pub fn module_code_hash(&self, id: &str) -> Option<Vec<u8>> {
+        self.registry.get(id).and_then(|m| m.code_hash())
+    }
+
     /// every registered module's `(id, root)`, in registry (sorted-id) order —
     /// the exact input [`Host::root_hash`] composes over. a recovery journal
     /// seals each applied block with these so a restarted node can locate every
@@ -827,24 +853,23 @@ impl Host {
             .collect()
     }
 
-    /// the per-block-durable disk cohort: every registered module whose sync
-    /// surface is [`StateSyncHandle::ResolverBacked`] — a qmdb-like store that
-    /// commits to its OWN disk each block and recovers itself at boot rather than
-    /// riding a checkpoint snapshot. recovery uses this to tell a disk substrate
-    /// that legitimately raced N blocks ahead of the last checkpoint apart from a
-    /// rolled-back in-memory cohort module: only a disk-cohort module may be
-    /// trusted at a self-durable root ABOVE the checkpoint. a module whose
-    /// `state_sync_handle` errors is excluded (it cannot claim the disk cohort's
-    /// self-durability), falling through to the ordinary root-equality path.
-    pub fn resolver_backed_ids(&self) -> BTreeSet<ModuleId> {
+    /// the per-block-durable disk cohort: every registered module that declares
+    /// [`Module::block_durable`] — a substrate that commits to its OWN disk each
+    /// block and recovers itself at boot rather than riding a checkpoint
+    /// snapshot. recovery uses this to tell a disk substrate that legitimately
+    /// raced N blocks ahead of the last checkpoint apart from a rolled-back
+    /// in-memory cohort module: only a disk-cohort module may be trusted at a
+    /// self-durable root ABOVE the checkpoint.
+    ///
+    /// the question is DURABILITY, not sync surface. this used to read
+    /// [`StateSyncHandle::ResolverBacked`] off `state_sync_handle`, which dropped
+    /// forge — per-block durable on its own disk, but shipping one
+    /// self-contained container — out of the cohort and bricked any restart with
+    /// two forge blocks above the last checkpoint.
+    pub fn block_durable_ids(&self) -> BTreeSet<ModuleId> {
         self.registry
             .iter()
-            .filter(|(_, m)| {
-                matches!(
-                    m.state_sync_handle(),
-                    Ok(StateSyncHandle::ResolverBacked { .. })
-                )
-            })
+            .filter(|(_, m)| m.block_durable())
             .map(|(id, _)| id.clone())
             .collect()
     }
@@ -873,9 +898,12 @@ impl Host {
         &self,
         finalized: FinalizedBlock,
     ) -> Result<FinalizedSnapshot, SnapshotError> {
-        self.snapshot_at(finalized.height, Some(finalized.root_hash), || {
-            Duration::ZERO
-        })
+        self.snapshot_at(
+            finalized.height,
+            Some(finalized.root_hash),
+            CapturePayloads::All,
+            || Duration::ZERO,
+        )
         .map(|(snapshot, _)| snapshot)
     }
 
@@ -894,9 +922,10 @@ impl Host {
     pub fn capture_current_snapshot(
         &self,
         height: u64,
+        payloads: CapturePayloads,
         now: impl FnMut() -> Duration,
     ) -> (FinalizedSnapshot, Vec<(ModuleId, Duration)>) {
-        self.snapshot_at(height, None, now)
+        self.snapshot_at(height, None, payloads, now)
             .expect("an unverified capture has no root to mismatch")
     }
 
@@ -908,6 +937,7 @@ impl Host {
         &self,
         height: u64,
         expected: Option<StateRoot>,
+        payloads: CapturePayloads,
         mut now: impl FnMut() -> Duration,
     ) -> Result<(FinalizedSnapshot, Vec<(ModuleId, Duration)>), SnapshotError> {
         let mut roots: Vec<(ModuleId, StateRoot)> = Vec::with_capacity(self.registry.len());
@@ -935,7 +965,18 @@ impl Host {
             .zip(capture_cost.iter_mut())
         {
             let started = now();
-            let handle = module.state_sync_handle();
+            // `block_durable` is only consulted where it can change the
+            // answer: its default impl reads `state_sync_handle`, and under
+            // `All` that would be a second (for forge, very expensive) call.
+            let reopens_from_own_disk =
+                matches!(payloads, CapturePayloads::InMemoryCohort) && module.block_durable();
+            let handle = if reopens_from_own_disk {
+                Ok(StateSyncHandle::Unsupported {
+                    reason: SELF_DURABLE_NO_PAYLOAD.into(),
+                })
+            } else {
+                module.state_sync_handle()
+            };
             cost.1 += now().saturating_sub(started);
             match handle {
                 Ok(state_sync) => modules.push(ModuleSnapshot {
@@ -1488,27 +1529,21 @@ impl Host {
                 .any(|k| k.as_slice() == submitter)
     }
 
-    /// does `submitter` belong to an identity account — as a member key or a
-    /// bound node key? an unreadable reply is "no" — fail-closed for a policy
-    /// that names user standing.
+    /// does `submitter` belong to an identity account? an unreadable reply is
+    /// "no" — fail-closed for a policy that names user standing. a node key
+    /// is never an account member by itself: only a user-signed origin holds
+    /// user standing.
     async fn identity_account_holds(&self, submitter: &[u8]) -> bool {
-        let owner = |q: identity::IdentityQuery| async move {
-            let bytes = self
-                .query(IDENTITY_MODULE_ID, &identity::encode_query(&q))
-                .await;
-            matches!(
-                bytes.map(|b| identity::decode_reply(&b)),
-                Ok(Ok(identity::IdentityReply::Account(Some(_))))
-            )
+        let query = identity::IdentityQuery::OfKey {
+            key: submitter.to_vec(),
         };
-        owner(identity::IdentityQuery::OfMember {
-            member_key: submitter.to_vec(),
-        })
-        .await
-            || owner(identity::IdentityQuery::OfNode {
-                node_key: submitter.to_vec(),
-            })
-            .await
+        let bytes = self
+            .query(IDENTITY_MODULE_ID, &identity::encode_query(&query))
+            .await;
+        matches!(
+            bytes.map(|b| identity::decode_reply(&b)),
+            Ok(Ok(identity::IdentityReply::Account(Some(_))))
+        )
     }
 
     async fn drain_queue(

@@ -1,6 +1,6 @@
 //! The huddle's media leg: the `/v1/call/ws` client the node's call hub has
 //! been serving since the webview era — mic capture in, mixed playout out,
-//! call control as json text frames. Binary framing is `chat::call_wire`, the
+//! call control as json text frames. Binary framing is `media_service::call_wire`, the
 //! single definition site; the control json mirrors `noded`'s
 //! `CallClientControl`/`CallServerControl` (tag = `type`, snake_case) — the
 //! app does not link the daemon crate, so the three-variant shapes are
@@ -17,7 +17,7 @@
 //! AUDIO THREADING: cpal streams are not `Send`, so they live on one
 //! dedicated OS thread that builds input+output and parks on a shutdown
 //! channel. Capture callbacks push mono i16 into a frame accumulator and hand
-//! full 20 ms frames (`chat::voice::FRAME_SAMPLES`) to the pump over an
+//! full 20 ms frames (`media_service::voice::FRAME_SAMPLES`) to the pump over an
 //! unbounded channel; playout callbacks drain a shared ring the pump fills
 //! from `mixed` frames. Late audio is dead audio: the ring caps at ~200 ms
 //! and drops oldest, capture frames drop when the pump is behind.
@@ -26,9 +26,9 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use chat::call_wire;
-use chat::call_wire::CapturedFrame;
-use chat::voice::FRAME_SAMPLES;
+use media_service::call_wire;
+use media_service::call_wire::CapturedFrame;
+use media_service::voice::FRAME_SAMPLES;
 use iced::futures::stream::BoxStream;
 use iced::futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
@@ -126,25 +126,104 @@ pub(crate) fn beacon_state() {
     let Some(handles) = guard.as_ref() else {
         return;
     };
+    let source = crate::video::source();
     let _ = handles.control.send(ClientControl::Beacon {
         muted: handles.muted.load(Ordering::Relaxed),
-        camera_on: crate::video::camera_enabled(),
-        sharing: false,
+        camera_on: source == crate::video::Source::Camera,
+        sharing: source == crate::video::Source::Screen,
     });
 }
 
-/// Steer the fan-out set to the huddle roster's peer NODE keys (self
-/// excluded). Called wherever the roster refreshes; a missing session is a
-/// no-op.
-pub fn call_recipients(nodes: Vec<String>) -> iced::Task<()> {
-    let guard = handles().lock().expect("call handles");
-    let Some(handles) = guard.as_ref() else {
-        return iced::Task::none();
-    };
-    let _ = handles
-        .control
-        .send(ClientControl::Recipients { peers: nodes });
-    iced::Task::none()
+/// How often the live session re-reads its huddle's roster. The hub beacons
+/// at 1 Hz, so this is the same order as the presence traffic it unblocks: a
+/// peer who joins is admitted within a second of their join committing.
+const ROSTER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// How many roster reads in a row have to fail before the session says so on
+/// its status line. One is nothing — a node mid-restart, a view a block
+/// behind. Three is the fan-out standing still, which is a huddle that hears
+/// nobody, and the app keeps no log for anyone to find that in.
+const ROSTER_REFUSALS_VOICED: u32 = 3;
+
+/// Steer the fan-out set from the huddle's ON-CHAIN roster, for as long as the
+/// session lives. See [`crate::backend::huddle_fanout_nodes`] for why this is a
+/// poll and not a push: admission is roster-gated on receive, so the peer whose
+/// arrival should have re-steered the set is exactly the peer we cannot hear
+/// until it is steered.
+///
+/// Ends with the session — the pump's control receiver drops and the send
+/// fails. A failed read (node restarting, view not yet synced) keeps the last
+/// set and tries again on the next tick.
+///
+/// THE POLL IS ALSO HOW A HUDDLE ENDS FOR SOMEONE. A peer who leaves simply
+/// stops beaconing, and nothing that stops arriving can announce itself: their
+/// badge, their last decoded frame and their claim on the stage would all
+/// stand for the rest of the call. The set that drops them is the one place
+/// that knows, so it says so — one `gone` event each, which the folds treat as
+/// the peer's last word.
+async fn steer_recipients(
+    rpc: String,
+    channel_id: String,
+    control: tokio::sync::mpsc::UnboundedSender<ClientControl>,
+    mut events: iced::futures::channel::mpsc::UnboundedSender<CallEvent>,
+) {
+    let mut steered: Vec<String> = Vec::new();
+    let mut ever_read = false;
+    let mut refusals: u32 = 0;
+    loop {
+        match crate::backend::huddle_fanout_nodes(&rpc, &channel_id).await {
+            Ok(peers) => {
+                // A read that comes back after the session complained about it
+                // takes the complaint down with it: an empty message is what
+                // the status fold reads as a plain "live".
+                let complained = refusals >= ROSTER_REFUSALS_VOICED;
+                if complained && events.send(CallEvent::of("live")).await.is_err() {
+                    return;
+                }
+                refusals = 0;
+                let moved = !ever_read || peers != steered;
+                if moved {
+                    ever_read = true;
+                    if control
+                        .send(ClientControl::Recipients {
+                            peers: peers.clone(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                    for departed in steered.iter().filter(|node| !peers.contains(node)) {
+                        crate::video::forget_peer(departed);
+                        let mut gone = CallEvent::of("gone");
+                        gone.peer = departed.clone();
+                        if events.send(gone).await.is_err() {
+                            return;
+                        }
+                    }
+                    steered = peers;
+                }
+            }
+            // A ROSTER THIS SESSION CANNOT READ IS A SILENT HUDDLE, and the app
+            // keeps no log for anyone to find it in. One reading is nothing (a
+            // node mid-restart, a view a block behind); several in a row is the
+            // fan-out standing still, which is the exact failure this whole
+            // poll exists to end — so it says so on the status line, once.
+            Err(reason) => {
+                refusals += 1;
+                if refusals == ROSTER_REFUSALS_VOICED
+                    && events
+                        .send(CallEvent::failed("live", format!("roster: {reason}")))
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        }
+        if control.is_closed() {
+            return;
+        }
+        tokio::time::sleep(ROSTER_POLL).await;
+    }
 }
 
 /// The session stream: connect, pump, and yield state the handlers fold. The
@@ -203,21 +282,31 @@ async fn run_session(
     let audio = AudioThread::start(muted.clone(), mic_tx, playout.clone());
     let audio_note = audio.note.clone();
 
-    // The camera leg (crate::video): its thread mirrors the audio thread's
-    // ownership rules and dies with the same teardown chain.
+    // The video leg (crate::video): camera or shared screen, one at a time.
+    // Its thread mirrors the audio thread's ownership rules and dies with the
+    // same teardown chain.
     let (video_tx, mut video_rx) = tokio::sync::mpsc::unbounded_channel::<CapturedFrame>();
     let _video_keepalive = video_tx.clone();
-    let (camera_shutdown_tx, camera_shutdown_rx) = std::sync::mpsc::channel::<()>();
-    let camera_events = events.clone();
-    let camera_thread = std::thread::Builder::new()
-        .name("huddle-camera".into())
-        .spawn(move || crate::video::camera_thread(video_tx, camera_shutdown_rx, camera_events))
+    let (capture_shutdown_tx, capture_shutdown_rx) = std::sync::mpsc::channel::<()>();
+    let capture_events = events.clone();
+    let capture_thread = std::thread::Builder::new()
+        .name("huddle-capture".into())
+        .spawn(move || crate::video::capture_thread(video_tx, capture_shutdown_rx, capture_events))
         .ok();
 
     *handles().lock().expect("call handles") = Some(Handles {
         muted: muted.clone(),
         control: control_tx.clone(),
     });
+
+    // The fan-out set is the huddle's, and the huddle's roster is on-chain —
+    // this poll is the ONLY thing that puts a later joiner into it.
+    tokio::spawn(steer_recipients(
+        rpc.clone(),
+        channel_id.clone(),
+        control_tx.clone(),
+        events.clone(),
+    ));
 
     // The hub beacons our state at 1 Hz on our behalf; one push seeds it.
     beacon_state();
@@ -240,6 +329,14 @@ async fn run_session(
                 Some(Ok(WsMessage::Text(text))) => {
                     match serde_json::from_str::<ServerControl>(&text) {
                         Ok(ServerControl::PeerBeacon { peer, muted, camera_on, sharing }) => {
+                            // A SOURCE THAT WENT OFF TAKES ITS LAST FRAME WITH
+                            // IT. Nothing arrives to replace a frame after the
+                            // camera stops, so the tile would hold the moment
+                            // it was turned off for the rest of the call — the
+                            // beacon is the only thing that says otherwise.
+                            if !camera_on && !sharing {
+                                crate::video::forget_peer(&peer);
+                            }
                             let event = CallEvent {
                                 kind: "peer".into(),
                                 message: String::new(),
@@ -312,8 +409,8 @@ async fn run_session(
 
     *handles().lock().expect("call handles") = None;
     crate::video::reset();
-    drop(camera_shutdown_tx);
-    if let Some(thread) = camera_thread {
+    drop(capture_shutdown_tx);
+    if let Some(thread) = capture_thread {
         let _ = thread.join();
     }
     drop(audio);
@@ -322,6 +419,26 @@ async fn run_session(
 // ============================================================================
 // audio — one OS thread owns the cpal streams (they are not Send)
 // ============================================================================
+
+/// Mixed frames that arrived carrying SOUND, for this process's life.
+///
+/// The one seam that can answer "is anybody else audible?" from outside the
+/// pump: the playout ring holds samples for ~200 ms and then forgets them, and
+/// the speaker is the only other place they go. The live huddle lane
+/// (`tests::huddle_live`) waits on this the way it waits on a decoded frame
+/// for the picture — a silent huddle is the failure it exists to catch.
+static VOICE_HEARD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Anything above this in a mixed frame is somebody talking. The far end's
+/// SILK decoder converges to near-zero on silence, so the floor only has to
+/// clear the decoder's own noise.
+const AUDIBLE: i16 = 1000;
+
+/// How many mixed frames with sound in them this process has received.
+#[cfg(test)]
+pub(crate) fn voice_frames_heard() -> u64 {
+    VOICE_HEARD.load(Ordering::Relaxed)
+}
 
 /// The playout ring: mixed 20 ms frames in, device-rate samples out. Caps at
 /// ~200 ms and drops oldest — late audio is dead audio.
@@ -334,6 +451,9 @@ const PLAYOUT_CAP: usize = FRAME_SAMPLES * 10;
 
 impl PlayoutRing {
     fn push_frame(&mut self, frame: &[i16]) {
+        if frame.iter().any(|sample| sample.abs() > AUDIBLE) {
+            VOICE_HEARD.fetch_add(1, Ordering::Relaxed);
+        }
         self.samples.extend(frame);
         while self.samples.len() > PLAYOUT_CAP {
             self.samples.pop_front();
@@ -631,15 +751,40 @@ pub fn apply_call_peer(peers: Vec<CallEvent>, event: CallEvent) -> Vec<CallEvent
             peers.push(event);
             peers
         }
+        // Someone left the huddle. A beacon is the only thing that can update
+        // a peer's row and theirs have stopped, so without this their badges,
+        // their frame and their claim on the stage outlive them.
+        "gone" => peers
+            .into_iter()
+            .filter(|peer| peer.peer != event.peer)
+            .collect(),
         "closed" | "refused" | "error" => Vec::new(),
         _ => peers,
     }
 }
 
-/// Any live camera in the call — the local one or any peer beaconing
-/// `camera_on` — gates the tile strip and its repaint tick.
-pub fn call_video_live_after(peers: Vec<CallEvent>, camera: bool) -> bool {
-    camera || peers.iter().any(|peer| peer.camera_on)
+/// Any live video in the call — this device's own source, or any peer
+/// beaconing a camera or a share — gates the tile strip and its repaint tick.
+pub fn call_video_live_after(peers: Vec<CallEvent>, camera: bool, sharing: bool) -> bool {
+    camera || sharing || peers.iter().any(|peer| peer.camera_on || peer.sharing)
+}
+
+/// WHO HOLDS THE STAGE — the one participant whose video is a screen, so the
+/// panel can show it whole instead of cropping a desktop into a 4:3 thumbnail.
+/// Empty means nobody is sharing and there is no stage.
+///
+/// A PEER'S SHARE OUTRANKS OUR OWN. Both can be true — nothing stops two
+/// people sharing at once — and of the two pictures, the one you have not
+/// already got on your screen is the one worth the space. Ours still appears
+/// (as [`crate::video::SELF_STAGE`]) when it is the only one, because a
+/// sharer with no view of what they published is sharing blind.
+pub fn huddle_stage_peer(peers: Vec<CallEvent>, local_sharing: bool) -> String {
+    let remote = peers.into_iter().find(|peer| peer.sharing);
+    match remote {
+        Some(peer) => peer.peer,
+        None if local_sharing => crate::video::SELF_STAGE.to_string(),
+        None => String::new(),
+    }
 }
 
 /// One huddle tile with its mute decision already attached.
@@ -746,6 +891,14 @@ mod tests {
         let peers = apply_call_peer(peers, beacon("bb", true));
         let peers = apply_call_peer(peers, beacon("aa", false));
         assert_eq!(peers.len(), 2);
+        // A peer who left stops beaconing, so their last beacon would stand
+        // for the rest of the call; the roster poll's `gone` is what ends it.
+        let mut left = CallEvent::of("gone");
+        left.peer = "bb".into();
+        let peers = apply_call_peer(peers, left);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].peer, "aa");
+        let peers = apply_call_peer(peers, beacon("bb", true));
         let participant = |node: &str, is_you: bool| crate::backend::HuddleParticipant {
             key: node.into(),
             label: node.into(),
@@ -767,6 +920,36 @@ mod tests {
         assert!(!rows[0].muted);
         assert!(rows[1].muted);
         assert!(rows[2].muted, "the local tile reads the local mute");
+    }
+
+    #[test]
+    fn the_stage_prefers_the_share_you_cannot_already_see() {
+        let sharing = |peer: &str, sharing: bool| CallEvent {
+            kind: "peer".into(),
+            peer: peer.into(),
+            sharing,
+            ..CallEvent::default()
+        };
+        // Nobody sharing: no stage, whatever the cameras are doing.
+        assert!(huddle_stage_peer(vec![sharing("aa", false)], false).is_empty());
+        // A peer's share takes it.
+        assert_eq!(
+            huddle_stage_peer(vec![sharing("aa", false), sharing("bb", true)], false),
+            "bb"
+        );
+        // Ours alone is staged too — a sharer with no view of what they
+        // published is sharing blind.
+        assert_eq!(
+            huddle_stage_peer(vec![sharing("aa", false)], true),
+            crate::video::SELF_STAGE
+        );
+        // Both at once: the picture we do NOT already have on screen wins.
+        assert_eq!(huddle_stage_peer(vec![sharing("bb", true)], true), "bb");
+        // And any live source at all lights the strip.
+        assert!(call_video_live_after(Vec::new(), false, true));
+        let live = |peers: Vec<CallEvent>| call_video_live_after(peers, false, false);
+        assert!(live(vec![sharing("bb", true)]));
+        assert!(!live(vec![sharing("bb", false)]));
     }
 
     #[test]

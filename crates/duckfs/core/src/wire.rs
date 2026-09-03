@@ -20,6 +20,15 @@ pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_DEPTH: usize = 128;
 pub const MAX_DIR_ENTRIES: usize = 65_536;
 pub const MAX_INLINE_COMMIT_BYTES: usize = 256 * 1024;
+/// the per-commit change ceiling — a CONSENSUS-WIRE bound, not a client setting.
+/// a commit is ONE op in ONE block: its inline bytes ride that block's payload,
+/// every chunked file rides one [`CHUNK_SIZE`] (~1 MiB) staging block each, in
+/// sequence, with no priority lane, and the commit walks a tree spine per touched
+/// path under [`MAX_OBJECT_READS_PER_OP`]. so raising this does not make a big
+/// tree land faster — it makes one commit monopolize the chain, and every
+/// validator pays. do not raise it: the client's answer to a large tree is
+/// `.duckfsignore` (never walk build output) and `ducktape fs commit --path`
+/// (one subtree per commit, each still atomic).
 pub const MAX_CHANGES_PER_COMMIT: usize = 4096;
 /// per-op ceiling on DISTINCT committed-store object reads — a files CONSENSUS
 /// cap enforced in the pure core, so the native `Files` module and the wasm
@@ -92,6 +101,19 @@ pub const MAX_SYNC_IDS: usize = MAX_PAGE as usize;
 /// `landed >= 1` invariant intact. bin/node compile-asserts this stays under
 /// its `MAX_MESSAGE_SIZE` with rpc-envelope headroom.
 pub const MAX_SYNC_REPLY_BYTES: usize = 3 << 19;
+/// ceiling on the encoded refs image (1 MiB). the `GetRefs` sync reply ships it
+/// WHOLE, base64-wrapped, under the same [`MAX_SYNC_REPLY_BYTES`] budget
+/// `GetObjects` spends — and there is no cursor to page it. the count caps alone
+/// do not hold it: at their ceilings the image is ~8 MB (65,536 staging rows at
+/// ~124 B each), several times the p2p cap the sender ASSERTS on. so every refs
+/// growth path (`putblob`, `pin`, `watch`) refuses an entry that would push the
+/// image past this, `decode_refs` refuses a larger image outright, and
+/// `serve_sync` refuses to ship one — the same execute/decode pairing as
+/// [`MAX_STAGING_ENTRIES`], for the same reason (an agreed image must always
+/// re-decode on reboot and install on a joiner).
+pub const MAX_REFS_IMAGE_BYTES: usize = 1 << 20;
+// the base64 image plus its json envelope rides under the reply budget.
+const _: () = assert!(MAX_REFS_IMAGE_BYTES.div_ceil(3) * 4 + 64 <= MAX_SYNC_REPLY_BYTES);
 pub const MAX_READ_BYTES: u64 = 1024 * 1024;
 pub const MAX_GREP_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_GREP_LINE_BYTES: usize = 256;
@@ -100,7 +122,7 @@ pub const MAX_GREP_LINE_BYTES: usize = 256;
 /// SCANNED, not hits EMITTED, so without this a single in-budget file of
 /// pathologically many matching lines could amplify into an unbounded reply;
 /// with it a reply is bounded at roughly 4096 hits x ~0.5 KiB each (path +
-/// capped line text + uri) — a couple of MiB worst case.
+/// capped line text + locator) — a couple of MiB worst case.
 pub const MAX_GREP_HITS_PER_CALL: usize = MAX_PAGE as usize * 16;
 /// first byte of the binary putblob op frame. json msgs start with b'{',
 /// so one leading byte disambiguates the whole op space.
@@ -274,9 +296,9 @@ pub struct GrepHit {
     pub path: String,
     pub line: u64,
     pub text: String,
-    /// `duck://files<path>@<snapshot>#L<line>` — the absolute path brings its
-    /// own leading slash (see [`evidence_uri`]).
-    pub uri: String,
+    /// `<path>@<snapshot>#L<line>` — where this hit was, pinned (see
+    /// [`evidence_locator`]).
+    pub locator: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -442,12 +464,17 @@ pub fn encode_putblob(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// grep-hit evidence uri: `duck://files<path>@<snapshot>#L<line>`. the path is
-/// absolute and brings its own leading slash, so the authority is joined
-/// bare — same rule as memory's `duck://memory<path>` uris (a separator slash
-/// here would double it).
-pub fn evidence_uri(path: &str, snapshot: &str, line: u64) -> String {
-    format!("duck://files{path}@{snapshot}#L{line}")
+/// grep-hit evidence locator: `<path>@<snapshot>#L<line>` — the file, the
+/// snapshot it was scanned at, and the 1-based line.
+///
+/// NOT a `duck://` uri, deliberately. the one duck:// grammar admits a file
+/// only as `duck://files/shared/attachments/<dir>/<name>`, plain, because
+/// classification is the only guard between a crafted ref and a client read
+/// at any path it names; a grep hit is an arbitrary path at a pinned
+/// snapshot, so minting one as a duck:// address produced a link the protocol
+/// refuses to open. evidence points AT a line, it does not address it.
+pub fn evidence_locator(path: &str, snapshot: &str, line: u64) -> String {
+    format!("{path}@{snapshot}#L{line}")
 }
 
 /// decode exactly 64 lowercase-hex chars into 32 bytes (uppercase rejected).

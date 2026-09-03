@@ -25,26 +25,31 @@
 //!
 //!   | # | shape | state | outcome |
 //!   |---|---|---|---|
-//!   | 0 | 0 submits, pinned to 1 | 1 admits nobody | `work_not_admitted` |
-//!   | 1 | 1 submits, pinned to itself | nobody granted | `credential_not_granted` |
-//!   | 2 | 0 submits, pinned to 1 | 1 admitted, **still ungranted** | `Done` + `PONG` |
+//!   | 0 | owner submits, pinned to 1 | 1 admits nobody | `work_not_admitted` |
+//!   | 1 | 1's user submits, pinned to 1 | nobody granted | `credential_not_granted` |
+//!   | 2 | owner submits, pinned to 1 | admitted, **still ungranted** | `Done` + `PONG` |
 //!   | 2b | direction 2's pointer, replayed once its saga is terminal | unchanged | **refused** |
-//!   | 3 | 1 submits, pinned to itself | 1 granted | `Done` + `PONG` |
+//!   | 3 | 1's user submits, pinned to 1 | 1's user granted | `Done` + `PONG` |
+//!
+//!   Every submit is a USER-signed frame (what `agent sched` sends): the saga's
+//!   committed origin is the user's key, which identity's `OfKey` resolves to
+//!   an account — the executor's admission and the lender's grant gate both
+//!   read that. A node key resolves to nothing; a node is never an account.
 //!
 //!   Direction 2 is the whole campaign: A submits, B executes, and the draw is
 //!   on A's grant. B supplies only a POINTER — the run's committed saga id — and
 //!   the lender resolves out of its own state that A submitted it and that B
-//!   holds its lease. Direction 3 is the non-regression: an executor granted in
+//!   holds its lease. Direction 3 is the non-regression: a submitter granted in
 //!   its own right still draws in its own right.
 //!
 //!   Directions 0 and 1 are two consents in OPPOSITE directions and both must
-//!   hold: node 1 decides whose work it runs, node 0 decides whose account may
-//!   draw on its credential. Neither substitutes for the other.
+//!   hold: node 1 decides whose work it runs, node 0's user decides whose
+//!   account may draw on its credential. Neither substitutes for the other.
 //!
 //! ## what a sandboxed run costs this suite in evidence
 //!
 //! Both legs boot each node's `ducktape service run compute` daemon and execute
-//! providers INSIDE a container, so `[sandbox]` is mandatory and a host path is
+//! providers INSIDE a microVM, so `[sandbox]` is mandatory and a host path is
 //! no longer a shared surface. The granted leg counts executions on the MOCK
 //! UPSTREAM, which is host-side and outside the sandbox; the refusal leg has
 //! only committed state (see its closing assertions). A host that cannot
@@ -60,7 +65,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{Cluster, poll_until, sandbox_toml, serial, skip_unless_sandboxed};
+use common::{
+    Cluster, create_account, poll_until, sandbox_toml, serial, skip_unless_sandboxed, submit_frame,
+};
 use commonware_cryptography::{Signer as _, ed25519};
 
 use airlock::attest::{self, Measurement};
@@ -74,7 +81,6 @@ use gateway::{
     RouteMethod, RouteName, RoutePolicy, RouteStatement, RouteTarget, SetCredentialStatement,
     set_credential_preimage,
 };
-use identity::{AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth};
 use saga::{SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView};
 
 use axum::extract::State;
@@ -232,51 +238,14 @@ async fn seal_credential(gw_base: &str, name: &str) -> [u8; 32] {
 // identity + gateway helpers (mirror airlock_gateway_e2e / gateway_e2e)
 // ===========================================================================
 
-/// The granted leg's image, and the reason it is not the harness default: its
-/// provider script dials the loopback broker with node's global `fetch`, so it
-/// needs a `node` runtime the busybox default does not have.
-///
-/// The refusal leg never executes anything, so it boots on
-/// [`common::SANDBOX_IMAGE`] — each compute daemon fills its OWN empty podman
-/// graph root at boot, and 4 MB beats 200 MB for an image no container ever
-/// runs.
-const BROKER_IMAGE: &str = "docker.io/library/node:22-slim";
+// The granted leg used to name its own image: its provider executor dials the
+// loopback broker, which the harness's busybox default could not do. Every node
+// now boots the same shared guest rootfs, so that choice moved to where the
+// image is built (ops/build-guest-rootfs.sh) — and the per-node cost that made
+// it a trade is gone, since one read-only image serves every node instead of each compute
+// daemon filling its own graph root at boot.
 
-fn bind_auth(member: &ed25519::PrivateKey, chain: &str, node: &[u8]) -> MemberAuth {
-    identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain, node, 0))
-}
-
-fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<AccountView> {
-    let bytes = cluster.query(
-        reader,
-        "identity",
-        &identity::encode_query(&IdentityQuery::OfNode {
-            node_key: node.to_vec(),
-        }),
-    )?;
-    match identity::decode_reply(&bytes).ok()? {
-        IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) => None,
-    }
-}
-
-/// Bind node `idx` (key `node`) to member `member`'s account and wait for it to
-/// commit — the account the credential grant is checked against.
-fn bind_node(cluster: &Cluster, idx: usize, member: &ed25519::PrivateKey, node: &[u8]) {
-    cluster.submit(
-        idx,
-        "identity",
-        &identity::encode_msg(&IdentityMsg::BindNode {
-            authorizer: bind_auth(member, &cluster.namespace, node),
-        }),
-    );
-    poll_until("identity binding", FINALIZE, || {
-        account_of_node(cluster, idx, node)
-            .filter(|account| account.account_id == member.public_key().as_ref())
-    });
-}
-
-fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<Vec<u8>> {
+fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
@@ -297,13 +266,13 @@ fn resolve_handle(cluster: &Cluster, reader: usize, handle: &str) -> Option<Vec<
 fn signed_airlock_route(
     member: &ed25519::PrivateKey,
     chain: &str,
+    account: u64,
     publisher: &[u8],
     revision: u64,
 ) -> GatewayMsg {
     let statement = RouteStatement {
-        version: 1,
         chain_id: chain.into(),
-        account_id: member.public_key().as_ref().to_vec(),
+        account_id: account,
         name: RouteName::named("airlock"),
         publisher_node: publisher.to_vec(),
         revision,
@@ -335,12 +304,12 @@ fn signed_airlock_route(
     }
 }
 
-fn airlock_route_revision(cluster: &Cluster, reader: usize, account: &[u8]) -> Option<u64> {
+fn airlock_route_revision(cluster: &Cluster, reader: usize, account: u64) -> Option<u64> {
     let bytes = cluster.query(
         reader,
         "gateway",
         &gateway::encode_query(&GatewayQuery::Get {
-            account_id: account.to_vec(),
+            account_id: account,
             name: RouteName::named("airlock"),
         }),
     )?;
@@ -369,36 +338,49 @@ fn seed_claude_store(storage: &Path, name: &str, refresh: &str) {
     .unwrap();
 }
 
-/// The seal PUBLIC key the lender minted when it opened its store — the on-chain
-/// anchor the executing node pins. Self-host has no quote.
-/// Give a node's workspace a work-admission policy admitting `account`.
+/// Give a node's workspace a work-admission policy admitting `accounts` (by
+/// number). A user-signed run is an ACCOUNT caller even on the user's own node
+/// — only the node key itself is `ThisNode` — so a node that runs its own
+/// user's scheduled work lists that user's account too.
 ///
 /// Written as the FILE, not through the writer: an integration test should pin
 /// the on-disk contract the operator (and `ducktape node work admit`) produces,
 /// not a second copy of the producer. The daemon re-reads it on every decision,
 /// so this lands with no restart — which is itself part of what the test proves.
-fn admit_work_from(workspace: &Path, account: &[u8]) {
+fn admit_work_from(workspace: &Path, accounts: &[u64]) {
+    let listed = accounts
+        .iter()
+        .map(|account| format!("\"{account}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     std::fs::write(
         workspace.join("work-admit.toml"),
-        format!("admit = [\"{}\"]\n", common::hex(account)),
+        format!("admit = [{listed}]\n"),
     )
     .expect("write work-admit.toml");
 }
 
+/// The seal PUBLIC key the lender minted when it opened its store — the on-chain
+/// anchor the executing node pins. Self-host has no quote.
 fn seal_pk_from_store(storage: &Path) -> [u8; 32] {
     let bytes = std::fs::read(storage.join("airlock-creds").join("seal.key")).expect("seal.key");
     let secret: [u8; 32] = bytes.as_slice().try_into().expect("32-byte seal secret");
     airlock::seal::SealKeypair::from_secret_bytes(secret).public_bytes()
 }
 
-/// Owner-signed grant of `CRED_NAME` to `grantee` — which, under this flow, is
-/// the account of the node that will RUN the workload.
-fn signed_grant(owner: &ed25519::PrivateKey, chain: &str, grantee: &[u8]) -> GatewayMsg {
+/// Owner-signed grant of `CRED_NAME` to account `grantee` — which, under this
+/// flow, is the account of the user whose node will RUN the workload.
+fn signed_grant(
+    owner: &ed25519::PrivateKey,
+    chain: &str,
+    owner_account: u64,
+    grantee: u64,
+) -> GatewayMsg {
     let statement = gateway::CredentialGrantStatement {
         chain_id: chain.into(),
-        owner_account: owner.public_key().as_ref().to_vec(),
+        owner_account,
         name: CRED_NAME.into(),
-        account: grantee.to_vec(),
+        account: grantee,
     };
     let signature = owner
         .sign(
@@ -421,6 +403,7 @@ fn signed_grant(owner: &ed25519::PrivateKey, chain: &str, grantee: &[u8]) -> Gat
 fn set_credential(
     owner: &ed25519::PrivateKey,
     chain: &str,
+    owner_account: u64,
     publisher_node: &[u8],
     seal_pk: [u8; 32],
 ) -> GatewayMsg {
@@ -428,7 +411,7 @@ fn set_credential(
         chain_id: chain.into(),
         record: CredentialRecord {
             name: CRED_NAME.into(),
-            owner_account: owner.public_key().as_ref().to_vec(),
+            owner_account,
             publisher_node: publisher_node.to_vec(),
             kind: CredentialKind::Claude,
             seal_pk,
@@ -436,7 +419,10 @@ fn set_credential(
         },
     };
     let signature = owner
-        .sign(GATEWAY_CREDENTIAL_NS, &set_credential_preimage(&statement).unwrap())
+        .sign(
+            GATEWAY_CREDENTIAL_NS,
+            &set_credential_preimage(&statement).unwrap(),
+        )
         .as_ref()
         .to_vec();
     GatewayMsg::SetCredential {
@@ -466,19 +452,27 @@ fn credential_record(cluster: &Cluster, reader: usize) -> Option<CredentialRecor
 // the sched trigger + its committed result
 // ===========================================================================
 
-/// saga's id space is namespaced per trigger origin, and `/v1/submit` re-signs
-/// with the RECEIVING node's own key — so an id node `idx` can trigger lives
-/// under that node's actor namespace, and no other member can create it.
-fn node_sid(cluster: &Cluster, idx: usize, id: &str) -> String {
-    let key = Cluster::identity(cluster.peer_ids[idx]);
+/// saga's id space is namespaced per trigger origin — the frame's USER key —
+/// so an id `user` triggers lives under that key's actor namespace, and no
+/// other signer can create it.
+fn user_sid(user: &ed25519::PrivateKey, id: &str) -> String {
+    let key = user.public_key().as_ref().to_vec();
     saga::namespaced_id(&sdk::Origin::External(key), id)
 }
 
-/// Submit a bare `SagaMsg::Trigger` from node `idx` (its key stamps the origin),
+/// Submit a bare `SagaMsg::Trigger` through node `idx` as a frame `submitter`
+/// signed (its USER key stamps the origin — the shape `agent sched` sends),
 /// pinned to `target`, whose v3 envelope carries `CRED_NAME`. No demands — the
-/// smallest reliable execution shape (the cpu/mem → Podman limit-flag
-/// dimension is not exercised here).
-fn submit_sched(cluster: &Cluster, idx: usize, saga_id: &str, target: &[u8], max_attempts: u32) {
+/// smallest reliable execution shape (the cpu/mem → VM size dimension is not
+/// exercised here).
+fn submit_sched(
+    cluster: &Cluster,
+    idx: usize,
+    submitter: &ed25519::PrivateKey,
+    saga_id: &str,
+    target: &[u8],
+    max_attempts: u32,
+) {
     let spec = dispatch::encode_work_spec(&dispatch::WorkSpec {
         kind: dispatch::WORK_SPEC_KIND.into(),
         dispatch_id: saga_id.rsplit('\u{1f}').next().unwrap().into(),
@@ -500,7 +494,7 @@ fn submit_sched(cluster: &Cluster, idx: usize, saga_id: &str, target: &[u8], max
         demands: BTreeMap::new(),
         pinned_assignee: Some(target.to_vec()),
     };
-    cluster.submit(idx, "saga", &saga::encode_msg(&trigger));
+    submit_frame(cluster, idx, submitter, "saga", &saga::encode_msg(&trigger));
 }
 
 fn saga_view(cluster: &Cluster, reader: usize, saga_id: &str) -> Option<SagaView> {
@@ -532,13 +526,7 @@ fn wait_terminal(cluster: &Cluster, reader: usize, saga_id: &str, budget: Durati
 /// `secret` is the node's own 0600 service-link token: `run-output:` carries
 /// provider stdout, so it is a workspace-gated topic and an un-tokened subscribe
 /// is refused.
-async fn run_output_has(
-    port: u16,
-    id: &str,
-    marker: &str,
-    secret: &str,
-    budget: Duration,
-) -> bool {
+async fn run_output_has(port: u16, id: &str, marker: &str, secret: &str, budget: Duration) -> bool {
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/v1/ws"))
         .await
         .expect("open run-output ws");
@@ -586,13 +574,52 @@ async fn run_output_has(
 /// seeds into `CLAUDE_CONFIG_DIR`) for the run leg, or none for the refusal leg
 /// (which never reaches execution).
 ///
-/// The script runs INSIDE the run's container, so its `stdout` is the whole of
-/// its observable behaviour: it can touch no host path (none exists in that
-/// mount namespace) and nothing beyond what the image provides. Execution
-/// counting therefore lives on the mock upstream, which is host-side.
+/// The executor runs INSIDE the run's microVM, so its `stdout` is the whole of
+/// its observable behaviour: it can touch no host path (none is mounted there)
+/// and nothing beyond what the guest rootfs provides. Execution counting
+/// therefore lives on the mock upstream, which is host-side.
 struct ScriptProvider {
     spec_dir: PathBuf,
-    script: PathBuf,
+    bin: PathBuf,
+}
+
+/// the broker leg's executor, as a shell one-liner.
+///
+/// It rides the spec's ARGV rather than a staged `provider.sh`, because a run
+/// executes inside a microVM that mounts nothing from the host — an executor a
+/// node lends has to already be in the guest rootfs. A host script reaches the
+/// guest as `execve /opt/duck/bin/provider.sh` and exit 126.
+///
+/// Absolute guest paths, not bare names: the guest inherits only the run's env,
+/// so nothing guarantees a `PATH` that finds `python3`. Everything it uses is
+/// in the rootfs `ops/build-guest-rootfs.sh` builds.
+///
+/// The guest reaches the HOST's loopback broker because `duck-guest-init`
+/// serves `127.0.0.1:<port>` inside the VM and tunnels it over vsock — the
+/// credential itself stays host-side, and this leg only ever sees the per-run
+/// bearer the broker seeded into `CLAUDE_CONFIG_DIR`.
+fn broker_leg_body() -> String {
+    // one `python3 -c` rather than curl + a JSON extractor: it keeps the whole
+    // request inside single quotes, so no shell metacharacter survives into
+    // TOML. Statements are `;`-joined (all simple, no blocks) so the arg needs
+    // no embedded newline either.
+    let python = concat!(
+        r#"import json,os,urllib.request as u; "#,
+        r#"t=json.load(open(os.environ["CLAUDE_CONFIG_DIR"]+"/.credentials.json"))["claudeAiOauth"]["accessToken"]; "#,
+        r#"b=json.dumps({"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"PING"}]}).encode(); "#,
+        r#"r=u.Request(os.environ["ANTHROPIC_BASE_URL"]+"/v1/messages",data=b,headers={"#,
+        r#""authorization":"Bearer "+t,"content-type":"application/json","#,
+        r#""anthropic-version":"2023-06-01","anthropic-beta":"oauth-2025-04-20"}); "#,
+        r#"print(u.urlopen(r).read().decode())"#,
+    );
+    format!("cat > /dev/null; exec /usr/bin/python3 -c '{python}'")
+}
+
+/// a shell body as the spec's `args` array: TOML-escape it and hand it to
+/// `sh -c`.
+fn argv_literal(body: &str) -> String {
+    let escaped = body.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("[\"-c\", \"{escaped}\"]")
 }
 
 impl ScriptProvider {
@@ -600,44 +627,15 @@ impl ScriptProvider {
         let dir = root.join("provider");
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
-        let script = dir.join("provider.sh");
+        // resolved by basename to /opt/duck/bin/sh inside the guest
+        let bin = PathBuf::from("/bin/sh");
 
-        // the broker leg runs INSIDE the podman sandbox ([`BROKER_IMAGE`]), so
-        // it dials the loopback broker with node's global fetch — the container
-        // has no curl. execution is counted host-side by the mock upstream. the
-        // refusal leg never runs, so its body only needs to be valid.
+        // the refusal leg never runs, so its body only needs to be valid.
         let body = if broker {
-            "#!/bin/sh\n\
-             set -e\n\
-             cat > /dev/null\n\
-             node -e '\n\
-             const fs = require(\"fs\");\n\
-             const creds = JSON.parse(fs.readFileSync(process.env.CLAUDE_CONFIG_DIR + \"/.credentials.json\", \"utf8\"));\n\
-             const body = {model:\"claude-sonnet-5\",max_tokens:16,messages:[{role:\"user\",content:\"PING\"}]};\n\
-             fetch(process.env.ANTHROPIC_BASE_URL + \"/v1/messages\", {\n\
-               method: \"POST\",\n\
-               headers: {\n\
-                 authorization: \"Bearer \" + creds.claudeAiOauth.accessToken,\n\
-                 \"content-type\": \"application/json\",\n\
-                 \"anthropic-version\": \"2023-06-01\",\n\
-                 \"anthropic-beta\": \"oauth-2025-04-20\",\n\
-               },\n\
-               body: JSON.stringify(body),\n\
-             }).then((r) => r.text()).then((t) => { console.log(t); });\n\
-             '\n"
-                .to_string()
+            broker_leg_body()
         } else {
-            "#!/bin/sh\n\
-             set -e\n\
-             cat > /dev/null\n\
-             printf 'unreachable\\n'\n"
-                .to_string()
+            "cat > /dev/null; printf 'unreachable\\n'".to_string()
         };
-        std::fs::write(&script, body).expect("write provider script");
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut perms = std::fs::metadata(&script).expect("script metadata").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod provider script");
 
         // `config_home_env` is NOT optional decoration for a claude-broker spec:
         // the broker seeds the per-run bearer as a `claudeAiOauth` credentials
@@ -662,20 +660,21 @@ impl ScriptProvider {
                  bin = \"{TAG}-nonexistent-cli\"\n\
                  env = \"DUCKTAPE_TEST_SCHED_BIN\"\n\
                  [invoke]\n\
-                 args = []\n\
+                 args = {args}\n\
                  prompt = \"stdin\"\n\
                  timeout_secs = 60\n\
                  [output]\n\
                  format = \"text\"\n\
-                 {isolation}"
+                 {isolation}",
+                args = argv_literal(&body),
             ),
         )
         .expect("write provider spec");
-        Self { spec_dir, script }
+        Self { spec_dir, bin }
     }
 
     /// the env that makes a node provide the tag: the operator spec dir plus the
-    /// detect override that points at the script.
+    /// detect override that points at the guest's shell.
     fn env(&self) -> Vec<(String, String)> {
         vec![
             (
@@ -684,7 +683,7 @@ impl ScriptProvider {
             ),
             (
                 "DUCKTAPE_TEST_SCHED_BIN".into(),
-                self.script.display().to_string(),
+                self.bin.display().to_string(),
             ),
         ]
     }
@@ -706,7 +705,8 @@ fn hide_builtins(root: &Path, name: &str) -> Vec<(String, String)> {
 
 #[test]
 fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
-    if skip_unless_sandboxed("a_granted_scheduled_run_executes_against_the_mock_upstream").is_some() {
+    if skip_unless_sandboxed("a_granted_scheduled_run_executes_against_the_mock_upstream").is_some()
+    {
         return;
     }
     let _serial = serial();
@@ -715,14 +715,15 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
 
     // the credential node's loopback services live in THIS process; the node
     // subprocess reaches the gateway over host loopback, like a real deployment
-    // (the provider container shares the host netns — no private netns here).
+    // (the guest has no host network at all: `duck-guest-init` serves the
+    // broker's port on the VM's own loopback and tunnels it over vsock).
     let (gw_base, gw_port, upstream) = rt.block_on(boot_gateway_and_upstream());
     let seal_pk = rt.block_on(seal_credential(&gw_base, CRED_NAME));
 
     let provider = ScriptProvider::stage(fixtures.path(), true);
     let mut cluster = Cluster::new(&[0], &[0]);
     cluster.wireguard = true;
-    cluster.extra_toml = sandbox_toml(BROKER_IMAGE);
+    cluster.extra_toml = sandbox_toml();
     // the [sandbox] table is only HOW runs are isolated; the pool also
     // needs the user's compute grant. This run is pinned, not claimed from a
     // pool, so the grant announces nothing.
@@ -739,28 +740,31 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     // consensus, three minutes from the actual cause. Its own marker names it
     // immediately.
     //
-    // What it covers, exactly: `PodmanService` + provider discovery. NOT the
-    // image — nothing is pulled at boot, so an unpullable tag passes this marker
-    // and fails the run ~20s later. A dead libpod socket never prints it and
-    // burns the full budget. Neither is a skip: past `probe()` this suite has
-    // declared the host capable, so an unusable sandbox is a failure.
+    // What it covers, exactly: the sandbox probe + provider discovery. NOT a
+    // bootable guest — no VM starts until a run does, so an unreadable rootfs
+    // passes this marker and fails the run seconds later. Not a skip either:
+    // past `probe()` this suite has declared the host capable, so an unusable
+    // sandbox is a failure.
     cluster.wait_compute_marker(0, "compute daemon serving", CONVERGE);
 
-    // the node owns the credential: bind its key to an account, map its handle,
-    // register the gateway port, publish the airlock route, register the record.
+    // the node's USER owns the credential: found its account, map its handle,
+    // register the gateway port, publish the airlock route, register the
+    // record — every one a user-signed frame.
     let owner = ed25519::PrivateKey::from_seed(42);
     let node_key = Cluster::identity(0);
-    bind_node(&cluster, 0, &owner, &node_key);
+    let owner_account = create_account(&cluster, 0, &owner, "owner");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("owner".into()),
         }),
     );
     poll_until("owner.duck resolution", FINALIZE, || {
-        resolve_handle(&cluster, 0, "owner").filter(|id| id == owner.public_key().as_ref())
+        resolve_handle(&cluster, 0, "owner").filter(|id| *id == owner_account)
     });
 
     let workspace = cluster.workspace(0);
@@ -776,34 +780,55 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     ]);
     assert!(ok, "airlock gateway port bind failed: {output}");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
-        &gateway::encode_msg(&signed_airlock_route(&owner, &cluster.namespace, &node_key, 1)),
+        &gateway::encode_msg(&signed_airlock_route(
+            &owner,
+            &cluster.namespace,
+            owner_account,
+            &node_key,
+            1,
+        )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
-        (airlock_route_revision(&cluster, 0, owner.public_key().as_ref()) == Some(1)).then_some(())
+        (airlock_route_revision(&cluster, 0, owner_account) == Some(1)).then_some(())
     });
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
-        &gateway::encode_msg(&set_credential(&owner, &cluster.namespace, &node_key, seal_pk)),
+        &gateway::encode_msg(&set_credential(
+            &owner,
+            &cluster.namespace,
+            owner_account,
+            &node_key,
+            seal_pk,
+        )),
     );
     poll_until("the credential record to commit", FINALIZE, || {
         credential_record(&cluster, 0).filter(|r| r.seal_pk == seal_pk)
     });
 
-    // the pinned run: bound to this node, drawing on its OWN credential (the
-    // owner is always granted). the origin is this node's key.
+    // the node runs its own user's work: a user-signed run is an ACCOUNT
+    // caller even here (only the node key itself is `ThisNode`), so the
+    // owner's account has to be admitted.
+    admit_work_from(&workspace, &[owner_account]);
+
+    // the pinned run: bound to this node, drawing on its user's OWN credential
+    // (the owner is always granted). the origin is the owner's user key.
     // 64 ascii-hex, because that is what the product mints
     // (`agent_cli::fresh_dispatch_id`) and what the node's ws `run_output` gate
     // admits. A short hand-made id — which this fixture used to carry — is
     // dropped at the node as `malformed_run_id`, so the ring assertion below
     // could only ever have failed on a real run.
     let dispatch_id = "5c4ed0e2be5f0ab8f8dc5d0f4c2b1a9e7d3f60518c2a4b6d8e0f1a3c5e7b9d02";
-    let saga_id = node_sid(&cluster, 0, &format!("sched\u{1f}{dispatch_id}"));
-    submit_sched(&cluster, 0, &saga_id, &node_key, 3);
+    let saga_id = user_sid(&owner, &format!("sched\u{1f}{dispatch_id}"));
+    submit_sched(&cluster, 0, &owner, &saga_id, &node_key, 3);
 
     let view = wait_terminal(&cluster, 0, &saga_id, ROUND_TRIP);
     assert_eq!(
@@ -832,7 +857,10 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
         &secret,
         FINALIZE,
     ));
-    assert!(saw, "the mock upstream's reply streamed to the run-output ring");
+    assert!(
+        saw,
+        "the mock upstream's reply streamed to the run-output ring"
+    );
 
     // exactly-once, counted host-side where the sandbox boundary can't hide
     // it: one provider execution = one accepted upstream call.
@@ -868,7 +896,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     let provider = ScriptProvider::stage(fixtures.path(), true);
     let mut cluster = Cluster::new(&[0, 1], &[0, 1]);
     cluster.wireguard = true;
-    cluster.extra_toml = sandbox_toml(BROKER_IMAGE);
+    cluster.extra_toml = sandbox_toml();
     cluster.compute_grant = Some(vec![]);
     let owner_storage = cluster.workspace(0);
     seed_claude_store(&owner_storage, CRED_NAME, "rt-delegated");
@@ -902,15 +930,19 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     cluster.spawn_service(0, "airlock");
     cluster.wait_service_marker(0, "airlock", "airlock daemon serving", CONVERGE);
 
+    // two USERS: the owner founds account 1 through node 0, the executor's
+    // user account 2 through node 1. The nodes themselves are on no account.
     let owner = ed25519::PrivateKey::from_seed(42);
     let executor = ed25519::PrivateKey::from_seed(43);
     let owner_node = Cluster::identity(0);
     let executor_node = Cluster::identity(1);
-    bind_node(&cluster, 0, &owner, &owner_node);
-    bind_node(&cluster, 1, &executor, &executor_node);
+    let owner_account = create_account(&cluster, 0, &owner, "owner");
+    let executor_account = create_account(&cluster, 1, &executor, "executor");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
         &gateway::encode_msg(&GatewayMsg::SetHandle {
             handle: Some("owner".into()),
@@ -918,31 +950,42 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     );
     for reader in 0..2 {
         poll_until("owner.duck resolution", FINALIZE, || {
-            resolve_handle(&cluster, reader, "owner").filter(|id| id == owner.public_key().as_ref())
+            resolve_handle(&cluster, reader, "owner").filter(|id| *id == owner_account)
         });
     }
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
         &gateway::encode_msg(&signed_airlock_route(
             &owner,
             &cluster.namespace,
+            owner_account,
             &owner_node,
             1,
         )),
     );
     poll_until("airlock route revision 1", FINALIZE, || {
-        (airlock_route_revision(&cluster, 1, owner.public_key().as_ref()) == Some(1)).then_some(())
+        (airlock_route_revision(&cluster, 1, owner_account) == Some(1)).then_some(())
     });
 
     // the record carries the STORE's seal_pk (self-host has no quote) and an
     // empty grant set — nobody may draw on it yet.
     let seal_pk = seal_pk_from_store(&owner_storage);
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
-        &gateway::encode_msg(&set_credential(&owner, &cluster.namespace, &owner_node, seal_pk)),
+        &gateway::encode_msg(&set_credential(
+            &owner,
+            &cluster.namespace,
+            owner_account,
+            &owner_node,
+            seal_pk,
+        )),
     );
     poll_until("the credential record to commit", FINALIZE, || {
         credential_record(&cluster, 1)
@@ -951,18 +994,18 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     // ---- DIRECTION 0: the executor does not run this submitter's work ------
     //
     // TWO consents in opposite directions, and this is the first: before the
-    // lender is ever dialled, node 1 decides whether it runs node 0's work at
-    // all. Its default is owner-only and these are two accounts, so the run is
-    // refused HERE — no container, no gateway hop, no session. Without this
-    // step the credential lane below is not even reachable.
+    // lender is ever dialled, node 1 decides whether it runs the owner's work
+    // at all. Its default admits no account, so the run is refused HERE — no
+    // microVM, no gateway hop, no session. Without this step the credential
+    // lane below is not even reachable.
     //
     // They COMPOSE, and this direction is where that is visible: the CREDENTIAL
     // consent is already satisfied for this exact run shape — the owner submits
     // it and the saga module leases it to node 1, which is precisely what
     // direction 2 delegates on — and it makes no difference. One consent
     // satisfied is not the other consent granted.
-    let unadmitted_id = &node_sid(&cluster, 0, "sched\u{1f}sched-delegated-unadmitted");
-    submit_sched(&cluster, 0, unadmitted_id, &executor_node, 1);
+    let unadmitted_id = &user_sid(&owner, "sched\u{1f}sched-delegated-unadmitted");
+    submit_sched(&cluster, 0, &owner, unadmitted_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 0, unadmitted_id, ROUND_TRIP);
     assert_eq!(
         view.status,
@@ -979,22 +1022,25 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
         view.error,
     );
 
-    // ---- the admission, on the EXECUTOR, for the SUBMITTER's account -------
+    // ---- the admission, on the EXECUTOR ------------------------------------
     //
     // The opposite direction from the grant below: this is node 1 saying whose
-    // work it will run, not node 0 saying who may draw on its credential. No
-    // restart — the policy is re-read on every decision.
-    admit_work_from(&cluster.workspace(1), owner.public_key().as_ref());
+    // work it will run, not the owner saying who may draw on its credential.
+    // It lists the SUBMITTER's account — and its own user's, because a
+    // user-signed run is an account caller on any node (only the node key
+    // itself is `ThisNode`). No restart — the policy is re-read on every
+    // decision.
+    admit_work_from(&cluster.workspace(1), &[owner_account, executor_account]);
 
     // ---- DIRECTION 1: nobody is granted ------------------------------------
     //
-    // Node 1 submits this one and pins it to ITSELF, so there is no delegation
-    // to be had: the committed origin, the assignee and the account the lender's
-    // node stamps on the hop are all node 1, and node 1 is on no grant list. It
-    // also takes the admission's `ThisNode` path, which isolates the CREDENTIAL
-    // gate from the work gate direction 0 just proved.
-    let refused_id = &node_sid(&cluster, 1, "sched\u{1f}sched-delegated-ungranted");
-    submit_sched(&cluster, 1, refused_id, &executor_node, 1);
+    // Node 1's user submits this one and pins it to node 1, so there is no
+    // delegation to be had: the committed origin is the executor's user key
+    // (account 2), the assignee is node 1, and account 2 is on no grant list.
+    // Admission passes (the account was just listed), which isolates the
+    // CREDENTIAL gate from the work gate direction 0 just proved.
+    let refused_id = &user_sid(&executor, "sched\u{1f}sched-delegated-ungranted");
+    submit_sched(&cluster, 1, &executor, refused_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 1, refused_id, ROUND_TRIP);
     assert_eq!(
         view.status,
@@ -1013,19 +1059,19 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
 
     // ---- DIRECTION 2: DELEGATION, and the grant list is untouched -----------
     //
-    // THE POINT OF THE CAMPAIGN. Node 1 is still granted nothing — direction 1
-    // just proved it, and no grant op is submitted until below. What changes is
-    // WHO SUBMITS: the owner does, so the run's committed origin is the owner's
-    // node key (proven by the signature `/v1/submit` re-stamped on the op), and
-    // the saga module leased the attempt to node 1.
+    // THE POINT OF THE CAMPAIGN. Account 2 is still granted nothing — direction
+    // 1 just proved it, and no grant op is submitted until below. What changes
+    // is WHO SUBMITS: the owner does, so the run's committed origin is the
+    // owner's USER key (proven by the frame signature), which resolves to the
+    // owner's account, and the saga module leased the attempt to node 1.
     //
     // Node 1's broker sends the saga id and nothing else. The lender reads both
     // facts out of its own committed state — the owner submitted it, node 1
     // holds its lease — and authorizes the draw on the OWNER's grant. A run
     // submitted by A and executed on B, drawing as A: the thing that has never
     // worked before this PR.
-    let delegated_id = &node_sid(&cluster, 0, "sched\u{1f}sched-delegated-pointer");
-    submit_sched(&cluster, 0, delegated_id, &executor_node, 1);
+    let delegated_id = &user_sid(&owner, "sched\u{1f}sched-delegated-pointer");
+    submit_sched(&cluster, 0, &owner, delegated_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 0, delegated_id, ROUND_TRIP);
     assert_eq!(
         view.status,
@@ -1041,10 +1087,10 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     assert!(
         !gateway::credential_use_allowed(
             &credential_record(&cluster, 1).expect("the record is still committed"),
-            executor.public_key().as_ref(),
+            executor_account,
         ),
-        "and it did so with the executor on NO grant list — otherwise this \
-         direction proves nothing the next one does not",
+        "and it did so with the executor's account on NO grant list — otherwise \
+         this direction proves nothing the next one does not",
     );
 
     // ---- DIRECTION 2b: and the pointer DIES with the run -------------------
@@ -1080,26 +1126,32 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     );
 
     // ---- the grant, and the ONLY thing that changes -------------------------
-    let executor_account = executor.public_key().as_ref().to_vec();
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &owner,
         "gateway",
-        &gateway::encode_msg(&signed_grant(&owner, &cluster.namespace, &executor_account)),
+        &gateway::encode_msg(&signed_grant(
+            &owner,
+            &cluster.namespace,
+            owner_account,
+            executor_account,
+        )),
     );
     poll_until("the grant to commit", FINALIZE, || {
         credential_record(&cluster, 1)
-            .filter(|record| gateway::credential_use_allowed(record, &executor_account))
+            .filter(|record| gateway::credential_use_allowed(record, executor_account))
             .map(|_| ())
     });
 
     // ---- DIRECTION 3: direction 1's exact shape, now granted ----------------
     //
-    // The non-regression half: an executor granted in its OWN right still draws
-    // in its own right, with no pointer doing any work — origin, assignee and
-    // caller are all node 1 again. The grant is the only thing that changed
-    // since direction 1.
-    let granted_id = &node_sid(&cluster, 1, "sched\u{1f}sched-delegated-granted");
-    submit_sched(&cluster, 1, granted_id, &executor_node, 1);
+    // The non-regression half: a submitter granted in its OWN right still draws
+    // in its own right — the pointer resolves to account 2, which is now on the
+    // grant list; origin, assignee and caller are node 1's user and node 1
+    // again. The grant is the only thing that changed since direction 1.
+    let granted_id = &user_sid(&executor, "sched\u{1f}sched-delegated-granted");
+    submit_sched(&cluster, 1, &executor, granted_id, &executor_node, 1);
     let view = wait_terminal(&cluster, 1, granted_id, ROUND_TRIP);
     assert_eq!(
         view.status,

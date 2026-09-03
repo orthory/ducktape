@@ -15,17 +15,70 @@ daemon Ducktape
   font "../../../crates/design/assets/fonts/NotoColorEmoji.ttf"
   text-size 13.5
   antialiasing true
+  // The status item. A click raises THIS menu, never a window: the platform
+  // only pops a menu that has rows, so with none a press did nothing but
+  // activate the process — which read as "the app opened".
+  //
+  // The icon is a state channel — grey while no node answers, a dot while
+  // the bell holds unread — and the label beside it is the bell count. The
+  // menu's two top rows are READ, not chosen: the network and the node's own
+  // status line. Everything below is a command; a row whose text moves with
+  // the state (the bell count, the huddle's channel, Mute/Unmute, the ✓ on
+  // the appearance) is still the same command, which is what lets a test
+  // choose it by its current words.
+  //
+  // A row's `when` takes it out of the menu — not disabled, gone — while
+  // there is nothing for it to do: the console's rows while only the launch
+  // window is up, the huddle's while she is not in one. The handlers keep
+  // their own guards; a native menu is its own event source and may deliver
+  // a row the frame after its reason went away.
   tray
+    icon-rgba "../../assets/tray-offline.rgba" 128 128 when !connected
+    icon-rgba "../../assets/tray-unread.rgba" 128 128 when bell_unread > 0
     icon-rgba "../../assets/tray.rgba" 128 128
-    tooltip "Ducktape"
+    label tray_badge(bell_unread)
+    tooltip tray_tooltip(network_name, status)
+    menu
+      keep_str(empty(network_name), "No network", network_name)
+      status
+      separator
+      "Open Ducktape" -> tray_open
+      tray_bell_row(bell_unread) -> tray_open_bell when console_win != none
+      "Go to" when console_win != none
+        "Chat" -> tray_go_chat
+        "Pages" -> tray_go_pages
+        "Node" -> tray_go_node
+        "Settings" -> tray_go_settings
+      separator
+      tray_huddle_row(huddle_joined, huddle_channel_name) when huddle_joined
+        keep_str(call_muted, "Unmute", "Mute") -> toggle_call_mute
+        "Leave huddle" -> leave_huddle_here
+      "Appearance"
+        tray_choice_row("Light", appearance == Appearance.light) -> set_appearance_light
+        tray_choice_row("Dark", appearance == Appearance.dark) -> set_appearance_dark
+      separator
+      "Copy node key" -> tray_copy_node_key when console_win != none
+      "Reconnect" -> tray_reconnect when console_win != none
+      separator
+      "Quit Ducktape" -> tray_quit
   // The launch window: Discord/Steam-shaped — a small fixed column that
   // signs the user in and picks a network. It opens on mount and closes when
   // the console takes over.
+  // EVERY WINDOW REPORTS THE APP ID. On Linux `app-id` is the ONLY source of
+  // the X11 WM_CLASS / Wayland app_id — the daemon-level `id` above reaches
+  // the BSDs and nothing else (iced_winit's `conversion.rs`), so without this
+  // block a window reports an empty class and associates with no installed
+  // `.desktop` entry: no icon, no pinned-app identity. It is the same string
+  // as `app/packaging/dev.ducktape.app.desktop`'s file name and
+  // `StartupWMClass`, and all three windows carry it so the app is one
+  // identity to the desktop.
   window onboarding
     icon-rgba "../../assets/icon.rgba" 128 128
     size 480 680
     position centered
     resizable false
+    platform linux
+      app-id "dev.ducktape.app"
   // The console. Same window the single-window app declared, now a named
   // template `open_network_submit` instantiates.
   // `min-size` is NOT a taste number — it is the arithmetic of the fixed
@@ -43,6 +96,8 @@ daemon Ducktape
     size 1280 800
     min-size 1040 540
     position centered
+    platform linux
+      app-id "dev.ducktape.app"
     platform macos
       title-hidden true
       titlebar-transparent true
@@ -58,6 +113,8 @@ daemon Ducktape
     icon-rgba "../../assets/icon.rgba" 128 128
     size 320 460
     min-size 320 340
+    platform linux
+      app-id "dev.ducktape.app"
 
 use "extern/backend.ice"
 use "extern/editor.ice"

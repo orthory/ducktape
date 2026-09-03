@@ -53,15 +53,15 @@ fn the_crumb_counts_split_the_listing_in_two() {
             object: String::new(),
         })
         .collect::<Vec<_>>();
-    assert_eq!(fs_dir_count(entries.clone()), 1);
-    assert_eq!(fs_file_count(entries.clone()), 2);
+    assert_eq!(fs_dir_count(&entries), 1);
+    assert_eq!(fs_file_count(&entries), 2);
     assert_eq!(
-        fs_dir_count(entries.clone()) + fs_file_count(entries),
+        fs_dir_count(&entries) + fs_file_count(&entries),
         3,
         "every row lands in exactly one bucket"
     );
-    assert_eq!(fs_dir_count(Vec::new()), 0);
-    assert_eq!(fs_file_count(Vec::new()), 0);
+    assert_eq!(fs_dir_count(&[]), 0);
+    assert_eq!(fs_file_count(&[]), 0);
 }
 
 #[test]
@@ -97,27 +97,80 @@ fn directory_rows_are_prepared_from_the_listing() {
     };
 
     assert_eq!(
-        fs_directories(vec![entry("docs", "dir"), entry("readme", "file")]),
+        fs_directories(&[entry("docs", "dir"), entry("readme", "file")]),
         vec![entry("docs", "dir")]
     );
 }
 
 #[test]
-fn a_roster_survives_only_while_this_device_is_in_the_huddle() {
-    let roster = vec![HuddleParticipant {
+fn a_chat_load_answers_for_the_huddle_only_when_it_loaded_the_huddles_channel() {
+    let member = |is_you: bool| HuddleParticipant {
         key: "aa".into(),
         label: "aa".into(),
         initials: "A".into(),
         is_agent: false,
-        is_you: true,
+        is_you,
         joined_at: 0,
         node: "aa11".into(),
-    }];
-    assert_eq!(keep_roster(true, roster.clone()).len(), 1);
-    assert!(
-        keep_roster(false, roster).is_empty(),
-        "another channel's roster never reaches the panel"
+    };
+    let idle = HuddleAfterLoad::default();
+
+    // Not in a huddle: the loaded channel's roster is the whole answer.
+    let joined = huddle_after_load(
+        true,
+        idle.joined,
+        idle.channel.clone(),
+        idle.channel_name.clone(),
+        idle.roster.clone(),
+        "eng".into(),
+        "Engineering".into(),
+        vec![member(true)],
     );
+    assert!(joined.joined);
+    assert_eq!(joined.channel, "eng");
+    assert_eq!(joined.channel_name, "Engineering");
+    assert_eq!(joined.roster.len(), 1);
+
+    // NOW CLICK ANOTHER ROOM. Its roster is a different conversation's, and
+    // reading the huddle off it used to cut the call's media (the session is
+    // subscribed on `joined`) and blank the channel `leave_huddle_here` needs.
+    let switched = huddle_after_load(
+        true,
+        joined.joined,
+        joined.channel.clone(),
+        joined.channel_name.clone(),
+        joined.roster.clone(),
+        "general".into(),
+        "General".into(),
+        Vec::new(),
+    );
+    assert_eq!(switched, joined, "another room's load is not the huddle's");
+
+    // Back on the huddle's own channel, a roster without her ends it.
+    let left = huddle_after_load(
+        true,
+        joined.joined,
+        joined.channel.clone(),
+        joined.channel_name.clone(),
+        joined.roster.clone(),
+        "eng".into(),
+        "Engineering".into(),
+        vec![member(false)],
+    );
+    assert_eq!(left, idle);
+
+    // And a resync that carried no chat at all says nothing either way.
+    let quiet = huddle_after_load(
+        false,
+        joined.joined,
+        joined.channel.clone(),
+        joined.channel_name.clone(),
+        joined.roster.clone(),
+        "eng".into(),
+        "Engineering".into(),
+        Vec::new(),
+    );
+    assert_eq!(quiet, joined);
 }
 
 #[test]
@@ -151,21 +204,18 @@ fn the_roster_answers_admin_tier_and_filters() {
             live: true,
         },
     ];
-    assert!(members_is_admin(rows.clone()));
-    assert_eq!(member_tier(rows.clone()), "validator");
+    assert!(members_is_admin(&rows));
+    assert_eq!(member_tier(&rows), "validator");
     // the two halves of "no row for this node", kept apart: an unanswered
     // roster is unknown, an answered one without this node is a real guest.
-    assert_eq!(member_tier(Vec::new()), "");
+    assert_eq!(member_tier(&[]), "");
     let mut answered_without_this_node = rows.clone();
     answered_without_this_node[0].is_this_node = false;
-    assert_eq!(member_tier(answered_without_this_node), "guest");
-    assert_eq!(filter_members(rows.clone(), MembersFilter::Agents).len(), 1);
-    assert_eq!(filter_members(rows.clone(), MembersFilter::Humans).len(), 2);
-    assert_eq!(
-        filter_members(rows.clone(), MembersFilter::Validators).len(),
-        1
-    );
-    assert_eq!(filter_members(rows, MembersFilter::All).len(), 3);
+    assert_eq!(member_tier(&answered_without_this_node), "guest");
+    assert_eq!(filter_members(&rows, MembersFilter::Agents).len(), 1);
+    assert_eq!(filter_members(&rows, MembersFilter::Humans).len(), 2);
+    assert_eq!(filter_members(&rows, MembersFilter::Validators).len(), 1);
+    assert_eq!(filter_members(&rows, MembersFilter::All).len(), 3);
 }
 
 /// THE HEADER COUNTS THE LIST IT SITS ABOVE. `members_summary` used to fold the
@@ -192,16 +242,13 @@ fn the_members_subtitle_folds_the_rows_the_screen_lists() {
         member("bb", "resident"),
         member("triage", "agent"),
     ];
-    assert_eq!(members_summary(true, rows.clone()), "2 humans · 1 agent");
+    assert_eq!(members_summary(true, &rows), "2 humans · 1 agent");
     // singulars, and the count that used to be the whole subtitle.
-    assert_eq!(
-        members_summary(true, rows[..1].to_vec()),
-        "1 human · 0 agents"
-    );
+    assert_eq!(members_summary(true, &rows[..1]), "1 human · 0 agents");
 
     // The invariant under the wording: every number in the subtitle is a slice
     // of the list, so they add up to the row count. The valset fold never did.
-    let counted: usize = members_summary(true, rows.clone())
+    let counted: usize = members_summary(true, &rows)
         .split(" · ")
         .filter_map(|part| part.split(' ').next()?.parse::<usize>().ok())
         .sum();
@@ -223,12 +270,12 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
         &[
             chat::index::HuddleEntry {
                 user: hex_encode(&me),
-                node: String::new(),
+                node: "0a0a".into(),
                 joined_at: 10,
             },
             chat::index::HuddleEntry {
                 user: hex_encode(&peer),
-                node: String::new(),
+                node: "0b0b".into(),
                 joined_at: 20,
             },
         ],
@@ -239,6 +286,10 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
     assert!(!roster[1].is_you && !roster[1].is_agent);
     assert!(huddle_self(roster.clone()));
     assert!(!huddle_self(vec![roster[1].clone()]));
+    // The fan-out the live session polls for is this roster's NODE keys with
+    // our own row removed — the hub admits and fans out by node identity, and
+    // a set that carried our own key would aim this device's media at itself.
+    assert_eq!(huddle_recipient_nodes(roster), vec!["0b0b".to_string()]);
 }
 
 #[test]
@@ -328,6 +379,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             thread_action,
             action,
             drawer,
+            false,
+            String::new(),
             repo_menu,
         )
     };
@@ -343,6 +396,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             MessageAction::More,
             MessageAction::More,
             true,
+            true,
+            "/shared/q3.md".into(),
             true,
         ),
         ""
@@ -397,10 +452,29 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
             false,
             MessageAction::More,
             MessageAction::More,
-            true,
+            false,
             true,
         ),
         "thread_menu"
+    );
+    // AND THE DRAWER OUTRANKS THE THREAD MENU WHEN IT IS OPEN. The rail is not
+    // mounted while Channel details is up (`if active_thread_seq > 0 &&
+    // !channel_settings_open`, `screens/chat.ice`), so a ⋯ flag left set behind
+    // it names no layer on screen — this test used to pin the opposite verdict,
+    // where the first Escape wiped `thread_edit_draft` and left the drawer
+    // standing.
+    assert_eq!(
+        target(
+            ShellTab::Chat,
+            false,
+            false,
+            false,
+            MessageAction::More,
+            MessageAction::Toolbar,
+            true,
+            true,
+        ),
+        "channel_settings"
     );
     assert_eq!(
         target(
@@ -415,8 +489,8 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
         ),
         "message_menu"
     );
-    // THE DRAWER SITS BETWEEN THEM. Both message menus float over Channel
-    // details, so they win; the repo menu lives on another tab, so it loses.
+    // THE DRAWER SITS BETWEEN THEM. The stream's menu floats over Channel
+    // details, so it wins; the repo menu lives on another tab, so it loses.
     // It had no rung at all — an `×` and no keyboard exit, while every other
     // overlay answered Escape. Measured: Escape over an open drawer changed
     // exactly zero pixels on the running app.
@@ -446,8 +520,30 @@ fn escape_ladder_names_the_topmost_transient_layer_only() {
         ),
         "repo_menu"
     );
-    // Nothing transient open → Escape is a no-op. The pages rungs are gone
-    // with the menus they dismissed: the document has no transient layer.
+    // THE PAGES DELETE CONFIRM. A scrim and a confirm over the canvas, inside
+    // the Pages screen — so it is a rung, and it answers only from Pages.
+    let armed = |tab: ShellTab, page_delete: bool, fs_delete: &str| {
+        escape_target(
+            escape.clone(),
+            tab,
+            false,
+            false,
+            false,
+            MessageAction::Toolbar,
+            MessageAction::Toolbar,
+            false,
+            page_delete,
+            fs_delete.into(),
+            false,
+        )
+    };
+    assert_eq!(armed(ShellTab::Pages, true, ""), "page_delete");
+    assert_eq!(armed(ShellTab::Chat, true, ""), "");
+    assert_eq!(armed(ShellTab::Files, false, "/shared/q3.md"), "fs_delete");
+    assert_eq!(armed(ShellTab::Node, false, "/shared/q3.md"), "");
+
+    // Nothing transient open → Escape is a no-op. The pages block menus are
+    // gone with the surfaces they dismissed.
     assert_eq!(
         target(
             ShellTab::Chat,
@@ -492,6 +588,8 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             thread_action,
             action,
             drawer,
+            false,
+            "",
             repo_menu,
         )
     };
@@ -509,6 +607,8 @@ fn a_rung_answers_only_from_the_tab_that_mounts_its_surface() {
             thread_action,
             MessageAction::Toolbar,
             false,
+            false,
+            String::new(),
             repo_menu,
         )
     };
@@ -623,6 +723,8 @@ fn the_content_pane_claims_only_the_keys_nothing_else_owns() {
         "thread_menu",
         "message_menu",
         "channel_settings",
+        "page_delete",
+        "fs_delete",
         "repo_menu",
     ] {
         for key in [Named::PageDown, Named::PageUp, Named::End, Named::Home] {
@@ -657,11 +759,11 @@ fn files_base64_round_trips() {
 
 #[test]
 fn bell_severity_projects_the_kind_and_defaults_to_info() {
-    assert_eq!(bell_severity("run_failed".into()), "danger");
-    assert_eq!(bell_severity("review_requested".into()), "warning");
-    assert_eq!(bell_severity("mentioned".into()), "info");
+    assert_eq!(bell_severity("run_failed"), "danger");
+    assert_eq!(bell_severity("review_requested"), "warning");
+    assert_eq!(bell_severity("mentioned"), "info");
     // an unnamed kind is a notice, never an alarm.
-    assert_eq!(bell_severity("brand_new_kind".into()), "info");
+    assert_eq!(bell_severity("brand_new_kind"), "info");
 }
 
 #[test]
@@ -676,21 +778,18 @@ fn bell_badge_takes_the_worst_unread_severity() {
     };
 
     assert_eq!(
-        bell_worst_severity(vec![
-            item(1, "mentioned", false),
-            item(2, "run_failed", false)
-        ]),
+        bell_worst_severity(&[item(1, "mentioned", false), item(2, "run_failed", false)]),
         "danger"
     );
     // a READ error does not keep the badge red.
     assert_eq!(
-        bell_worst_severity(vec![
+        bell_worst_severity(&[
             item(1, "run_failed", true),
             item(2, "review_requested", false)
         ]),
         "warning"
     );
-    assert_eq!(bell_worst_severity(Vec::new()), "info");
+    assert_eq!(bell_worst_severity(&[]), "info");
 }
 
 /// THE TAB-SWITCH GATE. Four planes used to refetch on every tab move —
@@ -738,4 +837,61 @@ fn a_tab_move_only_refetches_what_its_destination_draws() {
             .collect();
         assert_eq!(readers, drawn, "exactly these tabs draw {plane}");
     }
+}
+
+/// The launch window reads the workspace files through the crate that wrote
+/// them, never a line parser: the chain id keeps its `#hex` half, a
+/// two-validator descriptor (the multi-line array `node admit` writes) still
+/// yields the founding key, and a wildcard `http_listen` dials loopback.
+#[test]
+fn workspace_facts_come_from_the_crate_that_wrote_them() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("mynet-dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let founder = "aa".repeat(32);
+    let admitted = "bb".repeat(32);
+    workspace_config::NetworkDescriptor {
+        chain_id: "mynet#a1b2c3d4".into(),
+        validators: vec![founder.clone(), admitted],
+        bootstrap: vec![],
+        reach: vec![],
+        coordination: None,
+        modules: vec![],
+    }
+    .save(&dir.join("network.toml"))
+    .unwrap();
+    let descriptor = std::fs::read_to_string(dir.join("network.toml")).unwrap();
+    assert!(
+        descriptor.contains("validators = [\n"),
+        "two validators serialize as a multi-line array:\n{descriptor}"
+    );
+    std::fs::write(
+        dir.join("node.toml"),
+        r#"network = "network.toml"
+key_file = "node.key"
+listen = "0.0.0.0:52200"
+advertised = "overlay"
+storage_dir = "data"
+http_listen = "0.0.0.0:8844"
+gateway_listen = "127.0.0.1:0"
+rpc_listen = "127.0.0.1:8845"
+wireguard_listen = "0.0.0.0:51820"
+invite_listen = "0.0.0.0:51821"
+wireguard_advertised = "auto"
+primary_coordinator = "none"
+coordinator_relay = "none"
+checkpoint_blocks = 32
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        registered_workspaces_in(root.path()),
+        vec![("mynet#a1b2c3d4".to_string(), dir.clone())]
+    );
+    assert_eq!(workspace_identity(&dir), Some(short_label(&founder)));
+    assert_eq!(
+        workspace_endpoint(&dir).as_deref(),
+        Some("http://127.0.0.1:8844")
+    );
 }

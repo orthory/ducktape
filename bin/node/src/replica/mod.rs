@@ -31,15 +31,15 @@
 use commonware_codec::{Decode as _, Encode as _};
 use commonware_consensus::simplex::types::Certificate;
 use commonware_cryptography::ed25519;
-use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::Ingress;
+use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_runtime::Quota;
 use commonware_utils::ordered::Set;
 use consensus::Digest;
 use recovery::{Manifest, Recovery};
 
-pub(crate) mod promotion;
 mod park;
+pub(crate) mod promotion;
 mod wiring;
 
 /// the overlay-net seam's runtime context type — the same wrapper
@@ -59,7 +59,7 @@ pub(crate) type OverlayCtx = overlay_net::OverlayContext<commonware_runtime::tok
 /// validator role continues with — and every other exit is
 /// `std::process::exit`.
 ///
-/// wiring (phase 6a: per-epoch channel bank, reachability standby, lobby)
+/// wiring (phase 6a: per-epoch channel bank, reachability standby, join gate)
 /// happens in [`wiring::wire`]; the resulting [`wiring::ReplicaChannels`]
 /// feed the park loop (phases 6b–6d: serve state, the loop itself,
 /// promotion) in [`park::park`].
@@ -104,6 +104,7 @@ pub(crate) async fn run(
     session_manager: Option<noded::TerminalSessions>,
     session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
     local_gateway_via: String,
+    node_api_ports: Vec<u16>,
     stream_hub: &noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
     metrics: noded::NodeMetrics,
@@ -118,6 +119,7 @@ pub(crate) async fn run(
     manifest: &Option<Manifest>,
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
+    genesis: &crate::config::GenesisModules,
 ) -> crate::validator::PromotionBaton {
     // `wire` and `park` both read `signer`/`label`/`namespace`/`overlay_slot`
     // — cheap plain-data (or, for `overlay_slot`, an Arc-backed handle)
@@ -176,6 +178,7 @@ pub(crate) async fn run(
         session_manager,
         session_requests,
         local_gateway_via,
+        node_api_ports,
         stream_hub,
         index,
         metrics,
@@ -190,6 +193,7 @@ pub(crate) async fn run(
         duckfs_dir,
         manifest,
         recovery,
+        genesis,
     )
     .await
 }
@@ -223,7 +227,8 @@ pub fn anchor_from_cert_msg<S>(scheme: &S, raw: &[u8]) -> Option<CertAnchor>
 where
     S: commonware_consensus::simplex::scheme::Scheme<Digest>,
 {
-    let cert = Certificate::<S, Digest>::decode_cfg(raw, &scheme.certificate_codec_config()).ok()?;
+    let cert =
+        Certificate::<S, Digest>::decode_cfg(raw, &scheme.certificate_codec_config()).ok()?;
     let Certificate::Finalization(finalization) = cert else {
         return None;
     };
@@ -306,8 +311,7 @@ mod tests {
             View::new(parent),
             digest_of(frame),
         );
-        let schemes: Vec<simplex_ed25519::Scheme> =
-            (0..n).map(|s| dev_scheme(n, s)).collect();
+        let schemes: Vec<simplex_ed25519::Scheme> = (0..n).map(|s| dev_scheme(n, s)).collect();
         let quorum = N3f1::quorum(n as u32) as usize;
         let attestations: Vec<_> = schemes
             .iter()
@@ -339,12 +343,14 @@ mod tests {
         assert_eq!(anchor.digest, digest_of(b"frame nine"));
         // the extracted bytes are the Finalization payload the phase-1 gate
         // verifies — the certificate tag stripped, nothing else lost.
-        assert!(consensus::verify_finalization(
-            &mut commonware_utils::test_rng(),
-            &dev_scheme(4, 0),
-            &anchor.finalization
-        )
-        .is_ok());
+        assert!(
+            consensus::verify_finalization(
+                &mut commonware_utils::test_rng(),
+                &dev_scheme(4, 0),
+                &anchor.finalization
+            )
+            .is_ok()
+        );
     }
 
     #[test]

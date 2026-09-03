@@ -37,10 +37,10 @@
 //! — the same trust class as a shell profile or systemd unit. they load from
 //! exactly two places, both local and operator-controlled: the specs embedded
 //! in this crate at compile time, and `$DUCKTAPE_CAPABILITY_DIR` (default
-//! `~/.ducktape/capabilities`). specs are NEVER fetched from the network, and
-//! nothing consensus-side may ever read one (host-local files are
-//! non-deterministic input; the consensus capability module sees only the
-//! announced TAGS, never the specs behind them).
+//! `<ducktape home>/capabilities`, so `$DUCKTAPE_HOME` moves it). specs are
+//! NEVER fetched from the network, and nothing consensus-side may ever read
+//! one (host-local files are non-deterministic input; the consensus capability
+//! module sees only the announced TAGS, never the specs behind them).
 //!
 //! ## how an executor authenticates — two paths, never both
 //!
@@ -48,22 +48,19 @@
 //! exactly two ways a spec can arrange that:
 //!
 //! ```toml
-//! [isolation]                     # the STRONG path: the credential never
-//! config_home_env = "CODEX_HOME"  # enters the child. the host reads it and
-//! broker = "codex-responses"      # the child gets an opaque per-run bearer
-//!                                 # aimed at a loopback endpoint. the fresh
-//!                                 # config home is what FORCES that: without
-//!                                 # it the CLI would just read ~/.codex.
-//!
-//! [sandbox]                       # the WEAK path: the CLI's own auth dir is
-//! rw_dirs = ["~/.claude"]         # mounted into the sandbox, so the
-//!                                 # credential DOES enter the child. for a BYO
-//!                                 # CLI that only knows how to read dotfiles.
+//! [isolation]                     # the credential never enters the child. the
+//! config_home_env = "CODEX_HOME"  # host reads it and the child gets an opaque
+//! broker = "codex-responses"      # per-run bearer aimed at a loopback
+//!                                 # endpoint. the fresh config home is what
+//!                                 # FORCES that: without it the CLI would just
+//!                                 # read ~/.codex.
 //! ```
 //!
-//! declaring BOTH is a HARD LOAD ERROR ([`parse_raw`]): an executor that HAS a
-//! broker must never be able to silently regress to shipping its credential
-//! dir into the child. the day an executor gains a broker, its `rw_dirs` go.
+//! There is no second path. A spec cannot ask for a host directory to be
+//! mounted into the run: a run executes inside a microVM that shares no
+//! filesystem with the host, so the only things that cross are the per-run
+//! devices the backend builds. An executor that can only authenticate by
+//! reading its own dotfiles cannot be lent by a node.
 //!
 //! ## override precedence
 //!
@@ -120,16 +117,7 @@ pub struct CapabilitySpec {
     pub timeout_secs: u64,
     /// which named stdout parser extracts the assistant's final text.
     pub output: OutputFormat,
-    /// optional `[sandbox] rw_dirs` — the executor's own auth/state dirs
-    /// (e.g. `~/.claude`, `~/.codex`) that must cross into a Podman sandbox
-    /// read-write so the BYO CLI can authenticate. HOME-RELATIVE ONLY
-    /// (validated at parse: absolute paths and `..` are rejected loudly);
-    /// expanded against the real `$HOME` at spawn. under Podman these are
-    /// the ONLY paths under HOME mounted.
-    /// the WEAK auth path: the credential DOES enter the child. mutually
-    /// exclusive with `isolation.broker` (see this module's doc).
-    pub rw_dirs: Vec<String>,
-    /// optional `[isolation]` — the STRONG auth path: a host-owned broker
+    /// optional `[isolation]` — the auth path: a host-owned broker
     /// holding the credential, and the fresh executor config home that forces
     /// the CLI through it (see [`IsolationSpec`]).
     pub isolation: IsolationSpec,
@@ -253,9 +241,6 @@ struct RawSpec {
     detect: RawDetect,
     invoke: RawInvoke,
     output: RawOutput,
-    /// optional `[sandbox]` — the Podman-backend auth/state mounts.
-    #[serde(default)]
-    sandbox: Option<RawSandbox>,
     /// optional `[isolation]` — the host-owned credential broker + fresh
     /// executor config home.
     #[serde(default)]
@@ -274,32 +259,6 @@ struct RawSpec {
     /// in [`crate::variants`].
     #[serde(default)]
     variants: Vec<RawVariant>,
-}
-
-/// the on-disk `[sandbox]` shape — a dumb serde mirror; unknown fields fail
-/// loud like everywhere else in the spec format.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawSandbox {
-    #[serde(default)]
-    rw_dirs: Vec<String>,
-}
-
-/// validate `[sandbox] rw_dirs`: each entry is a HOME-RELATIVE path (a `~/`
-/// prefix is allowed sugar). absolute paths and any `..` segment are rejected
-/// loudly — the whole point of the sandbox is that only these named dirs under
-/// HOME cross the boundary, so an entry that could escape HOME defeats it.
-fn validate_rw_dirs(raw: &RawSandbox, origin: &str) -> Result<Vec<String>, String> {
-    for entry in &raw.rw_dirs {
-        let rel = entry.strip_prefix("~/").unwrap_or(entry);
-        if rel.starts_with('/') || rel.split('/').any(|seg| seg == "..") {
-            return Err(format!(
-                "{origin}: sandbox.rw_dirs entry {entry:?} must be home-relative \
-                 (no absolute path, no \"..\")"
-            ));
-        }
-    }
-    Ok(raw.rw_dirs.clone())
 }
 
 /// the on-disk `[isolation]` shape — a dumb serde mirror; unknown fields fail
@@ -608,28 +567,10 @@ impl CapabilitySpec {
                 ));
             }
         };
-        let rw_dirs = raw
-            .sandbox
-            .map(|s| validate_rw_dirs(&s, origin))
-            .transpose()?
-            .unwrap_or_default();
         let isolation = parse_isolation(raw.isolation, origin)?;
         // AFTER isolation: `config-home:` is only meaningful when the spec asked
         // for a fresh config home, so the check needs the parsed block.
         let context = parse_context(raw.context, &isolation, origin)?;
-        // THE credential invariant. a broker exists so the operator's credential
-        // never enters the child; rw_dirs exist to mount that credential INTO the
-        // child. a spec with both would authenticate through whichever the CLI
-        // happened to prefer — and the leak would be silent, because the run would
-        // still work. so it is a load error, not a warning: an executor that HAS a
-        // broker can never regress to shipping its credential dir.
-        if isolation.broker.is_some() && !rw_dirs.is_empty() {
-            return Err(format!(
-                "{origin}: a spec declaring [isolation] broker may not also declare \
-                 [sandbox] rw_dirs — the broker exists so the credential never enters \
-                 the child, and rw_dirs would mount it in anyway. drop the rw_dirs."
-            ));
-        }
         Ok((
             Self {
                 tag,
@@ -640,7 +581,6 @@ impl CapabilitySpec {
                 args: raw.invoke.args,
                 timeout_secs: raw.invoke.timeout_secs,
                 output,
-                rw_dirs,
                 isolation,
                 context,
                 interactive: raw.interactive.map(|i| InteractiveSpec {
@@ -861,7 +801,7 @@ format = "text"
 
     /// A RETIRED section is an unknown one: a stale operator spec that still
     /// declares it fails loud at load rather than parsing into a block nothing
-    /// would ever read. (`~/.ducktape/capabilities` is operator-writable, so
+    /// would ever read. (`<ducktape home>/capabilities` is operator-writable, so
     /// this is the door a leftover file comes in.)
     #[test]
     fn retired_sections_fail_loud_at_load() {
@@ -888,36 +828,26 @@ format = "text"
         }
     }
 
+    /// A spec cannot ask for a host directory in the run. There is no
+    /// `[sandbox]` table any more: a run executes inside a microVM that shares
+    /// no filesystem with the host, so mounting `~/.claude` into it is not a
+    /// thing the backend can do at all.
+    ///
+    /// This refuses at LOAD rather than being ignored at spawn, which is the
+    /// whole point of pinning it: an accepted-then-discarded `rw_dirs` would
+    /// leave a BYO CLI looking for a credential dir that silently was not
+    /// there, and the run would still answer.
     #[test]
-    fn sandbox_rw_dirs_parse_and_reject_absolute_or_traversal() {
-        // absent [sandbox] = no rw_dirs (default empty, v1 posture).
-        let plain = CapabilitySpec::parse(&spec_toml("ok"), "t").unwrap();
-        assert!(plain.rw_dirs.is_empty(), "no [sandbox] = no rw_dirs");
-
-        // a home-relative list parses verbatim.
-        let good = format!(
-            "{}\n[sandbox]\nrw_dirs = [\"~/.claude\", \"~/.claude.json\"]\n",
-            spec_toml("ok")
-        );
-        let spec = CapabilitySpec::parse(&good, "t").unwrap();
-        assert_eq!(spec.rw_dirs, vec!["~/.claude", "~/.claude.json"]);
-
-        // absolute and `..`-carrying entries are rejected loudly (they would
-        // cross the isolation boundary the sandbox exists to hold).
-        for (entry, expect) in [
-            ("/etc/passwd", "home-relative"),
-            ("~/../..", "home-relative"),
-            ("../escape", "home-relative"),
+    fn a_spec_may_not_ask_for_a_host_directory_in_the_run() {
+        for table in [
+            "[sandbox]\nrw_dirs = [\"~/.claude\"]\n",
+            "[sandbox]\nrw_dirs = [\"/etc/passwd\"]\n",
+            "[sandbox]\n",
         ] {
-            let bad = format!("{}\n[sandbox]\nrw_dirs = [\"{entry}\"]\n", spec_toml("ok"));
-            let err = CapabilitySpec::parse(&bad, "t").unwrap_err();
-            assert!(err.contains(expect), "wanted {expect:?} in {err:?}");
+            let spec = format!("{}\n{table}", spec_toml("ok"));
+            let err = CapabilitySpec::parse(&spec, "t").unwrap_err();
+            assert!(err.contains("not a valid spec"), "{table:?} -> {err:?}");
         }
-
-        // an unknown field under [sandbox] fails loud like everywhere else.
-        let typo = format!("{}\n[sandbox]\nrw_dir = [\"~/.claude\"]\n", spec_toml("ok"));
-        let err = CapabilitySpec::parse(&typo, "t").unwrap_err();
-        assert!(err.contains("not a valid spec"), "got {err:?}");
     }
 
     #[test]
@@ -958,35 +888,23 @@ format = "text"
         }
     }
 
+    /// THE credential invariant, from the other side: the broker is the ONLY
+    /// auth path, so both halves of it parse on their own and neither can be
+    /// paired with a request for a host directory (which no longer parses at
+    /// all — see [`a_spec_may_not_ask_for_a_host_directory_in_the_run`]).
     #[test]
-    fn a_broker_spec_may_not_also_mount_its_credential_dir() {
-        // THE credential invariant: the broker exists so the credential never
-        // enters the child; rw_dirs would mount it in anyway, and the run would
-        // still WORK — so the regression would be silent. hence a load error.
-        let both = format!(
-            "{}\n[isolation]\nbroker = \"codex-responses\"\n\n[sandbox]\nrw_dirs = [\"~/.codex\"]\n",
-            spec_toml("ok")
-        );
-        let err = CapabilitySpec::parse(&both, "t").unwrap_err();
-        assert!(err.contains("may not also declare"), "got {err:?}");
-        assert!(err.contains("rw_dirs"), "the error names the offender: {err:?}");
-
-        // either one ALONE is fine — they are the two legitimate auth paths.
+    fn the_broker_and_its_config_home_are_the_whole_auth_surface() {
         let broker_only = format!(
             "{}\n[isolation]\nbroker = \"codex-responses\"\n",
             spec_toml("ok")
         );
         assert!(CapabilitySpec::parse(&broker_only, "t").is_ok());
-        let dirs_only = format!("{}\n[sandbox]\nrw_dirs = [\"~/.claude\"]\n", spec_toml("ok"));
-        assert!(CapabilitySpec::parse(&dirs_only, "t").is_ok());
 
-        // and a config home WITHOUT a broker is still compatible with rw_dirs:
-        // only the broker makes the credential dir a contradiction.
-        let config_home_and_dirs = format!(
-            "{}\n[isolation]\nconfig_home_env = \"CLI_HOME\"\n\n[sandbox]\nrw_dirs = [\"~/.cli\"]\n",
+        let config_home_only = format!(
+            "{}\n[isolation]\nconfig_home_env = \"CLI_HOME\"\n",
             spec_toml("ok")
         );
-        assert!(CapabilitySpec::parse(&config_home_and_dirs, "t").is_ok());
+        assert!(CapabilitySpec::parse(&config_home_only, "t").is_ok());
     }
 
     #[test]

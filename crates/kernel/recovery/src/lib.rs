@@ -28,9 +28,12 @@
 //!   synced, which also makes every earlier append durable). boot ROLLS it
 //!   FORWARD: if the live roots still equal the pre-block vector the frame
 //!   re-applies; if they moved, the apply completed before the crash and the
-//!   block is sealed from the observed roots. a POWER CUT flavor of this
-//!   window — the disk substrate committed the block but the un-fsync'd seal
-//!   was lost — is bound-and-verified through the substrate's per-commit
+//!   block is sealed from the observed roots. a narrower flavor of this
+//!   window survives the seal's own fsync — a crash in the TAIL OF APPLY,
+//!   after a disk substrate committed the block but before the seal syncs,
+//!   and a SIGKILL reaches it (the journal buffers in userspace, so an
+//!   un-fsync'd append dies with the process). it is bound-and-verified
+//!   through the substrate's per-commit
 //!   height cursor (see `trailing.rs`): the cursor must claim exactly the
 //!   trailing WAL height, or the state stays fail-closed as [`Error::Torn`].
 //! - a TORN SEALED block: a block whose commit spans substrates with different
@@ -47,25 +50,31 @@
 //!   a changed module at NEITHER pre nor post is genuine damage and still
 //!   fail-stops as [`Error::Torn`], and the recomposed-vs-sealed root-hash
 //!   check is the final backstop.
-//! - a block that touches several DISK substrates could in principle crash
-//!   BETWEEN their commits — the classic multi-store atomicity limit; today no
-//!   block commits to more than one disk substrate (ops target one module; the
-//!   only cross-module dispatch, governance -> valset, stays in the in-memory
-//!   cohort). recovery refuses this EXPLICITLY: only a per-block-durable disk
-//!   substrate can be at its post-root after a crash (the in-memory cohort
-//!   always rolls back to the checkpoint), so two-or-more changed modules at
-//!   post means two-or-more disk substrates committed — a changed set spanning
-//!   more than one disk substrate at mixed roots. selective replay's premise (only the
-//!   in-memory cohort rolled back) no longer holds and its single-frame
-//!   re-execution could read a partially-committed world, so boot fail-stops
-//!   with [`Error::Torn`] at the point it detects this rather than healing and
-//!   leaning on the after-the-fact per-module verify. (a residual case — two
-//!   disk substrates where exactly ONE committed, so only one is at post — is
-//!   indistinguishable by root alone from the healthy single-disk torn block;
-//!   selective replay reconciles it and the per-module post-root verify is the
-//!   backstop that fail-stops rather than forks if the re-execution diverges.)
-//!   the exact fix if a block ever legitimately commits >1 disk substrate: a
-//!   per-commit height cursor in qmdb's commit metadata slot.
+//! - a block that touches several DISK substrates crashing BETWEEN their
+//!   commits — the classic multi-store atomicity limit. an ORDINARY block
+//!   touches several: every store-backed module keeps its own qmdb instance
+//!   and the odb modules their own duckfs/forge disks, so one agent-run settle
+//!   commits the in-memory `runs` plus chat, tasks and dispatch. what bounds
+//!   the window is the SEAL, not a count of substrates: [`Record::Seal`] is
+//!   fsync'd only after the block's apply RETURNED, and a per-block-durable
+//!   substrate's commit is durable when it returns inside that apply — so for
+//!   any SEALED block every disk substrate it changed is durable at (or
+//!   beyond) its post-root. the partial-commit window lies strictly ABOVE the
+//!   last seal, in the single unsealed WAL block, which `trailing.rs` bounds
+//!   and verifies on its own terms — fail-CLOSED terms: it admits only a
+//!   claimant carrying a per-commit height cursor, so a trailing qmdb store
+//!   commit (no cursor) and more than one claimant BOTH still refuse. inside
+//!   the sealed window the NUMBER of durable substrates is evidence of nothing
+//!   but how many disk modules the block touched, and the at-pre set is
+//!   exactly the cohort the checkpoint rolled back — so selective replay
+//!   handles one and many identically. the fail-stops that DO carry evidence
+//!   stay: a changed module at neither its pre- nor its post-root (nor ahead)
+//!   is damage ([`Error::Torn`]), a torn block with nothing left to re-commit
+//!   is damage, and the per-module post-root verify plus the tip root-hash
+//!   recompose fail-stop rather than fork if the re-execution diverges. the
+//!   residual — the re-execution can read a durable sibling's POST state
+//!   where the original read its pre state — is the one the single-substrate
+//!   heal always had, with the same backstop.
 //! - crash between the engine journaling a finalization and the drain: the
 //!   frame's bytes are already durable here — locally-submitted frames are
 //!   pinned at submit time ([`Record::Pinned`]), before the engine can ever
@@ -109,6 +118,11 @@ pub enum Error {
     /// sealed — the recovered node would fork, so it must not start.
     #[error("recovery verification failed: {0}")]
     Verify(String),
+    /// a checkpoint manifest carries a field longer than this crate's own
+    /// reader accepts — writing it would replace a restorable checkpoint with
+    /// one that can never be read back.
+    #[error("recovery checkpoint field over cap: {0}")]
+    FieldOverCap(String),
     /// the caller asked for records below the retained checkpoint/journal
     /// suffix boundary. a statesync joiner must refetch a fresher manifest.
     #[error("recovery journal range pruned after {after_height}; retained from {retained_start}")]
@@ -143,10 +157,18 @@ impl From<sdk::Error> for Error {
 /// replay metadata.
 const MAX_RECORD_FIELD_LEN: usize = 1 << 21; // 2 MiB: > the p2p frame cap + framing.
 
-/// A checkpoint embeds self-contained module snapshots. Forge snapshots carry
-/// a Git object closure and can legitimately exceed the operation/frame cap;
-/// keep their per-field decoder bound aligned with the smart-HTTP pack ceiling.
+/// A checkpoint embeds the IN-MEMORY cohort's self-contained snapshots — a
+/// module's whole state as one field, which is legitimately far larger than an
+/// operation/frame. The disk cohort (forge's git pack closure, the qmdb
+/// stores) is NOT here: it reopens its own substrate, so nothing in a manifest
+/// grows with a repository any more (#1308).
 const MAX_CHECKPOINT_FIELD_LEN: usize = 512 * 1024 * 1024;
+
+/// the sanity cap every count-prefixed list in this codec is read under: a
+/// corrupt count must not make the reader pre-allocate the world. One number,
+/// so the write-side refusal ([`Manifest::check_field_caps`]) and the three
+/// readers below cannot drift apart.
+const MAX_LIST_LEN: usize = 4096;
 
 // WRITE side: raw fixed-width ints stay inline one-liners; the length-prefixed
 // byte writer IS `sdk::codec::push_bytes` (verbatim `u64`-LE length + bytes), so
@@ -181,7 +203,7 @@ fn put_roots(out: &mut Vec<u8>, roots: &[(ModuleId, StateRoot)]) {
 
 fn get_roots(c: &mut sdk::codec::Cursor) -> Result<Vec<(ModuleId, StateRoot)>, Error> {
     let n = c.u64("module roots count")? as usize;
-    if n > 4096 {
+    if n > MAX_LIST_LEN {
         return Err(Error::Corrupt(format!(
             "{n} module roots exceeds sanity cap"
         )));
@@ -203,7 +225,7 @@ fn put_keys(out: &mut Vec<u8>, keys: &[Vec<u8>]) {
 
 fn get_keys(c: &mut sdk::codec::Cursor) -> Result<Vec<Vec<u8>>, Error> {
     let n = c.u64("participant keys count")? as usize;
-    if n > 4096 {
+    if n > MAX_LIST_LEN {
         return Err(Error::Corrupt(format!(
             "{n} participant keys exceeds sanity cap"
         )));
@@ -382,8 +404,12 @@ pub struct Manifest {
     /// every module's root at `height` — the replay baseline.
     pub roots: Vec<(ModuleId, StateRoot)>,
     /// canonical snapshot bytes for the modules that do NOT persist
-    /// themselves (the in-memory cohort), keyed by module id. the caller
-    /// decides the set; this crate stores bytes.
+    /// themselves (the in-memory cohort), keyed by module id. a disk-cohort
+    /// module (`sdk::Module::block_durable`) is deliberately absent: it
+    /// reopens its own substrate at boot and a restore installs nothing for
+    /// it, so its bytes here would be write amplification nothing reads
+    /// (#1308). [`Manifest::capture_timed`] asks the host for exactly that
+    /// cohort.
     pub snapshots: Vec<(ModuleId, Vec<u8>)>,
     /// the op-journal position at which this manifest was written; everything
     /// below the PREVIOUS manifest's position is prunable once the persisted
@@ -397,6 +423,57 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// the WRITE-SIDE twin of [`Manifest::decode`]'s per-field cap.
+    ///
+    /// `decode` opens its cursor `with_cap(MAX_CHECKPOINT_FIELD_LEN)` and
+    /// REFUSES any field over it, so encoding one produces a checkpoint this
+    /// node can never restore from — and writing it replaces the previous,
+    /// still-restorable manifest and re-anchors the journal prune below a
+    /// boundary nothing can recover. The realistic overflow is an in-memory
+    /// module's snapshot; the key lists and the list COUNTS are checked
+    /// because the same reader
+    /// refuses those too, and a refusal the writer cannot reach is a rule
+    /// nobody keeps.
+    ///
+    /// Refusing keeps the PREVIOUS checkpoint plus the journal, which still
+    /// restores — the same all-or-nothing stance `capture_timed` takes for a
+    /// module that could not prepare a snapshot at all.
+    fn check_field_caps(&self) -> Result<(), Error> {
+        let counts = [
+            ("module roots", self.roots.len()),
+            ("participant keys", self.participants.len()),
+            ("resident keys", self.residents.len()),
+            ("snapshots", self.snapshots.len()),
+        ];
+        if let Some((what, n)) = counts.iter().find(|(_, n)| *n > MAX_LIST_LEN) {
+            return Err(Error::FieldOverCap(format!(
+                "{n} {what} is over the {MAX_LIST_LEN}-entry list cap this crate's own reader \
+                 enforces"
+            )));
+        }
+        let over_cap = |len: usize| len > MAX_CHECKPOINT_FIELD_LEN;
+        if let Some((id, bytes)) = self.snapshots.iter().find(|(_, b)| over_cap(b.len())) {
+            return Err(Error::FieldOverCap(format!(
+                "module {id}'s snapshot is {} bytes, over the {MAX_CHECKPOINT_FIELD_LEN}-byte \
+                 checkpoint field cap this crate's own reader enforces",
+                bytes.len()
+            )));
+        }
+        if let Some(k) = self
+            .participants
+            .iter()
+            .chain(self.residents.iter())
+            .find(|k| over_cap(k.len()))
+        {
+            return Err(Error::FieldOverCap(format!(
+                "a validator key field is {} bytes, over the {MAX_CHECKPOINT_FIELD_LEN}-byte \
+                 checkpoint field cap this crate's own reader enforces",
+                k.len()
+            )));
+        }
+        Ok(())
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self.height {
@@ -447,7 +524,7 @@ impl Manifest {
         let root_hash = read_root(&mut c, "root hash")?;
         let roots = get_roots(&mut c)?;
         let n = c.u64("snapshots count")? as usize;
-        if n > 4096 {
+        if n > MAX_LIST_LEN {
             return Err(Error::Corrupt(format!("{n} snapshots exceeds sanity cap")));
         }
         let mut snapshots = Vec::with_capacity(n);
@@ -488,11 +565,11 @@ impl Manifest {
     }
 
     /// build a checkpoint manifest from a live host at a settled boundary.
-    /// reuses the statesync surface: every module that reports
-    /// [`sdk::StateSyncHandle::SnapshotBytes`] gets its bytes stored (the
-    /// in-memory cohort); disk-backed modules recover themselves and
-    /// contribute only their root. a local checkpoint IS a statesync capture
-    /// of your past self.
+    /// reuses the statesync surface, over the IN-MEMORY COHORT: every module
+    /// asked that reports [`sdk::StateSyncHandle::SnapshotBytes`] gets its
+    /// bytes stored. a disk-cohort module is not asked at all — it reopens its
+    /// own substrate at boot, contributes only its root, and asking would cost
+    /// a container the restore path discards (#1308).
     #[allow(clippy::too_many_arguments)]
     pub fn capture(
         host: &Host,
@@ -546,6 +623,14 @@ impl Manifest {
             // a genesis manifest has no boundary yet; 0 is a placeholder, not
             // a height.
             height.unwrap_or(0),
+            // THE IN-MEMORY COHORT ONLY. a disk-cohort module reopens its own
+            // substrate at its committed position and a restore installs
+            // nothing for it, so its container was captured, encoded and
+            // fsync'd into every checkpoint only to be thrown away on the way
+            // back in — forge's is its whole git pack closure, built on the
+            // consensus select loop (#1308). the ROOT is still captured: the
+            // position model compares live roots against it.
+            host::CapturePayloads::InMemoryCohort,
             now,
         );
         let root_hash = snapshot.root_hash;
@@ -757,8 +842,26 @@ where
 
     /// atomically persist a checkpoint manifest. syncs the op journal first
     /// so the manifest can never be newer than the journal it summarizes.
+    ///
+    /// REFUSES a manifest this crate's own reader would reject (see
+    /// [`Manifest::check_field_caps`]) before the store write, so nothing
+    /// unreadable ever reaches disk and the previous checkpoint stays exactly
+    /// where it is. The journal sync happens FIRST and unconditionally: it is
+    /// the shutdown barrier `graceful_checkpoint` leans on, and a refused
+    /// manifest must not leave buffered journal appends unflushed.
     pub async fn write_manifest(&mut self, manifest: &Manifest) -> Result<(), Error> {
         self.journal.sync().await.map_err(storage_err)?;
+        if let Err(e) = manifest.check_field_caps() {
+            tracing::error!(
+                target: "ducktape::recovery",
+                reason = "checkpoint_field_over_cap",
+                height = manifest.height.unwrap_or_default(),
+                error = %e,
+                "checkpoint refused: this node cannot restore from a manifest it \
+                 cannot read back, so the previous one stays on disk"
+            );
+            return Err(e);
+        }
         self.manifest_store
             .put_sync(U64::new(KEY), manifest.encode())
             .await
@@ -770,8 +873,11 @@ where
         self.journal.size().await
     }
 
-    /// force every buffered journal append durable — the graceful-shutdown
-    /// barrier (a crash instead simply leaves the tail to roll forward).
+    /// force every buffered journal append durable. NOT part of any live path:
+    /// every record the sink writes fsyncs where it is written, so nothing in
+    /// the node needs a separate barrier. it survives for the power-loss
+    /// harness, which wraps this sink to swallow a seal and then syncs the
+    /// inner journal by hand — the only way to build "durable except the seal".
     pub async fn sync(&mut self) -> Result<(), Error> {
         self.journal.sync().await.map_err(storage_err)
     }
@@ -935,11 +1041,16 @@ where
     }
 }
 
-// the live sink: append (and where required, sync) records as the ordered
-// lane drives it. sync policy: `pin` and `pre_apply` are barriers (their
-// records must be durable before the engine/host may act); `seal` is a plain
-// append — the NEXT pre-apply's sync makes it durable before another block
-// can apply, and a lost trailing seal is exactly the roll-forward case.
+// the live sink: append and sync records as the ordered lane drives it. sync
+// policy: every record this sink writes is a BARRIER. `pin` and `pre_apply`
+// must be durable before the engine/host may act; `seal` must be durable
+// because a store-backed tenant has ALREADY durably committed the block to its
+// own disk by the time it is written, and the seal is the only record that
+// vouches for that state. the residual window is the tail of block apply —
+// between the first tenant's commit and this sync — and is not closable by a
+// per-store cursor: `trailing.rs` refuses a block claimed by more than one
+// substrate, because there is no cross-substrate atomicity. the seal IS the
+// cross-substrate barrier.
 impl<E> BlockSink for Recovery<E>
 where
     E: Context + BufferPooler + commonware_runtime::Supervisor,
@@ -986,6 +1097,15 @@ where
         .encode();
         async move {
             self.journal.append(&record).await.map_err(storage_err)?;
+            // the seal is a BARRIER, not a plain append. a store-backed tenant
+            // durably commits its own disk during apply (`MerkleStore::commit_batch`
+            // is "apply + durably commit"), so from the moment the first one
+            // returns, this node holds state that only the seal can vouch for.
+            // syncing HERE — rather than deferring to the next block's
+            // `pre_apply`, or to a barrier the drain loop remembers to take —
+            // is what makes that vouching durable at the same instant the
+            // state is. it is also the only place that cannot be forgotten.
+            self.journal.sync().await.map_err(storage_err)?;
             Ok(())
         }
     }
@@ -1113,6 +1233,13 @@ where
         // shared past the `&mut self` journal borrows below (see the field doc).
         let code_source = std::sync::Arc::clone(&self.code_source);
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
+        // a module the composer adopted EMPTY (admitted after the checkpoint,
+        // so the manifest never captured it) has no root above; its pre-root
+        // is what it holds right now, so the block that activates it — and
+        // may carry its first op — is found `at_pre`, never torn.
+        for (id, root) in host.module_roots() {
+            expected.entry(id).or_insert(root);
+        }
         let mut tip_height: Option<u64> = manifest.height;
         let mut tip_hash = manifest.root_hash;
         let mut epoch = manifest.epoch;
@@ -1143,8 +1270,8 @@ where
         }
 
         // forward pre-scan — seed each per-block-durable disk substrate's
-        // "durable floor". a disk-cohort (ResolverBacked) module commits to its
-        // OWN disk every block, but the checkpoint only persists on a cadence
+        // "durable floor". a disk-cohort (`block_durable`) module commits to
+        // its OWN disk every block, but the checkpoint only persists on a cadence
         // (default 32 blocks), so at boot a disk module can legitimately sit N
         // blocks AHEAD of the checkpoint: its live root equals a recorded
         // post-root well above the last checkpoint, matching NEITHER the
@@ -1160,7 +1287,7 @@ where
         // recovery never heals from a nearest/approximate record. a mis-read
         // root could only mis-seed a floor and trip the final root-hash
         // recompose (fail-stop), never fork.
-        let disk_cohort = host.resolver_backed_ids();
+        let disk_cohort = host.block_durable_ids();
         let mut disk_floor: BTreeMap<ModuleId, u64> = BTreeMap::new();
         if !disk_cohort.is_empty() {
             for record in &records {
@@ -1179,15 +1306,16 @@ where
                 }
             }
         }
-        // TRAILING bound-and-verify (see `trailing.rs`): a power cut can lose
-        // the tip block's seal (a plain append; only the NEXT pre-apply syncs
-        // it) after a disk module already committed that block — leaving its
-        // live root matching NO recorded post-root, which the exact-match scan
-        // above rightly refuses to floor. a disk module carrying a per-commit
-        // height cursor (persisted atomically with its own commit) is floored
-        // AT the trailing unsealed WAL height iff the cursor claims exactly
-        // that height — binding the live root to the one finalized frame the
-        // WAL still holds durably. everything else stays floorless (Torn).
+        // TRAILING bound-and-verify (see `trailing.rs`). `seal` fsyncs where it
+        // is written, so the window is the TAIL OF BLOCK APPLY — between a disk
+        // module's own durable commit and that sync — and not everything up to
+        // the next pre-apply. a crash there leaves the module's live root
+        // matching NO recorded post-root, which the exact-match scan above
+        // rightly refuses to floor. a disk module carrying a per-commit height
+        // cursor (persisted atomically with its own commit) is floored AT the
+        // trailing unsealed WAL height iff the cursor claims exactly that
+        // height — binding the live root to the one finalized frame the WAL
+        // still holds durably. everything else stays floorless (Torn).
         let trailing_claims = trailing::seed_trailing_claims(
             host,
             &disk_cohort,
@@ -1267,7 +1395,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &[],
-                                                                    }),
+                                }),
                                 // an applied block whose ops moved no root:
                                 // its trace existed at runtime but is not
                                 // re-executed here — unreproducible.
@@ -1330,7 +1458,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
-                                                                    });
+                                });
                             }
                             for (id, root) in &changed {
                                 let live = host.module_root(id);
@@ -1363,32 +1491,18 @@ where
                                 }
                                 // else: neither — genuine damage, caught below.
                             }
-                            // MULTI-DISK atomicity limit — fail-stop EXPLICITLY.
-                            // only a per-block-durable disk substrate can be
-                            // durable after a crash (the in-memory cohort always
-                            // rolls back to the checkpoint pre-root), so `durable`
-                            // counts exactly the disk substrates that committed
-                            // this block. two or more of them is a changed set
-                            // spanning >1 disk substrate at mixed roots: the classic
-                            // multi-store atomicity zone whose sealed state may not
-                            // be internally consistent and whose single-frame
-                            // re-execution can read a partially-committed world.
-                            // selective replay's assumption (only the in-memory
-                            // cohort was rolled back) no longer holds, so we refuse
-                            // it up front rather than heal-and-hope the per-module
-                            // verify catches a divergence. no block commits to >1
-                            // disk substrate today, so this is unreachable in prod;
-                            // the real fix if that changes is a per-commit height
-                            // cursor in the disk substrate's commit metadata.
-                            if durable >= 2 {
-                                return Err(Error::Torn(format!(
-                                    "block {height}: changed set spans {durable} \
-                                     per-block-durable disk substrates at mixed roots — the \
-                                     multi-store atomicity limit; single-frame selective replay \
-                                     cannot safely reconcile this. wipe app state and re-sync \
-                                     (keep the consensus journal)"
-                                )));
-                            }
+                            // `durable` is NOT capped here, and that is the
+                            // point: this block is SEALED, and the seal is
+                            // fsync'd only after the apply returned, so every
+                            // per-block-durable substrate the block changed
+                            // committed durably before the seal existed. the
+                            // count is just how many disk modules the block
+                            // touched — an agent-run settle touches several —
+                            // and the at-pre set is exactly the checkpoint's
+                            // rolled-back cohort. the crash-between-commits
+                            // window lives strictly above the last seal, where
+                            // `trailing.rs` bounds it. (see the crate docblock.)
+                            //
                             // a changed module at NEITHER pre nor durable is
                             // genuine damage — still fail-stop. so is a torn
                             // block with nothing left to re-commit (it should
@@ -1422,7 +1536,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
-                                                                    });
+                                });
                             }
                             // every re-committed and exact-post module must now
                             // stand at its sealed post-root. a disk substrate that
@@ -1479,7 +1593,7 @@ where
                         // below; this is that same post-block boundary.
                         root_hash: host.root_hash(),
                         dispatches: &dispatches,
-                                            });
+                    });
                 }
                 disposition
             } else {
@@ -1547,7 +1661,7 @@ where
                             disposition,
                             root_hash: host.root_hash(),
                             dispatches: &dispatches,
-                                                    });
+                        });
                     }
                     disposition
                 }
@@ -1695,9 +1809,12 @@ async fn replay_batch(
 ) -> Result<(Disposition, Vec<DispatchRecord>), Error> {
     // CODE-SWAP REALIZATION, mirroring the live drain: a block sealed after a
     // code-registry swap executed on the NEW component, so replay must swap
-    // before re-applying or the sealed roots cannot reproduce. keyed purely on
-    // the replayed committed registry state + height — the identical swap
-    // points the live node realized. fail-closed on missing/tampered bytes.
+    // before re-applying or the sealed roots cannot reproduce. the registry
+    // is disk-durable and reopens AHEAD of this window — its tip says nothing
+    // about which code sealed `height` — so realization keys on the registry's
+    // activation HISTORY at `height` (`lifecycle::code_at`): the identical
+    // swap points the live node realized, walked in either direction.
+    // fail-closed on missing/tampered bytes.
     host.realize_module_swaps(height, code_source)
         .await
         .map_err(|e| Error::Verify(format!("code-swap realization at height {height}: {e}")))?;
@@ -1888,6 +2005,91 @@ mod tests {
         assert!(msg.contains("no pack for committed head"), "{msg}");
     }
 
+    /// the disk cohort in miniature: per-block durable on its own substrate,
+    /// yet shipping ONE self-contained container as its sync surface — forge's
+    /// shape exactly (#1308), and the one where the two answers differ.
+    struct SelfDurableModule {
+        id: &'static str,
+        /// counts every `state_sync_handle` call: for forge each one is a full
+        /// git pack closure, built on the node's select loop.
+        payloads_built: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl sdk::Module for SelfDurableModule {
+        fn id(&self) -> ModuleId {
+            self.id.into()
+        }
+
+        fn root(&self) -> StateRoot {
+            StateRoot([11; 32])
+        }
+
+        fn block_durable(&self) -> bool {
+            true
+        }
+
+        fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+            self.payloads_built
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(sdk::StateSyncHandle::SnapshotBytes(vec![0xAB; 4096]))
+        }
+
+        async fn execute(
+            &mut self,
+            _ctx: &mut dyn sdk::Ctx,
+            _msg: &sdk::Msg,
+        ) -> Result<(), sdk::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_never_builds_or_stores_a_self_durable_module_payload() {
+        let built = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host = Host::genesis(vec![
+            Box::new(SelfDurableModule {
+                id: "forge",
+                payloads_built: built.clone(),
+            }),
+            Box::new(CountingModule {
+                id: "runs",
+                roots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        ])
+        .expect("genesis");
+
+        let m = Manifest::capture(&host, Some(9), 0, 0, vec![], vec![], None, 0, 1)
+            .expect("the disk cohort is not degraded — it was never asked");
+
+        assert_eq!(
+            built.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a checkpoint must not build the container it throws away: that \
+             build is forge's whole pack closure, on the select loop",
+        );
+        assert_eq!(
+            m.snapshot("forge"),
+            None,
+            "restore reopens the disk cohort from its own substrate and \
+             installs nothing, so its bytes must never ride the manifest",
+        );
+        assert_eq!(
+            m.root("forge"),
+            Some(StateRoot([11; 32])),
+            "the ROOT still rides it — the position model compares against it",
+        );
+        assert_eq!(
+            m.snapshot("runs"),
+            Some([7].as_ref()),
+            "the in-memory cohort is still captured whole",
+        );
+
+        // THE READER ON THIS BRANCH READS WHAT THIS BRANCH WRITES.
+        assert!(m.check_field_caps().is_ok(), "writable");
+        assert_eq!(Manifest::decode(&m.encode()).expect("roundtrip"), m);
+    }
+
     /// a module that COUNTS its own `root()` calls. for a map-backed module
     /// `root()` is a full state serialization + SHA-256, so every extra call is
     /// another whole pass over the module's state — and the capture is holding
@@ -1996,6 +2198,60 @@ mod tests {
         let decoded = Manifest::decode(&manifest.encode()).expect("large checkpoint decodes");
         assert_eq!(decoded.snapshot("forge"), Some(snapshot.as_slice()));
         assert_eq!(decoded, manifest);
+    }
+
+    /// THE WRITER MUST NOT PRODUCE WHAT THE READER REFUSES. A forge snapshot
+    /// grows with the repo, and past the field cap the old code wrote a
+    /// checkpoint the next boot could never decode — while pruning the journal
+    /// below it (#1308).
+    #[test]
+    fn a_field_over_the_checkpoint_cap_is_refused_at_write_time() {
+        let mut manifest = sample_manifest();
+        assert!(
+            manifest.check_field_caps().is_ok(),
+            "the sample is writable"
+        );
+
+        // zero-filled: only the length is read, so this never touches a page.
+        manifest.snapshots = vec![("forge".into(), vec![0u8; MAX_CHECKPOINT_FIELD_LEN + 1])];
+        let refused = manifest
+            .check_field_caps()
+            .expect_err("an over-cap snapshot must be refused");
+        assert!(
+            matches!(&refused, Error::FieldOverCap(what) if what.contains("forge")),
+            "the refusal must name the module whose snapshot outgrew the cap: {refused}"
+        );
+        // (deliberately NOT encode+decode'd here: proving the reader refuses it
+        // would copy a gigabyte through this test for a bound
+        // `manifest_roundtrips_a_module_snapshot_above_the_operation_cap`
+        // already pins from the other side.)
+
+        let over_cap_key = Manifest {
+            snapshots: Vec::new(),
+            residents: vec![vec![0u8; MAX_CHECKPOINT_FIELD_LEN + 1]],
+            ..sample_manifest()
+        };
+        assert!(matches!(
+            over_cap_key.check_field_caps(),
+            Err(Error::FieldOverCap(_))
+        ));
+
+        // the same rule for the list COUNTS the reader caps: an over-long list
+        // decodes no better than an over-long field.
+        let too_many_roots = Manifest {
+            roots: (0..=MAX_LIST_LEN)
+                .map(|i| (format!("m{i}"), StateRoot([0; 32])))
+                .collect(),
+            ..sample_manifest()
+        };
+        assert!(matches!(
+            too_many_roots.check_field_caps(),
+            Err(Error::FieldOverCap(_))
+        ));
+        assert!(matches!(
+            Manifest::decode(&too_many_roots.encode()),
+            Err(Error::Corrupt(_)),
+        ));
     }
 
     #[test]

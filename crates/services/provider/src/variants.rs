@@ -4,7 +4,7 @@
 //! a variant is pure sugar over the documented "finer tag with its own spec"
 //! pattern: each entry registers an ADDITIONAL spec under the composed tag
 //! `{parent_tag}_{suffix}`, inheriting `bin`/`env`/`prompt`/`output`/
-//! `timeout_secs`/`rw_dirs`/`isolation`/`context` (and `description`) from the parent,
+//! `timeout_secs`/`isolation`/`context` (and `description`) from the parent,
 //! with the variant's own FULL argv. there is no
 //! merging, no placeholder, no substitution — the
 //! "argv is literal" invariant holds per tag, exactly as if the operator had
@@ -86,12 +86,9 @@ pub(crate) fn expand(
             args: variant.args.clone(),
             timeout_secs: base.timeout_secs,
             output: base.output,
-            // HOW the executor authenticates — its broker, its config home, its
-            // auth/state dirs — is a property of the CLI, not of the model or the
-            // effort a variant pins. so both auth sections inherit whole, and the
-            // parent's broker⊕rw_dirs exclusivity (checked once, at parse) holds
-            // for every variant by construction.
-            rw_dirs: base.rw_dirs.clone(),
+            // HOW the executor authenticates — its broker and its config home —
+            // is a property of the CLI, not of the model or the effort a variant
+            // pins. so the auth section inherits whole.
             isolation: base.isolation.clone(),
             // WHERE the CLI auto-loads its ambient instructions is a property of
             // the CLI, like its auth — not of the model or effort a variant pins.
@@ -251,9 +248,6 @@ args = ["run", "--model", "m1", "--effort", "high"]
     fn variants_inherit_auth_and_context_sections() {
         let toml = family_toml(
             r#"
-[sandbox]
-rw_dirs = ["~/.prov"]
-
 [isolation]
 config_home_env = "PROV_HOME"
 
@@ -268,10 +262,9 @@ args = ["run", "--model", "m1"]
         let specs = CapabilitySpec::parse_all(&toml, "t").unwrap();
         let get = |tag: &str| specs.iter().find(|s| s.tag == tag).unwrap();
 
-        // BOTH auth sections inherited — how the CLI authenticates is a
+        // the auth section is inherited — how the CLI authenticates is a
         // property of the CLI, not of the model/effort the variant pins.
         let v = get("prov_m1_low");
-        assert_eq!(v.rw_dirs, vec!["~/.prov"], "sandbox rw_dirs inherited");
         assert_eq!(
             v.isolation,
             get("prov").isolation,
@@ -419,13 +412,12 @@ args = ["run", "--model", "m1"]
             );
         }
 
-        // the shipped AUTH posture, per family, inherited by every variant: BOTH
-        // families now take the STRONG path (a host broker + fresh config home,
-        // so the credential never enters the child, and therefore NO credential
-        // dir mounted). They differ only in wire shape — codex speaks the OpenAI
-        // Responses API, claude the Anthropic Messages API. The parse-time
-        // invariant is what makes "broker + rw_dirs" unrepresentable; this pins
-        // which broker each family is on and that neither mounts a credential dir.
+        // the shipped AUTH posture, per family, inherited by every variant: a
+        // host broker + a fresh config home, so the credential never enters the
+        // child. They differ only in wire shape — codex speaks the OpenAI
+        // Responses API, claude the Anthropic Messages API. Mounting a
+        // credential dir instead is not representable at all (the spec format
+        // has no `[sandbox]` table); this pins which broker each family is on.
         for spec in specs.iter().filter(|s| s.tag.starts_with("codex")) {
             assert_eq!(
                 spec.isolation.broker,
@@ -434,11 +426,6 @@ args = ["run", "--model", "m1"]
                 spec.tag
             );
             assert_eq!(spec.isolation.config_home_env.as_deref(), Some("CODEX_HOME"));
-            assert!(
-                spec.rw_dirs.is_empty(),
-                "{}: a broker-backed spec mounts no credential dir",
-                spec.tag
-            );
         }
         for spec in specs.iter().filter(|s| s.tag.starts_with("claude")) {
             assert_eq!(
@@ -450,11 +437,6 @@ args = ["run", "--model", "m1"]
             assert_eq!(
                 spec.isolation.config_home_env.as_deref(),
                 Some("CLAUDE_CONFIG_DIR")
-            );
-            assert!(
-                spec.rw_dirs.is_empty(),
-                "{}: a broker-backed spec mounts no credential dir",
-                spec.tag
             );
         }
 

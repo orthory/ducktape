@@ -102,7 +102,7 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
     // the round trip its own submit opened.
     let pages_screen = inlined(include_str!("../ui/screens/pages.ice"));
     assert!(pages_screen.contains(
-        "if connected && empty(page_search_hits) && !page_searching && !empty(page_search_query) && trim(page_search_draft) == page_search_query"
+        "if connected && empty(page_search_hits) && search_answer_stands(page_search_query, page_search_draft, page_searching)"
     ));
     let overlays = inlined(include_str!("../ui/screens/overlays.ice"));
     assert!(overlays
@@ -112,7 +112,7 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
     // or over "No page selected" — and `EmptyPlate` is `bg=transparent`, so
     // what it denies would render straight through the sentence denying it.
     let card = pages_screen
-        .split("if connected && empty(page_search_hits) && !page_searching")
+        .split("if connected && empty(page_search_hits) && search_answer_stands(")
         .nth(1)
         .expect("the zero-hit arm");
     let card = &card[..card.find("No pages matched").expect("the plate's message")];
@@ -150,6 +150,323 @@ fn the_zero_hit_plates_sit_where_the_answer_is_needed() {
         "the pages plate must be declared AFTER the document arm: a stack draws \
          its layers in declaration order, first at the BOTTOM, so an earlier plate \
          is painted UNDER the document it is supposed to cover"
+    );
+    // AND THE HITS HALF SITS BESIDE IT. Nested in the document arm it was a row
+    // in the document COLUMN, so `live_resynced` emptying `active_page` under a
+    // standing answer took the input, the × and the hits down together — "No
+    // page selected" over a search nobody could see or dismiss. Same indent,
+    // same pin: re-nesting it deepens the indent and this needle stops
+    // matching.
+    let hits = pages_screen
+        .find("\n          if connected && !empty(page_search_hits)")
+        .expect("the pages hits float, as a SIBLING stack layer");
+    assert!(
+        document < hits,
+        "the pages hits float must be declared AFTER the document arm, for the \
+         same paint order its zero-hit sibling needs"
+    );
+    // OPAQUE, like the plate: it floats over live document text.
+    let card = &pages_screen[hits..];
+    let card = &card[..card.find("PageSearchResult").expect("the hit rows")];
+    assert!(
+        card.contains("bg=elevated"),
+        "a hits float over the document must not be a transparent layer"
+    );
+}
+
+/// THE EXPLORER'S PLATE SPEAKS FOR THE QUERY IT WAS SENT — the same class the
+/// pages plate above was fixed for, on the last surface that still keyed its
+/// zero-hit sentence on the LIVE draft. Workspace search is enter-to-submit and
+/// two-way bound with no `change=` route, so a keystroke after a zero-hit answer
+/// runs no handler at all: only `trim(query) == sent_query` can retire the
+/// plate, and the captured string is the only thing that can carry the
+/// comparison. Read off the component's own source because its state is
+/// instance-local and its draft is written by the input widget, not by a
+/// handler the harness could dispatch.
+#[test]
+fn the_explorer_plate_speaks_for_the_query_it_was_sent() {
+    let explorer = inlined(include_str!("../ui/screens/storage.ice"));
+    let submit = ice_handler_body(&explorer, "explorer_search_submit");
+    // CAPTURED AT SUBMIT, AND SENT FROM THE CAPTURE — passing `trim(query)` to
+    // the call a second time would let the string asked about and the string
+    // spoken for drift apart in a later edit.
+    assert!(
+        submit.contains("sent_query = trim(query)"),
+        "the submit must capture the query it sends"
+    );
+    assert!(
+        submit.contains(
+            "run replace lane=workspace_search search_workspace(rpc, sent_query) -> explorer_results_loaded _"
+        ),
+        "the search must be sent for the captured string itself"
+    );
+    // THE ARM. A flag could never carry this: `searching` is down and the hits
+    // are empty for a zero-hit answer no matter what is in the box.
+    assert!(
+        explorer.contains(
+            "if connected && empty(hits) && empty(partial) && search_answer_stands(sent_query, query, searching)"
+        ),
+        "the zero-hit plate must be keyed on the query that was sent"
+    );
+    // AND THE DISMISSAL DROPS IT. Left standing, the plate would speak for a
+    // query whose box has been emptied.
+    assert!(
+        ice_handler_body(&explorer, "clear_explorer_search").contains("sent_query = \"\""),
+        "clearing the box must take the standing answer with it"
+    );
+}
+
+/// CHAT'S FLOAT MAY NOT OUTLIVE THE QUERY IN THE BOX — and only its zero-hit
+/// arm retires that way. The message field is enter-to-submit and two-way
+/// bound, so a keystroke runs no handler and `done` went on standing over a
+/// string the node never saw: "No messages match" kept asserting about a query
+/// nobody had sent. Hit ROWS are a different thing — they are what the reader
+/// is typing toward — so they stand until a new query is sent or the box is
+/// cleared, exactly as the pages hits float does.
+#[test]
+fn the_chat_float_stands_only_for_the_query_it_was_sent() {
+    // Draft -> submit -> answer: the state a standing float reads.
+    let answered = |draft: &str, hits: Vec<backend::ChatSearchHit>| {
+        let (mut app, _) = Ducktape::__boot();
+        app.connected = true;
+        app.loading = false;
+        app.chat_search_draft = draft.into();
+        // A DRAFT IS NOT A QUERY: typing alone runs nothing and captures
+        // nothing.
+        assert!(app.chat_search_query.is_empty());
+        let _ = app.__update(__DucktapeMessage::SearchChatSubmit);
+        assert_eq!(app.chat_search_phase, SearchPhase::Searching);
+        assert_eq!(
+            app.chat_search_query, "zzz",
+            "the submit captures the TRIMMED string it sent"
+        );
+        let _ = app.__update(__DucktapeMessage::ChatSearchLoaded(
+            backend::ChatSearchData { hits },
+        ));
+        assert_eq!(app.chat_search_phase, SearchPhase::Done);
+        app
+    };
+
+    // THE ZERO-HIT ANSWER STANDS FOR ITS OWN QUERY, and one more character
+    // walks the draft away from it with no handler run.
+    let mut empty = answered("  zzz  ", Vec::new());
+    assert!(empty.chat_search_hits.is_empty());
+    assert_eq!(empty.chat_search_draft.trim(), empty.chat_search_query);
+    empty.chat_search_draft = "zzzq".into();
+    assert_ne!(empty.chat_search_draft.trim(), empty.chat_search_query);
+
+    // THE WITH-HITS ANSWER DOES NOT RETIRE THAT WAY — the rows survive the
+    // keystroke, and the float's gate says so on its own `!empty(search_hits)`
+    // term.
+    let mut rows = answered("zzz", vec![stale_chat_hit()]);
+    rows.chat_search_draft = "zzzq".into();
+    assert_eq!(rows.chat_search_hits.len(), 1);
+
+    // A FAILED search never ran, so nothing may stand for it.
+    let mut failed = answered("zzz", Vec::new());
+    let _ = failed.__update(__DucktapeMessage::ChatSearchFailed(backend::AppError {
+        message: "node refused".into(),
+        committed: false,
+    }));
+    assert_eq!(failed.chat_search_phase, SearchPhase::Idle);
+    assert!(failed.chat_search_query.is_empty());
+    assert_eq!(failed.error, "node refused");
+
+    // AND EVERY DISMISSAL TAKES THE QUERY WITH THE HITS, or the next answer
+    // inherits a string that was never sent for it.
+    for leaving in [
+        __DucktapeMessage::ClearChatSearch,
+        __DucktapeMessage::ChooseChannel("next".into()),
+        __DucktapeMessage::ChooseDm("peer".into()),
+    ] {
+        let mut app = answered("zzz", vec![stale_chat_hit()]);
+        let _ = app.__update(leaving);
+        assert!(
+            app.chat_search_query.is_empty(),
+            "a dismissal must not leave a query standing"
+        );
+    }
+
+    // THE GATE. The float stands while the search is out, while hits are in
+    // hand, or while the box still holds the string the answer speaks for —
+    // and for no other reason, so a zero-hit answer cannot outlive its query.
+    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    assert!(
+        chat.contains(
+            "if search_phase == SearchPhase.searching || !empty(search_hits) || search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)"
+        ),
+        "the results float must be gated on the query it was sent for"
+    );
+}
+
+/// ONE PREDICATE, THREE SURFACES. Pages, chat and the explorer each grew their
+/// own copy of the same conjunct arm, and a fourth surface would have grown a
+/// fourth; the arithmetic lives in one place now, and the three arms call it.
+#[test]
+fn one_predicate_decides_whether_a_search_answer_still_stands() {
+    // The answer speaks for the string it was sent for — trimmed, because that
+    // is what was sent.
+    assert!(backend::search_answer_stands("zzz", "  zzz  ", false));
+    // ONE MORE CHARACTER AND IT DOES NOT. No handler ran; only this comparison
+    // can tell.
+    assert!(!backend::search_answer_stands("zzz", "zzzq", false));
+    // A ROUND TRIP IS NOT AN ANSWER — the submit's own search is still out.
+    assert!(!backend::search_answer_stands("zzz", "zzz", true));
+    // AND AN EMPTY QUERY IS NO ANSWER AT ALL, which is what every dismissal
+    // leaves behind: an emptied box must not match an emptied query.
+    assert!(!backend::search_answer_stands("", "", false));
+
+    // The three arms read it, so none of them can drift from the others.
+    for (source, call) in [
+        (
+            inlined(include_str!("../ui/screens/pages.ice")),
+            "search_answer_stands(page_search_query, page_search_draft, page_searching)",
+        ),
+        (
+            inlined(include_str!("../ui/screens/chat.ice")),
+            "search_answer_stands(search_query, search_draft, search_phase == SearchPhase.searching)",
+        ),
+        (
+            inlined(include_str!("../ui/screens/storage.ice")),
+            "search_answer_stands(sent_query, query, searching)",
+        ),
+    ] {
+        assert!(
+            source.contains(call),
+            "every search surface decides through the shared predicate: `{call}`"
+        );
+    }
+}
+
+/// THE PAIRING IS WALKED, NOT ENUMERATED. An answer and the query it speaks
+/// for are one fact in two fields, so a handler that drops the hits and leaves
+/// the query behind arms the next reply to render an answer nobody asked for —
+/// and the navigation test that checks today's handlers cannot see the
+/// navigation handler added next year. This reads every `on` block in every
+/// authored `.ice` source instead.
+#[test]
+fn a_handler_that_drops_search_hits_drops_the_query_with_it() {
+    // The three surfaces that capture a query. Two app-scope pairs and the
+    // explorer's component-local one; a bare `hits` cannot collide with the
+    // prefixed names, because the match is anchored at the start of the line.
+    const PAIRED: [(&str, &str); 3] = [
+        ("page_search_hits", "page_search_query"),
+        ("chat_search_hits", "chat_search_query"),
+        ("hits", "sent_query"),
+    ];
+    let mut walked = 0;
+    for (path, source) in ice_sources() {
+        for (handler, body) in ice_handlers(&source) {
+            for (hits, query) in PAIRED {
+                // A DROP, not a write: `x = next.hits` is an answer landing.
+                // `keep_` is the conditional drop `close_doc_tab` rides.
+                let drops = body.lines().any(|line| {
+                    let line = line.trim();
+                    line.starts_with(&format!("{hits} = "))
+                        && (line.ends_with("= []") || line.contains("= keep_"))
+                });
+                if !drops {
+                    continue;
+                }
+                walked += 1;
+                assert!(
+                    body.lines()
+                        .any(|line| line.trim().starts_with(&format!("{query} = "))),
+                    "`on {handler}` in {path} drops `{hits}` and leaves `{query}` \
+                     standing — the plate would speak for a query nobody sent"
+                );
+            }
+        }
+    }
+    assert!(
+        walked >= 10,
+        "the walk found only {walked} hit-dropping handlers, so it is not \
+         reading the sources it claims to"
+    );
+}
+
+/// A WORKSPACE ANSWER BELONGS TO THE NETWORK IT WAS SENT FROM, and the
+/// explorer's search state is the one search state exempt from every app-level
+/// reset: `ExplorerScreen` is `lifetime retained`, so no reconnect and no
+/// network switch reaches inside it. What keeps a reply issued on one network
+/// from rendering as another's is the identity in its INSTANCE KEY —
+/// `#explorer(connected_rpc)` — which the run inherits as its scope at send
+/// time and the reply carries back. Switching networks renders a different
+/// instance, and the answer in flight lands on the one that asked for it.
+///
+/// The key is therefore load-bearing, not decoration: dropped, both networks
+/// share one instance and a cross-network answer renders as the new network's.
+#[test]
+fn an_explorer_answer_lands_on_the_network_that_asked_for_it() {
+    let (mut app, _) = Ducktape::__boot();
+    let console = iced::window::Id::unique();
+    app.console_win = Some(console);
+    app.connected = true;
+    app.loading = false;
+    let _ = app.__update(__DucktapeMessage::SelectShellTab(ShellTab::Explorer));
+
+    // A render materializes the instance the mount's key names — this app's own
+    // window and no other's, since the sighting channel is thread-local and a
+    // sibling test on the same thread renders the same mount.
+    let mounted = |app: &mut Ducktape| -> Vec<String> {
+        let _ = app.__view(console);
+        let window = format!("/{console:?}/");
+        app.__ice_test_scopes_explorer_screen()
+            .into_iter()
+            .filter(|scope| scope.contains(&window))
+            .collect()
+    };
+
+    app.connected_rpc = "http://one".into();
+    let one = mounted(&mut app);
+    assert_eq!(one.len(), 1, "one network, one explorer instance");
+    app.connected_rpc = "http://two".into();
+    let both = mounted(&mut app);
+    assert_eq!(
+        both.len(),
+        2,
+        "the explorer instance must be keyed by the network it is reading — one \
+         instance shared across networks is exactly what lets an answer sent on \
+         the first render as the second's"
+    );
+    let first = one[0].clone();
+    let second = both
+        .iter()
+        .find(|scope| **scope != first)
+        .expect("the second network's instance")
+        .clone();
+
+    // THE REPLY IN FLIGHT, delivered to the scope its send captured — the app
+    // is on the second network by now.
+    let _ = app.__update(
+        Ducktape::__ice_test_message_explorer_screen_explorer_results_loaded(
+            first.clone(),
+            backend::ExplorerResults {
+                hits: vec![backend::ExplorerHit {
+                    kind: "page".into(),
+                    code: "pg".into(),
+                    title: "Old".into(),
+                    snippet: "stale".into(),
+                    meta: String::new(),
+                    target: "page".into(),
+                }],
+                kinds: Vec::new(),
+                partial: String::new(),
+            },
+        ),
+    );
+    assert_eq!(
+        app.__ice_test_state_explorer_screen(&first)
+            .expect("the first network's instance answers")
+            .hits
+            .len(),
+        1,
+        "the answer belongs to the network that asked for it"
+    );
+    assert!(
+        app.__ice_test_state_explorer_screen(&second)
+            .is_none_or(|state| state.hits.is_empty()),
+        "a cross-network answer must not render as the new network's"
     );
 }
 
@@ -754,11 +1071,11 @@ fn a_disconnected_console_reports_no_counts_at_all() {
 
     app.connected = true;
     assert_eq!(
-        backend::members_summary(app.connected, app.members_rows.clone()),
+        backend::members_summary(app.connected, &app.members_rows),
         "1 human · 0 agents"
     );
     assert_eq!(
-        backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+        backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         "1 file · 0 dirs"
     );
     // The two registers this boot leaves EMPTY are silent while connected too —
@@ -766,33 +1083,27 @@ fn a_disconnected_console_reports_no_counts_at_all() {
     // "No agents registered" / "No proposals yet". `a_subtitle_that_is_all_zeros_
     // says_nothing_at_all` (backend/tests.rs) is where the speaking case is
     // proved with real rows; here they are empty on purpose.
-    assert_eq!(
-        backend::agents_summary(app.connected, app.agents_rows.clone()),
-        ""
-    );
-    assert_eq!(
-        backend::proposals_summary(app.connected, app.gov_rows.clone()),
-        ""
-    );
+    assert_eq!(backend::agents_summary(app.connected, &app.agents_rows), "");
+    assert_eq!(backend::proposals_summary(app.connected, &app.gov_rows), "");
 
     // The node goes down. Everything above was a reading; none of it is one now.
     app.connected = false;
     for (screen, meta) in [
         (
             "Members",
-            backend::members_summary(app.connected, app.members_rows.clone()),
+            backend::members_summary(app.connected, &app.members_rows),
         ),
         (
             "Agents",
-            backend::agents_summary(app.connected, app.agents_rows.clone()),
+            backend::agents_summary(app.connected, &app.agents_rows),
         ),
         (
             "Approvals",
-            backend::proposals_summary(app.connected, app.gov_rows.clone()),
+            backend::proposals_summary(app.connected, &app.gov_rows),
         ),
         (
             "Files",
-            backend::fs_counts_summary(app.connected, true, app.fs_entries.clone()),
+            backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         ),
     ] {
         assert_eq!(
@@ -844,13 +1155,16 @@ fn a_failed_message_search_closes_the_float_instead_of_claiming_zero_results() {
 /// Enter (lands `done`+empty again), not clearing the field (the submit
 /// handler returns early on an empty query, leaving the phase untouched).
 /// Only a channel/DM switch or a reconnect ever wrote "idle" again. The ×
-/// must share the float's own gate, not a narrower one.
+/// must therefore never be gated more narrowly than the float. It is gated
+/// WIDER: the float's own discriminant OR a live field. Every state that
+/// raises the float is covered — searching and done are both `!= idle`, and an
+/// answer that still stands for the box means the box is not empty.
 #[test]
 fn the_clear_search_button_survives_a_zero_hit_result() {
     let screen = inlined(include_str!("../ui/screens/chat.ice"));
     assert!(
-        screen.contains("if search_phase != SearchPhase.idle\n"),
-        "the float and the clear button read the same discriminant"
+        screen.contains("if search_phase != SearchPhase.idle || !empty(trim(search_draft))\n"),
+        "the clear × must open on the float's discriminant or on a live field"
     );
     assert!(
         !screen.contains("if !empty(search_hits)\n"),

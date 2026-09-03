@@ -207,13 +207,18 @@ pub(crate) fn widest(grants: &[ServiceGrant]) -> Vec<noded::services::Signaling>
 /// (`capability` takes the announcing node from the verified submit origin,
 /// never from payload data). That is why no caller here holds a signing key —
 /// and why a user-signed announce could never have worked.
-pub(crate) fn submit(base: &str, set: &AnnounceSet) -> Result<u64, String> {
+pub(crate) fn submit(
+    base: &str,
+    workspace: &std::path::Path,
+    set: &AnnounceSet,
+) -> Result<u64, String> {
     let msg = capability::CapabilityMsg::Announce {
         capabilities: set.capabilities.clone(),
         resources: set.resources.clone(),
     };
     let payload = serde_json::to_value(&msg).map_err(|error| error.to_string())?;
-    crate::node_http::submit(base, "capability", &payload).map_err(|error| error.to_string())
+    crate::node_http::submit(base, workspace, "capability", &payload)
+        .map_err(|error| error.to_string())
 }
 
 /// This node's committed announce.
@@ -396,7 +401,7 @@ fn run(watch: Watch) {
                 report(failures, &reason);
             }
             Tick::Quiet => failures = 0,
-            Tick::Announce(want) => match submit(&watch.base, &want) {
+            Tick::Announce(want) => match submit(&watch.base, &watch.workspace, &want) {
                 Ok(height) => {
                     failures = 0;
                     tracing::info!(
@@ -489,7 +494,10 @@ mod tests {
         // nothing itself, so consent alone is not evidence anything can run.
         let grants = [grant("compute", &["claude", "codex"])];
         let set = announced_set(&grants, &[], &caps(8)).unwrap();
-        assert!(set.capabilities.is_empty(), "a grant without a hello offers nothing");
+        assert!(
+            set.capabilities.is_empty(),
+            "a grant without a hello offers nothing"
+        );
         assert!(set.resources.is_empty(), "empty tags force empty resources");
 
         // a daemon signals: the intersection appears, kind tag included, and
@@ -515,7 +523,10 @@ mod tests {
         let grants = [grant("agent", &["claude"]), grant("compute", &["codex"])];
         let live = [signal("agent", &["claude"]), signal("compute", &["codex"])];
         let set = announced_set(&grants, &live, &caps(4)).unwrap();
-        assert_eq!(set.capabilities, tags(&["agent", "claude", "codex", "compute"]));
+        assert_eq!(
+            set.capabilities,
+            tags(&["agent", "claude", "codex", "compute"])
+        );
     }
 
     #[test]
@@ -572,7 +583,7 @@ mod tests {
     /// watcher reads consent off disk, so a test grant IS a file.
     fn granted_workspace(grants: &[(&str, &[&str])]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("scratch workspace");
-        let mut body = String::from("version = 1\n");
+        let mut body = String::new();
         let mut sorted = grants.to_vec();
         sorted.sort_by_key(|(kind, _)| *kind);
         for (kind, capabilities) in &sorted {
@@ -653,7 +664,12 @@ mod tests {
             "and the capacity with them — resources without tags is a module-level reject"
         );
         // the grant is untouched on disk: consent survives the daemon.
-        assert!(crate::services::load(workspace.path()).unwrap().grant("compute").is_some());
+        assert!(
+            crate::services::load(workspace.path())
+                .unwrap()
+                .grant("compute")
+                .is_some()
+        );
     }
 
     #[test]
@@ -771,7 +787,9 @@ mod tests {
         let live = [signal("agent", &["claude"])];
         let now = announced_set(&grants, &live, &caps(4)).unwrap();
         assert!(
-            now.capabilities.iter().all(|tag| bound.capabilities.contains(tag)),
+            now.capabilities
+                .iter()
+                .all(|tag| bound.capabilities.contains(tag)),
             "a live derivation is always a subset of the bound"
         );
         assert!(now.capabilities.len() < bound.capabilities.len());

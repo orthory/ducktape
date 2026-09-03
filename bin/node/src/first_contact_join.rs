@@ -5,7 +5,7 @@
 //! inviter meshes with (the invite's `fronts`). This module turns that set into
 //! ONE candidate list (`{inviter} ∪ {fronts}`), races first contact across the
 //! whole union, and stops at the first candidate whose doorbell SETTLES THE
-//! GATE (join ADR §4: the sealed intro is the gate request, and the acked
+//! GATE (the sealed intro is the gate request, and the acked
 //! `Admitted`/terminal `Rejected` is the authoritative outcome) — cancelling
 //! the rest. If every path is exhausted it returns an HONEST terminal (a
 //! distinct, mode-naming failure the caller surfaces loudly and exits on),
@@ -31,7 +31,7 @@
 //! it and are exercised end-to-end against a live plane.
 
 use std::future::Future;
-use std::net::{SocketAddr, ToSocketAddrs as _};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -41,7 +41,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use futures::StreamExt as _;
 
 use crate::config::Front;
-use crate::lobby;
+use crate::join_gate;
 
 /// how long each attempt paces a retry / waits for an ack.
 const RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -105,7 +105,7 @@ impl std::fmt::Display for ContactVia {
 }
 
 /// the outcome of a single candidate's attempt. the sealed intro IS the gate
-/// request (join ADR §4), so an attempt no longer succeeds at "tunnel up" — it
+/// request, so an attempt no longer succeeds at "tunnel up" — it
 /// resolves when the member's doorbell answers the GATE.
 #[derive(Debug, PartialEq)]
 pub enum AttemptResult {
@@ -114,9 +114,9 @@ pub enum AttemptResult {
     /// (private coordination) or `None`.
     Admitted { height: u64, cap: Option<Vec<u8>> },
     /// the gate refused TERMINALLY — this invite can never redeem; the whole
-    /// race stops and the joiner exits (ADR R2).
+    /// race stops and the joiner exits.
     Rejected {
-        code: lobby::RejectCode,
+        code: join_gate::RejectCode,
         detail: String,
     },
     /// the attempt exhausted its window, was refused non-terminally, or the
@@ -141,9 +141,9 @@ pub enum FirstContactOutcome {
         cap: Option<Vec<u8>>,
     },
     /// a member answered a TERMINAL `Rejected` — this invite can never
-    /// redeem. the caller exits loudly instead of failing over (ADR R2).
+    /// redeem. the caller exits loudly instead of failing over.
     Rejected {
-        code: lobby::RejectCode,
+        code: join_gate::RejectCode,
         detail: String,
     },
     /// every offered path was exhausted. HONEST: the caller must surface this
@@ -173,30 +173,111 @@ pub struct InviterContact {
 pub fn build_candidates(inviter: Option<InviterContact>, fronts: &[Front]) -> Vec<Candidate> {
     let mut out = Vec::new();
     if let Some(inv) = inviter {
-        out.push(Candidate {
-            key: inv.key,
-            wg: inv.wg,
-            mesh_port: inv.mesh_port,
-            endpoint: inv.endpoint,
-            // the inviter advertises its intro listener explicitly; honor it.
-            intro: inv.intro,
-        });
+        push_with_offnet_twin(
+            &mut out,
+            Candidate {
+                key: inv.key,
+                wg: inv.wg,
+                mesh_port: inv.mesh_port,
+                endpoint: inv.endpoint,
+                // the inviter advertises its intro listener explicitly; honor it.
+                intro: inv.intro,
+            },
+        );
     }
     for front in fronts {
         match ed25519::PublicKey::decode(&front.member_key[..]) {
-            Ok(key) => out.push(Candidate {
-                key,
-                wg: front.wireguard_public_key,
-                mesh_port: front.mesh_port,
-                endpoint: front.endpoint.clone(),
-                // fronts advertise no separate intro listener — the direct
-                // path derives `wg_port + 1`.
-                intro: None,
-            }),
+            Ok(key) => push_with_offnet_twin(
+                &mut out,
+                Candidate {
+                    key,
+                    wg: front.wireguard_public_key,
+                    mesh_port: front.mesh_port,
+                    endpoint: front.endpoint.clone(),
+                    // fronts advertise no separate intro listener — the direct
+                    // path derives `wg_port + 1`.
+                    intro: None,
+                },
+            ),
             Err(_) => continue,
         }
     }
     out
+}
+
+/// Push `candidate`, and — when its endpoint only carries inside its own
+/// network — a COORDINATED twin of the same member beside it.
+///
+/// An invite minted on a LAN advertises its members as
+/// `endpoint: Some("192.168.0.70:51821")`, and `Some` means DIRECT. A joiner
+/// on any other network then spends the entire join window announcing intros
+/// at an address that cannot answer, and never drives the coordinated
+/// rendezvous — the very mechanic that, one layer down, already punched its
+/// WireGuard tunnel to that same member up. The endpoint says where a member
+/// is, never whether THIS joiner can get there, so the unroutable case offers
+/// both mechanics and lets the race decide.
+///
+/// The twin costs one extra concurrent attempt on a LAN join, where the
+/// direct path wins in one RTT; off the LAN it is the only path there is.
+fn push_with_offnet_twin(out: &mut Vec<Candidate>, candidate: Candidate) {
+    let reachable_only_on_its_own_network = candidate
+        .endpoint
+        .as_deref()
+        .is_some_and(endpoint_is_unroutable_offnet);
+    let twin = reachable_only_on_its_own_network.then(|| Candidate {
+        key: candidate.key.clone(),
+        wg: candidate.wg,
+        mesh_port: candidate.mesh_port,
+        // `None` IS the coordinated mechanic (see `drive_first_contact`), and
+        // an intro listener on an unreachable host is unreachable too.
+        endpoint: None,
+        intro: None,
+    });
+    // direct first: on its own LAN that is the fast path, and the race reads
+    // in the order the invite offered.
+    out.push(candidate);
+    out.extend(twin);
+}
+
+/// Could a joiner on a DIFFERENT network route to this endpoint at all?
+///
+/// True for a `host:port` whose host is an IP literal in a range that only
+/// carries inside one network: RFC1918, loopback, link-local, the CGNAT
+/// shared block, or an IPv6 ULA — which is what the overlay itself numbers
+/// out of, making such a front reachable only once the tunnel it exists to
+/// bring up is already up. A DNS name is resolved per-attempt against the
+/// joiner's own resolver and is never judged here.
+fn endpoint_is_unroutable_offnet(endpoint: &str) -> bool {
+    let Ok(address) = endpoint.parse::<SocketAddr>() else {
+        return false;
+    };
+    ip_is_unroutable_offnet(address.ip())
+}
+
+/// [`endpoint_is_unroutable_offnet`] over an already-parsed address — the
+/// entry point [`crate::mesh_book`] judges a signed advert's control endpoint
+/// with, so the masks live in ONE place.
+pub(crate) fn ip_is_unroutable_offnet(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private() || ip.is_loopback() || ip.is_link_local() || is_v4_shared_address(ip)
+        }
+        // `Ipv6Addr::is_unique_local`/`is_unicast_link_local` are still
+        // unstable; these are the same masks the wireguard crate's endpoint
+        // policy uses.
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || (ip.segments()[0] & 0xfe00) == 0xfc00
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// the 100.64.0.0/10 shared address space: a node behind a carrier NAT is no
+/// more directly reachable than one behind a home router.
+fn is_v4_shared_address(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0b1100_0000) == 64
 }
 
 /// Race `attempt` across every candidate concurrently; the FIRST to settle
@@ -425,9 +506,9 @@ fn open_ack(
     keypair: &reachability::WireGuardKeypair,
     token_nonce: &[u8],
     datagram: &[u8],
-) -> Option<lobby::IntroReply> {
+) -> Option<join_gate::IntroReply> {
     let opened = keypair.open_sealed(datagram).ok()?;
-    let ack = lobby::decode_intro_ack(&opened).ok()?;
+    let ack = join_gate::decode_intro_ack(&opened).ok()?;
     if ack.nonce != token_nonce {
         return None;
     }
@@ -437,25 +518,25 @@ fn open_ack(
 /// What a decoded gate reply does to the attempt: `None` ⇒ the gate is still
 /// settling (`Installed`) — keep announcing, a later retransmit carries the
 /// outcome home; `Some` ⇒ the attempt resolved.
-fn ack_resolution(reply: lobby::IntroReply) -> Option<AttemptResult> {
+fn ack_resolution(reply: join_gate::IntroReply) -> Option<AttemptResult> {
     match reply {
-        lobby::IntroReply::Installed => None,
-        lobby::IntroReply::Admitted { height, cap } => {
+        join_gate::IntroReply::Installed => None,
+        join_gate::IntroReply::Admitted { height, cap } => {
             Some(AttemptResult::Admitted { height, cap })
         }
-        lobby::IntroReply::Rejected {
+        join_gate::IntroReply::Rejected {
             code,
             detail,
             terminal: true,
         } => Some(AttemptResult::Rejected { code, detail }),
         // a non-terminal refusal (issuer view lag, member busy) fails THIS
         // candidate over — the race tries the next one.
-        lobby::IntroReply::Rejected {
+        join_gate::IntroReply::Rejected {
             code,
             detail,
             terminal: false,
         } => Some(AttemptResult::Failed(format!("{code:?}: {detail}"))),
-        lobby::IntroReply::Refused { detail } => Some(AttemptResult::Failed(detail)),
+        join_gate::IntroReply::Refused { detail } => Some(AttemptResult::Failed(detail)),
     }
 }
 
@@ -595,7 +676,7 @@ async fn direct_attempt(
 /// async runtime): re-send the intro every [`RETRY_INTERVAL`] until the gate
 /// resolves, the window is exhausted, or the stop flag trips. an `Installed`
 /// ack means "the gate is settling in consensus" — keep sending; a later
-/// retransmit's ack carries the settled outcome (join ADR §4).
+/// retransmit's ack carries the settled outcome.
 fn run_direct_announcer(
     intro: &[u8],
     token_nonce: &[u8],
@@ -660,10 +741,10 @@ async fn coordinated_attempt(
         if reach
             .send(
                 reachability::ReachabilityCommand::BootstrapCoordinatedInvitePeer {
-                peer: candidate.key.clone(),
-                wireguard_public_key: wireguard::X25519PublicKey(candidate.wg),
-                intro: sealed_intro.clone(),
-                reply: reachability::CoordinatedInviteReply(reply_tx),
+                    peer: candidate.key.clone(),
+                    wireguard_public_key: wireguard::X25519PublicKey(candidate.wg),
+                    intro: sealed_intro.clone(),
+                    reply: reachability::CoordinatedInviteReply(reply_tx),
                 },
             )
             .await
@@ -684,7 +765,7 @@ async fn coordinated_attempt(
             Err(_) => return AttemptResult::Failed("coordinated reply dropped".into()),
         }
         // the line this codebase reserved for itself. `nonce` is the ONE id on
-        // BOTH sides of a join (lobby::IntroAck.nonce == our token_nonce), so an
+        // BOTH sides of a join (join_gate::IntroAck.nonce == our token_nonce), so an
         // inviter's log and a joiner's log can finally be read together.
         tracing::debug!(
             target: "ducktape::join",
@@ -911,6 +992,82 @@ mod tests {
         assert_eq!(coordinated.via(), ContactVia::Coordinated);
     }
 
+    #[test]
+    fn a_lan_only_endpoint_also_yields_a_coordinated_twin() {
+        // the bug: an invite minted on a LAN advertises `192.168.0.70:51821`
+        // as if it were routable. A joiner on another network can never reach
+        // it, and because the endpoint is `Some` the coordinated mechanic —
+        // the one that works — was never attempted for that member.
+        let fronts = vec![front(2, Some("192.168.0.70:51821"))];
+        let candidates = build_candidates(None, &fronts);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "direct attempt PLUS a coordinated twin"
+        );
+        assert_eq!(
+            candidates[0].via(),
+            ContactVia::Direct("192.168.0.70:51821".into()),
+            "the LAN fast path stays first — a joiner on that LAN still wins directly"
+        );
+        assert_eq!(candidates[1].via(), ContactVia::Coordinated);
+        assert_eq!(
+            candidates[1].key, candidates[0].key,
+            "the twin is the SAME member, reached by identity"
+        );
+    }
+
+    #[test]
+    fn a_routable_endpoint_yields_no_twin() {
+        let fronts = vec![front(2, Some("93.184.216.34:51820"))];
+        let candidates = build_candidates(None, &fronts);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a globally routable endpoint needs no coordinator detour"
+        );
+    }
+
+    #[test]
+    fn a_lan_only_inviter_also_yields_a_coordinated_twin() {
+        let candidates = build_candidates(Some(inviter(Some("10.0.0.5:51820"))), &[]);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[1].via(), ContactVia::Coordinated);
+        assert_eq!(candidates[1].key, key(1));
+    }
+
+    #[test]
+    fn unroutable_endpoints_are_classified_by_address_family() {
+        for endpoint in [
+            "192.168.0.70:51821",
+            "10.0.0.5:51820",
+            "172.16.3.9:51820",
+            "127.0.0.1:51820",
+            "169.254.7.7:51820",
+            "100.64.1.2:51820",
+            // the overlay's own ULA — a front advertising it is reachable
+            // only once the tunnel it is supposed to bring up already exists.
+            "[fd9c:3bb:532d:2938:59d5:a3f7:cab:840d]:9010",
+            "[fe80::1]:9010",
+        ] {
+            assert!(
+                endpoint_is_unroutable_offnet(endpoint),
+                "{endpoint} is reachable only from inside its own network"
+            );
+        }
+        for endpoint in [
+            "93.184.216.34:51820",
+            "[2606:2800:220:1:248:1893:25c8:1946]:51820",
+            // a name resolves per-attempt; the joiner cannot judge it here.
+            "relay.ducktape.industries:51820",
+        ] {
+            assert!(
+                !endpoint_is_unroutable_offnet(endpoint),
+                "{endpoint} must keep the direct-only path"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn race_admits_the_first_to_settle_without_waiting_on_the_rest() {
         let winner = key(1);
@@ -959,7 +1116,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_terminal_reject_stops_the_race_instead_of_failing_over() {
-        // ADR R2: a terminal refusal (spent nonce, bad token) is network-wide
+        // a terminal refusal (spent nonce, bad token) is network-wide
         // truth — the race must surface it, never churn the remaining
         // candidates toward the same answer.
         let candidates = vec![
@@ -981,7 +1138,7 @@ mod tests {
         let outcome = race_first_contact(candidates, |c| async move {
             match c.endpoint.as_deref() {
                 Some("reject") => AttemptResult::Rejected {
-                    code: lobby::RejectCode::Spent,
+                    code: join_gate::RejectCode::Spent,
                     detail: "invite already redeemed".into(),
                 },
                 _ => std::future::pending::<AttemptResult>().await,
@@ -990,7 +1147,7 @@ mod tests {
         .await;
         match outcome {
             FirstContactOutcome::Rejected { code, detail } => {
-                assert_eq!(code, lobby::RejectCode::Spent);
+                assert_eq!(code, join_gate::RejectCode::Spent);
                 assert!(detail.contains("already redeemed"), "{detail}");
             }
             other => panic!("expected Rejected, got {other:?}"),
@@ -1000,10 +1157,10 @@ mod tests {
     #[test]
     fn ack_resolution_maps_each_reply_to_its_attempt_step() {
         // Installed = the gate is settling: keep announcing.
-        assert_eq!(ack_resolution(lobby::IntroReply::Installed), None);
+        assert_eq!(ack_resolution(join_gate::IntroReply::Installed), None);
         // Admitted settles the attempt with the authoritative outcome.
         assert_eq!(
-            ack_resolution(lobby::IntroReply::Admitted {
+            ack_resolution(join_gate::IntroReply::Admitted {
                 height: 3,
                 cap: None
             }),
@@ -1014,26 +1171,26 @@ mod tests {
         );
         // a TERMINAL reject stops the race; a non-terminal one fails over.
         assert!(matches!(
-            ack_resolution(lobby::IntroReply::Rejected {
-                code: lobby::RejectCode::Spent,
+            ack_resolution(join_gate::IntroReply::Rejected {
+                code: join_gate::RejectCode::Spent,
                 detail: "spent".into(),
                 terminal: true,
             }),
             Some(AttemptResult::Rejected {
-                code: lobby::RejectCode::Spent,
+                code: join_gate::RejectCode::Spent,
                 ..
             })
         ));
         assert!(matches!(
-            ack_resolution(lobby::IntroReply::Rejected {
-                code: lobby::RejectCode::Busy,
+            ack_resolution(join_gate::IntroReply::Rejected {
+                code: join_gate::RejectCode::Busy,
                 detail: "settling too slowly".into(),
                 terminal: false,
             }),
             Some(AttemptResult::Failed(_))
         ));
         assert!(matches!(
-            ack_resolution(lobby::IntroReply::Refused {
+            ack_resolution(join_gate::IntroReply::Refused {
                 detail: "no".into()
             }),
             Some(AttemptResult::Failed(_))
@@ -1047,18 +1204,18 @@ mod tests {
             .unwrap()
             .0;
         let nonce = vec![9u8; 4];
-        let ack = lobby::IntroAck {
+        let ack = join_gate::IntroAck {
             nonce: nonce.clone(),
-            reply: lobby::IntroReply::Admitted {
+            reply: join_gate::IntroReply::Admitted {
                 height: 1,
                 cap: None,
             },
         };
-        let plain = lobby::encode_intro_ack(&ack);
+        let plain = join_gate::encode_intro_ack(&ack);
         let sealed = reachability::seal(&joiner.public_key().0, &plain);
         assert_eq!(
             open_ack(&joiner, &nonce, &sealed),
-            Some(lobby::IntroReply::Admitted {
+            Some(join_gate::IntroReply::Admitted {
                 height: 1,
                 cap: None
             })
@@ -1259,7 +1416,7 @@ mod tests {
                 .unwrap()
                 .0,
         );
-        let intro = lobby::encode_intro(&lobby::intro_request(
+        let intro = join_gate::encode_intro(&join_gate::intro_request(
             &joiner,
             MULE_BINDING,
             &token,
@@ -1357,12 +1514,12 @@ mod tests {
             let opened = member_wg
                 .open_sealed(&buf[..n])
                 .expect("the relayed intro is sealed to the member's WG key");
-            let request = lobby::decode_intro(&opened).expect("decodes");
-            let verified =
-                lobby::verify_intro(&request, MULE_BINDING).expect("verifies against the binding");
-            let ack = lobby::encode_intro_ack(&lobby::IntroAck {
+            let request = join_gate::decode_intro(&opened).expect("decodes");
+            let verified = join_gate::verify_intro(&request, MULE_BINDING)
+                .expect("verifies against the binding");
+            let ack = join_gate::encode_intro_ack(&join_gate::IntroAck {
                 nonce: verified.nonce.to_vec(),
-                reply: lobby::IntroReply::Admitted {
+                reply: join_gate::IntroReply::Admitted {
                     height: 7,
                     cap: None,
                 },

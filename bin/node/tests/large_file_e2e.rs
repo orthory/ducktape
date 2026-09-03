@@ -24,12 +24,12 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use common::{Cluster, poll_until};
-use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
 use files::{
     CHUNK_SIZE, Change, Content, EntryInfo, FilesMsg, FilesQuery, FilesReply, Kind,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
     encode_query as files_encode_query, objects::object_id, to_hex,
 };
+use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 /// a distinctive, non-uniform byte pattern (251 is prime, so it aligns with no
 /// power-of-two boundary — truncation or chunk-order corruption is caught, not
@@ -98,14 +98,14 @@ fn files_read_all(cluster: &Cluster, idx: usize, path: &str, total: u64) -> Vec<
     out
 }
 
-fn dir_value(cluster: &Cluster, idx: usize, key: &str) -> Option<String> {
-    let reply = cluster.query(
-        idx,
-        "directory",
-        &encode_query(&DirQuery::Get { key: key.into() }),
-    )?;
-    match decode_reply(&reply).ok()? {
-        DirReply::Value(v) => v,
+fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
+    let req = encode_task_query(&TaskQuery::Get {
+        task_id: task_id.into(),
+    });
+    let reply = cluster.query(idx, "tasks", &req)?;
+    match decode_task_reply(&reply).ok()? {
+        TaskReply::Task(task) => task.map(|t| t.title),
+        TaskReply::Tasks(_) => None,
     }
 }
 
@@ -231,17 +231,17 @@ fn oversized_op_rejects_cleanly_and_the_cluster_stays_live() {
     // the rejection is clean: both validators keep accepting and finalizing.
     cluster.submit(
         0,
-        "directory",
-        &encode_msg(&DirMsg::Set {
-            key: "alive".into(),
-            value: "yes".into(),
+        "tasks",
+        &encode_task_msg(&TaskMsg::CreateTask {
+            task_id: "alive".into(),
+            title: "yes".into(),
         }),
     );
     for idx in [0, 1] {
         poll_until(
             &format!("post-rejection finalization visible on node {idx}"),
             Duration::from_secs(60),
-            || (dir_value(&cluster, idx, "alive").as_deref() == Some("yes")).then_some(()),
+            || (task_title(&cluster, idx, "alive").as_deref() == Some("yes")).then_some(()),
         );
     }
 }

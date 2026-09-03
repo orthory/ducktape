@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::{Cluster, poll_until, serial};
-use directory::{DirMsg, DirQuery, DirReply, decode_reply, encode_msg, encode_query};
+use tasks::{TaskMsg, TaskQuery, TaskReply, decode_task_reply, encode_task_msg, encode_task_query};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -34,22 +34,28 @@ const CONVERGE: Duration = Duration::from_secs(180);
 /// budget for one submitted op to finalize and become readable elsewhere.
 const FINALIZE: Duration = Duration::from_secs(60);
 
-fn dir_set(key: &str, value: &str) -> Vec<u8> {
-    encode_msg(&DirMsg::Set {
-        key: key.into(),
-        value: value.into(),
+/// a create for `task_id`; NOT an upsert — `tasks` refuses a duplicate id
+/// (`task_board.rs:77-80`). That rejection is ISOLATED, not fatal: the op's
+/// stage rolls back and it is recorded `Rejected` while the block still seals
+/// (`host/src/lib.rs:237`, `:283`). So a duplicate never applies and never
+/// announces itself — `write_and_confirm` spins to its timeout, or passes
+/// VACUOUSLY when the re-created title happens to match the surviving one.
+/// Every call site here has to carry a fresh id.
+fn task_create(task_id: &str, title: &str) -> Vec<u8> {
+    encode_task_msg(&TaskMsg::CreateTask {
+        task_id: task_id.into(),
+        title: title.into(),
     })
 }
 
-fn dir_value(cluster: &Cluster, idx: usize, key: &str) -> Option<String> {
-    let reply = cluster.query(
-        idx,
-        "directory",
-        &encode_query(&DirQuery::Get { key: key.into() }),
-    )?;
-    match decode_reply(&reply) {
-        Ok(DirReply::Value(v)) => v,
-        Err(_) => None,
+fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
+    let req = encode_task_query(&TaskQuery::Get {
+        task_id: task_id.into(),
+    });
+    let reply = cluster.query(idx, "tasks", &req)?;
+    match decode_task_reply(&reply) {
+        Ok(TaskReply::Task(task)) => task.map(|t| t.title),
+        _ => None,
     }
 }
 
@@ -196,16 +202,16 @@ fn joiner_enters_through_a_sentry() {
     // address; the sentry proof is the ENTRY path, the cross-reads below are
     // independent liveness.) an op submitted via the FOUNDER must become
     // readable via the FRIEND...
-    cluster.submit(0, "directory", &dir_set("from-founder", "hello"));
+    cluster.submit(0, "tasks", &task_create("from-founder", "hello"));
     let value = poll_until("founder's op to read on the friend", FINALIZE, || {
-        dir_value(&cluster, joiner, "from-founder")
+        task_title(&cluster, joiner, "from-founder")
     });
     assert_eq!(value, "hello");
 
     // ...and an op submitted via the FRIEND must read on the founder.
-    cluster.submit(joiner, "directory", &dir_set("from-friend", "hi back"));
+    cluster.submit(joiner, "tasks", &task_create("from-friend", "hi back"));
     let value = poll_until("friend's op to read on the founder", FINALIZE, || {
-        dir_value(&cluster, 0, "from-friend")
+        task_title(&cluster, 0, "from-friend")
     });
     assert_eq!(value, "hi back");
 

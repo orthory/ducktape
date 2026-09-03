@@ -15,7 +15,7 @@
 //! per-process `ContentStore`.
 //!
 //! payload dissemination is REAL: each process submits a DISTINCT op (node N
-//! writes directory key `kN`), so a peer that finalizes another node's op-digest
+//! creates task `kN`), so a peer that finalizes another node's op-digest
 //! has NO local bytes for it. `SimplexOrderer::spawn_with_resolver` wires a
 //! `ConsensusRelay` that, at propose time, gossips the proposed frame's bytes to
 //! all peers on the payload channel; every peer's STORE-ONLY drain caches them, so
@@ -49,6 +49,8 @@
 use commonware_cryptography::Signer;
 use commonware_runtime::{Metrics as _, Runner, Supervisor};
 
+mod account_cli;
+mod agent;
 mod agent_cli;
 mod agent_plane;
 mod airlock;
@@ -58,15 +60,13 @@ mod boot;
 mod cli;
 mod cli_args;
 mod code_plane;
+mod compute;
 mod config;
 mod constants;
 mod cred_cli;
 mod cred_seal;
-mod node_http;
-mod tty;
-mod agent;
-mod compute;
 mod drain_actions;
+mod executors;
 mod explorer;
 mod first_contact_join;
 mod fs_cli;
@@ -75,12 +75,14 @@ mod gateway_routes;
 mod host_reads;
 mod host_resources;
 mod host_state;
-mod lobby;
+mod join_gate;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
 mod mesh_book;
 mod mesh_window;
+mod module_cli;
+mod node_http;
 mod overlay_book;
 mod plane_metrics;
 mod reachability_plane;
@@ -91,15 +93,17 @@ mod relay_runtime;
 mod replica;
 mod resource_limits;
 mod rpc;
+mod sandbox_cli;
 mod services;
 mod sync;
 mod term_plane;
-mod userkey;
+mod tty;
 mod userkey_cli;
 mod util;
 mod validator;
 mod voice;
 mod voice_plane;
+mod wallet_cli;
 mod work_admission;
 use crate::util::fatal;
 use config::Resolved;
@@ -138,7 +142,24 @@ fn main() {
     // reason immediately instead of inferring death. (Onboarding subcommands
     // still surface their own stderr via run_verb; the prefix is harmless there.)
     if let Err(err) = run() {
-        eprintln!("FATAL: {err}");
+        // `node run` (and `service run`) installs its subscriber BEFORE it
+        // resolves the config and binds, so a bad field or a port conflict
+        // propagates back here with a perfectly good sink open — and used to
+        // leave daemon.log ending at the previous run's last line. that
+        // subscriber tees stderr, so the one event IS the CLI's last word
+        // there too; a one-shot verb installs none, and for it stderr is the
+        // whole record.
+        let sink_installed = tracing::dispatcher::has_been_set();
+        if sink_installed {
+            tracing::error!(
+                target: "ducktape::boot",
+                event = "boot_fatal",
+                error = %err,
+                "FATAL: {err}"
+            );
+        } else {
+            eprintln!("FATAL: {err}");
+        }
         std::process::exit(1);
     }
 }
@@ -176,8 +197,9 @@ Getting started:
   ducktape node init --name mynet     found your own network here
   ducktape node join <invite>         ...or join someone else's
   ducktape node run                   start it (^C checkpoints and exits)
-  ducktape user account-init --name <you>
-                                      claim an account on it (mints your key)
+  ducktape wallet new <you>           mint your user key
+  ducktape account create --name <you>
+                                      found your account on it (signed by that key)
   ducktape node status                height + root hash of the running node
 
 Then, to run agents on it:
@@ -189,6 +211,25 @@ Each verb's own --help carries the rest. `ducktape node list` shows every
 network this machine is registered on; -n <chain-id> picks one when there is
 more than one.";
 
+/// What `/v1/status` and `ducktape -V` report as `version`:
+/// `<cargo version>+<build stamp>`, e.g. `0.1.0+e6352411a` or
+/// `0.1.0+e6352411a-<dirty digest>`. The package version alone is pinned at
+/// v1 forever and could never tell two hosts' builds apart; the stamp is
+/// `noded`'s `DUCKTAPE_BUILD` (short sha, plus a working-tree digest when
+/// dirty) or `unknown` for a git-less build. Display only — nothing admits or
+/// refuses on it.
+fn build_version() -> String {
+    format!(
+        "{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        noded::services::build_identity_or_unknown()
+    )
+}
+
+/// clap's `version` wants a `&'static str`; built once, however many times
+/// the command is (completions, docs generation).
+static VERSION: std::sync::LazyLock<String> = std::sync::LazyLock::new(build_version);
+
 // clap owns parsing, help, usage errors (exit 2) and `-V/--version`; the
 // `FATAL:` wrapper in `main` stays for runtime death.
 #[derive(clap::Parser)]
@@ -196,8 +237,9 @@ more than one.";
     name = "ducktape",
     about = "one workspace-network node and its operator tools",
     // clap prints "<name> <version>", so the version string must not repeat
-    // the binary name.
-    version = env!("CARGO_PKG_VERSION"),
+    // the binary name. Same stamp as `/v1/status`, so `ducktape -V` on two
+    // hosts is the same comparison.
+    version = VERSION.as_str(),
     arg_required_else_help = true,
     // `arg_required_else_help` means a bare `ducktape` lands HERE, so this is
     // the one screen every new operator sees. A list of eight families does
@@ -218,9 +260,14 @@ enum Family {
     /// run a workspace node, plus operator verbs (init, invite, join, ...)
     #[command(subcommand)]
     Node(cli_args::NodeCmd),
-    /// user-identity keys and signing (init/restore, sign-*, account-init, ...)
+    /// user keys and signing (init/restore, sign-*, cred)
     #[command(subcommand)]
     User(userkey_cli::UserCmd),
+    /// the account this user key belongs to: create, keys, name, profile
+    Account(account_cli::AccountArgs),
+    /// named user-key wallets: mint, import, list, switch the active one
+    #[command(subcommand)]
+    Wallet(wallet_cli::WalletCmd),
     /// local loopback bindings for signed gateway routes
     #[command(subcommand)]
     Gateway(gateway_routes::GatewayCmd),
@@ -230,15 +277,14 @@ enum Family {
     /// offchain service daemons: what is signaling, and what you have enabled
     #[command(subcommand)]
     Service(services::ServiceCmd),
-    /// remote/interactive sandboxed provider sessions (pty attach, sched runs)
+    /// sandboxed provider sessions (pty attach, sched runs) and run control
+    /// (cancel, reassign)
     Agent(agent_cli::AgentArgs),
+    /// live code swaps: update, register, status
+    #[command(subcommand)]
+    Module(module_cli::ModuleCmd),
     /// the stdio MCP server an agent runner spawns
     Mcp,
-    /// internal: the OCI createRuntime hook that installs a sandbox run's egress
-    /// firewall. podman invokes it (via the node's --hooks-dir) with the OCI
-    /// container state on stdin; never run by hand. Hidden from help.
-    #[command(name = "__egress-hook", hide = true)]
-    EgressHook,
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -257,13 +303,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp::serve();
             Ok(())
         }
-        // podman pipes the OCI state on stdin; a non-zero exit aborts the
-        // container (fail-closed), so map a hook error to a real process error.
-        Family::EgressHook => provider_host::run_egress_hook().map_err(Into::into),
+        // The `__egress-hook` subcommand lived here: an OCI createRuntime hook
+        // podman invoked to install a run's firewall inside its netns. A
+        // microVM has no netns to enter — its guest has no network device at
+        // all, and reaches this host only through a vsock tunnel the host owns
+        // both ends of — so there is no hook and nothing for one to install.
         Family::User(cmd) => userkey_cli::run(cmd),
+        Family::Account(args) => account_cli::run(args),
+        Family::Wallet(cmd) => wallet_cli::run(cmd),
         Family::Agent(args) => agent_cli::run(args),
         Family::Gateway(cmd) => gateway_routes::run(cmd),
         Family::Service(cmd) => services::run(cmd),
+        Family::Module(cmd) => module_cli::run(cmd),
         Family::Node(cli_args::NodeCmd::Run(args)) => run_node_verb(args),
         Family::Node(cli_args::NodeCmd::Op(op)) => cli::run(op),
     }
@@ -283,7 +334,7 @@ fn run_node_verb(args: cli_args::RunArgs) -> Result<(), Box<dyn std::error::Erro
     let workspace = cfg_path.parent().unwrap_or(std::path::Path::new("."));
     noded::log::init(Some(log_ring.clone()), Some(workspace.join("daemon.log")));
 
-    run_node(config::resolve(&cfg_path)?, sync_only, log_ring)
+    run_node(config::resolve(&cfg_path)?, cfg_path, sync_only, log_ring)
 }
 
 /// stand up the real-socket node from `cfg` and run it until killed (validator)
@@ -318,6 +369,10 @@ fn gateway_can_start(
 
 fn run_node(
     resolved: Resolved,
+    // this daemon's own `node.toml` — kept whole rather than re-derived from
+    // `Resolved`, because the invite mint reads and REWRITES the descriptor
+    // beside it (see the `/v1/invite` wiring below).
+    cfg_path: std::path::PathBuf,
     sync_only: bool,
     log_ring: noded::LogRing,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -356,6 +411,7 @@ fn run_node(
         sandbox,
         compute_backend,
         sandbox_capacity,
+        genesis,
     } = boot::env::derive(resolved, sync_only);
 
     // A node whose config says it can isolate runs, booting with no compute
@@ -399,9 +455,9 @@ fn run_node(
     // There is NO sandbox probe here any more, and its absence is the point:
     // this process runs nothing in a sandbox. Both planes that did — compute's
     // headless runs and agent's interactive ptys — are separate daemons that
-    // probe the runtime themselves before they signal, and start their own
-    // podman service before they serve. Probing here would have made a missing
-    // podman a fatal BOOT error on a node that never needed one.
+    // probe the runtime themselves before they signal. Probing here would have
+    // made a missing hypervisor, or a missing guest image, a fatal BOOT error
+    // on a node that never needed one.
 
     // THE MESH LISTENER, taken for a moment while a bind failure can still be
     // a sentence. Everything below this line runs inside commonware's runtime,
@@ -437,6 +493,7 @@ fn run_node(
         terminals,
         session_requests,
         local_gateway_via,
+        node_api_ports,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
         sync_only,
         label: &label,
@@ -453,7 +510,7 @@ fn run_node(
         // every run commit is authored by this node's signer (D2 — the author
         // is the agent).
         // the owner-gated admin namespace resolves ownership against this node's
-        // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice (ADR A2/A4).
+        // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice.
         node_key: signer.public_key().as_ref().to_vec(),
         admin_exposure: noded::AdminExposure::from_env(),
     })?;
@@ -531,13 +588,49 @@ fn run_node(
         // encode() serves the identical exposition).
         status.wire_metrics(&metrics);
         stream_hub.wire_metrics(&metrics);
+        // the retained stores' footprint, on its own slow background task:
+        // the blobstore and the derived index keep every applied op payload
+        // forever and nothing prunes either, so their size IS the operator's
+        // only warning (#1309). Off the node's task by construction — a walk
+        // of a directory holding one file per op must never ride the loop.
+        noded::spawn_store_footprint_sampler(metrics.clone(), storage_for_sync.clone());
         let exposition_context = context.child("exposition");
         status.wire_exposition(move || exposition_context.encode());
+        // `/v1/invite` — the daemon mints its own invites. Minting FOLDS this
+        // member's dial hint into the network descriptor and saves it, and
+        // reads the persisted mesh for the fronts the blob carries: both are
+        // this process's files, so a second process doing it races us over
+        // them. The route hands the work to a blocking thread.
+        let invite_config = cfg_path.clone();
+        status.wire_invite_minter(move |ttl_days| {
+            let (blob, notes) =
+                cli::mint_invite_blob(&invite_config, ttl_days).map_err(|why| why.to_string())?;
+            for note in notes {
+                tracing::warn!(
+                    target: "ducktape::join",
+                    reason = note.reason(),
+                    "the minted invite carries fewer paths than a full mesh would give it"
+                );
+            }
+            Ok(blob)
+        });
         status.publish(noded::NodeStatus {
-            version: env!("CARGO_PKG_VERSION").into(),
+            version: build_version(),
             public_key: status_public_key.clone(),
             ..Default::default()
         });
+        // the chain every chain-scoped user proof names; a boot fact, wired
+        // once so no role loop's boundary publish has to carry it.
+        status.wire_chain_id(identity_chain_id.clone());
+        // The one moment `/v1/status` starts carrying a mesh identity, and the
+        // only wait seam a supervisor has for it. The HTTP listener binds well
+        // upstream of here, so "app surface listening" says nothing about
+        // whether the identity is there yet — a daemon started on that marker
+        // reads `public_key: ""` and exits FATAL
+        // (`services::NOT_PUBLISHED_YET`). Logged HERE rather than at a role
+        // loop's first boundary publish: this is where the key actually
+        // appears, and every role passes through it.
+        tracing::info!(target: "ducktape::node", "mesh identity published");
         // One process-wide bulk budget: the per-use planes retain separate
         // protocols, queues, sockets, and admission but cannot independently
         // saturate the same WireGuard link.
@@ -564,6 +657,7 @@ fn run_node(
                 storage_for_sync,
                 namespace,
                 blobs,
+                &genesis,
                 voice_requests,
             )
             .await;
@@ -656,6 +750,7 @@ fn run_node(
                 terminals,
                 session_requests,
                 local_gateway_via,
+                node_api_ports,
                 &stream_hub,
                 index.clone(),
                 metrics.clone(),
@@ -668,8 +763,9 @@ fn run_node(
                 storage_for_sync,
                 recovery,
                 &manifest,
-                forge_repo,
+                forge_repo.clone(),
                 duckfs_dir,
+                &genesis,
             )
             .await;
             // THE PROMOTION SEAT: the park loop returned the baton — the
@@ -701,6 +797,7 @@ fn run_node(
                 stream_hub,
                 index,
                 code_stage_requests,
+                forge_repo,
                 blobs,
                 overlay_slot,
                 bulk_pacer,
@@ -745,6 +842,7 @@ fn run_node(
             terminals,
             session_requests,
             local_gateway_via,
+            node_api_ports,
             stream_hub,
             index,
             voice_requests,
@@ -759,6 +857,7 @@ fn run_node(
             manifest,
             forge_repo,
             duckfs_dir,
+            &genesis,
         )
         .await;
     });

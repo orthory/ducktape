@@ -68,6 +68,7 @@ fn push(forge: &mut Forge, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) {
                 new_oid: Some(new.to_vec()),
             }],
             pack_digest: Some(digest.to_vec()),
+            cert: None,
         }),
     };
     futures::executor::block_on(forge.execute(&mut at(0), &msg)).unwrap();

@@ -1,43 +1,22 @@
 //! `.duck` naming over two real node processes, on the MERGED gateway module's
-//! handle plane. It maps one optional `.duck` account name to AccountId and
-//! deliberately exposes no NodeId, route, endpoint, or service discovery state.
+//! handle plane. It maps one optional `.duck` account name to an account NUMBER
+//! and deliberately exposes no NodeId, route, endpoint, or service discovery
+//! state. The handle is claimed by a USER-signed frame: the gateway resolves
+//! the account from the frame origin through identity's `OfKey`.
 
 mod common;
 
 use std::time::Duration;
 
-use common::{Cluster, poll_until, serial};
+use common::{Cluster, create_account, poll_until, serial, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 use gateway::{
     DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, ResolvedAccount,
     decode_reply as gw_decode_reply, encode_msg as gw_encode_msg, encode_query as gw_encode_query,
 };
-use identity::{
-    AccountView, IdentityMsg, IdentityQuery, IdentityReply, MemberAuth,
-    decode_reply as identity_decode_reply, encode_msg as identity_encode_msg,
-    encode_query as identity_encode_query,
-};
 
 const READY: Duration = Duration::from_secs(90);
 const FINALIZE: Duration = Duration::from_secs(60);
-
-fn bind_auth(member: &ed25519::PrivateKey, chain_id: &str, node: &[u8]) -> MemberAuth {
-    identity::testkit::ed_bind_auth(member, &identity::bind_preimage(chain_id, node, 0))
-}
-
-fn account_of_node(cluster: &Cluster, reader: usize, node: &[u8]) -> Option<AccountView> {
-    let bytes = cluster.query(
-        reader,
-        "identity",
-        &identity_encode_query(&IdentityQuery::OfNode {
-            node_key: node.to_vec(),
-        }),
-    )?;
-    match identity_decode_reply(&bytes).ok()? {
-        IdentityReply::Account(account) => account,
-        IdentityReply::Accounts(_) => None,
-    }
-}
 
 /// Outer `Option` is query/decode success; inner `Option` is the naming result.
 fn resolve(cluster: &Cluster, reader: usize) -> Option<Option<ResolvedAccount>> {
@@ -69,21 +48,12 @@ fn account_name_converges_without_node_discovery() {
     }
 
     let member = ed25519::PrivateKey::from_seed(42);
-    let account_id = member.public_key().as_ref().to_vec();
-    let node = Cluster::identity(0);
-    cluster.submit(
-        0,
-        "identity",
-        &identity_encode_msg(&IdentityMsg::BindNode {
-            authorizer: bind_auth(&member, &cluster.namespace, &node),
-        }),
-    );
-    poll_until("identity bind", FINALIZE, || {
-        account_of_node(&cluster, 0, &node).filter(|account| account.account_id == account_id)
-    });
+    let number = create_account(&cluster, 0, &member, "alice");
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &member,
         "gateway",
         &gw_encode_msg(&GatewayMsg::SetHandle {
             handle: Some("alice".into()),
@@ -93,7 +63,7 @@ fn account_name_converges_without_node_discovery() {
         let resolved = poll_until(&format!("alice.duck on node {reader}"), FINALIZE, || {
             resolve(&cluster, reader).flatten()
         });
-        assert_eq!(resolved.account_id, account_id);
+        assert_eq!(resolved.account_id, number);
         let wire = serde_json::to_string(&resolved).unwrap();
         for excluded in ["node", "service", "provider", "endpoint", "route", "port"] {
             assert!(
@@ -103,8 +73,10 @@ fn account_name_converges_without_node_discovery() {
         }
     }
 
-    cluster.submit(
+    submit_frame(
+        &cluster,
         0,
+        &member,
         "gateway",
         &gw_encode_msg(&GatewayMsg::SetHandle { handle: None }),
     );

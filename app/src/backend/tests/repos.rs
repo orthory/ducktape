@@ -6,7 +6,7 @@ fn the_forge_hint_is_a_command_that_actually_pushes() {
     // creates the repo, and an uppercase one 404s the ref advertisement because
     // `forge::norm_repo` accepts `[a-z0-9._-]` only — so the placeholder has to
     // be a name the reader can paste unchanged.
-    let hint = forge_push_command("http://127.0.0.1:38259".into());
+    let hint = forge_push_command("http://127.0.0.1:38259");
     assert_eq!(
         hint,
         "git remote add ducktape http://127.0.0.1:38259/forge/my-repo && git push ducktape main"
@@ -18,7 +18,7 @@ fn the_forge_hint_is_a_command_that_actually_pushes() {
         .expect("the hint names a repo");
     assert!(forge::norm_repo(placeholder).is_ok());
     // A trailing slash on the endpoint must not double up in the URL.
-    assert_eq!(forge_push_command("http://127.0.0.1:38259/".into()), hint);
+    assert_eq!(forge_push_command("http://127.0.0.1:38259/"), hint);
 }
 
 #[test]
@@ -88,11 +88,11 @@ fn the_tracker_splits_into_open_prs_and_open_issues() {
         item(3, "issue", "open"),
         item(4, "issue", "closed"),
     ];
-    assert_eq!(filter_forge_items(items.clone(), ForgeTab::Pulls).len(), 2);
-    assert_eq!(filter_forge_items(items.clone(), ForgeTab::Issues).len(), 2);
-    assert!(filter_forge_items(items.clone(), ForgeTab::Code).is_empty());
-    assert_eq!(forge_open_count(items.clone(), "pr".into()), 1);
-    assert_eq!(forge_open_count(items, "issue".into()), 1);
+    assert_eq!(filter_forge_items(&items, ForgeTab::Pulls).len(), 2);
+    assert_eq!(filter_forge_items(&items, ForgeTab::Issues).len(), 2);
+    assert!(filter_forge_items(&items, ForgeTab::Code).is_empty());
+    assert_eq!(forge_open_count(&items, "pr"), 1);
+    assert_eq!(forge_open_count(&items, "issue"), 1);
 }
 
 #[test]
@@ -234,4 +234,131 @@ async fn a_forge_op_does_not_load_the_repo_list_for_a_closed_pane() {
         "an unloaded list must leave the handler's keep alone"
     );
     assert!(data.repos.is_empty());
+}
+
+/// A WEB PICTURE IS ONE CAPPED GET. The bytes come back as served; a
+/// response that announces more than the viewer takes, one that streams more
+/// than it announced (or announced nothing), and one without a body to show
+/// all come back as `None` — the image keeps its alt text. This drives the
+/// GET behind the host gate: the gate itself refuses loopback, which is
+/// where a test server lives.
+#[tokio::test(flavor = "current_thread")]
+async fn a_web_picture_is_one_capped_get() {
+    use super::super::picture::MAX_PICTURE_BYTES;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 2048];
+            let read = socket.read(&mut request).await.unwrap();
+            let head = String::from_utf8_lossy(&request[..read]).into_owned();
+            let route = head.split(' ').nth(1).unwrap_or("").to_owned();
+            let (status, length, body_len): (&str, Option<usize>, usize) = match route.as_str() {
+                "/small" => ("200 OK", Some(9), 9),
+                "/announced-huge" => ("200 OK", Some(MAX_PICTURE_BYTES + 1), 0),
+                "/streamed-huge" => ("200 OK", None, MAX_PICTURE_BYTES + 1),
+                _ => ("404 Not Found", Some(0), 0),
+            };
+            let mut response = format!("HTTP/1.1 {status}\r\nConnection: close\r\n");
+            if let Some(length) = length {
+                response.push_str(&format!("Content-Length: {length}\r\n"));
+            }
+            response.push_str("\r\n");
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let body = match route.as_str() {
+                "/small" => b"PNG-bytes".to_vec(),
+                _ => vec![0u8; body_len],
+            };
+            let _ = socket.write_all(&body).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    assert_eq!(
+        fetch_picture_bytes(reqwest::Url::parse(&format!("{origin}/small")).unwrap())
+            .await
+            .as_deref(),
+        Some(&b"PNG-bytes"[..]),
+        "a picture under the cap comes back as served"
+    );
+    assert!(
+        fetch_picture_bytes(reqwest::Url::parse(&format!("{origin}/announced-huge")).unwrap())
+            .await
+            .is_none(),
+        "an announced length past the cap is refused before the body"
+    );
+    assert!(
+        fetch_picture_bytes(reqwest::Url::parse(&format!("{origin}/streamed-huge")).unwrap())
+            .await
+            .is_none(),
+        "a body that streams past the cap is refused mid-stream"
+    );
+    assert!(
+        fetch_picture_bytes(reqwest::Url::parse(&format!("{origin}/missing")).unwrap())
+            .await
+            .is_none(),
+        "a miss has no picture"
+    );
+}
+
+/// A README NAMES THE URL, THE READER'S MACHINE MAKES THE REQUEST. The host
+/// gate refuses the machine itself, its link (cloud metadata), nothing and
+/// everyone — as an IP literal or as a name that resolves there — and keeps
+/// a LAN address, which is where a team's forge lives.
+#[tokio::test(flavor = "current_thread")]
+async fn a_web_picture_never_points_the_reader_at_its_own_machine() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    let blocked = [
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V4(Ipv4Addr::BROADCAST),
+        IpAddr::V6(Ipv6Addr::LOCALHOST),
+        IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+        IpAddr::V6("fe80::1".parse().unwrap()),
+    ];
+    for ip in blocked {
+        assert!(blocked_picture_host(ip), "{ip} is not a picture's address");
+    }
+    let allowed = [
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+        IpAddr::V4(Ipv4Addr::new(140, 82, 112, 3)),
+        IpAddr::V6("2606:4700::1".parse().unwrap()),
+    ];
+    for ip in allowed {
+        assert!(!blocked_picture_host(ip), "{ip} may serve a picture");
+    }
+    // The gate end to end, without a socket: a literal and the name that
+    // resolves to the machine are refused before any request is made.
+    assert!(
+        web_picture_bytes("http://127.0.0.1:9/logo.png")
+            .await
+            .is_none(),
+        "a loopback literal is refused"
+    );
+    assert!(
+        web_picture_bytes("http://localhost:9/logo.png")
+            .await
+            .is_none(),
+        "a name resolving to loopback is refused"
+    );
+    assert!(
+        web_picture_bytes("ftp://example.com/logo.png")
+            .await
+            .is_none(),
+        "only a web URL is fetched"
+    );
+}
+
+/// THE FORGE TREE'S ROOT IS "", NOT "/". `fs_parent` answers for duckfs,
+/// whose root is `/`; a committed path's directory is spelled the way
+/// `forge_tree` is asked for it, so a root file's deep link lands on the
+/// tree the browser is waiting for.
+#[test]
+fn a_committed_paths_directory_is_spelled_like_the_tree() {
+    assert_eq!(forge_parent("README.md".into()), "");
+    assert_eq!(forge_parent("docs/guide.md".into()), "docs");
+    assert_eq!(forge_parent("a/b/c.rs".into()), "a/b");
 }

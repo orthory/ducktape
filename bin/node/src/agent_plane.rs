@@ -6,55 +6,39 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use data_plane::{
-    AddressBook, AdmissionPolicy, BulkPacer, DataPlane, DataPlaneTransport, FlowId, PeerId,
-    Service, SocketFactory, StreamPacing, StreamPlaneSpec, StreamPolicy, StreamService,
-    bind_stream_plane,
+    BulkPacer, DataPlane, DataPlaneTransport, FlowId, PeerId, Service, SocketFactory, StreamPacing,
+    StreamPlaneSpec, StreamPolicy, StreamService, bind_stream_plane,
 };
 use noded::{RunOutputEvent, RunOutputRegistry};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::voice_plane::MediaPeers;
+use crate::overlay_book::{BIND_RETRY, OverlayBook, OverlayPeers, Plane, StreamPlane};
 
 const RUN_OUTPUT_INTENT: u8 = 1;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
-const RETRY: Duration = Duration::from_secs(3);
+/// the outbound re-dial cadence: how long a peer's fan-out task waits after
+/// a failed open, and how often the fan-out re-reads the tracked set.
+const DIAL_RETRY: Duration = Duration::from_secs(3);
 
 fn run_output_flow() -> FlowId {
     FlowId::derive(b"ducktape:agent-run-output:v1")
 }
 
-struct AgentBook {
-    peers: Arc<MediaPeers>,
+/// the agent-telemetry plane's tag for the shared [`OverlayBook`]:
+/// default-deny admission scoped to the service + run-output flow.
+struct AgentPlane;
+
+impl Plane for AgentPlane {
+    const SERVICE: Service = Service::AgentTelemetry;
 }
 
-impl AddressBook for AgentBook {
-    fn datagram_addr(&self, peer: PeerId) -> Option<SocketAddr> {
-        Some(SocketAddr::new(
-            self.peers.overlay_ip(&peer.0),
-            Service::AgentTelemetry.overlay_datagram_port(),
-        ))
-    }
-
-    fn stream_addr(&self, peer: PeerId) -> Option<SocketAddr> {
-        Some(SocketAddr::new(
-            self.peers.overlay_ip(&peer.0),
-            Service::AgentTelemetry.overlay_stream_port(),
-        ))
-    }
-
-    fn peer_at(&self, src: std::net::IpAddr) -> Option<PeerId> {
-        self.peers.peer_at(src)
-    }
-}
-
-impl AdmissionPolicy for AgentBook {
-    fn permits(&self, peer: PeerId, service: Service, flow: FlowId) -> bool {
-        service == Service::AgentTelemetry && flow == run_output_flow() && self.peers.contains(peer)
+impl StreamPlane for AgentPlane {
+    fn flow() -> FlowId {
+        run_output_flow()
     }
 }
 
@@ -64,7 +48,7 @@ impl AdmissionPolicy for AgentBook {
 pub(crate) fn spawn(
     label: String,
     factory: Arc<dyn SocketFactory>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     me: [u8; 32],
     pacer: BulkPacer,
     planes: data_plane::PlaneMonitor,
@@ -77,16 +61,14 @@ pub(crate) fn spawn(
             service: Service::AgentTelemetry,
             pacing: StreamPacing::Shared(pacer),
             policy: StreamPolicy { accept_backlog: 64 },
-            retry: RETRY,
+            retry: BIND_RETRY,
         };
-        let book = Arc::new(AgentBook {
-            peers: Arc::clone(&peers),
-        });
+        let book = OverlayBook::<AgentPlane>::new(Arc::clone(&peers));
         let (plane, service) = match bind_stream_plane(spec, factory, book).await {
             Ok(bound) => bound,
             Err(error) => {
                 tracing::error!(
-                    target: "ducktape::dataplane",
+                    target: "ducktape::agent",
                     node = %label,
                     service = "agent_telemetry",
                     error = %error,
@@ -96,7 +78,7 @@ pub(crate) fn spawn(
             }
         };
         tracing::info!(
-            target: "ducktape::dataplane",
+            target: "ducktape::agent",
             node = %label,
             service = "agent_telemetry",
             own = %own,
@@ -110,7 +92,7 @@ pub(crate) fn spawn(
 async fn run_bound<T: DataPlaneTransport>(
     plane: DataPlane<T>,
     service: Arc<StreamService<T>>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     me: PeerId,
     registry: RunOutputRegistry,
 ) {
@@ -123,7 +105,7 @@ async fn run_bound<T: DataPlaneTransport>(
 
 async fn accept_loop<T: DataPlaneTransport>(
     service: Arc<StreamService<T>>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     registry: RunOutputRegistry,
 ) {
     let active = Arc::new(std::sync::Mutex::new(HashSet::new()));
@@ -147,7 +129,7 @@ async fn accept_loop<T: DataPlaneTransport>(
 async fn receive_peer<S: AsyncRead + Unpin>(
     mut stream: S,
     peer: PeerId,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     registry: RunOutputRegistry,
 ) -> io::Result<()> {
     while peers.contains(peer) {
@@ -171,7 +153,7 @@ async fn receive_peer<S: AsyncRead + Unpin>(
 
 async fn fanout_loop<T: DataPlaneTransport>(
     service: Arc<StreamService<T>>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     me: PeerId,
     registry: RunOutputRegistry,
 ) {
@@ -194,13 +176,13 @@ async fn fanout_loop<T: DataPlaneTransport>(
                 ))
             });
         }
-        tokio::time::sleep(RETRY).await;
+        tokio::time::sleep(DIAL_RETRY).await;
     }
 }
 
 async fn send_peer<T: DataPlaneTransport>(
     service: Arc<StreamService<T>>,
-    peers: Arc<MediaPeers>,
+    peers: Arc<OverlayPeers>,
     peer: PeerId,
     registry: RunOutputRegistry,
 ) {
@@ -212,7 +194,7 @@ async fn send_peer<T: DataPlaneTransport>(
         {
             Ok(stream) => stream,
             Err(_) => {
-                tokio::time::sleep(RETRY).await;
+                tokio::time::sleep(DIAL_RETRY).await;
                 continue;
             }
         };
@@ -227,7 +209,7 @@ async fn send_peer<T: DataPlaneTransport>(
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                 },
-                _ = tokio::time::sleep(RETRY) => {
+                _ = tokio::time::sleep(DIAL_RETRY) => {
                     if !peers.contains(peer) {
                         return;
                     }
@@ -311,7 +293,7 @@ mod tests {
         let a = PeerId(raw_a);
         let b = PeerId(raw_b);
 
-        let peers = MediaPeers::new("agent-plane-test".into());
+        let peers = OverlayPeers::new("agent-plane-test".into());
         peers.set_peers([&key_a, &key_b].into_iter());
         let net = SimNet::new();
         net.set_link(
@@ -330,16 +312,12 @@ mod tests {
         };
         let plane_a = DataPlane::new(
             net.endpoint(a),
-            Arc::new(AgentBook {
-                peers: Arc::clone(&peers),
-            }),
+            OverlayBook::<AgentPlane>::new(Arc::clone(&peers)),
             config,
         );
         let plane_b = DataPlane::new(
             net.endpoint(b),
-            Arc::new(AgentBook {
-                peers: Arc::clone(&peers),
-            }),
+            OverlayBook::<AgentPlane>::new(Arc::clone(&peers)),
             config,
         );
         let service_a = Arc::new(

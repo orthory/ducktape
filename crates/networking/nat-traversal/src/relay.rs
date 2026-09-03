@@ -1,4 +1,4 @@
-//! TCP relay fallback for UDP-dead joiners (join ADR, item 2).
+//! TCP relay fallback for UDP-dead joiners.
 //!
 //! The whole join path is UDP-only, so on a network that eats outbound UDP
 //! (hostile café wifi) a joiner can never deliver its sealed first-contact
@@ -18,8 +18,11 @@
 //! gate who may use the relay (anti-abuse), mirroring the UDP [`AuthPolicy`].
 //!
 //! Targets resolve from the SAME [`SharedAdverts`] book the UDP rendezvous
-//! maintains — never a second registry. The crate stays log-free: the relay's
-//! only telemetry is the [`RelayMetrics`] counters.
+//! maintains — never a second registry. Telemetry is the [`RelayMetrics`]
+//! counters plus `ducktape::reachability` events: a counter says how many
+//! sessions were refused, the events say which peer and for what reason. Every
+//! event on this lane is peer-driven, so refusals are latched and nothing here
+//! logs per forwarded frame.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,6 +43,7 @@ use crate::auth::{
     sign_authenticator, verify_request,
 };
 use crate::wire::{NodeKey, Reader, WireError, put, put_key, put_u16, put_u64};
+use crate::{Latch, short_key};
 
 // ---------------------------------------------------------------------------
 // Framing constants
@@ -597,6 +601,15 @@ impl Session {
         }
         RelayMetrics::increment(&self.metrics.0.sessions_opened);
         RelayMetrics::increment(&self.metrics.0.forwards);
+        tracing::debug!(
+            target: "ducktape::reachability",
+            event = "relay_session_opened",
+            caller = short_key(intro.caller),
+            member = short_key(intro.target),
+            member_reflexive = %target_addr,
+            bytes = intro.payload.len(),
+            "relaying a sealed intro to a member"
+        );
         let caller = intro.caller;
         let target = intro.target;
         let mut forwards: u32 = 1;
@@ -670,6 +683,16 @@ impl Session {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     RelayMetrics::increment(&self.metrics.0.expired);
+                    tracing::debug!(
+                        target: "ducktape::reachability",
+                        event = "relay_session_expired",
+                        reason = "session_ttl",
+                        caller = short_key(caller),
+                        member = short_key(target),
+                        forwards,
+                        replies,
+                        "relay session hit its TTL"
+                    );
                     return SessionEnd::Closed;
                 }
             }
@@ -677,8 +700,35 @@ impl Session {
     }
 }
 
+/// A `REASON_*` token as a latch key. The tokens are ASCII by construction;
+/// the fallback exists only so a future non-UTF8 token cannot silence the line.
+fn reason_key(reason: &'static [u8]) -> &'static str {
+    std::str::from_utf8(reason).unwrap_or("non_utf8")
+}
+
+/// One refused relay session, named. `reason` is the same stable token the
+/// peer gets back in its [`RelayFrame::Error`]; latched PER REASON, because
+/// refusing strangers is this lane's steady state under abuse and a connection
+/// flood tripping `session_limit` must not swallow the first
+/// `target_unregistered` — the one an operator is actually hunting.
+fn note_refused(peer: SocketAddr, reason: &'static [u8]) {
+    static REFUSALS: Latch = Latch::new();
+    let reason = reason_key(reason);
+    if let Some(occurrences) = REFUSALS.hit(reason) {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            event = "relay_session_refused",
+            reason,
+            peer = %peer,
+            occurrences,
+            "relay session refused"
+        );
+    }
+}
+
 async fn run_session(
     stream: TcpStream,
+    peer: SocketAddr,
     slot: SessionSlot,
     policy: Arc<AuthPolicy>,
     adverts: SharedAdverts,
@@ -697,6 +747,7 @@ async fn run_session(
         metrics,
     };
     if let SessionEnd::Refused(reason) = session.drive().await {
+        note_refused(peer, reason);
         // Best-effort refusal token; a stalled peer must not pin the task.
         let error = RelayFrame::Error {
             reason: reason.to_vec(),
@@ -723,11 +774,31 @@ pub async fn run_relay_listener(
 ) {
     let sessions: Arc<Mutex<SessionTable>> = Arc::default();
     loop {
-        let Ok((stream, peer)) = listener.accept().await else {
-            continue;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            // A persistent accept error (EMFILE, and every other exhaustion
+            // that does not clear by itself) otherwise spins this loop
+            // forever emitting nothing at all. Latched because the failure
+            // repeats once per poll: unlatched it would be its own outage.
+            // The errno is the whole diagnosis, so it rides the line.
+            Err(err) => {
+                static ACCEPT_FAILED: Latch = Latch::new();
+                if let Some(occurrences) = ACCEPT_FAILED.hit("accept_failed") {
+                    tracing::warn!(
+                        target: "ducktape::reachability",
+                        event = "relay_accept_failed",
+                        reason = "accept_failed",
+                        error = %err,
+                        occurrences,
+                        "relay accept failed"
+                    );
+                }
+                continue;
+            }
         };
         let Some(slot) = SessionSlot::try_acquire(&sessions, peer.ip()) else {
             RelayMetrics::increment(&metrics.0.sessions_rejected);
+            note_refused(peer, REASON_SESSION_LIMIT);
             // Tell the joiner it was the cap, not a dead relay — but from a
             // spawned task with a bounded write, so a stalled peer can never
             // block the accept loop.
@@ -742,6 +813,7 @@ pub async fn run_relay_listener(
         };
         tokio::spawn(run_session(
             stream,
+            peer,
             slot,
             policy.clone(),
             adverts.clone(),
@@ -805,6 +877,22 @@ mod tests {
             assert_eq!(&frame.encode_inline()[..], &bytes[..]);
             assert_eq!(RelayFrame::decode(&bytes).expect("decode"), frame);
         }
+    }
+
+    /// A session-limit flood is this lane's loudest refusal; the line an
+    /// operator came for is the first `target_unregistered`. One latch per lane
+    /// would swallow it 99 times out of 100, so the latch counts per reason.
+    #[test]
+    fn a_session_limit_flood_does_not_swallow_the_first_unregistered_refusal() {
+        let latch = Latch::new();
+        assert_eq!(latch.hit(reason_key(REASON_SESSION_LIMIT)), Some(1));
+        for _ in 0..1_000 {
+            let _ = latch.hit(reason_key(REASON_SESSION_LIMIT));
+        }
+        assert_eq!(latch.hit(reason_key(REASON_TARGET_UNREGISTERED)), Some(1));
+        // ... and each reason still latches down to first-and-every-Nth on its
+        // own count, rather than every occurrence.
+        assert_eq!(latch.hit(reason_key(REASON_TARGET_UNREGISTERED)), None);
     }
 
     #[test]
@@ -921,7 +1009,10 @@ mod tests {
         let coord_addr = coord_sock.local_addr().unwrap();
         let coord = Coordinator::with_policy(policy.clone());
         let adverts = coord.adverts();
-        tokio::spawn(run_coordinator_with(coord_sock, coord));
+        tokio::spawn(run_coordinator_with(
+            crate::NatSocket::Owned(coord_sock),
+            coord,
+        ));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = listener.local_addr().unwrap();

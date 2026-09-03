@@ -29,6 +29,12 @@ pub(crate) struct Surfaces {
     /// the host's own browser-gateway base URL — the `via` a resolved credential
     /// routes through. Empty when no browser gateway is bound.
     pub(crate) local_gateway_via: String,
+    /// the ports THIS node's own surfaces answer on (operator rpc, browser
+    /// gateway, app-surface http), as actually bound. The gateway plane
+    /// refuses a loopback route aimed at any of them: a member mapping a
+    /// route to its own `/v1` would hand the whole mesh its unauthenticated
+    /// node API.
+    pub(crate) node_api_ports: Vec<u16>,
 }
 
 pub(crate) struct BindConfig<'a> {
@@ -44,10 +50,10 @@ pub(crate) struct BindConfig<'a> {
     pub(crate) gateway_listen: Option<String>,
     pub(crate) gateway_enabled: bool,
     pub(crate) log_ring: noded::LogRing,
-    /// this node's consensus public key — the `BindNode` subject the owner-gated
-    /// admin namespace resolves ownership against (ADR A5).
+    /// this node's consensus public key — the salt every owner PoP on the
+    /// admin namespace is bound to.
     pub(crate) node_key: Vec<u8>,
-    /// how the owner-gated admin namespace is exposed (ADR A2/A4).
+    /// how the owner-gated admin namespace is exposed.
     pub(crate) admin_exposure: noded::AdminExposure,
 }
 
@@ -76,6 +82,18 @@ pub(crate) fn bind_listener(
     })
 }
 
+/// the operator's active wallet PUBLIC key, if this host has a keystore — the
+/// key whose account owns the admin namespace. Read without a password (the
+/// key file carries its pubkey in the clear); a host with no wallet, or one
+/// whose keystore cannot be read, boots operator-gated instead of refusing to
+/// boot. Not the user's node: the wallet is per operator, shared by the CLI
+/// and the app.
+fn operator_wallet_key() -> Option<Vec<u8>> {
+    let path = keystore::wallet::active_user_key().ok()?;
+    let key = keystore::userkey::read_user_key_file(&path).ok()?;
+    Some(key.pubkey)
+}
+
 pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::error::Error>> {
     let BindConfig {
         sync_only,
@@ -99,6 +117,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         Some(addr) if !sync_only => Some(bind_listener("operator rpc", "rpc_listen", addr)?),
         _ => None,
     };
+    let rpc_port = rpc_listener
+        .as_ref()
+        .and_then(|listener| listener.local_addr().ok())
+        .map(|address| address.port());
     // the http/ws app surface: same bind-early rule. the server itself runs on
     // its OWN plain-tokio OS thread (noded's exact split — the host never
     // leaves the commonware runner thread; http handlers only send
@@ -125,6 +147,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         }
         _ => None,
     };
+    let gateway_port = gateway_listener.as_ref().map(|(_, actual)| actual.port());
     let (gateway_lane, gateway_requests) = tokio::sync::mpsc::channel::<noded::GatewayJob>(32);
     // the guest-side remote-session lane: /v1/term/sessions with a `node` hands a
     // SessionJob here, drained by the term plane's client half (mirrors the
@@ -144,11 +167,13 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index".
     let index = noded::open_index_store(storage, MODULE_IDS)?;
-    // the admin namespace's operator credential: minted fresh each boot and
-    // written 0600 beside node.toml, exactly like the service link token — and
-    // NOT minted at all under `DUCKTAPE_ADMIN=off`, where the routes do not
-    // exist to present it to. The node key goes on below; everything else is
-    // decided here.
+    // this node's operator credential: minted fresh each boot and written 0600
+    // beside node.toml, exactly like the service link token. Minted on EVERY
+    // boot, `DUCKTAPE_ADMIN=off` included — it is no longer the admin
+    // namespace's alone, it is what this node's own daemons present to the
+    // mutating `/v1` write gate (`noded::signed_req`), and turning the control
+    // surface off must not leave the announce and lease writes with nothing to
+    // show. The node key goes on below; everything else is decided here.
     let admin = noded::AdminConfig::minted(admin_exposure, workspace);
     stream_hub.prime(index.resume_height()?, String::new());
     // the realtime hub's session lane: /v1/call/ws and /v1/presence/ws ask for
@@ -177,12 +202,15 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
         // from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"))
-        // the owner-gated control namespace (ADR A2/A5): this node's own key is
-        // the `BindNode` subject ownership resolves against; the exposure is the
-        // operator's choice (default loopback). shutdown + module-code staging
-        // live here, off the unauthenticated public surface.
+        // the owner-gated control namespace: this node's own key
+        // salts the owner PoP, and the operator's active wallet key names the
+        // account that may present one (identity binds no node to anyone);
+        // the exposure is the operator's choice (default loopback). shutdown +
+        // module-code staging live here, off the unauthenticated public
+        // surface.
         .with_admin(noded::AdminConfig {
             node_key: Some(node_key.clone()),
+            owner_key: operator_wallet_key(),
             ..admin
         });
     let http_handle = if gateway_enabled {
@@ -221,7 +249,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // This node SPAWNS NO PTY. What is wired here is the rings, the per-session
     // metadata and the admission entry points; the ptys themselves live in the
     // agent daemon (`ducktape service run agent`), which attaches over this
-    // node's own ws and owns its own podman. So the gate is purely "is there an
+    // node's own ws and owns its own sandbox. So the gate is purely "is there an
     // app surface to serve it on" — no sandbox backend, no provider discovery,
     // no execution identity. With no daemon attached a create returns the
     // "requires an agent service" 503, still distinct from the "terminal
@@ -254,7 +282,9 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // the term plane's host side (control handler) takes a clone of the same
     // manager the http handle serves; the guest side drains the session lane.
     let http_handle = match terminals.clone() {
-        Some(manager) => http_handle.with_terminals(manager).with_session_lane(session_lane),
+        Some(manager) => http_handle
+            .with_terminals(manager)
+            .with_session_lane(session_lane),
         None => {
             drop(session_lane);
             http_handle
@@ -262,10 +292,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     };
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
+    let mut http_port = None;
     match http_listen.as_deref() {
         Some(addr) if !sync_only => {
             let listener = bind_listener("node HTTP API", "http_listen", addr)?;
             listener.set_nonblocking(true)?;
+            http_port = listener.local_addr().ok().map(|address| address.port());
             tracing::info!(
                 target: "ducktape::http",
                 node = %label,
@@ -338,6 +370,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         terminals,
         session_requests,
         local_gateway_via,
+        node_api_ports: [rpc_port, gateway_port, http_port]
+            .into_iter()
+            .flatten()
+            .collect(),
     })
 }
 
