@@ -326,7 +326,7 @@ extern crate::backend
   ForgeTreeData(repo:str, rev:str, path:str, born:bool, entries:[TreeEntry], truncated:bool)
   BlobView(repo:str, rev:str, path:str, text:str, truncated:bool, binary:bool, lines:i64, picture:bool, width:i64, height:i64)
   forge_tree(rpc:str, repo:str, rev:str, path:str) -> ForgeTreeData ! AppError
-  forge_blob(rpc:str, repo:str, rev:str, path:str) -> BlobView ! AppError
+  forge_blob(rpc:str, repo:str, rev:str, path:str, net:str) -> BlobView ! AppError
   ForgeDraftComment(anchor:str, path:str, line:str, side:str, body:str)
   pure stage_forge_comment(staged:[ForgeDraftComment], path:str, line:str, side:str, body:str) -> [ForgeDraftComment]
   pure drop_forge_comment(staged:[ForgeDraftComment], anchor:str) -> [ForgeDraftComment]

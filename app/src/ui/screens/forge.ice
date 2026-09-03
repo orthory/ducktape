@@ -314,6 +314,7 @@ component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connec
                     connected_rpc
                     connected
                     repo=open_repo
+                    network_chain_id
                     dark
                   forward
                     open_message_link
@@ -839,7 +840,7 @@ component LinkedNote(note:ChatMessage)
             forward
               open_message_link
 
-component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:bool)
+component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, network_chain_id:str, dark:bool)
   emits
     open_message_link(str)
   lifetime mounted
@@ -862,6 +863,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     focus_rpc = ""
     focus_online = false
     focus_repo = ""
+    focus_net = ""
     focus_path = ""
     failed_note = ""
     opened_dir = ""
@@ -887,7 +889,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     return if empty(focus_path)
     let path = focus_path
     focus_path = ""
-    run every duck_echo_str(path) -> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _) | file_failed _
+    run every duck_echo_str(path) -> open_file(focus_rpc, focus_online, focus_repo, focus_net, tree_rev, tree_path, _) | file_failed _
   on tree_failed(cause)
     tree_phase = ForgeTreePhase.failed
   // A `duck://forge/<repo>/blob/<path>[@<rev>]` deep link. The reader's
@@ -896,11 +898,12 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
   // directory (pinned to `@rev` when the link names one, else wherever the
   // tree already is), and `tree_loaded` opens the file under that tree.
   // One path whether or not a tree had landed yet.
-  on focus_file(rpc, online, repo_now, path, rev)
+  on focus_file(rpc, online, repo_now, net, path, rev)
     return if !online || empty(repo_now)
     focus_rpc = rpc
     focus_online = online
     focus_repo = repo_now
+    focus_net = net
     focus_path = path
     tree_path = forge_parent(path)
     tree_rev = keep_str(!empty(rev), rev, tree_rev)
@@ -908,7 +911,10 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     tree_truncated = false
     tree_phase = ForgeTreePhase.loading
     run replace lane=tree forge_tree(rpc, repo_now, tree_rev, tree_path) -> tree_loaded _ | tree_failed _
-  on open_file(rpc, online, repo_now, rev, dir, path)
+  // `net` is the connected chain id, carried down to the blob's reader: a
+  // Markdown blob's inline pictures are duck:// addresses too, and one naming
+  // another network must not draw THIS network's blob of the same name.
+  on open_file(rpc, online, repo_now, net, rev, dir, path)
     return if !online || empty(repo_now)
     opened_dir = dir
     opened_rev = rev
@@ -921,7 +927,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
     file_picture = false
     failed_note = ""
     phase = ForgeFilePhase.loading
-    run replace lane=blob forge_blob(rpc, repo_now, rev, path) -> file_loaded _ | file_failed _
+    run replace lane=blob forge_blob(rpc, repo_now, rev, path, net) -> file_loaded _ | file_failed _
   on file_loaded(next)
     return if next.path != file_path
     file_text = next.text
@@ -1056,7 +1062,7 @@ component ForgeCodeBrowser(connected_rpc:str, connected:bool, repo:str, dark:boo
                     hovered bg=rail_hover text=fg
                     pressed bg=elevated text=fg
                 if entry.kind != "dir"
-                  button -> open_file(connected_rpc, connected, repo, tree_rev, tree_path, entry.path)
+                  button -> open_file(connected_rpc, connected, repo, network_chain_id, tree_rev, tree_path, entry.path)
                     with
                       label="Open file"
                       description=entry.path

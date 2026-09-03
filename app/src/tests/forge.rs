@@ -40,9 +40,9 @@ fn forge_depth_rides_the_established_seams() {
             "forge_tree(rpc:str, repo:str, rev:str, path:str) -> ForgeTreeData ! AppError"
         )
     );
-    assert!(
-        backend.contains("forge_blob(rpc:str, repo:str, rev:str, path:str) -> BlobView ! AppError")
-    );
+    assert!(backend.contains(
+        "forge_blob(rpc:str, repo:str, rev:str, path:str, net:str) -> BlobView ! AppError"
+    ));
     for deleted in [
         concat!("forge_", "discussion_generation"),
         concat!("forge_", "code_generation"),
@@ -235,7 +235,7 @@ fn forge_code_loaders_query_only_the_requested_tree_or_blob() {
 
     let screen = include_str!("../ui/screens/forge.ice");
     assert!(
-        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path)"),
+        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path, net)"),
         "the blob read launches from ForgeCodeBrowser's local handler"
     );
 }
@@ -321,7 +321,7 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
     assert!(
         repo_loaded.contains("match forge_focus_kind(forge_focus_number, forge_focus_path)")
             && repo_loaded.contains("-> forge_open_item _")
-            && repo_loaded.contains("slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, path, rev) at forge_repo"),
+            && repo_loaded.contains("slice ForgeCodeBrowser.focus_file(connected_rpc, connected, forge_repo, network_chain_id, path, rev) at forge_repo"),
         "the repo's load consumes the forge focus"
     );
     let files = include_str!("../ui/handlers/files.ice");
@@ -338,7 +338,7 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
     );
     let screen = include_str!("../ui/screens/forge.ice");
     let focus_file = screen
-        .split_once("on focus_file(rpc, online, repo_now, path, rev)")
+        .split_once("on focus_file(rpc, online, repo_now, net, path, rev)")
         .expect("the browser's handler")
         .1
         .split_once("\n  on ")
@@ -351,7 +351,7 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         "a focused file first moves the tree to its directory, pinned to the link's rev"
     );
     assert!(
-        screen.matches("-> open_file(focus_rpc, focus_online, focus_repo, tree_rev, tree_path, _)").count() == 1,
+        screen.matches("-> open_file(focus_rpc, focus_online, focus_repo, focus_net, tree_rev, tree_path, _)").count() == 1,
         "and opens from `tree_loaded` alone — under the tree's own revision"
     );
 
@@ -419,8 +419,23 @@ fn the_forge_reader_draws_a_markdown_blobs_pictures_inline() {
         .0;
     assert!(
         text_loader.contains("markdown_path(&view.path) && !view.binary")
-            && text_loader.contains("load_inline_pictures(client, &view).await"),
-        "pictures preload for a markdown blob and nothing else"
+            && text_loader.contains("load_inline_pictures(client, &view, net).await"),
+        "pictures preload for a markdown blob and nothing else, scoped to the network"
+    );
+    // A cited picture is an address like any other: `?net=` decides whether it
+    // is ours before a byte is read, or a body from another network draws
+    // THIS one's blob of the same name.
+    let picture_bytes = loader
+        .split_once("async fn inline_picture_bytes(")
+        .expect("the picture resolver")
+        .1
+        .split_once("\nasync fn ")
+        .expect("the resolver ends")
+        .0;
+    assert!(
+        picture_bytes.contains("resolve_duck_link(url.to_owned(), net.to_owned())")
+            && !picture_bytes.contains("classify_duck_link"),
+        "an inline picture resolves through the SCOPED entry, never the bare grammar"
     );
 }
 
@@ -615,7 +630,7 @@ fn forge_code_reads_are_compiler_replaced_without_ui_generations() {
     }
     let screen = inlined(include_str!("../ui/screens/forge.ice"));
     assert!(
-        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path)"),
+        screen.contains("run replace lane=blob forge_blob(rpc, repo_now, rev, path, net)"),
         "the blob read supersedes on the component's own lane"
     );
 
@@ -796,6 +811,7 @@ fn a_blob_for_another_file_does_not_paint_the_open_one() {
         "http://node".into(),
         true,
         "core".into(),
+        String::new(),
         "1111111111111111111111111111111111111111".into(),
         String::new(),
         "src/lib.rs".into(),
