@@ -202,7 +202,7 @@ extern crate::backend
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
-  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, rev:str, net:str)
+  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, authority:str, rev:str, net:str)
   pure resolve_duck_link(url:str, connected_chain_id:str) -> DuckLink
   pure foreign_network_error(link_net:str, connected_chain_id:str) -> str
   pure duck_page_link(page:str, chain_id:str) -> str
@@ -528,6 +528,9 @@ extern crate::backend
   post_block_comment(rpc:str, password:str, target:str, thread_id:str, text:str, generation:i64) -> BlockCommentData ! AppError
   resolve_comment_thread(rpc:str, password:str, thread_id:str, resolved:bool) -> bool ! AppError
   open_external_url(url:str) -> bool ! AppError
+  // A published `.duck` route, opened in the OS browser through the node's own
+  // browser-gateway origin (the app has no webview and no `duck:` handler).
+  open_gateway_url(rpc:str, authority:str, path:str) -> bool ! AppError
   create_page(rpc:str, password:str, title:str) -> PagesData ! AppError
   delete_page(rpc:str, password:str, page_id:str) -> PagesData ! AppError
   // THE PAGE'S ONE WRITE PATH. The edited buffer in, the module's own ops

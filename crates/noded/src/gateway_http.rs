@@ -5,7 +5,10 @@
 //! The browser origin is stateless: the trusted `duck://` scheme handler
 //! forwards the page's stable `<label>.<handle>.duck` authority on every
 //! request; the node resolves it fresh through DuckDNS each time (no session
-//! token, no server-side binding). A WebSocket side door (`/.duck/ws-token` +
+//! token, no server-side binding). A client with no `duck:` scheme handler —
+//! the desktop app, which hands links to the OS browser — uses the PATH form
+//! `/.duck/<authority>/<path>` instead: same resolver, same proxy, see
+//! [`gateway_browser_path`]. A WebSocket side door (`/.duck/ws-token` +
 //! `/.duck/ws/{token}`) bridges `duck://` pages onto the upgrade lane, because
 //! `new WebSocket()` cannot open a socket on the `duck:` scheme directly.
 
@@ -18,7 +21,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use futures::SinkExt as _;
 use futures::channel::oneshot;
@@ -393,6 +396,11 @@ pub fn gateway_browser_router(handle: NodeHandle) -> Router {
     Router::new()
         .route("/.duck/ws-token", post(gateway_ws_token_mint))
         .route("/.duck/ws/{token}", get(gateway_ws_door))
+        // The path form. Static segments win over `{authority}` in the
+        // router, so the two `ws` doors above stay reachable — and no
+        // authority can shadow them, since every one of them ends in `.duck`.
+        .route("/.duck/{authority}", any(gateway_browser_path))
+        .route("/.duck/{authority}/{*path}", any(gateway_browser_path))
         .fallback(gateway_browser_proxy)
         .layer(DefaultBodyLimit::max(
             gateway::MAX_REQUEST_BODY_BYTES as usize,
@@ -536,18 +544,118 @@ impl futures::Stream for HeadCommitFence {
                     Poll::Pending
                 }
             },
-            FenceState::FailureAfterFlush(failure) => Poll::Ready(Some(Err(
-                std::io::Error::other(format!("{failure:?}")),
-            ))),
+            FenceState::FailureAfterFlush(failure) => {
+                Poll::Ready(Some(Err(std::io::Error::other(format!("{failure:?}")))))
+            }
             FenceState::Finished => Poll::Ready(None),
         }
     }
 }
 
+/// Which door a request came through. It decides ONE thing — the page's
+/// origin — and that origin decides both the CSP and the cross-origin
+/// refusal. Everything past it is the same code for both doors.
+enum BrowserDoor {
+    /// `x-duck-authority` stamped by the trusted `duck://` scheme handler:
+    /// the page keeps its own `duck://<authority>` origin.
+    Scheme,
+    /// `/.duck/<authority>/<path>` on this listener: the page's origin is the
+    /// listener's own `http://<listen>`.
+    Path,
+}
+
+/// The header form: the trusted `duck://` scheme handler forwards the page's
+/// stable authority (`<label>.<handle>.duck`), which the node resolves fresh
+/// each request — there is no session token and no server-side binding.
 async fn gateway_browser_proxy(
     State(handle): State<NodeHandle>,
     method: Method,
     uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(authority) = headers
+        .get("x-duck-authority")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+    else {
+        return error_response(StatusCode::MISDIRECTED_REQUEST, "missing duck authority");
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or("/")
+        .to_string();
+    gateway_browser_serve(
+        handle,
+        BrowserDoor::Scheme,
+        method,
+        authority,
+        path_and_query,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// The path form: `/.duck/<authority>/<path>`, for a client that cannot mint
+/// a `duck://` origin — the desktop app hands the OS browser one of these
+/// URLs, because there is no `duck:` scheme handler installed anywhere yet.
+/// Same resolver, same proxy, same response shaping as the header form; only
+/// the page origin differs (`http://<listen>`, so the served page's own
+/// subresources are not blocked by its CSP).
+///
+/// TWO LIMITS, both inherent and neither worth rewriting HTML for:
+/// * a RELATIVE link in the served page resolves under the prefix and works;
+///   an ABSOLUTE `/x` link escapes the prefix and does not.
+/// * every route served this way shares the one `http://<listen>` origin, so
+///   the browser's own origin separation between `.duck` routes is gone. The
+///   listener is loopback-only and the app is its only caller.
+async fn gateway_browser_path(
+    State(handle): State<NodeHandle>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some((authority, path_and_query)) = path_form_target(&uri) else {
+        return error_response(StatusCode::MISDIRECTED_REQUEST, "missing duck authority");
+    };
+    gateway_browser_serve(
+        handle,
+        BrowserDoor::Path,
+        method,
+        authority,
+        path_and_query,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// Split `/.duck/<authority>[/<path>][?query]` into the authority and the
+/// path-and-query the PUBLISHER sees — the prefix is the door's, not the
+/// route's. Read off the raw URI rather than a `Path` extractor so the
+/// publisher gets the client's percent-encoding back unchanged.
+fn path_form_target(uri: &Uri) -> Option<(String, String)> {
+    let rest = uri.path().strip_prefix("/.duck/")?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((authority, tail)) => (authority, format!("/{tail}")),
+        None => (rest, "/".to_string()),
+    };
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
+    Some((authority.to_string(), path_and_query))
+}
+
+async fn gateway_browser_serve(
+    handle: NodeHandle,
+    door: BrowserDoor,
+    method: Method,
+    authority: String,
+    path_and_query: String,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -565,17 +673,10 @@ async fn gateway_browser_proxy(
         )
             .into_response();
     };
-    // The trusted duck:// scheme handler is the only caller; it forwards the
-    // page's stable authority (`<label>.<handle>.duck`), which the node resolves
-    // fresh each request — there is no session token and no server-side binding.
-    let Some(authority) = headers
-        .get("x-duck-authority")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-    else {
-        return error_response(StatusCode::MISDIRECTED_REQUEST, "missing duck authority");
+    let page_origin = match door {
+        BrowserDoor::Scheme => format!("duck://{authority}"),
+        BrowserDoor::Path => format!("http://{}", gateway.listen),
     };
-    let page_origin = format!("duck://{authority}");
     if headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -604,11 +705,7 @@ async fn gateway_browser_proxy(
         name,
         revision: record.statement.revision,
         method,
-        path_and_query: uri
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or("/")
-            .to_string(),
+        path_and_query,
         headers: forwarded,
         body_len: body.len() as u64,
         upgrade: false,
@@ -912,7 +1009,9 @@ mod tests {
     #[tokio::test]
     async fn head_commits_before_a_queued_body_failure_aborts() {
         let (tx, rx) = tokio::sync::mpsc::channel(2);
-        tx.send(Ok(Bytes::from(vec![b'c'; 64 * 1024]))).await.unwrap();
+        tx.send(Ok(Bytes::from(vec![b'c'; 64 * 1024])))
+            .await
+            .unwrap();
         tx.send(Err(GatewayFailure::Unavailable("cap".into())))
             .await
             .unwrap();
