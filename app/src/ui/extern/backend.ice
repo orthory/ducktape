@@ -163,7 +163,25 @@ extern crate::backend
   pure without_window(current:window-id?, closed:window-id) -> window-id?
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
+  // THE RECOVERY-PHRASE CEREMONY, in two calls. `create_device_key` picks a
+  // wallet name and 24 words and writes NOTHING — the words live in a
+  // zeroizing slot in the backend, never in app state — and returns the name.
+  // `confirm_recovery_phrase` checks three of them back and only then seals
+  // the key file, returning its pubkey: an abandoned ceremony leaves no key.
+  // `phrase_rows_of` is the same pairing over a GIVEN phrase — the screen's
+  // test drives it with a fixed mnemonic so no capture holds a real one.
+  // `phrase_rows` and `recovery_prompt` READ that slot, so their `pure` bends
+  // the same-args-same-value promise `derived` caches on. They are declared
+  // pure because a view binding cannot call a `sync` extern, and the ceremony
+  // makes the bend safe: `hub_step` changes on every entry to these two steps,
+  // so the view re-runs them. Never put either behind a `derived` — that would
+  // cache an empty grid for the life of the frame cache.
   create_device_key(password:str) -> str ! AppError
+  PhraseRow(left_number:str, left_word:str, right_number:str, right_word:str)
+  pure phrase_rows() -> [PhraseRow]
+  pure phrase_rows_of(words:&str) -> [PhraseRow]
+  pure recovery_prompt() -> str
+  confirm_recovery_phrase(answer:str, password:str) -> str ! AppError
   restore_user_key(name:str, words:secret, password:str) -> str ! AppError
   unlock_wallet(name:str, password:str) -> str ! AppError
   unlock_user_key(password:str) -> str ! AppError

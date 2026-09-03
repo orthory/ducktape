@@ -19,6 +19,9 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
     unlock_submit(str)
     login_skip
     password_submit(str)
+    phrase_written_down
+    show_phrase_again
+    confirm_phrase_submit(str)
     welcome_create_submit(str)
     welcome_login_submit
     welcome_desktop
@@ -66,6 +69,25 @@ component HubColumn(step:HubStep, wallets:[WalletInfo], wallet_selected:str, net
               password_submit
               go_restore
               login_skip
+        // The two ceremony steps read the phrase the backend is holding
+        // rather than any app state — the words are never a reading this
+        // process keeps, and both screens are gone the moment it lets go.
+        HubStep.phrase
+          PhraseScreen #phrase
+            with
+              rows=phrase_rows()
+              busy
+            forward
+              phrase_written_down
+        HubStep.confirm
+          ConfirmPhraseScreen #confirm
+            with
+              prompt=recovery_prompt()
+              busy
+              error
+            forward
+              confirm_phrase_submit
+              show_phrase_again
         HubStep.restore
           RestoreScreen
             with
@@ -401,11 +423,12 @@ component WalletRow(row:WalletInfo, selected:bool, busy:bool)
         hovered bg=subtle text=fg
         pressed bg=rail_hover text=fg
 
-// PASSWORD. First run: one password, and the device key is minted under it —
-// no name to pick, no 24 words to write down. Recovery is a passkey login
-// from another device (the welcome step, once a network is picked). The
-// authoritative floor lives in Rust (`password_problem` mirrors the CLI's
-// 8-char minimum); the button stays dead until the pair is acceptable.
+// PASSWORD. First run: one password, and the device key is minted under it.
+// The mint's 24 words are shown on the next step and confirmed on the one
+// after — they are the ONLY backup this key has once the disk holding it is
+// gone. The authoritative password floor lives in Rust
+// (`password_problem` mirrors the CLI's 8-char minimum); the button stays
+// dead until the pair is acceptable.
 component PasswordScreen(busy:bool, error:str)
   emits
     password_submit(str)
@@ -418,7 +441,7 @@ component PasswordScreen(busy:bool, error:str)
     HubBrand
       with
         title="Welcome to ducktape"
-        caption="Set a password for this device. Your account lives on the network you join next — a passkey on your phone is how you get back in."
+        caption="Set a password for this device. It encrypts the key on this disk — the next screen shows the 24 words that are the only way to get that key back."
     box w=fill pt=26.0
       text "PASSWORD"
         with
@@ -547,6 +570,196 @@ component PasswordScreen(busy:bool, error:str)
             wrap=none
             font=code_medium
             @text-icon_idle
+    OnboardingError message=error
+
+// THE PHRASE, SHOWN EXACTLY ONCE. The mint picked 24 words and no key file
+// exists yet — the confirm on the next screen is what seals it — and this is
+// the only screen in the app that will ever draw them: there is no copy
+// button (a phrase in the clipboard is a phrase in every paste target), no
+// skip, and no re-show. Off the app, someone who still HAS the key file and
+// its password can read them back with
+// `ducktape user key reveal --key ~/.ducktape/keys/<name>.key` — which is
+// exactly the case this screen exists for the loss of. The rows are
+// paired 1↔13 … 12↔24 in Rust because Ice cannot index a list, and because
+// twelve rows fit this window and twenty-four do not.
+component PhraseScreen(rows:[PhraseRow], busy:bool)
+  emits
+    phrase_written_down
+  col #root w=428.0 gap=0.0
+    text "Write these 24 words down"
+      with
+        w=fill
+        size=20.0
+        wrap=none
+        font=display
+        @text-primary
+    box w=fill pt=6.0
+      text "They are the only backup of this device's key: the sign-in screen's Restore from recovery phrase rebuilds it from them, here or on another machine. Paper or a password manager — never the same disk. The next screen asks for three of them, and the key is saved only once you get them right."
+        with
+          w=fill
+          size=13.0
+          line-h=1.5
+          @text-caption
+    box w=fill pt=18.0
+      col #phrase-grid w=fill gap=6.0
+        for pair in rows
+          row w=fill gap=8.0
+            PhraseCell number=pair.left_number word=pair.left_word
+            PhraseCell number=pair.right_number word=pair.right_word
+    box w=fill pt=18.0
+      button #phrase-continue -> emit(phrase_written_down)
+        with
+          label="I wrote them down"
+          disabled=busy
+          w=fill
+          @primary_action
+          @px-0px
+          @py-13px
+          @rounded-10px
+        text "I wrote them down →"
+          with
+            w=fill
+            size=13.5
+            wrap=none
+            align-x=center
+            font=display
+            @text-primary_fg
+    box w=fill pt=14.0
+      text "the app never shows this phrase again"
+        with
+          w=fill
+          size=10.5
+          wrap=none
+          align-x=center
+          font=code_medium
+          @text-icon_idle
+
+// One numbered word.
+component PhraseCell(number:str, word:str)
+  box #root
+    with
+      w=fill
+      px=10.0
+      py=6.0
+      bg=surface
+      border=border
+      border-w=1.0
+      r=8.0
+    row
+      with
+        w=fill
+        gap=8.0
+        align=center
+      text number
+        with
+          w=20.0
+          size=10.5
+          wrap=none
+          font=code_medium
+          @text-meta
+      text word
+        with
+          w=fill
+          size=13.0
+          wrap=none
+          font=code_semibold
+          @text-primary
+
+// THE CONFIRM. Three words back, at positions the backend picked at random
+// and names in `prompt` — the check runs against the phrase it is still
+// holding, and passing it is what SEALS the key and drops the phrase. A miss
+// keeps both the phrase and this step, and "Show the phrase again" is the way
+// past a typo; once this passes there is no way back to it.
+// `answer` is plain `str`, not the `secret` the restore screen uses for a
+// whole phrase: this screen exists so you can SEE what you typed and compare
+// it with the words on the paper, which a value-suppressing PasswordInput
+// would defeat. Three words out of 24 are not a key, and the field holds them
+// only until the step ends.
+component ConfirmPhraseScreen(prompt:str, busy:bool, error:str)
+  emits
+    confirm_phrase_submit(str)
+    show_phrase_again
+  state
+    answer = ""
+  col #root w=428.0 gap=0.0
+    text "Confirm your recovery phrase"
+      with
+        w=fill
+        size=20.0
+        wrap=none
+        font=display
+        @text-primary
+    box w=fill pt=6.0
+      text prompt
+        with
+          w=fill
+          size=13.0
+          line-h=1.5
+          @text-caption
+    box w=fill pt=20.0
+      text "THREE WORDS"
+        with
+          size=10.0
+          wrap=none
+          font=code_semibold
+          @text-label
+    box w=fill pt=8.0
+      box
+        with
+          w=fill
+          px=14.0
+          py=12.0
+          bg=surface
+          border=primary
+          border-w=1.5
+          r=10.0
+        input "" #confirm-words <-> answer
+          with
+            label="The three words"
+            hint="three words, space-separated"
+            disabled=busy
+            submit=emit(confirm_phrase_submit, answer)
+            w=fill
+            p=0.0
+            text-size=13.0
+            line-h=1.2
+            font=code
+            @control
+          active bg=transparent border=transparent value=fg placeholder=label selection=fg/18 border-w=0.0 r=0.0
+          disabled value=hint
+    box w=fill pt=16.0
+      button #confirm-submit -> emit(confirm_phrase_submit, answer)
+        with
+          label="Confirm"
+          disabled=(busy || empty(trim(answer)))
+          w=fill
+          @primary_action
+          @px-0px
+          @py-13px
+          @rounded-10px
+        text "Confirm →"
+          with
+            w=fill
+            size=13.5
+            wrap=none
+            align-x=center
+            font=display
+            @text-primary_fg
+    box w=fill pt=18.0
+      col
+        with
+          w=fill
+          gap=8.0
+          align=center
+        button "Show the phrase again" #confirm-back -> emit(show_phrase_again)
+          with
+            disabled=busy
+            h=26.0
+            p=5.0
+            @ghost_action
+          active bg=transparent text=muted r=7.0
+          hovered bg=fg/9 text=fg
+          pressed bg=fg/14
     OnboardingError message=error
 
 // WELCOME. A picked network on which this device's key has no account. The
