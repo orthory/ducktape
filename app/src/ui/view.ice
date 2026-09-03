@@ -576,6 +576,7 @@ view
               account_busy
               account_ticket
               appearance
+              desktop_notifications
               password
               status
               loading
@@ -607,6 +608,7 @@ view
               forget_workspace_submit -> forget_workspace_submit
               set_appearance_light -> set_appearance_light
               set_appearance_dark -> set_appearance_dark
+              set_desktop_notifications -> set_desktop_notifications _
         explorer:
           ExplorerScreen #explorer(connected_rpc)
             with
