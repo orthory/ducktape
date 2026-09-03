@@ -66,6 +66,7 @@ macro_rules! suite {
             member_restart_mapping_kept,
             member_restart_mapping_lost,
             nat_rebind_readvertises,
+            nat_rebind_live_readvertises,
             cutover_keeps_unchanged_peers,
             cutover_to_reduced_mesh,
             coordinator_dark,
