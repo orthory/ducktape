@@ -6,8 +6,6 @@ attested, session-scoped handshake — so the sandbox calls the Claude/Codex API
 using a credential it never holds, and the operator of the credential side
 cannot read the credential out of it.
 
-Promoted from a PoC into real workspace crates.
-
 ## Crates
 
 - **`airlock`** (this crate) — the pure attestation + sealing + session-key
@@ -119,23 +117,23 @@ export DUCKTAPE_AIRLOCK_ATTEST=snp                  # or tdx
 export DUCKTAPE_AIRLOCK_SNP_PRODUCT=milan           # snp: pin the platform generation
 # optional transport overrides: DUCKTAPE_AIRLOCK_SNP_VCEK=<der file> (air-gapped),
 # DUCKTAPE_AIRLOCK_PCCS_URL=<pccs> (tdx)
-# then run a claude agent through capability-host as usual — the run's
+# then run a claude agent through the provider as usual — the run's
 # /v1/messages flow crosses the overlay to the enclave.
 ```
 
 The quote is fetched + verified **over the overlay** before any token is derived,
 so a relaying node cannot substitute its key or read the session token. The
-overlay proxy **streams** responses end to end (2026-07-20): publish the route
-with `max_response_bytes: 0` (unbounded stream — now literal) for live SSE; a
+overlay proxy **streams** responses end to end: publish the route with
+`max_response_bytes: 0` (an unbounded stream, literally) for live SSE; a
 non-zero cap is enforced as a RUNNING total (declared over-length refused
 before the head; unsized overflow truncates the body mid-stream). The
 request-body admission ceiling is 16 MiB.
 
 ## Body AEAD (sealed sessions)
 
-Airlock sessions are **sealed-body** (2026-07-20): the broker seals request
-bodies and unseals response streams under keys derived from the same handshake
-ECDH (`bodyseal`; per-stream salted key, counter nonces, authenticated Final
+Airlock sessions are **sealed-body**: the broker seals request bodies and
+unseals response streams under keys derived from the same handshake ECDH
+(`bodyseal`; per-stream salted key, counter nonces, authenticated Final
 marker). Consequences:
 
 - **Path hosts see ciphertext** — including the credential-provider's node
@@ -186,9 +184,9 @@ is real and fails closed — there is NO mock:
   file) must chain to the **builtin AMD ARK/ASK for the operator-pinned product
   generation** (`--snp-product milan|genoa|turin`), and the report signature
   must verify under it. VLEK-signed reports are refused. The measurement is then
-  compared to the pinned value. Known gap (deliberate, tracked with the
-  hardware TODO): no TCB-freshness gate — AMD issues VCEKs for older TCBs, so
-  firmware rollback is not detected; TDX gets freshness from its TCB status.
+  compared to the pinned value. Known gap: no TCB-freshness gate — AMD issues
+  VCEKs for older TCBs, so firmware rollback is not detected; TDX gets
+  freshness from its TCB status.
 
 `--attest` has **no default** anywhere. Trust roots are plain typed data in the
 lib (`TrustRoots`); each binary parses its flags/env ONCE at its boundary — the
@@ -215,29 +213,23 @@ the full custody path — attest → seal → handshake → proxied call → cre
 swap → reply — asserting the session token never reaches the upstream (and that a
 static `Bearer` credential is used without any OAuth refresh).
 
-### Verified end-to-end against the real API
+### The live chain
 
-The whole chain has run live (2026-07-19, real `api.anthropic.com`, with the
-since-deleted mock attest standing in for the quote — the custody path is
-unchanged; a TEE-silicon rerun is the standing hardware TODO):
-
-1. `airlock-gateway serve --anthropic-base https://api.anthropic.com` (loopback).
-2. `ducktape user cred seal --credentials ~/.claude/.credentials.json --cred-kind bearer`
-   — seals the current subscription access token (no rotation).
-3. A `claude` CLI inside a **microVM** holding only the opaque run bearer,
-   driven through `capability-host` in airlock mode
-   (`DUCKTAPE_AIRLOCK_GATEWAY`/`_MEASUREMENT`/`_ATTEST`) — the ignored live test
-   `claude_model_turn_through_the_broker`.
-
-`microVM(claude) → capability-host broker → airlock gateway → real api.anthropic.com`
-returned a real completion; the sandbox never held the credential, only the
-temp bearer.
-
+The whole chain runs against the real API from the provider crate's ignored
+live tests (`claude_model_turn_in_a_microvm`, `codex_model_turn_in_a_microvm`
+in `crates/services/provider/src/lib.rs`): a CLI inside a **microVM** holding
+only the opaque run bearer, driven through the provider's broker to the
+gateway and on to the vendor —
+`microVM(claude) → provider broker → airlock gateway → api.anthropic.com`.
+The sandbox never holds the credential, only the temp bearer. On a box
+without TEE silicon the gateway attests through `airlock::testkit`; the
+custody path is identical.
 
 ## Grafted into the product
 
-`capability-host`'s Anthropic broker can now use a verified airlock gateway as
-its credential SOURCE instead of a host-held credential: set
+The provider's Anthropic broker (`crates/services/provider`) can use a
+verified airlock gateway as its credential SOURCE instead of a host-held
+credential: set
 `DUCKTAPE_AIRLOCK_GATEWAY=<url>` (local) or `DUCKTAPE_AIRLOCK_REMOTE=<handle>.duck`
 + `DUCKTAPE_AIRLOCK_VIA=<browser-gw>` (remote), plus `DUCKTAPE_AIRLOCK_MEASUREMENT`
 (the pinned audited-image hex) and `DUCKTAPE_AIRLOCK_ATTEST` (`tdx`/`snp`; no
@@ -251,11 +243,8 @@ including a check that a sandbox child cannot inject the overlay routing header.
 
 ## Deferred
 
-Body-level AEAD of proxied traffic, and **SSE-over-overlay streaming** — the
-remote topology routes through the node's gateway proxy, which today BUFFERS
-responses (4 MiB cap; only the WS-upgrade lane streams), so live `claude`
-streaming over the overlay waits on that slice. Remote mode also needs the node
-to publish the gateway's `LoopbackHttp` route with `allow_authorization` so the
-session-token bearer reaches the enclave. Subscription OAuth proxied by a third
-party remains an accepted, named ToS risk — attested custody is mitigation, not
-a solution.
+Per-subject session revocation (today revocation is a gateway restart, which
+kills every outstanding token and body key at once), the SNP TCB-freshness
+gate, and a rerun of the live chain on real TEE silicon. Subscription OAuth
+proxied by a third party remains an accepted, named ToS risk — attested
+custody is mitigation, not a solution.

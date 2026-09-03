@@ -7,7 +7,7 @@
 //! persisted-mesh codec — lives in the `netstack-machine` crate; this crate
 //! re-exports the shared surface so consumers keep one import root.
 //!
-//! Design anchors (docs/deploy/private-cutover-integration-gap.md §2/§3):
+//! Design anchors (docs/records/architecture/reachability.md §1):
 //! - The control mesh (commonware TCP) is UNTOUCHED — this plane composes
 //!   orthogonally, exchanging its messages over one dedicated mesh channel
 //!   and driving only the WireGuard DATA tunnel.
