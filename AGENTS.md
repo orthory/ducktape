@@ -27,6 +27,25 @@ in `skills/` (`qa`, `sim-lane`, `module-dev`).
   gating, or migration machinery is an explicit, user-requested decision —
   never a side effect of a task.
 
+## No Embedded Wasm (the binary is not the module set)
+
+- A ducktape binary NEVER carries a wasm artifact in its bytes. No
+  `include_bytes!` or `include_str!` of a `component.wasm`, an `index.wasm`,
+  or any other guest, in any binary or library crate that a binary links —
+  not behind a feature, not behind an env var, not for "just this one".
+- The node is one artifact and the module set is another. A module ships,
+  pins and swaps independently of the binary that runs it: `node init` hashes
+  each `<id>.component.wasm` out of a directory into the descriptor, a member
+  `join` verifies its copy against those hashes, and the code registry swaps a
+  module at a block. Bytes compiled into a binary are a second copy of a module
+  that only a rebuild can change, and a rebuild changing what a node founds or
+  joins with is a silent network change.
+- Every wasm a node runs reaches it as a FILE it reads at runtime, resolved
+  from a directory (`workspace_config::modules_dir()` for the genesis set).
+  Getting the files there is a build or install step, never a compile step.
+- Tests may `include_bytes!` a committed fixture — a test pins bytes on
+  purpose. Nothing else may.
+
 ## Internal Skills
 
 - Keep repo-specific operational runbooks in `skills/` (`qa`, `sim-lane`,
