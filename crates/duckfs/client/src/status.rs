@@ -16,7 +16,7 @@ use duckfs_core::to_hex;
 
 use crate::chunk::{chunk_ids, file_object_id};
 use crate::index::{EntryKind, Index, IndexEntry, IndexError};
-use crate::scan::{Ignore, ScanEntry, ScanError, ScanKind, disk_path, scan};
+use crate::scan::{Ignore, ScanEntry, ScanError, ScanKind, disk_path, is_builtin_skip, scan};
 
 /// the working-copy delta: files/symlinks/empty-dirs added or modified relative
 /// to the index base, and index paths removed from disk. `clean` iff all empty.
@@ -164,13 +164,17 @@ pub fn status(root: &Path) -> Result<Status, StatusError> {
     })
 }
 
-/// does the ignore file exclude this INDEXED duckfs path? the rules are written
-/// against the checkout-relative path, so the index `prefix` comes off first.
+/// is this INDEXED duckfs path one the walk never reaches — a built-in skip, or
+/// excluded by the ignore file? the rules are written against the
+/// checkout-relative path, so the index `prefix` comes off first.
 fn is_ignored(ignore: &Ignore, path: &str, index: &Index) -> bool {
     let rel = path
         .strip_prefix(&index.prefix)
         .unwrap_or(path)
         .trim_start_matches('/');
+    if is_builtin_skip(rel) {
+        return true;
+    }
     let is_dir = index
         .entries
         .get(path)

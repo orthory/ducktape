@@ -367,3 +367,24 @@ fn a_socket_in_the_checkout_is_skipped_not_scanned_as_a_file() {
         "only the regular file is a change"
     );
 }
+
+/// a tree that somehow carries a `.git` path is not deleted by the skip: the
+/// walk never reaches it, so status must freeze it rather than report a removal
+/// the next commit would apply upstream.
+#[test]
+fn an_indexed_git_path_is_frozen_not_reported_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    fs::create_dir(root.join(".git")).unwrap();
+    fs::write(root.join(".git/config"), b"[core]").unwrap();
+    fs::write(root.join("a.txt"), b"content").unwrap();
+
+    let mut idx = Index::new(PREFIX, "http://node", None);
+    record_file(&mut idx, root, ".git/config", false);
+    record_file(&mut idx, root, "a.txt", false);
+    idx.save(root).unwrap();
+
+    let st = status(root).unwrap();
+    assert!(st.clean, "a skipped path is not a change: {st:?}");
+}

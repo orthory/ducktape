@@ -73,6 +73,20 @@ impl From<std::io::Error> for ScanError {
 /// not content.
 pub const IGNORE_FILE: &str = ".duckfsignore";
 
+/// what the walk never treats as content, whatever the ignore file says: the
+/// `.duckfs` state dir at the checkout ROOT (client bookkeeping, never
+/// replicated) and any `.git` at any depth (a checkout holding a git repo is the
+/// documented dogfooding shape, and its object store is not the user's content).
+///
+/// `rel` is relative to the checkout root. `status` asks the same question of an
+/// INDEXED path, so a tree that somehow carries one of these names sees it
+/// frozen rather than reported removed — a skip must never read as a deletion.
+pub(crate) fn is_builtin_skip(rel: &str) -> bool {
+    let is_state_dir = rel == ".duckfs" || rel.starts_with(".duckfs/");
+    let holds_git = rel.split('/').any(|seg| seg == ".git");
+    is_state_dir || holds_git
+}
+
 /// how a pattern is matched: `*` and `?` stop at a `/` (so `*.log` is a name
 /// pattern, not a path one), `**` spans components, and a leading dot is not
 /// special (`.cache` is matched by `*`, as gitignore matches it).
@@ -231,12 +245,8 @@ fn scan_dir(
             .to_str()
             .ok_or_else(|| ScanError::NonUtf8(path.display().to_string()))?;
 
-        // client bookkeeping and a git object store are never content: the
-        // `.duckfs` dir at the checkout root, and any `.git` (a checkout that
-        // holds a git repo is the documented dogfooding shape).
-        let is_state_dir = dir == root && name == ".duckfs";
-        let is_git = name == ".git";
-        if is_state_dir || is_git {
+        let rel = relative(root, &path)?;
+        if is_builtin_skip(&rel) {
             continue;
         }
 
@@ -247,7 +257,6 @@ fn scan_dir(
 
         // an ignored entry is dropped here, before it is emitted and before a
         // directory is descended into — pruned, not walked and filtered.
-        let rel = relative(root, &path)?;
         if ignore.matches(&rel, name, ft.is_dir()) {
             continue;
         }
