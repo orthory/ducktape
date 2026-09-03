@@ -1196,12 +1196,12 @@ impl ValidatorRuntime<'_> {
         {
             return;
         }
-        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
-        let Ok(bytes) = node.host().query(host::LIFECYCLE_MODULE_ID, &req).await else {
+        let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
+        let Ok(bytes) = node.host().query(host::MODULES_ID, &req).await else {
             return; // registry absent: byte-identical drain on a baseline net.
         };
-        let Ok(lifecycle::LifecycleReply::ModuleStatus { modules }) =
-            lifecycle::decode_reply(&bytes)
+        let Ok(modules::ModulesReply::ModuleStatus { modules }) =
+            modules::decode_reply(&bytes)
         else {
             return;
         };

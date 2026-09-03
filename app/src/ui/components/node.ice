@@ -598,7 +598,7 @@ component MatrixTick(on:bool)
 //
 // This is the INSTALLED half of the artifact's screen and nothing else. What is
 // built is what the chain publishes: `/v1/status` carries every registered
-// module's id and presentation category, and `LifecycleQuery::ModuleStatus`
+// module's id and presentation category, and `ModulesQuery::ModuleStatus`
 // carries the active code hash plus any scheduled swap with its activation
 // height and readiness signals.
 //
@@ -663,7 +663,7 @@ component ModulesPanel(rows:[ModuleRow])
 //
 // A pending swap is present exactly when `pending_hash` is non-empty; the row
 // carries no separate flag and none is invented. `code_hash` is likewise empty
-// on a network that runs no lifecycle module — every such row reads `—` for
+// on a network that runs no modules registry — every such row reads `—` for
 // code and still shows a true id, category and state root, because a hash
 // placeholder would name code we cannot prove is running.
 component ModuleCard(entry:ModuleRow)
@@ -723,7 +723,7 @@ component ModuleCard(entry:ModuleRow)
       if !empty(entry.pending_hash)
         ModulePendingPlate entry=entry
 
-// A labelled digest. An absent one reads `—`: on a network with no lifecycle
+// A labelled digest. An absent one reads `—`: on a network with no modules registry
 // module there is no active code hash to show, and printing a zeroed digest
 // would be a fabricated identity for the running code.
 component ModuleHashField(label:str, hash:str)
@@ -816,7 +816,7 @@ component ModuleSwapChip(ready:bool)
 // The scheduled swap, when there is one. `readiness` is the count of validators
 // that verified the target bytes and signalled; it carries NO denominator,
 // because the boundary member set it is measured against is not on the
-// lifecycle projection — so the count is shown as a count and the `ready` latch
+// registry projection — so the count is shown as a count and the `ready` latch
 // beside it is the answer to whether it is covered.
 component ModulePendingPlate(entry:ModuleRow)
   box #root

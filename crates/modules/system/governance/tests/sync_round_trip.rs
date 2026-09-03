@@ -126,7 +126,7 @@ async fn replies(m: &Governance) -> Vec<GovReply> {
 fn governance_over(store: Box<dyn sdk::MerkleStore>) -> Governance {
     Governance::new("governance", store, "valset", "identity")
         .with_invite_binding(BINDING)
-        .with_code_registry("lifecycle")
+        .with_code_registry("modules")
 }
 
 #[test]

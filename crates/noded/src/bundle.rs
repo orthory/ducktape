@@ -87,7 +87,7 @@ pub fn qmdb_stores<'a>(
 }
 
 /// the wasm-runtime [`host::ModuleFactory`]: a post-genesis ADMISSION
-/// (governance `RegisterModule` → lifecycle `ScheduleRegister`) instantiates its
+/// (governance `RegisterModule` → modules `ScheduleRegister`) instantiates its
 /// module from the verified component bytes at the activation boundary — the
 /// constructor twin of the code source.
 pub struct WasmModuleFactory;

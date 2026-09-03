@@ -45,7 +45,7 @@ governance = { workspace = true }
 # the resident-accept verb drives governance ops through the local rpc.
 # the network module-code registry. Height-gated live code swaps are realized
 # through the blobstore-backed CodeSource.
-lifecycle = { workspace = true }
+modules = { workspace = true }
 wasm-host = { workspace = true }
 saga = { workspace = true }
 # the network-wide node-capability registry + its wire surface; the host-side

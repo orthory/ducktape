@@ -53,9 +53,9 @@ pub struct Bindings<'a> {
     pub validators: &'a [Vec<u8>],
     /// module id → the sha256 of its genesis component: the code source is
     /// asked for these bytes (and the bytes are checked against the hash), and
-    /// lifecycle seeds its registry with them. PRECONDITION: the key set is
+    /// the `modules` registry seeds from them. PRECONDITION: the key set is
     /// EXACTLY the selection's wasm ids (`TOPOLOGY.wasm_ids(selection)`) —
-    /// every entry lands in the lifecycle root, so a stray extra key would
+    /// every entry lands in the modules root, so a stray extra key would
     /// move the genesis root; [`compose`] refuses any drift by name.
     pub code_hashes: &'a BTreeMap<String, [u8; 32]>,
 }
@@ -106,7 +106,7 @@ pub async fn compose(
 }
 
 /// the `code_hashes` key set is EXACTLY the selection's wasm ids: every entry
-/// seeds the lifecycle registry (a stray key moves the genesis root) and every
+/// seeds the modules registry (a stray key moves the genesis root) and every
 /// wasm tenant needs one (a missing key cannot compose). named both ways.
 fn check_code_hash_keys(
     selection: &[&'static str],
@@ -167,19 +167,19 @@ async fn native(
             }
             Ok(Box::new(valset))
         }
-        "lifecycle" => {
-            let mut registry = lifecycle::Lifecycle::new(spec.id, store, "valset");
+        "modules" => {
+            let mut registry = modules::Modules::new(spec.id, store, "valset");
             if is_genesis {
                 for (id, hash) in bindings.code_hashes {
                     registry
                         .seed(id.as_str(), hash.to_vec())
                         .await
-                        .map_err(|e| format!("lifecycle seed {id}: {e}"))?;
+                        .map_err(|e| format!("modules seed {id}: {e}"))?;
                 }
                 registry
                     .finish_seed()
                     .await
-                    .map_err(|e| format!("lifecycle seed: {e}"))?;
+                    .map_err(|e| format!("modules seed: {e}"))?;
             }
             Ok(Box::new(registry))
         }
@@ -214,7 +214,7 @@ async fn wasm(
     // a code source is a lookup, not a guarantee: the bytes are re-hashed here
     // exactly as the host's swap path re-checks them, so a lying source (a dir
     // keyed by filename, a stale blob) can never seat code whose `code_hash()`
-    // disagrees with the lifecycle entry seeded from the same map.
+    // disagrees with the registry entry seeded from the same map.
     let matches_hash = sha2::Sha256::digest(&bytes)[..] == hash[..];
     if !matches_hash {
         return Err(format!(

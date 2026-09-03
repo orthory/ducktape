@@ -83,6 +83,28 @@ pub(crate) fn hex(root: &StateRoot) -> String {
     duckfs_core::to_hex(&root.0)
 }
 
+/// every module the host runs, as the status projection reports it — the
+/// registry's sorted-id order, the same set and order the root-hash composes
+/// over. a module admitted after genesis is a row like any other.
+pub(crate) fn module_statuses(host: &host::Host) -> Vec<noded::ModuleStatus> {
+    host.module_roots()
+        .into_iter()
+        .map(|(id, root)| noded::ModuleStatus {
+            category: noded::ModuleCategory::of(&id),
+            root: hex(&root),
+            id,
+        })
+        .collect()
+}
+
+/// the same set as the rpc status's id → hex-root map.
+pub(crate) fn module_roots_hex(host: &host::Host) -> std::collections::BTreeMap<String, String> {
+    host.module_roots()
+        .into_iter()
+        .map(|(id, root)| (id, hex(&root)))
+        .collect()
+}
+
 pub(crate) fn unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

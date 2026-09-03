@@ -1399,7 +1399,7 @@ fn cast_yes_once(
 pub(super) enum CeremonyOutcome {
     /// passed and executed. what that execution CHANGED is the caller's to
     /// confirm: a membership set turns over at the next epoch cutover, a
-    /// module swap lands in the lifecycle registry.
+    /// module swap lands in the modules registry.
     Passed,
     /// this ballot landed but the proposal's frozen threshold is outstanding.
     AwaitingBallots,

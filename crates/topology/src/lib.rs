@@ -23,7 +23,7 @@
 //! the kernel (`host`) knows nothing of the product modules composed over it.
 
 /// Where a module's CODE comes from: compiled into the binary, or a wasm
-/// component the code registry (lifecycle) can swap at a height boundary.
+/// component the modules registry can swap at a height boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Code {
     Native,
@@ -155,7 +155,7 @@ const MODULES: &[ModuleSpec] = &[
     store("identity", CHAIN_ID),
     indexed_store("inbox", NONE),
     ModuleSpec { id: "kv", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false, index_guest: false },
-    ModuleSpec { id: "lifecycle", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false, index_guest: false },
+    ModuleSpec { id: "modules", config: NONE, code: Code::Native, backing: Backing::Store, committed_queries: false, index_guest: false },
     indexed_store("pages", NONE),
     ModuleSpec { id: "runs", config: CHAIN_ID, code: Code::Wasm, backing: Backing::Map, committed_queries: false, index_guest: false },
     indexed_store("saga", NONE),
@@ -175,7 +175,7 @@ pub const PRODUCTION: &[&str] = &[
     "valset",
     "acl",
     "governance",
-    "lifecycle",
+    "modules",
     "saga",
     "capability",
     "dispatch",
@@ -222,9 +222,9 @@ pub const SIM_BASE: &[&str] = &[
 /// AFTER `sim_base`, in registry order: the KV store, the membership registry
 /// seeded with the genesis validators, the acl policy table (empty =
 /// allow-all), governance (the sole authorized author of valset and acl
-/// change), and the lifecycle coordinator — whose mere registration makes the
+/// change), and the modules registry — whose mere registration makes the
 /// host-injected once-per-block boundary `Advance` ride every block.
-pub const SIM_VALSET: &[&str] = &["kv", "valset", "acl", "governance", "lifecycle"];
+pub const SIM_VALSET: &[&str] = &["kv", "valset", "acl", "governance", "modules"];
 
 /// The one topology value composers read.
 pub const TOPOLOGY: ModuleTopology = ModuleTopology {
@@ -265,7 +265,7 @@ mod tests {
             sorted(&[
                 "acl", "agent", "automations", "capability", "chat", "dispatch",
                 "files", "forge", "gateway", "governance", "identity", "inbox",
-                "lifecycle", "pages", "runs", "saga", "tagging", "tasks", "valset",
+                "modules", "pages", "runs", "saga", "tagging", "tasks", "valset",
             ])
         );
         assert_eq!(
@@ -277,7 +277,7 @@ mod tests {
         );
         assert_eq!(
             sorted(SIM_VALSET),
-            sorted(&["acl", "governance", "kv", "lifecycle", "valset"])
+            sorted(&["acl", "governance", "kv", "modules", "valset"])
         );
     }
 
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn shape_table_pins_native_odb_map_and_committed_queries() {
         let native: Vec<&str> = MODULES.iter().filter(|m| m.code == Code::Native).map(|m| m.id).collect();
-        assert_eq!(sorted(&native), ["kv", "lifecycle", "valset"]);
+        assert_eq!(sorted(&native), ["kv", "modules", "valset"]);
         let odb: Vec<&str> = MODULES.iter().filter(|m| m.backing == Backing::Odb).map(|m| m.id).collect();
         assert_eq!(sorted(&odb), ["files", "forge"]);
         let map: Vec<&str> = MODULES.iter().filter(|m| m.backing == Backing::Map).map(|m| m.id).collect();

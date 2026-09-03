@@ -16,7 +16,7 @@ fn fixtures() -> PathBuf {
 /// one `SnapshotSource` call's future.
 type SnapshotFut<'a> = BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>>;
 
-const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "lifecycle", "runs"];
+const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "modules", "runs"];
 
 fn run(body: impl FnOnce(commonware_runtime::tokio::Context, PathBuf) -> BoxFut<'static, ()>) {
     let dir = tempfile::tempdir().unwrap();
@@ -186,7 +186,7 @@ fn code_hash_drift_and_unknown_ids_are_refused_by_name() {
                 err.contains("not-a-module"),
                 "an unknown id is refused by name: {err}"
             );
-            // a stray extra hash would seed the lifecycle registry (and move
+            // a stray extra hash would seed the modules registry (and move
             // the genesis root) for a module the selection never composes.
             let extra = Bindings {
                 code_hashes: &with_extra,
@@ -225,7 +225,7 @@ impl host::CodeSource for LiarSource {
 }
 
 /// a code source is a lookup, not a guarantee: bytes that do not hash to the
-/// genesis entry never seat, or the running code and the lifecycle registry
+/// genesis entry never seat, or the running code and the modules registry
 /// would silently disagree.
 #[test]
 fn a_code_source_whose_bytes_miss_the_hash_is_refused() {

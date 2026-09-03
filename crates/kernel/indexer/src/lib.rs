@@ -520,7 +520,7 @@ impl IndexStore {
     fn apply_inner(&self, block: &BlockOps) -> Result<()> {
         // group by module, keeping the block-wide dispatch index as seq. a
         // module this store does not index — one admitted after boot by the
-        // lifecycle registry, whose guest (if any) is not bundled — writes no
+        // modules registry, whose guest (if any) is not bundled — writes no
         // rows: the index is a read model over the DECLARED tenants, and
         // skipping an undeclared op on every block leaves nothing torn.
         // refusing it poisoned every node on a real network for the rest of

@@ -5,7 +5,7 @@ use std::time::Duration;
 use super::{Cluster, FIXTURES};
 
 /// blocks a ceremony's activation is placed out: three sequential runs plus
-/// the readiness signals must all land under the lifecycle floor
+/// the readiness signals must all land under the registry floor
 /// (`height + MIN_SWAP_LEAD`) at execute time, and each validator beats one
 /// nop per block time, so a 3-founder chain ticks three blocks per block time while idle.
 /// it also bounds the MATCHER: run 1 joins run 0's

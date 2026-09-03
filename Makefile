@@ -298,6 +298,15 @@ wasm-modules:
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
 	cp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
+	# noop: the smallest compliant module, the admission fixture that touches
+	# nothing. Its component is committed beside the crate and pinned in the
+	# host fixtures, the hello shape.
+	cd crates/guests/noop-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/guests/noop-wasm/target/wasm32-unknown-unknown/release/noop_wasm.wasm \
+	  -o crates/guests/noop-wasm/component.wasm
+	cp crates/guests/noop-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/noop.component.wasm
 	cd crates/guests/hello-wasm-replacement && $(CARGO) build --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/hello-wasm-replacement/target/wasm32-unknown-unknown/release/hello_wasm_replacement.wasm \
@@ -321,6 +330,8 @@ wasm-modules-check:
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
 	cmp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
+	cmp crates/guests/noop-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/noop.component.wasm
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
 	  cmp $$m/component.wasm \

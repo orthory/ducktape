@@ -14,11 +14,11 @@ sdk = { workspace = true }
 sha2 = { workspace = true }
 async-trait = { workspace = true }
 # WIRE-TYPES-ONLY dep: the drain's boundary code-swap realization reads the
-# lifecycle module's committed active/pending hashes and injects the shared
+# modules registry's committed active/pending hashes and injects the shared
 # `Advance` tick. host uses only the crate-root wire types — it never
 # constructs or registers the module impl (same shape as governance reading
 # valset's wire types).
-lifecycle = { workspace = true }
+modules = { workspace = true }
 # WIRE-TYPES-ONLY dep, same shape: the drain's delivery injection reads
 # the dispatch module's committed mailbox count between blocks.
 dispatch = { workspace = true }
@@ -38,7 +38,7 @@ statesync = { workspace = true }
 # parity proofs' identity sibling).
 sdk-testkit = { workspace = true }
 # the live-code-update proof stands a real wasm module on the host and swaps its
-# component across a code-registry activation boundary (lifecycle is a normal dep).
+# component across a code-registry activation boundary (modules is a normal dep).
 wasm-host = { workspace = true }
 # the end-to-end test stands a real qmdb-backed module on the deterministic
 # runtime and drives it through the host.
@@ -56,7 +56,7 @@ tagging = { workspace = true }
 capability = { workspace = true }
 duckdns = { workspace = true }
 # the gateway/governance parity proofs stand the native modules (and their
-# native identity/valset/lifecycle siblings) beside the wasm ports.
+# native identity/valset/modules siblings) beside the wasm ports.
 gateway = { workspace = true }
 governance = { workspace = true }
 greeter = { workspace = true }

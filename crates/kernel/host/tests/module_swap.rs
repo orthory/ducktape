@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BlockContext, CodeSource, Host, LIFECYCLE_MODULE_ID};
-use lifecycle::{Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply};
+use host::{BlockContext, CodeSource, Host, MODULES_ID};
+use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
@@ -35,7 +35,7 @@ const HELLO_V1: &[u8] = include_bytes!("fixtures/hello.component.wasm");
 const HELLO_REPLACEMENT: &[u8] = include_bytes!("fixtures/hello-replacement.component.wasm");
 
 /// the swap boundary used throughout: far enough past genesis to clear
-/// `lifecycle::MIN_SWAP_LEAD` from the scheduling block.
+/// `modules::MIN_SWAP_LEAD` from the scheduling block.
 const H: u64 = 10;
 
 fn sha(bytes: &[u8]) -> Vec<u8> {
@@ -67,8 +67,8 @@ const MEMBER: [u8; 32] = [7; 32];
 /// as hello's genesis-active code.
 fn host_with_wasm() -> Host {
     let mut host = Host::new();
-    host.register(Box::new(Lifecycle::new(
-        LIFECYCLE_MODULE_ID,
+    host.register(Box::new(Modules::new(
+        MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
     )));
@@ -83,7 +83,7 @@ fn host_with_wasm() -> Host {
         &mut host,
         0,
         Origin::System,
-        lifecycle_msg(&LifecycleMsg::RegisterModule {
+        modules_msg(&ModulesMsg::RegisterModule {
             module_id: "hello".into(),
             code_hash: sha(HELLO_V1),
         }),
@@ -100,15 +100,15 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }
 
-fn lifecycle_msg(m: &LifecycleMsg) -> Msg {
+fn modules_msg(m: &ModulesMsg) -> Msg {
     Msg {
-        target: LIFECYCLE_MODULE_ID.into(),
-        payload: lifecycle::encode_msg(m),
+        target: MODULES_ID.into(),
+        payload: modules::encode_msg(m),
     }
 }
 
 fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
-    lifecycle_msg(&LifecycleMsg::ScheduleSwap {
+    modules_msg(&ModulesMsg::ScheduleSwap {
         name: "hello-replacement".into(),
         module_id: "hello".into(),
         activation_height,
@@ -119,7 +119,7 @@ fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
 /// the member's byte-receipt signal: what `code_announce` self-submits once
 /// the component is verified-resident. latches the swap `ready` (R = n = 1).
 fn signal_ready_msg() -> Msg {
-    lifecycle_msg(&LifecycleMsg::SwapReady {
+    modules_msg(&ModulesMsg::SwapReady {
         name: "hello-replacement".into(),
         module_id: "hello".into(),
     })
@@ -138,10 +138,10 @@ fn count(host: &Host) -> u64 {
 }
 
 fn active_hash(host: &Host) -> (Vec<u8>, bool) {
-    let req = lifecycle::encode_query(&LifecycleQuery::ModuleStatus);
-    let bytes = block_on(host.query(LIFECYCLE_MODULE_ID, &req)).expect("status");
-    match lifecycle::decode_reply(&bytes).expect("decode") {
-        LifecycleReply::ModuleStatus { modules } => {
+    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
+    match modules::decode_reply(&bytes).expect("decode") {
+        ModulesReply::ModuleStatus { modules } => {
             let m = modules
                 .iter()
                 .find(|m| m.module_id == "hello")
@@ -297,17 +297,17 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     assert!(!pending, "post-activation: nothing pending");
 
     // joiner: modreg rebuilt to the source's committed state (the real
-    // joiner pulls the qmdb op range — `lifecycle/tests/sync_round_trip.rs`
+    // joiner pulls the qmdb op range — `modules/tests/sync_round_trip.rs`
     // pins that wire; here the deterministic REPLAY of the same admin ops
     // reconstructs the identical record set over the MemStore double, and
     // the roots must agree), wasm module freshly wired from GENESIS (v1)
     // code.
     let modreg_root = source
-        .module_root(LIFECYCLE_MODULE_ID)
+        .module_root(MODULES_ID)
         .expect("modreg root");
     let mut joiner = Host::new();
-    joiner.register(Box::new(Lifecycle::new(
-        LIFECYCLE_MODULE_ID,
+    joiner.register(Box::new(Modules::new(
+        MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
     )));
@@ -322,7 +322,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
         &mut joiner,
         0,
         Origin::System,
-        lifecycle_msg(&LifecycleMsg::RegisterModule {
+        modules_msg(&ModulesMsg::RegisterModule {
             module_id: "hello".into(),
             code_hash: sha(HELLO_V1),
         }),
@@ -349,7 +349,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
         signal_ready_msg(),
     );
     assert_eq!(
-        joiner.module_root(LIFECYCLE_MODULE_ID).expect("modreg root"),
+        joiner.module_root(MODULES_ID).expect("modreg root"),
         modreg_root,
         "the replayed registry converges on the source's committed root"
     );

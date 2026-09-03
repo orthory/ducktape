@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BlockContext, CodeSource, Host, LIFECYCLE_MODULE_ID, ModuleFactory};
-use lifecycle::{Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply};
+use host::{BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
+use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
@@ -63,8 +63,8 @@ const MEMBER: [u8; 32] = [7; 32];
 /// anywhere: the module this proof admits does not exist at genesis.
 fn bare_host(with_factory: bool) -> Host {
     let mut host = Host::new();
-    host.register(Box::new(Lifecycle::new(
-        LIFECYCLE_MODULE_ID,
+    host.register(Box::new(Modules::new(
+        MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
     )));
@@ -87,15 +87,15 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }
 
-fn lifecycle_msg(m: &LifecycleMsg) -> Msg {
+fn modules_msg(m: &ModulesMsg) -> Msg {
     Msg {
-        target: LIFECYCLE_MODULE_ID.into(),
-        payload: lifecycle::encode_msg(m),
+        target: MODULES_ID.into(),
+        payload: modules::encode_msg(m),
     }
 }
 
 fn schedule_register_msg() -> Msg {
-    lifecycle_msg(&LifecycleMsg::ScheduleRegister {
+    modules_msg(&ModulesMsg::ScheduleRegister {
         name: "kanban-v1".into(),
         module_id: "kanban".into(),
         activation_height: H,
@@ -104,7 +104,7 @@ fn schedule_register_msg() -> Msg {
 }
 
 fn signal_ready_msg() -> Msg {
-    lifecycle_msg(&LifecycleMsg::SwapReady {
+    modules_msg(&ModulesMsg::SwapReady {
         name: "kanban-v1".into(),
         module_id: "kanban".into(),
     })
@@ -123,10 +123,10 @@ fn count(host: &Host) -> u64 {
 }
 
 fn kanban_entry(host: &Host) -> Option<(Vec<u8>, bool)> {
-    let req = lifecycle::encode_query(&LifecycleQuery::ModuleStatus);
-    let bytes = block_on(host.query(LIFECYCLE_MODULE_ID, &req)).expect("status");
-    match lifecycle::decode_reply(&bytes).expect("decode") {
-        LifecycleReply::ModuleStatus { modules } => modules
+    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
+    match modules::decode_reply(&bytes).expect("decode") {
+        ModulesReply::ModuleStatus { modules } => modules
             .iter()
             .find(|m| m.module_id == "kanban")
             .map(|m| (m.active_code_hash.clone(), m.pending.is_some())),
@@ -192,6 +192,58 @@ fn run_admission_scenario() -> (Host, StateRoot) {
 
     let final_hash = host.root_hash();
     (host, final_hash)
+}
+
+/// the smallest compliant module — two exports, no state, no events, no
+/// emitted messages — admits like any other and costs the network exactly one
+/// registry entry and one empty root in the root-hash: it runs over the empty
+/// store, an op is accepted as a no-op that never moves that root, and a
+/// query answers empty.
+#[test]
+fn a_module_that_touches_nothing_admits_over_the_empty_root_and_never_moves_it() {
+    const NOOP: &[u8] = include_bytes!("fixtures/noop.component.wasm");
+    let mut host = bare_host(true);
+    let src = MapSource::with(&[NOOP]);
+    submit(
+        &mut host,
+        3,
+        Origin::System,
+        modules_msg(&ModulesMsg::ScheduleRegister {
+            name: "noop-v1".into(),
+            module_id: "noop".into(),
+            activation_height: H,
+            code_hash: sha(NOOP),
+        }),
+    );
+    submit(
+        &mut host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        modules_msg(&ModulesMsg::SwapReady {
+            name: "noop-v1".into(),
+            module_id: "noop".into(),
+        }),
+    );
+    realize(&mut host, H, &src).expect("admission realizes at H");
+    let (_, empty_root) = wasm_host::initial_state(&[]);
+    assert_eq!(
+        host.module_root("noop"),
+        Some(empty_root),
+        "admitted over the empty store"
+    );
+
+    let any_op = Msg {
+        target: "noop".into(),
+        payload: b"anything".to_vec(),
+    };
+    submit(&mut host, H, Origin::External(vec![9; 32]), any_op);
+    assert_eq!(
+        host.module_root("noop"),
+        Some(empty_root),
+        "an accepted op moves nothing"
+    );
+    let reply = block_on(host.query("noop", b"anything")).expect("a query answers");
+    assert!(reply.is_empty(), "the answer is empty, got {reply:?}");
 }
 
 /// the headline proof: a module that did not exist at genesis goes LIVE at `H`
