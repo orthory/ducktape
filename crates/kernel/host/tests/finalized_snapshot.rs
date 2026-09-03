@@ -7,7 +7,7 @@
 //! a single module abort it stopped the whole node from doing either.
 
 use commonware_runtime::{Runner as _, deterministic};
-use host::{BlockContext, FinalizedBlock, Host, SnapshotError};
+use host::{BlockContext, CapturePayloads, FinalizedBlock, Host, SnapshotError};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 
 const BYTES_ID: &str = "bytes";
@@ -324,10 +324,11 @@ fn the_capture_cost_breakdown_covers_every_registered_module() {
         // cost is attributable and a per-module measurement is distinguishable
         // from one aggregate stamped onto everybody.
         let mut tick = std::time::Duration::ZERO;
-        let (_snapshot, capture_cost) = host.capture_current_snapshot(4, || {
-            tick += std::time::Duration::from_millis(1);
-            tick
-        });
+        let (_snapshot, capture_cost) =
+            host.capture_current_snapshot(4, CapturePayloads::All, || {
+                tick += std::time::Duration::from_millis(1);
+                tick
+            });
 
         let mut billed: Vec<&str> = capture_cost.iter().map(|(id, _)| id.as_str()).collect();
         billed.sort_unstable();

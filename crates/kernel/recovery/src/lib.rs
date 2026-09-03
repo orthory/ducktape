@@ -157,9 +157,11 @@ impl From<sdk::Error> for Error {
 /// replay metadata.
 const MAX_RECORD_FIELD_LEN: usize = 1 << 21; // 2 MiB: > the p2p frame cap + framing.
 
-/// A checkpoint embeds self-contained module snapshots. Forge snapshots carry
-/// a Git object closure and can legitimately exceed the operation/frame cap;
-/// keep their per-field decoder bound aligned with the smart-HTTP pack ceiling.
+/// A checkpoint embeds the IN-MEMORY cohort's self-contained snapshots — a
+/// module's whole state as one field, which is legitimately far larger than an
+/// operation/frame. The disk cohort (forge's git pack closure, the qmdb
+/// stores) is NOT here: it reopens its own substrate, so nothing in a manifest
+/// grows with a repository any more (#1308).
 const MAX_CHECKPOINT_FIELD_LEN: usize = 512 * 1024 * 1024;
 
 /// the sanity cap every count-prefixed list in this codec is read under: a
@@ -402,8 +404,12 @@ pub struct Manifest {
     /// every module's root at `height` — the replay baseline.
     pub roots: Vec<(ModuleId, StateRoot)>,
     /// canonical snapshot bytes for the modules that do NOT persist
-    /// themselves (the in-memory cohort), keyed by module id. the caller
-    /// decides the set; this crate stores bytes.
+    /// themselves (the in-memory cohort), keyed by module id. a disk-cohort
+    /// module (`sdk::Module::block_durable`) is deliberately absent: it
+    /// reopens its own substrate at boot and a restore installs nothing for
+    /// it, so its bytes here would be write amplification nothing reads
+    /// (#1308). [`Manifest::capture_timed`] asks the host for exactly that
+    /// cohort.
     pub snapshots: Vec<(ModuleId, Vec<u8>)>,
     /// the op-journal position at which this manifest was written; everything
     /// below the PREVIOUS manifest's position is prunable once the persisted
@@ -423,9 +429,9 @@ impl Manifest {
     /// REFUSES any field over it, so encoding one produces a checkpoint this
     /// node can never restore from — and writing it replaces the previous,
     /// still-restorable manifest and re-anchors the journal prune below a
-    /// boundary nothing can recover. The realistic overflow is a module
-    /// snapshot (forge's manifest embeds its whole git pack closure, #1308);
-    /// the key lists and the list COUNTS are checked because the same reader
+    /// boundary nothing can recover. The realistic overflow is an in-memory
+    /// module's snapshot; the key lists and the list COUNTS are checked
+    /// because the same reader
     /// refuses those too, and a refusal the writer cannot reach is a rule
     /// nobody keeps.
     ///
@@ -559,11 +565,11 @@ impl Manifest {
     }
 
     /// build a checkpoint manifest from a live host at a settled boundary.
-    /// reuses the statesync surface: every module that reports
-    /// [`sdk::StateSyncHandle::SnapshotBytes`] gets its bytes stored (the
-    /// in-memory cohort); disk-backed modules recover themselves and
-    /// contribute only their root. a local checkpoint IS a statesync capture
-    /// of your past self.
+    /// reuses the statesync surface, over the IN-MEMORY COHORT: every module
+    /// asked that reports [`sdk::StateSyncHandle::SnapshotBytes`] gets its
+    /// bytes stored. a disk-cohort module is not asked at all — it reopens its
+    /// own substrate at boot, contributes only its root, and asking would cost
+    /// a container the restore path discards (#1308).
     #[allow(clippy::too_many_arguments)]
     pub fn capture(
         host: &Host,
@@ -617,6 +623,14 @@ impl Manifest {
             // a genesis manifest has no boundary yet; 0 is a placeholder, not
             // a height.
             height.unwrap_or(0),
+            // THE IN-MEMORY COHORT ONLY. a disk-cohort module reopens its own
+            // substrate at its committed position and a restore installs
+            // nothing for it, so its container was captured, encoded and
+            // fsync'd into every checkpoint only to be thrown away on the way
+            // back in — forge's is its whole git pack closure, built on the
+            // consensus select loop (#1308). the ROOT is still captured: the
+            // position model compares live roots against it.
+            host::CapturePayloads::InMemoryCohort,
             now,
         );
         let root_hash = snapshot.root_hash;
@@ -1989,6 +2003,91 @@ mod tests {
             "every degraded module is named, not just the first: {msg}",
         );
         assert!(msg.contains("no pack for committed head"), "{msg}");
+    }
+
+    /// the disk cohort in miniature: per-block durable on its own substrate,
+    /// yet shipping ONE self-contained container as its sync surface — forge's
+    /// shape exactly (#1308), and the one where the two answers differ.
+    struct SelfDurableModule {
+        id: &'static str,
+        /// counts every `state_sync_handle` call: for forge each one is a full
+        /// git pack closure, built on the node's select loop.
+        payloads_built: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl sdk::Module for SelfDurableModule {
+        fn id(&self) -> ModuleId {
+            self.id.into()
+        }
+
+        fn root(&self) -> StateRoot {
+            StateRoot([11; 32])
+        }
+
+        fn block_durable(&self) -> bool {
+            true
+        }
+
+        fn state_sync_handle(&self) -> Result<sdk::StateSyncHandle, sdk::Error> {
+            self.payloads_built
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(sdk::StateSyncHandle::SnapshotBytes(vec![0xAB; 4096]))
+        }
+
+        async fn execute(
+            &mut self,
+            _ctx: &mut dyn sdk::Ctx,
+            _msg: &sdk::Msg,
+        ) -> Result<(), sdk::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_never_builds_or_stores_a_self_durable_module_payload() {
+        let built = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host = Host::genesis(vec![
+            Box::new(SelfDurableModule {
+                id: "forge",
+                payloads_built: built.clone(),
+            }),
+            Box::new(CountingModule {
+                id: "runs",
+                roots: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        ])
+        .expect("genesis");
+
+        let m = Manifest::capture(&host, Some(9), 0, 0, vec![], vec![], None, 0, 1)
+            .expect("the disk cohort is not degraded — it was never asked");
+
+        assert_eq!(
+            built.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a checkpoint must not build the container it throws away: that \
+             build is forge's whole pack closure, on the select loop",
+        );
+        assert_eq!(
+            m.snapshot("forge"),
+            None,
+            "restore reopens the disk cohort from its own substrate and \
+             installs nothing, so its bytes must never ride the manifest",
+        );
+        assert_eq!(
+            m.root("forge"),
+            Some(StateRoot([11; 32])),
+            "the ROOT still rides it — the position model compares against it",
+        );
+        assert_eq!(
+            m.snapshot("runs"),
+            Some([7].as_ref()),
+            "the in-memory cohort is still captured whole",
+        );
+
+        // THE READER ON THIS BRANCH READS WHAT THIS BRANCH WRITES.
+        assert!(m.check_field_caps().is_ok(), "writable");
+        assert_eq!(Manifest::decode(&m.encode()).expect("roundtrip"), m);
     }
 
     /// a module that COUNTS its own `root()` calls. for a map-backed module

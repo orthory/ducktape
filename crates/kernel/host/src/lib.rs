@@ -343,6 +343,28 @@ pub struct ModuleSnapshot {
     pub state_sync: StateSyncHandle,
 }
 
+/// what [`CapturePayloads::InMemoryCohort`] reports for the disk cohort.
+const SELF_DURABLE_NO_PAYLOAD: &str =
+    "per-block durable on its own disk: this capture materializes no payload for it";
+
+/// which modules a capture MATERIALIZES payload bytes for. every module's
+/// root and the composed root-hash are captured either way — this decides only
+/// whose `state_sync_handle` is asked, and asking is what costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturePayloads {
+    /// every module's: the boundary a JOINER installs the whole registry from.
+    All,
+    /// the in-memory cohort's only. a [`Module::block_durable`] module commits
+    /// to its OWN disk every block and reopens from it at boot — a checkpoint
+    /// restore installs nothing for one — so materializing its container is a
+    /// full re-encode of state the manifest never reads back. forge's is its
+    /// whole git pack closure, built on the consensus select loop and fsync'd
+    /// into every checkpoint (#1308). such a module is reported
+    /// [`StateSyncHandle::Unsupported`]: this capture holds no payload for it,
+    /// which is what the field means to every reader of a capture.
+    InMemoryCohort,
+}
+
 /// one module that could NOT prepare a sync surface at this boundary. its
 /// committed root is still known — `root()` is pure and cannot fail — so the
 /// boundary stays describable; only this module's transfer surface is missing.
@@ -876,9 +898,12 @@ impl Host {
         &self,
         finalized: FinalizedBlock,
     ) -> Result<FinalizedSnapshot, SnapshotError> {
-        self.snapshot_at(finalized.height, Some(finalized.root_hash), || {
-            Duration::ZERO
-        })
+        self.snapshot_at(
+            finalized.height,
+            Some(finalized.root_hash),
+            CapturePayloads::All,
+            || Duration::ZERO,
+        )
         .map(|(snapshot, _)| snapshot)
     }
 
@@ -897,9 +922,10 @@ impl Host {
     pub fn capture_current_snapshot(
         &self,
         height: u64,
+        payloads: CapturePayloads,
         now: impl FnMut() -> Duration,
     ) -> (FinalizedSnapshot, Vec<(ModuleId, Duration)>) {
-        self.snapshot_at(height, None, now)
+        self.snapshot_at(height, None, payloads, now)
             .expect("an unverified capture has no root to mismatch")
     }
 
@@ -911,6 +937,7 @@ impl Host {
         &self,
         height: u64,
         expected: Option<StateRoot>,
+        payloads: CapturePayloads,
         mut now: impl FnMut() -> Duration,
     ) -> Result<(FinalizedSnapshot, Vec<(ModuleId, Duration)>), SnapshotError> {
         let mut roots: Vec<(ModuleId, StateRoot)> = Vec::with_capacity(self.registry.len());
@@ -938,7 +965,18 @@ impl Host {
             .zip(capture_cost.iter_mut())
         {
             let started = now();
-            let handle = module.state_sync_handle();
+            // `block_durable` is only consulted where it can change the
+            // answer: its default impl reads `state_sync_handle`, and under
+            // `All` that would be a second (for forge, very expensive) call.
+            let reopens_from_own_disk =
+                matches!(payloads, CapturePayloads::InMemoryCohort) && module.block_durable();
+            let handle = if reopens_from_own_disk {
+                Ok(StateSyncHandle::Unsupported {
+                    reason: SELF_DURABLE_NO_PAYLOAD.into(),
+                })
+            } else {
+                module.state_sync_handle()
+            };
             cost.1 += now().saturating_sub(started);
             match handle {
                 Ok(state_sync) => modules.push(ModuleSnapshot {
