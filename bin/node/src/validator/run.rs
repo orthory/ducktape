@@ -182,6 +182,15 @@ struct ValidatorRuntime<'a> {
     status: noded::StatusCell,
     status_public_key: String,
     coordination: crate::config::Coordination,
+    /// read only by the SIGUSR1 task-dump arm, which exists on Linux alone.
+    #[cfg_attr(
+        not(all(
+            tokio_unstable,
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
     workspace: std::path::PathBuf,
     /// the earliest instant the NEXT `refresh_operations` may run — the
     /// exposition parse is the pricey part of a status publish, so it is

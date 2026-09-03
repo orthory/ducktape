@@ -131,10 +131,9 @@ indexer = { workspace = true }
 # the app-surface thread runs plain tokio (axum); the node itself stays on
 # commonware's runner. the promoted-validator boot catch-up also uses Tokio's
 # bounded mutex/timeout around the temporary statesync client; `signal` drives
-# the SIGTERM/SIGINT graceful-checkpoint arm of the run loop; `taskdump` is
-# required (with `--cfg tokio_unstable`) for `Handle::dump()`, the SIGUSR1
-# task dump — Linux x86_64/aarch64 only, cfg-gated at the call site.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-std", "io-util", "taskdump"] }
+# the SIGTERM/SIGINT graceful-checkpoint arm of the run loop. The `taskdump`
+# feature behind the SIGUSR1 task dump lives in the Linux-only table below.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-std", "io-util"] }
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
@@ -168,6 +167,14 @@ libc = { workspace = true }
 # each carries its own dependency. What is left is 4 crates, `console` being
 # the terminal one clap's own graph already pulls.
 dialoguer = { version = "0.12.0", default-features = false }
+
+# `taskdump` is required (with `--cfg tokio_unstable`) for `Handle::dump()`,
+# the SIGUSR1 task dump (src/task_dump.rs). tokio only compiles the feature on
+# Linux x86_64/aarch64 — a `compile_error!` everywhere else — so it is enabled
+# from a target table matching exactly the cfg the call site is gated on;
+# cargo unifies it with the feature set above for that target only.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tokio = { version = "1", features = ["taskdump"] }
 
 # App Nap opt-out (see main.rs `hold_macos_activity`): a desktop-spawned node
 # lives in the GUI app's coalition and would otherwise be timer-coalesced the
