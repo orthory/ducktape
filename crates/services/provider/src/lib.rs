@@ -1643,23 +1643,13 @@ impl Drop for ContextGuard {
 /// run-action lane while every read dies on the guest's own loopback.
 ///
 /// **The node entry is a whole http listener, not a read lane.** The VM has no
-/// NIC, so these tunnels ARE the guest's attack surface, and this one is wide.
-/// Reachable from any process in the guest, with no credential:
+/// NIC, so these tunnels ARE the guest's attack surface. Reachable from any
+/// process in the guest, with no credential:
 /// * the reads the plane exists for — `/v1/query`, `/v1/status`, `/v1/peers`,
 ///   `/v1/blocks`, `/v1/index/*`, the `/v1/files/*` duckfs reads, `/metrics`;
-/// * `/v1/submit` — NOT a scoped write: the handler discards the
-///   caller-supplied `origin` and the node re-signs the op with its OWN
-///   consensus key (`crates/noded/src/lib.rs:718`), so a guest can forge any
-///   module op under this node's identity, bypassing the per-run session
-///   signer that `crates/noded/src/agent_provision/session.rs` exists to
-///   provide. `/v1/submit/frame` needs a real signature and does not;
-/// * the routine writes — `/v1/invite` (mints an invite to this mesh),
-///   `/v1/files/` stage/commit/pin, `/v1/files/object/{path}` PUT and DELETE,
-///   `/v1/fs/workspaces` create + commit + delete, `/v1/services/hello`,
-///   `/v1/log-filter`, and the `/forge/{repo}` git receive-pack remote;
-/// * `/v1/term/sessions` — a guest can spawn an interactive terminal on this
-///   node, and with a `cred` in the body one on ANOTHER node
-///   (`term::create_remote`);
+/// * `/v1/submit/frame` — self-authenticating: the frame's own signature IS
+///   its origin, so a guest with no key can put nothing through it;
+/// * `/v1/services/hello`, volatile presence that ages out on its own TTL;
 /// * `/v1/ws` — no credential of any kind, and it carries the `logs` topic, so
 ///   a guest can read this operator's log ring;
 /// * EGRESS OFF THIS HOST — `/v1/gateway/proxy` dispatches a `GatewayJob::Http`
@@ -1668,12 +1658,15 @@ impl Drop for ContextGuard {
 ///   caller passes by sending no headers. `/v1/gateway/browser` likewise.
 ///
 /// Out of reach: every other port and every other address on this host (no
-/// listener is bound for them, with or without a NIC), and `/v1/admin/*` —
-/// which rides this same listener by design but whose own middleware wants the
-/// operator credential or an owner PoP, and a run's env is an allowlist that
-/// carries neither.
+/// listener is bound for them, with or without a NIC); `/v1/admin/*`; and
+/// EVERY MUTATING `/v1` ROUTE — `/v1/submit`, `/v1/invite`, the duckfs writes,
+/// the object facade's PUT/DELETE, `/v1/fs/workspaces`, `/v1/term/sessions`
+/// and `/v1/log-filter` all want either a per-request user signature or this
+/// node's operator credential (`noded::signed_req`), and a run's env is an
+/// allowlist that carries neither. The forge's `git-receive-pack` wants git's
+/// own push certificate, which a guest cannot mint either.
 ///
-/// Narrowing this to a scoped read lane is the open half of #1317, and this
+/// Narrowing the READS to a scoped lane is the open half of #1317, and this
 /// function is the one place such a lane would replace.
 fn wire_guest_tunnels(envs: &mut Vec<(String, String)>, broker_base: Option<&str>) -> Vec<u16> {
     let mut ports = Vec::new();

@@ -84,7 +84,13 @@ async fn run(
         node_key,
     } = compute;
     let node_key = node_key.to_vec();
-    let node = NodeLink::new(&http_base).with_forge_repo(service.storage_dir.join("forge-repo"));
+    // the workspace credential is what makes this daemon's WRITES land: every
+    // mutating `/v1` route refuses a caller holding neither it nor a user
+    // signature, and a lease heartbeat, a bid and a run's duckfs commit are the
+    // NODE's ops, not a person's.
+    let node = NodeLink::new(&http_base)
+        .with_forge_repo(service.storage_dir.join("forge-repo"))
+        .with_workspace_credential(&service.workspace);
 
     // the node must be ANSWERING before anything is discovered or reaped: a
     // daemon that boots first would otherwise reap against a socket that does

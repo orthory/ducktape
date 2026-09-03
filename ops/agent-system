@@ -101,6 +101,32 @@ const rememberedUrl = () => {
 let base;
 const nodeUrl = () => (base ??= localUrl(rememberedUrl()));
 
+// The node's own operator credential, when this box holds the workspace serving
+// the selected URL. Every MUTATING /v1 route refuses a caller that presents
+// neither it nor a per-request user signature; a URL with no local workspace
+// behind it (an explicit `use`, or DUCKTAPE_NODE) reads only, and the node's own
+// 401 names what is missing.
+let operator;
+const operatorToken = () => {
+  if (operator !== undefined) return operator;
+  operator = null;
+  try {
+    const registry = JSON.parse(
+      fs.readFileSync(path.join(duckHome, "registry.json"), "utf8"),
+    );
+    const active = registry.workspaces?.find((workspace) => workspace.id === registry.active);
+    if (active?.ports?.http && nodeUrl().endsWith(`:${active.ports.http}`)) {
+      const token = fs
+        .readFileSync(path.join(duckHome, "workspaces", active.id, "admin.token"), "utf8")
+        .trim();
+      if (token) operator = token;
+    }
+  } catch {
+    // no registry, no workspace dir, no credential — reads still work.
+  }
+  return operator;
+};
+
 const request = async (pathname, options = {}) => {
   let response;
   try {
@@ -113,12 +139,12 @@ const request = async (pathname, options = {}) => {
   return text ? JSON.parse(text) : null;
 };
 
-const post = (pathname, body) =>
-  request(pathname, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+const post = (pathname, body) => {
+  const headers = { "content-type": "application/json" };
+  const token = operatorToken();
+  if (token) headers["x-ducktape-admin-token"] = token;
+  return request(pathname, { method: "POST", headers, body: JSON.stringify(body) });
+};
 const query = (target, queryBody) => post("/v1/query", { target, query: queryBody });
 const submit = (target, payload) => post("/v1/submit", { target, payload });
 const receipt = (value) =>

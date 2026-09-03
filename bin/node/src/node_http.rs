@@ -11,18 +11,28 @@
 //! to `/v1/submit/frame`; its verified signer is the op's origin. `/v1/query`
 //! reads committed module state.
 
-/// Submit one module op over `/v1/submit` `{target, payload}` and return the
-/// commit height from the receipt. A non-2xx status carries the node's
-/// rejection string.
+/// Submit one NODE-AUTHORED module op over `/v1/submit` `{target, payload}` and
+/// return the commit height from the receipt. A non-2xx status carries the
+/// node's rejection string.
+///
+/// `workspace` is the node's own directory, and reading this boot's operator
+/// credential out of it is how the request authenticates: the route refuses a
+/// caller that presents neither that nor a user signature, and an announce IS
+/// the node's op — no user key would be the right actor for it. An unreadable
+/// credential is not a reason to give up early; the node's own 401 names it
+/// far better than a guess here would.
 pub(crate) fn submit(
     base: &str,
+    workspace: &std::path::Path,
     target: &str,
     payload: &serde_json::Value,
 ) -> Result<u64, Box<dyn std::error::Error>> {
-    let body = post(
+    let operator = noded::admin::read_operator_token(workspace).ok();
+    let body = post_with(
         base,
         "/v1/submit",
         &serde_json::json!({ "target": target, "payload": payload }),
+        operator.as_deref(),
     )?;
     receipt_height(&body)
 }
@@ -68,6 +78,20 @@ pub(crate) fn query(
         &serde_json::json!({ "target": target, "query": query }),
     )?;
     Ok(serde_json::from_str(&body)?)
+}
+
+/// This node's own consensus key, read from `/v1/status`.
+///
+/// Every data-plane signature is BOUND to it ([`noded::signed_req`]), so one
+/// minted for this node can never be replayed against another node the same key
+/// acts on. It comes from the node ITSELF rather than from a local workspace,
+/// which is what lets a signed verb work against a node this host holds no
+/// config for.
+pub(crate) fn node_public_key(base: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let status = get_json(base, "/v1/status").map_err(|failure| failure.to_string())?;
+    Ok(crate::config::unhex(
+        status["public_key"].as_str().unwrap_or_default(),
+    )?)
 }
 
 /// Why a node-local read did not produce an answer.
@@ -185,13 +209,28 @@ fn post(
     path: &str,
     body: &serde_json::Value,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    post_with(base, path, body, None)
+}
+
+/// [`post`] carrying the node's operator credential — what a MUTATING route
+/// wants from a caller that acts as the node rather than as a person.
+fn post_with(
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+    operator_token: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     // the SAME classifier the read lane uses: `submit`/`query` are how every
     // `user`/`agent`/`cred` verb reaches the node, and a down node used to
     // surface here as a raw `POST http://…: error sending request for url (…)`
     // while `service list` — one function away — said "the node is not running".
-    let resp = reqwest::blocking::Client::new()
+    let mut request = reqwest::blocking::Client::new()
         .post(format!("{base}{path}"))
-        .json(body)
+        .json(body);
+    if let Some(token) = operator_token {
+        request = request.header(noded::admin::ADMIN_TOKEN_HEADER, token);
+    }
+    let resp = request
         .send()
         .map_err(|error| transport_failure(path, &error).to_string())?;
     let status = resp.status();

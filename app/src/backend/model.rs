@@ -796,6 +796,25 @@ pub(crate) fn rpc_client(input: &str) -> Result<RpcClient, String> {
         return Ok(client.clone());
     }
     let client = RpcClient::new(&configured).map_err(String::from)?;
+    // The node's own operator credential, when this device holds the node's
+    // workspace: every MUTATING `/v1` route (a files commit, an invite mint, a
+    // frameless submit) refuses a caller that presents neither it nor a
+    // per-request user signature. The app already reads this same directory for
+    // the service-link token, and a node with no local workspace here is a
+    // REMOTE one — read-only from this device, which the node's own 401 says.
+    let client = match operator_token_for(&configured) {
+        Some(token) => client.with_operator_token(token),
+        None => client,
+    };
     clients.insert(configured, client.clone());
     Ok(client)
+}
+
+/// The `admin.token` of the node serving `endpoint`, if this device has its
+/// workspace registered.
+fn operator_token_for(endpoint: &str) -> Option<String> {
+    let (_, workspace) = super::shell::workspace_at(endpoint)?;
+    let token = std::fs::read_to_string(workspace.join("admin.token")).ok()?;
+    let token = token.trim().to_string();
+    (!token.is_empty()).then_some(token)
 }

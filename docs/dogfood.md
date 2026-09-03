@@ -73,14 +73,24 @@ strict no-fallback prompt path. Upload the prompt to a **validator** node
 (the one whose provider will execute); on the single-node dev workspace
 that's just your node.
 
+Both calls below MUTATE, so they carry a credential. `/v1` takes either a
+per-request user signature or this node's own operator credential — the secret
+it mints 0600 into its workspace at every boot — and a curl can only present the
+second. `<workspace>` is the directory holding `node.toml` (on the dev shape,
+the storage dir).
+
 ```sh
+OPERATOR="$(cat <workspace>/admin.token)"
+
 # 1. upload the prompt text as a blob; the receipt's digest IS the hash to pin
 curl -s <base>/v1/files/blob -X POST -H 'content-type: application/json' \
+  -H "x-ducktape-admin-token: $OPERATOR" \
   -d '"You are the dogfooding duck. Work the referenced spec."'
 # → {"digest":"<64-hex sha256>", ...}
 
 # 2. register, granting the full dogfood surface in ONE submit
-curl -s <base>/v1/submit -X POST -H 'content-type: application/json' -d '{
+curl -s <base>/v1/submit -X POST -H 'content-type: application/json' \
+  -H "x-ducktape-admin-token: $OPERATOR" -d '{
   "target": "agent",
   "payload": { "register_agent": {
     "agent_id": "dogfood",

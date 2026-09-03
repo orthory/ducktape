@@ -143,8 +143,11 @@ done
 
 # The channel both sides huddle in. The frameless submit lane stamps `origin`
 # as the author — this row is the room, not a person.
+# A mutating route takes either a user signature or the node's own operator
+# credential; this lane drives node 0 as its operator, from its storage dir.
 create=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_A/v1/submit" \
   -H 'content-type: application/json' \
+  -H "x-ducktape-admin-token: $(cat "$LANE/storage-0/admin.token")" \
   -d "{\"target\":\"chat\",\"payload\":{\"create_channel\":{\"channel_id\":\"$CHANNEL\",\"name\":\"Huddle lane\",\"post_policy\":\"open\"}},\"origin\":\"lane\"}")
 [ "$create" = "200" ] || die "creating #$CHANNEL was rejected [$create]"
 log "channel #$CHANNEL created"

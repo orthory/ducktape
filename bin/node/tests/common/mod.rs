@@ -1534,7 +1534,55 @@ impl Cluster {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> (u16, serde_json::Value) {
-        http_request(self.http_ports[idx], method, path, body)
+        let bytes = body
+            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+            .unwrap_or_default();
+        let (status, raw) = self.http_bytes(idx, method, path, "application/json", &bytes);
+        (
+            status,
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// the raw-bytes twin of [`Self::http`], carrying this node's operator
+    /// credential. EVERY mutating `/v1` route refuses a caller that presents
+    /// neither that nor a user signature, and a harness driving a node it owns
+    /// is exactly the local operator the credential names.
+    pub fn http_bytes(
+        &self,
+        idx: usize,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let token = self.operator_token(idx);
+        nettest::try_http_bytes_with(
+            self.http_ports[idx],
+            method,
+            path,
+            content_type,
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &token)],
+            body,
+        )
+        .expect("app-surface request")
+    }
+
+    /// node `idx`'s operator credential, read out of the workspace the node
+    /// minted it into at boot — the same file a real local daemon reads.
+    pub fn operator_token(&self, idx: usize) -> String {
+        noded::admin::read_operator_token(&self.workspace(idx))
+            .expect("the node minted an operator credential")
+    }
+
+    /// a duckfs transport for node `idx` whose writes it admits.
+    pub fn files(&self, idx: usize) -> duckfs_client::http::HttpNode {
+        let token = self.operator_token(idx);
+        duckfs_client::http::HttpNode::new(self.http_base(idx)).with_write_auth(
+            std::sync::Arc::new(move |_method, _path, _body| {
+                vec![(noded::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
+            }),
+        )
     }
 
     /// GET a raw TEXT body from node `idx`'s app surface — for non-json

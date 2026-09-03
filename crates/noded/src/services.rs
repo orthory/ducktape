@@ -286,9 +286,7 @@ impl HelloRefusal {
     pub fn message(self) -> String {
         match self {
             HelloRefusal::Malformed(detail) => detail.to_string(),
-            HelloRefusal::CatalogFull => {
-                "too many services are signaling to this node".into()
-            }
+            HelloRefusal::CatalogFull => "too many services are signaling to this node".into(),
         }
     }
 }
@@ -317,10 +315,14 @@ impl Hello {
     /// Reject a malformed hello at the boundary, naming one stable reason.
     pub fn validate(&self) -> Result<(), HelloRefusal> {
         if !kind_is_well_formed(&self.kind) {
-            return Err(HelloRefusal::Malformed("kind must be 1..32 chars of [a-z0-9-]"));
+            return Err(HelloRefusal::Malformed(
+                "kind must be 1..32 chars of [a-z0-9-]",
+            ));
         }
         if self.version.len() > MAX_VERSION_LEN || !item_is_well_formed(&self.version) {
-            return Err(HelloRefusal::Malformed("version must be 1..32 printable ascii chars"));
+            return Err(HelloRefusal::Malformed(
+                "version must be 1..32 printable ascii chars",
+            ));
         }
         // the build is no longer compared, but it IS rendered — `service
         // status` prints it — so it stays a validated trust boundary: a
@@ -332,7 +334,9 @@ impl Hello {
         // `core.abbrev = 40`. A cap that refused an honest daemon's own stamp
         // would be the same fail-closed trap the build gate was.
         if !item_is_well_formed(&self.build) {
-            return Err(HelloRefusal::Malformed("build must be 1..64 printable ascii chars"));
+            return Err(HelloRefusal::Malformed(
+                "build must be 1..64 printable ascii chars",
+            ));
         }
         let lists_ok = self.capabilities.len() <= MAX_CAPABILITIES
             && self.scopes.len() <= MAX_LIST_LEN
@@ -348,12 +352,16 @@ impl Hello {
             .chain(self.scopes.iter())
             .all(|item| item_is_well_formed(item));
         if !items_ok {
-            return Err(HelloRefusal::Malformed("each capability/scope must be 1..64 printable ascii chars"));
+            return Err(HelloRefusal::Malformed(
+                "each capability/scope must be 1..64 printable ascii chars",
+            ));
         }
         // a need names a KIND, so it obeys the kind grammar — that is what
         // makes it comparable against the grants without any normalizing.
         if !self.needs.iter().all(|need| kind_is_well_formed(need)) {
-            return Err(HelloRefusal::Malformed("each need must be a service kind (1..32 chars of [a-z0-9-])"));
+            return Err(HelloRefusal::Malformed(
+                "each need must be a service kind (1..32 chars of [a-z0-9-])",
+            ));
         }
         Ok(())
     }
@@ -471,14 +479,15 @@ fn expire(entries: &mut HashMap<String, Entry>, now: Instant) {
     });
 }
 
-// AUTH: both routes are registered on the daemon's `public` router, so they
-// inherit the SAME gate as `/v1/submit` and `/v1/term/sessions`:
-// `origin_guard::guard` + its CORS allowlist. That surface is trusted-local by
-// design (see `origin_guard`) — the CLI sends no `Origin` and is allowed; a
-// browser must present an allowlisted one. There is no bearer token because a
-// local process can already read the node's key off disk. Signaling is
-// deliberately unprivileged: an entry grants NOTHING, so the weakest gate on
-// the surface is the right one. Consent happens in `ducktape service enable`.
+// AUTH: a hello is DELIBERATELY the one write-shaped route with no credential —
+// it is not in the signed-write table (`crate::signed_req`) that `/v1/submit`
+// and `/v1/term/sessions` are, and it should not be. An entry grants NOTHING
+// (it is volatile presence that ages out on its own TTL; consent happens in
+// `ducktape service enable`), so the weakest gate on the surface is the right
+// one, and a daemon that has not yet read the node's workspace must still be
+// able to say it is up. What DOES run in front of it is the browser
+// `origin_guard` + CORS allowlist: the CLI sends no `Origin` and is allowed, a
+// browser must present an allowlisted one.
 //
 // NOTE the transport assumption: unlike `/v1/submit`, which carries a signed
 // frame and is therefore safe wherever it is reachable, a hello is
@@ -648,7 +657,9 @@ mod tests {
         assert!(catalog.hello(long_kind, now).is_err());
 
         let mut too_many = hello("compute");
-        too_many.capabilities = (0..MAX_CAPABILITIES + 1).map(|i| format!("tag{i}")).collect();
+        too_many.capabilities = (0..MAX_CAPABILITIES + 1)
+            .map(|i| format!("tag{i}"))
+            .collect();
         assert!(catalog.hello(too_many, now).is_err());
 
         let mut long_item = hello("compute");

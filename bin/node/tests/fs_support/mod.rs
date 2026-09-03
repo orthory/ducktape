@@ -45,6 +45,12 @@ impl Harness {
         self.daemon.node_url()
     }
 
+    /// a duckfs transport whose writes this node admits: the harness owns the
+    /// node, so it presents the operator credential the daemon minted.
+    pub fn files(&self) -> duckfs_client::http::HttpNode {
+        self.daemon.files()
+    }
+
     /// a `ducktape fs` invocation pre-pointed at this node via `--node`.
     pub fn cli(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ducktape"));

@@ -227,6 +227,11 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
     // this secret, so a workspace we cannot read is a session we could never
     // attach to — and failing here costs no container.
     let secret = workspace_secret(addr)?;
+    // spawning a pty MUTATES this node (a process, a container, a guest VM), so
+    // the create and close carry a credential like every other mutation. This
+    // CLI acts as the operator of the node it just addressed, and the proof is
+    // the same directory read the ws topic already needs.
+    let operator = workspace_operator(addr);
     let provider = resolve_provider(base, args.provider, args.cred.as_deref())?;
     let host_hex = match args.host_node.as_deref() {
         Some(hex) => Some(hex_bytes(&host_node_key(hex)?)),
@@ -235,6 +240,7 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
 
     let created = create_session(
         base,
+        operator.as_deref(),
         provider.token(),
         host_hex.as_deref(),
         args.cred.as_deref(),
@@ -262,7 +268,7 @@ fn cmd_pty(args: PtyArgs, base: &str, addr: &NodeAddr) -> AgentResult {
 
     // Best-effort close (idempotent host-side; the 4 h wall-clock + kill-on-drop
     // are the backstops if it never lands).
-    let _ = close_session(base, &created.session_id);
+    let _ = close_session(base, operator.as_deref(), &created.session_id);
     outcome
 }
 
@@ -277,6 +283,7 @@ struct Created {
 /// `a cross-node session requires --cred`, …) come back verbatim.
 fn create_session(
     base: &str,
+    operator: Option<&str>,
     provider: &str,
     node_hex: Option<&str>,
     cred: Option<&str>,
@@ -297,11 +304,14 @@ fn create_session(
         body["mem_gb"] = serde_json::Value::Number(mem_gb.into());
     }
 
-    let resp = reqwest::blocking::Client::new()
-        .post(format!("{base}/v1/term/sessions"))
-        .json(&body)
-        .send()
-        .map_err(|e| format!("POST {base}/v1/term/sessions: {e}"))?;
+    let resp = with_operator(
+        reqwest::blocking::Client::new()
+            .post(format!("{base}/v1/term/sessions"))
+            .json(&body),
+        operator,
+    )
+    .send()
+    .map_err(|e| format!("POST {base}/v1/term/sessions: {e}"))?;
     let status = resp.status();
     let text = resp.text().unwrap_or_default();
     if !status.is_success() {
@@ -319,12 +329,30 @@ fn create_session(
     Ok(Created { session_id, topic })
 }
 
-fn close_session(base: &str, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    reqwest::blocking::Client::new()
-        .post(format!("{base}/v1/term/sessions/{session_id}/close"))
-        .send()
-        .map_err(|e| format!("close session: {e}"))?;
+fn close_session(
+    base: &str,
+    operator: Option<&str>,
+    session_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    with_operator(
+        reqwest::blocking::Client::new()
+            .post(format!("{base}/v1/term/sessions/{session_id}/close")),
+        operator,
+    )
+    .send()
+    .map_err(|e| format!("close session: {e}"))?;
     Ok(())
+}
+
+/// attach the node's operator credential when this host could read it.
+fn with_operator(
+    request: reqwest::blocking::RequestBuilder,
+    operator: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    match operator {
+        Some(token) => request.header(noded::admin::ADMIN_TOKEN_HEADER, token),
+        None => request,
+    }
 }
 
 /// Attach this terminal to the session's ws output topic and forward keystrokes
@@ -725,6 +753,17 @@ fn control_outcome(lane: ControlLane, verb: ControlVerb, run_id: &str, height: u
 /// The DIRECTORY comes from the shared addressing ladder
 /// ([`NodeAddr::workspace`]), so "which node" is answered once for both the url
 /// this CLI dials and the files behind it.
+/// this boot's operator credential for the node being addressed — the second
+/// thing behind that same 0600 directory, and what a MUTATING `/v1` route wants
+/// from a caller acting as the node's operator rather than as an account.
+///
+/// `None` rather than an error: an unreadable credential surfaces as the node's
+/// own 401, which names it precisely, instead of a guess made one layer early.
+fn workspace_operator(addr: &NodeAddr) -> Option<String> {
+    let workspace = addr.workspace().ok()?;
+    noded::admin::read_operator_token(&workspace).ok()
+}
+
 fn workspace_secret(addr: &NodeAddr) -> Result<String, Box<dyn std::error::Error>> {
     let workspace = addr
         .workspace()

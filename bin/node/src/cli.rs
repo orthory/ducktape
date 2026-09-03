@@ -52,9 +52,7 @@ fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
         key: args.key,
     };
     let base = ctx.http_base()?;
-    let status =
-        crate::node_http::get_json(&base, "/v1/status").map_err(|failure| failure.to_string())?;
-    let node_key = unhex(status["public_key"].as_str().unwrap_or_default())?;
+    let node_key = crate::node_http::node_public_key(&base)?;
     let mut stdin = std::io::BufReader::new(std::io::stdin());
     let signer = crate::userkey_cli::load_user_signer(&ctx.key_path()?, &mut stdin)?;
 

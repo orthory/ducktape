@@ -93,6 +93,15 @@ impl Daemon {
 
     /// POST the graceful-exit route with this daemon's operator credential —
     /// the ONLY thing that may drive it.
+    /// a duckfs transport whose writes this daemon admits.
+    fn files(&self) -> duckfs_client::http::HttpNode {
+        let token = self.admin_token.clone();
+        duckfs_client::http::HttpNode::new(format!("http://127.0.0.1:{}", self.port))
+            .with_write_auth(std::sync::Arc::new(move |_method, _path, _body| {
+                vec![(noded::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
+            }))
+    }
+
     fn admin_shutdown(&self) -> Option<u16> {
         nettest::http_status_with(
             self.port,
@@ -142,7 +151,35 @@ impl Daemon {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> std::io::Result<(u16, serde_json::Value)> {
-        nettest::try_http_json(self.port, method, path, body)
+        let bytes = body
+            .map(|b| serde_json::to_vec(b).expect("request body serializes"))
+            .unwrap_or_default();
+        let (status, raw) = self.try_bytes(method, path, "application/json", &bytes)?;
+        Ok((
+            status,
+            serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null),
+        ))
+    }
+
+    /// every request this harness makes carries the daemon's own operator
+    /// credential. The harness OWNS this daemon, so it is the local operator
+    /// the credential names — and every mutating `/v1` route now refuses a
+    /// caller holding neither it nor a user signature.
+    fn try_bytes(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: &str,
+        body: &[u8],
+    ) -> std::io::Result<(u16, Vec<u8>)> {
+        nettest::try_http_bytes_with(
+            self.port,
+            method,
+            path,
+            content_type,
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &self.admin_token)],
+            body,
+        )
     }
 
     fn request(
@@ -187,7 +224,7 @@ impl Daemon {
             "POST",
             &format!("/v1/index/{module}/view"),
             "application/json",
-            &[],
+            &[(noded::admin::ADMIN_TOKEN_HEADER, &self.admin_token)],
             &body,
         )
         .expect("daemon reachable");
@@ -226,7 +263,8 @@ impl Daemon {
     /// BYTES exactly as received. the json helpers above lossy-decode the
     /// whole response as utf-8, which would corrupt binary chunk bodies.
     fn request_bytes(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
-        nettest::http_bytes(self.port, method, path, "application/octet-stream", body)
+        self.try_bytes(method, path, "application/octet-stream", body)
+            .expect("daemon reachable")
     }
 
     /// open /v1/ws with a minimal rfc6455 client handshake and return the
@@ -2159,12 +2197,13 @@ fn git_push_larger_than_post_buffer_uses_the_probe_path() {
 fn duckfs_engine_round_trips_and_reports_conflict_through_http_node() {
     use duckfs_client::checkout::{CheckoutOptions, checkout_with};
     use duckfs_client::commit::{CommitError, commit};
-    use duckfs_client::http::HttpNode;
 
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
     let base_url = format!("http://127.0.0.1:{}", daemon.port);
-    let node = HttpNode::new(base_url.clone());
+    // the harness owns this daemon, so its duckfs writes carry the operator
+    // credential the daemon minted at boot.
+    let node = daemon.files();
     let opts = CheckoutOptions {
         node_url: base_url.clone(),
         ..Default::default()

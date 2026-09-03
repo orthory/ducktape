@@ -202,7 +202,7 @@ impl Selector {
 /// `--node` is an http base here and means nothing else anywhere: the `agent`
 /// family's host targeting — which PEER runs the work, a raw 64-hex node key —
 /// is `--host-node`, because it is a different type of input.
-#[derive(Debug, Default, clap::Args)]
+#[derive(Debug, Default, Clone, clap::Args)]
 pub struct NodeAddr {
     /// the node's http base url (wins over -n/--network and DUCKTAPE_NODE)
     #[arg(long, value_name = "HTTP-URL", global = true)]

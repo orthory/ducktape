@@ -158,6 +158,9 @@ pub(crate) struct CommitArgs {
     pub no_rebase: bool,
     #[command(flatten)]
     pub addr: NodeAddr,
+    /// the user key that signs the write (default: the active wallet)
+    #[arg(long, value_name = "PATH")]
+    pub key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -168,6 +171,9 @@ pub(crate) struct PinArgs {
     pub name: String,
     #[command(flatten)]
     pub addr: NodeAddr,
+    /// the user key that signs the write (default: the active wallet)
+    #[arg(long, value_name = "PATH")]
+    pub key: Option<std::path::PathBuf>,
 }
 
 /// `main` installs a subscriber only for `node run`, so a one-shot verb would
