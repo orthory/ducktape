@@ -33,6 +33,8 @@ pub struct ForgeItemData {
     pub state: String,
     pub kind: String,
     pub body: String,
+    /// the body through the chat tokenizer — links included.
+    pub blocks: Vec<ChatBlock>,
     pub author_name: String,
     pub branches: String,
     pub channel_id: String,
@@ -177,6 +179,7 @@ pub async fn load_forge_item(
             state: view.state,
             kind: view.kind,
             body: view.body,
+            blocks: view.blocks,
             author_name: view.author_name,
             branches,
             channel_id: view.channel_id,
@@ -2732,5 +2735,13 @@ pub fn keep_forge_reviews(
     next: Vec<ForgeReview>,
     current: Vec<ForgeReview>,
 ) -> Vec<ForgeReview> {
+    if loaded { next } else { current }
+}
+
+pub fn keep_chat_blocks(
+    loaded: bool,
+    next: Vec<ChatBlock>,
+    current: Vec<ChatBlock>,
+) -> Vec<ChatBlock> {
     if loaded { next } else { current }
 }

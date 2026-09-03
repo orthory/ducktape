@@ -114,7 +114,13 @@ fn loaded_module() -> Result<RunsModule, host::Error> {
     )
     .with_files_module(FILES_ID)
     .with_sink_forge(FORGE_ID)
-    .with_pages_module(PAGES_ID);
+    .with_pages_module(PAGES_ID)
+    // the per-network parameter a fixed component cannot compile in: the host
+    // installed it as this Map tenant's genesis state (`__config`), and every
+    // `duck://` link the injector renders stamps its `?net=` half from it. a
+    // missing or malformed record is host wiring corruption, refused
+    // deterministically rather than silently producing network-less links.
+    .with_chain_id(guest_adapter::genesis_chain_id(MODULE_ID)?);
     if let Some((bytes, root)) = load_state() {
         module
             .install(&bytes, StateRoot(root))

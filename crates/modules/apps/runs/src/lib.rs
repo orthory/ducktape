@@ -518,6 +518,14 @@ pub struct RunsModule {
     /// pages; page refs then compose no page section (a silent skip, never
     /// a failure).
     pages: Option<ModuleId>,
+    /// this network's chain id, from the genesis `__config` record
+    /// (`topology::CONFIG_CHAIN_ID`) — the ONLY way a fixed component learns
+    /// which network it is running on. Genesis config, NOT committed state
+    /// (never in `root()`). Every `duck://` link this module renders into an
+    /// agent's context stamps its `?net=` half from it; empty (dev tools,
+    /// tests) renders the hand-typed form, which resolves against whichever
+    /// network the reader is on.
+    chain_id: String,
     /// committed state — what `root()` and the root-hash commit to.
     watches: BTreeMap<String, TurnPolicy>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
@@ -607,6 +615,7 @@ impl RunsModule {
             forge: None,
             files: None,
             pages: None,
+            chain_id: String::new(),
             watches: BTreeMap::new(),
             pending: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -670,6 +679,21 @@ impl RunsModule {
         );
         self.pages = Some(pages);
         self
+    }
+
+    /// wire this network's chain id, after construction — mirrors the injected
+    /// collaborators so `new` and every existing call site stay untouched. the
+    /// guest reads it out of the genesis `__config` record; unwired, produced
+    /// links carry no `?net=`.
+    pub fn with_chain_id(mut self, chain_id: impl Into<String>) -> Self {
+        self.chain_id = chain_id.into();
+        self
+    }
+
+    /// the `?net=` every `duck://` link this module produces carries — the
+    /// chat client's one spelling of the query, never a second dialect.
+    pub(crate) fn net_query(&self) -> String {
+        chat::client::duck_net_query(&self.chain_id)
     }
 
     // ---- staged-over-committed reads ---------------------------------------

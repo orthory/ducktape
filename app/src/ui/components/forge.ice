@@ -964,7 +964,9 @@ component DiffCount(additions:i64, deletions:i64, files:i64)
 // is a person or a machine — `ItemDetail` carries the author's display name and
 // not the handle it is derived from, so the plate would have to guess. It is
 // left out rather than drawn as a lie.
-component IssueBodyCard(author:str, body:str)
+component IssueBodyCard(author:str, blocks:[ChatBlock])
+  emits
+    open_message_link(str)
   box #root
     with
       w=fill
@@ -1011,12 +1013,13 @@ component IssueBodyCard(author:str, body:str)
           pr=15.0
           pt=13.0
           pb=13.0
-        text body
-          with
-            w=fill
-            size=13.0
-            line-h=1.6
-            @text-accent_fg
+        // AN ISSUE BODY IS MARKDOWN, like every other body in the product:
+        // the chat tokenizer's blocks through the chat renderer, so a
+        // `duck://` ref or a pasted URL in a description is openable instead
+        // of being dead ink.
+        RichBody blocks=blocks size=13.0
+          forward
+            open_message_link
 
 // ── MERGE ─────────────────────────────────────────────────────────────────
 
@@ -1537,6 +1540,8 @@ component DiffRow(line:DiffLine)
 // A review that is in state is finalized by construction, so the chip claims
 // exactly what it can prove.
 component ReviewCard(review:ForgeReview)
+  emits
+    open_message_link(str)
   box #root
     with
       w=fill
@@ -1583,12 +1588,9 @@ component ReviewCard(review:ForgeReview)
         space w=fill
         FinalityChip height=review.created_at
       if !empty(review.body)
-        text review.body
-          with
-            w=fill
-            size=13.0
-            line-h=1.55
-            @text-accent_fg
+        RichBody blocks=review.blocks size=13.0
+          forward
+            open_message_link
       for comment in review.comments
         box
           with
@@ -1620,12 +1622,9 @@ component ReviewCard(review:ForgeReview)
                   wrap=none
                   font=code_semibold
                   @text-label
-            text comment.body
-              with
-                w=fill
-                size=12.0
-                line-h=1.55
-                @text-accent_fg
+            RichBody blocks=comment.blocks size=12.0
+              forward
+                open_message_link
 
 // The verdict in its own tone: approval is the success ink, a change request is
 // the refusal ink, a comment is neither.

@@ -330,9 +330,9 @@ extern crate::backend
   ForgeItem(number:i64, kind:str, state:str, title:str, author:str, author_name:str)
   ForgeData(generation:i64, repos:[ForgeRepo])
   ForgeRepoData(generation:i64, repo:str, branches:[str], items:[ForgeItem])
-  ForgeReviewComment(anchor:str, body:str)
-  ForgeReview(author:str, author_name:str, verdict:str, body:str, commit:str, outdated:bool, created_at:i64, comments:[ForgeReviewComment])
-  ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, author_name:str, branches:str, channel_id:str, source_branch:str, source_oid:str, target_oid:str, merge_oid:str, diff:str, diff_truncated:bool, files_changed:i64, additions:i64, deletions:i64, reviews:[ForgeReview], approvals:i64, change_requests:i64)
+  ForgeReviewComment(anchor:str, body:str, blocks:[ChatBlock])
+  ForgeReview(author:str, author_name:str, verdict:str, body:str, blocks:[ChatBlock], commit:str, outdated:bool, created_at:i64, comments:[ForgeReviewComment])
+  ForgeItemData(generation:i64, repo:str, number:i64, title:str, state:str, kind:str, body:str, blocks:[ChatBlock], author_name:str, branches:str, channel_id:str, source_branch:str, source_oid:str, target_oid:str, merge_oid:str, diff:str, diff_truncated:bool, files_changed:i64, additions:i64, deletions:i64, reviews:[ForgeReview], approvals:i64, change_requests:i64)
   ForgeDiscussionData(channel_id:str, messages:[ChatMessage], members:[ChatMember])
   ForgeMergeOutcome(merged:bool, merge_oid:str, conflicts:[str])
   ForgeLiveData(generation:i64, repos_loaded:bool, repos:[ForgeRepo], repo_loaded:bool, branches:[str], items:[ForgeItem], item_loaded:bool, item:ForgeItemData)
@@ -469,6 +469,7 @@ extern crate::backend
   pure keep_branches(loaded:bool, next:[str], current:[str]) -> [str]
   pure keep_forge_items(loaded:bool, next:[ForgeItem], current:[ForgeItem]) -> [ForgeItem]
   pure keep_forge_reviews(loaded:bool, next:[ForgeReview], current:[ForgeReview]) -> [ForgeReview]
+  pure keep_chat_blocks(loaded:bool, next:[ChatBlock], current:[ChatBlock]) -> [ChatBlock]
   pure initial_channel_reads(channels:[ChatChannel], existing:[ChannelRead]) -> [ChannelRead]
   pure frozen_unread_boundary(reads:[ChannelRead], channels:[ChatChannel], current_channel:str, next_channel:str, current_boundary:i64) -> i64
   pure first_unread_seq(messages:[ChatMessage], boundary:i64) -> i64

@@ -17,7 +17,7 @@ enum ForgeTreePhase
   ready
   failed
 
-component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, linked_note:ChatMessage?, connected:bool, loading:bool, dark:bool)
+component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_blocks:[ChatBlock], forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, linked_note:ChatMessage?, connected:bool, loading:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -438,7 +438,9 @@ component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connec
                       deletions=forge_item_deletions
                       files=forge_item_files_changed
               if !empty(forge_item_body)
-                IssueBodyCard author=forge_item_author body=forge_item_body
+                IssueBodyCard author=forge_item_author blocks=forge_item_blocks
+                  forward
+                    open_message_link
               if !empty(forge_item_diff)
                 col w=fill gap=6.0
                   if forge_item_diff_truncated
@@ -524,6 +526,8 @@ component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connec
                     text "No reviews yet." size=12.5 @text-caption
                   for review in forge_item_reviews
                     ReviewCard review=review
+                      forward
+                        open_message_link
                   row
                     with
                       w=fill

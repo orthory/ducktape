@@ -87,8 +87,21 @@ use wasm_host::WasmModule;
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const RUNS_WASM: &[u8] = include_bytes!("fixtures/runs.component.wasm");
 
+/// the chain id both hosts run on — the genesis `__config` parameter the
+/// composer installs into this Map tenant, and the network every `duck://`
+/// link the injector renders names. Both sides take it, or the two disagree
+/// on the `?net=` of a rendered page link.
+const PARITY_CHAIN_ID: &str = "parity#d0cdf950";
+
 fn wasm_runs() -> WasmModule {
-    WasmModule::from_bytes("runs", RUNS_WASM).expect("load component")
+    let mut module = WasmModule::from_bytes("runs", RUNS_WASM).expect("load component");
+    // exactly what `noded::compose` seeds a Map-backed network-bound tenant
+    // with at genesis; without it the guest refuses every dispatch.
+    let config = sdk::genesis_config::encode_config(&[("chain_id", PARITY_CHAIN_ID.as_bytes())]);
+    let (bytes, root) =
+        wasm_host::initial_state(&[(sdk::genesis_config::CONFIG_KEY, config.as_slice())]);
+    module.install(&bytes, root).expect("seed genesis config");
+    module
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`) — the exact
@@ -107,6 +120,7 @@ fn native_runs() -> RunsModule {
     .with_files_module("files")
     .with_sink_forge("forge")
     .with_pages_module("pages")
+    .with_chain_id(PARITY_CHAIN_ID)
 }
 
 /// the shared native sibling set under the production ids. `chat_label` /
