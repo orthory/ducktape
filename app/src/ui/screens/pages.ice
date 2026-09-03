@@ -29,7 +29,7 @@
 // the very defect the body just lost: you had to CLICK the title to edit it.
 // As line 0 it needs no control at all, and Enter at its end / Backspace at the
 // body's start are ordinary text edits that cross the boundary for free.
-component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:MutationPhase, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, block_autosave_status:AutosaveStatus, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], commented_block_hits:[str], caret_comment_target:str, active_thread_target:str, active_thread_anchor:str, orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_rows:[PageCommentThreadRow], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
+component PagesScreen(network_chain_id:str, pages:[PageItem], page_create_open:bool, loading:bool, mutation_phase:MutationPhase, connected:bool, connected_rpc:str, password:str, dark:bool, bind page_draft:str, active_page:str, active_page_title:str, active_page_parent:str, bind page_search_draft:str, page_searching:bool, page_search_hits:[PageSearchHit], page_search_query:str, page_delete_armed:bool, block_autosave_status:AutosaveStatus, page_refusal:str, doc_tabs:[str], blocks:[PageBlock], commented_block_hits:[str], caret_comment_target:str, active_thread_target:str, active_thread_anchor:str, orphaned_comment_drafts:[str], bind page_editor:editor, block_comments_open:bool, block_comment_thread_total:i64, block_comment_threads:[PageCommentThread], block_comment_rows:[PageCommentThreadRow], block_comment_threads_loading:bool, block_comment_threads_has_more:bool, active_block_comment_thread:str, block_thread_comments:[PageComment], block_thread_comments_loading:bool, block_thread_comments_has_more:bool, bind block_comment_draft:str)
   emits
     toggle_page_create()
     create_page_submit()
@@ -52,6 +52,7 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
     close_block_comment_thread()
     load_more_block_comments()
     post_block_comment_submit()
+    copy_to_clipboard(str, str)
   row w=fill h=fill
     box
       with
@@ -285,6 +286,31 @@ component PagesScreen(pages:[PageItem], page_create_open:bool, loading:bool, mut
                   active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                   hovered bg=fg/8 text=fg border=fg/10
                   pressed bg=fg/12 text=fg
+                // A page id is a uuid, so this button is the only way a
+                // member gets a page's address out of the app at all. The
+                // link it copies names the network it belongs to.
+                button -> emit(copy_to_clipboard, duck_page_link(active_page, network_chain_id), "Page link copied")
+                  with
+                    label="Copy page link"
+                    disabled=empty(active_page)
+                    w=28.0
+                    h=28.0
+                    p=0.0
+                    @icon_action
+                  box
+                    with
+                      w=fill
+                      h=fill
+                      align-x=center
+                      align-y=center
+                    Icon
+                      with
+                        name="link"
+                        tone="label"
+                        px=14.0
+                  active bg=transparent text=muted r=7.0
+                  hovered bg=fg/10 text=fg
+                  pressed bg=fg/15
                 // The trigger STAYS a trigger: arming opens the named
                 // confirm dialog below — it must never swap the red
                 // button in under the same cursor.

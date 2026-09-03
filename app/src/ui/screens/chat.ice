@@ -149,7 +149,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               open_thread_message_reactions
               open_message_link
 
-component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
+component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
   lifetime retained
   emits
     search_chat_submit()
@@ -167,6 +167,7 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
     load_more_history()
     chat_scrolled(f64, f64, f64, f64)
     open_message_link(str)
+    copy_to_clipboard(str, str)
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
     open_thread_for(i64)
@@ -944,6 +945,46 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                                     active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
                                     hovered bg=fg/8 text=fg
                                     pressed bg=fg/12 text=fg
+                                  // COPY LINK. A message has no address a
+                                  // member could type: the channel id is a
+                                  // uuid and the seq is nowhere on screen, so
+                                  // this row is the only way one leaves the
+                                  // app. The built link names its network, so
+                                  // pasted into a workspace on another chain
+                                  // it refuses instead of opening that
+                                  // chain's message 42.
+                                  button -> emit(copy_to_clipboard, duck_channel_message_link(active_channel, selected_message_seq, network_chain_id), "Message link copied")
+                                    with
+                                      label="Copy message link"
+                                      w=fill
+                                      h=30.0
+                                      p=0.0
+                                      @ghost_action
+                                    box
+                                      with
+                                        w=fill
+                                        h=fill
+                                        pl=9.0
+                                        pr=9.0
+                                        align-y=center
+                                      row
+                                        with
+                                          w=fill
+                                          gap=9.0
+                                          align=center
+                                        Icon
+                                          with
+                                            name="link"
+                                            tone="muted"
+                                            px=14.0
+                                        text "Copy link"
+                                          with
+                                            size=12.5
+                                            wrap=none
+                                            @text-accent_fg
+                                    active bg=transparent text=muted border=transparent border-w=1.0 r=7.0
+                                    hovered bg=fg/8 text=fg
+                                    pressed bg=fg/12 text=fg
                                   button -> emit(begin_message_edit, selected_message_seq, message_edit_draft, selected_message_rev)
                                     with
                                       label="Edit message"
@@ -1397,6 +1438,15 @@ component ChatScreen(endpoint:str, network_name:str, status:str, block_height:i6
                           h=29.0
                           p=6.0
                           @secondary_action
+                  // A channel id is a uuid: this is the only place a member
+                  // can get one out of the app. The link names its network.
+                  button "Copy channel link" -> emit(copy_to_clipboard, duck_channel_link(active_channel, network_chain_id), "Channel link copied")
+                    with
+                      label="Copy channel link"
+                      w=fill
+                      h=29.0
+                      p=6.0
+                      @secondary_action
                   col w=fill gap=6.0
                     row
                       with

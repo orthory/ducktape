@@ -848,9 +848,10 @@ pub async fn resolve_comment_thread(
     .map_err(app_error)
 }
 
-/// Hand a WEB link to the OS opener. Only http(s) is a link this surface
-/// opens — everything else stays text (this passes a string to a shell
-/// command, and the scheme gate is the trust boundary).
+/// Hand a WEB link to the OS opener — the `DuckKind::Web` arm of the open
+/// plane, and its only caller. Only http(s) leaves the app this way
+/// (this passes a string to a shell command, and the scheme gate is the trust
+/// boundary); every other scheme is the open plane's own to resolve.
 pub async fn open_external_url(url: String) -> Result<bool, AppError> {
     async {
         // "" is `page_edited`'s "not my turn" (see its parallel) — nothing
@@ -860,7 +861,7 @@ pub async fn open_external_url(url: String) -> Result<bool, AppError> {
         }
         let is_web = url.starts_with("http://") || url.starts_with("https://");
         if !is_web {
-            return Err("only web links open from a page".to_string());
+            return Err("only web links are handed to the system browser".to_string());
         }
         let opener = match std::env::consts::OS {
             "macos" => "open",

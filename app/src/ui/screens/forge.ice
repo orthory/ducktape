@@ -17,7 +17,7 @@ enum ForgeTreePhase
   ready
   failed
 
-component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, linked_note:ChatMessage?, connected:bool, loading:bool, dark:bool)
+component ForgeScreen(org:str, about:str, tier:str, network_chain_id:str, connected_rpc:str, repos:[ForgeRepo], list_phase:ForgePhase, open_repo:str, repo_menu:bool, repo_phase:ForgePhase, branches:[str], tab:ForgeTab, items:[ForgeItem], forge_item_number:i64, item_phase:ForgePhase, forge_item_kind:str, forge_item_title:str, forge_item_state:str, forge_item_author:str, forge_item_branches:str, forge_item_body:str, forge_item_files_changed:i64, forge_item_additions:i64, forge_item_deletions:i64, forge_item_diff:str, forge_item_diff_truncated:bool, forge_item_merge_oid:str, forge_item_source_oid:str, forge_item_channel:str, forge_item_approvals:i64, forge_item_change_requests:i64, forge_item_reviews:[ForgeReview], merge_conflicts:[str], merge_busy:bool, review_verdict:ForgeReviewVerdict, bind review_draft:str, review_busy:bool, comment_target:str, bind comment_draft:str, staged_comments:[ForgeDraftComment], discussion:[ChatMessage], bind discussion_editor:editor, discussion_pending:str, linked_note:ChatMessage?, connected:bool, loading:bool, dark:bool)
   emits
     forge_open_repo(str)
     forge_close_repo()
@@ -34,6 +34,7 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
     forge_comment_drop(str)
     note_composer_event(ComposerEvent)
     open_message_link(str)
+    copy_to_clipboard(str, str)
   col w=fill h=fill
     // NOT CONNECTED IS NOT EMPTY, and the arm sits ABOVE both seats because
     // both of them read. `connected` already disabled every act here, while the
@@ -171,6 +172,13 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                     h=28.0
                     p=6.0
                     @secondary_action
+              // The repo's own address. Its NAME is typeable; the `?net=`
+              // digest that says which network's `ducktape` this is, is not.
+              button "Copy repo link" -> emit(copy_to_clipboard, duck_forge_repo_link(open_repo, network_chain_id), "Repo link copied")
+                with
+                  h=28.0
+                  p=6.0
+                  @secondary_action
               button "All repos" -> emit(forge_close_repo)
                 with
                   h=28.0
@@ -375,6 +383,30 @@ component ForgeScreen(org:str, about:str, tier:str, connected_rpc:str, repos:[Fo
                   PrStatePill state=forge_item_state
                 if forge_item_kind != "pr"
                   StatusBadge label=forge_item_state
+                // The item's own address, for a chat message or a commit
+                // trailer. It names the network it belongs to, so the same
+                // repo name on another one cannot answer for it.
+                button -> emit(copy_to_clipboard, duck_forge_item_link(open_repo, forge_item_number, network_chain_id), "Item link copied")
+                  with
+                    label="Copy item link"
+                    w=26.0
+                    h=26.0
+                    p=0.0
+                    @icon_action
+                  box
+                    with
+                      w=fill
+                      h=fill
+                      align-x=center
+                      align-y=center
+                    Icon
+                      with
+                        name="link"
+                        tone="label"
+                        px=13.0
+                  active bg=transparent text=muted r=7.0
+                  hovered bg=fg/10 text=fg
+                  pressed bg=fg/15
               row
                 with
                   w=fill
