@@ -51,6 +51,37 @@ pub enum OpCmd {
     Sandbox(SandboxArgs),
     /// retune a RUNNING node's tracing filter (the 3am verb)
     LogFilter(LogFilterArgs),
+    /// the reachability plane's netstack backend
+    #[command(subcommand)]
+    Netstack(NetstackCmd),
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum NetstackCmd {
+    /// move a RUNNING node's plane onto another backend, mid-life
+    Swap(NetstackSwapArgs),
+}
+
+/// `ducktape node netstack swap --native | --component <PATH>` — the operator
+/// client for `POST /v1/admin/netstack/swap`.
+///
+/// The swap is node-local and epoch-safe: the running machine's snapshot
+/// restores into the new backend and the epoch continues, with no retarget and
+/// no tunnel flap. A backend that cannot restore the snapshot is REFUSED and
+/// the current machine keeps running — this verb reports that and does not
+/// retry, because a component built against another contract is refused by
+/// name every time.
+#[derive(Debug, clap::Args)]
+#[command(group(clap::ArgGroup::new("backend").required(true).args(["native", "component"])))]
+pub struct NetstackSwapArgs {
+    /// run the machine compiled into the node binary
+    #[arg(long)]
+    pub native: bool,
+    /// run a `ducktape:netstack` component at this path ON THE NODE's disk
+    #[arg(long, value_name = "PATH")]
+    pub component: Option<PathBuf>,
+    #[command(flatten)]
+    pub selector: Selector,
 }
 
 /// `ducktape node log-filter <FILTER>` — the signed client for

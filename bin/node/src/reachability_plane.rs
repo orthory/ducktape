@@ -588,7 +588,61 @@ where
                 }
             });
     }
+    publish_live_plane(&cmd_tx);
     cmd_tx
+}
+
+/// The live plane's command lane, for the ONE caller that is not on a role
+/// loop: the admin swap route (`POST /v1/admin/netstack/swap`), which is
+/// handled on the http runtime and owns no role state.
+///
+/// A process runs at most one reachability plane at a time — a promotion tears
+/// the old one down before wiring the next — and every wiring goes through
+/// [`wire_reachability_plane`], so this cell is written exactly where the lane
+/// is created and replaced exactly where it is replaced. It holds a WEAK
+/// sender: a torn-down plane's lane must not be kept alive by an operator
+/// route that may never be called.
+static LIVE_PLANE: std::sync::RwLock<
+    Option<tokio::sync::mpsc::WeakSender<reachability::ReachabilityCommand>>,
+> = std::sync::RwLock::new(None);
+
+fn publish_live_plane(cmds: &tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>) {
+    *LIVE_PLANE.write().expect("live plane lock poisoned") = Some(cmds.downgrade());
+}
+
+/// Swap the live plane's netstack backend and answer the new backend's name,
+/// or the reason the plane refused. A refusal leaves the running machine
+/// untouched — the executor's contract — so this never retries.
+///
+/// The component path is read HERE, on the node: the route takes a path on the
+/// node's own disk and no caller ships bytes through it.
+pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> Result<String, String> {
+    let backend = match request {
+        noded::NetstackSwapRequest::Native => reachability::NetstackBackend::Native,
+        noded::NetstackSwapRequest::Component(path) => reachability::NetstackBackend::Guest {
+            component: std::fs::read(&path)
+                .map_err(|error| format!("{}: {error}", path.display()))?,
+            step_fuel: reachability::NETSTACK_STEP_FUEL,
+        },
+    };
+    let name = backend.name();
+    let lane = LIVE_PLANE
+        .read()
+        .expect("live plane lock poisoned")
+        .clone()
+        .and_then(|weak| weak.upgrade())
+        .ok_or_else(|| "the reachability plane is not running".to_string())?;
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    lane.send(reachability::ReachabilityCommand::SwapBackend {
+        backend,
+        reply: reachability::SwapReply(reply),
+    })
+    .await
+    .map_err(|_| "the reachability plane stopped".to_string())?;
+    outcome
+        .await
+        .map_err(|_| "the reachability plane dropped the swap reply".to_string())?
+        .map(|()| name.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -839,21 +893,43 @@ async fn reachability_plane(
     // Establishment is asynchronous: narrate its transitions — one loud line
     // if the coordinator is dark at boot (so a self-healing plane is never
     // mistaken for a silently degraded one), then the reflexive when it
-    // lands, however late.
+    // lands, however late. The watch does not end at the first `Ready`: the
+    // keepalive re-probes the coordinator, so a MID-EPOCH NAT rebind lands
+    // here as a fresh `Ready` at a new address, and the plane learns its own
+    // mapping moved from this one place (peers otherwise keep dialing the
+    // dead mapping until this member's next life).
     if let Some(mut status) = resolver.status() {
         let status_label = label.clone();
+        // weak: the plane exits when every command sender drops, and a
+        // strong clone parked in this task would hold its channel open.
+        let reflexive_cmds = nudges.clone().downgrade();
+        let mut observed: Option<std::net::SocketAddr> = None;
         tokio::spawn(async move {
             loop {
                 let current = *status.borrow_and_update();
                 match current {
                     reachability::RendezvousStatus::Ready { reflexive } => {
+                        let moved = observed
+                            .replace(reflexive)
+                            .is_some_and(|last| last != reflexive);
                         tracing::info!(
                             target: "ducktape::reachability",
                             node = %status_label,
                             %reflexive,
+                            moved,
                             "coordinator-observed reflexive"
                         );
-                        return;
+                        if moved {
+                            let Some(cmds) = reflexive_cmds.upgrade() else {
+                                return;
+                            };
+                            let cmd = reachability::ReachabilityCommand::ReflexiveChanged {
+                                endpoint: reflexive,
+                            };
+                            if cmds.send(cmd).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                     reachability::RendezvousStatus::Unavailable { attempts: 1 } => {
                         tracing::warn!(
@@ -1089,7 +1165,7 @@ const NETSTACK_COMPONENT: &[u8] =
 /// runs the wasm component; unset or `native` runs the machine compiled
 /// into this binary. Any other value is refused loudly and runs native —
 /// a typo must never pick a backend by accident.
-fn netstack_backend() -> reachability::NetstackBackend {
+pub(crate) fn netstack_backend() -> reachability::NetstackBackend {
     let requested = std::env::var("DUCKTAPE_NETSTACK").ok();
     match requested.as_deref() {
         Some("guest") => reachability::NetstackBackend::Guest {

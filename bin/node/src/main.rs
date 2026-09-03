@@ -96,6 +96,7 @@ mod rpc;
 mod sandbox_cli;
 mod services;
 mod sync;
+mod task_dump;
 mod term_plane;
 mod tty;
 mod userkey_cli;
@@ -131,7 +132,10 @@ use util::hex;
 
 fn main() {
     resource_limits::cap_malloc_arenas();
-    resource_limits::raise_open_file_limit();
+    // before any subscriber exists, so the warning is stderr's to carry.
+    if let Err(err) = node::resource_limits::raise_open_file_limit() {
+        eprintln!("[node] warning: could not raise open-file limit: {err}");
+    }
     #[cfg(target_os = "macos")]
     hold_macos_activity();
     // Convert any terminal error into the same stable `FATAL:` marker the node
@@ -614,6 +618,32 @@ fn run_node(
             }
             Ok(blob)
         });
+        // the netstack plane's operator trigger and its status field. Both
+        // exist only where a reachability plane will: `wireguard_listen` is
+        // exactly the condition every role's wiring branches on, so a node
+        // without one names no backend rather than naming a plane it never
+        // started.
+        if wireguard_listen.is_some() {
+            metrics.set_netstack_backend(reachability_plane::netstack_backend().name());
+            let swap_metrics = metrics.clone();
+            status.wire_netstack_swapper(move |request| {
+                let metrics = swap_metrics.clone();
+                Box::pin(async move {
+                    let outcome = reachability_plane::swap_netstack(request).await;
+                    match &outcome {
+                        Ok(backend) => {
+                            metrics.set_netstack_backend(backend.clone());
+                            metrics.record_netstack_swap(noded::NetstackSwapOutcome::Swapped, None);
+                        }
+                        Err(reason) => metrics.record_netstack_swap(
+                            noded::NetstackSwapOutcome::Refused,
+                            Some(reason.clone()),
+                        ),
+                    }
+                    outcome
+                })
+            });
+        }
         status.publish(noded::NodeStatus {
             version: build_version(),
             public_key: status_public_key.clone(),
@@ -803,6 +833,7 @@ fn run_node(
                 bulk_pacer,
                 plane_monitor,
                 sync_monitor,
+                workspace.clone(),
             )
             .await;
             return;

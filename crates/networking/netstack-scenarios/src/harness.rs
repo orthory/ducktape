@@ -549,6 +549,13 @@ impl Net {
         }
     }
 
+    /// This node's own NAT rebound mid-epoch: the host observed a new
+    /// reflexive for itself. Scripts a LIVE rebind — no restart, the epoch
+    /// and every peer's session stay exactly where they are.
+    pub fn reflexive_changed(&mut self, node: usize, endpoint: SocketAddr) {
+        self.drive(node, Event::ReflexiveChanged { endpoint });
+    }
+
     pub fn view_tick_all(&mut self, view: u64) {
         for node in 0..self.nodes.len() {
             if self.nodes[node].machine.is_some() {
@@ -935,6 +942,7 @@ impl Net {
                 )
             }
             Event::ViewTick(view) => format!("ViewTick({view})"),
+            Event::ReflexiveChanged { endpoint } => format!("ReflexiveChanged({endpoint})"),
             Event::Nudge => "Nudge".into(),
             Event::InstallInvitePeer {
                 token,

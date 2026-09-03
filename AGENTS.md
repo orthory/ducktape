@@ -2,6 +2,15 @@
 
 # Repository Instructions
 
+## Where to look
+
+`docs/README.md` is the one index: one line per document, grouped by the
+question it answers. Load the document that answers the question, never the
+tree. It covers the operator runbooks (`docs/deploy/`, `docs/dogfood.md`,
+`docs/sandbox-macos.md`), the references code cites by path (`docs/records/`),
+the per-area READMEs (`ops/`, `app/`, `crates/airlock/`) and the agent runbooks
+in `skills/` (`qa`, `sim-lane`, `module-dev`).
+
 ## No Legacy, No Compat (until a live network exists)
 
 - There are ZERO live ducktape networks. Nothing deployed needs backward
@@ -33,38 +42,47 @@
 - There is no decision-record system: no ADRs, no plan/spec archive, no docs
   site. The code, its comments, the skills, and git history are the record. A
   comment states its rule outright; it never cites a document for it.
-- Specs and plans the brainstorming/writing-plans workflow writes under
-  `docs/superpowers/` are local working files: the directory is gitignored and
-  nothing under it ships in a PR. When the PR merges the plan is done and the
-  file is garbage, like its worktree.
+- A document states what is true at HEAD and nothing else: no dates, no
+  "shipped"/"phase N"/"status" framing, no issue or PR numbers, no "what
+  remains" lists. An open item is an issue on the tracker, not a paragraph.
+  Every path, symbol, flag and constant a document names must exist in the
+  tree; a claim that cannot be checked against the code is deleted.
+- Specs and plans that planning workflows write under `docs/superpowers/` are
+  local working files: the directory is gitignored and nothing under it ships
+  in a PR. When the PR merges the plan is done and the file is garbage, like
+  its worktree.
 - `docs/` holds only what an operator executes (`deploy/`, `dogfood.md`,
   `sandbox-macos.md`) and the few records code or a skill cites by path
-  (`records/`); `docs/README.md` is the index. A record nothing cites is
-  deleted, not archived.
+  (`records/`); `docs/README.md` is the index and every document is one hop
+  from it. A record nothing cites is deleted, not archived.
 
 ## Branching and Delivery
 
 - All task work targets `dev`: worktrees fork from `origin/dev`, PRs are based
   on `dev`, and high-confidence reviewed PRs merge into `dev`. `main` advances
-  only by an explicit, user-requested release of `dev`. Binding detail lives in
-  `.project/work.md`.
+  only by an explicit, user-requested release of `dev`.
 - Default feature/fix/doc work happens in an isolated git worktree rather than
   directly in the primary checkout. Use the current checkout only when the user
   explicitly asks for in-place work or the task is limited to repo-state repair.
-- Put every task worktree under `<primary-checkout>/.worktree/<branch-slug>`.
-  Never create one as a sibling checkout, under `/tmp`, or in assistant-specific
-  `.claude/worktrees` or `.codex/worktrees` directories. Keep Cargo targets and
+- Put every task worktree inside the primary checkout, in one of its gitignored
+  worktree directories (`.claude/worktrees/`, `.codex/worktrees/`, `.worktree/`
+  are all ignored; the user-global worktree hook owns the exact path). Never
+  create one as a sibling checkout or under `/tmp`. Keep Cargo targets and
   other large build outputs in the disk-backed worktree too: `/tmp` may be a
   memory-backed filesystem, so building there consumes RAM and swap.
 - After the worktree change is implemented and verified, submit it as a PR
   against `dev`. Do not treat local completion as done when the requested flow
   is delivery.
+- Merge to `dev` only when confidence is high: the change is understood and the
+  relevant gates are green or any skips are justified. If confidence is medium
+  or low, leave the PR open with the risks, failed checks, or follow-up review
+  needed instead of merging by default.
 
 ## Worktree Cleanup (a merged worktree is garbage — remove it)
 
 - **A worktree's life ends when its PR merges.** Once merged, remove the
   worktree and delete its branch. Leaving it costs ~20 GB of Cargo target each
-  and nothing else; twelve of them once ate 250 GB and had to be swept by hand.
+  and nothing else.
 - **`ops/worktree-clean.sh` does it safely.** Dry-run by default; `--yes` to
   act. It removes worktrees whose branch is fully merged into `origin/dev`, and
   REFUSES one that is dirty, carries a commit not in `dev`, or has live
@@ -73,10 +91,6 @@
 - Never stop desktop/QA processes with `pkill -f` — a pattern match will
   cheerfully kill an editor, a grep, or this script. Find them by process cwd,
   executable, and workspace config or let the native app shut them down.
-- Merge to `dev` only when confidence is high: the change is understood and the
-  relevant gates are green or any skips are justified. If confidence is medium
-  or low, leave the PR open with the risks, failed checks, or follow-up review
-  needed instead of merging by default.
 
 ## Logging
 

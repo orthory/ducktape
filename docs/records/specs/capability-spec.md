@@ -5,7 +5,7 @@ one executor — an installed CLI that can turn a prompt into text. Everything
 the node needs is in the file: how to detect the binary, the exact argv to
 invoke it, and how to parse its output. **Adding an executor is a config
 change, never a code change** — the embedded built-ins are themselves spec
-files globbed out of `crates/modules/system/capability-host/specs/` at build time; no
+files globbed out of `crates/services/provider/specs/` at build time; no
 Rust source names an executor.
 
 Specs are the data half of the capability system:
@@ -13,7 +13,7 @@ Specs are the data half of the capability system:
 | Layer | Owns | Code |
 |---|---|---|
 | Consensus (`crates/modules/system/capability`) | *who provides what*, network-wide: node key → announced tag set | never reads specs |
-| Host (`crates/modules/system/capability-host`) | *actually running it*: spec loading, binary discovery, spawning, parsing | this document |
+| Host (`crates/services/provider`) | *actually running it*: spec loading, binary discovery, spawning, parsing | this document |
 
 The consensus registry only ever sees **tags**. The spec behind a tag is
 private to each host — two nodes can announce the same tag with differently
@@ -53,7 +53,7 @@ in the same trust class as a shell profile or a systemd unit:
 
 - They load from exactly two places, both local and operator-controlled:
   1. the specs **embedded in the node binary** at compile time
-     (`crates/modules/system/capability-host/specs/*.toml`);
+     (`crates/services/provider/specs/*.toml`);
   2. the **operator spec directory** (see [Spec sources](#spec-sources)).
 - They are **never fetched from the network**, and no consensus code path can
   read one (host-local files are non-deterministic input).
@@ -64,18 +64,17 @@ in the same trust class as a shell profile or a systemd unit:
 - The child process runs **fenced**: its working directory is the workspace
   the run's provisioner materialized (an empty scratch dir when the embedder
   provisions none, never the node's data dir itself), non-interactive mode,
-  and whatever sandbox flags the spec's argv encodes. Fence flags live in the spec — audit them when you
-  audit the spec.
+  and whatever sandbox flags the spec's argv encodes. Fence flags live in the
+  spec — audit them when you audit the spec.
 
-**Auth: the operator brings a logged-in CLI; the spec decides where the
-credential ends up.** There is exactly one way:
+**Auth: the credential never enters the child.** There is exactly one way:
 
-- **`[isolation]`.** The *host* reads the credential and keeps it in the node
+- **`[isolation]`.** The *host* holds the credential and keeps it in the node
   process. A run-scoped, loopback-only broker serves the model API, and the
   child gets only an unrelated opaque run bearer, a localhost base URL, and a
   **fresh, empty config home** (which is what stops the CLI reading the
-  operator's real one and forces it through the broker). The credential never
-  enters the child's process tree. Codex and Claude are both here.
+  operator's real one and forces it through the broker). Codex and Claude
+  are both here.
 
 **A spec cannot ask for a host directory instead.** A run executes inside its
 own microVM, which shares no filesystem with the host — the only things that
@@ -97,8 +96,9 @@ Specs load in two passes:
 2. **Operator directory** — every `*.toml` in:
    - `$DUCKTAPE_CAPABILITY_DIR` if set. Pointing this at a missing directory
      is a **hard error** (you asked for a dir that isn't there);
-   - otherwise `~/.ducktape/capabilities`, only if it exists (absent default
-     simply means "no operator specs").
+   - otherwise `<ducktape home>/capabilities` (`$DUCKTAPE_HOME` when set,
+     else `~/.ducktape`), only if it exists (absent default simply means "no
+     operator specs").
 
 **Override rule:** an operator spec whose `tag` matches a built-in **replaces
 it wholesale** — there is no field-level merging; the spec file is the unit of
@@ -113,7 +113,8 @@ be file-order guessing; the node refuses to guess.
 **Failure posture:** a spec that fails to parse or validate is a **boot
 error**, not a skipped file. An operator config mistake should stop the node
 loudly, not silently drop an executor and let jobs fail later with a confusing
-"capability not provided".
+"capability not provided". If the binary is missing, though, the capability is
+simply not announced — a spec sitting in the directory is inert, not an error.
 
 ---
 
@@ -157,10 +158,14 @@ prompt = "stdin"
 # SILENT this long dies. a quiet-by-design CLI (claude -p prints one result at
 # the end) gets exactly this many seconds of silence, so budget for its
 # longest silent stretch. a continuously-chatty child is still bounded at
-# 6x this value (the host hard cap; the saga's consensus deadline bounds the
-# run's outcome regardless). $DUCKTAPE_PROVIDER_TIMEOUT_SECS overrides every
-# spec's idle budget at once (ops knob for slow hosts).
+# `hard_timeout_factor` x this value (the host hard cap; the saga's consensus
+# deadline bounds the run's outcome regardless).
+# $DUCKTAPE_PROVIDER_TIMEOUT_SECS overrides every spec's idle budget at once
+# (ops knob for slow hosts).
 timeout_secs = 300
+# the host hard cap as a multiple of the idle budget (1..=1000, default 36):
+# even a child that never goes quiet is killed at `timeout_secs x this`.
+hard_timeout_factor = 36
 
 [output]
 # which NAMED parser extracts the assistant's final text from stdout:
@@ -178,6 +183,15 @@ timeout_secs = 300
 format = "text"
 ```
 
+A file like this dropped into the operator directory is the whole wiring of
+a new executor: after a node restart, if the binary is executable on `PATH`,
+discovery builds the provider, the node **announces** the tag to the
+capability registry (network-wide, member-gated, idempotent), and an agent
+registered with that `capability` dispatches here with exactly the argv
+above. The provider crate's unit test
+`an_operator_spec_discovers_a_custom_executor` exercises this path with a
+fake CLI.
+
 ---
 
 ## Field reference
@@ -188,13 +202,12 @@ format = "text"
 |---|---|---|---|
 | `spec` | integer | yes | must be `1` |
 | `[isolation]` | table | no | host-owned auth broker + fresh executor config home — see [Isolation](#isolation--host-owned-auth) |
-| `[sandbox]` | table | no | the executor's own auth dirs, mounted into a sandbox — see [Isolation](#isolation--host-owned-auth) |
 | `[tools]` | table | no | argv injected into every argv the file produces — see [Tools](#tools--argv-injected-into-every-argv-the-file-produces) |
 | `[[variants]]` | array of tables | no | load-time expansion into finer tags — see [Variants](#variants--one-file-a-family-of-finer-tags) |
 
-Unknown fields **anywhere** in the file are rejected — a typo (or a field
-from the retired model-routing era, like `[models]`) fails loud instead of
-being silently ignored.
+Unknown fields **anywhere** in the file are rejected — a typo, or a section
+this format does not have (`[sandbox]`, `[models]`, `[session]`,
+`[workspace]`), fails loud instead of being silently ignored.
 
 ### `[capability]`
 
@@ -217,7 +230,8 @@ being silently ignored.
 |---|---|---|---|
 | `args` | string array | no (default `[]`) | passed verbatim to exec; fully literal, no placeholders |
 | `prompt` | string | yes | must be `"stdin"` in v1 |
-| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at 36x regardless |
+| `timeout_secs` | integer | no (default `300`) | 1..=3600; IDLE budget — output refreshes it; killed after this much silence, or at `hard_timeout_factor`x regardless |
+| `hard_timeout_factor` | integer | no (default `36`) | 1..=1000; the host hard cap, as a multiple of the idle budget — a chatty-forever child is killed at `timeout_secs x` this |
 
 ### `[output]`
 
@@ -230,7 +244,7 @@ being silently ignored.
 | Field | Type | Required | Rules |
 |---|---|---|---|
 | `config_home_env` | string | no | executor config-home env name such as `CODEX_HOME`; must match `[A-Z_][A-Z0-9_]*` |
-| `broker` | string | no | currently only `"codex-responses"`; credentials remain in the host process |
+| `broker` | string | no | `"codex-responses"` \| `"anthropic-messages"`; credentials remain in the host process |
 
 ### `[tools]`
 
@@ -238,15 +252,19 @@ being silently ignored.
 |---|---|---|---|
 | `args` | string array | yes (when the section is present) | spliced into every argv the file produces, immediately after `args[0]` |
 
+### `[[variants]]`
+
+| Field | Type | Required | Rules |
+|---|---|---|---|
+| `suffix` | string | yes | `<model>_<effort>`, each side `[a-z0-9.-]+` (so exactly one `_`) |
+| `args` | string array | yes | the variant's **full** argv — verbatim, complete, never merged with or derived from the parent's args |
+
 ---
 
 ## Isolation — host-owned auth
 
-An executor CLI needs the operator's model credential. The two sections below are
-the two ways to arrange that, and **a spec may declare only one of them** (see
-[Trust model](#trust-model--read-this-first)).
-
-### `[isolation]` — the credential stays in the host
+An executor CLI needs a model credential. `[isolation]` is the one way to
+arrange that (see [Trust model](#trust-model--read-this-first)):
 
 ```toml
 [isolation]
@@ -254,8 +272,8 @@ config_home_env = "CODEX_HOME"
 broker = "codex-responses"
 ```
 
-The host reads the credential (`OPENAI_API_KEY`, else `~/.codex/auth.json`) and
-keeps it in the node process. The child gets:
+The host holds the credential and keeps it in the node process. The child
+gets:
 
 - a **loopback base URL** spliced into its argv as a custom model provider, and
 - an **opaque random bearer** minted for this run,
@@ -272,9 +290,11 @@ also deleted before DuckFS or Forge scans the workspace, so the provider's runti
 state can never enter a snapshot or commit.
 
 The broker is deliberately not a generic proxy: it binds an ephemeral loopback
-port, requires the per-run bearer, accepts only Responses POSTs, enforces
-body/response/total-byte, concurrency and request-count budgets, and is torn down
-when the run ends. It substitutes the host credential only on the upstream hop.
+port, requires the per-run bearer, accepts only the one API shape its kind
+names (Responses POSTs for `codex-responses`, Messages POSTs for
+`anthropic-messages`), enforces body/response/total-byte, concurrency and
+request-count budgets, and is torn down when the run ends. It substitutes the
+host credential only on the upstream hop.
 
 **How the guest reaches it.** A microVM has its own network stack, so the
 broker's `127.0.0.1` is not the guest's. `duck-guest-init` closes that gap
@@ -286,40 +306,27 @@ vsock. The CLI dials the localhost URL its env names and never knows.
 
 ## Tools — argv injected into every argv the file produces
 
-An agentic executor is only as useful as the tools it can reach. `[tools]`
-names the flags that wire one in — in the built-ins, the Ducktape MCP server —
-without making every argv in the file repeat them:
+`[tools]` names the flags that wire a tool plane in — in the built-ins, the
+Ducktape MCP server — without making every argv in the file repeat them:
 
 ```toml
 [tools]
 args = ["-c", 'mcp_servers.ducktape.command="ducktape-mcp"']
 ```
 
-**The insertion rule: immediately after `args[0]`, never at the end.** An argv
-like codex's ends in a bare `-` (the stdin marker) that must stay LAST, so
-appending is not an option; `args[0]` is always the mode/subcommand selector
-(`exec`, `-p`), so the position right after it is the one slot that is legal
-for every executor and stable across variants.
-
-It applies to **every argv the file produces**:
-
-- the `[invoke] args`;
-- **every** `[[variants]]` `args` list (variants inherit `[tools]` like they
-  inherit everything else — they never repeat it);
-
-Everything else is the format's usual posture:
-
-- **injection happens once, at load time.** Nothing downstream knows tools
-  exist — a spec in hand already has them, and one tag still means one fixed,
-  fully literal argv.
-- **no `[tools]` section, or an argv with fewer than 1 arg, means no
-  insertion** — an older spec is byte-for-byte what it was.
-- **override is still wholesale, by tag.** An operator spec that replaces a
-  built-in replaces its `[tools]` too: to run an executor without the MCP
-  server (or with a different one), copy the embedded spec, edit `[tools]`,
-  drop it in the operator dir. There is no field-level merging here either.
-- a `[tools]` section with no `args` is a **hard error**, like every other
-  section that would do nothing.
+- **Insertion is immediately after `args[0]`, never at the end.** An argv
+  like codex's ends in a bare `-` (the stdin marker) that must stay LAST;
+  `args[0]` is always the mode/subcommand selector (`exec`, `-p`), so the
+  slot after it is legal for every executor and stable across variants.
+- It applies to the `[invoke] args` and to **every** `[[variants]]` `args`
+  list (variants inherit `[tools]` like everything else — they never repeat
+  it). No `[tools]` section, or an argv with fewer than one arg, means no
+  insertion.
+- Injection happens once, at load time: a spec in hand already has its
+  tools, and one tag still means one fixed, fully literal argv.
+- Override is still wholesale, by tag: an operator spec that replaces a
+  built-in replaces its `[tools]` too. A `[tools]` section with no `args` is
+  a hard error, like every other section that would do nothing.
 
 The binary a `[tools]` argv names (`ducktape-mcp` in the built-ins) is resolved
 from the **run's `PATH`** — the provisioner puts its directory there — so specs
@@ -339,20 +346,9 @@ it. Nothing changes at dispatch time — **one tag still means one fixed,
 fully literal argv**.
 
 ```toml
-spec = 1
-
 [capability]
 tag = "myllm"
-
-[detect]
-bin = "myllm"
-
-[invoke]
-args = ["run"]              # the base tag's argv — untouched by variants
-prompt = "stdin"
-
-[output]
-format = "text"
+# … [detect] / [invoke] / [output] as above; the base tag's argv is untouched
 
 # registers the tag "myllm_large-v2_high" with its OWN full argv.
 [[variants]]
@@ -360,35 +356,25 @@ suffix = "large-v2_high"
 args = ["run", "--model", "large-v2", "--effort", "high"]
 ```
 
-Each entry:
-
-| Field | Type | Required | Rules |
-|---|---|---|---|
-| `suffix` | string | yes | `<model>_<effort>`, each side `[a-z0-9.-]+` (so exactly one `_`) |
-| `args` | string array | yes | the variant's **full** argv — verbatim, complete, never merged with or derived from the parent's args |
-
-A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`, `output`
-(and `description`) from the parent spec;
-`args` is its own, whole, and literal. There is no field merging and no
-placeholder substitution — the "argv is literal" invariant holds per tag.
+A variant **inherits** `bin`, `env`, `prompt`, `timeout_secs`,
+`hard_timeout_factor`, `output`, `[tools]` (and `description`) from the parent
+spec; `args` is its own, whole, and literal. There is no field merging and no
+placeholder substitution — the "argv is literal" invariant holds per tag, and
+there is no routing table, no pattern matching, and no substitution anywhere in
+the invoke path.
 
 **The tag grammar.** A composed tag is `{provider}_{model}_{effort}` and
 splits into **exactly three segments on `_`** — the contract the desktop
 app's provider/model/effort picker decomposes tags by (e.g.
 `codex_gpt-5.5_xhigh`, `claude_opus_max`). The loader enforces it fail-loud:
-
-- the parent tag must be underscore-free (a `my_llm` parent cannot declare
-  variants — write separate spec files instead);
-- the suffix must be `<model>_<effort>` with both sides non-empty
-  `[a-z0-9.-]+`;
-- the composed tag must pass the shared consensus tag rule (≤ 64 bytes);
-- duplicate suffixes in one file — and composed tags colliding with any other
-  tag in the operator dir — are hard errors, like every other duplicate tag;
-- unknown fields inside a `[[variants]]` entry are rejected, like everywhere
-  else in the format.
-
-A tag that does not follow the grammar is still a perfectly good tag — the
-app just treats it as opaque (selectable as-is, no cascading picker).
+the parent tag must be underscore-free (a `my_llm` parent cannot declare
+variants — write separate spec files instead); the suffix must be
+`<model>_<effort>` with both sides non-empty `[a-z0-9.-]+`; the composed tag
+must pass the shared consensus tag rule (≤ 64 bytes); duplicate suffixes in
+one file — and composed tags colliding with any other tag in the operator
+dir — are hard errors; unknown fields inside an entry are rejected. A tag
+that does not follow the grammar is still a perfectly good tag — the app just
+treats it as opaque (selectable as-is, no cascading picker).
 
 **Override semantics are unchanged**: a variant tag is its own tag, and
 operator specs override **by tag, wholesale**. Overriding a built-in base tag
@@ -396,65 +382,12 @@ operator specs override **by tag, wholesale**. Overriding a built-in base tag
 override those individually if you want them retuned, or shadow them with an
 operator file declaring its own `[[variants]]`.
 
-**This is NOT the removed model routing.** The retired `[models]` table and
-`{model}` argv placeholder chose flags at *dispatch time*; `[[variants]]`
-expands *once at load* into ordinary specs, each with a fixed verbatim argv.
-There is still no routing table, no pattern matching, and no substitution
-anywhere in the invoke path.
-
 The embedded built-ins use this to ship a curated model/effort matrix:
 `codex` (base) plus
 `codex_{gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna}_{low,medium,high,xhigh,max}`
 and `codex_gpt-5.5_{low,medium,high,xhigh}` (the effort set follows what each
 model actually supports, so the codex side is not a rectangle), and `claude`
 (base) plus `claude_{fable,opus,sonnet,haiku}_{low,medium,high,max}`.
-
----
-
-## Worked example: wiring a brand-new executor
-
-Suppose you run [ollama](https://ollama.com) locally and want agents to use
-it. No Ducktape code changes — one file:
-
-`~/.ducktape/capabilities/ollama.toml`
-
-```toml
-spec = 1
-
-[capability]
-tag = "ollama"
-description = "local ollama daemon via its CLI"
-
-[detect]
-bin = "ollama"
-
-[invoke]
-# `ollama run <model>` reads the prompt from stdin and prints the answer.
-# the model is a literal arg — host policy, invisible to consensus.
-args = ["run", "llama4"]
-prompt = "stdin"
-timeout_secs = 600          # local models can be slow to first token
-
-[output]
-format = "text"             # plain stdout IS the answer
-```
-
-Restart the node. If `ollama` is executable on `PATH`:
-
-- discovery builds an `ollama` provider;
-- the node **announces** `ollama` to the capability registry (network-wide,
-  member-gated, idempotent);
-- an agent registered with `capability = "ollama"` dispatches here: its runs
-  are leased over the nodes announcing `ollama`, and the assigned host
-  executes with exactly the argv above;
-- `capability-host` unit tests exercise exactly this path with a fake CLI
-  (`an_operator_spec_discovers_a_custom_executor`).
-
-If the binary is missing, the capability is simply not announced — the spec
-sitting in the directory is inert, not an error. Want the same daemon under
-two tunings? Two files, two tags (`ollama`, `ollama-large`), each with its
-own literal args — or one file with [`[[variants]]`](#variants--one-file-a-family-of-finer-tags)
-if the tunings follow the `provider_model_effort` grammar.
 
 ---
 
@@ -470,26 +403,11 @@ if the tunings follow the `provider_model_effort` grammar.
 
 ## Versioning
 
-`spec = 1` is the only version this build reads. Format changes that would
-alter the meaning of existing files bump the version; the parser rejects
-versions it does not understand rather than guessing. New optional fields
-within v1 are **not** added silently — unknown fields are errors, so any field
-addition is itself a version bump. Yes, that is strict; strict is the point:
-a spec means one thing, on every build that accepts it.
-
-(The retired `[models]` routing table and `{model}` argv placeholder were
-removed within v1 as a pre-release flag day: files that still carry them fail
-loudly at boot with an unknown-field error, never a silent behavior change.
-`[[variants]]` was likewise added within v1 pre-release — a build older than
-it rejects a file carrying variants loudly as an unknown field, never
-misreading it as a single-tag spec. The `[session]` thread-continuity block
-(`capture` / `resume_args` / `resume_args_append` / the `{session_id}` slot,
-and a variant's `resume_args` override) was REMOVED within v1 the same way: a
-file that still declares it fails loudly at boot as an unknown field. Every
-run starts cold — a run's whole continuity is its prompt envelope, which is
-what lets any assignee execute it. The `[workspace]` per-agent-persistence
-block was removed the same way, for the same reason: a run's cwd is the
-workspace its provisioner materialized, so the section selected nothing.
-`[tools]` follows the same pre-release precedent: an older build rejects a
-file carrying it as an unknown field rather than silently running
-tool-less.)
+`spec = 1` is the only version this build reads, and there are no live
+networks, so the format changes in place: a section this build does not know
+fails loudly at boot as an unknown field, never as a silent behavior change.
+Every run starts cold — a run's whole continuity is its envelope, which is
+what lets any assignee execute it — and a run's cwd is the workspace its
+provisioner materialized, so the format has no per-run session or workspace
+sections. Yes, that is strict; strict is the point: a spec means one thing,
+on every build that accepts it.

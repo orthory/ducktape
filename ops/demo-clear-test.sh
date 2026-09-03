@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Guards the one line in demo-clear.sh that can silently rot: what it prints
-# when the node REFUSES /v1/admin/shutdown. The reason token there must be the
+# Guards the one line in demo-clear.sh AND dev-clear.sh that can silently rot:
+# what each prints when the node REFUSES /v1/admin/shutdown (both extract the
+# body's fields with the same sed). The reason token there must be the
 # node's own (`refuse` in crates/noded/src/admin.rs puts it in the response
 # body) — a token invented in the script greps to nothing, which is how three
 # fictional ones lived there until #1331.
@@ -40,11 +41,11 @@ trap cleanup EXIT
 
 fail(){ printf '\033[31m[demo-clear-test] %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Run demo-clear against a stub that answers every request with this status and
-# body. The stub prints its port once `Bun.serve` is LISTENING, and the read
-# blocks on that line — the handshake is the event, not a sleep.
-run_case(){
-  local status="$1" body="$2" port out pid
+# A stub admin surface answering every request with this status and body. It
+# prints its port once `Bun.serve` is LISTENING, and the read blocks on that
+# line — the handshake is the event, not a sleep.
+start_stub(){
+  local status="$1" body="$2" port
   rm -rf "$TMP/.ducktape" "$TMP/ready"
   mkdir -p "$WS"
   printf 'stub-token\n' > "$WS/admin.token"
@@ -54,17 +55,50 @@ run_case(){
     const server = Bun.serve({ port: 0, fetch: () => new Response(body, { status: Number(status) }) });
     console.log(server.port);
   ' "$status" "$body" > "$TMP/ready" 2>/dev/null &
-  pid=$!
-  printf '%s\n' "$pid" > "$TMP/stub.pid"
+  printf '%s\n' "$!" > "$TMP/stub.pid"
   # the timeout is not a wait-for-readiness poll — the fifo line is the event.
   # It is only so a stub that never listens fails this gate instead of hanging
   # `make test` forever.
   read -r -t 10 port < "$TMP/ready" || fail "the stub never reported a port"
+  printf '%s\n' "$port"
+}
+
+stop_stub(){
+  [ -r "$TMP/stub.pid" ] || return 0
+  kill "$(cat "$TMP/stub.pid")" 2>/dev/null
+  rm -f "$TMP/stub.pid"
+}
+
+# demo-clear finds the port in the registry.
+run_case(){
+  local port out
+  port="$(start_stub "$1" "$2")"
   printf '{"active":"%s","workspaces":[{"id":"%s","ports":{"http":%s}}]}\n' "$ID" "$ID" "$port" \
     > "$TMP/.ducktape/registry.json"
   out="$(HOME="$TMP" DUCKTAPE_HOME="$TMP/.ducktape" DEMO_WORKSPACE_ID="$ID" \
     bash "$OPS/demo-clear.sh" 2>&1)"
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -f "$TMP/stub.pid"
+  stop_stub
+  printf '%s\n' "$out"
+}
+
+# dev-clear reads http_listen out of the workspace's node.toml instead, and only
+# reaches the shutdown call when its sweep finds a live `ducktape … node run …`
+# process for THIS workspace — so the case stands one up: a copy of /bin/sh
+# named `ducktape` (the sweep matches on comm=, which a shebang script cannot
+# fake) parked on a sleep with that command shape. dev-clear kills it, which is
+# the point — nothing but this case's own process answers that pattern.
+run_dev_case(){
+  local port out fake
+  port="$(start_stub "$1" "$2")"
+  printf 'http_listen = "127.0.0.1:%s"\n' "$port" > "$WS/node.toml"
+  fake="$TMP/ducktape"
+  cp /bin/sh "$fake"
+  # the trailing `:` keeps sh from exec'ing sleep over itself — an exec'd sleep
+  # is named `sleep`, and the sweep would never see it.
+  "$fake" -c 'sleep 10; :' node run "$WS" &
+  out="$(HOME="$TMP" DUCKTAPE_HOME="$TMP/.ducktape" DEMO_WORKSPACE_ID="$ID" \
+    bash "$OPS/dev-clear.sh" 2>&1)"
+  stop_stub
   printf '%s\n' "$out"
 }
 
@@ -90,6 +124,28 @@ case "$ABSENT" in
 esac
 case "$ABSENT" in
   *"reason="*) printf '%s\n' "$ABSENT" >&2; fail "a body with no reason must not produce one" ;;
+esac
+
+# 3. dev-clear reports the same refusal: it used to throw the body away and log
+#    a bare status, which is indistinguishable from a stop that worked.
+DEV_REFUSED="$(run_dev_case 403 "{\"error\":\"$ERROR\",\"reason\":\"$REASON\"}")"
+case "$DEV_REFUSED" in
+  *"reason=$REASON"*) ;;
+  *) printf '%s\n' "$DEV_REFUSED" >&2; fail "dev-clear's refusal line dropped the node's reason token" ;;
+esac
+case "$DEV_REFUSED" in
+  *"$ERROR"*) ;;
+  *) printf '%s\n' "$DEV_REFUSED" >&2; fail "dev-clear's refusal line dropped the node's error sentence" ;;
+esac
+
+# 4. and it must not invent one when the body carries none.
+DEV_ABSENT="$(run_dev_case 404 '')"
+case "$DEV_ABSENT" in
+  *"http 404"*) ;;
+  *) printf '%s\n' "$DEV_ABSENT" >&2; fail "dev-clear's refusal line dropped the status" ;;
+esac
+case "$DEV_ABSENT" in
+  *"reason="*) printf '%s\n' "$DEV_ABSENT" >&2; fail "a body with no reason must not produce one" ;;
 esac
 
 printf '\033[32m[demo-clear-test] ok\033[0m\n'

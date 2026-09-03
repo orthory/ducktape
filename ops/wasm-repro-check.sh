@@ -55,7 +55,7 @@ fi
 git -C "$copy" init -q
 git -C "$copy" add -A -f -N .
 
-cargo build -q -p guest-builder
+cargo build -q --locked -p guest-builder
 builder="${CARGO_TARGET_DIR:-$repo/target}/debug/guest-builder"
 
 "$builder" --platform-root "$repo" "$repo/$MODULE" --out "$work/here.wasm"

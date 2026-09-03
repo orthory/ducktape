@@ -38,8 +38,7 @@ ceremony's own blocks). `status` prints one row per module — `id  active
 pending`, a pending swap carrying `ready k` (validators that signalled) or
 `ready ✓`. `adopt_admitted_modules` composes every admitted id on restore and
 state sync, and a module admitted after the last checkpoint restores empty and
-is rebuilt by replay (unit-pinned in `host_state.rs`; no e2e drives the full
-restore lane yet — live-upgrade part 4).
+is rebuilt by replay (unit-pinned in `host_state.rs`).
 
 The CLI stages bytes, it never builds them: the component still comes from
 `make wasm-modules` / `guest-builder` (§2).
@@ -98,7 +97,7 @@ key-only, a failing fold holding its queue with backoff — is fluent31's own
 pins; read it before writing a mapper. A guest's `log` output is a `debug`
 event under `fluent31::wasm::guest` — turn that one target up to see it.
 
-## 3. Registration — `module register`, or (for genesis) the topology + three bins
+## 3. Registration — `module register`, or (for genesis) the topology
 
 Post-genesis is the whole of this section for most modules: `ducktape module
 register <id> <component.wasm>` admits the id on a live network and `ducktape
@@ -106,20 +105,21 @@ module update <id> <component.wasm>` swaps its code later. The registry is
 consensus state, so nothing below needs editing — every node composes the
 admitted module from it.
 
-The table is the GENESIS path: the flag day that moves the root hash.
+The table is the GENESIS path: the flag day that moves the root hash. There
+is ONE source: `crates/topology/src/lib.rs`. Every binary composes from it
+through `crates/noded/src/compose.rs` — `bin/node` from `PRODUCTION`, `bin/noded`
+and `bin/simnode` from `SIM_BASE` (+ `SIM_VALSET` under simnode's
+`--with-valset`) — so a wasm store-backed module touches no bin at all.
 
-| Bin | Runs | What to touch |
-|---|---|---|
-| `bin/node` | production set: native + wasm tenants | `crates/topology/src/lib.rs`: a `ModuleSpec` row in `MODULES` (`code`/`backing`/`config`) and the id in `PRODUCTION`; the siblings a module reads are compiled into its guest, not declared here; `host_state` composes genesis/restore/sync from that selection — nothing to mirror there. A native tenant also needs the `Cargo.toml` dep. The component is NOT embedded: `node init` hashes `<id>.component.wasm` out of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `<ducktape home>/modules` — `$DUCKTAPE_HOME` when set, else `~/.ducktape` — filled by `make install-node`) into the descriptor, then copies those bytes into `<workspace>/modules/`. The kernel fixtures dir pins the same bytes. |
-| `bin/noded` | daemon, composes native instances | grep `"tasks"`: id list, `use`, construct, register |
-| `bin/simnode` | deterministic /v1 twin | same shape as noded |
-| the indexer | one index database per composed module | `open_index_store` opens a database for EVERY id in the selection, so joining or leaving `PRODUCTION` gains or loses one — nothing to touch for a module with no mapper. A module that ships one also needs its arm in `index_guest_wasm()` (`crates/noded/src/index.rs`, `include_bytes!` of the committed `index.wasm`) and its `INDEX_MODULES` entry in the `Makefile`. |
+| Where | What to touch |
+|---|---|
+| `crates/topology/src/lib.rs` | a `ModuleSpec` row in `MODULES` (`code`/`backing`/`config`) and the id in the selection(s) it joins. The siblings a module reads are compiled into its guest, not declared here; `host_state` composes genesis/restore/sync from the selection — nothing to mirror there. The component is NOT embedded: `node init` hashes `<id>.component.wasm` out of `--modules <dir>` (default `$DUCKTAPE_MODULES_DIR`, else `<ducktape home>/modules` — `$DUCKTAPE_HOME` when set, else `~/.ducktape` — filled by `make install-node`) into the descriptor, then copies those bytes into `<workspace>/modules/`. The kernel fixtures dir pins the same bytes. |
+| `crates/noded/src/compose.rs` | ONLY for a `Code::Native` tenant (an arm in `native`, plus the `Cargo.toml` dep) or a `Backing::Odb` tenant (an arm in `open_odb` opening its disk substrate). A wasm store-backed module needs neither. |
+| the indexer | `open_index_store` opens a database for EVERY id in the selection, so joining or leaving a selection gains or loses one — nothing to touch for a module with no mapper. A module that ships one also needs its arm in `index_guest_wasm()` (`crates/noded/src/index.rs`, `include_bytes!` of the committed `index.wasm`) and its `INDEX_MODULES` entry in the `Makefile`. |
 
-noded/simnode run a SUBSET: `SIM_BASE` is 15 of production's 19, and the four
-it leaves out — `acl`, `governance`, `lifecycle`, `valset` — are exactly what
-simnode's `--with-valset` appends (with native `kv`). So no production tenant
-is `bin/node`-only today; the two wasm ones outside the default set (`acl`,
-`governance`) compose in the sim under that flag. Decide which selection a new
+`SIM_BASE` is 15 of production's 19; the four it leaves out — `acl`,
+`governance`, `lifecycle`, `valset` — are exactly what simnode's
+`--with-valset` appends (with native `kv`). Decide which selection a new
 module joins: `SIM_BASE` if it should boot by default (testable in sim-lane,
 visible in the app), `SIM_VALSET` if it is governance-shaped.
 
@@ -144,7 +144,7 @@ make wasm-index-check                                     # 6. index guests matc
 
 | Mistake | Reality |
 |---|---|
-| Registering only in `bin/node` | noded/simnode compose their own instances; the module is invisible in daemon/sim lanes |
+| Adding the id to `PRODUCTION` only | noded/simnode compose `SIM_BASE`/`SIM_VALSET`; the module is invisible in daemon/sim lanes until it joins one of those too |
 | Topology pins or `GENESIS_ROOT_HASH` left stale after adding/removing a module | `cargo test -p topology` and the root-hash pin fail; update both in the same commit |
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
 | Node pins run before `make wasm-modules` | the fixtures dir lacks the component; `hash_bundle` refuses by name |

@@ -11,6 +11,10 @@ use crate::wire::{MAX_DEPTH, MAX_NAME_BYTES, MAX_PATH_BYTES};
 /// `/`-separated, with no empty / `.` / `..` segments and no NUL bytes. this
 /// only ever rejects — it never rewrites (no trimming, no collapsing). a bare
 /// `/` (root) yields an empty segment list, which read queries like Ls use.
+///
+/// rewriting belongs on the client side of the wire, where an OS filename first
+/// becomes a path: `duckfs_client::scan::duckfs_join` composes an NFD name (what
+/// macOS hands back) to NFC before it ever reaches here.
 pub fn canonical(path: &str) -> Result<Vec<String>, String> {
     // absolute: every path is anchored at root, so a leading '/' is required.
     if !path.starts_with('/') {

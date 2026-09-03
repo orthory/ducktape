@@ -20,6 +20,7 @@ state
   forge_item_state = ""
   forge_item_kind = ""
   forge_item_body = ""
+  forge_item_blocks:[ChatBlock] = []
   forge_item_author = ""
   forge_item_branches = ""
   forge_item_channel = ""

@@ -62,9 +62,10 @@ pub struct Bindings<'a> {
 
 /// how the composed modules come up.
 pub enum Boot<'a, 'b> {
-    /// fresh stores: the native registries seed from [`Bindings`], the
-    /// store-backed network-bound tenants commit their `__config` record, and
-    /// the Map tenants start empty.
+    /// fresh stores: the native registries seed from [`Bindings`], and every
+    /// network-bound tenant installs its `__config` record — a store-backed
+    /// one commits it into its merkle store, a Map-backed one installs it as
+    /// its initial state map. A tenant with no config keys starts empty.
     Genesis,
     /// reopened/synced stores: nothing re-seeds (a store already carries its
     /// genesis records), and `snapshots(id)` installs the Map (and, on the
@@ -241,6 +242,23 @@ async fn wasm(
     if spec.committed_queries {
         module = module.with_committed_queries();
     }
+    // a MAP-backed network-bound tenant carries its `__config` in its state
+    // map, so genesis INSTALLS the record the store-backed twin commits into
+    // its merkle store. it then rides snapshots and state-sync like any other
+    // map entry (and the guest's `save_state` never touches that key), so only
+    // genesis seeds it — the reopen/sync install below replaces the whole map,
+    // config included.
+    let seeds_map_config =
+        matches!(boot, Boot::Genesis) && spec.backing == Backing::Map && !spec.config.is_empty();
+    if seeds_map_config {
+        let (bytes, root) = wasm_host::initial_state(&[(
+            sdk::genesis_config::CONFIG_KEY,
+            &encode_config(spec, bindings)?,
+        )]);
+        module
+            .install(&bytes, root)
+            .map_err(|e| format!("{} genesis config installs: {e}", spec.id))?;
+    }
     // a store-backed tenant's state IS its store: it never installs (and
     // `WasmModule::install` refuses), so the source is not even asked.
     let installs_snapshots = spec.backing != Backing::Store;
@@ -298,15 +316,21 @@ async fn seed_store_config(
     if already.is_some() {
         return Ok(());
     }
-    let mut params: Vec<(&str, &[u8])> = Vec::with_capacity(spec.config.len());
-    for config_key in spec.config {
-        params.push((config_key, config_value(config_key, bindings)?));
-    }
-    let config = sdk::genesis_config::encode_config(&params);
+    let config = encode_config(spec, bindings)?;
     store
         .commit_batch(vec![(key, Some(config))])
         .await
         .map_err(|e| format!("{} genesis config seeds: {e}", spec.id))
+}
+
+/// this tenant's genesis `__config` bytes: every topology config key resolved
+/// against the network bindings, in the topology's own key order.
+fn encode_config(spec: &ModuleSpec, bindings: &Bindings<'_>) -> Result<Vec<u8>, String> {
+    let mut params: Vec<(&str, &[u8])> = Vec::with_capacity(spec.config.len());
+    for config_key in spec.config {
+        params.push((config_key, config_value(config_key, bindings)?));
+    }
+    Ok(sdk::genesis_config::encode_config(&params))
 }
 
 /// the binding a topology config key resolves to; an unknown key is a

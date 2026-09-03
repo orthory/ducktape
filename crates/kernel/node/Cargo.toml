@@ -30,6 +30,8 @@ thiserror = { workspace = true }
 # is authenticated authorship under any scheme a key can carry.
 keyscheme = { workspace = true }
 commonware-cryptography = { workspace = true }
+# `resource_limits`: getrlimit/setrlimit/sysconf for the open-file soft limit.
+libc = { workspace = true }
 
 [dev-dependencies]
 # the `log_file` rotation tests open real files in an isolated dir.

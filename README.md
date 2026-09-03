@@ -46,7 +46,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `bin/` | Runnable binaries: `node` (the unified `ducktape` CLI: `node run` plus every operator family — `node`, `user`, `account`, `wallet`, `gateway`, `fs`, `service`, `agent`, `module`, `mcp`), `noded` (`noded-bin`: the throwaway dev daemon with temp storage), `simnode` (deterministic /v1 twin), `coordinator` (STUN rendezvous + the TCP first-contact relay), `airlock-gateway` (the TEE enclave lender; the non-TEE lender is `ducktape service run airlock`), `guest-builder` (module → wasm component packaging tool), `duck-guest-init` (PID 1 inside a run's microVM), `duck-vz-shim` (the macOS Virtualization.framework VMM shim, Swift) |
 | `app/` | `ducktape-app`, the native Iced desktop client (Chat + Pages), UI declared in `src/ui/*.ice`; `crates/design` is its design system |
 | `ops/` | Operator scripts, the node and coordinator systemd units, the sandbox guest image builder, the hosted auth page — see `ops/README.md` |
-| `docs/` | Operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`) and the few records code cites by path (`records/`) |
+| `docs/` | Operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`) and the few records code cites by path (`records/`); `docs/README.md` indexes every document in the repo by the question it answers |
 
 Each module publishes its wire surface — types-only payload/query/reply shapes
 and codecs — at its own crate root; those wire types plus host-routed queries
@@ -233,7 +233,8 @@ make demo-seed
 
 ## Documentation
 
-`docs/` holds operator runbooks (`deploy/`, `dogfood.md`, `sandbox-macos.md`)
-and the few records code cites by path (`records/`); `docs/README.md` is the
-index. There is no docs site and no decision-record system: the code and its
-comments are the record.
+`docs/README.md` is the index: one line per document, grouped by the question
+it answers — the operator runbooks under `docs/deploy/`, the records code cites
+by path under `docs/records/`, the agent runbooks in `skills/`, and the
+per-area READMEs. There is no docs site and no decision-record system: the
+code and its comments are the record.

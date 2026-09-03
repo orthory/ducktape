@@ -24,6 +24,8 @@
 //! is already on this host.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use duckfs_client::http::HttpNode;
 
@@ -49,12 +51,26 @@ pub struct NodeLink {
     /// the node's forge repo base (`<storage>/forge-repo`) — a host path, not a
     /// route. `None` on a node whose storage dir is unknown to the daemon.
     forge_repo: Option<PathBuf>,
-    /// this boot's operator credential, read out of the node's workspace. EVERY
-    /// mutating `/v1` route now refuses a caller that presents neither this nor
-    /// a user signature ([`crate::signed_req`]), and a daemon has no user key —
-    /// its writes ARE the node's. `None` = reads only.
-    operator_token: Option<String>,
+    /// the node's workspace — the PATH the operator credential lives at, never
+    /// the credential itself. EVERY mutating `/v1` route refuses a caller that
+    /// presents neither it nor a user signature ([`crate::signed_req`]), and a
+    /// daemon has no user key — its writes ARE the node's. Re-read per attach,
+    /// never latched: the node mints a fresh `admin.token` on every boot, so a
+    /// daemon that outlives a node restart would otherwise present a dead
+    /// credential forever. `None` = reads only.
+    workspace: Option<PathBuf>,
+    /// both credential warnings are latched: an attach runs per REQUEST, and a
+    /// heartbeat that fires every block would turn either into a log bomb.
+    /// Shared across clones, so one link warns once however it is cloned.
+    warned_unreadable: Arc<AtomicBool>,
+    warned_rejected: Arc<AtomicBool>,
     client: reqwest::Client,
+}
+
+/// true exactly once per flag — the latch behind the two credential warnings.
+fn first_time(flag: &AtomicBool) -> bool {
+    flag.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 impl NodeLink {
@@ -63,33 +79,19 @@ impl NodeLink {
         Self {
             base: base.into().trim_end_matches('/').to_string(),
             forge_repo: None,
-            operator_token: None,
+            workspace: None,
+            warned_unreadable: Arc::new(AtomicBool::new(false)),
+            warned_rejected: Arc::new(AtomicBool::new(false)),
             client: http_client(CALL_TIMEOUT),
         }
     }
 
-    /// carry the operator credential from the node's `workspace` on every
+    /// carry the operator credential out of the node's `workspace` on every
     /// mutating call. A daemon that cannot read it keeps its READS — the link
     /// still works for `/v1/query`, and a write comes back as the node's own
     /// 401 naming the credential, which beats a daemon that refuses to boot.
-    pub fn with_workspace_credential(self, workspace: &Path) -> Self {
-        match crate::admin::read_operator_token(workspace) {
-            Ok(token) => self.with_operator_token(token),
-            Err(error) => {
-                tracing::warn!(
-                    target: "ducktape::service",
-                    reason = "operator_token_unreadable",
-                    %error,
-                    "this daemon cannot write to its node"
-                );
-                self
-            }
-        }
-    }
-
-    /// carry an operator credential already in hand.
-    pub fn with_operator_token(mut self, token: String) -> Self {
-        self.operator_token = Some(token);
+    pub fn with_workspace_credential(mut self, workspace: &Path) -> Self {
+        self.workspace = Some(workspace.to_path_buf());
         self
     }
 
@@ -117,8 +119,25 @@ impl NodeLink {
         self.forge_repo.as_deref()
     }
 
-    pub fn operator_token(&self) -> Option<&str> {
-        self.operator_token.as_deref()
+    /// this node's operator credential AS OF NOW — a fresh read of
+    /// `admin.token`, because the node re-mints it every boot. `None` on a
+    /// read-only link or an unreadable file (warned once).
+    pub fn operator_token(&self) -> Option<String> {
+        let workspace = self.workspace.as_deref()?;
+        match crate::admin::read_operator_token(workspace) {
+            Ok(token) => Some(token),
+            Err(error) => {
+                if first_time(&self.warned_unreadable) {
+                    tracing::warn!(
+                        target: "ducktape::service",
+                        reason = "operator_token_unreadable",
+                        %error,
+                        "this daemon cannot write to its node"
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// the duckfs checkout/commit engine's transport.
@@ -128,12 +147,15 @@ impl NodeLink {
     /// owns a runtime whose DROP panics inside an async context. Building it
     /// where it is used keeps both halves on the blocking side.
     pub fn files(&self) -> HttpNode {
-        let node = HttpNode::new(self.base.clone());
-        let Some(token) = self.operator_token.clone() else {
-            return node;
-        };
-        node.with_write_auth(std::sync::Arc::new(move |_method, _path, _body| {
-            vec![(crate::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
+        // the closure re-reads the credential per write, exactly like every
+        // other attach: an engine built once at boot must not pin this boot's
+        // token into every later commit.
+        let link = self.clone();
+        HttpNode::new(self.base.clone()).with_write_auth(Arc::new(move |_method, _path, _body| {
+            match link.operator_token() {
+                Some(token) => vec![(crate::admin::ADMIN_TOKEN_HEADER.to_string(), token)],
+                None => Vec::new(),
+            }
         }))
     }
 
@@ -185,13 +207,25 @@ impl NodeLink {
             .send()
             .await
             .map_err(|error| format!("POST {path}: {error}"))?;
+        // a 401 here is the CREDENTIAL, not the request: the node re-mints
+        // `admin.token` per boot, so this is what a daemon holding a stale one
+        // looks like from the outside. Named, or the caller only ever sees its
+        // own generic failure reason.
+        let credential_refused = response.status() == reqwest::StatusCode::UNAUTHORIZED;
+        if credential_refused && first_time(&self.warned_rejected) {
+            tracing::warn!(
+                target: "ducktape::service",
+                reason = "operator_token_rejected",
+                "this node refused the daemon's operator credential"
+            );
+        }
         Self::body_of(response).await
     }
 
-    /// attach the operator credential when this link holds one. Harmless on a
-    /// read route (the gate never looks) and required on every write.
+    /// attach the operator credential when this link has one to read. Harmless
+    /// on a read route (the gate never looks) and required on every write.
     fn credentialed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match self.operator_token.as_deref() {
+        match self.operator_token() {
             Some(token) => request.header(crate::admin::ADMIN_TOKEN_HEADER, token),
             None => request,
         }
@@ -210,5 +244,60 @@ impl NodeLink {
             return Err(detail);
         }
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// a fake node whose `/v1/query` answers with the operator credential the
+    /// caller presented — so a test can assert WHICH token the link attached.
+    async fn credential_echo_node() -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind a loopback test surface");
+        let address = listener.local_addr().expect("read the test address");
+        let app = axum::Router::new().route(
+            "/v1/query",
+            axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .get(crate::admin::ADMIN_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    async fn presented_credential(link: &NodeLink) -> String {
+        let bytes = link.query("t", b"{}").await.expect("query the fake node");
+        String::from_utf8(bytes).expect("the echoed credential is utf-8")
+    }
+
+    #[tokio::test]
+    async fn the_operator_credential_is_re_read_on_every_request() {
+        let workspace = tempfile::tempdir().expect("a node workspace");
+        let booted = crate::admin::mint_operator_token(workspace.path()).expect("mint");
+        let link =
+            NodeLink::new(credential_echo_node().await).with_workspace_credential(workspace.path());
+        assert_eq!(presented_credential(&link).await, booted);
+
+        // the node restarted and re-minted. A daemon that outlives that restart
+        // must present the NEW secret, not the one it read at its own boot.
+        let reminted = crate::admin::mint_operator_token(workspace.path()).expect("re-mint");
+        assert_ne!(reminted, booted);
+        assert_eq!(presented_credential(&link).await, reminted);
+    }
+
+    #[tokio::test]
+    async fn a_link_without_a_workspace_presents_nothing() {
+        let link = NodeLink::new(credential_echo_node().await);
+        assert_eq!(link.operator_token(), None);
+        assert_eq!(presented_credential(&link).await, "");
     }
 }

@@ -3,6 +3,11 @@ name = "node-bin"
 edition.workspace = true
 version.workspace = true
 
+# `--cfg tokio_unstable` (set workspace-wide in .cargo/config.toml, for the
+# SIGUSR1 task dump) is a real, deliberately-set cfg, not a typo.
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(tokio_unstable)"] }
+
 # a runnable multi-process node: derives an ed25519 identity from a config seed,
 # stands up a real `authenticated::discovery` encrypted TCP mesh to its peers,
 # runs a live simplex Engine (via consensus::SimplexOrderer, over the REAL tokio
@@ -126,8 +131,10 @@ indexer = { workspace = true }
 # the app-surface thread runs plain tokio (axum); the node itself stays on
 # commonware's runner. the promoted-validator boot catch-up also uses Tokio's
 # bounded mutex/timeout around the temporary statesync client; `signal` drives
-# the SIGTERM/SIGINT graceful-checkpoint arm of the run loop.
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-std", "io-util"] }
+# the SIGTERM/SIGINT graceful-checkpoint arm of the run loop; `taskdump` is
+# required (with `--cfg tokio_unstable`) for `Handle::dump()`, the SIGUSR1
+# task dump — Linux x86_64/aarch64 only, cfg-gated at the call site.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-std", "io-util", "taskdump"] }
 
 commonware-runtime = { workspace = true }
 commonware-cryptography = { workspace = true }
@@ -154,8 +161,8 @@ zeroize = { workspace = true }
 # internals ride the same filter: RUST_LOG=commonware_p2p=debug.
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Raise the node's inherited open-file soft limit before opening module stores.
-libc = "0.2"
+# Cap glibc's malloc arenas before any thread spawns (src/resource_limits.rs).
+libc = { workspace = true }
 # the `agent install` checklist (src/executors.rs). default-features off: the
 # editor/password/history extras are prompts this binary does not have, and
 # each carries its own dependency. What is left is 4 crates, `console` being

@@ -56,6 +56,14 @@ member's node (the chat module gates posting, not reading, and holds no
 encryption) — never paste an `identity.key` hex, a wallet password or an
 invite blob into chat. Credentials go through `ducktape user cred add`.
 
+An **invite blob** is a secret in its own right: besides the single-use
+admission token it names the inviter's reachable members — their node
+identities, WireGuard public keys, overlay ports, and public endpoints for
+the host-capable ones (`docs/records/architecture/reachability.md` §5). That
+is data the signed mesh already carries, but a leaked blob widens who sees it
+from admitted members to whoever holds it. Mint one per joiner, hand it over
+a private channel, and let it expire.
+
 ## What to copy
 
 For **every** host, off-host and encrypted:

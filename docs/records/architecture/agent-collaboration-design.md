@@ -1,9 +1,8 @@
 # Consensus-Backed Agent Collaboration — Design
 
-Status: as built (dissolution completed 2026-07-06; grounded in checked-in
-code). Scope: how LLM agents collaborate deterministically over the consensus
-log — the ordering contract the platform promises and the module architecture
-that delivers it.
+Scope: how LLM agents collaborate deterministically over the consensus log —
+the ordering contract the platform promises and the module architecture that
+delivers it.
 
 Principle: **no backwards compatibility.** This is an early-stage product.
 Schema, wire, and root-preimage changes are flag-day changes on a fresh
@@ -21,9 +20,9 @@ or wire-surface preservation. Delete and replace.
   drain FIFO within one block (cap `MAX_DISPATCHES`); the host commits or
   aborts the whole touched set at the boundary.
 - **Non-determinism only enters as ordered ops.** Effects surface
-  post-finalization; a `reactor::Worker` does off-consensus work and returns a
-  `Msg` submitted as an ordinary op (oracle-as-op). The worker can never
-  mutate state directly.
+  post-finalization; a `host::worker::Worker` does off-consensus work and
+  returns a `Msg` submitted as an ordinary op (oracle-as-op). The worker can
+  never mutate state directly.
 - **Cross-module reads are consensus reads.** `ctx.query` routes through the
   host's live query routing, staged same-block writes included — so a module
   reading another module's state mid-block sees the same bytes on every
@@ -48,8 +47,9 @@ to keep these seven promises cheap and the two non-promises honest.
   Happens-before within a channel = sequence order.
 - **P4 — Anchored generation.** The ENTIRE model input is composed in
   consensus — the bounded transcript window ending at the anchor, the
-  agent's prompt framing (pinned by the registered `prompt_hash`), and the
-  strict output contract — and rides the dispatch as committed payload data.
+  agent's persona (its `always` skills, named by the registered skill refs
+  and pinnable to a snapshot), and the strict output contract — and rides
+  the dispatch as committed payload data.
   Any validator holds the exact prompt input as ordered state, and a reply is
   never presented as ordered before its anchor.
 - **P5 — Result singularity.** Exactly one oracle result transitions a saga;
@@ -82,25 +82,25 @@ to keep these seven promises cheap and the two non-promises honest.
 
 ## 3. Architecture — the collaboration loop, dissolved
 
-The original agent module stacked five jobs: registry, chat engagement
-policy, run lifecycle, saga dispatch, and cross-module effect application.
-Each landed in its proper home; what remains is a set of module-agnostic
-planes plus two small agent-specific modules. Roles (all deterministic
-except the driver):
+The collaboration loop is a set of module-agnostic planes plus two small
+agent-specific modules: the registry and the actor are separate modules, and
+engagement policy, run lifecycle, saga dispatch and cross-module effect
+application each live in their own plane. Roles (all deterministic except
+the driver):
 
 | Piece | Role |
 | --- | --- |
 | `chat` | The collaboration surface: channels, threads, blocks; reports posts (mentions included) to the tagging plane |
 | `tagging` | The engagement plane: content modules report tags, subscriber modules receive engagement events — router only, module-agnostic |
-| `agent` | The REGISTRY, and nothing more: agent records (owner, capability tag, prompt pin, granted actions, status) + the formal response wire spec (`agent-interface`). 100% self-contained — no other module's interface crosses the crate |
+| `agent` | The REGISTRY, and nothing more: agent records (owner, capability tag, granted actions, resource caps, skill refs, status) + the formal response wire spec (`agent::interface`). 100% self-contained — no other module's interface crosses the crate |
 | `runs` | The ACTOR: channel watches, run orchestration, in-consensus payload composition, response validation and delivery. Reads the registry by query; holds no registry state |
 | `dispatch` | The task plane: consensus-registered recipes (capability, routing, output contract), saga-backed execution, contract judging, mailbox + next-block `ResultEvent` delivery |
 | `capability` | Per-node capability announcements — the provider domain recipes route over |
 | `saga` | The domain-agnostic async-RPC ledger underneath dispatch: one effect ↔ one result, leases, deadlines, retries |
-| `jobs` | The work board: submitted jobs fan out to registered workers; the runs module claims `agent/{id}` jobs |
+| `tasks` (the jobs board) | The work board inside the tasks module: submitted jobs fan out to registered workers; the runs module claims `agent/{id}` jobs |
 | dispatch-oracle (node) | The only impure piece: resolves a work spec's capability tag to a machine-local provider CLI, feeds the payload VERBATIM, submits the raw answer as an oracle op. No prompt composed, no output parsed, no credentials touched |
 
-Two hard rules fell out of the dissolution:
+Two hard rules hold across the planes:
 
 - **The registry never references another module.** The agent crate imports
   only platform vocabulary (`sdk`, `SagaOrigin`, the capability tag shape
@@ -192,17 +192,20 @@ again: the permanent-abort loop. The rules, as implemented:
 **`agent` — the record book.**
 
 - `AgentRecord{agent_id, owner (origin), display_name, capability,
-  prompt_hash, allowed_actions, status}` — registration is an ordered op, so
-  *which capability and prompt an agent runs is part of the root-hash* and
-  auditable. `capability` names WHAT a run needs (an open-set registry tag);
-  HOW it executes — binary, flags, model — is host policy in each provider's
-  spec, invisible to consensus. Prompt CONTENT is content-addressed in the
-  node's blob store under `prompt_hash`; consensus commits to the hash and the
-  host resolves the content.
+  allowed_actions, status, role, recipe_hash, caps, skills}` — registration
+  is an ordered op, so *which capability and persona an agent runs is part of
+  the root-hash* and auditable. `capability` names WHAT a run needs (an
+  open-set registry tag); HOW it executes — binary, flags, model — is host
+  policy in each provider's spec, invisible to consensus. The persona is the
+  agent's `always` skills: skill documents in the shared library
+  (`/shared/skills/…` in the files module) referenced by prefix, tracking the
+  library head or pinned to a snapshot id; the host inlines their bodies into
+  the run's context document, and `recipe_hash` content-addresses an optional
+  recipe.
 - Ops: `RegisterAgent`/`UpdateAgent`/`PauseAgent`/`ResumeAgent` (owner-gated
   by origin). Registration and capability changes notify the hook (§3).
 - The response wire spec (`AgentResponse{reply_blocks, actions[]}`) lives in
-  `agent-interface` as the formal contract; reply blocks are the spec's OWN
+  `agent::interface` as the formal contract; reply blocks are the spec's OWN
   vocabulary, mapped to chat blocks by the consumer at emission.
 - Agent ids reject the reserved `\x1f` unit separator — the runs module keys
   run records with it.
@@ -227,9 +230,11 @@ again: the permanent-abort loop. The rules, as implemented:
 - **Output validation is the safety boundary.** The response is data until
   every check passes; only then do its follow-ups exist. Fan-out is bounded
   per run (`MAX_ACTIONS_PER_RUN`).
-- Both modules are state-based (BTreeMap + canonical-encoding root,
-  saga-style) with snapshot/install joiner support; the snapshot IS the root
-  preimage, and install re-derives the root before adopting.
+- The registry is store-backed (qmdb point reads behind the module root).
+  `runs` still rides the in-memory map backing (`Backing::Map` in
+  `crates/topology`: BTreeMap + canonical-encoding root) with
+  snapshot/install joiner support; its snapshot IS the root preimage, and
+  install re-derives the root before adopting.
 
 ## 6. Deliberately deferred
 
@@ -238,7 +243,6 @@ again: the permanent-abort loop. The rules, as implemented:
   validation are the honest v1).
 - Real agreed timestamps (consensus_time = view is sufficient for ordering
   and leases-in-views; wall-clock deadlines need consensus timestamp wiring).
-- Generalizing the recipe manifest layer (the `feat/agent-recipes` thread):
-  richer what-to-run manifests — prompt as dispatch payload, output
-  contracts beyond Text/Json, static binding — ride the existing dispatch
-  recipe shape when they land.
+- Generalizing the recipe manifest layer: richer what-to-run manifests —
+  output contracts beyond Text/Json, static binding — ride the existing
+  dispatch recipe shape when they land.

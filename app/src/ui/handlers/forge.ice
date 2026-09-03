@@ -105,6 +105,7 @@ on forge_item_loaded(next)
   forge_item_state = next.state
   forge_item_kind = next.kind
   forge_item_body = next.body
+  forge_item_blocks = next.blocks
   forge_item_author = next.author_name
   forge_item_branches = next.branches
   forge_item_channel = next.channel_id
@@ -253,6 +254,7 @@ on forge_refreshed(next)
   forge_item_state = keep_str(next.item_loaded, next.item.state, forge_item_state)
   forge_item_kind = keep_str(next.item_loaded, next.item.kind, forge_item_kind)
   forge_item_body = keep_str(next.item_loaded, next.item.body, forge_item_body)
+  forge_item_blocks = keep_chat_blocks(next.item_loaded, next.item.blocks, forge_item_blocks)
   forge_item_author = keep_str(next.item_loaded, next.item.author_name, forge_item_author)
   forge_item_branches = keep_str(next.item_loaded, next.item.branches, forge_item_branches)
   forge_item_channel = keep_str(next.item_loaded, next.item.channel_id, forge_item_channel)

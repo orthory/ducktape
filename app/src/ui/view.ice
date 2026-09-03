@@ -470,6 +470,7 @@ view
               forge_item_author
               forge_item_branches
               forge_item_body
+              forge_item_blocks
               forge_item_files_changed
               forge_item_additions
               forge_item_deletions

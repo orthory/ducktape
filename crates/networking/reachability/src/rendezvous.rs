@@ -365,7 +365,32 @@ async fn establish_then_pump(
         std::sync::Arc::downgrade(&client),
         keepalive,
     ));
-    rendezvous_pump(client, commands, datagrams).await
+    rendezvous_pump(client, commands, datagrams, status).await
+}
+
+/// Publish a coordinator observation of this node's own reflexive, ONLY when
+/// it moved: the NAT rebound and every peer is now dialing a dead mapping.
+/// The watch is the plane's only notice of that — the node re-advertises its
+/// record off this transition — so it must not fire on the steady stream of
+/// unchanged re-probes. `send_replace`, not `send`: the ledger has to move
+/// even in the window where nothing holds a receiver, or the next real move
+/// back to this address would look like no move at all.
+fn publish_reflexive(status: &tokio::sync::watch::Sender<RendezvousStatus>, observed: SocketAddr) {
+    let unchanged = matches!(
+        *status.borrow(),
+        RendezvousStatus::Ready { reflexive } if reflexive == observed
+    );
+    if unchanged {
+        return;
+    }
+    tracing::info!(
+        target: "ducktape::reachability",
+        reflexive = %observed,
+        "coordinator-observed reflexive MOVED — the NAT rebound"
+    );
+    status.send_replace(RendezvousStatus::Ready {
+        reflexive: observed,
+    });
 }
 
 /// The pump's idle-arm socket handling, shared with the establishment
@@ -479,6 +504,15 @@ async fn rendezvous_keepalive(client: std::sync::Weak<NatClient>, keepalive: Dur
             return;
         };
         nonce = nonce.max(nat_traversal::now_secs()) + 1;
+        // Ask what the coordinator observes us at, every tick. The
+        // re-advertisement above MOVES the coordinator's mapping to whatever
+        // source it sees, but tells this node nothing — and a rebind this
+        // node cannot see is a rebind it cannot re-advertise to its peers,
+        // who keep dialing the dead mapping until this member's next life.
+        // Send-only here (the pump owns the receive side and publishes the
+        // answer); a failure needs no report of its own, the readvertise on
+        // the same socket reports the same breakage.
+        let _ = client.send_bind_request().await;
         match client.readvertise(nonce).await {
             Ok(()) => failures = 0,
             Err(err) => {
@@ -509,6 +543,7 @@ async fn rendezvous_pump(
     client: std::sync::Arc<NatClient>,
     mut commands: tokio::sync::mpsc::Receiver<ResolveCmd>,
     datagrams: Option<tokio::sync::mpsc::Sender<(SocketAddr, Vec<u8>)>>,
+    status: tokio::sync::watch::Sender<RendezvousStatus>,
 ) {
     loop {
         tokio::select! {
@@ -545,9 +580,14 @@ async fn rendezvous_pump(
                     }
                 }
             }
-            ev = client.recv_socket_event() => {
-                handle_idle_socket_event(&client, ev, datagrams.as_ref()).await;
-            }
+            ev = client.recv_socket_event() => match ev {
+                // the keepalive's standing re-probe answering: the pump owns
+                // the receive side, so this is where a moved mapping is seen.
+                Ok(SocketEvent::Rendezvous(ClientEvent::BindResponse { reflexive })) => {
+                    publish_reflexive(&status, reflexive);
+                }
+                other => handle_idle_socket_event(&client, other, datagrams.as_ref()).await,
+            },
         }
     }
 }
@@ -954,5 +994,34 @@ mod tests {
             r.resolve(key, advertised).await,
             Ok(Resolution::Advertised)
         ));
+    }
+
+    /// The keepalive re-probes every tick, so the pump sees the SAME
+    /// reflexive over and over. Only a move may reach the watch: the node
+    /// re-signs and re-advertises its record off this transition, and doing
+    /// that every 25 seconds would flood the mesh with fresh lives.
+    #[test]
+    fn a_reflexive_reaches_the_watch_only_when_it_moved() {
+        let first: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        let moved: SocketAddr = "203.0.113.7:40021".parse().unwrap();
+        let (tx, mut rx) = tokio::sync::watch::channel(RendezvousStatus::Establishing);
+
+        publish_reflexive(&tx, first);
+        assert_eq!(
+            *rx.borrow_and_update(),
+            RendezvousStatus::Ready { reflexive: first }
+        );
+
+        publish_reflexive(&tx, first);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "an unchanged re-probe is not a rebind"
+        );
+
+        publish_reflexive(&tx, moved);
+        assert_eq!(
+            *rx.borrow_and_update(),
+            RendezvousStatus::Ready { reflexive: moved }
+        );
     }
 }

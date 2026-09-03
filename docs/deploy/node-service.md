@@ -12,8 +12,7 @@ checkpoint path (the same one the desktop shell uses on quit; a resident
 installs no handler and simply re-syncs at its next boot), it raises its own open-file
 soft limit to 65536 (`bin/node/src/resource_limits.rs`), and
 `ducktape service run` names systemd as its target (`bin/node/src/services.rs`,
-`RunArgs::enable`: "for scripts and systemd units"). What was missing was the
-recipe; this is it.
+`RunArgs::enable`: "for scripts and systemd units").
 
 ## Where the workspace lives
 
@@ -68,6 +67,10 @@ alias dt='sudo -u ducktape env DUCKTAPE_HOME=/var/lib/ducktape /usr/local/bin/du
 ```
 
 ## Install
+
+`ops/node/install.sh --workspace <name> (--init | --join <invite>)` runs
+steps 1-5 below end to end (`--dry-run` prints the commands without touching
+the host); the steps are spelled out here for anyone auditing or adapting them.
 
 ```sh
 # 1. Build and install the CLI system-wide (make install-node puts it in
@@ -173,6 +176,12 @@ curl -XPOST 127.0.0.1:8844/v1/log-filter -d 'info,ducktape::join=debug' \
 
 The tee files are opened append-only once and never reopened, which is why
 the logrotate drop-in uses `copytruncate` (weekly, or at 256 MB, eight kept).
+
+A wedged node (no more progress, no crash) can dump every async task it is
+parked on: `kill -USR1 $(systemctl show -p MainPID --value ducktape-node@mynet)`
+writes `/var/lib/ducktape/workspaces/<chain-id>/tasks.txt` (overwritten each
+time) and logs one `task_dump_written` line to `daemon.log`. Linux
+x86_64/aarch64 only; elsewhere the signal does nothing.
 
 ## Restart, stop, upgrade
 
@@ -304,7 +313,7 @@ Defaults from `crates/workspace-config/src/node_toml.rs`, written into
 | p2p control mesh (`listen`) | `[::]:8846` | TCP | **Yes** for a node others dial directly (a founder, a `Direct`-hinted member). A member that advertises `"overlay"` is dialed over the WireGuard tunnel instead. |
 | WireGuard tunnel plane (`wireguard_listen`) | `0.0.0.0:51820` | UDP | **Yes** for an inviter / a node without a coordinator; the plane hole-punches through a coordinator otherwise. Bind the concrete IP on a LAN or VPS without a coordinator — an unspecified bind advertises an endpoint-less record and joiner↔joiner tunnels stay dark. |
 | invite intro (`invite_listen`) | WireGuard port + 1 → `0.0.0.0:51821` | UDP | **Yes** on any node that mints invites (a joiner rings this doorbell first). |
-| node HTTP API (`http_listen`) | `127.0.0.1:8844` | TCP | No — loopback only. `/v1` is unauthenticated; never bind it wider. |
+| node HTTP API (`http_listen`) | `127.0.0.1:8844` | TCP | No — loopback only. Every mutating `/v1` route requires a per-request user signature or the workspace's operator token from a loopback peer, and every co-located process dials this plane over loopback whatever it is bound to; never bind it wider. |
 | operator rpc (`rpc_listen`) | `127.0.0.1:8845` | TCP | No — loopback only. |
 | browser gateway (`gateway_listen`) | `127.0.0.1:0` | TCP | No — port 0, printed at boot, re-read per session. |
 

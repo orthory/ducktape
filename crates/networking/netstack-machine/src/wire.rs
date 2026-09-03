@@ -37,7 +37,7 @@ use crate::machine::MachineState;
 /// (`tests/fixtures/contract.schema`) and this constant are regenerated in
 /// the same PR (`UPDATE_TRACES=1 cargo test -p netstack-machine`).
 pub const CONTRACT_SCHEMA_HASH: &str =
-    "340b116303e8e94fac5ef2922c620f4832541cb6b89ebfe48508a955fa808911";
+    "9c324c2545c0027faf29c8d12b2a8299e48c6c0b92ab79195e1110e8b0d0db01";
 
 #[derive(Debug, thiserror::Error)]
 #[error("contract wire: {0}")]

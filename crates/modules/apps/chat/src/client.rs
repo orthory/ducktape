@@ -1614,6 +1614,42 @@ fn dangling_close(run: &[char]) -> bool {
 /// else stays plain text.
 const LINK_SCHEMES: [&str; 3] = ["http://", "https://", "duck://"];
 
+/// How many hex characters `mint_chain_id` puts after the `#`.
+const CHAIN_DIGEST_HEX: usize = 8;
+
+/// The chain id's hash half — `mint_chain_id` spells a chain id
+/// `<name>#<8 hex>` and only the hex rides a URI. "" for an unnamed chain.
+///
+/// Split from the RIGHT: `node init --name` validates nothing, so a network
+/// named `my#net` mints the chain id `my#net#a1b2c3d4`, and only the LAST `#`
+/// is the minted separator.
+pub fn chain_digest(chain_id: &str) -> &str {
+    chain_id.rsplit_once('#').map(|(_, hex)| hex).unwrap_or("")
+}
+
+/// The `?net=` a produced `duck://` link carries, or "" when the producer has
+/// no chain id. THIS IS THE ONE PLACE THE QUERY IS SPELLED: the app's link
+/// builders (`backend/duck_uri.rs`) and the in-consensus producer
+/// (`runs::inject`) both go through here, so a produced link cannot carry a
+/// second dialect of the half that makes a foreign-network refusal possible.
+/// It lives beside the tokenizer that PARSES the form for the same reason.
+pub fn duck_net_query(chain_id: &str) -> String {
+    let digest = chain_digest(chain_id);
+    match digest.is_empty() {
+        true => String::new(),
+        false => format!("?net={digest}"),
+    }
+}
+
+/// Is `digest` a minted chain-id hash half — exactly [`CHAIN_DIGEST_HEX`]
+/// lowercase hex? The reader's side of [`duck_net_query`].
+pub fn is_chain_digest(digest: &str) -> bool {
+    digest.len() == CHAIN_DIGEST_HEX
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// If `chars[at..]` opens a `[label](url)` reference — the form agents already
 /// emit for `duck://` refs (`runs::inject`) — the label, the target, and the
 /// total consumed length. The label is one line with no nested brackets and
