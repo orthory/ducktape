@@ -177,6 +177,12 @@ curl -XPOST 127.0.0.1:8844/v1/log-filter -d 'info,ducktape::join=debug' \
 The tee files are opened append-only once and never reopened, which is why
 the logrotate drop-in uses `copytruncate` (weekly, or at 256 MB, eight kept).
 
+A wedged node (no more progress, no crash) can dump every async task it is
+parked on: `kill -USR1 $(systemctl show -p MainPID --value ducktape-node@mynet)`
+writes `/var/lib/ducktape/workspaces/<chain-id>/tasks.txt` (overwritten each
+time) and logs one `task_dump_written` line to `daemon.log`. Linux
+x86_64/aarch64 only; elsewhere the signal does nothing.
+
 ## Restart, stop, upgrade
 
 ```sh
