@@ -68,6 +68,13 @@ pub(super) struct ForgeLane {
     push_base: String,
     /// the committer identity on every run commit (the node, never the agent).
     committer_name: String,
+    /// this node's operator credential, which is what the loopback push
+    /// presents: `git-receive-pack` refuses a push carrying neither git's own
+    /// certificate nor this (#1292), and a run has no SSH signing key to make
+    /// a certificate with — the NODE is the pusher here, which is exactly what
+    /// this credential says. `None` on a link that could not read the node's
+    /// workspace; the push then comes back as the node's own 401.
+    operator_token: Option<String>,
 }
 
 impl ForgeLane {
@@ -101,6 +108,7 @@ impl ForgeLane {
             repo_base,
             push_base,
             committer_name,
+            operator_token: node.operator_token().map(str::to_string),
         })
     }
 }
@@ -326,6 +334,7 @@ pub(super) async fn provision(
     validate_coords(repo, commit, branch)?;
     let repo_dir = lane.repo_base.join(repo);
     let push_url = format!("{}/{repo}", lane.push_base);
+    let push_credential = lane.operator_token.clone();
 
     let blocking = ProvisionArgs {
         repo_dir,
@@ -404,6 +413,7 @@ pub(super) async fn provision(
         run_dir: workspace_args.run_dir,
         ro_dir,
         push_url,
+        push_credential,
         forge_push: *forge_push,
         source: spec.source.clone(),
         agent_id: spec.agent_id.clone(),
@@ -493,6 +503,8 @@ struct ForgeWorkspace {
     /// (it lives outside the worktree, so git cannot see it either).
     ro_dir: Option<PathBuf>,
     push_url: String,
+    /// the operator credential the push presents (see [`ForgeLane`]).
+    push_credential: Option<String>,
     /// compose-height `forge_push` verdict; false for old envelopes.
     forge_push: bool,
     source: WorkspaceSource,
@@ -819,6 +831,7 @@ fn commit_blocking(
     pinned_commit: &str,
     branch: &str,
     push_url: &str,
+    push_credential: Option<&str>,
     forge_push: bool,
     response_proposal: Option<&str>,
     item_title: &str,
@@ -882,13 +895,26 @@ fn commit_blocking(
     // the interloper's tip stays branch head.
     let refspec = format!("HEAD:refs/heads/{branch}");
     let fetchspec = format!("refs/heads/{branch}");
+    // the credential rides GIT_CONFIG_*, not `-c`: an argv is world-readable
+    // through /proc on Linux, and this is a secret.
+    let header = push_credential
+        .map(|token| format!("{}: {token}", crate::admin::ADMIN_TOKEN_HEADER))
+        .unwrap_or_default();
+    let push_env: Vec<(&str, &str)> = match header.is_empty() {
+        true => Vec::new(),
+        false => vec![
+            ("GIT_CONFIG_COUNT", "1"),
+            ("GIT_CONFIG_KEY_0", "http.extraHeader"),
+            ("GIT_CONFIG_VALUE_0", header.as_str()),
+        ],
+    };
     let committer_env = [
         ("GIT_COMMITTER_NAME", identity.committer_name.as_str()),
         ("GIT_COMMITTER_EMAIL", committer_email.as_str()),
     ];
     let mut rebased = false;
     for attempt in 1..=PUSH_ATTEMPTS {
-        match run_git(run_dir, &["push", push_url, &refspec], &[]) {
+        match run_git(run_dir, &["push", push_url, &refspec], &push_env) {
             Ok(_) => {
                 // re-read AFTER any rebase: the pushed head is the output_commit.
                 let oid = run_git(run_dir, &["rev-parse", "HEAD"], &[])?;
@@ -906,7 +932,7 @@ fn commit_blocking(
                 // fetch miss means the branch is unborn remotely (a create
                 // race that resolved away, or a non-tip reject like a hook):
                 // skip the rebase and just push again.
-                if run_git(run_dir, &["fetch", push_url, &fetchspec], &[]).is_ok() {
+                if run_git(run_dir, &["fetch", push_url, &fetchspec], &push_env).is_ok() {
                     run_git(
                         run_dir,
                         &[
@@ -967,6 +993,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         let (pinned_commit, branch, item_title) = self.coords();
         let run_dir = self.run_dir.clone();
         let push_url = self.push_url.clone();
+        let push_credential = self.push_credential.clone();
         let forge_push = self.forge_push;
         let agent_id = self.agent_id.clone().unwrap_or_else(|| "agent".into());
         let agent_display_name = self
@@ -986,6 +1013,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
                 &pinned_commit,
                 &branch,
                 &push_url,
+                push_credential.as_deref(),
                 forge_push,
                 proposal.as_deref(),
                 &item_title,

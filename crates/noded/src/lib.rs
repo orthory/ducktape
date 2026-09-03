@@ -28,7 +28,7 @@ pub use admin::{AdminConfig, AdminExposure};
 // the per-request signature every MUTATING `/v1` route now carries, and the
 // verifier both it and `/v1/admin/*` share. reads stay open.
 pub mod signed_req;
-pub use signed_req::{SignedBy, WriteRefusal};
+pub use signed_req::{OperatorCredential, SignedBy, WriteRefusal};
 
 pub mod blobs;
 // the pieces every process needs AROUND the composer: the on-disk component

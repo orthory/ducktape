@@ -23,7 +23,7 @@
 
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::net::TcpStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -275,6 +275,21 @@ impl NetworkShapeCluster {
             nodes: vec![None, None],
             dir,
         }
+    }
+
+    /// this shape's per-node workspace — the directory holding `node.toml`, and
+    /// the credential the node mints beside it.
+    pub fn workspace(&self, idx: usize) -> PathBuf {
+        match idx {
+            0 => self.founder_dir.clone(),
+            _ => self.friend_dir.clone(),
+        }
+    }
+
+    /// the `GIT_CONFIG_*` environment a push at node `idx` must carry — the
+    /// shape-cluster twin of [`Cluster::git_push_env`].
+    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
+        git_push_env_for(&self.workspace(idx))
     }
 
     pub fn init_founder(&self, name: &str) -> String {
@@ -1575,6 +1590,18 @@ impl Cluster {
             .expect("the node minted an operator credential")
     }
 
+    /// the `GIT_CONFIG_*` environment a push at node `idx`'s smart-HTTP
+    /// surface must carry.
+    ///
+    /// `git-receive-pack` refuses a push that proves nothing (#1292): it takes
+    /// git's own push certificate, or this node's operator credential. A
+    /// harness pushing at a node it spawned IS its operator. `GIT_CONFIG_*`
+    /// rather than `git -c`, exactly as `ops/dogfood-forge.sh` sets it — an
+    /// argv is world-readable through /proc, and this is a secret.
+    pub fn git_push_env(&self, idx: usize) -> [(String, String); 3] {
+        git_push_env_for(&self.workspace(idx))
+    }
+
     /// a duckfs transport for node `idx` whose writes it admits.
     pub fn files(&self, idx: usize) -> duckfs_client::http::HttpNode {
         let token = self.operator_token(idx);
@@ -1625,6 +1652,24 @@ impl Cluster {
         );
         reply["status"].clone()
     }
+}
+
+/// the `GIT_CONFIG_*` environment carrying the operator credential minted into
+/// `workspace` — one implementation for both cluster shapes.
+fn git_push_env_for(workspace: &Path) -> [(String, String); 3] {
+    let token = noded::admin::read_operator_token(workspace)
+        .expect("the node minted an operator credential");
+    [
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            "http.extraHeader".to_string(),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            format!("{}: {token}", noded::admin::ADMIN_TOKEN_HEADER),
+        ),
+    ]
 }
 
 fn command_output(out: &std::process::Output) -> String {

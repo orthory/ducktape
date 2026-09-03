@@ -83,8 +83,37 @@ resolve_base_url() {
   die "no Forge node selected; set DUCKTAPE_DEV_FORGE_URL or start an active workspace"
 }
 
+# The workspace behind the resolved node, when there is one — the directory
+# holding the operator credential this script's pushes present.
+resolve_workspace() {
+  local duck="${DUCKTAPE_HOME:-$HOME/.ducktape}"
+  local reg="$duck/registry.json"
+  [ -f "$reg" ] || return 0
+  local active
+  active=$(sed -n 's/.*"active"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$reg" | head -1)
+  [ -n "$active" ] || return 0
+  printf '%s' "$duck/workspaces/$active"
+}
+
 BASE_URL="$(resolve_base_url)"
 REMOTE_URL="$BASE_URL/forge/$FORGE_REPO"
+
+# A push MUST prove itself: `git-receive-pack` takes git's own push certificate
+# (`git push --signed`, whose signer becomes the repo's owner on chain) or this
+# node's operator credential, which makes the NODE the owner. This script seeds
+# the node's own mirror of the canonical repo, so the node is the right owner
+# and this is the right proof.
+#
+# GIT_CONFIG_*, not `git -c`: an argv is world-readable through /proc, and this
+# is a secret. Exported so `git push`/`git fetch` below inherit it.
+WORKSPACE="$(resolve_workspace)"
+if [ -n "$WORKSPACE" ] && [ -r "$WORKSPACE/admin.token" ]; then
+  export GIT_CONFIG_COUNT=1
+  export GIT_CONFIG_KEY_0=http.extraHeader
+  export GIT_CONFIG_VALUE_0="x-ducktape-admin-token: $(cat "$WORKSPACE/admin.token")"
+else
+  log "WARNING: no operator credential found; the node will refuse an unsigned push"
+fi
 
 log "node forge endpoint: $REMOTE_URL"
 

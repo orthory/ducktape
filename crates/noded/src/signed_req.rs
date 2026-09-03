@@ -242,6 +242,17 @@ pub fn request_headers(
     ]
 }
 
+/// the mark [`signed_write_guard`] puts on a request that arrived from a
+/// loopback peer holding this node's operator credential.
+///
+/// It exists for the ONE mutating route this middleware cannot decide for
+/// itself: the forge's `git-receive-pack`, whose other proof (git's own push
+/// certificate) is inside the packfile body. The gate establishes the fact
+/// once, here, and the handler reads it rather than re-deriving the loopback
+/// and constant-time-compare rules a second time.
+#[derive(Clone, Copy, Debug)]
+pub struct OperatorCredential;
+
 /// the verified acting identity, put on the request by [`signed_write_guard`]
 /// and read by any gated handler that submits on the caller's behalf. its
 /// presence IS the proof the gate ran: a handler that finds none was reached
@@ -408,14 +419,17 @@ impl WriteRefusal {
 /// a node that minted no credential verifies none: it fails closed here and the
 /// request falls through to the signature check, exactly as if nothing had been
 /// presented.
-fn operator_credential_matches(cfg: &crate::AdminConfig, req: &axum::extract::Request) -> bool {
+pub(crate) fn operator_credential_matches(
+    cfg: &crate::AdminConfig,
+    headers: &HeaderMap,
+    on_box: bool,
+) -> bool {
     let Some(expected) = cfg.operator_token.as_deref() else {
         return false;
     };
-    let Some(offered) = header_str(req.headers(), crate::admin::ADMIN_TOKEN_HEADER) else {
+    let Some(offered) = header_str(headers, crate::admin::ADMIN_TOKEN_HEADER) else {
         return false;
     };
-    let on_box = crate::admin::peer_is_loopback(req);
     on_box && crate::services::token_matches(offered, expected)
 }
 
@@ -423,20 +437,28 @@ fn operator_credential_matches(cfg: &crate::AdminConfig, req: &axum::extract::Re
 /// an open (read) route is passed straight through, body untouched.
 pub(crate) async fn signed_write_guard(
     State(handle): State<NodeHandle>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: Next,
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
+    // the node's own daemons, acting AS the node. established for EVERY
+    // request, gated or not, because the forge's git lane needs the same fact
+    // and cannot re-derive it (see [`OperatorCredential`]). no `SignedBy` is
+    // inserted, so the acting origin stays the node's own name — which is what
+    // a daemon's write is.
+    let on_box = crate::admin::peer_is_loopback(&req);
+    let is_operator = operator_credential_matches(&handle.admin, req.headers(), on_box);
+    if is_operator {
+        req.extensions_mut().insert(OperatorCredential);
+    }
     if !needs_signature(&method, &path) {
         return next.run(req).await;
     }
-    // the node's own daemons, acting AS the node. checked first and without
-    // touching the body: nothing is signed over it here, so a whole packfile or
-    // a 4 MiB blob still streams to its handler instead of buffering in
-    // middleware. no `SignedBy` is inserted, so the acting origin stays the
-    // node's own name — which is what a daemon's write is.
-    if operator_credential_matches(&handle.admin, &req) {
+    // admitted without touching the body: nothing is signed over it on this
+    // path, so a whole packfile or a 4 MiB blob still streams to its handler
+    // instead of buffering in middleware.
+    if is_operator {
         return next.run(req).await;
     }
     let path_and_query = req

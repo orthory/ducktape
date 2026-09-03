@@ -117,6 +117,10 @@ impl NodeLink {
         self.forge_repo.as_deref()
     }
 
+    pub fn operator_token(&self) -> Option<&str> {
+        self.operator_token.as_deref()
+    }
+
     /// the duckfs checkout/commit engine's transport.
     ///
     /// MUST be called from a blocking context (`spawn_blocking`), never from an

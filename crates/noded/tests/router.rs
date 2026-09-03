@@ -316,6 +316,82 @@ async fn a_signed_submit_is_authored_by_the_signer_not_the_claim() {
     assert_eq!(stamped, acting);
 }
 
+/// one git pkt-line: a 4-hex length prefix over the payload INCLUDING itself.
+fn pkt(payload: &str) -> String {
+    format!("{:04x}{payload}", payload.len() + 4)
+}
+
+/// a stock (UNSIGNED) receive-pack body: one ref-update command, the flush that
+/// ends the command list, and an empty pack.
+fn unsigned_push_body() -> String {
+    let zero = "0".repeat(40);
+    let one = "1".repeat(40);
+    format!(
+        "{}0000",
+        pkt(&format!("{zero} {one} refs/heads/main\0report-status\n"))
+    )
+}
+
+/// A PUSH MUST PROVE ITSELF. An unsigned push used to be accepted and re-signed
+/// with the node's key, so the first one to a new repo made this node's raw
+/// pubkey the permanent owner (#1292).
+#[tokio::test]
+async fn an_unproven_push_is_refused() {
+    let (handle, cmd_rx, _events) = local_node();
+    tokio::spawn(async move {
+        let mut cmds = cmd_rx;
+        if cmds.next().await.is_some() {
+            panic!("an unproven push reached the node actor");
+        }
+    });
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/forge/lab/git-receive-pack")
+        .header(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-request",
+        )
+        .body(Body::from(unsigned_push_body()))
+        .unwrap();
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        body_json(response).await["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("git push --signed")),
+        "the refusal names the two proofs a push can carry"
+    );
+}
+
+/// The node's own operator credential is the OTHER proof: it is what
+/// `make dogfood-forge` and the agent-run lane present, and it makes the NODE
+/// the repo's owner — right for a node publishing its own mirror.
+#[tokio::test]
+async fn an_operator_credentialed_push_is_admitted() {
+    let (handle, cmd_rx, _events) = local_node();
+    spawn_fake_actor(cmd_rx, None);
+
+    let request = with_operator(with_peer(
+        Request::builder()
+            .method("POST")
+            .uri("/forge/lab/git-receive-pack")
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-git-receive-pack-request",
+            )
+            .body(Body::from(unsigned_push_body()))
+            .unwrap(),
+        "127.0.0.1:40000",
+    ));
+    let response = noded::router(handle).oneshot(request).await.unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "the operator credential is a proof this route accepts"
+    );
+}
+
 /// a signature that does not bind THIS body is not a signature for THIS
 /// request: the gate hashes the body precisely so an authenticated caller's
 /// bytes cannot be swapped in flight.

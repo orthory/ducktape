@@ -165,7 +165,11 @@ fn resident_posts_to_chat_with_its_own_authorship() {
         cluster.http_ports[1]
     );
     git_ok(source.path(), &["remote", "add", "resident", &resident_url]);
-    git_ok(source.path(), &["push", "resident", "main"]);
+    git_push_ok(
+        cluster.git_push_env(1),
+        source.path(),
+        &["push", "resident", "main"],
+    );
 
     for (idx, role) in [(0, "validator"), (1, "resident")] {
         let head = poll_until(
@@ -266,7 +270,11 @@ fn validator_push_fans_pack_to_every_validator_before_consensus() {
         source.path(),
         &["remote", "add", "validator", &receiving_validator],
     );
-    git_ok(source.path(), &["push", "validator", "main"]);
+    git_push_ok(
+        cluster.git_push_env(0),
+        source.path(),
+        &["push", "validator", "main"],
+    );
 
     poll_until(
         "the peer validator to finalize the pushed Forge head",
@@ -357,6 +365,21 @@ fn git_output(dir: &Path, args: &[&str]) -> Output {
 
 fn git_ok(dir: &Path, args: &[&str]) {
     let output = git_output(dir, args);
+    assert!(
+        output.status.success(),
+        "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// a `git push` carrying a node's operator credential (`cluster.git_push_env`)
+/// — the proof `git-receive-pack` now requires (#1292).
+fn git_push_ok(env: [(String, String); 3], dir: &Path, args: &[&str]) {
+    let output = git_command(dir, args)
+        .envs(env)
+        .output()
+        .expect("spawn git");
     assert!(
         output.status.success(),
         "git {args:?} failed:\nstdout:\n{}\nstderr:\n{}",

@@ -1799,6 +1799,40 @@ fn git_capture(dir: &Path, args: &[&str]) -> std::process::Output {
     git_cmd(dir, args).output().expect("spawn git")
 }
 
+/// a git command against the daemon's smart-HTTP surface, carrying its
+/// operator credential.
+///
+/// `git-receive-pack` refuses a push that proves nothing (#1292): it takes
+/// git's own push certificate, or this node's operator credential. A test that
+/// spawned the daemon IS its operator, and the credential rides `GIT_CONFIG_*`
+/// exactly the way `ops/dogfood-forge.sh` sets it — never an argv, which is
+/// world-readable through /proc.
+fn git_push(daemon: &Daemon, dir: &Path, args: &[&str]) -> std::process::Output {
+    git_cmd(dir, args)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            format!(
+                "{}: {}",
+                noded::admin::ADMIN_TOKEN_HEADER,
+                daemon.admin_token
+            ),
+        )
+        .output()
+        .expect("spawn git")
+}
+
+/// [`git_push`] that must succeed.
+fn git_push_ok(daemon: &Daemon, dir: &Path, args: &[&str]) {
+    let out = git_push(daemon, dir, args);
+    assert!(
+        out.status.success(),
+        "git {args:?} failed:\n{}",
+        render(&out)
+    );
+}
+
 /// run a git command that must succeed.
 fn git_ok(dir: &Path, args: &[&str]) {
     let out = git_capture(dir, args);
@@ -1859,7 +1893,7 @@ fn git_push_over_http_lands_in_forge_head() {
     git_ok(wd, &["remote", "add", "ducktape", &url]);
 
     // THE gate: a real `git push` to the daemon exits 0 and updates the ref.
-    let push1 = git_capture(wd, &["push", "ducktape", "main"]);
+    let push1 = git_push(&daemon, wd, &["push", "ducktape", "main"]);
     eprintln!("=== git push #1 (create) ===\n{}", render(&push1));
     assert!(
         push1.status.success(),
@@ -1877,7 +1911,7 @@ fn git_push_over_http_lands_in_forge_head() {
     commit_file(wd, "hello.txt", "hi again\n", "second commit");
     let head2 = rev_parse_head(wd);
     assert_ne!(head2, head1, "second commit is a new oid");
-    let push2 = git_capture(wd, &["push", "ducktape", "main"]);
+    let push2 = git_push(&daemon, wd, &["push", "ducktape", "main"]);
     eprintln!("=== git push #2 (fast-forward) ===\n{}", render(&push2));
     assert!(
         push2.status.success(),
@@ -1895,7 +1929,7 @@ fn git_push_over_http_lands_in_forge_head() {
     // advertised head and refuses; forge's HEAD stays put.
     git_ok(wd, &["reset", "--hard", "HEAD~1"]);
     commit_file(wd, "hello.txt", "divergent line\n", "divergent commit");
-    let push3 = git_capture(wd, &["push", "ducktape", "main"]);
+    let push3 = git_push(&daemon, wd, &["push", "ducktape", "main"]);
     eprintln!(
         "=== git push #3 (non-fast-forward, expected reject) ===\n{}",
         render(&push3)
@@ -1944,7 +1978,7 @@ fn git_clone_over_http_round_trips_full_history() {
     commit_file(wd, "readme.md", "line one\n", "first commit");
     commit_file(wd, "readme.md", "line one\nline two\n", "second commit");
     git_ok(wd, &["remote", "add", "ducktape", &url]);
-    let push = git_capture(wd, &["push", "ducktape", "main"]);
+    let push = git_push(&daemon, wd, &["push", "ducktape", "main"]);
     eprintln!("=== git push (2 commits) ===\n{}", render(&push));
     assert!(push.status.success(), "push failed:\n{}", render(&push));
 
@@ -2033,7 +2067,7 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
         commit_file(src, "history.txt", &content, &message);
     }
     git_ok(src, &["remote", "add", "ducktape", &url]);
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let first_head = rev_parse_head(src);
 
     let checkout_root = tempfile::TempDir::new().expect("checkout root");
@@ -2050,7 +2084,7 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
     // A fetch from a non-empty repo has a common first commit. This exercises
     // the intermediate have/NAK round and leaves the worktree at its prior head.
     commit_file(src, "history.txt", "fetched\n", "fetched commit");
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let fetch = git_capture(&checkout, &["fetch", "origin"]);
     eprintln!("=== negotiated git fetch ===\n{}", render(&fetch));
     assert!(
@@ -2067,7 +2101,7 @@ fn git_fetch_and_pull_into_nonempty_checkout_complete_negotiation() {
     // Advance once more so pull performs its own negotiated fetch, then verify
     // both the ref update and checkout bytes through stock git.
     commit_file(src, "history.txt", "pulled\n", "pulled commit");
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let pull = git_capture(&checkout, &["pull", "--ff-only"]);
     eprintln!("=== negotiated git pull ===\n{}", render(&pull));
     assert!(
@@ -2100,7 +2134,7 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
     git_ok(src, &["init"]);
     commit_file(src, "history.txt", "one\n", "first commit");
     git_ok(src, &["remote", "add", "ducktape", &url]);
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let first_head = rev_parse_head(src);
 
     let mirror_dir = tempfile::TempDir::new().expect("mirror dir");
@@ -2123,7 +2157,7 @@ fn libgit2_mirror_fetch_completes_incremental_sync() {
     // origin advances; the re-sync's haves earn an ACK + delta pack, and the
     // mirror must still complete the new head's closure from it.
     commit_file(src, "history.txt", "two\n", "second commit");
-    git_ok(src, &["push", "ducktape", "main"]);
+    git_push_ok(&daemon, src, &["push", "ducktape", "main"]);
     let second_head = rev_parse_head(src);
     fetch(&mirror);
     let second_oid = git2::Oid::from_str(&second_head).expect("head oid");
@@ -2169,7 +2203,11 @@ fn git_push_larger_than_post_buffer_uses_the_probe_path() {
     git_ok(wd, &["remote", "add", "ducktape", &url]);
 
     // `-c http.postBuffer=1` forces git through the large-request probe.
-    let push = git_capture(wd, &["-c", "http.postBuffer=1", "push", "ducktape", "main"]);
+    let push = git_push(
+        &daemon,
+        wd,
+        &["-c", "http.postBuffer=1", "push", "ducktape", "main"],
+    );
     eprintln!("=== probed git push ===\n{}", render(&push));
     assert!(
         push.status.success(),
