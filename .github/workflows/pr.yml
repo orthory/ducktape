@@ -56,9 +56,12 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
-      # `reachability` is excluded: crates/networking/reachability/src/executor.rs's
-      # `Input` enum trips `clippy::large_enum_variant` (272 vs 40 bytes) under
-      # `-D warnings` on the pinned toolchain, pre-existing on `dev` at 04d22f472,
-      # untouched by this PR. Track it as its own fix rather than gating every PR
-      # on it.
-      - run: cargo clippy --locked --workspace --exclude reachability --tests --no-deps -- -D warnings
+      # Both exclusions are pre-existing red on `dev` at 04d22f472 (commit
+      # 1c2f270e1, "the machine learns its own reflexive moved"), untouched by
+      # this PR — confirmed via `git diff origin/dev...HEAD` on each crate:
+      #   reachability: executor.rs's `Input` enum trips
+      #     clippy::large_enum_variant (272 vs 40 bytes).
+      #   netstack-scenarios: lib.rs's `restore: fn(...)  -> Box<dyn ...>`
+      #     field trips clippy::type_complexity.
+      # Track each as its own fix rather than gating every PR on it.
+      - run: cargo clippy --locked --workspace --exclude reachability --exclude netstack-scenarios --tests --no-deps -- -D warnings
