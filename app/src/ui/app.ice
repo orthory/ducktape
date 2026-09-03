@@ -64,11 +64,21 @@ daemon Ducktape
   // The launch window: Discord/Steam-shaped — a small fixed column that
   // signs the user in and picks a network. It opens on mount and closes when
   // the console takes over.
+  // EVERY WINDOW REPORTS THE APP ID. On Linux `app-id` is the ONLY source of
+  // the X11 WM_CLASS / Wayland app_id — the daemon-level `id` above reaches
+  // the BSDs and nothing else (iced_winit's `conversion.rs`), so without this
+  // block a window reports an empty class and associates with no installed
+  // `.desktop` entry: no icon, no pinned-app identity. It is the same string
+  // as `app/packaging/dev.ducktape.app.desktop`'s file name and
+  // `StartupWMClass`, and all three windows carry it so the app is one
+  // identity to the desktop.
   window onboarding
     icon-rgba "../../assets/icon.rgba" 128 128
     size 480 680
     position centered
     resizable false
+    platform linux
+      app-id "dev.ducktape.app"
   // The console. Same window the single-window app declared, now a named
   // template `open_network_submit` instantiates.
   // `min-size` is NOT a taste number — it is the arithmetic of the fixed
@@ -86,6 +96,8 @@ daemon Ducktape
     size 1280 800
     min-size 1040 540
     position centered
+    platform linux
+      app-id "dev.ducktape.app"
     platform macos
       title-hidden true
       titlebar-transparent true
@@ -101,6 +113,8 @@ daemon Ducktape
     icon-rgba "../../assets/icon.rgba" 128 128
     size 320 460
     min-size 320 340
+    platform linux
+      app-id "dev.ducktape.app"
 
 use "extern/backend.ice"
 use "extern/editor.ice"

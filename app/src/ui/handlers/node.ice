@@ -44,6 +44,21 @@ on node_facts_loaded(next)
   node_sync_retries = next.sync_retries
   node_sync_failures = next.sync_failures
   node_sync_last_error = next.sync_last_error
+  // THE OS HANDED THIS PROCESS A LINK, and this status is the first moment it
+  // can be judged: the open plane refuses a link whose `?net=` names another
+  // network, and `network_chain_id` — set from this same document above — is
+  // what it compares against. Blanked before the run, so it is spent once and
+  // no later reconnect re-opens it.
+  // A launch link WAITS for that first status rather than being refused on
+  // the way there: a poll that fails while the node is still coming up would
+  // otherwise eat a link that opens fine a second later.
+  // ponytail: so an app that never connects at all opens nothing and says
+  // nothing — give the link its own visible pending/refused plate if that is
+  // ever felt.
+  let launch_link = startup_duck_link
+  startup_duck_link = ""
+  return if empty(launch_link)
+  run every duck_echo_str(launch_link) -> open_message_link _ | external_url_failed _
 
 on node_facts_failed(_cause)
 

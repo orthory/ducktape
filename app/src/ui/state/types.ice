@@ -100,11 +100,14 @@ enum AutosaveStatus
   error
 
 // The duck:// module table's verdict on a clicked or embedded link
-// (`classify_duck_link`): which existing navigation it maps onto. `unknown` is
-// a malformed/unknown ref; `web` is an http(s) URL for the OS opener.
+// (`resolve_duck_link`): which existing navigation it maps onto. `unknown` is
+// a malformed/unknown ref; `web` is an http(s) URL for the OS opener;
+// `foreign_network` is a well-formed link whose `?net=` names a network this
+// app is not on, so its ids address a store that is not this one.
 enum DuckKind
   unknown
   web
+  foreign_network
   page
   files
   forge_repo

@@ -2,8 +2,9 @@
 //! place to add a module.
 //!
 //! ```text
-//! duck-uri  = "duck://" authority path [ "@" rev ] [ "#" fragment ]
+//! duck-uri  = "duck://" authority path [ "@" rev ] [ "?net=" digest ] [ "#" fragment ]
 //! authority = module | gateway-host        ; a dot means gateway plane
+//! digest    = 8 lowercase hex              ; the chain id's hash half
 //! ```
 //!
 //! [`classify_duck_link`] is the module table: every surface that opens or
@@ -11,6 +12,14 @@
 //! `handlers/chat.ice`) classifies through it and nowhere else. A malformed
 //! or unknown ref is [`DuckKind::Unknown`] — never an error here; the caller
 //! decides what "nothing to open" looks like.
+//!
+//! THE LINK NAMES ITS NETWORK IN THE QUERY. A chain id is `<name>#<8 hex>`
+//! (`workspace_config::identity::mint_chain_id`) and that literal `#` cannot
+//! ride a URI, so the link carries the hex half alone. The authority stays
+//! the module label. Every link the app PRODUCES carries `?net=`; one that
+//! does not (hand-typed) resolves against the connected network as written.
+//! [`resolve_duck_link`] is the open plane's entry — it adds the scope check
+//! `classify_duck_link` cannot make on its own.
 
 pub(crate) use crate::DuckKind;
 
@@ -34,6 +43,10 @@ pub struct DuckLink {
     pub path: String,
     /// `forge_blob`: the `@rev`, or "" for the head.
     pub rev: String,
+    /// The `?net=` digest — the hex half of the chain id this link belongs
+    /// to — or "" when the link names no network. `foreign_network` carries
+    /// the digest that did NOT match.
+    pub net: String,
 }
 
 impl DuckLink {
@@ -47,6 +60,7 @@ impl DuckLink {
             channel: String::new(),
             path: String::new(),
             rev: String::new(),
+            net: String::new(),
         }
     }
 
@@ -78,17 +92,137 @@ pub fn classify_duck_link(url: String) -> DuckLink {
         return DuckLink::unknown();
     }
     let (body, fragment) = tail.split_once('#').unwrap_or((tail.as_str(), ""));
-    let (path, rev) = body.split_once('@').unwrap_or((body, ""));
+    let (address, query) = body.split_once('?').unwrap_or((body, ""));
+    let Some(net) = query_net(query) else {
+        return DuckLink::unknown();
+    };
+    let (path, rev) = address.split_once('@').unwrap_or((address, ""));
     let Some(segments) = clean_segments(path) else {
         return DuckLink::unknown();
     };
-    match authority {
+    let link = match authority {
         "page" => classify_page(&segments, rev, fragment),
         "files" => classify_files(path, &segments, rev, fragment),
         "forge" => classify_forge(&segments, rev, fragment),
         "channel" => classify_channel(&segments, rev, fragment),
         _ => DuckLink::unknown(),
+    };
+    // An `Unknown` addresses nothing, so it belongs to no network either.
+    let names_nothing = link.kind == DuckKind::Unknown;
+    match names_nothing {
+        true => link,
+        false => DuckLink { net, ..link },
     }
+}
+
+/// The `?net=` digest a link's query names: `""` for no query at all, the
+/// digest for exactly `net=<8 lowercase hex>`, and `None` for every other
+/// query — an unreadable query is a malformed link, not one to guess at.
+fn query_net(query: &str) -> Option<String> {
+    if query.is_empty() {
+        return Some(String::new());
+    }
+    let digest = query.strip_prefix("net=")?;
+    let minted = digest.len() == CHAIN_DIGEST_HEX
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    minted.then(|| digest.to_owned())
+}
+
+/// The chain id's hash half — `mint_chain_id` spells a chain id
+/// `<name>#<8 hex>` and only the hex rides a URI. "" for an unnamed chain.
+///
+/// Split from the RIGHT: `node init --name` validates nothing, so a network
+/// named `my#net` mints the chain id `my#net#a1b2c3d4`, and only the LAST `#`
+/// is the minted separator.
+fn chain_digest(chain_id: &str) -> &str {
+    chain_id.rsplit_once('#').map(|(_, hex)| hex).unwrap_or("")
+}
+
+/// How many hex characters `mint_chain_id` puts after the `#`.
+const CHAIN_DIGEST_HEX: usize = 8;
+
+/// The open plane's entry: the grammar, plus the one check the grammar cannot
+/// make on its own. A link that names a network OTHER than the connected one
+/// would resolve its repo name / page id / channel id against a store that is
+/// not the link's own, so it opens nothing — the caller draws the refusal
+/// [`foreign_network_error`] spells. A link naming no network is the
+/// hand-typed case and resolves against the connected network as written.
+pub fn resolve_duck_link(url: String, connected_chain_id: String) -> DuckLink {
+    let link = classify_duck_link(url);
+    let ours = link.net.is_empty() || link.net == chain_digest(&connected_chain_id);
+    match ours {
+        true => link,
+        false => DuckLink {
+            kind: DuckKind::ForeignNetwork,
+            ..link
+        },
+    }
+}
+
+/// The refusal for a link that belongs to another network: both networks by
+/// name, because "this link does not open" without them is unactionable.
+pub fn foreign_network_error(link_net: String, connected_chain_id: String) -> String {
+    let here = match connected_chain_id.is_empty() {
+        true => "no network".to_owned(),
+        false => connected_chain_id,
+    };
+    format!("this link belongs to network {link_net} — this app is on {here}")
+}
+
+/// The `?net=` a produced link carries, or "" when the app has no chain id
+/// yet. Every builder below goes through here, so a produced link cannot
+/// silently lose the half that makes the refusal possible.
+fn net_query(chain_id: &str) -> String {
+    let digest = chain_digest(chain_id);
+    match digest.is_empty() {
+        true => String::new(),
+        false => format!("?net={digest}"),
+    }
+}
+
+/// `duck://page/<id>?net=…` — the only handle on a page, whose id is a uuid.
+pub fn duck_page_link(page: String, chain_id: String) -> String {
+    format!("duck://page/{page}{}", net_query(&chain_id))
+}
+
+/// `duck://channel/<id>?net=…` — likewise the only handle on a channel.
+pub fn duck_channel_link(channel: String, chain_id: String) -> String {
+    format!("duck://channel/{channel}{}", net_query(&chain_id))
+}
+
+/// `duck://channel/<id>?net=…#<seq>` — one message. The query precedes the
+/// fragment, as in every other URI.
+pub fn duck_channel_message_link(channel: String, seq: i64, chain_id: String) -> String {
+    format!("duck://channel/{channel}{}#{seq}", net_query(&chain_id))
+}
+
+/// `duck://forge/<repo>/<number>?net=…` — one issue or PR.
+pub fn duck_forge_item_link(repo: String, number: i64, chain_id: String) -> String {
+    format!("duck://forge/{repo}/{number}{}", net_query(&chain_id))
+}
+
+/// `duck://forge/<repo>?net=…` — the repo itself. Its name is typeable, but
+/// the digest that scopes it to THIS network is not.
+pub fn duck_forge_repo_link(repo: String, chain_id: String) -> String {
+    format!("duck://forge/{repo}{}", net_query(&chain_id))
+}
+
+/// The `duck://` URL the OS launched this process with, or "" for a plain
+/// start. `xdg-open 'duck://forge/ducktape/1?net=…'` runs the `Exec=` line of
+/// the desktop entry that claims `x-scheme-handler/duck`
+/// (`app/packaging/dev.ducktape.app.desktop`), which passes the URL as `%u`.
+///
+/// Read once into state and PARKED, never opened here: the link addresses
+/// objects in a network this process has not connected to yet, and the open
+/// plane must know the connected chain id before it can tell an address of
+/// its own from one of somebody else's.
+pub fn startup_duck_url() -> String {
+    std::env::args()
+        .skip(1)
+        .find(|argument| argument.starts_with("duck://"))
+        .unwrap_or_default()
 }
 
 /// The path's segments, or `None` when any is empty (`//`), `.` or `..`.
@@ -339,6 +473,137 @@ mod tests {
         assert_eq!(kind("duck://forge/ducktape/blob/"), DuckKind::Unknown, "no file");
         assert_eq!(kind("duck://forge/ducktape/blob/../x"), DuckKind::Unknown, "no dot-segments");
         assert_eq!(kind("duck://forge/ducktape/blob/a.png#L3"), DuckKind::Unknown, "no fragment yet");
+    }
+
+    /// The `?net=` component: parsed off every row, refused when malformed,
+    /// and carried by every link the app builds.
+    #[test]
+    fn a_link_names_its_network_in_the_query() {
+        let item = classify_duck_link("duck://forge/ducktape/58?net=d0cdf950".into());
+        assert_eq!(
+            (item.kind, item.number, item.net.as_str()),
+            (DuckKind::ForgeItem, 58, "d0cdf950")
+        );
+        let anchored = classify_duck_link("duck://channel/general?net=d0cdf950#42".into());
+        assert_eq!(
+            (anchored.kind, anchored.seq, anchored.net.as_str()),
+            (DuckKind::ChannelMessage, 42, "d0cdf950"),
+            "query precedes fragment"
+        );
+        let blob = classify_duck_link(
+            "duck://forge/d/blob/a.png@1111111111111111111111111111111111111111?net=d0cdf950"
+                .into(),
+        );
+        assert_eq!(
+            (blob.kind, blob.net.as_str()),
+            (DuckKind::ForgeBlob, "d0cdf950")
+        );
+        assert_eq!(
+            kind("duck://page/p1?net=D0CDF950"),
+            DuckKind::Unknown,
+            "lowercase hex"
+        );
+        assert_eq!(
+            kind("duck://page/p1?net=d0cdf9"),
+            DuckKind::Unknown,
+            "eight hex"
+        );
+        assert_eq!(kind("duck://page/p1?net="), DuckKind::Unknown);
+        assert_eq!(
+            kind("duck://page/p1?chain=d0cdf950"),
+            DuckKind::Unknown,
+            "one key"
+        );
+        assert!(classify_duck_link("duck://page/p1".into()).net.is_empty());
+        assert!(
+            classify_duck_link("duck://nope/x?net=d0cdf950".into())
+                .net
+                .is_empty()
+        );
+
+        assert_eq!(
+            duck_page_link("p1".into(), "mynet#d0cdf950".into()),
+            "duck://page/p1?net=d0cdf950"
+        );
+        assert_eq!(
+            duck_page_link("p1".into(), "my#net#d0cdf950".into()),
+            "duck://page/p1?net=d0cdf950",
+            "a name may carry a #; the minted separator is the last one"
+        );
+        assert_eq!(
+            duck_channel_message_link("general".into(), 42, "mynet#d0cdf950".into()),
+            "duck://channel/general?net=d0cdf950#42"
+        );
+        assert_eq!(
+            duck_channel_link("c1".into(), "mynet#d0cdf950".into()),
+            "duck://channel/c1?net=d0cdf950"
+        );
+        assert_eq!(
+            duck_forge_item_link("ducktape".into(), 58, "mynet#d0cdf950".into()),
+            "duck://forge/ducktape/58?net=d0cdf950"
+        );
+        assert_eq!(
+            duck_page_link("p1".into(), String::new()),
+            "duck://page/p1",
+            "no chain id yet, no query — never a `?net=` naming nothing"
+        );
+        assert_eq!(
+            duck_forge_repo_link("ducktape".into(), "mynet#d0cdf950".into()),
+            "duck://forge/ducktape?net=d0cdf950"
+        );
+        for built in [
+            duck_page_link("p1".into(), "mynet#d0cdf950".into()),
+            duck_channel_link("c1".into(), "mynet#d0cdf950".into()),
+            duck_channel_message_link("c1".into(), 3, "mynet#d0cdf950".into()),
+            duck_forge_item_link("r".into(), 7, "mynet#d0cdf950".into()),
+            duck_forge_repo_link("r".into(), "mynet#d0cdf950".into()),
+        ] {
+            let link = resolve_duck_link(built.clone(), "mynet#d0cdf950".into());
+            assert_ne!(link.kind, DuckKind::Unknown, "{built} must round-trip");
+            assert_eq!(link.net, "d0cdf950", "{built}");
+        }
+    }
+
+    /// The refusal: a link that names another network opens nothing, and says
+    /// which two networks it is talking about.
+    #[test]
+    fn a_link_from_another_network_is_refused_not_resolved() {
+        let here = "mynet#d0cdf950";
+        let mine = resolve_duck_link("duck://forge/ducktape/58?net=d0cdf950".into(), here.into());
+        assert_eq!((mine.kind, mine.number), (DuckKind::ForgeItem, 58));
+        let theirs = resolve_duck_link("duck://forge/ducktape/58?net=aaaaaaaa".into(), here.into());
+        assert_eq!(
+            (theirs.kind, theirs.net.as_str()),
+            (DuckKind::ForeignNetwork, "aaaaaaaa"),
+            "the same repo name on another network is not this repo"
+        );
+        let typed = resolve_duck_link("duck://forge/ducktape/58".into(), here.into());
+        assert_eq!(
+            typed.kind,
+            DuckKind::ForgeItem,
+            "a hand-typed link stays usable"
+        );
+        let unjoined = resolve_duck_link("duck://page/p1?net=d0cdf950".into(), String::new());
+        assert_eq!(
+            unjoined.kind,
+            DuckKind::ForeignNetwork,
+            "no connected chain id is no store to resolve against"
+        );
+        assert_eq!(
+            resolve_duck_link("https://example.com".into(), here.into()).kind,
+            DuckKind::Web,
+            "a web link belongs to no network"
+        );
+
+        let refusal = foreign_network_error("aaaaaaaa".into(), here.into());
+        assert!(
+            refusal.contains("aaaaaaaa") && refusal.contains(here),
+            "{refusal}"
+        );
+        assert!(
+            foreign_network_error("aaaaaaaa".into(), String::new()).contains("no network"),
+            "an unconnected app still names where it is"
+        );
     }
 
     #[test]

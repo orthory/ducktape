@@ -1158,6 +1158,7 @@ test message_stream_reset_contract
       with
         endpoint=connected_rpc
         network_name
+        network_chain_id
         status
         block_height
         search_phase=chat_search_phase
@@ -1219,6 +1220,8 @@ test message_stream_reset_contract
         load_more_history -> load_more_history
         chat_scrolled -> chat_scrolled _ _ _ _
         open_message_link -> open_message_link _
+        copy_to_clipboard -> copy_to_clipboard _ _
+        copy_message_link -> copy_message_link _
         add_reaction_at -> add_reaction_at _ _
         remove_reaction_at -> remove_reaction_at _ _
         open_thread_for -> open_thread_for _
@@ -1291,6 +1294,7 @@ test message_body_renders_as_one_rich_paragraph
       with
         endpoint=connected_rpc
         network_name
+        network_chain_id
         status
         block_height
         search_phase=chat_search_phase
@@ -1352,6 +1356,8 @@ test message_body_renders_as_one_rich_paragraph
         load_more_history -> load_more_history
         chat_scrolled -> chat_scrolled _ _ _ _
         open_message_link -> open_message_link _
+        copy_to_clipboard -> copy_to_clipboard _ _
+        copy_message_link -> copy_message_link _
         add_reaction_at -> add_reaction_at _ _
         remove_reaction_at -> remove_reaction_at _ _
         open_thread_for -> open_thread_for _

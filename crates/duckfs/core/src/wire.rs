@@ -122,7 +122,7 @@ pub const MAX_GREP_LINE_BYTES: usize = 256;
 /// SCANNED, not hits EMITTED, so without this a single in-budget file of
 /// pathologically many matching lines could amplify into an unbounded reply;
 /// with it a reply is bounded at roughly 4096 hits x ~0.5 KiB each (path +
-/// capped line text + uri) — a couple of MiB worst case.
+/// capped line text + locator) — a couple of MiB worst case.
 pub const MAX_GREP_HITS_PER_CALL: usize = MAX_PAGE as usize * 16;
 /// first byte of the binary putblob op frame. json msgs start with b'{',
 /// so one leading byte disambiguates the whole op space.
@@ -296,9 +296,9 @@ pub struct GrepHit {
     pub path: String,
     pub line: u64,
     pub text: String,
-    /// `duck://files<path>@<snapshot>#L<line>` — the absolute path brings its
-    /// own leading slash (see [`evidence_uri`]).
-    pub uri: String,
+    /// `<path>@<snapshot>#L<line>` — where this hit was, pinned (see
+    /// [`evidence_locator`]).
+    pub locator: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -464,12 +464,17 @@ pub fn encode_putblob(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// grep-hit evidence uri: `duck://files<path>@<snapshot>#L<line>`. the path is
-/// absolute and brings its own leading slash, so the authority is joined
-/// bare — same rule as memory's `duck://memory<path>` uris (a separator slash
-/// here would double it).
-pub fn evidence_uri(path: &str, snapshot: &str, line: u64) -> String {
-    format!("duck://files{path}@{snapshot}#L{line}")
+/// grep-hit evidence locator: `<path>@<snapshot>#L<line>` — the file, the
+/// snapshot it was scanned at, and the 1-based line.
+///
+/// NOT a `duck://` uri, deliberately. the one duck:// grammar admits a file
+/// only as `duck://files/shared/attachments/<dir>/<name>`, plain, because
+/// classification is the only guard between a crafted ref and a client read
+/// at any path it names; a grep hit is an arbitrary path at a pinned
+/// snapshot, so minting one as a duck:// address produced a link the protocol
+/// refuses to open. evidence points AT a line, it does not address it.
+pub fn evidence_locator(path: &str, snapshot: &str, line: u64) -> String {
+    format!("{path}@{snapshot}#L{line}")
 }
 
 /// decode exactly 64 lowercase-hex chars into 32 bytes (uppercase rejected).

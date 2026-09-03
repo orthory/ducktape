@@ -20,7 +20,7 @@ use crate::tree::{Store, entry_at, snapshot_root_tree};
 use crate::wire::{
     CHUNK_SIZE, DiffEntry, DiffKind, EntryInfo, EntryKindWire, FilesQuery, FilesReply, GrepHit,
     MAX_GREP_HITS_PER_CALL, MAX_GREP_LINE_BYTES, MAX_PAGE, MAX_READ_BYTES, MAX_SYNC_IDS, RefsInfo,
-    SnapshotInfo, evidence_uri, from_hex_32, to_hex,
+    SnapshotInfo, evidence_locator, from_hex_32, to_hex,
 };
 
 /// a diff reply is capped at MAX_PAGE * 16 entries: a bounded reply, no cursor —
@@ -411,7 +411,7 @@ fn grep<S: ObjectStore>(
         return Err("files: grep pattern exceeds the line byte cap".into());
     }
     // resolve the snapshot HERE (not via committed_view) because a hit's evidence
-    // uri needs the resolved snapshot hex, not just its root tree.
+    // locator needs the resolved snapshot hex, not just its root tree.
     let snapshot_id = resolve_head(fs, snapshot)?;
     let store = Store {
         store: fs.store_ref(),
@@ -557,7 +557,7 @@ fn grep_file(
                 path: path.to_string(),
                 line: line_no,
                 text: truncate_str(&text, MAX_GREP_LINE_BYTES),
-                uri: evidence_uri(path, acc.snapshot_hex, line_no),
+                locator: evidence_locator(path, acc.snapshot_hex, line_no),
             });
         }
     }

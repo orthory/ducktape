@@ -710,12 +710,13 @@ pub async fn forge_blob(
     repo: String,
     rev: String,
     path: String,
+    net: String,
 ) -> Result<BlobView, AppError> {
     async {
         let client = rpc_client(&rpc)?;
         match super::picture::picture_path(path.clone()) {
             true => forge_picture(&client, repo, rev, path).await,
-            false => forge_text(&client, repo, rev, path).await,
+            false => forge_text(&client, repo, rev, path, &net).await,
         }
     }
     .await
@@ -727,6 +728,7 @@ async fn forge_text(
     repo: String,
     rev: String,
     path: String,
+    net: &str,
 ) -> Result<BlobView, String> {
     let query = serde_json::json!({ "blob": {
         "repo": &repo,
@@ -737,7 +739,7 @@ async fn forge_text(
     let view = blob_view(reply, repo)?;
     let illustrated = markdown_path(&view.path) && !view.binary;
     if illustrated {
-        load_inline_pictures(client, &view).await;
+        load_inline_pictures(client, &view, net).await;
     }
     Ok(view)
 }
@@ -835,7 +837,7 @@ async fn forge_picture(
 /// an image that does not resolve, fetch or decode simply keeps its alt text.
 /// ponytail: fetched before the text lands, so a README with eight large
 /// pictures shows late; split into its own lane if that is ever felt.
-async fn load_inline_pictures(client: &RpcClient, view: &BlobView) {
+async fn load_inline_pictures(client: &RpcClient, view: &BlobView, net: &str) {
     use super::picture::{MAX_INLINE_PICTURES, decode_off_thread, park_inline_pictures};
     let mut wanted: Vec<String> = Vec::new();
     for item in iced::widget::markdown::parse(&view.text) {
@@ -852,7 +854,7 @@ async fn load_inline_pictures(client: &RpcClient, view: &BlobView) {
     // host's clock, and eight of them in a row would stack eight timeouts in
     // front of the README.
     let fetches = wanted.into_iter().map(|url| async move {
-        let bytes = inline_picture_bytes(client, view, &url).await?;
+        let bytes = inline_picture_bytes(client, view, &url, net).await?;
         let picture = decode_off_thread(bytes).await.ok()?;
         Some((url, picture))
     });
@@ -870,10 +872,19 @@ async fn load_inline_pictures(client: &RpcClient, view: &BlobView) {
 /// this repo's file beside the document at the document's own commit, and a
 /// web URL is one capped GET. Every other kind — a page or channel ref, a
 /// malformed duck URI — has no bytes to fetch.
-async fn inline_picture_bytes(client: &RpcClient, view: &BlobView, url: &str) -> Option<Vec<u8>> {
-    use super::duck_uri::{DuckKind, classify_duck_link};
+///
+/// Scoped by `net`, the connected chain id, exactly as the open plane is: a
+/// citation whose `?net=` names another network addresses another store, so
+/// it draws nothing rather than this network's object of the same name.
+async fn inline_picture_bytes(
+    client: &RpcClient,
+    view: &BlobView,
+    url: &str,
+    net: &str,
+) -> Option<Vec<u8>> {
+    use super::duck_uri::{DuckKind, resolve_duck_link};
     use super::picture::resolve_repo_path;
-    let link = classify_duck_link(url.to_owned());
+    let link = resolve_duck_link(url.to_owned(), net.to_owned());
     match link.kind {
         DuckKind::ForgeBlob => forge_blob_bytes(client, &link.repo, &link.rev, &link.path)
             .await
@@ -891,7 +902,9 @@ async fn inline_picture_bytes(client: &RpcClient, view: &BlobView, url: &str) ->
                 .and_then(|(_, bytes)| bytes)
         }
         DuckKind::Web => web_picture_bytes(url).await,
-        DuckKind::Page
+        // A citation from another network, and the kinds that name no bytes.
+        DuckKind::ForeignNetwork
+        | DuckKind::Page
         | DuckKind::ForgeRepo
         | DuckKind::ForgeItem
         | DuckKind::Channel
