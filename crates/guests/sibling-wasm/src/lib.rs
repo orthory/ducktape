@@ -39,6 +39,14 @@ fn split_target(rest: &[u8]) -> Result<(String, &[u8]), host::Error> {
 }
 
 impl Guest for Component {
+    fn shape() -> host::ModuleShape {
+        host::ModuleShape {
+            backing: host::Backing::Map,
+            config: Vec::new(),
+            committed_queries: false,
+        }
+    }
+
     fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
         match payload.split_first() {
             // 'q' target ':' req — read-modify-write the own counter BEFORE the

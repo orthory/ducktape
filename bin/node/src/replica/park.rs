@@ -24,7 +24,7 @@ use crate::explorer::{
     boundary_block_row, heal_and_backfill_index, heal_index, retry_owed_backfill,
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
-use crate::host_state::{NodeSubstrates, restore_host, sync_all_modules};
+use crate::host_state::{NetworkBindings, NodeSubstrates, restore_host, sync_all_modules};
 use crate::relay;
 use crate::relay_runtime;
 use crate::replica;
@@ -253,11 +253,9 @@ async fn publish_replica_status(
     metrics.update_storage(
         ckpt_height.unwrap_or_default(),
         index.is_poisoned(),
-        MODULE_IDS.iter().map(|module| {
-            (
-                (*module).to_string(),
-                index.applied_height(module).unwrap_or_default(),
-            )
+        index.module_ids().into_iter().map(|module| {
+            let height = index.applied_height(&module).unwrap_or_default();
+            (module, height)
         }),
     );
     let (height, root_hash, modules) = match serving {
@@ -299,6 +297,7 @@ pub(super) async fn park(
     signer: ed25519::PrivateKey,
     label: String,
     namespace: Vec<u8>,
+    identity_chain_id: String,
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
@@ -656,6 +655,10 @@ pub(super) async fn park(
         let restored = restore_host(
             &context,
             ckpt,
+            NetworkBindings {
+                invite: &namespace,
+                identity_chain_id: &identity_chain_id,
+            },
             NodeSubstrates {
                 forge_repo: &forge_repo,
                 duckfs_dir: &duckfs_dir,
@@ -2109,6 +2112,10 @@ pub(super) async fn park(
                         &context,
                         &client,
                         &m,
+                        NetworkBindings {
+                            invite: &namespace,
+                            identity_chain_id: &identity_chain_id,
+                        },
                         NodeSubstrates {
                             forge_repo: &forge_repo,
                             duckfs_dir: &duckfs_dir,
@@ -2419,6 +2426,10 @@ pub(super) async fn park(
             &context,
             &client,
             &m,
+            NetworkBindings {
+                invite: &namespace,
+                identity_chain_id: &identity_chain_id,
+            },
             NodeSubstrates {
                 forge_repo: &forge_repo,
                 duckfs_dir: &duckfs_dir,

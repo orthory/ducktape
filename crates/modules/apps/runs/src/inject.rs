@@ -224,7 +224,7 @@ fn render_page(page_id: &str, blocks: Option<&[Block]>, net_query: &str) -> Stri
     //
     // it names its network in `?net=` like every other link the product mints
     // — the module reads the chain id out of its genesis `__config` record
-    // (`topology::CONFIG_CHAIN_ID`), the only way a fixed component learns
+    // (`sdk::genesis_config::CHAIN_ID`), the only way a fixed component learns
     // which network it is running on. an unwired chain id (dev tools, tests)
     // renders the bare hand-typed form, which resolves against whichever
     // network the reader is connected to.

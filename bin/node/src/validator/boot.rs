@@ -102,6 +102,10 @@ pub(super) async fn restore(
             let restored = restore_host(
                 context,
                 &manifest,
+                NetworkBindings {
+                    invite: namespace,
+                    identity_chain_id,
+                },
                 NodeSubstrates {
                     forge_repo,
                     duckfs_dir,
@@ -341,6 +345,7 @@ pub(super) async fn catch_up<C>(
     metrics: &noded::NodeMetrics,
     signer: &ed25519::PrivateKey,
     namespace: &[u8],
+    identity_chain_id: &str,
     label: &str,
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
@@ -410,6 +415,7 @@ where
         metrics,
         signer,
         namespace,
+        identity_chain_id,
         label,
         forge_repo,
         duckfs_dir,
@@ -437,6 +443,7 @@ async fn rebootstrap<C>(
     metrics: &noded::NodeMetrics,
     signer: &ed25519::PrivateKey,
     namespace: &[u8],
+    identity_chain_id: &str,
     label: &str,
     forge_repo: &std::path::Path,
     duckfs_dir: &std::path::Path,
@@ -488,6 +495,10 @@ where
         context,
         client,
         &boundary,
+        NetworkBindings {
+            invite: namespace,
+            identity_chain_id,
+        },
         NodeSubstrates {
             forge_repo,
             duckfs_dir,

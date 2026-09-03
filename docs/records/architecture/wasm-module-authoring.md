@@ -46,8 +46,22 @@ boundary. Consequences you design around:
 
 ## The contract
 
-Implement the two exports:
+Implement the three exports:
 
+- `shape() -> module-shape` — what the host must know to run this component:
+  the `backing` its committed state lives on (`map`: a host-owned key/value
+  map; `store`: a host-constructed authenticated store, every key a 32-byte
+  digest; `odb`: a host-side content-addressed substrate the host provides
+  for this module's id — `files`, `forge`), the `config` keys the host seeds
+  into the reserved `__config` record when the module starts fresh
+  (`chain_id`, `invite`; empty when the module is not network-bound), and
+  `committed-queries` (the query lane answers from committed state alone,
+  regardless of caller). A pure constant of the code: the host reads it once
+  from the bytes on every path a module enters a host — genesis, a registry
+  admission, a reopen, a code swap — before wrapping them over a substrate,
+  and refuses a backing other than the declared one. `guest_adapter` names
+  the three plain shapes (`store_shape()`, `map_shape()`, `odb_shape()`);
+  a network-bound module sets `config` on top.
 - `execute(payload) -> result<_, error>` — apply one op addressed to this
   module. Reject unknown ops with `error::rejected(..)`; a rejection is a clean
   deterministic no-op, never a fork.

@@ -38,11 +38,12 @@ fn default_genesis_composes_topology_sim_base() {
     let sim = Sim::spawn(storage.path(), &[]);
     let status = sim.status();
 
-    let want: Vec<String> = topology::SIM_BASE.iter().map(|s| s.to_string()).collect();
+    let mut want: Vec<String> = topology::SIM_BASE.iter().map(|s| s.to_string()).collect();
+    want.sort_unstable();
     assert_eq!(
         module_ids(&status),
         want,
-        "sim default genesis composes topology sim_base, in registry order"
+        "sim default genesis composes topology sim_base; status lists the host's set by id"
     );
     // the module a capability-tagged saga draws its Strict-lease pool from
     // ANSWERS here — an empty set — instead of erroring `UnknownModule`. That
@@ -93,15 +94,16 @@ fn with_valset_genesis_appends_topology_sim_valset_and_wires_the_code_registry()
     let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &key]);
     let status = sim.status();
 
-    let want: Vec<String> = topology::SIM_BASE
+    let mut want: Vec<String> = topology::SIM_BASE
         .iter()
         .chain(topology::SIM_VALSET)
         .map(|s| s.to_string())
         .collect();
+    want.sort_unstable();
     assert_eq!(
         module_ids(&status),
         want,
-        "--with-valset appends topology sim_valset after sim_base, in registry order"
+        "--with-valset composes topology sim_base plus sim_valset; status lists the host's set by id"
     );
 
     // governance composes as a WASM tenant now, so the modules code registry

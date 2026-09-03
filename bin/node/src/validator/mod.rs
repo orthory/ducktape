@@ -284,6 +284,7 @@ pub(crate) async fn run_validator(
         &metrics,
         &signer,
         &namespace,
+        &identity_chain_id,
         &label,
         &forge_repo,
         &duckfs_dir,

@@ -26,5 +26,6 @@ use guest_adapter::WitStore;
 guest_adapter::store_guest! {
     id: DEFAULT_ACL_ID,
     module: Acl,
+    shape: guest_adapter::store_shape(),
     new: Acl::new(DEFAULT_ACL_ID, Box::new(WitStore)),
 }

@@ -133,17 +133,6 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 64;
 /// the same deterministic discard ceiling. small for the demo network; a
 /// production mesh would size this in minutes of views.
 pub(crate) const CUTOVER_DELAY: u64 = 3;
-/// every module in the production genesis set, in status-report order — the
-/// `production` selection of the single-source [`topology`]. pinned to the
-/// composed host's registry by the parity test in `host_state`; the
-/// topology's own tests pin the selection to today's 19 (the founder bundles
-/// each wasm tenant's component; the descriptor commits its hash).
-///
-/// A module here is in the root-hash: every node must run it, agree on its root
-/// at every height, and keep doing so forever. Experiments therefore live
-/// unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: &[&str] = topology::PRODUCTION;
-
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
 /// block events). mirrors the rpc bridge's stuck-node budget.

@@ -8,7 +8,7 @@
 //! compile).
 //!
 //! ops: 'p' put+same-dispatch-check · 'a' assert-absent · 'P' assert-present ·
-//! 'b' budget-probe · 'r' stage-refs-image · 'i' query the last put id.
+//! 'b' budget-probe · 'r' stage-refs-image.
 
 wit_bindgen::generate!({
     world: "module",
@@ -18,8 +18,6 @@ wit_bindgen::generate!({
 use ducktape::module::host;
 
 struct Component;
-
-const ID_KEY: &[u8] = b"id";
 
 /// the tagged body a put stores under `id`: `kind ‖ body`.
 fn tagged(kind: u8, body: &[u8]) -> Vec<u8> {
@@ -37,16 +35,35 @@ fn distinct_id(i: u64) -> Vec<u8> {
 }
 
 impl Guest for Component {
+    /// the object plane is the odb backing's: this guest declares odb, so the
+    /// host wraps it over an object store (the kernel tests' mock) and never
+    /// over a plain map.
+    fn shape() -> host::ModuleShape {
+        host::ModuleShape {
+            backing: host::Backing::Odb,
+            config: Vec::new(),
+            committed_queries: false,
+        }
+    }
+
     fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
         match payload.split_first() {
-            // 'p' kind body.. — put, then stat AND get the returned id IN THE
+            // 'p' kind id(32) body.. — put, check the host's id is the one the
+            // caller computed (sha256(kind ‖ body)), then stat AND get it IN THE
             // SAME DISPATCH: both must answer from the staged overlay (no pause,
-            // no backing). rejects if either disagrees with the put.
+            // no backing). rejects if anything disagrees with the put.
             Some((b'p', rest)) => {
-                let (&kind, body) = rest
+                let (&kind, rest) = rest
                     .split_first()
                     .ok_or_else(|| host::Error::Rejected("put needs a kind byte".into()))?;
+                if rest.len() < 32 {
+                    return Err(host::Error::Rejected("put needs a 32-byte expected id".into()));
+                }
+                let (expected, body) = rest.split_at(32);
                 let id = host::object_put(kind, body);
+                if id != expected {
+                    return Err(host::Error::Rejected("host id differs from sha256(kind ‖ body)".into()));
+                }
                 let want = tagged(kind, body);
 
                 let stat = host::object_stat(&id);
@@ -57,8 +74,6 @@ impl Guest for Component {
                 if got.as_deref() != Some(want.as_slice()) {
                     return Err(host::Error::Rejected("same-dispatch get missed the put".into()));
                 }
-
-                host::state_set(ID_KEY, &id);
                 Ok(())
             }
             // 'a' id(32) — assert the id is ABSENT: get/stat/has all empty. a
@@ -119,12 +134,10 @@ impl Guest for Component {
         }
     }
 
-    fn query(req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
-        match req.split_first() {
-            // 'i' — the id of the last 'p' put (the host cross-checks the hash).
-            Some((b'i', _)) => Ok(host::state_get(ID_KEY).unwrap_or_default()),
-            _ => Err(host::Error::Rejected("unknown query".into())),
-        }
+    /// an odb-declared component's queries are served host-side from the
+    /// backing; this export is never reached.
+    fn query(_req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
+        Err(host::Error::Unsupported)
     }
 }
 

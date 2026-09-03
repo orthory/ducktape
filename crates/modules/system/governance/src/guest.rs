@@ -67,8 +67,6 @@ const VALSET_ID: &str = "valset";
 const MODULES_ID: &str = "modules";
 const IDENTITY_ID: &str = "identity";
 const ACL_ID: &str = acl::DEFAULT_ACL_ID;
-/// the genesis-config key carrying this network's invite binding.
-const INVITE_PARAM: &str = "invite";
 
 /// this network's invite binding, decoded from the host-seeded genesis
 /// config. a missing or malformed config is host wiring corruption surfaced
@@ -80,7 +78,7 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
     })?;
     let params = genesis_config::decode_config(&raw)
         .map_err(|e| host::Error::Rejected(format!("governance genesis config: {e}")))?;
-    genesis_config::find(&params, INVITE_PARAM)
+    genesis_config::find(&params, genesis_config::INVITE)
         .map(<[u8]>::to_vec)
         .ok_or_else(|| {
             host::Error::Rejected("governance genesis config carries no invite binding".into())
@@ -95,6 +93,10 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Governance,
+    shape: guest_adapter::host::ModuleShape {
+        config: vec![genesis_config::INVITE.into()],
+        ..guest_adapter::store_shape()
+    },
     new: Governance::new(MODULE_ID, Box::new(WitStore), VALSET_ID, IDENTITY_ID)
         .with_invite_binding(invite_binding()?)
         .with_code_registry(MODULES_ID)

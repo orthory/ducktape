@@ -6,7 +6,7 @@
 //! by the module build target); it is committed so this proof is self-contained.
 
 use sdk::{Env, Module, Msg, Origin, StateRoot};
-use wasm_host::WasmModule;
+use wasm_host::{Backing, Shape, WasmModule};
 
 const HELLO: &[u8] = include_bytes!("fixtures/hello.component.wasm");
 
@@ -136,13 +136,48 @@ async fn hot_swap_keeps_state() {
     assert_eq!(count(m.query(b"").await.expect("query")), 3);
 }
 
+/// A CODE SWAP NEVER CHANGES A MODULE'S SHAPE: the state layout is the swap
+/// contract, so a replacement declaring another backing cannot keep this
+/// state — refused by name at the boundary, and the running code and state
+/// are left exactly as they were.
+#[tokio::test]
+async fn a_swap_to_another_backing_is_refused_and_keeps_the_running_code() {
+    const OBJECT: &[u8] = include_bytes!("fixtures/object.component.wasm");
+    let mut m = WasmModule::from_bytes("hello", HELLO).expect("load");
+    let mut ctx = mock("hello");
+    inc(&mut m, &mut ctx).await;
+    m.commit_block().await.expect("commit");
+    let before = m.root();
+
+    let err = m
+        .swap_code(OBJECT)
+        .expect_err("an odb-declared replacement over a map is refused");
+    assert!(
+        err.to_string().contains("declares a Odb backing"),
+        "the refusal names the declared backing: {err}"
+    );
+    assert_eq!(m.root(), before, "the refused swap moved nothing");
+    inc(&mut m, &mut ctx).await;
+    m.commit_block().await.expect("commit");
+    assert_eq!(count(m.query(b"").await.expect("query")), 2, "the running code still runs");
+}
+
 /// THE READINESS PROBE MUST ACTUALLY LOAD. A validator signals `SwapReady` off
-/// this answer, and byte residency alone let a node on an older binary arm a
-/// swap it then rejected every op to (#1297) — so the check has to run the real
-/// compile + instantiate, not merely look at the bytes.
+/// the declared-shape read, and byte residency alone would let a node on an
+/// older binary arm a swap it then rejects every op to — so reading the shape
+/// runs the real compile + instantiate, not merely a look at the bytes.
 #[test]
-fn check_loadable_accepts_a_real_component_and_refuses_garbage() {
-    WasmModule::check_loadable(HELLO).expect("the shipped fixture loads on this binary");
+fn declared_shape_reads_a_real_component_and_refuses_garbage() {
+    let shape = WasmModule::declared_shape(HELLO).expect("the shipped fixture loads on this binary");
+    assert_eq!(
+        shape,
+        Shape {
+            backing: Backing::Map,
+            config: Vec::new(),
+            committed_queries: false,
+        },
+        "hello declares a map-backed, unconfigured, read-your-writes shape"
+    );
 
     for (what, bytes) in [
         ("empty", Vec::new()),
@@ -152,8 +187,25 @@ fn check_loadable_accepts_a_real_component_and_refuses_garbage() {
         ("truncated", b"\0asm\x0d\0\x01\0\x01\x02".to_vec()),
     ] {
         assert!(
-            WasmModule::check_loadable(&bytes).is_err(),
-            "{what} bytes must never be reported loadable"
+            WasmModule::declared_shape(&bytes).is_err(),
+            "{what} bytes must never read as a loadable component"
         );
     }
+}
+
+/// A MODULE RUNS OVER THE SUBSTRATE ITS CODE DECLARES, NEVER ANOTHER: the host
+/// wrapping a map-declared component over a store is a wiring bug refused by
+/// name at load, not a module silently computing a root over the wrong
+/// substrate.
+#[tokio::test]
+async fn a_backing_the_component_did_not_declare_is_refused() {
+    let store = sdk_testkit::MemStore::default();
+    let err = WasmModule::with_store("hello", HELLO, Box::new(store))
+        .err()
+        .expect("a map-declared component over a store is refused");
+    assert!(
+        err.to_string().contains("declares a Map backing"),
+        "the refusal names the declared backing: {err}"
+    );
+    WasmModule::from_bytes("hello", HELLO).expect("the declared backing loads");
 }

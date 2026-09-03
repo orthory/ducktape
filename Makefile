@@ -287,9 +287,10 @@ BUILDER_MODULES := \
 # `index-guest` feature): guest-builder --index writes the canonical
 # index.wasm (core wasm, no componentize) into the module directory; the
 # build stages it into the founding set as `<id>.index.wasm` and a genesis
-# carries it (the topology's `index_guest` flag declares which modules have
-# one). The reference testmap mapper is the indexer crate's test fixture and
-# rides the same sweep.
+# carries it. The shell file IS the declaration: noded's build script stages
+# an index guest for exactly the module crates that carry src/index_guest.rs,
+# so this list must name exactly those. The reference testmap mapper is the
+# indexer crate's test fixture and rides the same sweep.
 INDEX_MODULES := \
   crates/modules/apps/chat crates/modules/apps/tasks crates/modules/apps/pages \
   crates/modules/apps/inbox crates/modules/system/saga \

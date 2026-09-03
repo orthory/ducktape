@@ -77,5 +77,6 @@ use guest_adapter::WitStore;
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Pages,
+    shape: guest_adapter::store_shape(),
     new: Pages::new(MODULE_ID, Box::new(WitStore)).with_tagging(TAGGING_ID),
 }

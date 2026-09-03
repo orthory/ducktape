@@ -29,6 +29,16 @@ fn read_count() -> u64 {
 }
 
 impl Guest for Component {
+    /// the same shape as `hello-wasm`: a code swap keeps the store, so the
+    /// replacement must declare the backing that store is.
+    fn shape() -> host::ModuleShape {
+        host::ModuleShape {
+            backing: host::Backing::Map,
+            config: Vec::new(),
+            committed_queries: false,
+        }
+    }
+
     fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
         let _env = host::get_env();
         match payload.as_slice() {

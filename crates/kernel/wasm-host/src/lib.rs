@@ -75,8 +75,52 @@ mod bindings {
 
 use bindings::Module as ModuleWorld;
 use bindings::ducktape::module::host::{
-    self, Env as WitEnv, Error as WitError, Origin as WitOrigin,
+    self, Backing as WitBacking, Env as WitEnv, Error as WitError, ModuleShape as WitShape,
+    Origin as WitOrigin,
 };
+
+/// where a wasm module's COMMITTED state lives: the kind a component declares
+/// ([`Shape::backing`]) and the host must wrap it over. the public twin of
+/// the private [`StateBacking`], which carries the substrate itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backing {
+    /// a host-owned key/value map: root = sha256 over the canonical encoding,
+    /// sync = installable snapshot bytes.
+    Map,
+    /// a host-constructed authenticated store (qmdb): root = the store's
+    /// merkle root, sync = the store's resolver lane.
+    Store,
+    /// a host-side content-addressed substrate the host provides by module
+    /// id: root = the substrate's fold of its refs image.
+    Odb,
+}
+
+/// what a component declares about itself — the `module.wit` `shape` export,
+/// read from the bytes by [`WasmModule::declared_shape`] and applied by every
+/// constructor: the backing it must be wrapped over, the network config keys
+/// it needs seeded when it starts fresh, and whether its query lane is
+/// committed-only. a property of the code: the same bytes always answer the
+/// same shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shape {
+    pub backing: Backing,
+    pub config: Vec<String>,
+    pub committed_queries: bool,
+}
+
+impl Shape {
+    fn from_wit(declared: WitShape) -> Self {
+        Self {
+            backing: match declared.backing {
+                WitBacking::Map => Backing::Map,
+                WitBacking::Store => Backing::Store,
+                WitBacking::Odb => Backing::Odb,
+            },
+            config: declared.config,
+            committed_queries: declared.committed_queries,
+        }
+    }
+}
 
 /// default per-dispatch fuel budget: the deterministic termination bound. It is
 /// identical on every validator, so a runaway guest traps at the same point on
@@ -514,6 +558,108 @@ enum StateBacking {
     Odb { backing: Box<dyn OdbBacking> },
 }
 
+impl StateBacking {
+    fn kind(&self) -> Backing {
+        match self {
+            StateBacking::Map { .. } => Backing::Map,
+            StateBacking::Store { .. } => Backing::Store,
+            StateBacking::Odb { .. } => Backing::Odb,
+        }
+    }
+}
+
+/// a compiled component, its declared [`Shape`], and the engine + linker it
+/// instantiates under — the compile-once half of every load. a host wraps it
+/// over the substrate the shape names ([`over_map`](Self::over_map),
+/// [`over_store`](Self::over_store), [`over_odb`](Self::over_odb)) without
+/// compiling the bytes a second time.
+pub struct CompiledModule {
+    engine: Engine,
+    linker: Linker<HostData>,
+    component: Component,
+    code_hash: Vec<u8>,
+    shape: Shape,
+}
+
+impl CompiledModule {
+    /// compile the bytes against this build's real linker and read the shape
+    /// they declare. this is ALSO the loadability proof: a component
+    /// importing a host function this build does not provide fails here, at
+    /// instantiate, rather than per dispatch on the live path (a validator
+    /// must prove the bytes load HERE before it votes a swap ready, or it
+    /// arms a swap it cannot run and forks the instant it activates). the
+    /// shape is read outside any dispatch with no env set, so a `shape` that
+    /// touches an import traps — a shape is a pure constant of the code.
+    pub fn compile(component_bytes: &[u8]) -> Result<Self, SdkError> {
+        let engine = Engine::new(&deterministic_config()).map_err(module_err)?;
+        let component = Component::from_binary(&engine, component_bytes).map_err(module_err)?;
+        let mut linker = Linker::new(&engine);
+        ModuleWorld::add_to_linker::<HostData, HasSelf<HostData>>(&mut linker, |d| d)
+            .map_err(module_err)?;
+        let shape = read_shape(&engine, &linker, &component)?;
+        Ok(Self {
+            engine,
+            linker,
+            component,
+            code_hash: sha256(component_bytes),
+            shape,
+        })
+    }
+
+    /// what the bytes declare about themselves.
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    /// wrap over an empty host-KV map — for a component declaring
+    /// [`Backing::Map`].
+    pub fn over_map(self, id: impl Into<ModuleId>) -> Result<WasmModule, SdkError> {
+        WasmModule::load(
+            id.into(),
+            self,
+            StateBacking::Map {
+                committed: BTreeMap::new(),
+            },
+        )
+    }
+
+    /// wrap over a host-injected authenticated store (already opened, or
+    /// already synced to a verified root) — for a component declaring
+    /// [`Backing::Store`].
+    pub fn over_store(
+        self,
+        id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
+    ) -> Result<WasmModule, SdkError> {
+        WasmModule::load(id.into(), self, StateBacking::Store { store })
+    }
+
+    /// wrap over a host-side content-addressed substrate — for a component
+    /// declaring [`Backing::Odb`].
+    pub fn over_odb(
+        self,
+        id: impl Into<ModuleId>,
+        backing: Box<dyn OdbBacking>,
+    ) -> Result<WasmModule, SdkError> {
+        WasmModule::load(id.into(), self, StateBacking::Odb { backing })
+    }
+}
+
+/// instantiate once, outside any dispatch, and read the component's declared
+/// shape (see [`CompiledModule::compile`]). no state is touched; the store
+/// dies with the probe.
+fn read_shape(
+    engine: &Engine,
+    linker: &Linker<HostData>,
+    component: &Component,
+) -> Result<Shape, SdkError> {
+    let mut store = Store::new(engine, HostData::default());
+    store.set_fuel(DEFAULT_FUEL).map_err(module_err)?;
+    let instance = ModuleWorld::instantiate(&mut store, component, linker).map_err(module_err)?;
+    let declared = instance.call_shape(&mut store).map_err(module_err)?;
+    Ok(Shape::from_wit(declared))
+}
+
 /// A wasm module: a `ducktape:module` component plus its host-owned
 /// authenticated state. Presented to the host as an ordinary [`sdk::Module`].
 pub struct WasmModule {
@@ -534,11 +680,12 @@ pub struct WasmModule {
     staged_objects: BTreeMap<Vec<u8>, Vec<u8>>,
     fuel: u64,
     /// serve QUERY rounds from committed state ALONE — the staged overlay is
-    /// dropped for the read (execute rounds are untouched). opt-in, for a ported
-    /// native module whose query surface was committed-only regardless of caller
-    /// (e.g. dispatch, whose between-block delivery injection must never observe a
-    /// same-block staged write). off by default: every other tenant keeps the
-    /// read-your-writes query surface.
+    /// dropped for the read (execute rounds are untouched). the component's
+    /// own declaration ([`Shape::committed_queries`]), for a module whose
+    /// query surface is committed-only regardless of caller (dispatch, whose
+    /// between-block delivery injection must never observe a same-block
+    /// staged write). every other tenant keeps the read-your-writes query
+    /// surface.
     committed_queries: bool,
     /// the height of the block currently staging, captured each `execute` and
     /// consumed at the block boundary. only [`StateBacking::Odb`] reads it — it
@@ -550,58 +697,53 @@ pub struct WasmModule {
 }
 
 impl WasmModule {
-    fn load(id: ModuleId, component_bytes: &[u8], backing: StateBacking) -> Result<Self, SdkError> {
-        let engine = Engine::new(&deterministic_config()).map_err(module_err)?;
-        let component = Component::from_binary(&engine, component_bytes).map_err(module_err)?;
-        let mut linker = Linker::new(&engine);
-        ModuleWorld::add_to_linker::<HostData, HasSelf<HostData>>(&mut linker, |d| d)
-            .map_err(module_err)?;
+    /// wrap a compiled component over `backing`: the ONE constructor. the
+    /// component's declared shape is applied here — its backing must be the
+    /// kind offered (a module runs over the substrate its code declares,
+    /// never another; a mismatch is a wiring bug refused by name, never a
+    /// module silently computing a root over the wrong substrate) and its
+    /// committed-query mode is taken as declared.
+    fn load(id: ModuleId, compiled: CompiledModule, backing: StateBacking) -> Result<Self, SdkError> {
+        Self::require_declared_backing(&id, &compiled.shape, backing.kind())?;
         Ok(Self {
             id,
-            engine,
-            linker,
-            component,
-            code_hash: sha256(component_bytes),
+            engine: compiled.engine,
+            linker: compiled.linker,
+            component: compiled.component,
+            code_hash: compiled.code_hash,
             backing,
             staged: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
-            committed_queries: false,
+            committed_queries: compiled.shape.committed_queries,
             block_height: None,
         })
     }
 
-    /// Load a module from component bytes with an empty host-KV state store.
-    pub fn from_bytes(id: impl Into<ModuleId>, component_bytes: &[u8]) -> Result<Self, SdkError> {
-        Self::load(
-            id.into(),
-            component_bytes,
-            StateBacking::Map {
-                committed: BTreeMap::new(),
-            },
-        )
+    fn require_declared_backing(id: &str, shape: &Shape, offered: Backing) -> Result<(), SdkError> {
+        let runs_over_its_declared_substrate = shape.backing == offered;
+        if runs_over_its_declared_substrate {
+            return Ok(());
+        }
+        Err(SdkError::Module(format!(
+            "module {id}: the component declares a {:?} backing but the host offered {offered:?} — fail-closed",
+            shape.backing
+        )))
     }
 
-    /// Can THIS BINARY actually run these component bytes?
-    ///
-    /// [`Component::from_binary`] only validates and compiles. A component
-    /// importing a host function this build does not provide fails at
-    /// INSTANTIATE — which on the live path happens per dispatch, one block at
-    /// a time, and surfaces as [`SdkError::Module`]: a rejection documented as
-    /// deterministic because "the same code runs on every validator". That
-    /// premise is false under binary skew, so a validator must prove the bytes
-    /// load HERE before it votes a code swap ready; otherwise it arms a swap it
-    /// cannot run and forks the instant the swap activates (#1297).
-    ///
-    /// Instantiates against this build's real linker and throws the instance
-    /// away: no state is touched and the temporary engine dies with it.
-    pub fn check_loadable(component_bytes: &[u8]) -> Result<(), SdkError> {
-        let probe = Self::from_bytes("code-probe", component_bytes)?;
-        let mut store = Store::new(&probe.engine, HostData::default());
-        store.set_fuel(probe.fuel).map_err(module_err)?;
-        ModuleWorld::instantiate(&mut store, &probe.component, &probe.linker)
-            .map_err(module_err)?;
-        Ok(())
+    /// the shape these component bytes declare — what the host must know to
+    /// wrap them over a substrate — and the proof that THIS BINARY can run
+    /// them ([`CompiledModule::compile`]). the compilation is discarded; a
+    /// caller about to wrap the bytes compiles once through
+    /// [`CompiledModule`] instead.
+    pub fn declared_shape(component_bytes: &[u8]) -> Result<Shape, SdkError> {
+        Ok(CompiledModule::compile(component_bytes)?.shape)
+    }
+
+    /// Load a module from component bytes with an empty host-KV state store —
+    /// for a component declaring the [`Backing::Map`] shape.
+    pub fn from_bytes(id: impl Into<ModuleId>, component_bytes: &[u8]) -> Result<Self, SdkError> {
+        CompiledModule::compile(component_bytes)?.over_map(id)
     }
 
     /// Load a module from component bytes over a host-injected authenticated
@@ -610,13 +752,14 @@ impl WasmModule {
     /// sync is the store's resolver lane. this is the STORE-BACKED port shape:
     /// a native module written over `Box<dyn MerkleStore>` compiles into the
     /// guest and drives the very same store through the wit `state-*` imports,
-    /// so the cutover is root-continuous.
+    /// so the cutover is root-continuous. for a component declaring
+    /// [`Backing::Store`].
     pub fn with_store(
         id: impl Into<ModuleId>,
         component_bytes: &[u8],
         store: Box<dyn MerkleStore>,
     ) -> Result<Self, SdkError> {
-        Self::load(id.into(), component_bytes, StateBacking::Store { store })
+        CompiledModule::compile(component_bytes)?.over_store(id, store)
     }
 
     /// Load a module from component bytes over a host-side duckfs substrate —
@@ -626,12 +769,13 @@ impl WasmModule {
     /// it. this is the ROOT-CONTINUOUS files port: a native module written over
     /// duckfs's disk odb + refs file cuts over with no root movement. the boxed
     /// backing is both the committed refs owner and this tenant's [`HostOdb`].
+    /// for a component declaring [`Backing::Odb`].
     pub fn with_odb(
         id: impl Into<ModuleId>,
         component_bytes: &[u8],
         backing: Box<dyn OdbBacking>,
     ) -> Result<Self, SdkError> {
-        Self::load(id.into(), component_bytes, StateBacking::Odb { backing })
+        CompiledModule::compile(component_bytes)?.over_odb(id, backing)
     }
 
     fn is_store_backed(&self) -> bool {
@@ -680,18 +824,6 @@ impl WasmModule {
                 unreachable!("resolve_object_read only handles object-plane reads")
             }
         }
-    }
-
-    /// serve this tenant's QUERY rounds from committed state ALONE — drop the
-    /// staged overlay for the read (execute rounds keep their read-your-writes
-    /// stage). the opt-in for a ported native module whose query surface was
-    /// committed-only regardless of caller: dispatch answers `Module::query` from
-    /// committed state so a same-block sibling read never observes an uncommitted
-    /// write (the between-block delivery injection depends on it). every other
-    /// tenant leaves this off and keeps the read-your-writes query surface.
-    pub fn with_committed_queries(mut self) -> Self {
-        self.committed_queries = true;
-        self
     }
 
     /// Canonical bytes of a store: count + length-prefixed sorted `(key, value)`
@@ -1075,12 +1207,18 @@ impl Module for WasmModule {
     /// This is the live-update primitive: same store, new logic, and the root is
     /// computed from the (untouched) store — so root-hash is continuous across the
     /// swap. Staged (yet uncommitted) writes are discarded: a swap is only ever
-    /// driven at a clean block boundary, never mid-block.
+    /// driven at a clean block boundary, never mid-block. the replacement must
+    /// declare the backing the store IS — the state layout is the code-swap
+    /// contract, and a component wanting another substrate cannot keep this
+    /// state — while its committed-query mode is taken as it declares.
     fn swap_code(&mut self, component_bytes: &[u8]) -> Result<(), SdkError> {
-        let component =
-            Component::from_binary(&self.engine, component_bytes).map_err(module_err)?;
-        self.component = component;
-        self.code_hash = sha256(component_bytes);
+        let compiled = CompiledModule::compile(component_bytes)?;
+        Self::require_declared_backing(&self.id, &compiled.shape, self.backing.kind())?;
+        self.engine = compiled.engine;
+        self.linker = compiled.linker;
+        self.component = compiled.component;
+        self.code_hash = compiled.code_hash;
+        self.committed_queries = compiled.shape.committed_queries;
         self.staged.clear();
         self.staged_objects.clear();
         Ok(())

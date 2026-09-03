@@ -55,5 +55,6 @@ use guest_adapter::WitStore;
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Inbox,
+    shape: guest_adapter::store_shape(),
     new: Inbox::new(MODULE_ID, Box::new(WitStore)),
 }

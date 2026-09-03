@@ -1869,7 +1869,7 @@ fn prepare_module(
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
     let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
-    if !store.module_ids().any(|id| id == module) {
+    if !store.module_ids().iter().any(|id| id == module) {
         return Err(refuse_topic(topic, TopicRefusal::UnknownModule));
     }
     let (cursor, lagged) = module_start_cursor(topic, module, resume, store)?;
@@ -1889,7 +1889,7 @@ fn prepare_files_watch(
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
     let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
-    if !store.module_ids().any(|id| id == "files") {
+    if !store.module_ids().iter().any(|id| id == "files") {
         return Err(refuse_topic(topic, TopicRefusal::UnknownModule));
     }
     let (cursor, lagged) = module_start_cursor(topic, "files", resume, store)?;

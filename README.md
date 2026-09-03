@@ -37,7 +37,7 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/duckfs/` | The versioned-filesystem engine: `core` (pure, wasm-ready — the `files` module wraps it), `disk`, `client` (OS-side) |
 | `crates/noded/`, `crates/rpc-client/`, `crates/workspace-config/` | The node's host-side libraries: `noded` (the embedded host behind http/ws — status cell, log ring, service catalog, projection), `rpc-client` (bounded async client for the public `/v1` surface), `workspace-config` (node.toml/network.toml shapes, `DUCKTAPE_HOME`, identity files, invites) |
 | `crates/keystore/`, `crates/authpage/`, `crates/run-envelope/` | `keystore` (the device keystore: named encrypted user keys + the `active` wallet pointer), `authpage` (the client half of the `auth.ducktape.industries` WebAuthn relying-party page; the page itself is `ops/auth-page/`), `run-envelope` (the run payload's magic and the headless composer that stamps it) |
-| `crates/topology/` | ONE source for the module id universe, its wiring, its genesis-config schema and the named genesis selections (`production`, sim, demo) every composer draws from |
+| `crates/topology/` | ONE source for the module id universe (each id and where its code comes from) and the named genesis selections (`PRODUCTION`, `SIM_BASE`, `SIM_VALSET`) every composer draws from; what a module needs from the host is its own component's `shape` export |
 | `crates/guests/` | Shared wasm-port infra only: `guest-adapter` (the `ducktape:module` world binding every port shares), the wasm32 dep stubs, and the kernel-fixture test guests. Every module carries its own port (`src/guest.rs` behind the `guest` feature) and `bin/guest-builder` synthesizes the packaging — no per-module crate lives here |
 | `crates/examples/` | Reference modules: `directory` (the first wasm port; a test tenant, in no genesis set), `greeter` (types-only composition example) |
 | `crates/testing/` | `nettest` — the raw-HTTP-over-TCP test client, collision-safe port allocation and coarse event poll every node/daemon/sim integration harness shares |
@@ -82,7 +82,7 @@ ordering arm.
 | `projection::project_block` · `noded` | one shared block-projection path (RootOp assembly + `block_row` bytes + index feed + stream publish) | golden test pins `block_row` bytes | validator drain, replica park, noded submit lane, simnode — a rejected op journals a block, validator parity |
 | `Orderer` — scripted-stepping seam · `crates/kernel/node` | — (sim-only arm) | `StepOrderer` + `StepHandle` (FIFO; release-one / release-all) | simnode actor (`OrderedNode<StepOrderer>`) |
 | `worker::drive` · `crates/kernel/host` | one shared reactor loop (offer events, budget rounds, follow-up `Msg`s + Nudge tail) | unit test on budget / Nudge behavior | validator drain, noded submit lane, simnode auto mode |
-| `ModuleTopology` · `crates/topology` | one genesis topology (ordered id set, wiring edges, genesis-config values; named selections `production` / sim / demo) | `genesis_registry_matches_module_ids` + subset derivation tests | node `ProductionModules` (wasm), simnode (native), the dev-demo seed |
+| `ModuleTopology` · `crates/topology` | one module id universe and its named selections (`PRODUCTION` / `SIM_BASE` / `SIM_VALSET`), composed through `noded::compose` | `genesis_registry_matches_production` + the topology's own selection pins | `bin/node` (`PRODUCTION`), noded and simnode (`SIM_BASE`, plus `SIM_VALSET` under `--with-valset`) |
 
 ## Quick Start
 
