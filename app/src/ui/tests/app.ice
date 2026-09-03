@@ -440,7 +440,9 @@ preset ui_launch
 
 // The launch window's two load-bearing renders: the wallet list's selected
 // row carries the password field, and an empty network list is the welcome
-// plate whose one CTA routes to the join flow.
+// plate whose one CTA routes to the join flow — with the remote-endpoint
+// field still there, because a device with no local network is exactly the
+// one that connects to a remote node.
 test launch_wallets_contract
   preset ui_launch
   viewport 480 680
@@ -677,7 +679,9 @@ test launch_networks_empty_contract
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
   target cta = #hub/root/networks/root/join-cta
+  target remote_field = #hub/root/networks/root/remote-endpoint
   expect exists cta
+  expect exists remote_field
   click cta
   expect hub_step == HubStep.join
 
