@@ -903,7 +903,10 @@ async fn inline_picture_bytes(
         }
         DuckKind::Web => web_picture_bytes(url).await,
         // A citation from another network, and the kinds that name no bytes.
+        // A gateway route serves over HTTP, so its picture is the publisher's
+        // to serve to a browser — this reader never dials one.
         DuckKind::ForeignNetwork
+        | DuckKind::Gateway
         | DuckKind::Page
         | DuckKind::ForgeRepo
         | DuckKind::ForgeItem

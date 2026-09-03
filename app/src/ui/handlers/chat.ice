@@ -904,6 +904,8 @@ on open_message_link(url)
       error = foreign_network_error(link.net, network_chain_id)
     DuckKind.web
       run every open_external_url(url) -> external_url_opened _ | external_url_failed _
+    DuckKind.gateway
+      run every open_gateway_url(connected_rpc, link.authority, link.path) -> external_url_opened _ | external_url_failed _
     DuckKind.page
       run every duck_echo_str(link.page) -> open_page_search_hit(_, "") | external_url_failed _
     DuckKind.files
