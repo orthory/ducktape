@@ -113,10 +113,11 @@ struct StoreLabels {
     store: String,
 }
 
-/// the node-local stores that retain op payloads forever, by the name their
-/// gauges carry. `<storage>/blobstore` holds one flat file per op payload
-/// digest; `<storage>/index` holds one indexer op row per dispatch per module.
-const RETAINED_STORES: [(&str, &str); 2] = [("blobstore", "blobstore"), ("index", "index")];
+/// the node-local stores that retain op payloads forever. the name is both the
+/// gauge label and the directory under `<storage>`: `blobstore` holds one flat
+/// file per op payload digest, `index` one indexer op row per dispatch per
+/// module.
+const RETAINED_STORES: [&str; 2] = ["blobstore", "index"];
 
 /// how often [`spawn_store_footprint_sampler`] re-walks the retained stores.
 /// they grow by OPS, not by seconds, and the walk is O(files) over a directory
@@ -161,7 +162,7 @@ pub struct NodeMetrics {
     index_poisoned: Registered<raw::Gauge>,
     index_height: Registered<raw::Family<ModuleLabels, raw::Gauge>>,
     store_bytes: Registered<raw::Family<StoreLabels, raw::Gauge>>,
-    store_entries: Registered<raw::Family<StoreLabels, raw::Gauge>>,
+    store_files: Registered<raw::Family<StoreLabels, raw::Gauge>>,
     stream_index_sweeps: Registered<raw::Family<SweepLabels, raw::Counter>>,
     stream_snapshot_samples: Registered<raw::Family<SnapshotLabels, raw::Counter>>,
     operations: Arc<RwLock<OperationalStatus>>,
@@ -285,7 +286,7 @@ impl NodeMetrics {
                 "ducktape_store_bytes",
                 "bytes on disk held by a node-local retained store; nothing prunes these",
             ),
-            store_entries: context.family(
+            store_files: context.family(
                 "ducktape_store_files",
                 "files on disk held by a node-local retained store; nothing prunes these",
             ),
@@ -502,9 +503,9 @@ impl NodeMetrics {
             self.store_bytes
                 .get_or_create(&labels)
                 .set(store.bytes as i64);
-            self.store_entries
+            self.store_files
                 .get_or_create(&labels)
-                .set(store.entries as i64);
+                .set(store.files as i64);
         }
         let mut status = self.operations.write().expect("operations lock poisoned");
         status.storage.stores = stores;
@@ -535,15 +536,11 @@ pub fn spawn_store_footprint_sampler(metrics: NodeMetrics, storage: std::path::P
                 // the blocking pool is gone: the process is shutting down.
                 return;
             };
-            for store in &sampled {
-                tracing::debug!(
-                    target: "ducktape::storage",
-                    store = %store.store,
-                    bytes = store.bytes,
-                    entries = store.entries,
-                    "retained store footprint"
-                );
-            }
+            // NO EVENT HERE. these numbers are a gauge and a projection field,
+            // both read on demand; a per-tick line saying the same thing would
+            // need a plane of its own (`ducktape::blobstore` and
+            // `ducktape::index` each cover half of it) and would evict 4096
+            // lines of the log ring a day to repeat what `/metrics` holds.
             metrics.update_store_footprint(sampled);
             tokio::time::sleep(STORE_FOOTPRINT_INTERVAL).await;
         }
@@ -554,12 +551,12 @@ pub fn spawn_store_footprint_sampler(metrics: NodeMetrics, storage: std::path::P
 fn sample_stores(storage: &std::path::Path) -> Vec<StoreOperationalStatus> {
     RETAINED_STORES
         .iter()
-        .map(|(store, dir)| {
-            let (bytes, entries) = dir_footprint(&storage.join(dir));
+        .map(|store| {
+            let (bytes, files) = dir_footprint(&storage.join(store));
             StoreOperationalStatus {
                 store: (*store).to_string(),
                 bytes,
-                entries,
+                files,
             }
         })
         .collect()
@@ -698,12 +695,12 @@ mod tests {
                 StoreOperationalStatus {
                     store: "blobstore".into(),
                     bytes: 8,
-                    entries: 2,
+                    files: 2,
                 },
                 StoreOperationalStatus {
                     store: "index".into(),
                     bytes: 7,
-                    entries: 1,
+                    files: 1,
                 },
             ],
         );
@@ -713,8 +710,8 @@ mod tests {
             metrics.update_store_footprint(sample_stores(root.path()));
 
             assert_eq!(
-                metrics.operational_status().storage.stores[0].bytes,
-                8,
+                metrics.operational_status().storage.stores,
+                sample_stores(root.path()),
                 "the projection carries the same numbers the gauges do",
             );
             let scrape = context.encode();

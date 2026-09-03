@@ -440,9 +440,10 @@ pub struct StoreOperationalStatus {
     /// the bounded store name — `blobstore` or `index`.
     pub store: String,
     pub bytes: u64,
-    /// files on disk. the blobstore is ONE FLAT DIRECTORY of op-payload
-    /// blobs, so this is also the count an operator's `ls` has to survive.
-    pub entries: u64,
+    /// files on disk — the same number `ducktape_store_files` carries. the
+    /// blobstore is ONE FLAT DIRECTORY of op-payload blobs, so this is also
+    /// the count an operator's `ls` has to survive.
+    pub files: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
