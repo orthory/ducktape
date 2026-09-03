@@ -47,12 +47,22 @@ pub fn checkout(args: CheckoutArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// `status [dir]` (default `.`) — one `A|M|D\tpath` line per change, exit 1 when
-/// dirty (script-friendly: exit code IS the clean/dirty signal).
+/// `status [dir] [--path P]...` (default `.`) — one `A|M|D\tpath` line per
+/// change, exit 1 when dirty (script-friendly: exit code IS the clean/dirty
+/// signal). `--path` reports what the same pathspec would commit.
 pub fn status(args: StatusArgs) -> Result<(), CliError> {
     let dir = args.dir.as_deref().unwrap_or(".");
-    let st = duckfs_client::status::status(Path::new(dir))
-        .map_err(|e| CliError::failed(e.to_string()))?;
+    let dirp = Path::new(dir);
+    let st = duckfs_client::status::status(dirp).map_err(|e| CliError::failed(e.to_string()))?;
+    let st = match args.paths.is_empty() {
+        true => st,
+        // the pathspec is written against the checkout, so it needs the prefix
+        // the index recorded.
+        false => {
+            let index = Index::load(dirp).map_err(|e| CliError::failed(e.to_string()))?;
+            st.select(&args.paths, &index.prefix)
+        }
+    };
 
     for e in &st.added {
         println!("A\t{}", e.path);
@@ -72,14 +82,16 @@ pub fn status(args: StatusArgs) -> Result<(), CliError> {
     }
 }
 
-/// `commit [dir] --message <m> [--no-rebase]` — commit the working copy. prints
-/// the new snapshot id; a conflict prints the report to stderr and exits 2.
+/// `commit [dir] --message <m> [--no-rebase] [--path P]...` — commit the working
+/// copy, or the part of it the pathspec selects. prints the new snapshot id; a
+/// conflict prints the report to stderr and exits 2.
 pub fn commit(args: CommitArgs) -> Result<(), CliError> {
     let dir = args.dir.as_deref().unwrap_or(".");
     let dirp = Path::new(dir);
     let node = node_for_dir(&args.addr, dirp)?;
     let opts = CommitOptions {
         auto_rebase: !args.no_rebase,
+        paths: args.paths,
     };
 
     match commit_with(&node, dirp, &args.message, &opts) {

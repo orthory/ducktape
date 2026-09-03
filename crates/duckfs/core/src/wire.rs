@@ -20,6 +20,15 @@ pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_DEPTH: usize = 128;
 pub const MAX_DIR_ENTRIES: usize = 65_536;
 pub const MAX_INLINE_COMMIT_BYTES: usize = 256 * 1024;
+/// the per-commit change ceiling — a CONSENSUS-WIRE bound, not a client setting.
+/// a commit is ONE op in ONE block: its inline bytes ride that block's payload,
+/// every chunked file rides one [`CHUNK_SIZE`] (~1 MiB) staging block each, in
+/// sequence, with no priority lane, and the commit walks a tree spine per touched
+/// path under [`MAX_OBJECT_READS_PER_OP`]. so raising this does not make a big
+/// tree land faster — it makes one commit monopolize the chain, and every
+/// validator pays. do not raise it: the client's answer to a large tree is
+/// `.duckfsignore` (never walk build output) and `ducktape fs commit --path`
+/// (one subtree per commit, each still atomic).
 pub const MAX_CHANGES_PER_COMMIT: usize = 4096;
 /// per-op ceiling on DISTINCT committed-store object reads — a files CONSENSUS
 /// cap enforced in the pure core, so the native `Files` module and the wasm

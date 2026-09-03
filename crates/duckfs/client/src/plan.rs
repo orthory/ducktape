@@ -7,7 +7,9 @@
 //! path is canonicalized locally first (NFC + the name/path/depth caps), so a
 //! bad name fails before any network op — the module would reject it anyway. and
 //! `MAX_CHANGES_PER_COMMIT` is a HARD fail: the commit is the atomic unit, never
-//! split into pieces.
+//! split into pieces. the cap is a consensus-wire bound (see its definition), so
+//! the way past it is a smaller change set — `--path` picks a subtree,
+//! `.duckfsignore` keeps build output out of the walk — never a bigger cap.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -40,8 +42,11 @@ pub enum PlanError {
     Io(String),
     #[error(
         "duckfs: commit would change {count} paths, over the MAX_CHANGES_PER_COMMIT \
-         cap of {cap} (the commit is the atomic unit — split the work into separate \
-         commits, never a partial one)"
+         cap of {cap}. that cap is a consensus-wire bound (one commit is one op in \
+         one block), not a client setting, so nothing local raises it. commit a \
+         subtree at a time with `ducktape fs commit --path <PATH> --message <M>` \
+         (`ducktape fs status --path <PATH>` shows what one selects), and keep build \
+         output out of the walk with a `.duckfsignore` at the checkout root"
     )]
     TooManyChanges { count: usize, cap: usize },
 }
