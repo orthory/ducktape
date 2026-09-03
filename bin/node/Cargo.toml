@@ -3,6 +3,11 @@ name = "node-bin"
 edition.workspace = true
 version.workspace = true
 
+# `--cfg tokio_unstable` (set workspace-wide in .cargo/config.toml, for the
+# SIGUSR1 task dump) is a real, deliberately-set cfg, not a typo.
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ["cfg(tokio_unstable)"] }
+
 # a runnable multi-process node: derives an ed25519 identity from a config seed,
 # stands up a real `authenticated::discovery` encrypted TCP mesh to its peers,
 # runs a live simplex Engine (via consensus::SimplexOrderer, over the REAL tokio
@@ -126,7 +131,9 @@ indexer = { workspace = true }
 # the app-surface thread runs plain tokio (axum); the node itself stays on
 # commonware's runner. the promoted-validator boot catch-up also uses Tokio's
 # bounded mutex/timeout around the temporary statesync client; `signal` drives
-# the SIGTERM/SIGINT graceful-checkpoint arm of the run loop.
+# the SIGTERM/SIGINT graceful-checkpoint arm of the run loop. the `taskdump`
+# feature behind the SIGUSR1 task dump is added by the Linux-only target
+# table below: tokio makes it a compile_error! on any other OS.
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "signal", "io-std", "io-util"] }
 
 commonware-runtime = { workspace = true }
@@ -166,6 +173,15 @@ dialoguer = { version = "0.12.0", default-features = false }
 # lives in the GUI app's coalition and would otherwise be timer-coalesced the
 # moment the app hides to the menu bar. already in the workspace lockfile via
 # another workspace dependency — this adds no new supply chain.
+# `Handle::dump()` for the SIGUSR1 task dump (src/task_dump.rs). tokio
+# supports the feature only here and refuses it elsewhere with a
+# compile_error!, so it rides a target table, never the main line; the
+# `--cfg tokio_unstable` it also needs is scoped the same way in
+# .cargo/config.toml. features unify per target, so this ADDS to the tokio
+# line above on Linux and is absent everywhere else.
+[target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+tokio = { version = "1", features = ["taskdump"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSProcessInfo", "NSString"] }
 

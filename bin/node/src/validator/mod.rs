@@ -231,7 +231,7 @@ pub(crate) async fn run_validator(
             session_manager,
             gateway_commands,
             local_gateway_via,
-            gateway_workspace,
+            gateway_workspace.clone(),
             session_requests,
         );
         // the module-code plane: serves push/pull transfers and drains the
@@ -409,6 +409,7 @@ pub(crate) async fn run_validator(
         status,
         status_public_key,
         coordination,
+        workspace: gateway_workspace,
     })
     .await;
 }
@@ -455,6 +456,7 @@ pub(crate) async fn run_promoted(
     bulk_pacer: data_plane::BulkPacer,
     planes: data_plane::PlaneMonitor,
     sync_monitor: statesync::monitor::ServeMonitor,
+    workspace: std::path::PathBuf,
 ) {
     use commonware_codec::DecodeExt as _;
     use commonware_utils::ordered::Set;
@@ -792,6 +794,7 @@ pub(crate) async fn run_promoted(
         status,
         status_public_key,
         coordination,
+        workspace,
     })
     .await;
 }
