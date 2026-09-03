@@ -61,12 +61,26 @@ pub(crate) async fn test_link(handle: crate::NodeHandle) -> NodeLink {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("bind a loopback test surface");
-    let address = listener.local_addr().expect("read the test surface address");
+    let address = listener
+        .local_addr()
+        .expect("read the test surface address");
     let forge_repo = handle.forge_repo.clone();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, crate::router(handle)).await;
+    // the provisioner WRITES duckfs, and every mutating route now wants a
+    // credential — so the fake node carries one and the link presents it,
+    // exactly as a real daemon reads it out of the node's workspace.
+    let operator_token = crate::services::new_secret();
+    let handle = handle.with_admin(crate::AdminConfig {
+        operator_token: Some(operator_token.clone()),
+        ..crate::AdminConfig::default()
     });
-    let link = NodeLink::new(format!("http://{address}"));
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            crate::router(handle).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let link = NodeLink::new(format!("http://{address}")).with_operator_token(operator_token);
     match forge_repo {
         Some(base) => link.with_forge_repo(base),
         None => link,
@@ -103,12 +117,7 @@ pub fn agent_runs_root(storage: &Path) -> Result<PathBuf, String> {
     // for hosts that want the run tree elsewhere.
     let base = std::env::var_os("DUCKTAPE_AGENT_RUNS_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            storage
-                .parent()
-                .unwrap_or(storage)
-                .join("agent-runs")
-        });
+        .unwrap_or_else(|| storage.parent().unwrap_or(storage).join("agent-runs"));
     runs_root_under(base, storage)
 }
 

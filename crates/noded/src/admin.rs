@@ -228,27 +228,27 @@ impl AdminConfig {
     /// the embedded daemon and the sim have none (no consensus, no on-chain
     /// owner), so the credential is their whole gate.
     ///
-    /// Minting is CONDITIONAL on the namespace existing. Under
-    /// `DUCKTAPE_ADMIN=off` the routes are never registered, so writing a secret
-    /// into the workspace would leave a credential on disk that nothing can ever
-    /// present — a file whose only property is being readable.
+    /// Minted UNCONDITIONALLY, `DUCKTAPE_ADMIN=off` included. The credential is
+    /// no longer the admin namespace's alone: it is the node's local-daemon
+    /// credential, and the data plane's write gate
+    /// ([`crate::signed_req::signed_write_guard`]) accepts it as the second way
+    /// past — so an operator who turns the CONTROL surface off must not thereby
+    /// leave this node's own announce, lease and provisioner writes with no
+    /// credential to present.
     ///
     /// A mint failure leaves `operator_token: None`, which REFUSES every admin
     /// request rather than falling back to the loopback trust this replaced.
     /// That fallback would be the whole bug.
     pub fn minted(exposure: AdminExposure, dir: &std::path::Path) -> Self {
-        let operator_token = match exposure.enabled() {
-            false => None,
-            true => mint_operator_token(dir)
-                .inspect_err(|error| {
-                    tracing::error!(
-                        target: "ducktape::admin",
-                        reason = "operator_token_unwritable",
-                        "the admin namespace will refuse every request: {error}"
-                    );
-                })
-                .ok(),
-        };
+        let operator_token = mint_operator_token(dir)
+            .inspect_err(|error| {
+                tracing::error!(
+                    target: "ducktape::admin",
+                    reason = "operator_token_unwritable",
+                    "admin and every mutating /v1 route will refuse this node's own daemons: {error}"
+                );
+            })
+            .ok();
         Self {
             exposure,
             operator_token,
@@ -365,7 +365,7 @@ async fn resolve_owner(
 /// `ConnectInfo` (an embedder that forgot `into_make_service_with_connect_info`)
 /// is NOT treated as loopback — an unknown peer must never inherit local trust.
 /// every real serve path (noded, bin/node, simnode) threads connect-info.
-fn peer_is_loopback(req: &axum::extract::Request) -> bool {
+pub(crate) fn peer_is_loopback(req: &axum::extract::Request) -> bool {
     req.extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip().is_loopback())

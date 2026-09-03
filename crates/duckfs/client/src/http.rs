@@ -12,6 +12,7 @@
 //! [`ApiError::NotFound`] (a `stat` treats it as "nothing there"); anything else
 //! that is not a clean 2xx is [`ApiError::Transport`].
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -21,11 +22,26 @@ use serde::Deserialize;
 
 use crate::api::{ApiError, CommitReceipt, NodeApi};
 
+/// the credential a MUTATING duckfs request carries, as the headers to set:
+/// `(method, path, body) -> [(name, value)]`.
+///
+/// A CLOSURE, not a key: the node refuses an unsigned write, and the two things
+/// that can satisfy it — a user key's per-request signature and the node's own
+/// operator credential — both live in crates that depend on THIS one
+/// (`noded`, `bin/node`), so neither can be named here. The body is passed
+/// because the node's signature covers it: the bytes a caller signs for are the
+/// bytes that land.
+pub type WriteAuth = Arc<dyn Fn(&str, &str, &[u8]) -> Vec<(String, String)> + Send + Sync>;
+
 /// a node addressed over http. holds a blocking client and the base url; each
 /// call builds one request off it.
 pub struct HttpNode {
     client: reqwest::blocking::Client,
     base: String,
+    /// how a write authenticates. `None` = reads only — every mutating verb
+    /// then comes back as the node's own 401, which names the missing
+    /// credential.
+    auth: Option<WriteAuth>,
 }
 
 impl HttpNode {
@@ -43,11 +59,40 @@ impl HttpNode {
         HttpNode {
             client,
             base: base_url.into().trim_end_matches('/').to_string(),
+            auth: None,
         }
+    }
+
+    /// carry a credential on every mutating request (see [`WriteAuth`]).
+    pub fn with_write_auth(mut self, auth: WriteAuth) -> Self {
+        self.auth = Some(auth);
+        self
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    /// POST `body` verbatim to a MUTATING route, carrying whatever credential
+    /// [`Self::with_write_auth`] installed. The bytes are built here rather than
+    /// by `reqwest`'s `.json()` so that what the credential is computed over and
+    /// what goes on the wire are the same buffer.
+    fn post(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<reqwest::blocking::Response, ApiError> {
+        let mut request = self
+            .client
+            .post(self.url(path))
+            .header("content-type", content_type);
+        if let Some(auth) = self.auth.as_ref() {
+            for (name, value) in auth("POST", path, &body) {
+                request = request.header(name, value);
+            }
+        }
+        self.run(request.body(body))
     }
 
     /// send a request and normalize the outcome: a clean 2xx yields the response;
@@ -240,11 +285,10 @@ impl NodeApi for HttpNode {
     }
 
     fn stage_chunk(&self, bytes: &[u8]) -> Result<DigestHex, ApiError> {
-        let resp = self.run(
-            self.client
-                .post(self.url("/v1/files/stage"))
-                .header("content-type", "application/octet-stream")
-                .body(bytes.to_vec()),
+        let resp = self.post(
+            "/v1/files/stage",
+            "application/octet-stream",
+            bytes.to_vec(),
         )?;
         let staged: StageWire = resp
             .json()
@@ -265,7 +309,8 @@ impl NodeApi for HttpNode {
             message,
             changes,
         };
-        let resp = self.run(self.client.post(self.url("/v1/files/commit")).json(&body))?;
+        let bytes = serde_json::to_vec(&body).map_err(|e| ApiError::Transport(e.to_string()))?;
+        let resp = self.post("/v1/files/commit", "application/json", bytes)?;
         let block: BlockSummaryWire = resp
             .json()
             .map_err(|e| ApiError::Transport(e.to_string()))?;
@@ -276,7 +321,8 @@ impl NodeApi for HttpNode {
 
     fn pin(&self, snapshot: &str, name: &str) -> Result<(), ApiError> {
         let body = serde_json::json!({ "snapshot": snapshot, "name": name });
-        self.run(self.client.post(self.url("/v1/files/pin")).json(&body))?;
+        let bytes = serde_json::to_vec(&body).map_err(|e| ApiError::Transport(e.to_string()))?;
+        self.post("/v1/files/pin", "application/json", bytes)?;
         Ok(())
     }
 }

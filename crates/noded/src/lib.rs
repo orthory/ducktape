@@ -483,12 +483,15 @@ pub struct SubmitRequest {
     /// the submitter identity stamped into `Origin::External` on a daemon that
     /// honours it (the embedded one, and simnode).
     ///
-    /// THIS IS A CLAIM, NOT AUTHENTICATION, and it is a known open finding
-    /// (#1304, #1312, #1292): anything that can reach the port can name any
-    /// origin, and `bin/node` throws the claim away and re-signs with the node
-    /// key, so nothing submitted here carries authorship a module can check.
-    /// The lane that can is `/v1/submit/frame`, whose origin IS its verified
-    /// signer.
+    /// THIS IS A CLAIM, NOT AUTHENTICATION. It is honoured only on a request
+    /// the OPERATOR CREDENTIAL admitted — a local daemon speaking for the node
+    /// it lives beside, which is the only caller left that can reach this
+    /// field. A request that signed acts as its verified key instead, and no
+    /// caller can present neither credential at all any more.
+    ///
+    /// It still carries no authorship consensus can check: `bin/node` throws
+    /// the claim away and re-signs with the node key. The lane that does is
+    /// `/v1/submit/frame`, whose origin IS its verified signer.
     ///
     /// Deleting the field is a small change HERE and a large one everywhere
     /// else: the simnode, embedded-daemon and MCP harnesses use it to model
@@ -739,26 +742,38 @@ pub const ORACLE_ORIGIN: &[u8] = b"oracle";
 /// disagreeing with the bindings would mint signatures nothing accepts.
 pub const LOCAL_CHAIN_ID: &str = "local";
 
-/// POST /v1/submit — the FRAMELESS lane, and the one route the signed-write
-/// gate does not cover.
+/// POST /v1/submit — the FRAMELESS lane.
 ///
-/// Not an oversight: it is how the node's own local daemons submit ops that
-/// must carry the NODE's identity — a capability announce (`capability` keys
-/// the registry on the submitting node), a compute lease heartbeat and bid
-/// (the lease-holder IS the node), an agent run bind (`runs` checks the
-/// committed assignee). None of those has a user key that would be right, and
-/// a user-signed frame there would name the WRONG actor rather than an
-/// unauthenticated one. Requiring a signature here therefore needs a decision
-/// about how a node's own daemons authenticate AS the node — see
-/// [`SubmitRequest::origin`] and `signed_req::Lane`.
-async fn submit(State(handle): State<NodeHandle>, Json(req): Json<SubmitRequest>) -> Response {
+/// It is how the node's OWN local daemons submit ops that must carry the NODE's
+/// identity: a capability announce (`capability` keys the registry on the
+/// submitting node), a compute lease heartbeat and bid (the lease-holder IS the
+/// node), an agent run bind (`runs` checks the committed assignee). No user key
+/// would be right for any of those, so requiring a user signature here would
+/// name the WRONG actor — which is why the gate takes the OPERATOR CREDENTIAL
+/// as well (`signed_req`), and those daemons present it. Nothing else gets in:
+/// leaving the route open to anyone who could dial the port is what let a
+/// sandbox guest, or any peer on a widened `http_listen`, forge an op under
+/// this node's own consensus key.
+///
+/// A request that DID sign acts as its key: the verified signer overrides the
+/// caller-supplied [`SubmitRequest::origin`], which is a claim (see there).
+async fn submit(
+    State(handle): State<NodeHandle>,
+    signed: Option<axum::Extension<SignedBy>>,
+    Json(req): Json<SubmitRequest>,
+) -> Response {
     let payload = serde_json::to_vec(&req.payload).expect("a decoded json value re-serializes");
-    // empty string falls back too — chat rejects empty external authors
-    let origin = req
-        .origin
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| DEFAULT_ORIGIN.to_string())
-        .into_bytes();
+    // a verified signer is an IDENTITY; `origin` is only ever a claim, so the
+    // claim never wins. empty string falls back too — chat rejects empty
+    // external authors.
+    let origin = match signed.as_deref() {
+        Some(SignedBy(key)) => key.clone(),
+        None => req
+            .origin
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| DEFAULT_ORIGIN.to_string())
+            .into_bytes(),
+    };
     let (reply, rx) = oneshot::channel();
     if let Err(resp) = handle
         .send(NodeCommand::Submit {
@@ -955,11 +970,12 @@ async fn log_filter(body: String) -> Response {
 /// 503 when the embedder wired no minter — a daemon with no workspace has no
 /// descriptor to fold a hint into.
 ///
-/// AUTH: STILL NONE, and it should not stay that way — a bearer invite is a
-/// real capability, a 365-day right to join this mesh. it belongs behind the
-/// signed-write gate ([`signed_req`]); what holds it open is its only in-tree
-/// writer, the desktop app's shell backend, which mints from a UI action with
-/// no unlocked signer in scope. see the inventory on `signed_req::Lane`.
+/// AUTH: a bearer invite is a real capability — a right to join this mesh for
+/// up to 365 days — so minting one is behind the signed-write gate
+/// ([`signed_req`]) like every other mutation: a user signature, or this node's
+/// operator credential from a local process that can read its workspace. The
+/// desktop app presents the latter (it already reads the same workspace for the
+/// service-link token).
 async fn mint_invite(
     State(handle): State<NodeHandle>,
     body: Option<Json<serde_json::Value>>,

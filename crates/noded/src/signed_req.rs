@@ -30,6 +30,22 @@
 //! node X never replays against node Y; and to a timestamp inside
 //! [`FRESHNESS_SECS`], so a captured request dies with the window.
 //!
+//! ## the second credential: the node's OWN daemons
+//!
+//! some mutations are the NODE's, not a person's. a capability announce keys
+//! the registry on the submitting node; a compute lease heartbeat and bid are
+//! held BY the node; an agent run's provisioner writes duckfs on the node's
+//! behalf. a user signature there would name the WRONG actor, so those callers
+//! present what `/v1/admin/*` already asks of a local daemon
+//! ([`crate::admin::ADMIN_TOKEN_HEADER`]): this boot's 0600 workspace secret,
+//! from a loopback peer. "can read the node's own workspace", never "can dial
+//! the port" — and a sandbox guest, which reaches this listener through a vsock
+//! tunnel with no workspace, holds neither credential and so writes nothing.
+//!
+//! EITHER admits a mutating request; nothing else does. which one was presented
+//! decides the ACTING identity, and that is the whole of the difference: a
+//! signature acts as its key, the operator credential acts as the node.
+//!
 //! ## what this gate proves, and what it does not
 //!
 //! it proves POSSESSION of the key named in the headers, and hands the
@@ -238,36 +254,24 @@ pub struct SignedBy(pub Vec<u8>);
 /// self-authenticating `/v1/submit/frame`, the volatile service-hello, the
 /// websocket upgrades, and `/v1/admin/*` (which carries its own gate).
 ///
-/// ## the routes that are NOT here yet, and exactly what each one is waiting on
-///
-/// the gate is a two-sided change: the node requires a signature and every
-/// in-tree writer mints one. a route whose in-tree writer HOLDS NO KEY cannot
-/// be moved by adding it to this table — that turns a working plane into a 401
-/// with no client that can ever satisfy it. each of these needs a decision
-/// about WHOSE key acts, and that decision is not this file's to make:
-///
-/// - `/v1/files/{blob,stage,commit,pin,watch}` and the object facade's
-///   PUT/DELETE. writers: `duckfs-client`'s `HttpNode` (`ducktape fs`), the
-///   app's storage backend, MCP — and the in-process agent-run provisioner
-///   (`agent_provision` writes duckfs through `node_link::NodeLink::files()`),
-///   which holds no key at all. the app's signer needs a password it does not
-///   have at a file write, and a daemon minting its own key would charge
-///   duckfs authorship and the staging quota to a stranger that changes every
-///   boot. #1312's authorship half is plumbed (the acting key IS threaded to
-///   `files_submit`); the GATE is what waits on this.
-/// - `/v1/term/sessions` and `…/close`. writers: `ducktape agent shell`, the
-///   app's terminal, and the SANDBOX GUEST lane (`boot/surfaces.rs`) — a guest
-///   VM is untrusted by construction and has no key to sign with.
-/// - `/v1/invite`. writer: the app's shell backend, which mints from a UI
-///   action with no unlocked signer in scope.
-/// - `/v1/submit`. it is the node's OWN daemons' lane (capability announce,
-///   compute lease/bid, agent run bind); the node's key is the correct
-///   identity there and no user key would be right. its caller-supplied
-///   `origin` string is gone, which is the forgeable half.
+/// the ONE route family that mutates and is NOT here is the forge's
+/// `git-receive-pack`: `git push` cannot attach a header of its own, so its
+/// proof is git's OWN push certificate (`git push --signed`), refused inside
+/// `git_http::parse_push_commands` rather than by this middleware.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Lane {
     /// `/v1/fs/workspaces…` — create, commit, delete a managed checkout.
     Workspace,
+    /// `/v1/files/object/{*path}` — the S3-shaped facade. PUT is a
+    /// single-change commit and DELETE a single-change rm; its GET is a read.
+    /// SEPARATE from [`Lane::Files`] because it is the only lane whose write
+    /// verb is PUT, and a `POST`-only arm left it open.
+    Object,
+    /// `/v1/files/…` — blob, stage, commit, pin, watch. every duckfs read on
+    /// this prefix is a GET, so POST alone names the writes.
+    Files,
+    /// `/v1/term/sessions…` — create and close a node-hosted pty.
+    Term,
     /// a fixed mutating path ([`SIGNED_POSTS`]).
     Fixed,
     Open,
@@ -276,30 +280,48 @@ enum Lane {
 /// the exact mutating POST paths that are not a path family. an ALLOWLIST, not
 /// "every POST": `/v1/query`, `/v1/index/{m}/view` and `/v1/gateway/proxy` are
 /// POSTs that read, and `/v1/submit/frame` carries its own signature inside the
-/// frame.
-const SIGNED_POSTS: &[&str] = &["/v1/log-filter"];
+/// frame (it is a longer path than `/v1/submit`, so the exact match leaves it
+/// open).
+const SIGNED_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite", "/v1/submit"];
 
 const WORKSPACE_PREFIX: &str = "/v1/fs/workspaces";
+const OBJECT_PREFIX: &str = "/v1/files/object/";
+const FILES_PREFIX: &str = "/v1/files/";
+const TERM_PREFIX: &str = "/v1/term/sessions";
+
+/// path prefix → lane, in match order. the object facade sits UNDER the files
+/// prefix, so it has to be tried first; everything else here is disjoint.
+const LANE_PREFIXES: &[(&str, Lane)] = &[
+    (WORKSPACE_PREFIX, Lane::Workspace),
+    (OBJECT_PREFIX, Lane::Object),
+    (FILES_PREFIX, Lane::Files),
+    (TERM_PREFIX, Lane::Term),
+];
 
 fn lane_of(path: &str) -> Lane {
-    if path.starts_with(WORKSPACE_PREFIX) {
-        return Lane::Workspace;
+    if let Some((_, lane)) = LANE_PREFIXES
+        .iter()
+        .find(|(prefix, _)| path.starts_with(prefix))
+    {
+        return *lane;
     }
-    if SIGNED_POSTS.contains(&path) {
-        return Lane::Fixed;
+    match SIGNED_POSTS.contains(&path) {
+        true => Lane::Fixed,
+        false => Lane::Open,
     }
-    Lane::Open
 }
 
-/// does this request mutate, and therefore need a signature? one discriminant,
+/// does this request mutate, and therefore need a credential? one discriminant,
 /// one match — a new route that mutates is added to [`lane_of`]'s table, never
 /// to a scattered `if` at a call site.
 pub(crate) fn needs_signature(method: &Method, path: &str) -> bool {
     let posts = *method == Method::POST;
-    let posts_or_removes = posts || *method == Method::DELETE;
+    let removes = *method == Method::DELETE;
+    let replaces = *method == Method::PUT;
     match lane_of(path) {
-        Lane::Workspace => posts_or_removes,
-        Lane::Fixed => posts,
+        Lane::Workspace => posts || removes,
+        Lane::Object => replaces || removes,
+        Lane::Files | Lane::Term | Lane::Fixed => posts,
         Lane::Open => false,
     }
 }
@@ -366,7 +388,7 @@ impl WriteRefusal {
         match self {
             Self::SignatureMissing => {
                 "this route mutates state, so it requires a signed request \
-                 (x-ducktape-key / -ts / -sig)"
+                 (x-ducktape-key / -ts / -sig) or this node's operator credential"
             }
             Self::SignatureStale => "the request timestamp is outside this node's freshness window",
             Self::SignatureMalformed => "the request key or signature is not a valid ed25519 value",
@@ -376,6 +398,25 @@ impl WriteRefusal {
             Self::BodyOverCap => "the request body is larger than this node accepts",
         }
     }
+}
+
+/// does this request carry THIS node's operator credential, presented by a
+/// loopback peer? the SAME conjunction `/v1/admin/*` requires
+/// ([`crate::admin`]), compared the same constant-time way — "can read the
+/// node's own workspace", never "can dial the port".
+///
+/// a node that minted no credential verifies none: it fails closed here and the
+/// request falls through to the signature check, exactly as if nothing had been
+/// presented.
+fn operator_credential_matches(cfg: &crate::AdminConfig, req: &axum::extract::Request) -> bool {
+    let Some(expected) = cfg.operator_token.as_deref() else {
+        return false;
+    };
+    let Some(offered) = header_str(req.headers(), crate::admin::ADMIN_TOKEN_HEADER) else {
+        return false;
+    };
+    let on_box = crate::admin::peer_is_loopback(req);
+    on_box && crate::services::token_matches(offered, expected)
 }
 
 /// the ONE gate over every mutating `/v1` route: decide, then run or refuse.
@@ -388,6 +429,14 @@ pub(crate) async fn signed_write_guard(
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     if !needs_signature(&method, &path) {
+        return next.run(req).await;
+    }
+    // the node's own daemons, acting AS the node. checked first and without
+    // touching the body: nothing is signed over it here, so a whole packfile or
+    // a 4 MiB blob still streams to its handler instead of buffering in
+    // middleware. no `SignedBy` is inserted, so the acting origin stays the
+    // node's own name — which is what a daemon's write is.
+    if operator_credential_matches(&handle.admin, &req) {
         return next.run(req).await;
     }
     let path_and_query = req
@@ -641,18 +690,29 @@ mod tests {
         );
     }
 
-    /// the whole table, in one place — and it is the SHIPPED table, not the
-    /// intended one. the routes the ruling names that are still open are listed
-    /// here too, each with the in-tree writer that holds no key (see [`Lane`]),
-    /// so adding one to the gate without giving that writer an identity fails
-    /// this test rather than shipping a 401 nothing can satisfy.
+    /// the whole table, in one place: every mutating `/v1` route, and the reads
+    /// that must not be dragged in with them. the pairs that matter most are the
+    /// ones that share a path with their own read — `/v1/files/blob` (POST
+    /// writes, GET fetches), the object facade (PUT/DELETE write, GET reads) and
+    /// `/v1/submit` vs `/v1/submit/frame`.
     #[test]
-    fn the_gate_covers_the_routes_whose_writers_can_sign() {
+    fn the_gate_covers_every_mutating_route() {
         let gated: &[(Method, &str)] = &[
             (Method::POST, "/v1/log-filter"),
+            (Method::POST, "/v1/invite"),
+            (Method::POST, "/v1/submit"),
             (Method::POST, "/v1/fs/workspaces"),
             (Method::POST, "/v1/fs/workspaces/abc/commit"),
             (Method::DELETE, "/v1/fs/workspaces/abc"),
+            (Method::POST, "/v1/files/blob"),
+            (Method::POST, "/v1/files/stage"),
+            (Method::POST, "/v1/files/commit"),
+            (Method::POST, "/v1/files/pin"),
+            (Method::POST, "/v1/files/watch"),
+            (Method::PUT, "/v1/files/object/shared/a.txt"),
+            (Method::DELETE, "/v1/files/object/shared/a.txt"),
+            (Method::POST, "/v1/term/sessions"),
+            (Method::POST, "/v1/term/sessions/abc/close"),
         ];
         for (method, path) in gated {
             assert!(
@@ -667,17 +727,14 @@ mod tests {
             (Method::GET, "/v1/files/object/shared/a.txt"),
             (Method::POST, "/v1/query"),
             (Method::POST, "/v1/index/chat/view"),
+            (Method::POST, "/v1/gateway/proxy"),
             // self-authenticating: the frame carries its own signature.
             (Method::POST, "/v1/submit/frame"),
             (Method::POST, "/v1/services/hello"),
             (Method::GET, "/v1/ws"),
-            // still open, each waiting on a writer that can sign:
-            (Method::POST, "/v1/files/stage"),
-            (Method::POST, "/v1/files/commit"),
-            (Method::PUT, "/v1/files/object/shared/a.txt"),
-            (Method::POST, "/v1/term/sessions"),
-            (Method::POST, "/v1/invite"),
-            (Method::POST, "/v1/submit"),
+            // git cannot attach a header, so the forge's proof is git's own
+            // push certificate — refused in `git_http`, not here.
+            (Method::POST, "/forge/lab/git-receive-pack"),
         ];
         for (method, path) in open {
             assert!(

@@ -49,6 +49,11 @@ pub struct NodeLink {
     /// the node's forge repo base (`<storage>/forge-repo`) — a host path, not a
     /// route. `None` on a node whose storage dir is unknown to the daemon.
     forge_repo: Option<PathBuf>,
+    /// this boot's operator credential, read out of the node's workspace. EVERY
+    /// mutating `/v1` route now refuses a caller that presents neither this nor
+    /// a user signature ([`crate::signed_req`]), and a daemon has no user key —
+    /// its writes ARE the node's. `None` = reads only.
+    operator_token: Option<String>,
     client: reqwest::Client,
 }
 
@@ -58,8 +63,34 @@ impl NodeLink {
         Self {
             base: base.into().trim_end_matches('/').to_string(),
             forge_repo: None,
+            operator_token: None,
             client: http_client(CALL_TIMEOUT),
         }
+    }
+
+    /// carry the operator credential from the node's `workspace` on every
+    /// mutating call. A daemon that cannot read it keeps its READS — the link
+    /// still works for `/v1/query`, and a write comes back as the node's own
+    /// 401 naming the credential, which beats a daemon that refuses to boot.
+    pub fn with_workspace_credential(self, workspace: &Path) -> Self {
+        match crate::admin::read_operator_token(workspace) {
+            Ok(token) => self.with_operator_token(token),
+            Err(error) => {
+                tracing::warn!(
+                    target: "ducktape::service",
+                    reason = "operator_token_unreadable",
+                    %error,
+                    "this daemon cannot write to its node"
+                );
+                self
+            }
+        }
+    }
+
+    /// carry an operator credential already in hand.
+    pub fn with_operator_token(mut self, token: String) -> Self {
+        self.operator_token = Some(token);
+        self
     }
 
     /// Bound this link's calls at `timeout` rather than the consensus-sized
@@ -93,7 +124,13 @@ impl NodeLink {
     /// owns a runtime whose DROP panics inside an async context. Building it
     /// where it is used keeps both halves on the blocking side.
     pub fn files(&self) -> HttpNode {
-        HttpNode::new(self.base.clone())
+        let node = HttpNode::new(self.base.clone());
+        let Some(token) = self.operator_token.clone() else {
+            return node;
+        };
+        node.with_write_auth(std::sync::Arc::new(move |_method, _path, _body| {
+            vec![(crate::admin::ADMIN_TOKEN_HEADER.to_string(), token.clone())]
+        }))
     }
 
     /// submit one module op. `payload` is the module's own serde_json wire
@@ -129,8 +166,8 @@ impl NodeLink {
     /// reply is its encoded `*Reply`, so callers decode with the module's own
     /// codec exactly as they did on the actor lane.
     pub async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, String> {
-        let query: serde_json::Value = serde_json::from_slice(req)
-            .map_err(|error| format!("query is not json: {error}"))?;
+        let query: serde_json::Value =
+            serde_json::from_slice(req).map_err(|error| format!("query is not json: {error}"))?;
         let body = serde_json::json!({ "target": target, "query": query });
         self.post_json("/v1/query", &body)
             .await
@@ -139,13 +176,21 @@ impl NodeLink {
 
     async fn post_json(&self, path: &str, body: &serde_json::Value) -> Result<String, String> {
         let response = self
-            .client
-            .post(format!("{}{path}", self.base))
+            .credentialed(self.client.post(format!("{}{path}", self.base)))
             .json(body)
             .send()
             .await
             .map_err(|error| format!("POST {path}: {error}"))?;
         Self::body_of(response).await
+    }
+
+    /// attach the operator credential when this link holds one. Harmless on a
+    /// read route (the gate never looks) and required on every write.
+    fn credentialed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.operator_token.as_deref() {
+            Some(token) => request.header(crate::admin::ADMIN_TOKEN_HEADER, token),
+            None => request,
+        }
     }
 
     /// the node's rejection string rides through VERBATIM — the duckfs conflict
