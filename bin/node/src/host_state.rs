@@ -33,7 +33,7 @@ use noded::{IndexGuests, converge_index_guests};
 
 use crate::config::{
     Genesis, GenesisModules, GenesisSource, component_path, hex_bytes, install_genesis,
-    verify_genesis,
+    modules_path, verify_genesis,
 };
 use crate::constants::MODULE_IDS;
 use crate::util::hex;
@@ -113,6 +113,11 @@ fn hydrate_from_disk(
                     hash: *hash,
                 });
             };
+            // the verified genesis, unpacked beside network.toml as bare files
+            let workspace = file
+                .parent()
+                .ok_or_else(|| format!("{} has no workspace directory", file.display()))?;
+            loaded.materialize(&modules_path(workspace))?;
             IndexGuests::from_genesis(&loaded, MODULE_IDS)?
         }
     };

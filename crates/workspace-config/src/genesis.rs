@@ -4,8 +4,10 @@
 //! A network's wasm is the network's: the genesis carries every consensus
 //! component and every index guest a node on that network runs, and the
 //! workspace's first boot installs them from here (components into the blob
-//! store, index guests into the index databases). Nothing outside the
-//! workspace decides what its network runs, so two networks carry two sets.
+//! store, index guests into the index databases) and unpacks them as bare
+//! files into `<workspace>/modules` (founding-set layout — the readable copy
+//! of what the network runs). Nothing outside the workspace decides what its
+//! network runs, so two networks carry two sets.
 //!
 //! The descriptor pins it twice: `network.toml`'s `genesis` is the sha256 of
 //! this whole file (in the genesis fingerprint — the network IS its genesis)
@@ -40,6 +42,13 @@ pub const NETSTACK_COMPONENT_FILE: &str = "netstack.component.wasm";
 /// `<dir>/genesis`.
 pub fn genesis_path(dir: &Path) -> PathBuf {
     dir.join(GENESIS_FILE)
+}
+
+/// `<dir>/modules` — where a workspace's genesis is unpacked into bare files
+/// ([`Genesis::materialize`]), in founding-set layout: the network's wasm,
+/// readable on disk beside `network.toml`.
+pub fn modules_path(dir: &Path) -> PathBuf {
+    dir.join("modules")
 }
 
 /// `<dir>/<id>.component.wasm` — a consensus component in a founding set.
@@ -87,6 +96,22 @@ impl Genesis {
             components,
             index_guests,
         })
+    }
+
+    /// unpack every artifact into `dir` in founding-set layout
+    /// (`<id>.component.wasm`, `<id>.index.wasm`): the genesis's readable
+    /// twin on disk. Rewritten in full on every call (each file atomically),
+    /// so the directory always says what the genesis says — a founding set
+    /// composed from it yields this genesis again.
+    pub fn materialize(&self, dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        for a in &self.components {
+            write_atomic(&component_path(dir, &a.id), &a.bytes)?;
+        }
+        for a in &self.index_guests {
+            write_atomic(&index_guest_path(dir, &a.id), &a.bytes)?;
+        }
+        Ok(())
     }
 
     /// the file's bytes.
@@ -293,6 +318,34 @@ mod tests {
         let bytes = genesis.encode();
         assert_eq!(Genesis::decode(&bytes).unwrap(), genesis);
         assert_eq!(genesis.encode(), bytes, "canonical: same set, same bytes");
+    }
+
+    #[test]
+    fn materialize_writes_a_founding_set_that_composes_back() {
+        let src = tempfile::tempdir().unwrap();
+        founding_set(
+            src.path(),
+            &[("pages", b"P"), ("chat", b"C")],
+            &[("chat", b"c-map")],
+        );
+        let genesis = Genesis::compose(src.path(), &["pages", "chat"], &["chat"]).unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        let modules = modules_path(ws.path());
+        // a stale file from an older genesis is overwritten, never kept
+        std::fs::create_dir_all(&modules).unwrap();
+        std::fs::write(component_path(&modules, "pages"), b"old").unwrap();
+        genesis.materialize(&modules).unwrap();
+        assert_eq!(
+            std::fs::read(component_path(&modules, "pages")).unwrap(),
+            b"P"
+        );
+        assert_eq!(
+            std::fs::read(index_guest_path(&modules, "chat")).unwrap(),
+            b"c-map"
+        );
+        let again = Genesis::compose(&modules, &["pages", "chat"], &["chat"]).unwrap();
+        assert_eq!(again, genesis, "the directory is the genesis, unpacked");
     }
 
     #[test]
