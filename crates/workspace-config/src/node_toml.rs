@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize as _;
 
 use super::DEFAULT_PRIMARY_COORDINATOR;
-use super::DEFAULT_CHECKPOINT_BLOCKS;
+use super::{DEFAULT_BLOCK_TIME_MS, DEFAULT_CHECKPOINT_BLOCKS};
 
 /// the generated defaults: a fresh init/join with no flags yields a node
 /// with every surface up. Loopback for the operator surfaces (HTTP app
@@ -94,6 +94,9 @@ pub struct NodeToml {
     pub coordinator_relay: String,
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
+    /// milliseconds between idle blocks; every consensus timer is a fixed
+    /// multiple of it.
+    pub block_time_ms: u64,
     /// the compute plane: PRESENT = provider runs execute in this sandbox;
     /// ABSENT = consensus-only node (no provider discovery, no announce, no
     /// terminal plane).
@@ -158,6 +161,7 @@ pub struct DevSeedToml {
     pub http_listen: Option<String>,
     pub gateway_listen: Option<String>,
     pub checkpoint_blocks: Option<u64>,
+    pub block_time_ms: Option<u64>,
     /// PRESENT = the reachability plane runs (userspace socket backend).
     pub wireguard_listen: Option<String>,
     pub invite_listen: Option<String>,
@@ -232,6 +236,7 @@ pub struct Plumbing {
     pub primary_coordinator: String,
     pub coordinator_relay: String,
     pub checkpoint_blocks: u64,
+    pub block_time_ms: u64,
     pub sandbox: Option<SandboxToml>,
 }
 
@@ -247,6 +252,7 @@ pub fn merged_plumbing(
     invite_listen: Option<&str>,
     primary_coordinator: Option<&str>,
     wireguard_advertised: Option<&str>,
+    block_time_ms: Option<u64>,
 ) -> Result<Plumbing, String> {
     let path = dir.join("node.toml");
     // an existing file must be a VALID network-shape file to contribute —
@@ -314,6 +320,9 @@ pub fn merged_plumbing(
         checkpoint_blocks: e
             .map(|r| r.checkpoint_blocks)
             .unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
+        block_time_ms: block_time_ms
+            .or_else(|| e.map(|r| r.block_time_ms))
+            .unwrap_or(DEFAULT_BLOCK_TIME_MS),
         sandbox: e.and_then(|r| r.sandbox.clone()),
         wireguard_listen,
         primary_coordinator,
@@ -447,6 +456,12 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
         format_args!("{}", p.checkpoint_blocks),
         "sealed blocks between recovery checkpoints",
     );
+    keyline(
+        &mut s,
+        "block_time_ms",
+        format_args!("{}", p.block_time_ms),
+        "milliseconds between idle blocks; every consensus timer scales with it",
+    );
     // the [sandbox] table LAST — everything after a toml table header belongs
     // to the table, so no top-level key may follow it.
     match &p.sandbox {
@@ -528,8 +543,10 @@ mod tests {
     }
 
     fn fresh_default_plumbing(dir: &Path) -> Plumbing {
-        merged_plumbing(dir, None, None, None, None, None, None, None, None, None)
-            .expect("fresh merge")
+        merged_plumbing(
+            dir, None, None, None, None, None, None, None, None, None, None,
+        )
+        .expect("fresh merge")
     }
 
     /// the generated file round-trips through the strict parser and its
@@ -590,6 +607,7 @@ mod tests {
             derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)
         );
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
+        assert_eq!(raw.block_time_ms, DEFAULT_BLOCK_TIME_MS);
         // no [sandbox] table by default: a fresh node is consensus-only, and
         // the commented example in the file must not parse as a live table.
         assert_eq!(raw.sandbox, None);
@@ -644,6 +662,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
@@ -670,14 +689,18 @@ mod tests {
         let edited = std::fs::read_to_string(dir.join("node.toml"))
             .expect("read")
             .replace("checkpoint_blocks = 32", "checkpoint_blocks = 7")
+            .replace("block_time_ms = 1000", "block_time_ms = 250")
             + "\n[sandbox]\nruntime = \"firecracker\"\nkernel = \"/g/vmlinux\"\n\
                rootfs = \"/g/rootfs.ext4\"\ncores = 4\nmem_gb = 0\n";
         std::fs::write(dir.join("node.toml"), edited).expect("write");
-        let p = merged_plumbing(&dir, None, None, None, None, None, None, None, None, None)
-            .expect("merge");
+        let p = merged_plumbing(
+            &dir, None, None, None, None, None, None, None, None, None, None,
+        )
+        .expect("merge");
         write_node_toml(&dir, &p).expect("rewrite");
         let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
         assert_eq!(raw.checkpoint_blocks, 7);
+        assert_eq!(raw.block_time_ms, 250);
         let sandbox = raw.sandbox.expect("hand-added [sandbox] survives rewrite");
         assert_eq!(sandbox.runtime, "firecracker");
         assert_eq!(sandbox.cores, 4);

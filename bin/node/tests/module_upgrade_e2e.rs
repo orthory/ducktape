@@ -175,7 +175,6 @@ fn update_and_activate(cluster: &Cluster) {
 
 #[test]
 fn a_registered_module_survives_a_live_swap_a_restart_and_statesync() {
-    let _guard = common::serial();
     let mut cluster = founders_and_declared_joiner();
 
     // 2. register hello on all three; 3. inc → 1 everywhere

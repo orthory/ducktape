@@ -21,7 +21,7 @@ use std::time::Duration;
 use chat::{
     Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg, encode_query,
 };
-use common::{NetworkShapeCluster, poll_until, serial};
+use common::NetworkShapeCluster;
 
 /// generous like the sibling legs: standing → follow-arm sync → first
 /// pre-synced boundary is several blocks of slack.
@@ -38,7 +38,6 @@ const PRE_JOIN: &str = "m-pre-join";
 
 #[test]
 fn resident_adopts_boundaries_on_the_cert_wake_not_the_fallback_poll() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("resident-follow");
@@ -56,40 +55,50 @@ fn resident_adopts_boundaries_on_the_cert_wake_not_the_fallback_poll() {
             post_policy: PostPolicy::Open,
         }),
     );
-    poll_until("the channel to finalize on the founder", CONVERGE, || {
-        let raw = cluster.query(
-            0,
-            "chat",
-            &encode_query(&ChatQuery::Channel {
-                channel_id: "general".into(),
-            }),
-        )?;
-        matches!(decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
-    });
+    cluster.await_committed(
+        0,
+        "the channel to finalize on the founder",
+        CONVERGE,
+        || {
+            let raw = cluster.query(
+                0,
+                "chat",
+                &encode_query(&ChatQuery::Channel {
+                    channel_id: "general".into(),
+                }),
+            )?;
+            matches!(decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
+        },
+    );
 
     // POSTED BEFORE ANYONE JOINS: the resident below never sees this block as
     // a frame — it arrives inside the synced boundary, with the op feed that
     // would have carried it long gone. The op-row backfill is the only reason
     // it can ever answer from the view lane (indexable spec §7).
     cluster.submit(0, "chat", &encode_msg(&post(PRE_JOIN, "before the join")));
-    poll_until("the pre-join post to finalize on the founder", CONVERGE, || {
-        let raw = cluster.query(
-            0,
-            "chat",
-            &encode_query(&ChatQuery::MessagesRange {
-                channel_id: "general".into(),
-                from_seq: 1,
-                limit: 10,
-            }),
-        )?;
-        let ChatReply::Messages(views) = decode_reply(&raw).ok()? else {
-            return None;
-        };
-        views
-            .into_iter()
-            .any(|v| v.head.message_id == PRE_JOIN)
-            .then_some(())
-    });
+    cluster.await_committed(
+        0,
+        "the pre-join post to finalize on the founder",
+        CONVERGE,
+        || {
+            let raw = cluster.query(
+                0,
+                "chat",
+                &encode_query(&ChatQuery::MessagesRange {
+                    channel_id: "general".into(),
+                    from_seq: 1,
+                    limit: 10,
+                }),
+            )?;
+            let ChatReply::Messages(views) = decode_reply(&raw).ok()? else {
+                return None;
+            };
+            views
+                .into_iter()
+                .any(|v| v.head.message_id == PRE_JOIN)
+                .then_some(())
+        },
+    );
 
     // invite + join a fresh identity; grant it RESIDENT standing and wait for
     // the first pre-synced boundary — the follow loop is live from here on.
@@ -132,7 +141,7 @@ fn resident_adopts_boundaries_on_the_cert_wake_not_the_fallback_poll() {
 /// poll the RESIDENT's own read surface (node 1 — reads serve from its
 /// pre-synced host, never a validator's) until `message_id` is visible.
 fn resident_sees(cluster: &NetworkShapeCluster, message_id: &str, what: &str, deadline: Duration) {
-    poll_until(what, deadline, || {
+    cluster.await_committed(1, what, deadline, || {
         let raw = cluster.query(
             1,
             "chat",
@@ -167,7 +176,8 @@ fn resident_view_holds(cluster: &NetworkShapeCluster, message_id: &str, deadline
         "roots": { "channel_id": "general", "limit": 50 }
     });
     let body = serde_json::to_vec(&query).expect("view query serializes");
-    poll_until(
+    cluster.await_committed(
+        1,
         "the resident view lane to answer a pre-join message",
         deadline,
         || {

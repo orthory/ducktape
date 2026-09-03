@@ -22,7 +22,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use common::{Cluster, create_account, poll_until, serial, submit_frame};
+use common::{Cluster, create_account, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 use gateway::{
     DuckDnsName, GatewayMsg, GatewayQuery, GatewayReply, MemberAuthorization, RouteAudience,
@@ -268,7 +268,6 @@ async fn boot_gateway_and_upstream() -> (String, u16) {
 // hardware. See the design spec "TODO — full 2-node + TEE validation".
 #[test]
 fn airlock_over_gateway_two_wireguard_nodes() {
-    let _serial = serial();
     let rt = Runtime::new().unwrap();
 
     // Alice's loopback services: the airlock gateway + the mock upstream it swaps
@@ -330,7 +329,7 @@ fn airlock_over_gateway_two_wireguard_nodes() {
         }),
     );
     for reader in 0..2 {
-        let resolved = poll_until("alice.duck resolution", FINALIZE, || {
+        let resolved = cluster.await_committed(reader, "alice.duck resolution", FINALIZE, || {
             resolve_handle(&cluster, reader, "alice")
         });
         assert_eq!(resolved, alice_account);
@@ -364,7 +363,7 @@ fn airlock_over_gateway_two_wireguard_nodes() {
             1,
         )),
     );
-    poll_until("airlock route revision 1", FINALIZE, || {
+    cluster.await_committed(1, "airlock route revision 1", FINALIZE, || {
         (airlock_route_revision(&cluster, 1, alice_account) == Some(1)).then_some(())
     });
 
@@ -432,7 +431,6 @@ fn airlock_over_gateway_two_wireguard_nodes() {
 /// 2-node WireGuard peers reliably). Runs green where the 2-node harness can't.
 #[test]
 fn airlock_single_node_self_serves_its_own_route() {
-    let _serial = serial();
     let rt = Runtime::new().unwrap();
 
     let (gw_base, gw_port) = rt.block_on(boot_gateway_and_upstream());
@@ -480,7 +478,7 @@ fn airlock_single_node_self_serves_its_own_route() {
             handle: Some("alice".into()),
         }),
     );
-    poll_until("alice.duck resolution", FINALIZE, || {
+    cluster.await_committed(0, "alice.duck resolution", FINALIZE, || {
         resolve_handle(&cluster, 0, "alice")
     });
 
@@ -510,7 +508,7 @@ fn airlock_single_node_self_serves_its_own_route() {
             1,
         )),
     );
-    poll_until("airlock route revision 1", FINALIZE, || {
+    cluster.await_committed(0, "airlock route revision 1", FINALIZE, || {
         (airlock_route_revision(&cluster, 0, alice_account) == Some(1)).then_some(())
     });
 
@@ -584,7 +582,6 @@ fn airlock_single_node_self_serves_its_own_route() {
 /// streaming through browser door -> duplex frame wire -> loopback upstream.
 #[test]
 fn gateway_streams_and_caps_over_the_frame_wire() {
-    let _serial = serial();
     let rt = Runtime::new().unwrap();
     const CHUNK: usize = 64 * 1024;
     const TOTAL: usize = 6 * 1024 * 1024; // > the old 4 MiB buffered ceiling
@@ -677,7 +674,7 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
             handle: Some("alice".into()),
         }),
     );
-    poll_until("alice.duck resolution", FINALIZE, || {
+    cluster.await_committed(0, "alice.duck resolution", FINALIZE, || {
         resolve_handle(&cluster, 0, "alice")
     });
 
@@ -728,7 +725,7 @@ fn gateway_streams_and_caps_over_the_frame_wire() {
             false,
         )),
     );
-    poll_until("both routes live", FINALIZE, || {
+    cluster.await_committed(0, "both routes live", FINALIZE, || {
         (route_revision(&cluster, 0, alice_account, "sse") == Some(1)
             && route_revision(&cluster, 0, alice_account, "capped") == Some(1))
         .then_some(())

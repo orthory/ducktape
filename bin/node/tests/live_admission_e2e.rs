@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use common::{NetworkShapeCluster, poll_until, serial};
+use common::NetworkShapeCluster;
 use files::{
     Change, Content, EntryInfo, FilesMsg, FilesQuery, FilesReply, Kind, RefsInfo,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg, encode_putblob,
@@ -52,7 +52,6 @@ fn task_title(cluster: &NetworkShapeCluster, idx: usize, task_id: &str) -> Optio
 
 #[test]
 fn network_shape_joiner_parks_until_promote() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("live-admission");
@@ -118,7 +117,6 @@ fn network_shape_joiner_parks_until_promote() {
 /// halted) would be invisible to CI without the liveness assertions below.
 #[test]
 fn promoted_resident_seats_in_process_and_serves() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("promote-reboot");
@@ -148,7 +146,8 @@ fn promoted_resident_seats_in_process_and_serves() {
     // finalized through the founder becomes readable from the promoted
     // friend's own surface…
     cluster.submit(0, "tasks", &task_create("post-promote-founder", "landed"));
-    poll_until(
+    cluster.await_committed(
+        1,
         "the promoted friend to serve the founder's write",
         CONVERGE,
         || task_title(&cluster, 1, "post-promote-founder").filter(|t| t == "landed"),
@@ -156,9 +155,12 @@ fn promoted_resident_seats_in_process_and_serves() {
     // …and the promoted friend's own ordered lane finalizes into the widened
     // quorum (a halted founder can never land this).
     cluster.submit(1, "tasks", &task_create("post-promote-friend", "landed"));
-    poll_until("the founder to serve the friend's write", CONVERGE, || {
-        task_title(&cluster, 0, "post-promote-friend").filter(|t| t == "landed")
-    });
+    cluster.await_committed(
+        0,
+        "the founder to serve the friend's write",
+        CONVERGE,
+        || task_title(&cluster, 0, "post-promote-friend").filter(|t| t == "landed"),
+    );
 }
 
 // ---- duckfs joiner proof: full object possession over the REAL wire ---------
@@ -245,7 +247,6 @@ fn df_head(cluster: &NetworkShapeCluster, idx: usize) -> Option<String> {
 
 #[test]
 fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("duckfs-joiner");
@@ -271,10 +272,10 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
             ],
         }),
     );
-    poll_until("founder inline files to finalize", CONVERGE, || {
+    cluster.await_committed(0, "founder inline files to finalize", CONVERGE, || {
         df_stat(&cluster, 0, "/shared/a").map(|_| ())
     });
-    let s1 = poll_until("founder head after inline commit", CONVERGE, || {
+    let s1 = cluster.await_committed(0, "founder head after inline commit", CONVERGE, || {
         df_head(&cluster, 0)
     });
 
@@ -304,12 +305,12 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
             }],
         }),
     );
-    poll_until("founder chunked file to finalize", CONVERGE, || {
+    cluster.await_committed(0, "founder chunked file to finalize", CONVERGE, || {
         df_stat(&cluster, 0, "/shared/big")
             .filter(|e| e.size == chunk_size)
             .map(|_| ())
     });
-    let s2 = poll_until("founder head after chunked commit", CONVERGE, || {
+    let s2 = cluster.await_committed(0, "founder head after chunked commit", CONVERGE, || {
         df_head(&cluster, 0)
     });
 
@@ -322,7 +323,7 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
             name: "release".into(),
         }),
     );
-    poll_until("founder pin to finalize", CONVERGE, || {
+    cluster.await_committed(0, "founder pin to finalize", CONVERGE, || {
         df_refs(&cluster, 0)
             .filter(|r| r.pins.contains_key("release"))
             .map(|_| ())
@@ -359,9 +360,10 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
     // BYTE-IDENTICAL. it holds them only because the possession loop moved every
     // chunk / file / tree / snapshot object over the wire and its post-promotion
     // reboot recovered them from disk; an empty odb errors on Read.
-    let joined_chunk = poll_until("joiner to read the chunked file", CONVERGE, || {
-        df_read(&cluster, 1, "/shared/big", 0, chunk_size)
-    });
+    let joined_chunk =
+        cluster.await_committed(1, "joiner to read the chunked file", CONVERGE, || {
+            df_read(&cluster, 1, "/shared/big", 0, chunk_size)
+        });
     assert_eq!(
         joined_chunk, chunk,
         "joiner rebuilt the chunked file byte-identical over the wire"
@@ -418,7 +420,6 @@ fn network_shape_joiner_rebuilds_duckfs_over_the_wire() {
 fn staged_admission_resident_presyncs_then_promotes_warm() {
     use valset::{ValsetQuery, ValsetReply};
 
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("staged-admission");
@@ -429,16 +430,12 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.spawn(0);
     cluster.wait_marker(0, "rpc listening on", Duration::from_secs(60));
 
-    let poll = |what: &str, mut pred: Box<dyn FnMut() -> bool + '_>| {
-        let deadline = std::time::Instant::now() + CONVERGE;
-        while !pred() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
-            std::thread::sleep(Duration::from_millis(300));
-        }
-    };
+    // every predicate reads committed state, so each re-read rides the
+    // founder's block wake; CONVERGE only names the failure.
+    let poll =
+        |cluster: &NetworkShapeCluster, what: &str, mut pred: Box<dyn FnMut() -> bool + '_>| {
+            cluster.await_committed(0, what, CONVERGE, || pred().then_some(()));
+        };
 
     // A TASKS WRITE BEFORE ANYONE JOINS: the resident below never sees
     // this block as a frame — it arrives inside the synced boundary, with the
@@ -446,6 +443,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     // §7) is the only reason it can ever be in the resident's own feed.
     cluster.submit(0, "tasks", &task_create("pre-join", "written"));
     poll(
+        &cluster,
         "the pre-join write to finalize on the founder",
         Box::new(|| task_title(&cluster, 0, "pre-join").is_some_and(|t| t == "written")),
     );
@@ -500,6 +498,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     binds, answered from the resident's own pre-synced boundary.
     //     rpc status names the served boundary…
     poll(
+        &cluster,
         "the resident to serve rpc status",
         Box::new(|| {
             let st = cluster.rpc(1, serde_json::json!({ "cmd": "status" }));
@@ -510,6 +509,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     …module reads answer from the RESIDENT's surface (the tier split is
     //     visible through the resident itself, not just the founder)…
     poll(
+        &cluster,
         "the resident to serve valset reads",
         Box::new(|| {
             cluster
@@ -551,6 +551,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     …and the resident READS ITS OWN WRITE once its follow arm crosses
     //     the boundary that carries it…
     poll(
+        &cluster,
         "the resident to serve its own relayed write",
         Box::new(|| task_title(&cluster, 1, "resident-writes").is_some_and(|t| t == "landed")),
     );
@@ -558,6 +559,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     becomes readable through the resident within a few boundaries.
     cluster.submit(0, "tasks", &task_create("resident-follow", "fresh"));
     poll(
+        &cluster,
         "the resident to serve the followed write",
         Box::new(|| task_title(&cluster, 1, "resident-follow").is_some_and(|t| t == "fresh")),
     );
@@ -565,6 +567,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     records the followed boundary (an honest boundary row — verified
     //     height + root-hash, frame-derived fields empty)…
     poll(
+        &cluster,
         "the resident explorer to record a followed boundary",
         Box::new(|| {
             let (status, body) =
@@ -590,6 +593,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     re-trigger), so a read racing an in-flight heal legitimately sees 0
     //     for a moment, and the floor clears only after the fold drains.
     poll(
+        &cluster,
         "the resident index to report folding watermarks over a backfilled feed",
         Box::new(|| {
             let (status, index_status) =
@@ -642,12 +646,14 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     //     tears again, exactly as it did at heights 43 and 94.
     cluster.submit(0, "tasks", &task_create("pre-kill-quiesce", "folded"));
     poll(
+        &cluster,
         "the resident to fold the last op before the kill",
         Box::new(|| task_title(&cluster, 1, "pre-kill-quiesce").is_some_and(|t| t == "folded")),
     );
     cluster.kill(1);
     cluster.submit(0, "tasks", &task_create("resident-down-liveness", "alive"));
     poll(
+        &cluster,
         "a finalized op with the resident down",
         Box::new(|| task_title(&cluster, 0, "resident-down-liveness").is_some()),
     );
@@ -661,6 +667,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.spawn(1);
     cluster.wait_marker(1, "resident: pre-synced boundary", CONVERGE);
     poll(
+        &cluster,
         "the restarted resident to serve reads again",
         Box::new(|| {
             cluster.rpc(1, serde_json::json!({ "cmd": "status" }))["ok"] == serde_json::json!(true)
@@ -678,6 +685,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         "unexpected resident remove output:\n{out}"
     );
     poll(
+        &cluster,
         "the revoke to clear resident standing",
         Box::new(|| {
             cluster
@@ -706,6 +714,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         "unexpected re-grant output:\n{out}"
     );
     poll(
+        &cluster,
         "the re-grant to restore resident standing",
         Box::new(|| {
             cluster
@@ -721,6 +730,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     );
     cluster.submit(0, "tasks", &task_create("post-revoke-follow", "back"));
     poll(
+        &cluster,
         "the re-granted resident to resume the follow",
         Box::new(|| task_title(&cluster, 1, "post-revoke-follow").is_some_and(|t| t == "back")),
     );
@@ -762,6 +772,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.wait_marker(1, "promoted: validator at epoch", CONVERGE);
     cluster.submit(0, "tasks", &task_create("validator-role-restart", "voting"));
     poll(
+        &cluster,
         "the restarted validator to restore quorum and serve the new write",
         Box::new(|| {
             task_title(&cluster, 1, "validator-role-restart").is_some_and(|t| t == "voting")
@@ -783,6 +794,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
     cluster.wait_marker(1, "demoted from the validator set; halting", CONVERGE);
     cluster.wait_exit(1, CONVERGE);
     poll(
+        &cluster,
         "the removal to leave only the founder validator",
         Box::new(|| {
             cluster
@@ -803,6 +815,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         "unexpected post-removal resident grant:\n{out}"
     );
     poll(
+        &cluster,
         "the removed validator to regain resident standing",
         Box::new(|| {
             cluster
@@ -824,6 +837,7 @@ fn staged_admission_resident_presyncs_then_promotes_warm() {
         &task_create("validator-to-resident-restart", "followed"),
     );
     poll(
+        &cluster,
         "the restarted resident to follow a new write",
         Box::new(|| {
             task_title(&cluster, 1, "validator-to-resident-restart")

@@ -32,7 +32,7 @@ mod common;
 use std::time::Duration;
 
 use capability::{CapabilityQuery, CapabilityReply};
-use common::{NetworkShapeCluster, poll_until, serial};
+use common::NetworkShapeCluster;
 
 /// generous like the sibling network-shape legs: standing → follow-arm sync →
 /// announce relay → registry commit is several blocks of slack.
@@ -81,7 +81,6 @@ fn opt_in_serving(cluster: &NetworkShapeCluster, idx: usize, tag: &str) {
 
 #[test]
 fn a_joined_resident_announces_into_the_committed_registry() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("resident-announce");
@@ -121,7 +120,8 @@ fn a_joined_resident_announces_into_the_committed_registry() {
     // THE ANNOUNCE: without promotion, `grant ∩ live hello` reaches the
     // COMMITTED registry — relayed to the founder, admitted by the relaxed
     // member gate, applied in consensus.
-    poll_until(
+    cluster.await_committed(
+        0,
         "the resident's announce to land in the founder's registry",
         CONVERGE,
         || {

@@ -19,8 +19,8 @@ mod common;
 use std::time::Duration;
 
 use chat::{ChatMsg, ChatQuery, ChatReply};
+use common::NetworkShapeCluster;
 use commonware_cryptography::{Signer as _, ed25519};
-use common::{NetworkShapeCluster, poll_until, serial};
 
 /// generous like the sibling network-shape legs: join → standing → follow-arm
 /// sync → relay → commit is several blocks of slack.
@@ -56,7 +56,6 @@ fn message(cluster: &NetworkShapeCluster, idx: usize, message_id: &str) -> Optio
 
 #[test]
 fn a_fresh_key_submits_through_a_resident_with_no_standing_ceremony() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     cluster.init_founder("open-submit");
@@ -126,10 +125,15 @@ fn a_fresh_key_submits_through_a_resident_with_no_standing_ceremony() {
     // the message is committed consensus state on the FOUNDER, and its author
     // is the frame's verified signer — the wallet key, not the relaying node.
     let user_key = user.public_key().as_ref().to_vec();
-    poll_until("the posted message to commit on the founder", CONVERGE, || {
-        let m = message(&cluster, 0, "open-door-m1")?;
-        (m.head.author == chat::AuthorRef::User(user_key.clone())).then_some(())
-    });
+    cluster.await_committed(
+        0,
+        "the posted message to commit on the founder",
+        CONVERGE,
+        || {
+            let m = message(&cluster, 0, "open-door-m1")?;
+            (m.head.author == chat::AuthorRef::User(user_key.clone())).then_some(())
+        },
+    );
 
     // the door verifies the signature before anything else: a tampered frame
     // is refused at the resident's own decode, never relayed, never committed.

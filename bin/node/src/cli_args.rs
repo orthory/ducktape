@@ -607,6 +607,9 @@ pub struct PlumbingArgs {
     /// invite intro listener address
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub invite_listen: Option<String>,
+    /// milliseconds between idle blocks; every consensus timer scales with it
+    #[arg(long, value_name = "MS", hide_short_help = true)]
+    pub block_time_ms: Option<u64>,
 }
 
 #[cfg(test)]

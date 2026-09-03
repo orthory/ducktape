@@ -39,7 +39,10 @@ use commonware_p2p::simulated::{self, Link};
 use commonware_runtime::{Clock as _, Quota, Runner as _, Supervisor as _, deterministic};
 use commonware_utils::{NZU32, NZUsize};
 
-use consensus::{BLOCK_TIME, ContentStore, Digest, SimMesh, SimplexOrderer};
+use consensus::{Cadence, ContentStore, Digest, SimMesh, SimplexOrderer};
+
+/// the beat the sim runs at — simulated time, so its size is not wall-clock.
+const CADENCE: Cadence = Cadence::from_millis(1_000);
 use directory::Directory;
 use directory::{DirMsg, encode_msg};
 use host::Host;
@@ -153,6 +156,7 @@ async fn converge(mut context: deterministic::Context) {
             genesis_floor,
             None,
             ContentStore::new(),
+            CADENCE,
             false,
         );
         nodes.push(OrderedNode::new(genesis_host(), orderer));
@@ -190,7 +194,7 @@ async fn converge(mut context: deterministic::Context) {
     let target = ops.len();
     let mut applied = [0usize; N];
     while applied.iter().any(|&c| c < target) {
-        context.sleep(BLOCK_TIME).await;
+        context.sleep(CADENCE.block_time).await;
         for (i, n) in nodes.iter_mut().enumerate() {
             n.flush_batch().await.expect("flush");
             applied[i] += n.drain_delivered().await.expect("drain");

@@ -65,9 +65,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use common::{
-    Cluster, create_account, poll_until, sandbox_toml, serial, skip_unless_sandboxed, submit_frame,
-};
+use common::{Cluster, create_account, sandbox_toml, skip_unless_sandboxed, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 
 use airlock::attest::{self, Measurement};
@@ -513,9 +511,12 @@ fn saga_view(cluster: &Cluster, reader: usize, saga_id: &str) -> Option<SagaView
 
 /// Poll committed state until the pinned saga reaches a terminal status.
 fn wait_terminal(cluster: &Cluster, reader: usize, saga_id: &str, budget: Duration) -> SagaView {
-    poll_until("the pinned saga to reach a terminal status", budget, || {
-        saga_view(cluster, reader, saga_id).filter(|v| v.status.is_terminal())
-    })
+    cluster.await_committed(
+        reader,
+        "the pinned saga to reach a terminal status",
+        budget,
+        || saga_view(cluster, reader, saga_id).filter(|v| v.status.is_terminal()),
+    )
 }
 
 /// Read the buffered `run-output:<id>` ring off node `port`'s ws surface until a
@@ -709,7 +710,6 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     {
         return;
     }
-    let _serial = serial();
     let rt = Runtime::new().unwrap();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
 
@@ -763,7 +763,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
             handle: Some("owner".into()),
         }),
     );
-    poll_until("owner.duck resolution", FINALIZE, || {
+    cluster.await_committed(0, "owner.duck resolution", FINALIZE, || {
         resolve_handle(&cluster, 0, "owner").filter(|id| *id == owner_account)
     });
 
@@ -793,7 +793,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
             1,
         )),
     );
-    poll_until("airlock route revision 1", FINALIZE, || {
+    cluster.await_committed(0, "airlock route revision 1", FINALIZE, || {
         (airlock_route_revision(&cluster, 0, owner_account) == Some(1)).then_some(())
     });
 
@@ -810,7 +810,7 @@ fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
             seal_pk,
         )),
     );
-    poll_until("the credential record to commit", FINALIZE, || {
+    cluster.await_committed(0, "the credential record to commit", FINALIZE, || {
         credential_record(&cluster, 0).filter(|r| r.seal_pk == seal_pk)
     });
 
@@ -876,7 +876,6 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
     if skip_unless_sandboxed("a_delegated_run_draws_on_the_submitters_grant").is_some() {
         return;
     }
-    let _serial = serial();
     let rt = Runtime::new().unwrap();
     let fixtures = tempfile::TempDir::new().expect("provider fixtures dir");
 
@@ -949,7 +948,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
         }),
     );
     for reader in 0..2 {
-        poll_until("owner.duck resolution", FINALIZE, || {
+        cluster.await_committed(reader, "owner.duck resolution", FINALIZE, || {
             resolve_handle(&cluster, reader, "owner").filter(|id| *id == owner_account)
         });
     }
@@ -967,7 +966,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
             1,
         )),
     );
-    poll_until("airlock route revision 1", FINALIZE, || {
+    cluster.await_committed(1, "airlock route revision 1", FINALIZE, || {
         (airlock_route_revision(&cluster, 1, owner_account) == Some(1)).then_some(())
     });
 
@@ -987,7 +986,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
             seal_pk,
         )),
     );
-    poll_until("the credential record to commit", FINALIZE, || {
+    cluster.await_committed(1, "the credential record to commit", FINALIZE, || {
         credential_record(&cluster, 1)
     });
 
@@ -1138,7 +1137,7 @@ fn a_delegated_run_draws_on_the_submitters_grant() {
             executor_account,
         )),
     );
-    poll_until("the grant to commit", FINALIZE, || {
+    cluster.await_committed(1, "the grant to commit", FINALIZE, || {
         credential_record(&cluster, 1)
             .filter(|record| gateway::credential_use_allowed(record, executor_account))
             .map(|_| ())

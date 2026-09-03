@@ -126,8 +126,8 @@ pub enum ModuleEvent {
     ///
     /// It carries the height and NOTHING ELSE on purpose. A read of `/v1/status`
     /// triggered by this event would be a poll wearing a consensus costume: an
-    /// idle chain nop-fills once per `BLOCK_TIME` (`bin/node/src/constants.rs`),
-    /// so "on every tip" is a 1 Hz timer with extra steps.
+    /// idle chain nop-fills once per block time (node.toml `block_time_ms`),
+    /// so "on every tip" is a timer with extra steps.
     Tip { height: u64 },
 }
 

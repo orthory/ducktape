@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chat::{Block, ChatMsg, PostPolicy, encode_msg};
-use common::{NetworkShapeCluster, serial};
+use common::NetworkShapeCluster;
 
 /// generous like the sibling legs: boot → served boundary → head follow is
 /// several blocks of slack even with the founder under load.
@@ -39,7 +39,6 @@ const CONVERGE: Duration = Duration::from_secs(180);
 
 #[test]
 fn resident_rebootstraps_while_the_chain_stays_busy() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("busy-ascend");

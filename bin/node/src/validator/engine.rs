@@ -28,6 +28,7 @@ pub(super) struct EpochSpawner<'a> {
     namespace: Vec<u8>,
     label: String,
     channel_bank: super::LaneBank,
+    cadence: consensus::Cadence,
 }
 
 impl<'a> EpochSpawner<'a> {
@@ -39,6 +40,7 @@ impl<'a> EpochSpawner<'a> {
         namespace: Vec<u8>,
         label: String,
         channel_bank: super::LaneBank,
+        cadence: consensus::Cadence,
     ) -> Self {
         Self {
             context,
@@ -47,6 +49,7 @@ impl<'a> EpochSpawner<'a> {
             namespace,
             label,
             channel_bank,
+            cadence,
         }
     }
 
@@ -108,6 +111,7 @@ impl<'a> EpochSpawner<'a> {
             // down epoch die with it (in-flight ops are resubmitted). a
             // RESTART's store arrives pre-seeded from the recovery journal.
             store,
+            self.cadence,
             false,
         )
     }

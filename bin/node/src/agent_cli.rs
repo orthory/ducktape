@@ -869,7 +869,7 @@ fn decode_node_key(text: &str) -> Option<[u8; 32]> {
 }
 
 /// `http(s)://host:port` → `ws(s)://host:port/v1/ws`, the node's own ws surface.
-fn ws_url(base: &str) -> String {
+pub(crate) fn ws_url(base: &str) -> String {
     let ws_base = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = base.strip_prefix("http://") {

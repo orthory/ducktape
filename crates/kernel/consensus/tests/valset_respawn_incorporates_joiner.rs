@@ -39,7 +39,10 @@ use commonware_p2p::simulated::{self, Link};
 use commonware_runtime::{Clock as _, Quota, Runner as _, Supervisor as _, deterministic};
 use commonware_utils::{NZU32, NZUsize, ordered::Set};
 
-use consensus::{ContentStore, SimplexOrderer};
+use consensus::{Cadence, ContentStore, SimplexOrderer};
+
+/// the beat the sim runs at — simulated time, so its size is not wall-clock.
+const CADENCE: Cadence = Cadence::from_millis(1_000);
 use node::Orderer as _;
 
 /// recover the dev seed behind a deterministic identity (all five live in 0..5).
@@ -160,6 +163,7 @@ where
             epoch0,
             genesis0,
             store.clone(),
+            CADENCE,
             vote,
             cert,
             res,
@@ -208,6 +212,7 @@ where
             epoch1,
             genesis1,
             store.clone(),
+            CADENCE,
             vote,
             cert,
             res,

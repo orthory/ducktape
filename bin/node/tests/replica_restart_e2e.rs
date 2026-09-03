@@ -18,7 +18,7 @@ use std::time::Duration;
 use chat::{
     Block, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg, encode_query,
 };
-use common::{NetworkShapeCluster, poll_until, serial};
+use common::NetworkShapeCluster;
 
 const CONVERGE: Duration = Duration::from_secs(180);
 
@@ -28,7 +28,6 @@ const FOLD_WINDOW: Duration = Duration::from_secs(8);
 
 #[test]
 fn a_restarted_replica_replays_its_journal_and_resumes_folding() {
-    let _serial = serial();
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("replica-restart");
@@ -45,16 +44,21 @@ fn a_restarted_replica_replays_its_journal_and_resumes_folding() {
             post_policy: PostPolicy::Open,
         }),
     );
-    poll_until("the channel to finalize on the founder", CONVERGE, || {
-        let raw = cluster.query(
-            0,
-            "chat",
-            &encode_query(&ChatQuery::Channel {
-                channel_id: "general".into(),
-            }),
-        )?;
-        matches!(decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
-    });
+    cluster.await_committed(
+        0,
+        "the channel to finalize on the founder",
+        CONVERGE,
+        || {
+            let raw = cluster.query(
+                0,
+                "chat",
+                &encode_query(&ChatQuery::Channel {
+                    channel_id: "general".into(),
+                }),
+            )?;
+            matches!(decode_reply(&raw).ok()?, ChatReply::Channel(Some(_))).then_some(())
+        },
+    );
 
     // join + ascend: the first life bootstraps (the only life that should).
     let invite = cluster.invite();
@@ -72,10 +76,17 @@ fn a_restarted_replica_replays_its_journal_and_resumes_folding() {
 
     // ---- crash, write THROUGH the outage, restart ----
     cluster.kill(1);
-    cluster.submit(0, "chat", &encode_msg(&post("m-offline", "landed while down")));
-    poll_until("the offline post to finalize on the founder", CONVERGE, || {
-        founder_sees(&cluster, "m-offline")
-    });
+    cluster.submit(
+        0,
+        "chat",
+        &encode_msg(&post("m-offline", "landed while down")),
+    );
+    cluster.await_committed(
+        0,
+        "the offline post to finalize on the founder",
+        CONVERGE,
+        || founder_sees(&cluster, "m-offline"),
+    );
 
     cluster.spawn(1);
     // THE property: the second life recovers by replaying its own journal —
@@ -97,9 +108,7 @@ fn a_restarted_replica_replays_its_journal_and_resumes_folding() {
 
 /// poll the RESIDENT's own read surface until `message_id` is visible.
 fn resident_sees(cluster: &NetworkShapeCluster, message_id: &str, what: &str, deadline: Duration) {
-    poll_until(what, deadline, || {
-        sees(cluster, 1, message_id)
-    });
+    cluster.await_committed(1, what, deadline, || sees(cluster, 1, message_id));
 }
 
 fn founder_sees(cluster: &NetworkShapeCluster, message_id: &str) -> Option<()> {

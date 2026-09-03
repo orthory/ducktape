@@ -881,6 +881,7 @@ wireguard_advertised = "auto"
 primary_coordinator = "none"
 coordinator_relay = "none"
 checkpoint_blocks = 32
+block_time_ms = 1000
 "#,
     )
     .unwrap();

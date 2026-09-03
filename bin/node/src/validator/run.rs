@@ -126,6 +126,7 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) validators: Vec<ed25519::PublicKey>,
     pub(super) dev_demo: bool,
     pub(super) checkpoint_blocks: u64,
+    pub(super) cadence: consensus::Cadence,
     /// sync retention lease (unix secs of the last served state-sync request)
     /// — the drain defers oplog pruning while it is fresh.
     pub(super) sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -172,6 +173,7 @@ struct ValidatorRuntime<'a> {
     validators: Vec<ed25519::PublicKey>,
     dev_demo: bool,
     checkpoint_blocks: u64,
+    cadence: consensus::Cadence,
     sync_lease: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stream_hub: noded::StreamHub,
     index: std::sync::Arc<indexer::IndexStore>,
@@ -271,6 +273,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         validators,
         dev_demo,
         checkpoint_blocks,
+        cadence,
         sync_lease,
         rpc_ingress,
         http_cmds,
@@ -343,7 +346,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
     // ViewTick per actual advance, not one per 100ms drain pass.
     let last_reach_view: Option<u64> = None;
     // the IDLE beat grid: when the last flush (or restamp) happened, pacing
-    // the one-nop-per-BLOCK_TIME idle heartbeat. busy flushing is event-driven
+    // the one-nop-per-block-time idle heartbeat. busy flushing is event-driven
     // and merely restamps this. see `pump_heartbeat` / `pump_eager_flush`.
     let last_flush = context.current();
     // a cutover Retarget the plane's command queue could not take yet
@@ -456,6 +459,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         validators,
         dev_demo,
         checkpoint_blocks,
+        cadence,
         sync_lease,
         stream_hub,
         index,

@@ -42,7 +42,6 @@ fn three_validators() -> Cluster {
 
 #[test]
 fn register_then_update_activate_across_three_validators() {
-    let _guard = common::serial();
     let cluster = three_validators();
 
     // register: hello is not in PRODUCTION, so it is a free id
@@ -105,7 +104,6 @@ fn register_then_update_activate_across_three_validators() {
 /// into a receipt the operator can read — well inside the CLI's 60 s.
 #[test]
 fn a_dead_peer_refuses_the_proposal_before_it_is_made() {
-    let _guard = common::serial();
     let mut cluster = three_validators();
     cluster.kill(2);
     let cfg = cluster.config_file(0);
@@ -147,7 +145,6 @@ fn assert_no_proposals(cluster: &Cluster, idx: usize) {
 
 #[test]
 fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
-    let _guard = common::serial();
     let cluster = three_validators();
     let runs = run_on_each(
         &cluster,
