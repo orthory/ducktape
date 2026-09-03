@@ -289,7 +289,15 @@ fn the_duck_open_plane_routes_every_kind_onto_existing_navigation() {
         .split_once("\non ")
         .expect("the handler ends")
         .0;
-    assert!(open.contains("let link = classify_duck_link(url)") && open.contains("match link.kind"));
+    assert!(
+        open.contains("let link = resolve_duck_link(url, network_chain_id)")
+            && open.contains("match link.kind"),
+        "one resolve, scoped to the connected network, then one dispatch"
+    );
+    assert!(
+        open.contains("error = foreign_network_error(link.net, network_chain_id)"),
+        "a link from another network is refused by name, not opened"
+    );
     for route in [
         "run every open_external_url(url)",
         "-> open_page_search_hit(_, \"\")",

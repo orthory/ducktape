@@ -891,7 +891,10 @@ async fn inline_picture_bytes(client: &RpcClient, view: &BlobView, url: &str) ->
                 .and_then(|(_, bytes)| bytes)
         }
         DuckKind::Web => web_picture_bytes(url).await,
-        DuckKind::Page
+        // `classify_duck_link` is the grammar alone, so it never mints this
+        // kind; the arm exists because the enum is the open plane's.
+        DuckKind::ForeignNetwork
+        | DuckKind::Page
         | DuckKind::ForgeRepo
         | DuckKind::ForgeItem
         | DuckKind::Channel

@@ -184,8 +184,15 @@ extern crate::backend
   FsListing(generation:i64, path:str, entries:[FsEntry])
   FsPreview(generation:i64, path:str, text:str, truncated:bool, binary:bool, picture:bool, width:i64, height:i64)
   FsHistory(generation:i64, snapshots:[FsSnapshot])
-  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, rev:str)
-  pure classify_duck_link(url:str) -> DuckLink
+  DuckLink(kind:DuckKind, repo:str, number:i64, seq:i64, page:str, channel:str, path:str, rev:str, net:str)
+  pure resolve_duck_link(url:str, connected_chain_id:str) -> DuckLink
+  pure foreign_network_error(link_net:str, connected_chain_id:str) -> str
+  pure duck_page_link(page:str, chain_id:str) -> str
+  pure duck_channel_link(channel:str, chain_id:str) -> str
+  pure duck_channel_message_link(channel:str, seq:i64, chain_id:str) -> str
+  pure duck_forge_item_link(repo:str, number:i64, chain_id:str) -> str
+  pure duck_forge_repo_link(repo:str, chain_id:str) -> str
+  pure startup_duck_url() -> str
   pure forge_focus_kind(number:i64, path:str) -> ForgeFocus
   pure linked_note(discussion:[ChatMessage], focus:i64) -> ChatMessage?
   duck_echo_str(value:str) -> str ! AppError

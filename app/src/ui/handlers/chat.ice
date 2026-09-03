@@ -870,19 +870,26 @@ on begin_message_edit(seq, body, rev)
 // A LINK PRESS IS A HAND-OFF TO THE OS, and nothing else: no selection, no
 // draft, no rail. Same route the page renderer's link press takes
 // (`handlers/pages.ice`), and it shares that handler's two result arms.
-// THE duck:// OPEN PLANE. A clicked link is classified ONCE — `classify_duck_link`
-// is the protocol's module table — and each kind maps onto navigation the
-// app ALREADY has: the handler a click on the screen itself would reach,
-// handed the link's field through an echo lane (the one way a handler reaches
-// another). A target that needs two steps (a repo, THEN its item or file; a
-// directory, THEN its file) parks a one-shot focus that `forge_repo_loaded` /
-// `fs_listed` consume. The protocol adds addresses, never navigation.
+// THE duck:// OPEN PLANE. A clicked link goes through `resolve_duck_link`
+// ONCE — the protocol's module table plus the network scope its grammar
+// cannot check alone — and each kind maps onto navigation the app ALREADY
+// has: the handler a click on the screen itself would reach, handed the
+// link's field through an echo lane (the one way a handler reaches another).
+// A target that needs two steps (a repo, THEN its item or file; a directory,
+// THEN its file) parks a one-shot focus that `forge_repo_loaded` / `fs_listed`
+// consume. The protocol adds addresses, never navigation.
+// A LINK NAMES ITS NETWORK: one whose `?net=` digest is another network's
+// addresses a store this app is not connected to, so it opens nothing and
+// says which network it belongs to. A link with no `?net=` is the hand-typed
+// case and resolves against the connected network as written.
 on open_message_link(url)
   return if empty(url)
-  let link = classify_duck_link(url)
+  let link = resolve_duck_link(url, network_chain_id)
   match link.kind
     DuckKind.unknown
       error = "this link names nothing the app can open"
+    DuckKind.foreign_network
+      error = foreign_network_error(link.net, network_chain_id)
     DuckKind.web
       run every open_external_url(url) -> external_url_opened _ | external_url_failed _
     DuckKind.page
