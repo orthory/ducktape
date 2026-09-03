@@ -148,6 +148,37 @@ async fn replica_roles(
     }
 }
 
+/// Point the reachability plane at `epoch` with the role this node holds in
+/// (`participants`, `residents`), so its restore/assembly can run. The
+/// freshness clock is the caller's `clock` (the app-height regime the
+/// members' `ViewTick`s run).
+///
+/// NON-BLOCKING by contract — the plane is never a caller's dependency:
+/// `false` says the plane's queue refused the command, and the caller must
+/// leave its epoch latch unadvanced so a later poll re-offers it.
+fn retarget_reach_plane(
+    cmd: &tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>,
+    epoch: u64,
+    clock: u64,
+    participants: &[Vec<u8>],
+    residents: &[Vec<u8>],
+) -> bool {
+    let keys = |raw: &[Vec<u8>]| -> Vec<ed25519::PublicKey> {
+        raw.iter()
+            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+            .collect()
+    };
+    cmd.try_send(reachability::ReachabilityCommand::Retarget(
+        reachability::MeshEpochEvent {
+            epoch,
+            members: keys(participants),
+            standbys: keys(residents),
+            current_view: clock,
+        },
+    ))
+    .is_ok()
+}
+
 /// the activation cutover's coordinates, lifted OWNED off the orchestrator's
 /// respawn plan the moment the fold observes a plan that seats this key —
 /// the drain pass stashes these and the loop body seats the baton once the
@@ -709,6 +740,34 @@ pub(super) async fn park(
             root_hash = %hex(&root),
             "resident: pre-synced boundary {tip} root_hash={}", hex(&root)
         );
+        // #1104: the reachability plane's boot Retarget comes from the
+        // RECOVERED state, not the manifest poll — the poll needs the p2p
+        // mesh, the mesh dials through the tunnels restore() would bring
+        // up, and restore() runs only on the first Retarget; without this
+        // the restarted resident deadlocks in that cycle.
+        //
+        // It fires HERE, ahead of everything below it, because the index
+        // heal below AWAITS a per-module fetch over the very mesh this
+        // command resurrects. On a restarted resident the tunnels are down,
+        // so every one of those fetches burns its full timeout before the
+        // next module's — ordering the plane behind them parks the node in
+        // `joining`, tunnel-less and mesh-less, for the whole doomed sweep.
+        // Nothing in the retarget reads the index or the serve state.
+        //
+        // Same standing gate, freshness clock, and non-blocking discipline
+        // as the poll below: a shed Retarget is retried there (the epoch
+        // latch only advances when the send is taken).
+        if let Some(cmd) = &reach_cmd
+            && resident_standing
+        {
+            let clock = rec.view_base.max(tip);
+            let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
+            let targeted =
+                retarget_reach_plane(cmd, rec.epoch, clock, &rec.participants, &rec.residents);
+            if targeted {
+                last_plane_epoch = Some(rec.epoch);
+            }
+        }
         // THE LAST SEAM BEFORE THIS RESIDENT SERVES, and the only one a
         // restart passes through: the same helper the ascension runs, because
         // a restart over a WIPED index directory lands here holding nothing
@@ -741,43 +800,6 @@ pub(super) async fn park(
             height = tip,
             source = "recovery"
         );
-        // #1104: the reachability plane's boot Retarget comes from the
-        // RECOVERED state, not the manifest poll — the poll needs the p2p
-        // mesh, the mesh dials through the tunnels restore() would bring
-        // up, and restore() runs only on the first Retarget; without this
-        // the restarted resident deadlocks in that cycle. Same standing
-        // gate, freshness clock, and non-blocking discipline as the poll
-        // below: a shed Retarget is retried there (the epoch latch only
-        // advances when the send is taken).
-        if let Some(cmd) = &reach_cmd
-            && resident_standing
-        {
-            let clock = rec.view_base.max(tip);
-            let members: Vec<ed25519::PublicKey> = rec
-                .participants
-                .iter()
-                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                .collect();
-            let standbys: Vec<ed25519::PublicKey> = rec
-                .residents
-                .iter()
-                .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                .collect();
-            let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
-            if cmd
-                .try_send(reachability::ReachabilityCommand::Retarget(
-                    reachability::MeshEpochEvent {
-                        epoch: rec.epoch,
-                        members,
-                        standbys,
-                        current_view: clock,
-                    },
-                ))
-                .is_ok()
-            {
-                last_plane_epoch = Some(rec.epoch);
-            }
-        }
     }
     let not_serving = |standing: bool| -> String {
         if standing {
@@ -1949,30 +1971,11 @@ pub(super) async fn park(
             // below only advances when the send is taken.
             let clock = tip.view_base.max(tip.height);
             let _ = cmd.try_send(reachability::ReachabilityCommand::ViewTick(clock));
-            if last_plane_epoch != Some(tip.epoch) {
-                let members: Vec<ed25519::PublicKey> = tip
-                    .participants
-                    .iter()
-                    .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                    .collect();
-                let standbys: Vec<ed25519::PublicKey> = tip
-                    .residents
-                    .iter()
-                    .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                    .collect();
-                if cmd
-                    .try_send(reachability::ReachabilityCommand::Retarget(
-                        reachability::MeshEpochEvent {
-                            epoch: tip.epoch,
-                            members,
-                            standbys,
-                            current_view: clock,
-                        },
-                    ))
-                    .is_ok()
-                {
-                    last_plane_epoch = Some(tip.epoch);
-                }
+            let epoch_is_new_to_the_plane = last_plane_epoch != Some(tip.epoch);
+            if epoch_is_new_to_the_plane
+                && retarget_reach_plane(cmd, tip.epoch, clock, &tip.participants, &tip.residents)
+            {
+                last_plane_epoch = Some(tip.epoch);
             }
         }
         let member_in_tip = tip.participants.iter().any(|k| k == &me_bytes);
