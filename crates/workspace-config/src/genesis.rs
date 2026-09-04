@@ -314,6 +314,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: hex_bytes(&sha256(&bytes)),
             modules: genesis
                 .component_hashes()

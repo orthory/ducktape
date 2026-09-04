@@ -58,11 +58,12 @@ pub fn founding_set() -> &'static str {
     })
 }
 
-/// the beat every harness node runs at (node.toml `block_time_ms`). the suites
-/// wait on block counts — checkpoints, epochs, finalization — so their
-/// wall-clock scales 1:1 with it, and every simplex timer scales with it too:
-/// the number is a policy choice for the whole lane, not a tuning of any one
-/// wait.
+/// the beat every harness network is FOUNDED at (`node init --block-time-ms`,
+/// which lands in the descriptor); a joiner inherits it off the invite and has
+/// no flag of its own. the suites wait on block counts — checkpoints, epochs,
+/// finalization — so their wall-clock scales 1:1 with it, and every simplex
+/// timer scales with it too: the number is a policy choice for the whole lane,
+/// not a tuning of any one wait.
 pub const TEST_BLOCK_TIME_MS: u64 = 100;
 
 /// A cluster's storage root, named so an ABANDONED one can be found and swept.
@@ -733,8 +734,6 @@ impl NetworkShapeCluster {
                 // LIVE public coordinator from inside the test.
                 "--primary-coordinator",
                 "none",
-                "--block-time-ms",
-                &TEST_BLOCK_TIME_MS.to_string(),
             ])
             .output()
             .expect("run join")
@@ -1600,6 +1599,13 @@ impl Cluster {
                     self.all_log_tails(60)
                 )
             })
+    }
+
+    /// how many times node `idx` has printed `marker` so far — the ABSENCE
+    /// assertion `wait_marker` cannot express.
+    pub fn marker_count(&self, idx: usize, marker: &str) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.marker_count(marker)
     }
 
     /// wait until node `idx`'s COMPUTE DAEMON prints a line containing `marker`.
