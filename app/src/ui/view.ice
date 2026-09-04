@@ -513,23 +513,16 @@ view
               open_message_link -> open_message_link _
               copy_to_clipboard -> copy_to_clipboard _ _
         governance:
-          // The module's own view when it ships one (`governance.view.wasm`
-          // beside the binary), the app's screen otherwise.
-          col w=fill h=fill
-            match gov_view
-              some(view)
-                extern wasm_view(view, dark, gov_generation, gov_view_wake) #governance-view -> gov_view_event _
-              none
-                GovernanceScreen #governance
-                  with
-                    rows=gov_rows
-                    voting=gov_voting
-                    admin=members_is_admin(members_rows)
-                    connected
-                    answered=gov_answered
-                  events
-                    gov_vote -> gov_vote _ _
-                    gov_execute -> gov_execute _
+          GovernanceScreen #governance
+            with
+              rows=gov_rows
+              voting=gov_voting
+              admin=members_is_admin(members_rows)
+              connected
+              answered=gov_answered
+            events
+              gov_vote -> gov_vote _ _
+              gov_execute -> gov_execute _
         node:
           NodeScreen wall_now=wall_now node_log_filter<->node_log_filter #node
             with
