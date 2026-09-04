@@ -404,7 +404,6 @@ mod search;
 mod shell;
 mod storage;
 mod style;
-pub mod wasm_view;
 
 pub use agent::*;
 pub use bell::*;

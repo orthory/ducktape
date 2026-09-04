@@ -102,21 +102,6 @@ key-only, a failing fold holding its queue with backoff — is fluent31's own
 pins; read it before writing a mapper. A guest's `log` output is a `debug`
 event under `fluent31::wasm::guest` — turn that one target up to see it.
 
-## 2c. View (optional) — the module's screen, run as wasm in the app
-
-A module may ship its screen as `view.wasm` beside its `component.wasm`: an
-ordinary Ice application in a standalone workspace at
-`crates/guests/views/<id>` (build on `ui-lang-guest`, export with
-`export_app!`, ask the app through `host::request("query.<id>", json)` and the
-`host.theme` / `host.refresh` streams; `governance` is the template). `make
-wasm-views` builds every id in `VIEW_MODULES` and copies the artifact into the
-module dir; `crates/noded/build.rs` stages it beside the binaries as
-`<id>.view.wasm`, where `app/src/backend/wasm_view.rs` loads it. The app tests
-its view under the same host it runs in
-(`cargo test -p ducktape-app wasm_view`), and the guest's own frames natively
-(`cargo test` in the view's workspace). A view is the app's business: it is
-not hashed into the genesis descriptor and not admitted by the code plane.
-
 ## 3. Registration — `module register`, or (for genesis) the topology
 
 Post-genesis is the whole of this section for most modules: `ducktape module
