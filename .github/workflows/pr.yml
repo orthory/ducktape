@@ -4,7 +4,9 @@
 # things the dev loop already treats as load-bearing: the committed wasm
 # component bytes (`make wasm-modules-check`) and that no binary embeds any
 # of them (`make wasm-embed-check`), the genesis root-hash pin
-# (`host_state`), and clippy across the workspace.
+# (`host_state`), the simnode suites (`cargo test -p simnode` — the sim's own
+# genesis pin in `topology_set.rs` lives here, alongside every other simnode
+# scenario; #1433), and clippy across the workspace.
 name: pr
 
 on:
@@ -48,6 +50,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
       - run: cargo test --locked -p node-bin host_state
+
+  # A separate job (not folded into genesis-pin) so it runs in parallel
+  # rather than lengthening one job's critical path. `cargo test -p simnode`
+  # cranelift-compiles the sim's module set per boot with no sandbox,
+  # microVM, or outbound network — every simnode test binds loopback only —
+  # so the whole crate runs here, not a scoped subset. This is the job that
+  # was missing (#1433): `topology_set.rs`'s `DEFAULT_GENESIS_ROOT_HASH`
+  # pins the sim's own genesis composition and drifted unnoticed with no PR
+  # gate exercising it.
+  simnode-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup show
+      - run: cargo test --locked -p simnode
 
   clippy:
     runs-on: ubuntu-latest
