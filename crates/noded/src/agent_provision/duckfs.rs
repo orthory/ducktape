@@ -66,6 +66,15 @@ pub(super) async fn provision(
     .await
     .map_err(|_| "workspace checkout task panicked".to_string())?
     .map_err(|e| e.to_string())?;
+    // the rw checkout is materialized on disk NOW — the one host-observable
+    // fact an e2e otherwise has to poll for (the dir lives only seconds and
+    // is cleaned up before a filesystem sample could reliably catch it).
+    tracing::debug!(
+        target: "ducktape::agent",
+        kind = "rw",
+        path = %dir.display(),
+        "run dir materialized kind=rw path={}", dir.display()
+    );
     // W6 skill ro mounts land at a SUFFIXED SIBLING of the rw checkout
     // root (`<slug>-ro/<name>`): `commit` scans only under `dir`, so a
     // skill tree beside it can never leak into the output snapshot. the same
@@ -101,6 +110,14 @@ pub(super) async fn provision(
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
+        // the ro skill root is the sibling half of the same host-observable
+        // fact (see the rw marker above).
+        tracing::debug!(
+            target: "ducktape::agent",
+            kind = "ro",
+            path = %ro_root.display(),
+            "run dir materialized kind=ro path={}", ro_root.display()
+        );
         (Some(ro_root), Some(context_doc))
     };
     // the workspace EXISTS now, so ask consensus to bind the run's agent session

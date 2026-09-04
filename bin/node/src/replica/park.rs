@@ -1487,6 +1487,18 @@ pub(super) async fn park(
                 // channel/orderer concern.
                 let committed_window = read_valset_mesh_window(node_r.host()).await;
                 mesh_window.track_new(oracle, &mesh_book, &committed_window);
+                // one round of the resident's own re-track against
+                // commonware's p2p tracker, clocked by this drain pass
+                // rather than any block content: a re-track that regressed
+                // or duplicated an index would be warn-dropped by
+                // commonware right here, so counting these is the direct
+                // "N quiet rounds passed" signal
+                // (resident_peerset_stability_e2e's SETTLE).
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    "tracker round completed"
+                );
                 let members_raw = read_valset_members(node_r.host()).await;
                 let observed: Vec<ed25519::PublicKey> = members_raw
                     .iter()

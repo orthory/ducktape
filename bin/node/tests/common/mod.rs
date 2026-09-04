@@ -191,6 +191,25 @@ impl NodeProc {
         })
     }
 
+    /// block until `marker` has appeared at least `count` times in total.
+    ///
+    /// every offered slice is counted exactly once (the feed only ever
+    /// offers a line to a probe once — see `OutputFeed::wait`), so this
+    /// tallies markers across repeated wakes rather than re-scanning from
+    /// the top each time.
+    fn wait_marker_count(
+        &self,
+        marker: &str,
+        count: usize,
+        deadline: Instant,
+    ) -> Result<usize, Unanswered> {
+        let mut seen = 0usize;
+        self.feed.wait(deadline, |unseen| {
+            seen += unseen.lines().filter(|line| line.contains(marker)).count();
+            (seen >= count).then_some(seen)
+        })
+    }
+
     /// block until the process closes its output — it exited — then reap it.
     fn wait_exit(&mut self, deadline: Instant) -> Result<std::process::ExitStatus, Unanswered> {
         self.feed.wait_closed(deadline)?;
@@ -200,6 +219,14 @@ impl NodeProc {
     /// everything the process has written so far.
     fn text(&self) -> String {
         self.feed.text()
+    }
+
+    /// how many lines printed so far contain `marker`.
+    fn marker_count(&self, marker: &str) -> usize {
+        self.text()
+            .lines()
+            .filter(|line| line.contains(marker))
+            .count()
     }
 
     /// the last `lines` lines the process wrote.
@@ -928,6 +955,31 @@ impl NetworkShapeCluster {
             })
     }
 
+    /// how many times node `idx` has printed `marker` so far.
+    pub fn marker_count(&self, idx: usize, marker: &str) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.marker_count(marker)
+    }
+
+    /// wait until node `idx` has printed `marker` at least `count` times.
+    pub fn wait_marker_count(
+        &self,
+        idx: usize,
+        marker: &str,
+        count: usize,
+        timeout: Duration,
+    ) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.wait_marker_count(marker, count, Instant::now() + timeout)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "network-shape node idx {idx} {} before printing {marker:?} {count} times;\n{}",
+                    why.verb(),
+                    self.all_log_tails(60),
+                )
+            })
+    }
+
     /// wait until node `idx` has COMMITTED STANDING as a member. the join protocol has
     /// two legitimate admission paths and which one lands first is a race:
     /// direct first contact prints "standing is committed" (replica/wiring),
@@ -1537,6 +1589,29 @@ impl Cluster {
                     daemon.tail(60),
                 )
             })
+    }
+
+    /// every value that followed `marker` on a line of node `idx`'s COMPUTE
+    /// DAEMON output, in the order the daemon printed them.
+    ///
+    /// unlike `wait_compute_marker` (blocks for the FIRST match) this reads
+    /// what the continuously-drained feed already holds: a fact this quick to
+    /// fire and this transient on disk — a run dir materializes and is
+    /// cleaned up inside one run — can only be witnessed as an event stream,
+    /// never a filesystem sample that might land between the create and the
+    /// cleanup. See `portable_workspace_e2e`'s `materialized_dirs`.
+    pub fn compute_markers(&self, idx: usize, marker: &str) -> Vec<String> {
+        let daemon = self.daemons[idx]
+            .as_ref()
+            .expect("node has a compute daemon (set `compute_grant` before spawn)");
+        daemon
+            .text()
+            .lines()
+            .filter_map(|line| {
+                line.find(marker)
+                    .map(|at| line[at + marker.len()..].trim().to_string())
+            })
+            .collect()
     }
 
     /// Wait until `probe` answers, re-evaluating it on node `idx`'s heartbeat.
