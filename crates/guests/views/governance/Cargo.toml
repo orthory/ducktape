@@ -27,16 +27,16 @@ test = false
 [dependencies]
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "tiny-skia", "fira-sans"] }
 serde_json = "1"
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", default-features = false, features = ["full-runtime"] }
-ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764" }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839", default-features = false, features = ["full-runtime"] }
+ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839" }
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839" }
 
 [patch.crates-io]
-iced_tiny_skia = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764" }
-iced_winit = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764" }
+iced_tiny_skia = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839" }
+iced_winit = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839" }
 
 [workspace]
 

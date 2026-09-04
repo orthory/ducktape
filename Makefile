@@ -357,9 +357,17 @@ wasm-modules:
 ## Each view is a standalone workspace under crates/guests/views/<id>.
 VIEW_MODULES := governance
 
+# The same prefix remap guest-builder applies (`remap_flags`): a panic
+# location or a debug path names the builder's checkout, CARGO_HOME and
+# RUSTUP_HOME otherwise, and `wasm-modules-check` refuses an artifact that
+# carries a host path.
+VIEW_REMAP = --remap-path-prefix=$${CARGO_HOME:-$$HOME/.cargo}=/cargo \
+  --remap-path-prefix=$${RUSTUP_HOME:-$$HOME/.rustup}=/rustup \
+  --remap-path-prefix=$(CURDIR)=/ducktape
+
 wasm-views:
 	@for id in $(VIEW_MODULES); do \
-	  (cd crates/guests/views/$$id && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release) && \
+	  (cd crates/guests/views/$$id && RUSTFLAGS="$(VIEW_REMAP)" $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release) && \
 	  cp crates/guests/views/$$id/target/wasm32-unknown-unknown/release/$${id}_view.wasm \
 	    crates/modules/system/$$id/view.wasm || exit 1; \
 	done
