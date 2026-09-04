@@ -250,7 +250,6 @@ view
               choose_channel -> choose_channel _
               choose_dm -> choose_dm _
               toggle_channel_settings -> toggle_channel_settings
-              pop_huddle -> pop_huddle
               focus_huddle -> focus_huddle
               leave_huddle_here -> leave_huddle_here
               huddle_go_channel -> huddle_go_channel
@@ -621,58 +620,83 @@ view
               refresh_explorer -> refresh_explorer
               copy_to_clipboard -> copy_to_clipboard _ _
         huddle:
+          // THE COLUMN THE HUDDLE LIVES IN, and its width IS the no-overlap
+          // rule. `huddle_dock_width` is the one number: zero when there is no
+          // huddle or it is popped into its own window, a pill's width when
+          // the card is folded, 420 when it is open — and the module's content
+          // box takes whatever is left (`w=fill`, components/shell.ice).
+          // Nothing here floats over the module beside it, so no tab needs a
+          // bottom inset and no composer, Send button, editor bar or timeline
+          // row can be covered.
+          //
+          // A `fill(N)` PORTION was the first shape of this and it is the
+          // wrong one: a portion cell is allotted its share of the row whether
+          // or not anything is in it, so an app with no call anywhere paid a
+          // quarter of every module's width for an empty gutter. A width that
+          // can be ZERO is what makes the column disappear.
+          //
+          // THE HUDDLE, ON EVERY TAB AND EVERY CHANNEL. There is exactly one
+          // kind of term missing from the two conditions below and it is
+          // missing on purpose: nothing here reads WHERE you are. A call you
+          // are in does not stop being live because you opened Pages or
+          // clicked another room, and the media session under it never thought
+          // it did — it is subscribed on `huddle_joined`
+          // (handlers/lifecycle.ice) and nothing else. What used to happen
+          // instead — a pill on some screens, and nothing at all while the
+          // popped window sat behind the console — WAS the defect: the huddle
+          // was still running and the app had stopped saying so.
+          //
+          // Three states, two arms and a window: open here, folded to the pill
+          // below, or popped into its own OS window, where `huddle_popped`
+          // blanks both arms and the window draws the panel. That is also what
+          // keeps exactly ONE video surface alive at a time — see `HuddleDock`.
           box
             with
-              w=fill
+              w=huddle_dock_width(huddle_joined, huddle_popped, huddle_dock_collapsed)
               h=fill
-              align-x=end
               align-y=end
-              pr=16.0
-              pb=huddle_dock_inset(shell_tab)
-            col
-              // THE HUDDLE, ON EVERY TAB AND EVERY CHANNEL. There is exactly
-              // one kind of term missing from these two conditions and it is
-              // missing on purpose: nothing here reads WHERE you are. A call
-              // you are in does not stop being live because you opened Pages
-              // or clicked another room, and the media session under it never
-              // thought it did — it is subscribed on `huddle_joined`
-              // (handlers/lifecycle.ice) and nothing else. What used to happen
-              // instead — a pill on some screens, and nothing at all while the
-              // popped window sat behind the console — WAS the defect: the
-              // huddle was still running and the app had stopped saying so.
-              //
-              // Three states, two arms and a window: expanded here, folded to
-              // the pill below, or popped into its own OS window, where
-              // `huddle_popped` blanks both arms and the window draws the
-              // panel. That is also what keeps exactly ONE video surface alive
-              // at a time — see `HuddleDock`.
+            col w=fill
               if huddle_joined && !huddle_popped && !huddle_dock_collapsed
-                HuddleDock
+                box
                   with
-                    channel=huddle_channel_name
-                    elapsed=mmss(huddle_now - huddle_joined_at)
-                    rows=huddle_rows
-                    status=call_status
-                    muted=call_muted
-                    camera=call_camera
-                    sharing=call_sharing
-                    stage=huddle_stage
-                    video_live=call_video_live
-                  events
-                    collapse_huddle_dock -> collapse_huddle_dock
-                    pop_huddle -> pop_huddle
-                    huddle_go_channel -> huddle_go_channel
-                    leave_huddle_here -> leave_huddle_here
-                    toggle_call_mute -> toggle_call_mute
-                    toggle_call_camera -> toggle_call_camera
-                    toggle_call_screen -> toggle_call_screen
+                    w=fill
+                    pl=13.0
+                    pr=13.0
+                    pt=13.0
+                    pb=13.0
+                  HuddleDock
+                    with
+                      channel=huddle_channel_name
+                      elapsed=mmss(huddle_now - huddle_joined_at)
+                      rows=huddle_rows
+                      status=call_status
+                      muted=call_muted
+                      camera=call_camera
+                      sharing=call_sharing
+                      stage=huddle_stage
+                      video_live=call_video_live
+                    events
+                      collapse_huddle_dock -> collapse_huddle_dock
+                      pop_huddle -> pop_huddle
+                      huddle_go_channel -> huddle_go_channel
+                      leave_huddle_here -> leave_huddle_here
+                      toggle_call_mute -> toggle_call_mute
+                      toggle_call_camera -> toggle_call_camera
+                      toggle_call_screen -> toggle_call_screen
               if huddle_joined && !huddle_popped && huddle_dock_collapsed
-                HuddleDockedPill
+                box
                   with
-                    channel=huddle_channel_name
-                    elapsed=mmss(huddle_now - huddle_joined_at)
-                  events
-                    expand_huddle_dock -> expand_huddle_dock
+                    w=fill
+                    pl=13.0
+                    pr=13.0
+                    pt=13.0
+                    pb=13.0
+                  HuddleDockedPill
+                    with
+                      channel=huddle_channel_name
+                      elapsed=mmss(huddle_now - huddle_joined_at)
+                    events
+                      expand_huddle_dock -> expand_huddle_dock
         palette:
           OverlayLayer draft<->channel_draft query<->palette_draft #overlays
             with

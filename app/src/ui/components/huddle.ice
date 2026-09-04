@@ -28,14 +28,17 @@
 // duration is no duration: every `elapsed` here is empty-tolerant and the
 // surface falls back to the bare LIVE mark rather than a plausible 00:00.
 
-// THE CHANNEL-HEADER LIVE PILL — shown only in the channel whose huddle you are
-// in. The plate is the pop-out target; the ✕ beside it is its own button, which
-// is how iced spells the artifact's `stopPropagation` on a nested control.
-// NOTE: the frozen signature carries no roster, so the artifact's overlapping
-// 18px face stack inside this pill cannot be drawn here (see the report).
-component HuddleLivePill(name:str, elapsed:str, muted:bool, popped:bool)
+// THE CHANNEL-HEADER LIVE PILL — and it draws ONLY while the huddle is popped
+// out into its own window, which is the one state the in-window dock cannot
+// speak for. Everywhere else the dock IS the huddle, and a header pill beside
+// it was one call said twice on one screen.
+//
+// So the plate has one arm now: it RAISES the huddle window. It used to carry
+// a second, open-the-window arm; opening the huddle is the dock's popout
+// button. The ✕ beside it is its own button, which is how iced spells the
+// artifact's `stopPropagation` on a nested control.
+component HuddleLivePill(elapsed:str, muted:bool)
   emits
-    pop_huddle
     focus_huddle
     leave_huddle_here
   box #root
@@ -47,81 +50,41 @@ component HuddleLivePill(name:str, elapsed:str, muted:bool, popped:bool)
       pt=5.0
       pb=5.0
     row gap=8.0 align=center
-      // Two arms, one face: while the huddle window is up, the pill's click
-      // RAISES it instead of trying to open a second one (which a branch-free
-      // handler could only swallow as a no-op).
-      if !popped
-        button -> emit(pop_huddle)
-          with
-            label=name
-            @icon_action
-            @px-0px
-            @py-0px
-          row gap=8.0 align=center
-            PulseDot plate=6.0 tone="success"
-            text "LIVE"
+      button -> emit(focus_huddle)
+        with
+          label="Focus the huddle window"
+          @icon_action
+          @px-0px
+          @py-0px
+        row gap=8.0 align=center
+          PulseDot plate=6.0 tone="success"
+          text "LIVE"
+            with
+              size=10.5
+              wrap=none
+              font=code_medium
+              @text-toast_fg
+          if !empty(elapsed)
+            text elapsed
               with
                 size=10.5
                 wrap=none
                 font=code_medium
                 @text-toast_fg
-            if !empty(elapsed)
-              text elapsed
-                with
-                  size=10.5
-                  wrap=none
-                  font=code_medium
-                  @text-toast_fg
-            if muted
-              Icon
-                with
-                  name="mic-off"
-                  tone="caption"
-                  px=11.0
+          if muted
             Icon
               with
-                name="popout"
+                name="mic-off"
                 tone="caption"
                 px=11.0
-          active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
-          hovered bg=ink_hover text=toast_fg
-          pressed bg=ink_hover text=toast_fg
-      if popped
-        button -> emit(focus_huddle)
-          with
-            label="Focus the huddle window"
-            @icon_action
-            @px-0px
-            @py-0px
-          row gap=8.0 align=center
-            PulseDot plate=6.0 tone="success"
-            text "LIVE"
-              with
-                size=10.5
-                wrap=none
-                font=code_medium
-                @text-toast_fg
-            if !empty(elapsed)
-              text elapsed
-                with
-                  size=10.5
-                  wrap=none
-                  font=code_medium
-                  @text-toast_fg
-            if muted
-              Icon
-                with
-                  name="mic-off"
-                  tone="caption"
-                  px=11.0
-            Icon
-              with
-                name="popout"
-                tone="caption"
-                px=11.0
-          active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
-          hovered bg=ink_hover text=toast_fg
-          pressed bg=ink_hover text=toast_fg
+          Icon
+            with
+              name="popout"
+              tone="caption"
+              px=11.0
+        active bg=transparent text=toast_fg border=transparent border-w=1.0 r=6.0
+        hovered bg=ink_hover text=toast_fg
+        pressed bg=ink_hover text=toast_fg
       box
         with
           w=1.0
@@ -761,9 +724,14 @@ component HuddleDock(channel:str, elapsed:str, rows:[HuddleTileRow], status:str,
     toggle_call_mute
     toggle_call_camera
     toggle_call_screen
+  // NO FIXED WIDTH AND NO `max-w` OF ITS OWN. The card is exactly as wide as
+  // the column view.ice gives it, and that column is a portion of the window —
+  // the clamp lives there, once, beside the rule that closes the column. A
+  // width here would be a second owner of the same number, and it is why a
+  // joined huddle used to sit in a 312px card on a 2560px screen.
   box #root
     with
-      w=312.0
+      w=fill
       bg=surface
       border=border
       border-w=1.0
@@ -868,7 +836,10 @@ component HuddleDock(channel:str, elapsed:str, rows:[HuddleTileRow], status:str,
               wrap=none
               font=code_medium
               @text-caption
-      box w=fill max-h=268.0
+      // 248 plus the two chrome bands is ~342 — under 45% of the window the
+      // console ships at — and it SCROLLS rather than growing: a ten-person
+      // roster lengthens the strip inside the card, never the card.
+      box w=fill max-h=248.0
         scroll
           with
             dir=vertical
@@ -903,39 +874,3 @@ component HuddleDock(channel:str, elapsed:str, rows:[HuddleTileRow], status:str,
           toggle_call_screen
           huddle_go_channel
           leave_huddle_here
-
-// "A CALL IS LIVE, BUT NOT HERE" — the channel-header affordance for the huddle
-// running in another channel. Clicking jumps to it; the pulse dot is the same
-// live mark the sidebar row wears.
-component HuddleElsewhere(name:str)
-  emits
-    huddle_go_channel
-  button #root -> emit(huddle_go_channel)
-    with
-      label="Open the channel the huddle is in"
-      @icon_action
-      @px-11px
-      @py-5px
-    row gap=7.0 align=center
-      PulseDot plate=6.0 tone="success"
-      text "#"
-        with
-          size=12.0
-          wrap=none
-          font=display
-          @text-hint
-      text name
-        with
-          size=12.0
-          wrap=none
-          font=display
-          @text-accent_fg
-      text "· call in progress"
-        with
-          size=12.0
-          wrap=none
-          font=display
-          @text-caption
-    active bg=surface text=accent_fg border=control_line border-w=1.0 r=9.0
-    hovered bg=muted_bg text=accent_fg border=control_line_hover
-    pressed bg=subtle text=accent_fg

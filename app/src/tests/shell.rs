@@ -626,6 +626,27 @@ fn joining_a_huddle_lands_in_the_in_window_dock() {
         ack.contains("huddle_dock_collapsed = false"),
         "a join is a huddle to look at, whatever the last one was folded to"
     );
+    // AND THE ACK LANDS THE JOINED STATE ITSELF. `huddle_joined` has no other
+    // writer on the way in: it is answered off a chat load's roster, and the
+    // load that answered it used to be the popped window's. With no window,
+    // an ack that only cleared the mutation left the write committed, the
+    // chain roster listing her, and the app showing the start button with no
+    // media session — `call_session` is gated on this very flag.
+    for landed in [
+        "huddle_joined = true",
+        "huddle_channel = active_channel",
+        "huddle_channel_name = active_channel_name",
+        "huddle_joined_at = huddle_now",
+    ] {
+        assert!(ack.contains(landed), "the join ack lands {landed}");
+    }
+    assert!(
+        ack.contains(
+            "run replace lane=chat_load load_channel_window(connected_rpc, active_channel, \
+             chat_generation) -> chat_updated"
+        ),
+        "and asks that channel for the roster the tiles and the reconciler need"
+    );
     let huddle = inlined(include_str!("../ui/handlers/huddle.ice"));
     let popped = huddle
         .split_once("on pop_huddle")
@@ -739,6 +760,136 @@ fn the_huddle_dock_rides_every_tab_and_keeps_one_video_surface() {
         mounting,
         ["HuddleDock", "HuddlePanel"],
         "a third video surface is a third repaint clock on one call"
+    );
+}
+
+/// THE HUDDLE RESERVES SPACE; IT DOES NOT FLOAT OVER THE MODULE.
+///
+/// A card in the corner of the window covers whatever the module put at that
+/// corner — the chat composer's Send, the Pages editor's own bottom bar, the
+/// last rows of every timeline — and no single inset clears all of them on
+/// every tab. So the huddle is a CELL IN THE CONTENT ROW: it sits beside the
+/// module, the module's content box gets `fill(5)` against its `fill(2)`, and
+/// overlap is impossible by construction rather than by arithmetic.
+///
+/// This walks the three sources that have to agree on that: shell.ice mounts
+/// the slot in the row, view.ice fills it with a portion-width column whose
+/// clamp is `huddle_dock_width`, and the card itself carries no width at all.
+#[test]
+fn the_huddle_reserves_a_column_instead_of_floating_over_the_module() {
+    let shell = include_str!("../ui/components/shell.ice");
+    let row = shell
+        .split_once("        row w=fill h=fill\n")
+        .expect("the rail/content row")
+        .1;
+    let row = row.split_once("\n      slot ").map_or(row, |split| split.0);
+    assert!(
+        row.contains("          slot huddle"),
+        "the huddle is a cell in the content row, not a layer over the window"
+    );
+    assert!(
+        row.contains("              w=fill\n"),
+        "the module's content box takes whatever the huddle column leaves"
+    );
+    // And it is NOT in the window-level stack any more: `palette` and `bell`
+    // are the layers that legitimately float, and the huddle left them.
+    let layers = shell
+        .rsplit_once("\n      slot palette")
+        .expect("the floating layers")
+        .1;
+    assert!(
+        !layers.contains("slot huddle"),
+        "a floating huddle is the overlap this test exists to prevent"
+    );
+
+    let view = inlined(include_str!("../ui/view.ice"));
+    let slot = view
+        .split_once("\n        huddle:\n")
+        .expect("the huddle slot")
+        .1;
+    let slot = slot
+        .split_once("\n        palette:\n")
+        .map_or(slot, |split| split.0);
+    let column = slot
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("box "))
+        .unwrap_or_default();
+    assert_eq!(
+        column,
+        "box w=huddle_dock_width(huddle_joined, huddle_popped, huddle_dock_collapsed) h=fill align-y=end",
+        "one number owns the column's width, and zero is what removes it"
+    );
+    // NO INSET ANYWHERE. A `pb=` big enough to clear a composer is the shape
+    // of the floating dock this replaced, and it belongs to no tab now.
+    assert!(
+        !slot.contains("huddle_dock_inset"),
+        "reserving space is the fix; an inset is the workaround it replaced"
+    );
+
+    // THE CARD CARRIES NO WIDTH. Its width is the column's, so a `max-w` or a
+    // fixed `w=` on any of the huddle's own surfaces is a second owner of the
+    // number — and the reason a joined huddle used to sit in a 312px card on a
+    // 2560px screen.
+    let components = inlined(include_str!("../ui/components/huddle.ice"));
+    let mut component = "";
+    for line in components.lines() {
+        if let Some(rest) = line.strip_prefix("component ") {
+            component = rest.split('(').next().unwrap_or(rest);
+        }
+        let reflows =
+            ["HuddleDock", "HuddlePanel", "HuddleTile", "HuddleControls"].contains(&component);
+        assert!(
+            !(reflows && line.contains("max-w=")),
+            "{component} must reflow with the window it is given: {line:?}"
+        );
+    }
+    let dock = components
+        .split_once("component HuddleDock(")
+        .expect("the dock")
+        .1;
+    assert!(
+        dock.contains("box #root w=fill bg=surface"),
+        "the dock is as wide as the column hands it and no wider"
+    );
+}
+
+/// ONE HUDDLE SURFACE AT A TIME.
+///
+/// The chat header used to carry two of its own — a LIVE pill in the huddle's
+/// room and a "call in progress" chip in every other one — beside a dock that
+/// says both things on every screen, with faces, a clock and a way in. Both
+/// are gone. What is left in the header is the one state the dock cannot
+/// speak for: a huddle popped out into its own OS window, where the pill is
+/// how you raise it.
+#[test]
+fn the_chat_header_carries_no_second_huddle_surface() {
+    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    assert!(
+        !screen.contains("HuddleElsewhere"),
+        "the dock names the huddle's room on every screen — the header chip          was the same sentence twice"
+    );
+    let at = screen
+        .find("HuddleLivePill")
+        .expect("the header's live pill");
+    let pill = screen[..at]
+        .lines()
+        .rev()
+        .find(|line| line.trim().starts_with("if "))
+        .map(str::trim)
+        .expect("its guard");
+    assert_eq!(
+        pill, "if huddle_joined && huddle_channel == active_channel && huddle_popped",
+        "the header pill draws only while the dock cannot: the huddle is in its own window"
+    );
+    let components = inlined(include_str!("../ui/components/huddle.ice"));
+    assert!(
+        !components.contains("component HuddleElsewhere"),
+        "deleted, not deprecated"
+    );
+    assert!(
+        !components.contains("component HuddleLivePill(name:str"),
+        "the pill names no channel now: the header it sits in already says which room this is"
     );
 }
 
@@ -2205,5 +2356,51 @@ fn the_account_card_gates_founding_and_the_last_key() {
     assert!(
         gate_line.contains("account_keys <= 1"),
         "the last key is never offered for removal: {gate_line}"
+    );
+}
+
+/// THE COLUMN'S THREE WIDTHS, and the band the open one has to land in.
+///
+/// `max-w` is the whole space rule for the huddle column: view.ice's two arms
+/// decide what is DRAWN, and this decides whether the cell takes any of the
+/// row at all. A non-zero answer with nothing to draw is a dead gutter beside
+/// every module; a pill-sized answer is what gives the room back when the card
+/// is folded, which a 28% column holding one pill would not.
+#[test]
+fn the_huddle_column_closes_folds_and_opens() {
+    use crate::backend::huddle_dock_width;
+
+    let closed = [
+        ("no huddle", huddle_dock_width(false, false, false)),
+        ("no huddle, folded", huddle_dock_width(false, false, true)),
+        ("popped out", huddle_dock_width(true, true, false)),
+        ("popped out, folded", huddle_dock_width(true, true, true)),
+    ];
+    for (state, width) in closed {
+        assert_eq!(width, 0.0, "{state}: the module gets the whole row back");
+    }
+
+    let folded = huddle_dock_width(true, false, true);
+    let open = huddle_dock_width(true, false, false);
+    assert!(
+        folded > 0.0 && folded < open,
+        "folded is a pill's width, not a column's: {folded} vs {open}"
+    );
+    assert_eq!(open, 420.0, "the upper end of the specified 280-420 band");
+
+    // AND THE LOWER END IS ARITHMETIC. The column takes `fill(2)` of what the
+    // nav rail leaves, against the content box's `fill(5)`, so the narrowest
+    // it is ever asked to be is set by the console's own minimum width — which
+    // is pinned here, because that is the number the band rests on.
+    let app = include_str!("../ui/app.ice");
+    assert!(
+        app.contains("min-size 1040 540"),
+        "the console's minimum is what puts a floor under the column's portion"
+    );
+    const RAIL_AND_ITS_RULE: f64 = 75.0;
+    let narrowest = (1040.0 - RAIL_AND_ITS_RULE) * 2.0 / 7.0;
+    assert!(
+        narrowest > 260.0 && narrowest < open,
+        "the smallest console still hands the huddle a usable column: {narrowest}"
     );
 }

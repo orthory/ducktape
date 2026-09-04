@@ -409,12 +409,34 @@ on join_huddle_submit
 // huddle looked like it had disappeared on the first channel or module
 // switch. Popping out is still here and is now what it always should have
 // been: an explicit click on the dock's own popout button (`pop_huddle`).
+//
+// AND THE ACK IS WHAT LANDS THE JOINED STATE, because nothing else was doing
+// it. `huddle_joined` has no local writer on the way IN — it is answered by
+// `huddle_after_load` off a chat load's roster — and the load that used to
+// answer it was the popped window's own read of the huddle channel. Take the
+// window away and the write committed, the chain roster listed you, and the
+// app sat there with the "Huddle" start button still up and no media session,
+// until some unrelated refresh of that room happened by. So: stamp the huddle
+// here, then ask that channel for its roster. `huddle_after_load` stays the
+// RECONCILER — it is what takes the huddle away again if the roster does not
+// have you on it — and it keeps the stamp below, because it reads the
+// `huddle_joined` this handler has already set.
 on huddle_joined_ack(_result)
   mutation_phase = MutationPhase.idle
   error = ""
   // A join is a huddle to look at. Whatever the last one was folded to, this
   // one draws itself.
   huddle_dock_collapsed = false
+  huddle_joined = true
+  huddle_channel = active_channel
+  huddle_channel_name = active_channel_name
+  // The clock starts where THIS process saw the join land — see the header of
+  // handlers/huddle.ice for why it is never the roster row's `joined_at`.
+  huddle_joined_at = huddle_now
+  // The roster the tiles are drawn from, and the reconciler's own input. Same
+  // one-root-window read `choose_channel` issues, on the same lane.
+  chat_generation = chat_generation + 1
+  run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
 // HUDDLE'S channel rather than the one on screen — the same button serves the

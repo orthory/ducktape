@@ -232,7 +232,7 @@ extern crate::backend
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   pure size_label(bytes:i64) -> str
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
-  pure huddle_dock_inset(tab:ShellTab) -> f64
+  pure huddle_dock_width(joined:bool, popped:bool, collapsed:bool) -> f64
   pure open_proposals(rows:&[ProposalRow]) -> i64
   pure plural(count:i64, one:&str, many:&str) -> str
   pure members_summary(connected:bool, rows:&[MemberRow]) -> str

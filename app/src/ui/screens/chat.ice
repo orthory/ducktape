@@ -159,7 +159,6 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
     choose_channel(str)
     choose_dm(str)
     toggle_channel_settings()
-    pop_huddle()
     focus_huddle()
     leave_huddle_here()
     huddle_go_channel()
@@ -539,23 +538,21 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                     Badge.Outline label="Archived"
                   if active_channel_members_only
                     Badge.Outline label="Members only"
-                  // The huddle control, in its three mutually exclusive
-                  // states — in it here, in it elsewhere, in none.
-                  if huddle_joined && huddle_channel == active_channel
+                  // THE HUDDLE CONTROL, and it is now TWO states, not three:
+                  // start one, or raise the window a running one was popped
+                  // into. The two that are gone — the live pill in the
+                  // huddle's own room, and the "call in progress elsewhere"
+                  // chip in every other room — were both saying what the dock
+                  // beside this header says on every screen, with faces, a
+                  // clock and a way in. One huddle surface at a time.
+                  if huddle_joined && huddle_channel == active_channel && huddle_popped
                     HuddleLivePill
                       with
-                        name=active_channel_name
                         elapsed=mmss(huddle_now - huddle_joined_at)
                         muted=call_muted
-                        popped=huddle_popped
                       forward
-                        pop_huddle
                         focus_huddle
                         leave_huddle_here
-                  if huddle_joined && huddle_channel != active_channel
-                    HuddleElsewhere name=huddle_channel_name
-                      forward
-                        huddle_go_channel
                   if !huddle_joined && !active_channel_archived
                     HuddleStart
                       forward

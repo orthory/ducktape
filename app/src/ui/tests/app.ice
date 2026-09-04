@@ -1213,7 +1213,6 @@ test message_stream_reset_contract
         choose_channel -> choose_channel _
         choose_dm -> choose_dm _
         toggle_channel_settings -> toggle_channel_settings
-        pop_huddle -> pop_huddle
         focus_huddle -> focus_huddle
         leave_huddle_here -> leave_huddle_here
         huddle_go_channel -> huddle_go_channel
@@ -1350,7 +1349,6 @@ test message_body_renders_as_one_rich_paragraph
         choose_channel -> choose_channel _
         choose_dm -> choose_dm _
         toggle_channel_settings -> toggle_channel_settings
-        pop_huddle -> pop_huddle
         focus_huddle -> focus_huddle
         leave_huddle_here -> leave_huddle_here
         huddle_go_channel -> huddle_go_channel
@@ -1621,38 +1619,264 @@ test the_huddle_controls_survive_the_narrowest_panel
   expect share.width ~= 32.0
   capture huddle_sharing_light
 
-// THE SAME CALL, IN THE CONSOLE WINDOW. The dock is what a join lands in now,
-// so it is drawn over whatever module you are on — and the thing that goes
-// wrong with a floating card is the control that falls off its right edge.
-// The card is a fixed 312 (it floats over a room that has to stay readable
-// under it), which is NARROWER than the popped panel's own minimum, so the
-// control band it shares with the panel is checked here at that width too.
-test the_huddle_dock_keeps_leave_inside_its_card
+// THE SAME CALL, IN THE CONSOLE WINDOW — and the card REFLOWS. The dock is a
+// column beside the module (components/shell.ice), sized as a portion of the
+// window and clamped by `huddle_dock_width`, so the card itself carries no
+// width of its own at all: it is as wide as it is given, at both ends of the
+// [280, 420] band the column is clamped to. A `max-w` or a fixed width on the
+// card is what made a joined huddle sit in a 312px box on a 2560px screen, and
+// this is the test that fails if one comes back.
+//
+// The other half is reachability at the narrow end: the control band is shared
+// with the popped panel, and `Leave` must stay inside the card at 280 exactly
+// as it must at the panel's own 320 minimum.
+test the_huddle_dock_reflows_and_keeps_leave_inside_its_card
   preset ui_huddle_sharing
-  viewport 900 640
+  viewport 420 700
   mount
-    HuddleDock #dock
-      with
-        channel=huddle_channel_name
-        elapsed="01:20"
-        rows=huddle_rows
-        status=call_status
-        muted=call_muted
-        camera=call_camera
-        sharing=call_sharing
-        stage=huddle_stage
-        video_live=call_video_live
-      events
-        collapse_huddle_dock -> collapse_huddle_dock
-        pop_huddle -> pop_huddle
-        huddle_go_channel -> huddle_go_channel
-        leave_huddle_here -> leave_huddle_here
-        toggle_call_mute -> toggle_call_mute
-        toggle_call_camera -> toggle_call_camera
-        toggle_call_screen -> toggle_call_screen
+    box w=fill
+      HuddleDock #dock
+        with
+          channel=huddle_channel_name
+          elapsed="01:20"
+          rows=huddle_rows
+          status=call_status
+          muted=call_muted
+          camera=call_camera
+          sharing=call_sharing
+          stage=huddle_stage
+          video_live=call_video_live
+        events
+          collapse_huddle_dock -> collapse_huddle_dock
+          pop_huddle -> pop_huddle
+          huddle_go_channel -> huddle_go_channel
+          leave_huddle_here -> leave_huddle_here
+          toggle_call_mute -> toggle_call_mute
+          toggle_call_camera -> toggle_call_camera
+          toggle_call_screen -> toggle_call_screen
   target card = #dock/root
   target share = #dock/root/controls/root/share-stop
   target leave = #dock/root/controls/root/leave
-  expect card.width ~= 312.0
+  expect call_sharing
+  // THE WIDE END of the band the column clamps to.
+  expect card.width ~= 420.0
   expect leave.x + leave.width <= card.x + card.width
   expect share.width ~= 32.0
+  // AND THE NARROW END. Same card, no second layout rule.
+  window resize 280 700
+  expect card.width ~= 280.0
+  expect leave.x + leave.width <= card.x + card.width
+  expect share.width ~= 32.0
+  // The card is content-driven and capped, never the height of the window it
+  // is dropped into: 700px of column, and the huddle takes what it needs.
+  expect card.height < 420.0
+
+// A ROOM WITH NO HUDDLE IN IT, and a console to join one from.
+preset ui_huddle_join
+  state
+    connected = false
+    loading = false
+    mutation_phase = MutationPhase.idle
+    error = ""
+    shell_tab = ShellTab.chat
+    active_channel = "chan-eng"
+    active_channel_name = "eng"
+    huddle_joined = false
+    huddle_dock_collapsed = false
+    huddle_now = 90
+
+// THE WHOLE REGRESSION, DRIVEN THROUGH THE REDUCERS: join from the room's own
+// header control, then walk away from the room and out of the module, and the
+// huddle is still on screen at every step.
+//
+// TWO FAILURES THIS PINS, both of them real and both of them found in the
+// running app:
+//
+// 1. THE JOIN THAT LANDED NOWHERE. `huddle_joined` has no writer on the way in
+//    other than a chat load's roster, and the load that used to answer it was
+//    the popped window's. With the window gone, the write committed, the chain
+//    roster listed her — and the app kept showing the `Huddle` start button
+//    with no media session, because `call_session` is gated on this flag. So
+//    the ack is dispatched here and `huddle_joined` is expected immediately.
+// 2. THE HUDDLE THAT DISAPPEARED. A channel switch and a module switch each
+//    used to take the huddle off the screen. Neither does anything to it here.
+//
+// THE HUDDLE SLOT'S MARKUP IS COPIED FROM view.ice on purpose — a mount test
+// fills its own slots, so this drives the ARMS as authored while the source
+// lint `the_huddle_dock_rides_every_tab_and_keeps_one_video_surface` is what
+// holds view.ice to the same two conditions. That lint is also where the
+// popped case lives: `!huddle_popped` is a window id, which this DSL cannot
+// mint.
+test the_huddle_dock_survives_a_channel_and_a_module_switch
+  preset ui_huddle_join
+  viewport 1280 800
+  mount
+    WorkspaceTabs wall_now=wall_now #console
+      with
+        network="testnet"
+        status
+        height=84912
+        sync_line=sync_label(node_phase, node_sync_applied, node_sync_target)
+        loading
+        degraded=false
+        tab=shell_tab
+        bell_count=0
+        bell_sev="info"
+        approvals=0
+        account=""
+        agent_live=false
+        tier="validator"
+        answered=true
+        root_hash=""
+        consensus_view="—"
+        quorum="—"
+        reachable="—"
+        last_finalized=0
+      events
+        select_shell_tab -> select_shell_tab _
+        toggle_bell -> toggle_bell
+        switch_network -> switch_network
+
+      chat:
+        space w=1.0 h=1.0
+      huddle:
+        box
+          with
+            w=huddle_dock_width(huddle_joined, huddle_popped, huddle_dock_collapsed)
+            h=fill
+            align-y=end
+          col w=fill
+            if huddle_joined && !huddle_popped && !huddle_dock_collapsed
+              box
+                with
+                  w=fill
+                  pl=13.0
+                  pr=13.0
+                  pt=13.0
+                  pb=13.0
+                HuddleDock #dock
+                  with
+                    channel=huddle_channel_name
+                    elapsed=mmss(huddle_now - huddle_joined_at)
+                    rows=huddle_rows
+                    status=call_status
+                    muted=call_muted
+                    camera=call_camera
+                    sharing=call_sharing
+                    stage=huddle_stage
+                    video_live=call_video_live
+                  events
+                    collapse_huddle_dock -> collapse_huddle_dock
+                    pop_huddle -> pop_huddle
+                    huddle_go_channel -> huddle_go_channel
+                    leave_huddle_here -> leave_huddle_here
+                    toggle_call_mute -> toggle_call_mute
+                    toggle_call_camera -> toggle_call_camera
+                    toggle_call_screen -> toggle_call_screen
+            if huddle_joined && !huddle_popped && huddle_dock_collapsed
+              box
+                with
+                  w=fill
+                  pl=13.0
+                  pr=13.0
+                  pt=13.0
+                  pb=13.0
+                HuddleDockedPill #pill
+                  with
+                    channel=huddle_channel_name
+                    elapsed=mmss(huddle_now - huddle_joined_at)
+                  events
+                    expand_huddle_dock -> expand_huddle_dock
+      notice:
+        space w=1.0 h=1.0
+      shell:
+        space w=1.0 h=1.0
+      pages:
+        space w=1.0 h=1.0
+      files:
+        space w=1.0 h=1.0
+      members:
+        space w=1.0 h=1.0
+      agents:
+        space w=1.0 h=1.0
+      forge:
+        space w=1.0 h=1.0
+      governance:
+        space w=1.0 h=1.0
+      node:
+        space w=1.0 h=1.0
+      settings:
+        space w=1.0 h=1.0
+      explorer:
+        space w=1.0 h=1.0
+      palette:
+        space w=1.0 h=1.0
+      bell:
+        space w=1.0 h=1.0
+  target content = #console/content
+  target dock = #console/dock/root
+  target leave = #console/dock/root/controls/root/leave
+  target pill = #console/pill/root
+  // Not in one yet: nothing is docked and the module has the whole row.
+  // 1280 - 74 rail - 1 rule = 1205.
+  expect missing dock
+  expect missing pill
+  expect content.width ~= 1205.0
+  // THE ROOM'S OWN `Huddle` BUTTON, as the handler it reaches: the chat
+  // header's `HuddleStart` emits exactly this and carries no state of its own
+  // (screens/chat.ice). It is dispatched rather than clicked because a mount
+  // test fills its own slots and this one does not build the chat screen.
+  //
+  // The write goes out and does NOT put her in a huddle by itself — nothing
+  // local answers `huddle_joined` on the way in — and that is exactly the hole
+  // the ack below has to fill. (Under this mount the write itself fails: there
+  // is no node behind it. The ack is the statement under test either way.)
+  dispatch join_huddle_submit
+  expect !huddle_joined
+  expect missing dock
+  // THE ACK, and it is the whole of failure 1: this is all the app hears back
+  // from the chain write, and it has to be enough to put her in the huddle.
+  dispatch huddle_joined_ack(true)
+  expect huddle_joined
+  expect huddle_channel == "chan-eng"
+  expect huddle_channel_name == "eng"
+  expect huddle_joined_at == 90
+  expect mutation_phase == MutationPhase.idle
+  expect exists dock
+  expect exists leave
+  expect text "eng" within dock
+  // AND THE ROOM MADE ROOM. This is the no-overlap rule as a number: the
+  // module's content box is 420 narrower than it was, which is the width the
+  // huddle column took — not a card drawn on top of a box that never moved.
+  expect content.width ~= 785.0
+  // ANOTHER ROOM. The huddle is not this room's, and never was.
+  // (The room this lands on is the harness's, not `"chan-ops"`: a mount test
+  // answers `load_channel_window` with a synthetic reply and `chat_updated`
+  // takes the arriving room's id from it. What matters is that the reader has
+  // LEFT the huddle's room, and that the huddle did not go with her.)
+  dispatch choose_channel("chan-ops")
+  expect active_channel != "chan-eng"
+  expect huddle_channel == "chan-eng"
+  expect exists dock
+  expect text "eng" within dock
+  // ANOTHER MODULE. Pages draws nothing about the huddle; the dock is not
+  // Pages' to draw.
+  dispatch select_shell_tab(ShellTab.pages)
+  expect shell_tab == ShellTab.pages
+  expect exists dock
+  expect exists leave
+  // FOLDED, AND GIVEN BACK. Neither touches the call: `huddle_joined` holds
+  // across both.
+  dispatch collapse_huddle_dock
+  expect huddle_joined
+  expect missing dock
+  expect exists pill
+  // Folding gives most of the column back — a pill's width is all it keeps —
+  // and the pill is IN that column, so it cannot sit over a Send button.
+  expect content.width ~= 1015.0
+  expect pill.x >= content.x + content.width
+  dispatch expand_huddle_dock
+  expect exists dock
+  expect missing pill
+  expect content.width ~= 785.0
+  expect dock.x >= content.x + content.width

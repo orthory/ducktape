@@ -827,26 +827,40 @@ fn duration_parts(seconds: i64) -> (i64, &'static str) {
 // artifact's clock is divergence, not a gap — see height_ago/height_label_short.
 
 /// Elapsed `mm:ss` for the huddle pills and panel.
-/// How far above the window's bottom edge the huddle dock floats.
+/// How much of the console row the huddle column takes — and, at zero, the
+/// rule that removes it.
 ///
-/// THE COMPOSER IS THE ONE THING UNDER IT. On Chat the message box sits on the
-/// room's bottom edge and its Send button is at the right end of it — exactly
-/// where a bottom-right dock lands — so the dock steps over the composer at its
-/// resting height. Every other module ends its content at the window wall, and
-/// there the inset is the same 16 the pill always used.
+/// THE HUDDLE IS A COLUMN BESIDE THE MODULE, NOT A CARD OVER IT. A card
+/// floating in a corner covers whatever the module put there — the chat
+/// composer's Send, the Pages editor's bottom bar, the last rows of every
+/// timeline — and no single inset clears all of them on every tab. A row cell
+/// cannot overlap anything, so this is the whole geometry, in one number:
 ///
-/// A draft grown to several lines passes BEHIND the card: the composer grows
-/// upward from a fixed base, and a dock that tracked it would move under the
-/// pointer on every keystroke. Fold the dock to its pill for a long draft.
-pub fn huddle_dock_inset(tab: crate::ShellTab) -> f64 {
-    const CLEAR_OF_THE_COMPOSER: f64 = 116.0;
-    const WINDOW_EDGE: f64 = 16.0;
-    let over_the_composer = tab == crate::ShellTab::Chat;
-    if over_the_composer {
-        CLEAR_OF_THE_COMPOSER
-    } else {
-        WINDOW_EDGE
+/// - NO HUDDLE, or one popped into its own window: `0.0`, and the module has
+///   the entire row. There is no second visibility rule to keep in step with
+///   view.ice's two arms — a zero-width cell IS the absent column.
+/// - FOLDED to its pill: the pill's own width. A folded huddle has to give the
+///   room back, which a quarter-width column holding one pill would not.
+/// - OPEN: 420, the upper end of the specified 280-420 band, and what the card
+///   inside reflows to fill.
+///
+/// PIXELS, NOT A `fill(N)` PORTION. A portion cell is allotted its share of
+/// the row whether or not anything is in it, so the portion form charged every
+/// module a quarter of its width with no call anywhere in the app. The console
+/// is 1040 at its narrowest (app.ice) and the rail takes 75, so an open huddle
+/// leaves the module 545. That is comfortable everywhere except the widest
+/// chat layout — channel list AND thread rail open, 566 of panes on its own —
+/// and there the answer is the fold: a huddle you are listening to rather than
+/// watching costs the room a pill.
+pub fn huddle_dock_width(joined: bool, popped: bool, collapsed: bool) -> f64 {
+    const CLOSED: f64 = 0.0;
+    const PILL: f64 = 190.0;
+    const OPEN: f64 = 420.0;
+    let no_column = !joined || popped;
+    if no_column {
+        return CLOSED;
     }
+    if collapsed { PILL } else { OPEN }
 }
 
 pub fn mmss(seconds: i64) -> String {

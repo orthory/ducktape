@@ -896,6 +896,12 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
               h=fill
               bg=separator
             space w=1.0 h=1.0
+          // `fill`, against a huddle column that names its width in pixels:
+          // the module takes whatever the huddle is not using, down to nothing
+          // when there is no call. A `fill(N)` PORTION cannot express that —
+          // a portion cell is allotted its share of the row whether or not it
+          // has anything in it, which cost every module a quarter of its width
+          // with no huddle anywhere.
           box #content
             with
               w=fill
@@ -929,11 +935,22 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
                   slot governance
                 ShellTab.settings
                   slot settings
+          // THE HUDDLE IS A COLUMN, NOT A FLOAT. It rides every screen — that
+          // is what it is for — but it does so BESIDE the module rather than
+          // over it: a card floating in the corner covers the chat composer's
+          // Send, the Pages editor's own bottom bar and the last rows of every
+          // timeline, and there is no inset that clears all of them on every
+          // tab. A row cell cannot overlap anything by construction, and the
+          // module simply gets a narrower content box while a call is up.
+          //
+          // It is a SLOT and not a prop for the same reason the palette and
+          // the bell are: `WorkspaceTabs` carries no huddle state, and a
+          // TitleBar seat would both widen a signature main.rs pins and land
+          // the card on the status/bell cluster.
+          //
+          // The slot's own width is zero when no huddle is up — see view.ice,
+          // where `huddle_dock_width` is what closes the column.
+          slot huddle
 
       slot palette
       slot bell
-      // The huddle rides every screen, so it is a window-level layer like the
-      // palette and the bell — not a prop on TitleBar. A titlebar seat would
-      // widen TitleBar's signature, which a source guard in main.rs pins, and
-      // it would land the pill on top of the status/bell cluster already there.
-      slot huddle
