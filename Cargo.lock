@@ -4610,6 +4610,7 @@ dependencies = [
  "tasks",
  "tempfile",
  "tracing",
+ "tracing-subscriber 0.3.23",
  "valset",
  "wasm-host",
 ]

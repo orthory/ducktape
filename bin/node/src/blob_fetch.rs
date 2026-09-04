@@ -332,6 +332,10 @@ impl<C: SyncClient + SourceRotate> host::CodeSource for FetchingCodeSource<C> {
         }
         self.local.get_chunk(&digest)
     }
+
+    fn origin(&self) -> &'static str {
+        "blob_mesh"
+    }
 }
 
 // ---- the validator's serve-lane co-client ------------------------------------

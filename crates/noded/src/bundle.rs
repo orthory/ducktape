@@ -70,6 +70,10 @@ impl host::CodeSource for DirCodeSource {
         let id = self.by_hash.get(&digest)?;
         std::fs::read(component_path(&self.dir, id)).ok()
     }
+
+    fn origin(&self) -> &'static str {
+        "modules_dir"
+    }
 }
 
 /// the canonical store source: every store-backed module `init`s its qmdb

@@ -124,6 +124,11 @@ const IDENTITY_MODULE_ID: &str = "identity";
 pub trait CodeSource: Send + Sync {
     /// component bytes for a content hash, or `None` if absent on this node.
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
+
+    /// a stable snake_case name for WHERE this source looks — logged with a
+    /// fail-closed miss so an operator reads "we asked the mesh and no peer
+    /// served it" apart from "this node never asked anyone".
+    fn origin(&self) -> &'static str;
 }
 
 /// the no-source default: a node wired without any code source. every fetch
@@ -135,6 +140,10 @@ pub struct NoCodeSource;
 impl CodeSource for NoCodeSource {
     async fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
         None
+    }
+
+    fn origin(&self) -> &'static str {
+        "none"
     }
 }
 
@@ -781,13 +790,25 @@ impl Host {
             if current.as_deref() == Some(target) {
                 continue; // already on the designated code — idempotent no-op.
             }
-            let bytes = src.fetch(target).await.ok_or_else(|| {
-                Error::Module(format!(
+            let Some(bytes) = src.fetch(target).await else {
+                // the ONE line that precedes the fatal: a fail-closed miss is
+                // terminal, so this fires at most once per node lifetime and
+                // names both the hash and the source that could not serve it.
+                tracing::error!(
+                    target: "ducktape::modules",
+                    event = "module_code_unresolved",
+                    reason = "code_bytes_absent",
+                    module = %m.module_id,
+                    code_hash = %hex32(target),
+                    source = src.origin(),
+                    "committed module code is unavailable — the boundary fails closed"
+                );
+                return Err(Error::Module(format!(
                     "code bytes absent for module {} (hash {}) — fail-closed",
                     m.module_id,
                     hex32(target),
-                ))
-            })?;
+                )));
+            };
             if sha256(&bytes) != target {
                 return Err(Error::Module(format!(
                     "code bytes for module {} do not match committed hash {} — fail-closed",

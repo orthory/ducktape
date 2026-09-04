@@ -78,6 +78,10 @@ impl host::CodeSource for BlobCodeSource {
         let digest: [u8; 32] = code_hash.try_into().ok()?;
         self.0.get_chunk(&digest)
     }
+
+    fn origin(&self) -> &'static str {
+        "blob_local"
+    }
 }
 
 /// what [`hydrate_from_disk`] found on disk.

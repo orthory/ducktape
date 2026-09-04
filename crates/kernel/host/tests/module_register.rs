@@ -46,6 +46,10 @@ impl CodeSource for MapSource {
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
         self.0.get(code_hash).cloned()
     }
+
+    fn origin(&self) -> &'static str {
+        "test_map"
+    }
 }
 
 /// the node-shaped factory: admissions instantiate through the wasm runtime.

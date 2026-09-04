@@ -31,6 +31,9 @@ valset = { workspace = true }
 identity = { workspace = true }
 
 [dev-dependencies]
+# the fail-closed proof asserts the OPERATOR-facing line the boundary emits
+# before it errors: a capturing subscriber, not a log-shaped comment.
+tracing-subscriber = { version = "0.3" }
 # the host-side qmdb store handle injected into disk-backed modules.
 statesync = { workspace = true }
 # MemStore: the in-memory MerkleStore double behind store-backed NATIVE

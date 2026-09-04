@@ -222,6 +222,10 @@ impl host::CodeSource for LiarSource {
     async fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
         std::fs::read(&self.0).ok()
     }
+
+    fn origin(&self) -> &'static str {
+        "test_liar"
+    }
 }
 
 /// a code source is a lookup, not a guarantee: bytes that do not hash to the
