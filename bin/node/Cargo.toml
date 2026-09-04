@@ -83,6 +83,9 @@ duckfs-core = { workspace = true }
 # the `ducktape fs` verb family drives the checkout/commit engine + HttpNode.
 duckfs-client = { workspace = true }
 duckfs-disk = { workspace = true }
+# NFC-normalizes a typed `fs` path argument at the CLI boundary (fs_cli/args.rs)
+# — the same dep `duckfs-core`/`duckfs-client` already carry for the wire side.
+unicode-normalization = { workspace = true }
 # the device keystore the `wallet`/`user key` verbs drive. A library rather
 # than modules of this binary because the desktop app links the same code —
 # it used to reach it by spawning this binary instead.

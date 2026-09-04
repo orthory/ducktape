@@ -16,7 +16,7 @@ mod args;
 mod read_cmds;
 mod work_cmds;
 
-use self::args::NodeAddr;
+use self::args::{nfc_path, NodeAddr};
 
 /// the `ducktape fs` verb tree. usage errors (a missing positional, a bad
 /// numeric flag, an unknown verb) are clap's job at the top-level parse — it
@@ -47,6 +47,7 @@ pub(crate) enum FsCmd {
 #[derive(Debug, clap::Args)]
 pub(crate) struct LsArgs {
     /// the directory path to list
+    #[arg(value_parser = nfc_path)]
     pub path: String,
     /// read at this snapshot instead of the head
     #[arg(long, value_name = "SNAPSHOT")]
@@ -64,6 +65,7 @@ pub(crate) struct LsArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct CatArgs {
     /// the file path to stream
+    #[arg(value_parser = nfc_path)]
     pub path: String,
     /// read at this snapshot instead of the head
     #[arg(long, value_name = "SNAPSHOT")]
@@ -75,6 +77,7 @@ pub(crate) struct CatArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct StatArgs {
     /// the entry path to describe
+    #[arg(value_parser = nfc_path)]
     pub path: String,
     /// read at this snapshot instead of the head
     #[arg(long, value_name = "SNAPSHOT")]
@@ -105,7 +108,7 @@ pub(crate) struct DiffArgs {
     /// the target snapshot
     pub to: String,
     /// restrict the diff to leaves under this path prefix
-    #[arg(long, value_name = "PREFIX")]
+    #[arg(long, value_name = "PREFIX", value_parser = nfc_path)]
     pub prefix: Option<String>,
     /// emit one JSON array line instead of tab-separated rows
     #[arg(long)]
@@ -117,6 +120,7 @@ pub(crate) struct DiffArgs {
 #[derive(Debug, clap::Args)]
 pub(crate) struct CheckoutArgs {
     /// the subtree prefix to materialize
+    #[arg(value_parser = nfc_path)]
     pub prefix: String,
     /// the directory to materialize into
     pub dir: String,
@@ -133,7 +137,7 @@ pub(crate) struct StatusArgs {
     pub dir: Option<String>,
     /// report only changes at or under this path (repeatable). a path is
     /// relative to the checkout, or an absolute duckfs path
-    #[arg(long = "path", value_name = "PATH")]
+    #[arg(long = "path", value_name = "PATH", value_parser = nfc_path)]
     pub paths: Vec<String>,
 }
 
@@ -151,7 +155,7 @@ pub(crate) struct CommitArgs {
     /// a FLAG, not a positional: `commit` already takes the checkout dir
     /// positionally, and `ducktape fs commit src/` reading as "the checkout is
     /// src/" is the kind of ambiguity that eats a commit
-    #[arg(long = "path", value_name = "PATH")]
+    #[arg(long = "path", value_name = "PATH", value_parser = nfc_path)]
     pub paths: Vec<String>,
     /// fail on a conflict instead of auto-rebasing onto the current head
     #[arg(long)]
