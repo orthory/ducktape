@@ -1,6 +1,6 @@
 //! the capability spec: a TOML file describing one executor capability.
 //!
-//! everything capability-host used to hardcode in Rust — which binary to
+//! everything the provider used to hardcode in Rust — which binary to
 //! probe, the argv to invoke it, how to parse its output — is data in a spec
 //! file. the built-in executors are embedded spec FILES (globbed by build.rs
 //! — no Rust source names an executor) parsed by this exact module, so an

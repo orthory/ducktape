@@ -332,7 +332,7 @@ impl RunBroker {
     }
 
     /// Test-only: a broker whose upstream is a dead port. `testkit` exposes it
-    /// to the consumer crates' tests too (capability-host drives a run against
+    /// to the consumer crates' tests too (the provider drives a run against
     /// it); it is compiled OUT of any build that doesn't ask for the feature.
     #[cfg(any(test, feature = "testkit"))]
     pub async fn start_for_test() -> Self {

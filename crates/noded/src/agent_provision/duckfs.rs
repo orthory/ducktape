@@ -136,7 +136,7 @@ struct NodedWorkspace {
     source: WorkspaceSource,
     env: BTreeMap<String, String>,
     /// the run's assembled soul — its `always` skills inlined, the rest indexed.
-    /// `None` when the agent curated no skills. capability-host delivers it.
+    /// `None` when the agent curated no skills. the provider delivers it.
     context_doc: Option<String>,
     /// Owns the scoped signer endpoint for exactly as long as the workspace.
     _session: Option<super::session::RunSession>,

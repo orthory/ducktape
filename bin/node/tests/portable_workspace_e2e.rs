@@ -53,7 +53,7 @@ const ARTIFACT_BODY: &str = "portable evidence";
 // the W6 skill: a committed duckfs subtree the agent pins, materialized by
 // the provisioner as a READ-ONLY mount beside (never inside) the rw mount. it is
 // curated `Always`, which makes it this agent's PERSONA: the assembler inlines
-// its whole body into the run's context document, and capability-host hands that
+// its whole body into the run's context document, and the provider hands that
 // document to a `prompt = "stdin"` provider ahead of the run's input.
 const SKILL_NAME: &str = "quackskill";
 const SKILL_FILE: &str = "SKILL.md";
