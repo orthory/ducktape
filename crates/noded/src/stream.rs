@@ -419,7 +419,7 @@ pub enum RunStream {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockWake {
     /// the tip moved and nothing else. An idle chain nop-fills once per
-    /// block time (node.toml `block_time_ms`) and that filler appends no
+    /// block time (network.toml `block_time_ms`) and that filler appends no
     /// per-module op row, so every scan it used to trigger returned empty.
     TipOnly,
     /// op rows were appended under the subscribers.

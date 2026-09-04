@@ -158,6 +158,16 @@ pub fn validate_module_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// a beat of zero is not a cadence: every consensus timer is a multiple of it,
+/// so the whole simplex clock collapses to a hot spin. checked at every
+/// boundary a descriptor enters through, exactly like [`validate_module_id`].
+pub fn validate_block_time_ms(ms: u64) -> Result<(), String> {
+    match ms {
+        0 => Err("block_time_ms must be at least 1ms".to_string()),
+        _ => Ok(()),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkDescriptor {
@@ -189,6 +199,14 @@ pub struct NetworkDescriptor {
     /// `node init` writes the file beside this descriptor; a joiner installs
     /// it (`install_genesis`) only after the bytes hash to this.
     pub genesis: String,
+    /// milliseconds between idle blocks — the network's BEAT, stated once by
+    /// the founder (`node init --block-time-ms`) and inherited by every
+    /// joiner. IN the genesis fingerprint because the invariant it carries is
+    /// cross-node: every simplex timer is a fixed multiple of the local beat
+    /// (`consensus::Cadence`), so a member running a faster one nullifies the
+    /// very views a slower leader fills on its own heartbeat. One beat per
+    /// network, or the members disagree about when a view is late.
+    pub block_time_ms: u64,
     /// the genesis wasm set: `(id, sha256 hex)` per wasm tenant, sorted by id.
     /// IN the genesis fingerprint — a node built against different components
     /// is a different network, never a block-0 fork. the bytes are the
@@ -219,6 +237,7 @@ impl NetworkDescriptor {
         }
         d.modules.sort_by(|a, b| a.id.cmp(&b.id));
         d.genesis = d.genesis.trim().to_ascii_lowercase();
+        validate_block_time_ms(d.block_time_ms)?;
         Ok(d)
     }
 
@@ -259,8 +278,9 @@ impl NetworkDescriptor {
 
     /// the namespace this network's nodes actually run under: the chain-id
     /// plus a GENESIS FINGERPRINT (sha256 over the sorted validator set +
-    /// the sorted `id=code_hash` module lines; bootstrap hints excluded — they
-    /// are advisory and legitimately differ between members). because the
+    /// the sorted `id=code_hash` module lines + the genesis pin + the beat;
+    /// bootstrap hints excluded — they are advisory and legitimately differ
+    /// between members). because the
     /// namespace domain-separates the mesh handshake, the simplex scheme, and
     /// the epoch genesis floor, a member holding a STALE descriptor (e.g. it
     /// missed a pre-genesis `admit` and kept the old validator list, or was
@@ -293,6 +313,8 @@ impl NetworkDescriptor {
         }
         hasher.update(b"\ngenesis=");
         hasher.update(self.genesis.trim().to_ascii_lowercase().as_bytes());
+        hasher.update(b"\nblock_time_ms=");
+        hasher.update(self.block_time_ms.to_string().as_bytes());
         let digest = hasher.finalize();
         // 128 bits: a 32-bit suffix is grindable (~2^32 hashes finds an
         // admitted key that leaves the fingerprint unchanged, resurrecting
@@ -1101,6 +1123,7 @@ mod tests {
                 bootstrap: vec![],
                 reach: vec![],
                 coordination: None,
+                block_time_ms: DEFAULT_BLOCK_TIME_MS,
                 genesis: String::new(),
                 modules: Vec::new(),
             }
@@ -1123,6 +1146,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1174,6 +1198,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1273,6 +1298,7 @@ mod tests {
                 bootstrap: vec![],
                 reach: vec![],
                 coordination: None,
+                block_time_ms: DEFAULT_BLOCK_TIME_MS,
                 genesis: String::new(),
                 modules: Vec::new(),
             };
@@ -1305,6 +1331,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         }
@@ -1318,7 +1345,7 @@ mod tests {
              gateway_listen = \"127.0.0.1:0\"\nrpc_listen = \"127.0.0.1:0\"\n\
              wireguard_listen = \"0.0.0.0:51820\"\ninvite_listen = \"0.0.0.0:51821\"\n\
              wireguard_advertised = \"auto\"\nprimary_coordinator = \"none\"\n\
-             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\nblock_time_ms = 1000\n"
+             coordinator_relay = \"none\"\ncheckpoint_blocks = 32\n"
         );
         std::fs::write(dir.join("node.toml"), node_toml).expect("write node.toml");
         dir
@@ -1378,6 +1405,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1399,6 +1427,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1418,6 +1447,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1462,6 +1492,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: modules_fixture(),
         };
@@ -1475,10 +1506,49 @@ mod tests {
         assert_eq!(reversed.genesis_namespace(), d.genesis_namespace());
     }
 
+    /// The beat is a genesis fact, so it is IN the fingerprint: two networks
+    /// alike in every other respect but the cadence cannot handshake. That is
+    /// what makes a mismatched member a loud connectivity failure instead of a
+    /// validator quietly nullifying the views its slower leader was filling.
+    #[test]
+    fn genesis_namespace_fingerprints_the_beat() {
+        let a = ed25519::PrivateKey::from_seed(5).public_key();
+        let d = NetworkDescriptor {
+            chain_id: "net#00000000".into(),
+            validators: vec![hex_bytes(a.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: "ab".repeat(32),
+            modules: modules_fixture(),
+        };
+        let faster = NetworkDescriptor {
+            block_time_ms: 100,
+            ..d.clone()
+        };
+        assert_ne!(faster.genesis_namespace(), d.genesis_namespace());
+    }
+
+    /// a zero beat collapses every consensus timer to a hot spin, so it is
+    /// refused at both boundaries a descriptor enters through — the file and
+    /// (in the invite suite) the blob.
+    #[test]
+    fn a_zero_beat_is_refused_at_the_file_boundary() {
+        let text = format!(
+            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 0\nmodules = []\n",
+            "ab".repeat(32)
+        );
+        let err = NetworkDescriptor::from_toml(&text).unwrap_err();
+        assert!(err.contains("block_time_ms"), "{err}");
+    }
+
     #[test]
     fn descriptor_without_modules_does_not_parse() {
         let text = format!(
-            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n",
+            "chain_id = \"net#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 1000\n",
             "ab".repeat(32)
         );
         let err = NetworkDescriptor::from_toml(&text).unwrap_err();
@@ -1493,6 +1563,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: modules_fixture(),
         };
@@ -1543,6 +1614,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1580,6 +1652,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1599,6 +1672,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: modules_fixture_sorted(),
         };
@@ -1613,6 +1687,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: format!("  {}  ", "ab".repeat(32).to_ascii_uppercase()),
             modules: vec![
                 ModuleCode {
@@ -1664,7 +1739,8 @@ mod tests {
         // or a newline could make two distinct module sets fold to one
         // namespace. every entry point refuses it, naming the id.
         let toml = format!(
-            "chain_id = \"canon#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\n\
+            "chain_id = \"canon#00000000\"\nvalidators = []\ngenesis = \"{}\"\n\
+             block_time_ms = 1000\n\n\
              [[modules]]\nid = \"a=b\"\ncode_hash = \"{}\"\n",
             "ab".repeat(32),
             "11".repeat(32)
@@ -1678,6 +1754,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: vec![ModuleCode {
                 id: "x\ny".into(),
@@ -1706,6 +1783,7 @@ mod tests {
             ],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1771,6 +1849,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1794,6 +1873,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1819,6 +1899,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1854,6 +1935,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1908,6 +1990,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -1971,6 +2054,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -2023,6 +2107,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -2061,6 +2146,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };
@@ -2098,6 +2184,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             genesis: String::new(),
             modules: Vec::new(),
         };

@@ -42,7 +42,6 @@ pub struct PlumbingOverrides {
     pub wireguard_listen: Option<String>,
     pub wireguard_advertised: Option<String>,
     pub invite_listen: Option<String>,
-    pub block_time_ms: Option<u64>,
 }
 
 /// What a join produced. Enough for either caller to say what happened without
@@ -281,5 +280,57 @@ mod tests {
         let overrides = PlumbingOverrides::default();
         assert!(join_workspace("not-an-invite", Some(target.clone()), &overrides).is_err());
         assert!(!target.exists(), "a refused join left a directory behind");
+    }
+
+    /// THE beat test: a joiner with NO flags at all — the desktop app's only
+    /// shape (`join_workspace(&blob, None, &Default::default())`) — comes up on
+    /// the founder's cadence, not the compiled default. The beat is a genesis
+    /// fact carried by the invite, so there is nothing left in `node.toml` for
+    /// a member to disagree about.
+    #[test]
+    fn a_joiner_inherits_the_founders_beat_with_no_flag() {
+        const FOUNDING_BEAT: u64 = 250;
+        assert_ne!(FOUNDING_BEAT, crate::DEFAULT_BLOCK_TIME_MS);
+
+        let issuer = ed25519::PrivateKey::from_seed(31);
+        let founder = issuer.public_key();
+        let mut descriptor = crate::NetworkDescriptor {
+            chain_id: "beat#a1b2c3d4".into(),
+            validators: vec![hex_bytes(founder.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: FOUNDING_BEAT,
+            genesis: "ab".repeat(32),
+            modules: Vec::new(),
+        };
+        descriptor.add_bootstrap(&founder, "127.0.0.1:52200");
+        let token =
+            crate::mint_invite_token(&issuer, descriptor.genesis_namespace().as_bytes(), u64::MAX);
+        let wireguard = crate::InviteWireGuard {
+            public_key: [0u8; 32],
+            endpoint: None,
+            intro: None,
+            mesh_port: 52200,
+        };
+        let blob = crate::encode_invite(&descriptor, &token, &wireguard, &[], &issuer)
+            .expect("encode the invite");
+
+        let root = tempfile::tempdir().unwrap();
+        let joined = join_workspace(
+            &blob,
+            Some(root.path().join("joined")),
+            &PlumbingOverrides::default(),
+        )
+        .expect("join");
+
+        let landed = crate::NetworkDescriptor::load(&joined.dir.join("network.toml"))
+            .expect("the joined descriptor");
+        assert_eq!(landed.block_time_ms, FOUNDING_BEAT);
+        let node_toml = std::fs::read_to_string(joined.dir.join("node.toml")).expect("node.toml");
+        assert!(
+            !node_toml.contains("block_time_ms"),
+            "the beat is descriptor-only; node.toml must not restate it:\n{node_toml}"
+        );
     }
 }
