@@ -53,7 +53,8 @@ jobs:
 
   # A separate job (not folded into genesis-pin) so it runs in parallel
   # rather than lengthening one job's critical path. `cargo test -p simnode`
-  # cranelift-compiles the sim's module set per boot with no sandbox,
+  # cranelift-compiles the sim's module set per boot (25–29 min on the
+  # 2-core runner, so the timeout sits well above that) with no sandbox,
   # microVM, or outbound network — every simnode test binds loopback only —
   # so the whole crate runs here, not a scoped subset. This is the job that
   # was missing (#1433): `topology_set.rs`'s `DEFAULT_GENESIS_ROOT_HASH`
@@ -61,7 +62,7 @@ jobs:
   # gate exercising it.
   simnode-suite:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
