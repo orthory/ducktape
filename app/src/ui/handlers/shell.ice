@@ -125,8 +125,7 @@ on shell_composer_event(event)
   shell_setup_open = false
   parallel
     stream replace lane=shell_chat agent_chat_turn(connected_rpc, shell_provider, shell_credential, shell_host_node_key, shell_chat_entries) -> shell_chat_event _
-    // `snap … 0.0`, not `snap-end`: the transcript is `anchor-y=end`, where
-    // relative 0.0 IS the tail — `snap-end` (relative 1.0) lands at the TOP.
+    // The transcript is `anchor-y=end`, where relative 0.0 is the tail.
     task widget snap #workspace-tabs/content/shell/root/transcript 0.0 0.0 window=window_target(console_win)
 
 // One pure reducer per field keeps this event handler flat. A progress event
