@@ -1213,6 +1213,14 @@ fn take_service_link(
         .ok_or("refused: present this node's service-link token, and only one agent service may attach")
 }
 
+/// every `ducktape::term` refusal below that a CLIENT drives per frame (a held
+/// key, a resize, a command, a publisher hammering an unattached connection),
+/// latched by reason. Unlatched, any one of them repeats at whatever rate the
+/// client sends frames — ~30/s for a held key — and evicts the whole
+/// 4096-line ring in about two minutes. First occurrence, then every 100th,
+/// carrying `occurrences`; the counter is the diagnosis.
+static TERM_WARN: crate::log::Latch = crate::log::Latch::new(100);
+
 /// Apply one daemon-published event to the terminal plane, or drop it.
 ///
 /// The `attached` gate is a trust boundary, not tidiness: these events append to
@@ -1220,19 +1228,25 @@ fn take_service_link(
 /// publishing one would be injecting into another member's terminal.
 fn handle_agent_event(handle: &NodeHandle, attached: bool, event: agent_service::wire::Event) {
     if !attached {
-        tracing::warn!(
-            target: "ducktape::term",
-            reason = "unattached_publisher",
-            "agent event dropped"
-        );
+        if let Some(occurrences) = TERM_WARN.hit("unattached_publisher") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "unattached_publisher",
+                occurrences,
+                "agent event dropped"
+            );
+        }
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(
-            target: "ducktape::term",
-            reason = "no_terminal_plane",
-            "agent event dropped"
-        );
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "agent event dropped"
+            );
+        }
         return;
     };
     terminals.on_event(event);
@@ -1267,6 +1281,12 @@ fn handle_client_msg(
     }
 }
 
+/// every `ducktape::agent` refusal below, latched by reason: a compute daemon
+/// publishes one `RunOutput` frame per line of its run, so a malformed id or
+/// an oversized line repeats at the daemon's own output rate. First
+/// occurrence, then every 100th, carrying `occurrences`.
+static AGENT_WARN: crate::log::Latch = crate::log::Latch::new(100);
+
 /// Admit one published run-output line, or drop it with a named reason.
 ///
 /// The two checks are a trust boundary, not tidiness: see [`ClientMsg::RunOutput`].
@@ -1276,20 +1296,26 @@ fn handle_run_output(hub: &StreamHub, id: String, stream: RunStream, line: Strin
     let id_well_formed =
         id.len() == RUN_OUTPUT_ID_LEN && id.bytes().all(|byte| byte.is_ascii_hexdigit());
     if !id_well_formed {
-        tracing::warn!(
-            target: "ducktape::agent",
-            reason = "malformed_run_id",
-            "run output dropped"
-        );
+        if let Some(occurrences) = AGENT_WARN.hit("malformed_run_id") {
+            tracing::warn!(
+                target: "ducktape::agent",
+                reason = "malformed_run_id",
+                occurrences,
+                "run output dropped"
+            );
+        }
         return;
     }
     if line.len() > MAX_RUN_OUTPUT_LINE {
-        tracing::warn!(
-            target: "ducktape::agent",
-            bytes = line.len(),
-            reason = "run_output_line_too_long",
-            "run output dropped"
-        );
+        if let Some(occurrences) = AGENT_WARN.hit("run_output_line_too_long") {
+            tracing::warn!(
+                target: "ducktape::agent",
+                bytes = line.len(),
+                reason = "run_output_line_too_long",
+                occurrences,
+                "run output dropped"
+            );
+        }
         return;
     }
     hub.run_output().append(id, stream, line);
@@ -1327,15 +1353,28 @@ fn forward_target(handle: &NodeHandle, session: &str) -> Option<[u8; 32]> {
 /// lane or a full channel drops the frame (never a panic); never logs the bytes.
 async fn forward_input(handle: &NodeHandle, host: [u8; 32], event: crate::SessionInputWire) {
     let Some(lane) = handle.session_lane() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_session_lane", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_session_lane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_session_lane",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     };
     if lane
         .send(crate::SessionJob::Input { host, event })
         .await
         .is_err()
+        && let Some(occurrences) = TERM_WARN.hit("input_forward_failed")
     {
-        tracing::warn!(target: "ducktape::term", reason = "input_forward_failed", "term input dropped");
+        tracing::warn!(
+            target: "ducktape::term",
+            reason = "input_forward_failed",
+            occurrences,
+            "term input dropped"
+        );
     }
 }
 
@@ -1351,7 +1390,9 @@ async fn forward_input(handle: &NodeHandle, host: [u8; 32], event: crate::Sessio
 /// held-down key would otherwise mint one `warn` per repeat into the 4096-line
 /// ring — evicting the very context an operator opened the Logs tab to read,
 /// and doing it through the `logs` topic any ws caller may hold. The other three
-/// reasons here stay `warn`: each is once per frame class, not once per byte.
+/// reasons here stay `warn`, each once per frame class rather than once per
+/// byte — but a stuck client can still hold ANY of those frame classes down,
+/// so they go through [`TERM_WARN`] too.
 async fn handle_term_input(
     handle: &NodeHandle,
     topics: &BTreeMap<String, TopicState>,
@@ -1377,27 +1418,58 @@ async fn handle_term_input(
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     };
     // a live session has a mode; an unknown or already-ended one has none. Two
     // causes, two countable reasons — collapsing them would hide "the id is
     // stale" behind "you used the wrong lane".
     let Some(mode) = terminals.mode(session) else {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("unknown_session") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "unknown_session",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     };
     // raw keystrokes are the SINGLE-session path only. A shared session refuses
     // them so nothing bypasses its ordered command lane (drive it with
     // TermCommand).
     if mode != crate::term::SessionMode::Single {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "raw_input_on_shared", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("raw_input_on_shared") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "raw_input_on_shared",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     }
     // decoded here purely to refuse a malformed frame at this boundary; the
     // daemon takes the base64 as-is, so the bytes never round-trip.
     if STANDARD.decode(data_b64).is_err() {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "bad_base64", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("bad_base64") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "bad_base64",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     }
     terminals.input(session, data_b64).await;
@@ -1431,13 +1503,28 @@ async fn handle_term_resize(
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term resize dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "term resize dropped"
+            );
+        }
         return;
     };
     // the same no-op-on-unknown discipline as input: refuse here rather than
     // spending a link frame on a session that is already gone.
     if terminals.mode(session).is_none() {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term resize dropped");
+        if let Some(occurrences) = TERM_WARN.hit("unknown_session") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "unknown_session",
+                occurrences,
+                "term resize dropped"
+            );
+        }
         return;
     }
     terminals.resize(session, cols, rows).await;
@@ -1462,7 +1549,14 @@ fn handle_term_command(
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term command dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "term command dropped"
+            );
+        }
         return;
     };
     terminals.enqueue_command(session, origin, text);

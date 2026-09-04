@@ -525,6 +525,14 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
 ///
 /// `peer` is also still used for the one thing it settles locally: binding the
 /// session's input frames to the node that created it.
+///
+/// every refusal below is PEER-drivable — `serve_control` opens one short
+/// CONTROL stream per create/close, and a peer that keeps retrying a refused
+/// create can open as many of those as it likes — so they latch by reason
+/// instead of flooding, the same discipline `sync::serve`'s statesync refusals
+/// use. First occurrence, then every 100th, carrying `occurrences`.
+static CREATE_REFUSED: noded::log::Latch = noded::log::Latch::new(100);
+
 async fn serve_create(
     control: &ControlState,
     peer: PeerId,
@@ -552,24 +560,30 @@ async fn serve_create(
             // routing metadata already logged at boot, and without it the
             // operator is told "someone was refused" with no way to find out
             // whom to admit.
-            tracing::warn!(
-                target: "ducktape::term",
-                reason = refusal.reason(),
-                node = %crate::config::hex_bytes(&peer.0[..4]),
-                "peer session create refused"
-            );
+            if let Some(occurrences) = CREATE_REFUSED.hit(refusal.reason()) {
+                tracing::warn!(
+                    target: "ducktape::term",
+                    reason = refusal.reason(),
+                    node = %crate::config::hex_bytes(&peer.0[..4]),
+                    occurrences,
+                    "peer session create refused"
+                );
+            }
             return refused(refusal.reason(), refusal.detail());
         }
         // not a refusal: nothing is known about the policy's subject, so the
         // caller is told to retry rather than sent to fix an admission that may
         // already exist.
         crate::work_admission::WorkVerdict::AuthorityUnavailable => {
-            tracing::warn!(
-                target: "ducktape::term",
-                reason = "work_authority_unavailable",
-                node = %crate::config::hex_bytes(&peer.0[..4]),
-                "peer session create not decided"
-            );
+            if let Some(occurrences) = CREATE_REFUSED.hit("work_authority_unavailable") {
+                tracing::warn!(
+                    target: "ducktape::term",
+                    reason = "work_authority_unavailable",
+                    node = %crate::config::hex_bytes(&peer.0[..4]),
+                    occurrences,
+                    "peer session create not decided"
+                );
+            }
             return refused(
                 "work_authority_unavailable",
                 "this node could not read committed identity to decide whose work it runs",
@@ -577,7 +591,14 @@ async fn serve_create(
         }
     }
     let Some(sessions) = control.sessions.clone() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_sandbox", "peer session create refused");
+        if let Some(occurrences) = CREATE_REFUSED.hit("no_sandbox") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_sandbox",
+                occurrences,
+                "peer session create refused"
+            );
+        }
         return refused("no_sandbox", "this node hosts no terminal sessions");
     };
     let sandbox_present = sessions.has_sandbox();
@@ -595,7 +616,14 @@ async fn serve_create(
     let admit = match admit_create(provider, record.as_ref(), cpu, mem_gb, sandbox_present) {
         Ok(admit) => admit,
         Err((reason, detail)) => {
-            tracing::warn!(target: "ducktape::term", reason, "peer session create refused");
+            if let Some(occurrences) = CREATE_REFUSED.hit(reason) {
+                tracing::warn!(
+                    target: "ducktape::term",
+                    reason,
+                    occurrences,
+                    "peer session create refused"
+                );
+            }
             return refused(reason, &detail);
         }
     };
@@ -810,6 +838,12 @@ async fn receive_input<S: AsyncRead + Unpin>(
     Ok(())
 }
 
+/// per-frame `ducktape::term` refusals below `deliver_input`/`client_input`:
+/// one comes in per keystroke on the forwarded-input stream, so an unlatched
+/// line here is the same ~30/s ring eviction [`TERM_WARN`] in `noded::stream`
+/// guards against. First occurrence, then every 100th, carrying `occurrences`.
+static INPUT_WARN: noded::log::Latch = noded::log::Latch::new(100);
+
 /// gate one input event on the creator, then apply it to the pty (write or
 /// resize). Shared by the remote input stream and the loopback client path.
 async fn deliver_input(sessions: &TerminalSessions, peer: PeerId, event: SessionInputEvent) {
@@ -819,12 +853,26 @@ async fn deliver_input(sessions: &TerminalSessions, peer: PeerId, event: Session
     // so establish existence first, or every stale id would be counted as an
     // authorization failure.
     if sessions.mode(&session).is_none() {
-        tracing::warn!(target: "ducktape::term", reason = "unknown_session", "forwarded input dropped");
+        if let Some(occurrences) = INPUT_WARN.hit("unknown_session") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "unknown_session",
+                occurrences,
+                "forwarded input dropped"
+            );
+        }
         return;
     }
     let permitted = input_permitted(sessions.creator_node(&session), peer);
     if !permitted {
-        tracing::warn!(target: "ducktape::term", reason = "input_not_creator", "forwarded input dropped");
+        if let Some(occurrences) = INPUT_WARN.hit("input_not_creator") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "input_not_creator",
+                occurrences,
+                "forwarded input dropped"
+            );
+        }
         return;
     }
     match event {
@@ -832,7 +880,14 @@ async fn deliver_input(sessions: &TerminalSessions, peer: PeerId, event: Session
             // decoded only to refuse a malformed frame at this boundary; the
             // daemon takes the base64 as-is, so the bytes never round-trip.
             if STANDARD.decode(&data_b64).is_err() {
-                tracing::warn!(target: "ducktape::term", reason = "bad_base64", "forwarded input dropped");
+                if let Some(occurrences) = INPUT_WARN.hit("bad_base64") {
+                    tracing::warn!(
+                        target: "ducktape::term",
+                        reason = "bad_base64",
+                        occurrences,
+                        "forwarded input dropped"
+                    );
+                }
                 return;
             }
             sessions.input(&session, &data_b64).await;
@@ -995,7 +1050,15 @@ async fn client_input<T: DataPlaneTransport>(
                 input_streams.insert(host, Box::new(stream));
             }
             Err(err) => {
-                tracing::warn!(target: "ducktape::term", reason = "input_open_failed", error = %err, "forwarded input dropped");
+                if let Some(occurrences) = INPUT_WARN.hit("input_open_failed") {
+                    tracing::warn!(
+                        target: "ducktape::term",
+                        reason = "input_open_failed",
+                        error = %err,
+                        occurrences,
+                        "forwarded input dropped"
+                    );
+                }
                 return;
             }
         }
@@ -1004,7 +1067,15 @@ async fn client_input<T: DataPlaneTransport>(
         .get_mut(&host)
         .expect("input stream just inserted");
     if let Err(err) = write_frame(stream.as_mut(), &event).await {
-        tracing::warn!(target: "ducktape::term", reason = "input_write_failed", error = %err, "forwarded input dropped; reopening");
+        if let Some(occurrences) = INPUT_WARN.hit("input_write_failed") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "input_write_failed",
+                error = %err,
+                occurrences,
+                "forwarded input dropped; reopening"
+            );
+        }
         input_streams.remove(&host);
     }
 }
