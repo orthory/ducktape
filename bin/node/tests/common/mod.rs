@@ -191,6 +191,25 @@ impl NodeProc {
         })
     }
 
+    /// block until `marker` has appeared at least `count` times in total.
+    ///
+    /// every offered slice is counted exactly once (the feed only ever
+    /// offers a line to a probe once — see `OutputFeed::wait`), so this
+    /// tallies markers across repeated wakes rather than re-scanning from
+    /// the top each time.
+    fn wait_marker_count(
+        &self,
+        marker: &str,
+        count: usize,
+        deadline: Instant,
+    ) -> Result<usize, Unanswered> {
+        let mut seen = 0usize;
+        self.feed.wait(deadline, |unseen| {
+            seen += unseen.lines().filter(|line| line.contains(marker)).count();
+            (seen >= count).then_some(seen)
+        })
+    }
+
     /// block until the process closes its output — it exited — then reap it.
     fn wait_exit(&mut self, deadline: Instant) -> Result<std::process::ExitStatus, Unanswered> {
         self.feed.wait_closed(deadline)?;
@@ -200,6 +219,14 @@ impl NodeProc {
     /// everything the process has written so far.
     fn text(&self) -> String {
         self.feed.text()
+    }
+
+    /// how many lines printed so far contain `marker`.
+    fn marker_count(&self, marker: &str) -> usize {
+        self.text()
+            .lines()
+            .filter(|line| line.contains(marker))
+            .count()
     }
 
     /// the last `lines` lines the process wrote.
@@ -922,6 +949,31 @@ impl NetworkShapeCluster {
             .unwrap_or_else(|why| {
                 panic!(
                     "network-shape node idx {idx} {} without printing {marker:?};\n{}",
+                    why.verb(),
+                    self.all_log_tails(60),
+                )
+            })
+    }
+
+    /// how many times node `idx` has printed `marker` so far.
+    pub fn marker_count(&self, idx: usize, marker: &str) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.marker_count(marker)
+    }
+
+    /// wait until node `idx` has printed `marker` at least `count` times.
+    pub fn wait_marker_count(
+        &self,
+        idx: usize,
+        marker: &str,
+        count: usize,
+        timeout: Duration,
+    ) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.wait_marker_count(marker, count, Instant::now() + timeout)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "network-shape node idx {idx} {} before printing {marker:?} {count} times;\n{}",
                     why.verb(),
                     self.all_log_tails(60),
                 )

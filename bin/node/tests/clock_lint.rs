@@ -73,11 +73,6 @@ const TIME_BASED_WAITS: &[(&str, usize, &str)] = &[
         1,
         "FREEZE is the scenario: a freeze longer than the founder's read deadline",
     ),
-    (
-        "resident_peerset_stability_e2e.rs",
-        1,
-        "SETTLE is a window of p2p tracker rounds, which are clocked, not block-paced",
-    ),
 ];
 
 #[test]
