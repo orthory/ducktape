@@ -30,7 +30,13 @@ use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, oneshot, watch};
 
+// Real quote verification (attest/measurement types + the verifier itself)
+// is the opt-in `verify` feature — everything below is used only by the
+// `AirlockTrust::Attested` arm and its tests, never by the everyday
+// self-hosted `PinnedSealPk` path.
+#[cfg(feature = "verify")]
 use airlock::attest::{self, AttestMode, Measurement};
+#[cfg(feature = "verify")]
 use airlock::verify::{SnpProduct, SnpRoots, TdxRoots, TrustRoots, VcekSource};
 use airlock::client::{Gateway, SessionRefusedBy, SessionResponseFault};
 pub use airlock::wire::WorkRef;
@@ -1224,12 +1230,23 @@ async fn open_airlock_session(cfg: AirlockConfig) -> Result<(AirlockSession, Str
     // REPORTDATA; `PinnedSealPk` is the self-host anchor — the on-chain seal_pk
     // pinned directly, no quote to verify.
     let seal_pk = match &cfg.trust {
+        #[cfg(feature = "verify")]
         AirlockTrust::Attested { measurement, attest } => {
             let mode: AttestMode =
                 attest.parse().map_err(|e| format!("airlock attest mode: {e}"))?;
             let expected = Measurement::from_hex(measurement)
                 .map_err(|e| format!("airlock measurement: {e}"))?;
             verify_gateway(&gateway, &cfg, mode, &expected).await?
+        }
+        // Compiled out, not silently skipped: an off build still parses
+        // DUCKTAPE_AIRLOCK_ATTEST (`from_env` below) and reaches here, and
+        // refuses BY NAME rather than falling back to a host credential.
+        #[cfg(not(feature = "verify"))]
+        AirlockTrust::Attested { measurement, attest } => {
+            return Err(format!(
+                "airlock quote verification is not compiled in (measurement={measurement} \
+                 attest={attest}); rebuild broker-host with --features verify"
+            ));
         }
         AirlockTrust::PinnedSealPk(pk) => *pk,
     };
@@ -1486,10 +1503,13 @@ pub struct AirlockConfig {
     /// site states which arm it means.
     work: WorkRef,
     /// attest=snp: the pinned AMD platform generation (parsed at config time).
+    #[cfg(feature = "verify")]
     snp_product: Option<SnpProduct>,
     /// attest=snp: an out-of-band VCEK (file READ at config time); KDS otherwise.
+    #[cfg(feature = "verify")]
     snp_vcek: Option<VcekSource>,
     /// attest=tdx: collateral endpoint override; Intel PCS otherwise.
+    #[cfg(feature = "verify")]
     pccs_url: Option<String>,
 }
 
@@ -1507,8 +1527,11 @@ impl AirlockConfig {
             trust: AirlockTrust::PinnedSealPk(resolved.seal_pk),
             sub: resolved.name.clone(),
             work,
+            #[cfg(feature = "verify")]
             snp_product: None,
+            #[cfg(feature = "verify")]
             snp_vcek: None,
+            #[cfg(feature = "verify")]
             pccs_url: None,
         }
     }
@@ -1547,7 +1570,11 @@ impl AirlockConfig {
             ));
         };
         // Typed at the boundary: THIS is the one place `DUCKTAPE_AIRLOCK_*`
-        // env is read, so misconfig fails here, not mid-verify.
+        // env is read, so misconfig fails here, not mid-verify. Skipped on an
+        // off build: `measurement`/`attest` alone are enough to build the
+        // (inert) `Attested` value, which refuses by name in
+        // `open_airlock_session` before these fields would ever be read.
+        #[cfg(feature = "verify")]
         let snp_product = match env_nonempty("DUCKTAPE_AIRLOCK_SNP_PRODUCT") {
             Some(p) => match p.parse::<SnpProduct>() {
                 Ok(p) => Some(p),
@@ -1555,6 +1582,7 @@ impl AirlockConfig {
             },
             None => None,
         };
+        #[cfg(feature = "verify")]
         let snp_vcek = match env_nonempty("DUCKTAPE_AIRLOCK_SNP_VCEK") {
             Some(path) => match std::fs::read(&path) {
                 Ok(der) => Some(VcekSource::Der(der)),
@@ -1569,8 +1597,11 @@ impl AirlockConfig {
             // The env lane is an operator pointing this broker at a gateway by
             // hand; there is no committed work behind it to point at.
             work: WorkRef::Direct,
+            #[cfg(feature = "verify")]
             snp_product,
+            #[cfg(feature = "verify")]
             snp_vcek,
+            #[cfg(feature = "verify")]
             pccs_url: env_nonempty("DUCKTAPE_AIRLOCK_PCCS_URL"),
         }))
     }
@@ -1578,6 +1609,7 @@ impl AirlockConfig {
 
 /// Fetch + verify the gateway quote and return the attested seal key, via the
 /// real vendor verifier (`airlock::verify`) against pinned Intel/AMD roots.
+#[cfg(feature = "verify")]
 async fn verify_gateway(
     gateway: &Gateway,
     cfg: &AirlockConfig,
@@ -1600,6 +1632,7 @@ async fn verify_gateway(
 /// builtins — nothing here can swap a trust anchor). Tests: an injected
 /// override, compiled OUT of non-test builds, so an in-process test enclave
 /// is verified through the real verify path.
+#[cfg(feature = "verify")]
 fn trust_roots(cfg: &AirlockConfig, mode: AttestMode) -> Result<TrustRoots, String> {
     #[cfg(test)]
     if let Some(roots) = test_trust_roots().lock().unwrap().clone() {
@@ -1620,7 +1653,7 @@ fn trust_roots(cfg: &AirlockConfig, mode: AttestMode) -> Result<TrustRoots, Stri
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "verify"))]
 fn test_trust_roots() -> &'static std::sync::Mutex<Option<TrustRoots>> {
     static ROOTS: std::sync::OnceLock<std::sync::Mutex<Option<TrustRoots>>> =
         std::sync::OnceLock::new();
@@ -2886,6 +2919,7 @@ mod tests {
     /// mints `acc-N`; `/v1/messages` accepts ONLY `Bearer acc-N` — so a 200
     /// proves the gateway swapped the session token for the real credential —
     /// and streams `AIRLOCK-OK`.
+    #[cfg(feature = "verify")]
     async fn airlock_mock_anthropic() -> String {
         use axum::response::IntoResponse;
         let n = Arc::new(Mutex::new(0u64));
@@ -2943,6 +2977,7 @@ mod tests {
     /// this file, so the parallel tests all agree on the injected trust roots.
     /// Its minted chain verifies through the REAL SNP verifier — only under
     /// its own roots, never under the AMD builtins.
+    #[cfg(feature = "verify")]
     fn test_enclave() -> &'static Arc<airlock::testkit::SnpTestEnclave> {
         static ENCLAVE: std::sync::OnceLock<Arc<airlock::testkit::SnpTestEnclave>> =
             std::sync::OnceLock::new();
@@ -2958,6 +2993,7 @@ mod tests {
 
     /// Boot an in-process airlock gateway (measures `0x11`×48) pointed at
     /// `upstream`, and return its base URL.
+    #[cfg(feature = "verify")]
     async fn boot_airlock_gateway(upstream: &str) -> String {
         let (app, vendor) = airlock::server::build_with_quoter(
             airlock::server::GatewayConfig {
@@ -2986,6 +3022,7 @@ mod tests {
         format!("http://{addr}")
     }
 
+    #[cfg(feature = "verify")]
     #[tokio::test]
     async fn airlock_broker_uses_the_gateway_as_credential_source() {
         let meas = "11".repeat(attest::MRTD_LEN);
@@ -3054,6 +3091,7 @@ mod tests {
         assert_ne!(broker.endpoint.run_bearer, "ref-seed");
     }
 
+    #[cfg(feature = "verify")]
     #[tokio::test]
     async fn airlock_broker_refuses_a_gateway_whose_measurement_mismatches() {
         let upstream = airlock_mock_anthropic().await;
@@ -3077,6 +3115,29 @@ mod tests {
         assert!(
             refused.is_err(),
             "a gateway whose measurement != the pinned audited image must be refused"
+        );
+    }
+
+    /// The mirror of the two tests above, for a build WITHOUT `verify`: an
+    /// `Attested` trust must still refuse BY NAME (never silently fall back to
+    /// a host credential) at the exact point it would otherwise fetch and
+    /// verify a quote. `PinnedSealPk` is untouched by this — see the
+    /// self-host tests below.
+    #[cfg(not(feature = "verify"))]
+    #[tokio::test]
+    async fn an_attested_trust_refuses_by_name_when_verify_is_not_compiled_in() {
+        let cfg = AirlockConfig {
+            gateway: AirlockGateway::Local { url: "http://127.0.0.1:1".into() },
+            trust: AirlockTrust::Attested { measurement: "11".repeat(48), attest: "snp".into() },
+            sub: "test-sub".into(),
+            work: WorkRef::Direct,
+        };
+        let Err(err) = resolve_anthropic_upstream(Some(cfg)).await else {
+            panic!("an Attested trust must refuse without the verify feature");
+        };
+        assert!(
+            err.contains("--features verify"),
+            "the refusal must name the rebuild flag: {err}"
         );
     }
 
