@@ -712,9 +712,11 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
 // only inside the window whose existence IS `huddle_popped`
 // (state/derived.ice).
 //
-// THE HEIGHT IS CAPPED, not fixed. `max-h` + `h=shrink` is the palette's own
-// shape (screens/overlays.ice): a two-person huddle draws a short card, and a
-// six-person one stops growing before it reaches the titlebar and scrolls.
+// THE HEIGHT IS THE WRAPPER'S, not the roster's. view.ice gives the card a
+// 320 x 300 box because the timeline underneath it has to give back exactly
+// that much (`huddle_timeline_inset`) — a card that grew with its roster would
+// be a card the timeline could only guess at. So one band takes the fill and
+// scrolls, and a ten-person huddle lengthens the strip inside it.
 component HuddleDock(channel:str, elapsed:str, rows:[HuddleTileRow], status:str, muted:bool, camera:bool, sharing:bool, stage:str, video_live:bool)
   emits
     collapse_huddle_dock
@@ -732,6 +734,7 @@ component HuddleDock(channel:str, elapsed:str, rows:[HuddleTileRow], status:str,
   box #root
     with
       w=fill
+      h=fill
       bg=surface
       border=border
       border-w=1.0
@@ -740,7 +743,7 @@ component HuddleDock(channel:str, elapsed:str, rows:[HuddleTileRow], status:str,
       shadow=shadow_modal
       shadow-y=16.0
       shadow-blur=40.0
-    col w=fill
+    col w=fill h=fill
       box
         with
           w=fill
@@ -836,15 +839,16 @@ component HuddleDock(channel:str, elapsed:str, rows:[HuddleTileRow], status:str,
               wrap=none
               font=code_medium
               @text-caption
-      // 248 plus the two chrome bands is ~342 — under 45% of the window the
-      // console ships at — and it SCROLLS rather than growing: a ten-person
-      // roster lengthens the strip inside the card, never the card.
-      box w=fill max-h=248.0
+      // THE ONE BAND THAT TAKES THE FILL, so the card is exactly the height
+      // its wrapper names (view.ice) and the timeline's inset is that same
+      // number rather than a guess about content. A ten-person roster
+      // lengthens the strip INSIDE this band; the card never grows.
+      box w=fill h=fill
         scroll
           with
             dir=vertical
             w=fill
-            h=shrink
+            h=fill
           col
             with
               w=fill

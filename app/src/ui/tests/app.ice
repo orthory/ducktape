@@ -1185,6 +1185,8 @@ test message_stream_reset_contract
         huddle_now
         call_muted
         huddle_popped=false
+        huddle_docked=false
+        huddle_pilled=false
         messages
         has_older_history
         history_view
@@ -1321,6 +1323,8 @@ test message_body_renders_as_one_rich_paragraph
         huddle_now
         call_muted
         huddle_popped=false
+        huddle_docked=false
+        huddle_pilled=false
         messages
         has_older_history
         history_view
@@ -1634,7 +1638,7 @@ test the_huddle_dock_reflows_and_keeps_leave_inside_its_card
   preset ui_huddle_sharing
   viewport 420 700
   mount
-    box w=fill
+    box w=fill h=300.0
       HuddleDock #dock
         with
           channel=huddle_channel_name
@@ -1667,9 +1671,9 @@ test the_huddle_dock_reflows_and_keeps_leave_inside_its_card
   expect card.width ~= 280.0
   expect leave.x + leave.width <= card.x + card.width
   expect share.width ~= 32.0
-  // The card is content-driven and capped, never the height of the window it
-  // is dropped into: 700px of column, and the huddle takes what it needs.
-  expect card.height < 420.0
+  // And the height is the wrapper's, not the roster's or the window's: the
+  // timeline under the card gives back exactly this much.
+  expect card.height ~= 300.0
 
 // A ROOM WITH NO HUDDLE IN IT, and a console to join one from.
 preset ui_huddle_join
@@ -1742,18 +1746,15 @@ test the_huddle_dock_survives_a_channel_and_a_module_switch
       huddle:
         box
           with
-            w=huddle_dock_width(huddle_joined, huddle_popped, huddle_dock_collapsed)
+            w=fill
             h=fill
+            align-x=end
             align-y=end
-          col w=fill
-            if huddle_joined && !huddle_popped && !huddle_dock_collapsed
-              box
-                with
-                  w=fill
-                  pl=13.0
-                  pr=13.0
-                  pt=13.0
-                  pb=13.0
+            pr=13.0
+            pb=huddle_dock_bottom(shell_tab)
+          col
+            if huddle_docked
+              box w=320.0 h=300.0
                 HuddleDock #dock
                   with
                     channel=huddle_channel_name
@@ -1773,15 +1774,8 @@ test the_huddle_dock_survives_a_channel_and_a_module_switch
                     toggle_call_mute -> toggle_call_mute
                     toggle_call_camera -> toggle_call_camera
                     toggle_call_screen -> toggle_call_screen
-            if huddle_joined && !huddle_popped && huddle_dock_collapsed
-              box
-                with
-                  w=fill
-                  pl=13.0
-                  pr=13.0
-                  pt=13.0
-                  pb=13.0
-                HuddleDockedPill #pill
+            if huddle_pilled
+              HuddleDockedPill #pill
                   with
                     channel=huddle_channel_name
                     elapsed=mmss(huddle_now - huddle_joined_at)
@@ -1814,11 +1808,13 @@ test the_huddle_dock_survives_a_channel_and_a_module_switch
       bell:
         space w=1.0 h=1.0
   target content = #console/content
-  target dock = #console/dock/root
-  target leave = #console/dock/root/controls/root/leave
-  target pill = #console/pill/root
-  // Not in one yet: nothing is docked and the module has the whole row.
-  // 1280 - 74 rail - 1 rule = 1205.
+  // The huddle layer lives INSIDE the module's own box now, so its ids chain
+  // off that box rather than off the window.
+  target dock = content/dock/root
+  target leave = content/dock/root/controls/root/leave
+  target pill = content/pill/root
+  // Not in one yet: nothing is docked, and the module's box is 1280 - 74 rail
+  // - 1 rule = 1205 wide. That number must NOT move again in this test.
   expect missing dock
   expect missing pill
   expect content.width ~= 1205.0
@@ -1845,10 +1841,18 @@ test the_huddle_dock_survives_a_channel_and_a_module_switch
   expect exists dock
   expect exists leave
   expect text "eng" within dock
-  // AND THE ROOM MADE ROOM. This is the no-overlap rule as a number: the
-  // module's content box is 420 narrower than it was, which is the width the
-  // huddle column took — not a card drawn on top of a box that never moved.
-  expect content.width ~= 785.0
+  // AND NOTHING REFLOWED. The card is a LAYER: the module's box is the width
+  // it was before the call started, which is the whole of the user's
+  // complaint about the column that preceded it.
+  expect content.width ~= 1205.0
+  // It floats in the module's own bottom-right corner — inside the content
+  // box, never over the rail — and it stops a composer band short of the
+  // bottom edge, which is what keeps it off Send.
+  expect dock.x + dock.width <= content.x + content.width
+  expect dock.x >= content.x
+  expect dock.width ~= 320.0
+  expect dock.height ~= 300.0
+  expect dock.y + dock.height <= content.y + content.height - 132.0
   // ANOTHER ROOM. The huddle is not this room's, and never was.
   // (The room this lands on is the harness's, not `"chan-ops"`: a mount test
   // answers `load_channel_window` with a synthetic reply and `chat_updated`
@@ -1865,18 +1869,25 @@ test the_huddle_dock_survives_a_channel_and_a_module_switch
   expect shell_tab == ShellTab.pages
   expect exists dock
   expect exists leave
+  expect content.width ~= 1205.0
+  // Pages ends its content at the wall, so the card takes the plain gutter
+  // rather than a composer band — one number per tab, and this is the other
+  // one.
+  expect dock.y + dock.height <= content.y + content.height - 13.0
   // FOLDED, AND GIVEN BACK. Neither touches the call: `huddle_joined` holds
   // across both.
   dispatch collapse_huddle_dock
   expect huddle_joined
   expect missing dock
   expect exists pill
-  // Folding gives most of the column back — a pill's width is all it keeps —
-  // and the pill is IN that column, so it cannot sit over a Send button.
-  expect content.width ~= 1015.0
-  expect pill.x >= content.x + content.width
+  // The pill takes the card's corner, and clears the same composer band: on
+  // Chat it can no more sit over Send than the card could.
+  expect content.width ~= 1205.0
+  expect pill.x + pill.width <= content.x + content.width
+  // 13, not the composer band: this is the Pages tab by now, and Pages ends
+  // its content at the wall.
+  expect pill.y + pill.height <= content.y + content.height - 13.0
   dispatch expand_huddle_dock
   expect exists dock
   expect missing pill
-  expect content.width ~= 785.0
-  expect dock.x >= content.x + content.width
+  expect content.width ~= 1205.0

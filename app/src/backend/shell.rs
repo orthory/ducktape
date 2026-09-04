@@ -827,40 +827,49 @@ fn duration_parts(seconds: i64) -> (i64, &'static str) {
 // artifact's clock is divergence, not a gap — see height_ago/height_label_short.
 
 /// Elapsed `mm:ss` for the huddle pills and panel.
-/// How much of the console row the huddle column takes — and, at zero, the
-/// rule that removes it.
+/// How far above the module's own bottom edge the huddle card floats.
 ///
-/// THE HUDDLE IS A COLUMN BESIDE THE MODULE, NOT A CARD OVER IT. A card
-/// floating in a corner covers whatever the module put there — the chat
-/// composer's Send, the Pages editor's bottom bar, the last rows of every
-/// timeline — and no single inset clears all of them on every tab. A row cell
-/// cannot overlap anything, so this is the whole geometry, in one number:
+/// THE CARD IS A LAYER, so the one thing it must never cover is whatever the
+/// tab put on that edge. Two tabs put a composer there — Chat's message box
+/// and Shell's prompt — and its Send button is at the right end of it, exactly
+/// where a bottom-right card lands. Every other module ends its content at the
+/// window wall and takes the plain gutter.
 ///
-/// - NO HUDDLE, or one popped into its own window: `0.0`, and the module has
-///   the entire row. There is no second visibility rule to keep in step with
-///   view.ice's two arms — a zero-width cell IS the absent column.
-/// - FOLDED to its pill: the pill's own width. A folded huddle has to give the
-///   room back, which a quarter-width column holding one pill would not.
-/// - OPEN: 420, the upper end of the specified 280-420 band, and what the card
-///   inside reflows to fill.
-///
-/// PIXELS, NOT A `fill(N)` PORTION. A portion cell is allotted its share of
-/// the row whether or not anything is in it, so the portion form charged every
-/// module a quarter of its width with no call anywhere in the app. The console
-/// is 1040 at its narrowest (app.ice) and the rail takes 75, so an open huddle
-/// leaves the module 545. That is comfortable everywhere except the widest
-/// chat layout — channel list AND thread rail open, 566 of panes on its own —
-/// and there the answer is the fold: a huddle you are listening to rather than
-/// watching costs the room a pill.
-pub fn huddle_dock_width(joined: bool, popped: bool, collapsed: bool) -> f64 {
-    const CLOSED: f64 = 0.0;
-    const PILL: f64 = 190.0;
-    const OPEN: f64 = 420.0;
-    let no_column = !joined || popped;
-    if no_column {
-        return CLOSED;
+/// A composer grows upward from a fixed base as a draft gets longer, so this
+/// clears it at its RESTING height and a many-line draft passes behind the
+/// card. Fold the huddle to its pill while writing one; the pill clears the
+/// same band.
+pub fn huddle_dock_bottom(tab: crate::ShellTab) -> f64 {
+    const COMPOSER_BAND: f64 = 132.0;
+    const WINDOW_EDGE: f64 = 13.0;
+    let over_a_composer = matches!(tab, crate::ShellTab::Chat | crate::ShellTab::Shell);
+    if over_a_composer {
+        COMPOSER_BAND
+    } else {
+        WINDOW_EDGE
     }
-    if collapsed { PILL } else { OPEN }
+}
+
+/// What the chat timeline gives back to the card floating over it.
+///
+/// A LAYER CANNOT GET OUT OF THE WAY, so the surface underneath has to. The
+/// timeline is bottom-anchored — a conversation grows up from the composer —
+/// and its last rows are the ones a corner card would sit on, which is the
+/// whole reason "floating" is usually a lie about not covering anything. This
+/// is that lie made false: the stream's bottom padding is exactly the height
+/// the card occupies plus its gutter, so the newest message stops above it
+/// instead of behind it.
+///
+/// The numbers are the wrapper's in view.ice (320 x 300 for the card, its own
+/// 13 gutter), which is why the card carries no size of its own: one owner.
+pub fn huddle_timeline_inset(docked: bool, pilled: bool) -> f64 {
+    const CARD: f64 = 313.0;
+    const PILL: f64 = 42.0;
+    const NOTHING: f64 = 0.0;
+    if docked {
+        return CARD;
+    }
+    if pilled { PILL } else { NOTHING }
 }
 
 pub fn mmss(seconds: i64) -> String {

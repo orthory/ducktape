@@ -239,7 +239,7 @@ fn node_operations_are_a_first_class_screen() {
     }
 
     let shell = include_str!("../ui/components/shell.ice");
-    assert!(shell.contains("ShellTab.node\n                  slot node"));
+    assert!(shell.contains("ShellTab.node\n                    slot node"));
     let view = include_str!("../ui/view.ice");
     assert!(view.contains("node:\n          NodeScreen"));
     assert!(view.contains("settings:\n          SettingsScreen"));
@@ -694,13 +694,17 @@ fn the_huddle_dock_rides_every_tab_and_keeps_one_video_surface() {
         .collect();
     assert_eq!(
         arms,
-        [
-            "if huddle_joined && !huddle_popped && !huddle_dock_collapsed",
-            "if huddle_joined && !huddle_popped && huddle_dock_collapsed",
-        ],
+        ["if huddle_docked", "if huddle_pilled"],
         "the dock is expanded or folded to its pill, and nothing else gates it"
     );
-    for arm in &arms {
+    // `huddle_docked`/`huddle_pilled` are derived from the huddle and nothing
+    // else, which is the property this walk is really about.
+    let derived_arms = inlined(include_str!("../ui/state/derived.ice"));
+    let derived_arms: Vec<&str> = derived_arms
+        .lines()
+        .filter(|line| line.trim_start().starts_with("huddle_"))
+        .collect();
+    for arm in arms.iter().copied().chain(derived_arms) {
         for elsewhere in ["shell_tab", "active_channel", "huddle_channel "] {
             assert!(
                 !arm.contains(elsewhere),
@@ -763,43 +767,49 @@ fn the_huddle_dock_rides_every_tab_and_keeps_one_video_surface() {
     );
 }
 
-/// THE HUDDLE RESERVES SPACE; IT DOES NOT FLOAT OVER THE MODULE.
+/// THE HUDDLE FLOATS, AND NOTHING UNDER IT MOVES SIDEWAYS.
 ///
-/// A card in the corner of the window covers whatever the module put at that
-/// corner — the chat composer's Send, the Pages editor's own bottom bar, the
-/// last rows of every timeline — and no single inset clears all of them on
-/// every tab. So the huddle is a CELL IN THE CONTENT ROW: it sits beside the
-/// module, the module's content box gets `fill(5)` against its `fill(2)`, and
-/// overlap is impossible by construction rather than by arithmetic.
+/// It was a cell in the content row for exactly one round: taking a column of
+/// its own shoved the whole module — chat screen, sidebar and all — across the
+/// window every time a call started, which is not a trade anybody wants for a
+/// call they can already hear. So it is a LAYER again, and the two things that
+/// make a layer honest are pinned here:
 ///
-/// This walks the three sources that have to agree on that: shell.ice mounts
-/// the slot in the row, view.ice fills it with a portion-width column whose
-/// clamp is `huddle_dock_width`, and the card itself carries no width at all.
+/// 1. IT IS THE MODULE'S CORNER. The stack is inside `#content`, so the card
+///    can never reach the nav rail or the titlebar, and the inset that keeps
+///    it off a composer is one number per tab.
+/// 2. WHAT IT COVERS PAYS FOR IT. The chat timeline is bottom-anchored, so it
+///    carries a bottom inset exactly the height of the card plus its gutter —
+///    the newest message stops above the card instead of behind it.
+///
+/// And the card still carries no size of its own: the wrapper in view.ice owns
+/// 320 x 300, which is the number `huddle_timeline_inset` is computed from.
 #[test]
-fn the_huddle_reserves_a_column_instead_of_floating_over_the_module() {
+fn the_huddle_floats_over_the_module_without_moving_it() {
     let shell = include_str!("../ui/components/shell.ice");
-    let row = shell
-        .split_once("        row w=fill h=fill\n")
-        .expect("the rail/content row")
+    let content = shell
+        .split_once("          box #content")
+        .expect("the module's own box")
         .1;
-    let row = row.split_once("\n      slot ").map_or(row, |split| split.0);
+    let content = content
+        .split_once("\n      slot palette")
+        .map_or(content, |split| split.0);
     assert!(
-        row.contains("          slot huddle"),
-        "the huddle is a cell in the content row, not a layer over the window"
+        content.contains("            stack w=fill h=fill")
+            && content.contains("              slot huddle"),
+        "the huddle is a layer over the module's box, and only over that box"
     );
     assert!(
-        row.contains("              w=fill\n"),
-        "the module's content box takes whatever the huddle column leaves"
+        content.contains("              w=fill\n"),
+        "the module's box keeps the whole row: a layer reflows nothing"
     );
-    // And it is NOT in the window-level stack any more: `palette` and `bell`
-    // are the layers that legitimately float, and the huddle left them.
     let layers = shell
         .rsplit_once("\n      slot palette")
-        .expect("the floating layers")
+        .expect("the window-level layers")
         .1;
     assert!(
         !layers.contains("slot huddle"),
-        "a floating huddle is the overlap this test exists to prevent"
+        "over the window it would reach the rail and the titlebar"
     );
 
     let view = inlined(include_str!("../ui/view.ice"));
@@ -810,27 +820,53 @@ fn the_huddle_reserves_a_column_instead_of_floating_over_the_module() {
     let slot = slot
         .split_once("\n        palette:\n")
         .map_or(slot, |split| split.0);
-    let column = slot
+    let anchors: Vec<&str> = slot
         .lines()
         .map(str::trim)
-        .find(|line| line.starts_with("box "))
-        .unwrap_or_default();
+        .filter(|line| line.starts_with("box w=fill h=fill"))
+        .collect();
     assert_eq!(
-        column,
-        "box w=huddle_dock_width(huddle_joined, huddle_popped, huddle_dock_collapsed) h=fill align-y=end",
-        "one number owns the column's width, and zero is what removes it"
+        anchors,
+        ["box w=fill h=fill align-x=end align-y=end pr=13.0 pb=huddle_dock_bottom(shell_tab)"; 2],
+        "both arms anchor bottom-right of the module, a tab's own bottom band \
+         above its edge"
     );
-    // NO INSET ANYWHERE. A `pb=` big enough to clear a composer is the shape
-    // of the floating dock this replaced, and it belongs to no tab now.
     assert!(
-        !slot.contains("huddle_dock_inset"),
-        "reserving space is the fix; an inset is the workaround it replaced"
+        slot.contains("box w=320.0 h=300.0"),
+        "the wrapper owns the card's size, once, where the inset can read it"
     );
 
-    // THE CARD CARRIES NO WIDTH. Its width is the column's, so a `max-w` or a
-    // fixed `w=` on any of the huddle's own surfaces is a second owner of the
-    // number — and the reason a joined huddle used to sit in a 312px card on a
-    // 2560px screen.
+    // NO CHILDLESS CONTAINER, IN ANY STATE. `Container::operate` unwraps its
+    // one layout child, and `operate` is what an accessibility action walks —
+    // so a `box` whose only children are `if`s that can all be false aborts
+    // the process the moment a screen reader presses anything in this app. A
+    // `col` with no children is fine; a `box` with none is not. Every `box`
+    // here therefore sits INSIDE an arm, under the slot's one `col`.
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let lines: Vec<&str> = slot
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.trim_start().starts_with("box ") {
+            continue;
+        }
+        let depth = indent_of(line);
+        let child = lines[index + 1..]
+            .iter()
+            .find(|next| indent_of(next) <= depth || !next.trim().starts_with("//"))
+            .map(|next| next.trim())
+            .unwrap_or_default();
+        assert!(
+            !child.starts_with("if "),
+            "a box whose only child is a condition is laid out with no child \
+             when that condition is false, and `operate` unwraps it: {line:?}"
+        );
+    }
+
+    // THE CARD CARRIES NO SIZE. A `max-w` or a fixed `w=` on any of the
+    // huddle's own surfaces is a second owner of that number — and the reason
+    // a joined huddle used to sit in a 312px card on a 2560px screen.
     let components = inlined(include_str!("../ui/components/huddle.ice"));
     let mut component = "";
     for line in components.lines() {
@@ -841,7 +877,7 @@ fn the_huddle_reserves_a_column_instead_of_floating_over_the_module() {
             ["HuddleDock", "HuddlePanel", "HuddleTile", "HuddleControls"].contains(&component);
         assert!(
             !(reflows && line.contains("max-w=")),
-            "{component} must reflow with the window it is given: {line:?}"
+            "{component} must reflow with the box it is given: {line:?}"
         );
     }
     let dock = components
@@ -849,8 +885,25 @@ fn the_huddle_reserves_a_column_instead_of_floating_over_the_module() {
         .expect("the dock")
         .1;
     assert!(
-        dock.contains("box #root w=fill bg=surface"),
-        "the dock is as wide as the column hands it and no wider"
+        dock.contains("box #root w=fill h=fill bg=surface"),
+        "the dock is exactly the box its wrapper hands it, in both directions"
+    );
+
+    // AND THE TIMELINE GIVES THE ROOM BACK. The stream is the surface the card
+    // sits on, so its bottom inset is not optional decoration.
+    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    let stream = chat
+        .split_once("scroll #message-stream")
+        .expect("the message stream")
+        .0;
+    let inset = stream
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or_default();
+    assert!(
+        inset.contains("pb=huddle_timeline_inset(huddle_docked, huddle_pilled)"),
+        "the newest message stops above the card, not behind it: {inset:?}"
     );
 }
 
@@ -2359,48 +2412,56 @@ fn the_account_card_gates_founding_and_the_last_key() {
     );
 }
 
-/// THE COLUMN'S THREE WIDTHS, and the band the open one has to land in.
+/// THE TWO NUMBERS THE FLOATING HUDDLE IS MADE OF.
 ///
-/// `max-w` is the whole space rule for the huddle column: view.ice's two arms
-/// decide what is DRAWN, and this decides whether the cell takes any of the
-/// row at all. A non-zero answer with nothing to draw is a dead gutter beside
-/// every module; a pill-sized answer is what gives the room back when the card
-/// is folded, which a 28% column holding one pill would not.
+/// A layer covers what is under it unless somebody does the arithmetic, and
+/// this is the arithmetic: how far above the module's bottom edge the card
+/// sits, and how much the timeline under it gives back. They are a pair — the
+/// inset is the card's own height plus its gutter — so they are pinned
+/// together, in the crate that owns them rather than in a comment.
 #[test]
-fn the_huddle_column_closes_folds_and_opens() {
-    use crate::backend::huddle_dock_width;
+fn the_huddle_clears_the_composer_and_the_timeline_clears_the_huddle() {
+    use crate::backend::{huddle_dock_bottom, huddle_timeline_inset};
 
-    let closed = [
-        ("no huddle", huddle_dock_width(false, false, false)),
-        ("no huddle, folded", huddle_dock_width(false, false, true)),
-        ("popped out", huddle_dock_width(true, true, false)),
-        ("popped out, folded", huddle_dock_width(true, true, true)),
-    ];
-    for (state, width) in closed {
-        assert_eq!(width, 0.0, "{state}: the module gets the whole row back");
+    // TWO TABS PUT A COMPOSER on their bottom edge, and its Send button is at
+    // the right end of it — exactly where a bottom-right card lands.
+    let composer_band = huddle_dock_bottom(crate::ShellTab::Chat);
+    assert_eq!(composer_band, huddle_dock_bottom(crate::ShellTab::Shell));
+    for wall in [
+        crate::ShellTab::Pages,
+        crate::ShellTab::Forge,
+        crate::ShellTab::Agents,
+        crate::ShellTab::Files,
+        crate::ShellTab::Node,
+        crate::ShellTab::Members,
+        crate::ShellTab::Governance,
+        crate::ShellTab::Settings,
+        crate::ShellTab::Explorer,
+    ] {
+        let gutter = huddle_dock_bottom(wall);
+        assert!(
+            gutter > 0.0 && gutter < composer_band,
+            "{wall:?} ends its content at the wall and takes the plain gutter"
+        );
     }
 
-    let folded = huddle_dock_width(true, false, true);
-    let open = huddle_dock_width(true, false, false);
+    // AND THE INSET IS THE CARD, NOT A GUESS. view.ice sizes the wrapper; this
+    // is that height plus its gutter, which is why the two are read together.
+    let view = inlined(include_str!("../ui/view.ice"));
     assert!(
-        folded > 0.0 && folded < open,
-        "folded is a pill's width, not a column's: {folded} vs {open}"
+        view.contains("box w=320.0 h=300.0"),
+        "the wrapper's size is what the inset below is computed from"
     );
-    assert_eq!(open, 420.0, "the upper end of the specified 280-420 band");
-
-    // AND THE LOWER END IS ARITHMETIC. The column takes `fill(2)` of what the
-    // nav rail leaves, against the content box's `fill(5)`, so the narrowest
-    // it is ever asked to be is set by the console's own minimum width — which
-    // is pinned here, because that is the number the band rests on.
-    let app = include_str!("../ui/app.ice");
+    let docked = huddle_timeline_inset(true, false);
+    let pilled = huddle_timeline_inset(false, true);
+    assert_eq!(docked, 313.0, "300 of card and its 13 gutter");
     assert!(
-        app.contains("min-size 1040 540"),
-        "the console's minimum is what puts a floor under the column's portion"
+        pilled > 0.0 && pilled < docked,
+        "a folded huddle still stands on the last row: {pilled}"
     );
-    const RAIL_AND_ITS_RULE: f64 = 75.0;
-    let narrowest = (1040.0 - RAIL_AND_ITS_RULE) * 2.0 / 7.0;
-    assert!(
-        narrowest > 260.0 && narrowest < open,
-        "the smallest console still hands the huddle a usable column: {narrowest}"
+    assert_eq!(
+        huddle_timeline_inset(false, false),
+        0.0,
+        "no card, no inset — the timeline runs to the composer"
     );
 }
