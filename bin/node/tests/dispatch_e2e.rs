@@ -1,6 +1,6 @@
 //! live multi-node dispatch e2e: REAL `ducktape` validators over
 //! localhost TCP, with REAL script-backed providers wired through the full
-//! capability-host path (operator spec dir -> discovery -> announce ->
+//! provider path (operator spec dir -> discovery -> announce ->
 //! resolve -> spawned CLI), driving the whole agent loop across nodes:
 //! mention -> engagement -> dispatch -> saga -> provider execution on the
 //! RIGHT node -> oracle result -> next-block delivery -> one chat reply.
@@ -72,7 +72,7 @@ const ROUND_TRIP: Duration = Duration::from_secs(300);
 /// one script-backed provider staged on disk for one node: an operator spec
 /// dir holding a single capability spec whose `detect.env` points at an
 /// executable script. the script answers on stdout in the spec's declared
-/// output format — a REAL provider through the full capability-host path
+/// output format — a REAL provider through the full provider path
 /// (discovery, announce, resolve, sandboxed spawn), minus the LLM bill.
 ///
 /// The script runs INSIDE the run's container, mounted read-only at

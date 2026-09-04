@@ -603,7 +603,7 @@ async fn serve_create(
         Ok(authority) => authority,
         Err(detail) => return refused("unknown_credential", &detail),
     };
-    // bin/node owns the record → ResolvedCredential mapping (capability-host must
+    // bin/node owns the record → ResolvedCredential mapping (provider-host must
     // not depend on the gateway crate): the seal_pk is the on-chain anchor, the
     // via is the host's own browser-gateway, the authority is the owner's airlock
     // route.

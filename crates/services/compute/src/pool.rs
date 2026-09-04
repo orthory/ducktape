@@ -612,7 +612,7 @@ async fn settle_attempt(
 /// fail-closed until the late operation settles and cleanup completes. This
 /// prevents host-side storage work from overlapping a replacement beyond the
 /// node's aggregate resource cap. The model call itself is bounded separately
-/// (X3, in capability-host). Tests shrink the window so a late step is
+/// (X3, in the provider). Tests shrink the window so a late step is
 /// observable without a wall-clock minute.
 fn workspace_step_timeout() -> Duration {
     if cfg!(test) {
@@ -2910,7 +2910,7 @@ format = "text"
         // the SOUL crosses provisioner → RunContext. it is assembled from the
         // MATERIALIZED skill mounts (only the provisioner can read them), so
         // this hop is the only way the persona ever reaches the model —
-        // capability-host then picks the door (the CLI's auto-load file, or a
+        // the provider then picks the door (the CLI's auto-load file, or a
         // prepend to the stdin prompt).
         assert_eq!(
             ctx.context_doc.as_deref(),

@@ -10,7 +10,7 @@
 //! verbatim with `duck-guest-init`.
 //!
 //! This crate is pure muscle — it decides nothing about WHICH executor runs or
-//! with what credentials. That is `capability-host`'s job, and it is the only
+//! with what credentials. That is `provider-host`'s job, and it is the only
 //! in-tree caller of the run path.
 
 use std::path::Path;
@@ -50,7 +50,7 @@ pub use sandbox::{SandboxBackend, Vmm};
 pub use workspace_image::GuestAsset;
 
 /// whether `p` is a file this process could exec. the shared predicate behind
-/// both PATH walks: the sandbox runtime probe here, and capability-host's
+/// both PATH walks: the sandbox runtime probe here, and the provider's
 /// executor discovery.
 pub fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;

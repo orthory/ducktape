@@ -199,7 +199,7 @@ fn non_empty_text(text: &str) -> String {
 }
 
 /// byte bound on the error excerpt a failure reply carries — same order as
-/// the host's diagnostic excerpts (capability-host bounds stderr to 400).
+/// the host's diagnostic excerpts (the provider bounds stderr to 400).
 pub(super) const FAILURE_EXCERPT_BYTES: usize = 400;
 
 /// a failed run's error as ONE bounded chat line: whitespace runs (newlines
