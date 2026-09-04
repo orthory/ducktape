@@ -86,7 +86,7 @@ pub const TEST_BLOCK_TIME_MS: u64 = 100;
 /// process is gone. A LIVE pid is never touched (sibling test binaries run
 /// concurrently), and pid reuse only makes the sweep skip a directory — it can
 /// never make it delete a live one.
-fn e2e_tempdir(tag: &str) -> tempfile::TempDir {
+pub fn e2e_tempdir(tag: &str) -> tempfile::TempDir {
     sweep_abandoned_e2e_dirs();
     tempfile::Builder::new()
         .prefix(&format!("ducktape-e2e-{}-{tag}-", std::process::id()))
@@ -141,12 +141,14 @@ pub struct NodeProc {
     pub id: u64,
     child: Child,
     pub log: PathBuf,
+    /// what this process is, for a wait's panic message.
+    what: String,
     feed: Arc<OutputFeed>,
 }
 
 impl NodeProc {
     /// spawn `cmd` as process `id`, its output draining into `log` and the feed.
-    fn spawn(id: u64, log: PathBuf, mut cmd: Command, what: &str) -> Self {
+    pub fn spawn(id: u64, log: PathBuf, mut cmd: Command, what: &str) -> Self {
         let (reader, writer) = std::io::pipe().expect("pipe for the process output");
         let stderr = writer.try_clone().expect("clone the pipe's write end");
         let child = cmd
@@ -171,6 +173,7 @@ impl NodeProc {
             id,
             child,
             log,
+            what: what.to_string(),
             feed,
         }
     }
@@ -179,6 +182,29 @@ impl NodeProc {
     fn wait_marker(&self, marker: &str, deadline: Instant) -> Result<String, Unanswered> {
         self.feed
             .wait(deadline, |unseen| find_marker(unseen, marker))
+    }
+
+    /// block until ONE line carries EVERY needle, and answer with that line.
+    ///
+    /// Matches against [`strip_ansi`]ed text: a `key=value` needle can never
+    /// match the raw bytes, because the node's stderr colours every field name
+    /// and its `=` separately.
+    pub fn expect_line(&self, needles: &[&str], timeout: Duration) -> String {
+        self.feed
+            .wait(Instant::now() + timeout, |unseen| {
+                strip_ansi(unseen)
+                    .lines()
+                    .find(|line| needles.iter().all(|needle| line.contains(needle)))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{} {} without printing one line carrying all of {needles:?};\n{}",
+                    self.what,
+                    why.verb(),
+                    self.tail(60)
+                )
+            })
     }
 
     /// which of `markers` a line carried first.
@@ -2040,6 +2066,33 @@ impl BlockFeed {
             }
         }
     }
+}
+
+/// Drop every ANSI escape sequence from `text`.
+///
+/// The node's stderr layer colours unconditionally — it never consults a tty —
+/// so a captured line reads `phase\x1b[0m\x1b[2m=\x1b[0m"serving"`, and any
+/// assertion on a `field=value` pair has to strip first. Message text is
+/// uncoloured, which is why the marker waits above never needed this.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI (`ESC [`) runs to a final byte in `@`..=`~`; any other escape is
+        // two characters, and its second one was just consumed.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn find_marker(text: &str, marker: &str) -> Option<String> {
