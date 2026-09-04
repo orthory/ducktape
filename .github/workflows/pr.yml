@@ -81,3 +81,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
       - run: cargo clippy --locked --workspace --tests --no-deps -- -D warnings
+      # the default workspace build never enables airlock's `verify` feature
+      # (#1302 — dcap-qvl/sev/a second reqwest-0.13 stack are opt-in), so the
+      # attested-path code (crates/services/broker/src/attested.rs,
+      # bin/node/src/cred_seal.rs) needs its own compile check or it rots
+      # unnoticed between the rare `--features verify` runs.
+      - run: cargo clippy --locked -p node-bin -p broker-host -p provider-host --tests --no-deps --features node-bin/verify,broker-host/verify,provider-host/verify -- -D warnings
