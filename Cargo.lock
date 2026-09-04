@@ -6322,6 +6322,7 @@ dependencies = [
  "topology",
  "tracing",
  "tracing-subscriber 0.3.23",
+ "unicode-normalization",
  "valset",
  "wasm-host",
  "wireguard",
