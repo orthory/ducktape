@@ -974,6 +974,9 @@ async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
                 noded::NetstackSwapRequest::Component(_) => {
                     Err("foreign contract: ducktape:netstack@0.2.0".to_string())
                 }
+                // the governance reconciler's variant: node-internal, never
+                // decoded from a request body (asserted below).
+                noded::NetstackSwapRequest::Bytes(_) => Err("bytes are not a route".to_string()),
             }
         })
     });
@@ -1015,19 +1018,24 @@ async fn netstack_swap_answers_the_plane_or_says_there_is_none() {
     );
 
     // a misspelled key must be a 400, never a request that silently swapped
-    // nothing.
-    let response = router
-        .oneshot(post(
-            "/v1/admin/netstack/swap",
-            serde_json::json!({ "backends": "native" }),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body_json(response).await["reason"],
-        "netstack_swap_body_invalid"
-    );
+    // nothing — and so must the node-internal bytes variant: this route reads
+    // a path on the node's own disk, and nothing off-box ships it component
+    // bytes.
+    for body in [
+        serde_json::json!({ "backends": "native" }),
+        serde_json::json!({ "backend": { "bytes": [0, 97, 115, 109] } }),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(post("/v1/admin/netstack/swap", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["reason"],
+            "netstack_swap_body_invalid"
+        );
+    }
 }
 
 /// THE regression this gate exists for: a LOOPBACK process with no operator

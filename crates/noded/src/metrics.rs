@@ -352,6 +352,14 @@ impl NodeMetrics {
         }
     }
 
+    /// the latest committed local block height — the same gauge
+    /// `ducktape_block_height` exposes, for a node-local task that must
+    /// compare committed state against the height it holds (the netstack
+    /// governance reconciler's activation floor).
+    pub fn block_height(&self) -> u64 {
+        u64::try_from(self.block_height.get()).unwrap_or(0)
+    }
+
     /// follow the committed height WITHOUT recording a block apply — the
     /// validator lane calls this for rejected frames (a deterministic no-op
     /// advances the height but is not a sample worth the block series; the

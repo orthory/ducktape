@@ -569,7 +569,10 @@ impl StreamHub {
         self.term_commands.clone()
     }
 
-    pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<BlockWake> {
+    /// one subscription to the block wake. The ws sessions ride it, and so
+    /// does any node-local task that must re-read committed state once per
+    /// block WITHOUT sitting on the drain's select loop.
+    pub fn subscribe_blocks(&self) -> broadcast::Receiver<BlockWake> {
         self.blocks.subscribe()
     }
 
