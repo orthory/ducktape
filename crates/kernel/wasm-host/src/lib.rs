@@ -660,6 +660,34 @@ fn read_shape(
     Ok(Shape::from_wit(declared))
 }
 
+/// the `ducktape:module` world's own exports — what makes a component a
+/// module at all, ahead of any question about whether THIS build can run it.
+const MODULE_WORLD_EXPORTS: [&str; 3] = ["shape", "execute", "query"];
+
+/// whether these bytes are a `ducktape:module` component AT ALL: they parse as
+/// a component and it exports the world's surface.
+///
+/// Deliberately NOT a loadability check ([`CompiledModule::compile`] is that,
+/// and it also links imports and runs `shape`). A genuine module whose bytes
+/// this build cannot run must still fail its boundary CLOSED — skipping it
+/// would seat a different registry set here than on peers that could run it,
+/// which is the silent fork the readiness probe exists to prevent. This asks
+/// the one question whose answer means "not an admission at all": code
+/// committed under an id for ANOTHER plane — the `ducktape:netstack` guest's
+/// configure/step/snapshot/restore — is a commitment record the module
+/// boundary has no business instantiating.
+pub fn speaks_module_abi(component_bytes: &[u8]) -> bool {
+    let Ok(engine) = Engine::new(&deterministic_config()) else {
+        return false;
+    };
+    let Ok(component) = Component::from_binary(&engine, component_bytes) else {
+        return false;
+    };
+    MODULE_WORLD_EXPORTS
+        .iter()
+        .all(|name| component.get_export_index(None, *name).is_some())
+}
+
 /// A wasm module: a `ducktape:module` component plus its host-owned
 /// authenticated state. Presented to the host as an ordinary [`sdk::Module`].
 pub struct WasmModule {

@@ -550,15 +550,28 @@ impl Admissions {
 
 #[async_trait::async_trait(?Send)]
 impl host::ModuleFactory for Admissions {
-    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Box<dyn Module>, sdk::Error> {
+    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<host::Admitted, sdk::Error> {
         let bindings = Bindings {
             invite: &self.invite,
             chain_id: &self.chain_id,
         };
         let mut stores = crate::bundle::qmdb_stores(&self.context);
-        let module = wasm_module(id, bytes, &mut stores, &self.substrates, &bindings, Start::Fresh)
-            .await
-            .map_err(sdk::Error::Module)?;
-        Ok(Box::new(module))
+        let seated =
+            wasm_module(id, bytes, &mut stores, &self.substrates, &bindings, Start::Fresh).await;
+        let refusal = match seated {
+            Ok(module) => return Ok(host::Admitted::Module(Box::new(module))),
+            Err(refusal) => refusal,
+        };
+        // ONLY now: do these bytes even speak the module ABI? A `ducktape:
+        // module` this build refused stays fail-closed (an older binary must
+        // never silently seat a different registry set than its peers); bytes
+        // that are no module at all are another plane's record, and this
+        // boundary is not the plane that realizes them. The extra compile is
+        // paid on the refusal path alone, and the host latches the answer.
+        let is_a_module = wasm_host::speaks_module_abi(bytes);
+        match is_a_module {
+            true => Err(sdk::Error::Module(refusal)),
+            false => Ok(host::Admitted::ForeignAbi),
+        }
     }
 }

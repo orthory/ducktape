@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
+use host::{Admitted, BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
 use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
@@ -57,8 +57,17 @@ struct WasmFactory;
 
 #[async_trait::async_trait(?Send)]
 impl ModuleFactory for WasmFactory {
-    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Box<dyn sdk::Module>, Error> {
-        Ok(Box::new(WasmModule::from_bytes(id, bytes)?))
+    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Admitted, Error> {
+        // the node's own answer, in miniature: a module that will not load
+        // HERE stays fail-closed; bytes that are no module at all are another
+        // plane's record (see `noded::compose::Admissions`).
+        match WasmModule::from_bytes(id, bytes) {
+            Ok(module) => Ok(Admitted::Module(Box::new(module))),
+            Err(refusal) => match wasm_host::speaks_module_abi(bytes) {
+                true => Err(refusal),
+                false => Ok(Admitted::ForeignAbi),
+            },
+        }
     }
 }
 
@@ -312,6 +321,86 @@ fn admission_fails_closed_without_a_module_factory() {
         realize(&mut host, H, &src).is_err(),
         "an armed admission with no factory must stop the boundary"
     );
+}
+
+/// THE REGISTRY IS ID-GENERIC AND THE BOUNDARY IS NOT. A record whose code is
+/// not a `ducktape:module` — the reachability plane's `ducktape:netstack`
+/// guest, delivered through the very same governance path — is SKIPPED here:
+/// it is not this boundary's to instantiate, and treating it as an admission
+/// would fail closed on every node, on every block, forever. The entry stays
+/// committed (its own plane's non-blocking reconciler reads it), the root-hash
+/// does not move, and a real admission in the same set still lands.
+#[test]
+fn a_foreign_abi_record_is_skipped_and_the_boundary_keeps_sealing() {
+    const NETSTACK: &[u8] = include_bytes!("../../../networking/netstack-machine/component.wasm");
+
+    let mut host = bare_host(true);
+    let src = MapSource::with(&[COMPONENT, NETSTACK]);
+    for (name, id, code) in [
+        ("netstack-v1", "netstack", NETSTACK),
+        ("kanban-v1", "kanban", COMPONENT),
+    ] {
+        submit(
+            &mut host,
+            3,
+            Origin::System,
+            modules_msg(&ModulesMsg::ScheduleRegister {
+                name: name.into(),
+                module_id: id.into(),
+                activation_height: H,
+                code_hash: sha(code),
+            }),
+        );
+        submit(
+            &mut host,
+            4,
+            Origin::External(MEMBER.to_vec()),
+            modules_msg(&ModulesMsg::SwapReady {
+                name: name.into(),
+                module_id: id.into(),
+            }),
+        );
+    }
+
+    let root_hash_before = host.root_hash();
+    realize(&mut host, H, &src).expect("a foreign-abi record must not stop the boundary");
+    assert!(
+        host.module_root("netstack").is_none(),
+        "nothing seated for another plane's component"
+    );
+    assert!(host.module_root("kanban").is_some(), "the real admission still lands");
+    assert_ne!(host.root_hash(), root_hash_before, "by exactly the real admission");
+
+    // the block seals: its ops apply and the drain-injected Advance flips both
+    // committed hashes — the netstack record stays in the registry, which is
+    // the whole point of committing it there.
+    submit(&mut host, H, Origin::External(vec![9; 32]), inc_msg());
+    assert_eq!(count(&host), 1, "the block applied");
+    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
+    let ModulesReply::ModuleStatus { modules } = modules::decode_reply(&bytes).expect("decode")
+    else {
+        panic!("expected ModuleStatus")
+    };
+    let netstack = modules
+        .iter()
+        .find(|m| m.module_id == "netstack")
+        .expect("the netstack record persists");
+    assert_eq!(
+        netstack.active_code_hash,
+        sha(NETSTACK),
+        "the registry carries the designated netstack code for its own plane to read"
+    );
+
+    // and every later boundary is a latched no-op — never a re-decision, never
+    // an error.
+    let sealed = host.root_hash();
+    for height in [H, H + 1, H + 2] {
+        realize(&mut host, height, &src).expect("later boundaries stay Ok");
+    }
+    assert_eq!(host.root_hash(), sealed, "the skip moves nothing");
+    submit(&mut host, H + 2, Origin::External(vec![9; 32]), inc_msg());
+    assert_eq!(count(&host), 2, "and blocks keep sealing");
 }
 
 /// an admission that never latches ready never arms — however high the height.

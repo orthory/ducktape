@@ -193,6 +193,40 @@ fn declared_shape_reads_a_real_component_and_refuses_garbage() {
     }
 }
 
+/// THE ABI QUESTION IS NOT THE LOADABILITY QUESTION. `speaks_module_abi` asks
+/// only whether the bytes are a `ducktape:module` at all, so a module boundary
+/// can SKIP code committed for another plane (the `ducktape:netstack` guest,
+/// whose world exports configure/step/snapshot/restore) instead of failing
+/// closed on it forever — while a genuine module keeps its fail-closed
+/// treatment whatever this build makes of it.
+#[test]
+fn speaks_module_abi_separates_a_module_from_another_plane_s_component() {
+    const NETSTACK: &[u8] = include_bytes!("../../../networking/netstack-machine/component.wasm");
+
+    assert!(
+        wasm_host::speaks_module_abi(HELLO),
+        "the shipped module fixture is a `ducktape:module`"
+    );
+    assert!(
+        !wasm_host::speaks_module_abi(NETSTACK),
+        "the netstack guest is a component, but not a module"
+    );
+    assert!(
+        WasmModule::declared_shape(NETSTACK).is_err(),
+        "and it is not loadable as one either — the two answers differ only for a MODULE"
+    );
+    for (what, bytes) in [
+        ("empty", Vec::new()),
+        ("not wasm at all", b"this is not a component".to_vec()),
+        ("truncated", b"\0asm\x0d\0\x01\0\x01\x02".to_vec()),
+    ] {
+        assert!(
+            !wasm_host::speaks_module_abi(&bytes),
+            "{what} bytes are no component at all"
+        );
+    }
+}
+
 /// A MODULE RUNS OVER THE SUBSTRATE ITS CODE DECLARES, NEVER ANOTHER: the host
 /// wrapping a map-declared component over a store is a wiring bug refused by
 /// name at load, not a module silently computing a root over the wrong
