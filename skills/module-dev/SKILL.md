@@ -126,8 +126,7 @@ encodings — not merely schema-compatible. A store-backed module's logical keys
 are hashed before they touch the store (`staged_store::store_key`, `sha256`),
 so the store carries no order and no prefix a new component could scan; the
 guest ABI a swapped-in component gets is `execute` and `query` and nothing
-else (`ducktape:module` WIT world). There is no migrate/scan import and none
-is coming: a new component cannot enumerate the records a key- or value-shape
+else (`ducktape:module` WIT world). There is no migrate/scan import: a new component cannot enumerate the records a key- or value-shape
 change would need to rewrite, because the keyspace it would scan is exactly
 the sha256 digests it can't invert. A key-layout or value-shape change is a
 new module id — a fresh `register`, decided at genesis if it must replace an
