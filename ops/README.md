@@ -25,17 +25,26 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 - `node/` — `ducktape-node@.service` (instance = workspace selector for
   `ducktape node run -n`), `ducktape-service@.service` (instance = kind for
   `ducktape service run compute|agent|airlock`) and the `copytruncate`
-  logrotate drop-in for `daemon.log` / `<kind>.log`. The install, port and
+  logrotate drop-in for `daemon.log` / `<kind>.log`. `install.sh` runs the
+  Linux install end to end (`--dry-run` prints it). The install, port and
   log recipe is `docs/deploy/node-service.md`; what to back up is
   `docs/deploy/backup-and-keys.md`.
+- `node/dev.ducktape.node.plist` + `node/install-macos.sh` — the macOS half:
+  a per-user LaunchAgent template and the script that renders it for one
+  workspace and hands it to `launchctl bootstrap gui/$(id -u)`
+  (`--dry-run` prints the rendered plist, `--uninstall` boots it out).
 
 ## Sandbox (microVM) hosts
 
 - `build-guest-rootfs.sh` — builds the guest kernel + rootfs image a Linux
   host's Firecracker sandbox boots each run from.
-- `macos-preflight.sh` — checks a macOS host for the vz backend (the
-  Virtualization.framework shim in `bin/duck-vz-shim`, the Kata kernel, the
-  file-descriptor limit the app lane needs).
+- `macos-preflight.sh` — checks a macOS host for everything the vz backend
+  needs (Hypervisor.framework, the CLT, `e2fsprogs`/`squashfs`/`zstd`, the musl
+  target, the entitled `bin/duck-vz-shim` on PATH, the guest kernel + rootfs)
+  and reports release-signing readiness — the Developer ID identities in the
+  keychain and the `ICE_NOTARY_*` variables — informationally, since a local
+  build needs neither. `--prompt` (what `make dev` passes) offers to run the
+  fixes it can.
 - `firecracker/` — `boot-bench.sh` and `snapshot-bench.sh`, the cold-boot and
   snapshot-restore timing lanes for the microVM sandbox.
 

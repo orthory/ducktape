@@ -16,7 +16,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-index-check labs-gate audit
+.PHONY: all app app-release dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-index-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -109,9 +109,40 @@ $(ICE_BIN):
 	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build" $(CARGO) install cargo-ice \
 		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
 
-## build the signed-ad-hoc Ducktape.app and DMG under target/ice-bundle
+## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed
+## unless the environment says otherwise — `cargo-ice bundle` reads these
+## itself, and this recipe inherits the environment, so nothing is forwarded
+## by hand:
+##   ICE_CODESIGN_IDENTITY  a "Developer ID Application: … (TEAMID)" identity
+##                          (`security find-identity -v -p codesigning`).
+##                          Signs the .app and the .dmg with --timestamp
+##                          --options runtime; without it both are signed
+##                          ad-hoc, which Gatekeeper refuses off this machine.
+##   ICE_NOTARY_KEY         path to the App Store Connect API key .p8
+##   ICE_NOTARY_KEY_ID      that key's id
+##   ICE_NOTARY_ISSUER      the issuer UUID
+##                          All three together add `xcrun notarytool submit
+##                          --wait` + `xcrun stapler staple` on the DMG. Set
+##                          without ICE_CODESIGN_IDENTITY, cargo-ice refuses
+##                          before the upload — Apple rejects an ad-hoc
+##                          signature.
+## The release recipe is app/README.md § "Release build".
 app: $(ICE_BIN)
 	"$(ICE_BIN)" bundle -p ducktape-app
+
+## `make app-release` for a build that leaves this machine: refuses unless a
+## real Developer ID identity is set, so an ad-hoc bundle cannot be shipped by
+## forgetting one variable. Notarization needs the three ICE_NOTARY_* vars on
+## top; without them the bundle is signed and stapleable but not stapled.
+app-release:
+	@if [ -z "$$ICE_CODESIGN_IDENTITY" ]; then \
+		echo "app-release needs ICE_CODESIGN_IDENTITY set to a Developer ID Application identity;" >&2; \
+		echo "list them with: security find-identity -v -p codesigning" >&2; \
+		echo "(and ICE_NOTARY_KEY, ICE_NOTARY_KEY_ID, ICE_NOTARY_ISSUER to notarize)" >&2; \
+		echo "see app/README.md § \"Release build\"; 'make app' builds the ad-hoc bundle" >&2; \
+		exit 1; \
+	fi
+	@$(MAKE) app
 
 ## install the operator CLI and desktop app without requiring root
 install: install-node install-app
