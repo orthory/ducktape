@@ -2,4 +2,3 @@
 # committed beside this file as component.wasm).
 /target
 /out
-/Cargo.lock

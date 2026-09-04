@@ -286,11 +286,10 @@ wasm-modules:
 	# hello mirrors its component into BOTH fixture homes; sibling/object write
 	# straight to the wasm-host fixture with no guest copy; hello-replacement
 	# builds the replacement crate directly into the host fixture. Each shape is
-	# unique — kept explicit. No $(LOCKED) below: these four are STANDALONE
-	# workspaces with no committed lock, and their components are kernel test
-	# fixtures — nothing the genesis hash pins. Committing their locks is what
-	# would earn them the flag.
-	cd crates/guests/hello-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	# unique — kept explicit. These five ARE STANDALONE workspaces (each owns a
+	# committed lock, so $(LOCKED) applies same as everywhere else) — their
+	# components are kernel test fixtures, nothing the genesis hash pins.
+	cd crates/guests/hello-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
 	  -o crates/guests/hello-wasm/component.wasm
@@ -301,21 +300,21 @@ wasm-modules:
 	# noop: the smallest compliant module, the admission fixture that touches
 	# nothing. Its component is committed beside the crate and pinned in the
 	# host fixtures, the hello shape.
-	cd crates/guests/noop-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/noop-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/noop-wasm/target/wasm32-unknown-unknown/release/noop_wasm.wasm \
 	  -o crates/guests/noop-wasm/component.wasm
 	cp crates/guests/noop-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/noop.component.wasm
-	cd crates/guests/hello-wasm-replacement && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/hello-wasm-replacement && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/hello-wasm-replacement/target/wasm32-unknown-unknown/release/hello_wasm_replacement.wasm \
 	  -o crates/kernel/host/tests/fixtures/hello-replacement.component.wasm
-	cd crates/guests/sibling-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/sibling-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
-	cd crates/guests/object-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/object-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/object.component.wasm
