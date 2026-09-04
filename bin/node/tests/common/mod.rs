@@ -190,16 +190,29 @@ impl NodeProc {
     /// match the raw bytes, because the node's stderr colours every field name
     /// and its `=` separately.
     pub fn expect_line(&self, needles: &[&str], timeout: Duration) -> String {
+        self.expect_line_where(&format!("one line carrying all of {needles:?}"), timeout, |line| {
+            needles.iter().all(|needle| line.contains(needle))
+        })
+    }
+
+    /// block until an ANSI-stripped line satisfies `accept`, and answer with
+    /// that line; `wanted` names it in the panic when the process never does.
+    pub fn expect_line_where(
+        &self,
+        wanted: &str,
+        timeout: Duration,
+        accept: impl Fn(&str) -> bool,
+    ) -> String {
         self.feed
             .wait(Instant::now() + timeout, |unseen| {
                 strip_ansi(unseen)
                     .lines()
-                    .find(|line| needles.iter().all(|needle| line.contains(needle)))
+                    .find(|line| accept(line))
                     .map(str::to_string)
             })
             .unwrap_or_else(|why| {
                 panic!(
-                    "{} {} without printing one line carrying all of {needles:?};\n{}",
+                    "{} {} without printing {wanted};\n{}",
                     self.what,
                     why.verb(),
                     self.tail(60)

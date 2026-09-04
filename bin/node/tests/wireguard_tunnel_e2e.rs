@@ -537,25 +537,28 @@ fn tunnel_first_invite_carries_the_mesh_with_no_tcp_ingress() {
     // tunnel. `MARGIN` makes it sustained folding rather than one straggler
     // already in flight.
     //
-    // The wait is `poll_until` and not the harness's block feed on purpose:
-    // that feed is a ws client against the node's app surface, and both nodes'
-    // surfaces live on loopback inside a namespace this process is not in.
-    // Reaching one would mean building the rig a third veth into the host —
-    // an observation network, to watch a number the product's own `node
-    // status` already prints. The predicate is still the node's own tip, and
-    // it exits on the first reading that clears the bar; the deadline only
-    // names the failure.
+    // The wait rides the joiner's own stderr, not its rpc: the app surface
+    // lives on loopback inside a namespace this process is not in. The
+    // resident's `node_checkpoint_written` line names the height it has
+    // folded, once per checkpoint interval, so the first one at or past the
+    // bar is the event.
     const MARGIN: u64 = 20;
     rig.cut_underlay_tcp();
     rig.assert_underlay_tcp_is_dead();
     let bar = rig.tip(&rig.founder_ns, &home, &founder_ws) + MARGIN;
-    nettest::poll_until(
-        &format!("the joiner to fold past {bar} with the underlay TCP path cut"),
+    joiner.expect_line_where(
+        &format!("a checkpoint at or past height {bar} with the underlay TCP path cut"),
         Duration::from_secs(60),
-        || {
-            rig.tip(&rig.joiner_ns, &home, &joiner_ws)
-                .ge(&bar)
-                .then_some(())
+        |line| {
+            let checkpoint = line.contains("node_checkpoint_written");
+            checkpoint && checkpoint_height(line).is_some_and(|height| height >= bar)
         },
     );
+}
+
+/// the `height=N` field of a checkpoint line.
+fn checkpoint_height(line: &str) -> Option<u64> {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("height="))
+        .and_then(|height| height.parse().ok())
 }
