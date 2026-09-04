@@ -130,8 +130,8 @@ $(ICE_BIN):
 app: $(ICE_BIN)
 	"$(ICE_BIN)" bundle -p ducktape-app
 
-## `make app` for a build that leaves this machine: refuses unless a real
-## Developer ID identity is set, so an ad-hoc bundle cannot be shipped by
+## `make app-release` for a build that leaves this machine: refuses unless a
+## real Developer ID identity is set, so an ad-hoc bundle cannot be shipped by
 ## forgetting one variable. Notarization needs the three ICE_NOTARY_* vars on
 ## top; without them the bundle is signed and stapleable but not stapled.
 app-release:
