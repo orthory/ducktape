@@ -4,8 +4,8 @@
 # `install -d`/`cp` are unconditional, `systemctl enable --now` on an already
 # enabled+running unit is a no-op). Linux/systemd only — the units and paths
 # this script writes (`/etc/systemd/system`, `/var/lib/ducktape`) have no
-# other-platform equivalent; run macos-preflight.sh for a dev-loop macOS host
-# instead.
+# other-platform equivalent. On macOS the node is a per-user LaunchAgent
+# instead: install-macos.sh beside this file.
 #
 # Usage:
 #   ops/node/install.sh --workspace <name> --init [-- <node init args...>]
