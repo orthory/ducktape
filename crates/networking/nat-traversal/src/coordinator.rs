@@ -311,6 +311,10 @@ impl Coordinator {
                         nonce,
                         "re-advertisement did not beat the stored nonce"
                     ),
+                    // AdvertBook::admit already logged the per-source refusal
+                    // (latched, reason "advert_source_cap") — nothing more to
+                    // do here.
+                    AdvertOutcome::Refused => {}
                 }
                 CoordinatorReplies::new()
             }
