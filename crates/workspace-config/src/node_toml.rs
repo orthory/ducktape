@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize as _;
 
+use super::PlumbingOverrides;
 use super::DEFAULT_PRIMARY_COORDINATOR;
 use super::{DEFAULT_BLOCK_TIME_MS, DEFAULT_CHECKPOINT_BLOCKS};
 
@@ -246,20 +247,17 @@ pub struct Plumbing {
     pub sandbox: Option<SandboxToml>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn merged_plumbing(
-    dir: &Path,
-    listen: Option<&str>,
-    advertised: Option<&str>,
-    http_listen: Option<&str>,
-    gateway_listen: Option<&str>,
-    rpc_listen: Option<&str>,
-    wireguard_listen: Option<&str>,
-    invite_listen: Option<&str>,
-    primary_coordinator: Option<&str>,
-    wireguard_advertised: Option<&str>,
-    block_time_ms: Option<u64>,
-) -> Result<Plumbing, String> {
+pub fn merged_plumbing(dir: &Path, overrides: &PlumbingOverrides) -> Result<Plumbing, String> {
+    let listen = overrides.listen.as_deref();
+    let advertised = overrides.advertised.as_deref();
+    let http_listen = overrides.http.as_deref();
+    let gateway_listen = overrides.gateway.as_deref();
+    let rpc_listen = overrides.rpc.as_deref();
+    let wireguard_listen = overrides.wireguard_listen.as_deref();
+    let invite_listen = overrides.invite_listen.as_deref();
+    let primary_coordinator = overrides.primary_coordinator.as_deref();
+    let wireguard_advertised = overrides.wireguard_advertised.as_deref();
+    let block_time_ms = overrides.block_time_ms;
     let path = dir.join("node.toml");
     // an existing file must be a VALID network-shape file to contribute —
     // an incomplete or dev-seed file aborts the verb instead of being
@@ -549,10 +547,7 @@ mod tests {
     }
 
     fn fresh_default_plumbing(dir: &Path) -> Plumbing {
-        merged_plumbing(
-            dir, None, None, None, None, None, None, None, None, None, None,
-        )
-        .expect("fresh merge")
+        merged_plumbing(dir, &PlumbingOverrides::default()).expect("fresh merge")
     }
 
     /// the generated file round-trips through the strict parser and its
@@ -659,16 +654,11 @@ mod tests {
 
         let p = merged_plumbing(
             &dir,
-            Some("127.0.0.1:53000"),
-            None,
-            Some("127.0.0.1:53001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            &PlumbingOverrides {
+                listen: Some("127.0.0.1:53000".to_string()),
+                http: Some("127.0.0.1:53001".to_string()),
+                ..Default::default()
+            },
         )
         .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
@@ -699,10 +689,7 @@ mod tests {
             + "\n[sandbox]\nruntime = \"firecracker\"\nkernel = \"/g/vmlinux\"\n\
                rootfs = \"/g/rootfs.ext4\"\ncores = 4\nmem_gb = 0\n";
         std::fs::write(dir.join("node.toml"), edited).expect("write");
-        let p = merged_plumbing(
-            &dir, None, None, None, None, None, None, None, None, None, None,
-        )
-        .expect("merge");
+        let p = merged_plumbing(&dir, &PlumbingOverrides::default()).expect("merge");
         write_node_toml(&dir, &p).expect("rewrite");
         let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
         assert_eq!(raw.checkpoint_blocks, 7);

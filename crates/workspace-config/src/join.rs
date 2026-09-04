@@ -98,19 +98,7 @@ pub fn join_workspace(
     // Computed BEFORE anything lands on disk, so a corrupt existing node.toml
     // aborts the join instead of leaving a half-written directory.
     let fresh_workspace = !dir.join("node.toml").exists();
-    let mut plumbing = merged_plumbing(
-        &dir,
-        overrides.listen.as_deref(),
-        overrides.advertised.as_deref(),
-        overrides.http.as_deref(),
-        overrides.gateway.as_deref(),
-        overrides.rpc.as_deref(),
-        overrides.wireguard_listen.as_deref(),
-        overrides.invite_listen.as_deref(),
-        overrides.primary_coordinator.as_deref(),
-        overrides.wireguard_advertised.as_deref(),
-        overrides.block_time_ms,
-    )?;
+    let mut plumbing = merged_plumbing(&dir, overrides)?;
     // A FRESH joining workspace gets the same compute detection as `init`: the
     // platform runtime on PATH ⇒ a live `[sandbox]` table (announce stays off),
     // so agent runs and the terminal plane work without a config edit. A
@@ -243,9 +231,7 @@ pub fn detect_platform_sandbox() -> Option<(SandboxToml, PathBuf)> {
 /// The plumbing a caller with no overrides gets — exposed because both callers
 /// want to show it before writing it.
 pub fn default_plumbing(dir: &Path) -> Result<Plumbing, String> {
-    merged_plumbing(
-        dir, None, None, None, None, None, None, None, None, None, None,
-    )
+    merged_plumbing(dir, &PlumbingOverrides::default())
 }
 
 #[cfg(test)]

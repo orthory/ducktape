@@ -650,6 +650,25 @@ pub struct PlumbingArgs {
     pub block_time_ms: Option<u64>,
 }
 
+impl PlumbingArgs {
+    /// this flag set, named the way [`config::merged_plumbing`] wants them —
+    /// `init` and `join` build the identical struct from their own flags.
+    pub fn overrides(&self) -> config::PlumbingOverrides {
+        config::PlumbingOverrides {
+            listen: self.listen.clone(),
+            advertised: self.advertised.clone(),
+            http: self.http.clone(),
+            gateway: self.gateway.clone(),
+            rpc: self.rpc.clone(),
+            primary_coordinator: self.primary_coordinator.clone(),
+            wireguard_listen: self.wireguard_listen.clone(),
+            wireguard_advertised: self.wireguard_advertised.clone(),
+            invite_listen: self.invite_listen.clone(),
+            block_time_ms: self.block_time_ms,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
