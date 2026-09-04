@@ -72,12 +72,12 @@ use commonware_cryptography::{Signer as _, ed25519};
 // really verified) are the opt-in `verify` feature; the delegated-grant test
 // uses only the self-host lender (`airlock::client`/`airlock::seal`, no quote).
 #[cfg(feature = "verify")]
-use airlock::attest::{self, Measurement};
+use airlock::{
+    attest::{self, Measurement},
+    server::{self, AttestMode, GatewayConfig},
+    wire::{CredentialKind as WireCredentialKind, CredentialPayload},
+};
 use airlock::client::Gateway as AirlockClient;
-#[cfg(feature = "verify")]
-use airlock::server::{self, AttestMode, GatewayConfig};
-#[cfg(feature = "verify")]
-use airlock::wire::{CredentialKind as WireCredentialKind, CredentialPayload};
 
 use gateway::{
     CredentialKind, CredentialRecord, DuckDnsName, GATEWAY_CREDENTIAL_NS, GATEWAY_ROUTE_NS,
