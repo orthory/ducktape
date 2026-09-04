@@ -14,10 +14,13 @@
 //! loop — reads it and drives the same `swap_netstack()` conversion the admin
 //! route drives. Nothing here can defer a frame or return `Err` to the drain.
 //!
-//! THE DESIGNATION IS THE PENDING RECORD. A `ducktape:netstack` component is
-//! not a `ducktape:module`, so no validator's readiness probe can load it and
-//! `ScheduleRegister`'s R = n latch never closes for it: the entry stays
-//! pending forever, and the pending hash IS what governance designated. (The
+//! THE DESIGNATION IS THE PENDING RECORD, AT ITS ACTIVATION HEIGHT. A
+//! `ducktape:netstack` component is not a `ducktape:module`, so no validator's
+//! readiness probe can load it and `ScheduleRegister`'s R = n latch never
+//! closes for it: the entry stays pending, and the pending hash IS what
+//! governance designated. The HEIGHT half of the schedule is honoured
+//! regardless — governance schedules a swap AT a height and the registry's
+//! minimum swap lead exists so every node cuts over on the same block. (The
 //! module boundary skips such a record outright — see
 //! `Host::skip_foreign_admission`.)
 //!
@@ -56,20 +59,40 @@ enum Step {
     Swap([u8; 32]),
 }
 
-/// THE PURE DECISION: the committed registry roster and the designation this
-/// process last acted on → this tick's step. Reads nothing, writes nothing.
-fn step(modules: &[modules::ModuleCode], acted: Option<&[u8; 32]>) -> Step {
+/// the code a registry entry designates AT `height`: the scheduled swap once
+/// its activation height is reached, else the code already activated.
+///
+/// GOVERNANCE SCHEDULES A SWAP AT A HEIGHT. The registry's minimum swap lead
+/// exists so every node cuts over on the SAME block; acting on the record the
+/// moment it is committed would cut each node over at whatever block it first
+/// saw it. Below the floor the entry still designates what it activated
+/// before, so a node that restarts mid-schedule converges on the code the
+/// network runs now rather than waiting. An EMPTY answer designates nothing —
+/// an admission that has neither reached its floor nor ever activated.
+///
+/// The same first read [`modules::code_at`] makes, minus the readiness latch:
+/// no validator can ever signal `SwapReady` for a component that is not a
+/// `ducktape:module`, and the reachability plane needs no cross-validator
+/// synchrony (it contributes no root-hash).
+fn designated_code(entry: &modules::ModuleCode, height: u64) -> &[u8] {
+    let scheduled = entry
+        .pending
+        .as_ref()
+        .filter(|pending| height >= pending.activation_height);
+    match scheduled {
+        Some(pending) => &pending.code_hash,
+        None => &entry.active_code_hash,
+    }
+}
+
+/// THE PURE DECISION: the committed registry roster, the committed height, and
+/// the designation this process last acted on → this tick's step. Reads
+/// nothing, writes nothing.
+fn step(modules: &[modules::ModuleCode], height: u64, acted: Option<&[u8; 32]>) -> Step {
     let Some(entry) = modules.iter().find(|m| m.module_id == NETSTACK_MODULE_ID) else {
         return Step::Nothing;
     };
-    // the pending record is the designation while it exists (it never arms for
-    // a component the module readiness probe cannot load); an activated one
-    // takes over if the module-code path ever seats it.
-    let designated: &[u8] = match &entry.pending {
-        Some(pending) => &pending.code_hash,
-        None => &entry.active_code_hash,
-    };
-    let Ok(designated) = <[u8; 32]>::try_from(designated) else {
+    let Ok(designated) = <[u8; 32]>::try_from(designated_code(entry, height)) else {
         return Step::Nothing; // absent, or a hash no bytes can ever match.
     };
     let already_answered = acted == Some(&designated);
@@ -118,7 +141,10 @@ pub(crate) async fn reconcile(
         let Some(modules) = registry_roster(&commands).await else {
             continue; // the actor is busy or absent — the next block re-asks.
         };
-        let Step::Swap(designated) = step(&modules, acted.as_ref()) else {
+        // the committed height this node holds — the gauge every applied block
+        // sets before the wake that carries it.
+        let height = metrics.block_height();
+        let Step::Swap(designated) = step(&modules, height, acted.as_ref()) else {
             continue;
         };
         let Some(component) = blobs.get_chunk(&designated) else {
@@ -219,13 +245,17 @@ fn report_answer(label: &str, designated: &[u8; 32], answer: SwapAnswer, retries
 mod tests {
     use super::*;
 
+    /// governance's own schedule shape: a pending swap AT [`ACTIVATION`], and
+    /// whatever code the entry had activated before it.
+    const ACTIVATION: u64 = 10;
+
     fn entry(pending: Option<[u8; 32]>, active: &[u8]) -> modules::ModuleCode {
         modules::ModuleCode {
             module_id: NETSTACK_MODULE_ID.into(),
             active_code_hash: active.to_vec(),
             pending: pending.map(|code_hash| modules::ScheduledSwap {
                 name: "netstack-v1".into(),
-                activation_height: 10,
+                activation_height: ACTIVATION,
                 code_hash: code_hash.to_vec(),
                 readiness: Vec::new(),
                 ready_at: None,
@@ -251,23 +281,56 @@ mod tests {
     fn one_swap_per_designation_and_the_pending_record_is_the_designation() {
         let designated = [7; 32];
         let roster = vec![other(), entry(Some(designated), &[])];
-        assert_eq!(step(&roster, None), Step::Swap(designated));
+        assert_eq!(step(&roster, ACTIVATION, None), Step::Swap(designated));
         assert_eq!(
-            step(&roster, Some(&designated)),
+            step(&roster, ACTIVATION, Some(&designated)),
             Step::Nothing,
             "the same designation is answered exactly once"
         );
         let next = [8; 32];
         assert_eq!(
-            step(&[entry(Some(next), &[])], Some(&designated)),
+            step(&[entry(Some(next), &[])], ACTIVATION, Some(&designated)),
             Step::Swap(next),
             "a NEW designation is acted on"
         );
         assert_eq!(
-            step(&[other()], None),
+            step(&[other()], ACTIVATION, None),
             Step::Nothing,
             "a network that designates no netstack component swaps nothing"
         );
+    }
+
+    /// A SCHEDULED SWAP HAPPENS AT ITS HEIGHT. Governance schedules the cutover
+    /// block (the registry's minimum swap lead exists so every node cuts over
+    /// on the same one); a node that swapped the moment it saw the record
+    /// would cut over at whatever block it first read. Below the floor the
+    /// entry designates what it already activated — a node restarting
+    /// mid-schedule converges on the code the network runs NOW.
+    #[test]
+    fn a_scheduled_designation_waits_for_its_activation_height() {
+        let scheduled = [7; 32];
+        let roster = vec![entry(Some(scheduled), &[])];
+        assert_eq!(
+            step(&roster, ACTIVATION - 1, None),
+            Step::Nothing,
+            "below the activation height the schedule designates nothing yet"
+        );
+        assert_eq!(step(&roster, ACTIVATION, None), Step::Swap(scheduled));
+        assert_eq!(step(&roster, ACTIVATION + 1, None), Step::Swap(scheduled));
+        assert_eq!(
+            step(&roster, ACTIVATION + 1, Some(&scheduled)),
+            Step::Nothing,
+            "and it is still answered exactly once"
+        );
+
+        let running = [3; 32];
+        let replacing = vec![entry(Some(scheduled), &running)];
+        assert_eq!(
+            step(&replacing, ACTIVATION - 1, None),
+            Step::Swap(running),
+            "before the cutover the entry designates the code already activated"
+        );
+        assert_eq!(step(&replacing, ACTIVATION, None), Step::Swap(scheduled));
     }
 
     /// A designation is spent by an ANSWER. The plane's refusal is one (the
@@ -291,14 +354,18 @@ mod tests {
     #[test]
     fn an_activated_record_designates_and_an_unusable_one_does_not() {
         let active = [3; 32];
-        assert_eq!(step(&[entry(None, &active)], None), Step::Swap(active));
         assert_eq!(
-            step(&[entry(None, &[])], None),
+            step(&[entry(None, &active)], 0, None),
+            Step::Swap(active),
+            "an activation is already in force — there is no height left to wait for"
+        );
+        assert_eq!(
+            step(&[entry(None, &[])], ACTIVATION, None),
             Step::Nothing,
             "an admission with no activation yet designates nothing"
         );
         assert_eq!(
-            step(&[entry(None, &[1, 2, 3])], None),
+            step(&[entry(None, &[1, 2, 3])], ACTIVATION, None),
             Step::Nothing,
             "a hash no bytes can match is not a swap"
         );
