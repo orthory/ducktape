@@ -119,6 +119,7 @@ daemon Ducktape
 use "extern/backend.ice"
 use "extern/editor.ice"
 use "extern/call.ice"
+use "extern/wasm_view.ice"
 use "ducktape-ui/recipes.ice"
 use "ducktape-ui/log-timeline.ice"
 use "theme.ice"

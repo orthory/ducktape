@@ -16,7 +16,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-index-check labs-gate audit
+.PHONY: all app app-release dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-views wasm-modules-check wasm-embed-check wasm-repro-check wasm-index-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -349,6 +349,20 @@ wasm-modules:
 	wasm-tools component new \
 	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/object.component.wasm
+
+## a module's VIEW: an Ice application built on ui-lang-guest to a core wasm
+## module (no componentizing — the app instantiates it directly, see
+## app/src/backend/wasm_view.rs), committed beside the module as `view.wasm`
+## and staged beside the binaries as `<id>.view.wasm` by crates/noded/build.rs.
+## Each view is a standalone workspace under crates/guests/views/<id>.
+VIEW_MODULES := governance
+
+wasm-views:
+	@for id in $(VIEW_MODULES); do \
+	  (cd crates/guests/views/$$id && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release) && \
+	  cp crates/guests/views/$$id/target/wasm32-unknown-unknown/release/$${id}_view.wasm \
+	    crates/modules/system/$$id/view.wasm || exit 1; \
+	done
 
 ## the drift gate for the committed component artifacts: every copy of the SAME
 ## module must be byte-identical (`node init` hashes the bundle into the

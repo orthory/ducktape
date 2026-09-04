@@ -197,6 +197,23 @@ on governance_loaded(next)
   gov_answered = true
   gov_rows = next.proposals
 
+// THE MODULE'S OWN VIEW. Loaded once at boot; absent means the screen above
+// stays. The widget's events all run one task — queries to the node, or a
+// reload after a trap — and the surface it answers with moves the wake, which
+// rebuilds the view and delivers what the task put in the guest's inbox.
+on gov_view_loaded(surface)
+  gov_view = surface
+
+on gov_view_failed(error)
+  gov_view = none
+
+on gov_view_event(event)
+  run every serve_wasm_view(gov_view, event, connected_rpc) -> gov_view_served _ | gov_view_failed _
+
+on gov_view_served(surface)
+  gov_view = surface
+  gov_view_wake = gov_view_wake + 1
+
 on governance_failed(cause)
   return if cause.generation != gov_generation
   gov_answered = true

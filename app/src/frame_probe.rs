@@ -1606,6 +1606,47 @@ fn drawn_frame(
     (cache, pixels)
 }
 
+/// The governance tab paints the module's own view when one is loaded: the
+/// widget takes the screen's place, the walk's redraw ticks the guest, and
+/// the guest's first frame queues the query the app must carry to the node.
+#[test]
+fn the_governance_tab_draws_the_modules_view_when_it_ships_one() {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(probe_governance_wasm_view)
+        .expect("the wasm view probe thread spawns")
+        .join()
+        .expect("the wasm view probe thread finishes");
+}
+
+fn probe_governance_wasm_view() {
+    let (mut app, console) = console_on(ShellTab::Governance);
+    let mut renderer = headless_renderer();
+    let (cache, native) = drawn_frame(
+        &mut app,
+        console,
+        &mut renderer,
+        user_interface::Cache::default(),
+    );
+    let view = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../crates/modules/system/governance/view.wasm"
+    ));
+    let surface = backend::wasm_view::WasmSurface::load_for_probe("governance", view)
+        .expect("the committed governance view loads");
+    app.gov_view = Some(surface.clone());
+    let (_, module) = drawn_frame(&mut app, console, &mut renderer, cache);
+    assert!(
+        native != module,
+        "the module's view paints something other than the native screen"
+    );
+    assert_eq!(
+        surface.queued_queries(),
+        1,
+        "the walk's redraw ticked the guest, whose first frame asks for the proposals"
+    );
+}
+
 /// A settled optimistic row keeps the identity already mounted in the keyed
 /// virtual timeline. Replacing its client identity with the canonical sequence
 /// used to wedge the main stream while the unkeyed thread rail kept working.

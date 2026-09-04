@@ -3345,7 +3345,9 @@ dependencies = [
  "ui-lang-build",
  "ui-lang-components",
  "ui-lang-runtime",
+ "ui-lang-wire",
  "usvg",
+ "wasmtime",
  "workspace-config",
  "x11rb",
  "zeroize",
@@ -4291,7 +4293,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 1.0.69",
- "windows 0.58.0",
+ "windows 0.54.0",
 ]
 
 [[package]]
@@ -10306,6 +10308,15 @@ source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=f18bfe648b26f
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "ui-lang-wire"
+version = "0.1.0"
+source = "git+https://github.com/byeongsu-hong/ducktape-ui.git?rev=f18bfe648b26f1d032f6a33ba441fdf66305e764#f18bfe648b26f1d032f6a33ba441fdf66305e764"
+dependencies = [
+ "bincode",
+ "serde",
 ]
 
 [[package]]
