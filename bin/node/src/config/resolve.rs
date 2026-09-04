@@ -465,8 +465,8 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     // non-empty by `load_valid_descriptor`, which BOTH paths run.
     let validators = descriptor.validator_keys()?;
     // one dial source of truth: reach_entries() folds bootstrap-synthesised
-    // Direct hints in with the typed `reach` hints (their union). Direct/Fronted
-    // resolve to a mesh Ingress dialed directly; Coordinated routes are handed
+    // Direct hints in with the typed `reach` hints (their union). Direct
+    // resolves to a mesh Ingress dialed directly; Coordinated routes are handed
     // to the nat client, which rendezvouses through the coordinator and
     // hole-punches to the target — but the target is still authenticated
     // end-to-end by its own key, so a coordinated peer is a real mesh member

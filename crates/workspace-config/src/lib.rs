@@ -409,7 +409,7 @@ impl NetworkDescriptor {
         let mut typed_keys = std::collections::BTreeSet::new();
         for s in &self.reach {
             let hint = ReachHint::parse(s)?;
-            // only a typed DIRECT/FRONTED route supersedes a bootstrap-
+            // only a typed DIRECT route supersedes a bootstrap-
             // synthesised Direct for the same key (the member's dial address
             // moved/upgraded). a Coordinated route is an ADDITIONAL rendezvous
             // path, not a replacement — it must not erase a real direct dial
@@ -421,8 +421,7 @@ impl NetworkDescriptor {
             // plane's tunnels apply, so letting it evict the underlay hint
             // strands the member behind a plane that has not assembled yet
             // (first join, promotion reboot, same-host tests).
-            if matches!(hint.reach, Reach::Direct(_) | Reach::Fronted(_))
-                && !self.overlay_route(&hint)?
+            if matches!(hint.reach, Reach::Direct(_)) && !self.overlay_route(&hint)?
             {
                 typed_keys.insert(hint.expected_key.as_ref().to_vec());
             }
@@ -440,7 +439,7 @@ impl NetworkDescriptor {
     /// classified as an overlay route, never an underlay replacement.
     fn overlay_route(&self, hint: &ReachHint) -> Result<bool, String> {
         let addr = match &hint.reach {
-            Reach::Direct(a) | Reach::Fronted(a) => a,
+            Reach::Direct(a) => a,
             Reach::Coordinated(_) => return Ok(false),
         };
         let Some(Ingress::Socket(sock)) = ingress_of(addr)? else {
@@ -478,8 +477,8 @@ impl NetworkDescriptor {
         }
     }
 
-    /// reach hints resolved to typed dial routes, hostname-native: `Direct`/
-    /// `Fronted` become an [`Ingress`] the mesh dials (a hostname stays a
+    /// reach hints resolved to typed dial routes, hostname-native: `Direct`
+    /// becomes an [`Ingress`] the mesh dials (a hostname stays a
     /// hostname, re-resolved per attempt); `Coordinated` becomes a route the
     /// nat client hole-punches through while still authenticating the
     /// target's own key end-to-end. advisory: an entry that cannot form a
@@ -496,7 +495,7 @@ impl NetworkDescriptor {
             std::collections::BTreeMap::new();
         for hint in self.reach_hints()? {
             let dial = match &hint.reach {
-                Reach::Direct(a) | Reach::Fronted(a) => match ingress_of(a)? {
+                Reach::Direct(a) => match ingress_of(a)? {
                     Some(ingress) => ReachDial::Direct(ingress),
                     None => continue, // unspecified ip / port 0 — advisory noise.
                 },
@@ -616,10 +615,9 @@ impl NetworkDescriptor {
 }
 
 /// a reach hint resolved to how the mesh actually reaches a member. `Direct`
-/// dials the ingress and authenticates `expected_key` end-to-end (a fronted
-/// path is transparent, so it looks the same to the dialer); `Coordinated`
-/// carries the coordinator's own ingress + identity so the nat client can
-/// rendezvous and hole-punch to the target.
+/// dials the ingress and authenticates `expected_key` end-to-end;
+/// `Coordinated` carries the coordinator's own ingress + identity so the nat
+/// client can rendezvous and hole-punch to the target.
 #[derive(Clone, Debug)]
 pub enum ReachDial {
     Direct(Ingress),
@@ -805,8 +803,6 @@ pub fn ingress_of(host_port: &str) -> Result<Option<Ingress>, String> {
 pub enum Reach {
     /// dial this `host:port` directly (today's bootstrap behaviour).
     Direct(String),
-    /// dial a transport forwarder that splices to the target.
-    Fronted(String),
     /// dial a coordinator (`coord_addr`) and ask it for a path to the target.
     Coordinated(CoordRef),
 }
@@ -835,7 +831,6 @@ impl ReachHint {
         let ek = hex_bytes(self.expected_key.as_ref());
         match &self.reach {
             Reach::Direct(a) => format!("direct:{ek}@{a}"),
-            Reach::Fronted(a) => format!("fronted:{ek}@{a}"),
             Reach::Coordinated(c) => {
                 format!(
                     "coordinated:{ek}@{}#{}",
@@ -856,7 +851,6 @@ impl ReachHint {
         let expected_key = decode_key(ek_hex)?;
         let reach = match tag {
             "direct" => Reach::Direct(addr_part.to_string()),
-            "fronted" => Reach::Fronted(addr_part.to_string()),
             "coordinated" => {
                 let (coord_addr, ck_hex) = addr_part
                     .rsplit_once('#')
@@ -1740,10 +1734,6 @@ mod tests {
             ReachHint {
                 expected_key: ek.clone(),
                 reach: Reach::Direct("127.0.0.1:9000".into()),
-            },
-            ReachHint {
-                expected_key: ek.clone(),
-                reach: Reach::Fronted("front.example.com:443".into()),
             },
             ReachHint {
                 expected_key: ek.clone(),

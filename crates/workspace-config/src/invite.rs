@@ -560,10 +560,6 @@ fn pack_invite(
                 out.push(0);
                 put_str_u8(&mut out, a)?;
             }
-            Reach::Fronted(a) => {
-                out.push(1);
-                put_str_u8(&mut out, a)?;
-            }
             Reach::Coordinated(c) => {
                 out.push(2);
                 put_str_u8(&mut out, &c.coord_addr)?;
@@ -680,7 +676,6 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
         let expected_key = r.take_key()?;
         let reach_val = match r.u8()? {
             0 => Reach::Direct(r.take_str_u8()?),
-            1 => Reach::Fronted(r.take_str_u8()?),
             2 => {
                 let coord_addr = r.take_str_u8()?;
                 let coord_key = r.take_key()?;
