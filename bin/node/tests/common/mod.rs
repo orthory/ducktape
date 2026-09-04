@@ -1602,6 +1602,13 @@ impl Cluster {
             })
     }
 
+    /// how many times node `idx` has printed `marker` so far — the ABSENCE
+    /// assertion `wait_marker` cannot express.
+    pub fn marker_count(&self, idx: usize, marker: &str) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.marker_count(marker)
+    }
+
     /// wait until node `idx`'s COMPUTE DAEMON prints a line containing `marker`.
     ///
     /// The compute plane is a SEPARATE PROCESS with its own failure domain, and

@@ -406,6 +406,54 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> ServeLaneBlobClient<S> {
             (!is_me).then(|| peer.clone())
         })
     }
+
+    /// the live peer book minus this node's own key — the co-validators and
+    /// residents a caller may address BY NAME (see [`Self::request_from`]).
+    pub fn other_peers(&self) -> Vec<ed25519::PublicKey> {
+        let peers = self.peers.read().expect("blob peers lock");
+        peers
+            .iter()
+            .filter(|peer| peer.as_ref() != self.requester.as_slice())
+            .cloned()
+            .collect()
+    }
+
+    /// one request ADDRESSED to a named peer. [`SyncClient::request`] takes
+    /// its peer off the rotating cursor, which every clone of this client
+    /// shares — the forge pack sweeper rotates it on its own failures — so a
+    /// caller that puts the peer's NAME on the answer must choose the peer
+    /// itself and carry it through the await.
+    pub async fn request_from(
+        &self,
+        peer: ed25519::PublicKey,
+        req: SyncRequest,
+    ) -> Result<SyncResponse, SyncError> {
+        let mut sender = self.sender.clone();
+        let pending = self.pending.clone();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (requester, proof) = (self.requester, self.proof);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending.lock().expect("pending blob lock").insert(id, tx);
+        let frame = statesync::encode_rpc(&requester, &proof, id, &statesync::encode_request(&req));
+        let attempted = sender.send(Recipients::One(peer), IoBuf::from(frame), false);
+        if attempted.is_empty() {
+            pending.lock().expect("pending blob lock").remove(&id);
+            return Err(SyncError::Transport(
+                "blob source unreachable (send attempted no recipients)".into(),
+            ));
+        }
+        match tokio::time::timeout(COCLIENT_TIMEOUT, rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            // timed out, or the demux dropped a malformed body: fail the
+            // request so the caller rotates — and clear our slot either way.
+            _ => {
+                pending.lock().expect("pending blob lock").remove(&id);
+                Err(SyncError::Transport(format!(
+                    "blob request {id} timed out on the serve lane"
+                )))
+            }
+        }
+    }
 }
 
 impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SourceRotate for ServeLaneBlobClient<S> {
@@ -419,37 +467,16 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobC
         &self,
         req: SyncRequest,
     ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
-        let mut sender = self.sender.clone();
-        let pending = self.pending.clone();
+        // the peer is chosen HERE, before the await, so the request and the
+        // answer it is attributed to name the same node even after a clone
+        // rotates the shared cursor underneath us.
         let peer = self.current_peer();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (requester, proof) = (self.requester, self.proof);
+        let client = self.clone();
         async move {
             let Some(peer) = peer else {
                 return Err(SyncError::Transport("no blob peers tracked".into()));
             };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            pending.lock().expect("pending blob lock").insert(id, tx);
-            let frame =
-                statesync::encode_rpc(&requester, &proof, id, &statesync::encode_request(&req));
-            let attempted = sender.send(Recipients::One(peer), IoBuf::from(frame), false);
-            if attempted.is_empty() {
-                pending.lock().expect("pending blob lock").remove(&id);
-                return Err(SyncError::Transport(
-                    "blob source unreachable (send attempted no recipients)".into(),
-                ));
-            }
-            match tokio::time::timeout(COCLIENT_TIMEOUT, rx).await {
-                Ok(Ok(resp)) => Ok(resp),
-                // timed out, or the demux dropped a malformed body: fail the
-                // request so the caller rotates — and clear our slot either way.
-                _ => {
-                    pending.lock().expect("pending blob lock").remove(&id);
-                    Err(SyncError::Transport(format!(
-                        "blob request {id} timed out on the serve lane"
-                    )))
-                }
-            }
+            client.request_from(peer, req).await
         }
     }
 }
