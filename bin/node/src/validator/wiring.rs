@@ -64,6 +64,8 @@ pub(super) struct RuntimeWiring {
     pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx:
         futures::channel::mpsc::Receiver<crate::sync::serve::SyncStateRequest>,
+    /// the send half of that seam, for this node's own root divergence watch.
+    pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
     /// unix seconds of the last served state-sync request — the drain reads it
     /// to defer oplog pruning while a syncer is actively pulling (the sync
     /// retention lease, see sync/serve.rs).
@@ -191,6 +193,7 @@ pub(super) async fn finish(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
     } = wire_serve_lanes(
         context,
@@ -240,6 +243,7 @@ pub(super) async fn finish(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
         relay_ingress,
     }
@@ -253,6 +257,10 @@ pub(super) struct ServeLanes {
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
+    /// the SEND half of the same seam, for a node-local reader: the root
+    /// divergence watch asks this node for its own tip coordinates exactly as
+    /// a peer would (see `sync::divergence`).
+    pub(super) sync_state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
     pub(super) sync_lease: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -323,6 +331,7 @@ pub(super) fn wire_serve_lanes(
         blob_proof,
     );
     let sync_lease = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let watch_state_tx = sync_state_tx.clone();
     let state_tx = sync_state_tx;
     let sync_lease_serve = sync_lease.clone();
     let mut sync_tx = sync_tx;
@@ -522,6 +531,7 @@ pub(super) fn wire_serve_lanes(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx: watch_state_tx,
         sync_lease,
     }
 }
