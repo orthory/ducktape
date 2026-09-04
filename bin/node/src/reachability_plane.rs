@@ -663,6 +663,10 @@ pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> Result
                 .map_err(|error| format!("{}: {error}", path.display()))?,
             step_fuel: reachability::NETSTACK_STEP_FUEL,
         },
+        noded::NetstackSwapRequest::Bytes(component) => reachability::NetstackBackend::Guest {
+            component,
+            step_fuel: reachability::NETSTACK_STEP_FUEL,
+        },
     };
     let name = backend.name();
     let lane = LIVE_PLANE

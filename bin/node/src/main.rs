@@ -82,6 +82,7 @@ mod mcp;
 mod mesh_book;
 mod mesh_window;
 mod module_cli;
+mod netstack_governance;
 mod node_http;
 mod overlay_book;
 mod plane_metrics;
@@ -678,6 +679,24 @@ fn run_node(
                     outcome
                 })
             });
+            // and the GOVERNANCE trigger for the same plane, on its own task:
+            // the module code registry carries the designated component as a
+            // commitment record, and this reconciler converges the plane onto
+            // it one block wake at a time. Deliberately not the module
+            // boundary — that one is fail-closed and rides the drain, and the
+            // reachability machine is per-node, root-hash-free, pre-genesis
+            // networking (`netstack_governance`).
+            //
+            // The command sender is the http surface's own (the gateway plane
+            // holds another clone): the reconciler READS committed state the
+            // same way `/v1/query` does.
+            tokio::spawn(netstack_governance::reconcile(
+                label.clone(),
+                status.clone(),
+                gateway_commands.clone(),
+                blobs.clone(),
+                stream_hub.subscribe_blocks(),
+            ));
         }
         status.publish(noded::NodeStatus {
             version: build_version(),
