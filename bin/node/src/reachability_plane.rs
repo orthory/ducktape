@@ -649,20 +649,46 @@ fn publish_live_plane(cmds: &tokio::sync::mpsc::Sender<reachability::Reachabilit
     *LIVE_PLANE.write().expect("live plane lock poisoned") = Some(cmds.downgrade());
 }
 
-/// Swap the live plane's netstack backend and answer the new backend's name,
-/// or the reason the plane refused. A refusal leaves the running machine
-/// untouched — the executor's contract — so this never retries.
+/// What one swap attempt came to. THE distinction a retrying caller needs: a
+/// machine that answered has decided (the same bytes decide the same way
+/// forever), while a swap no machine ever saw has decided nothing.
+pub(crate) enum SwapAnswer {
+    /// The plane took the swap and now runs this backend.
+    Swapped(String),
+    /// The plane REFUSED — a foreign contract, not a component, a restore
+    /// fault — and keeps running the machine it has, untouched. Deterministic:
+    /// re-offering the same bytes buys the same refusal.
+    Refused(String),
+    /// No machine was ever asked: no plane is running yet, the lane died
+    /// mid-flight (a promotion tears the old plane down before wiring the
+    /// next), or the request never resolved to a backend at all. Nothing was
+    /// attempted, so this is the ONE answer a caller may retry.
+    Unattempted(String),
+}
+
+/// Swap the live plane's netstack backend. A refusal leaves the running
+/// machine untouched — the executor's contract — so nothing retries a
+/// [`SwapAnswer::Refused`].
 ///
 /// The component path is read HERE, on the node: the route takes a path on the
-/// node's own disk and no caller ships bytes through it.
-pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> Result<String, String> {
+/// node's own disk and no caller ships bytes through it. The governance
+/// reconciler takes the [`noded::NetstackSwapRequest::Bytes`] road instead —
+/// its component is already a verified chunk on the blob plane.
+pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAnswer {
     let backend = match request {
         noded::NetstackSwapRequest::Native => reachability::NetstackBackend::Native,
-        noded::NetstackSwapRequest::Component(path) => reachability::NetstackBackend::Guest {
-            component: std::fs::read(&path)
-                .map_err(|error| format!("{}: {error}", path.display()))?,
-            step_fuel: reachability::NETSTACK_STEP_FUEL,
-        },
+        noded::NetstackSwapRequest::Component(path) => {
+            let component = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return SwapAnswer::Unattempted(format!("{}: {error}", path.display()));
+                }
+            };
+            reachability::NetstackBackend::Guest {
+                component,
+                step_fuel: reachability::NETSTACK_STEP_FUEL,
+            }
+        }
         noded::NetstackSwapRequest::Bytes(component) => reachability::NetstackBackend::Guest {
             component,
             step_fuel: reachability::NETSTACK_STEP_FUEL,
@@ -673,19 +699,42 @@ pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> Result
         .read()
         .expect("live plane lock poisoned")
         .clone()
-        .and_then(|weak| weak.upgrade())
-        .ok_or_else(|| "the reachability plane is not running".to_string())?;
+        .and_then(|weak| weak.upgrade());
+    let Some(lane) = lane else {
+        return SwapAnswer::Unattempted("the reachability plane is not running".to_string());
+    };
     let (reply, outcome) = tokio::sync::oneshot::channel();
-    lane.send(reachability::ReachabilityCommand::SwapBackend {
-        backend,
-        reply: reachability::SwapReply(reply),
-    })
-    .await
-    .map_err(|_| "the reachability plane stopped".to_string())?;
-    outcome
-        .await
-        .map_err(|_| "the reachability plane dropped the swap reply".to_string())?
-        .map(|()| name.to_string())
+    let sent = lane
+        .send(reachability::ReachabilityCommand::SwapBackend {
+            backend,
+            reply: reachability::SwapReply(reply),
+        })
+        .await;
+    if sent.is_err() {
+        return SwapAnswer::Unattempted("the reachability plane stopped".to_string());
+    }
+    match outcome.await {
+        Ok(Ok(())) => SwapAnswer::Swapped(name.to_string()),
+        Ok(Err(reason)) => SwapAnswer::Refused(reason),
+        Err(_) => {
+            SwapAnswer::Unattempted("the reachability plane dropped the swap reply".to_string())
+        }
+    }
+}
+
+/// Record one swap attempt in the `operations.netstack` projection — the ONE
+/// place it is written, for the operator's admin route and the governance
+/// reconciler alike. A refusal is recorded WITHOUT moving `backend`: the
+/// machine that was running still is.
+pub(crate) fn record_swap(metrics: &noded::NodeMetrics, answer: &SwapAnswer) {
+    match answer {
+        SwapAnswer::Swapped(backend) => {
+            metrics.set_netstack_backend(backend.clone());
+            metrics.record_netstack_swap(noded::NetstackSwapOutcome::Swapped, None);
+        }
+        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => metrics
+            .record_netstack_swap(noded::NetstackSwapOutcome::Refused, Some(reason.clone())),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

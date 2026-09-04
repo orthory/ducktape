@@ -21,16 +21,19 @@
 //! module boundary skips such a record outright — see
 //! `Host::skip_foreign_admission`.)
 //!
-//! ONE SWAP PER DESIGNATION. A backend that refuses the swap — a component
-//! built against another contract, refused by name before a byte of state is
-//! decoded — refuses it identically every time, and the running machine
-//! continues untouched. So a refusal is said once and not retried; only a NEW
-//! designation is acted on again. A designation this node holds no bytes for
-//! is the one thing that heals on its own (the code plane's push and the
-//! readiness pump's fetch land them), so that retries on the next block.
+//! ONE SWAP PER DESIGNATION — spent by a MACHINE'S ANSWER, not by an attempt.
+//! A backend that refuses the swap (a component built against another
+//! contract, refused by name before a byte of state is decoded) refuses it
+//! identically every time and keeps running untouched, so that refusal is said
+//! once and never retried; only a NEW designation is acted on again. The two
+//! non-answers heal on their own and retry on the next block: bytes this node
+//! does not hold yet (the code plane's push and the readiness pump's fetch
+//! land them), and a swap no plane was running to answer.
 
 use futures::SinkExt as _;
 use tokio::sync::broadcast::error::RecvError;
+
+use crate::reachability_plane::SwapAnswer;
 
 /// the module code registry id the reachability component is committed under.
 /// Deliberately absent from `topology::PRODUCTION`: netstack is no module, and
@@ -38,10 +41,10 @@ use tokio::sync::broadcast::error::RecvError;
 /// state at all.
 pub(crate) const NETSTACK_MODULE_ID: &str = "netstack";
 
-/// how often a designation this node cannot resolve to bytes says so: the
+/// how often an unapplied designation says so again: the
 /// first miss, then every 60th (roughly a minute of blocks). The counter is
 /// the diagnosis — an unconditional line per block would evict the ring.
-const MISS_REPORT_EVERY: u64 = 60;
+const RETRY_REPORT_EVERY: u64 = 60;
 
 /// what one tick owes the plane.
 #[derive(Debug, PartialEq, Eq)]
@@ -76,18 +79,29 @@ fn step(modules: &[modules::ModuleCode], acted: Option<&[u8; 32]>) -> Step {
     }
 }
 
+/// Has this designation been ANSWERED — spending its one try? A machine that
+/// spoke has decided, whichever way. A swap no plane was running to see
+/// decided nothing, and latching it would strand this node on the machine it
+/// happens to be on until governance designates something else.
+fn spends_the_designation(answer: &SwapAnswer) -> bool {
+    match answer {
+        SwapAnswer::Swapped(_) | SwapAnswer::Refused(_) => true,
+        SwapAnswer::Unattempted(_) => false,
+    }
+}
+
 /// Watch the registry and converge the plane. One pass per block wake — the
 /// node's own event, never a timer — and every pass re-derives from committed
 /// state, so a restart, a late join or a dropped wake all heal for free.
 pub(crate) async fn reconcile(
     label: String,
-    status: noded::StatusCell,
+    metrics: noded::NodeMetrics,
     commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     blobs: noded::blobs::BlobHandle,
     mut blocks: tokio::sync::broadcast::Receiver<noded::BlockWake>,
 ) {
     let mut acted: Option<[u8; 32]> = None;
-    let mut misses: u64 = 0;
+    let mut retries: u64 = 0;
     loop {
         let woken = blocks.recv().await;
         let node_is_alive = match woken {
@@ -108,22 +122,29 @@ pub(crate) async fn reconcile(
             continue;
         };
         let Some(component) = blobs.get_chunk(&designated) else {
-            misses += 1;
-            report_missing_bytes(&label, &designated, misses);
-            continue; // the code plane's push / the fetch lane heal this.
+            // the code plane's push and the readiness pump's fetch land them.
+            retries += 1;
+            report_retry(
+                &label,
+                &designated,
+                retries,
+                "netstack_code_absent",
+                "this node does not hold the designated component's bytes",
+            );
+            continue;
         };
-        misses = 0;
-        // LATCH BEFORE THE SWAP: whatever the plane answers, this designation
-        // has been answered. A refusal is deterministic and the machine keeps
-        // running; retrying it every block would say nothing new.
-        acted = Some(designated);
-        let outcome = status
-            .swap_netstack(noded::NetstackSwapRequest::Bytes(component))
-            .await;
-        let Some(outcome) = outcome else {
-            return; // no swapper wired: this node runs no reachability plane.
+        let request = noded::NetstackSwapRequest::Bytes(component);
+        let answer = crate::reachability_plane::swap_netstack(request).await;
+        crate::reachability_plane::record_swap(&metrics, &answer);
+        let decided = spends_the_designation(&answer);
+        retries = match decided {
+            true => 0,
+            false => retries + 1,
         };
-        report_outcome(&label, &designated, outcome);
+        if decided {
+            acted = Some(designated);
+        }
+        report_answer(&label, &designated, answer, retries);
     }
 }
 
@@ -149,32 +170,37 @@ async fn registry_roster(
     Some(modules)
 }
 
-fn report_missing_bytes(label: &str, designated: &[u8; 32], attempts: u64) {
-    let due = attempts == 1 || attempts.is_multiple_of(MISS_REPORT_EVERY);
+/// the forever-retry voice: attempt 1, then every [`RETRY_REPORT_EVERY`]th,
+/// carrying `attempts`. The counter IS the diagnosis, and a line per block
+/// would evict the ring it is evidence in.
+fn report_retry(label: &str, designated: &[u8; 32], attempts: u64, reason: &str, detail: &str) {
+    let due = attempts == 1 || attempts.is_multiple_of(RETRY_REPORT_EVERY);
     if !due {
         return;
     }
     tracing::warn!(
         target: "ducktape::reachability",
         node = %label,
-        reason = "netstack_code_absent",
+        reason,
         code_hash = %crate::config::hex_bytes(designated),
         attempts,
-        "governance designates a netstack component this node does not hold yet"
+        detail = %detail,
+        "the netstack component governance designates is not applied here; the next block \
+         re-offers it"
     );
 }
 
-fn report_outcome(label: &str, designated: &[u8; 32], outcome: Result<String, String>) {
+fn report_answer(label: &str, designated: &[u8; 32], answer: SwapAnswer, retries: u64) {
     let code_hash = crate::config::hex_bytes(designated);
-    match outcome {
-        Ok(backend) => tracing::info!(
+    match answer {
+        SwapAnswer::Swapped(backend) => tracing::info!(
             target: "ducktape::reachability",
             node = %label,
             backend = %backend,
             code_hash = %code_hash,
             "the reachability plane is on the netstack component governance designates"
         ),
-        Err(reason) => tracing::warn!(
+        SwapAnswer::Refused(reason) => tracing::warn!(
             target: "ducktape::reachability",
             node = %label,
             reason = "netstack_swap_refused",
@@ -183,6 +209,9 @@ fn report_outcome(label: &str, designated: &[u8; 32], outcome: Result<String, St
             "the plane refused the netstack component governance designates; it keeps \
              running the machine it has and this node will not retry these bytes"
         ),
+        SwapAnswer::Unattempted(detail) => {
+            report_retry(label, designated, retries, "netstack_plane_absent", &detail)
+        }
     }
 }
 
@@ -239,6 +268,21 @@ mod tests {
             Step::Nothing,
             "a network that designates no netstack component swaps nothing"
         );
+    }
+
+    /// A designation is spent by an ANSWER. The plane's refusal is one (the
+    /// same bytes buy it again forever); "no plane was running" is not, or a
+    /// swap offered in the gap a promotion leaves between two planes would
+    /// strand this node on the machine it happens to be on.
+    #[test]
+    fn only_a_machines_answer_spends_the_designation() {
+        assert!(spends_the_designation(&SwapAnswer::Swapped("guest".into())));
+        assert!(spends_the_designation(&SwapAnswer::Refused(
+            "foreign contract".into()
+        )));
+        assert!(!spends_the_designation(&SwapAnswer::Unattempted(
+            "the reachability plane is not running".into()
+        )));
     }
 
     /// An activated record (the module-code path seating one) designates its
