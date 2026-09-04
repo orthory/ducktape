@@ -3,7 +3,10 @@
 // onboarding.ice) loads the hub state and appearance once the window is up;
 // `connect` runs only after a pick, from `console_opened`.
 on mount
-  task window open onboarding -> onboarding_opened _
+  parallel
+    task window open onboarding -> onboarding_opened _
+    // A module's own view, if the modules dir beside the binary ships one.
+    run every load_wasm_view("governance") -> gov_view_loaded _ | gov_view_failed _
 
 // The persisted reading, applied on boot. The light block runs first and the
 // dark block reverses it — the handler grammar has no branches, so the

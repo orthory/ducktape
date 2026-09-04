@@ -18,7 +18,7 @@ camera = "Ducktape uses the camera for video in huddles."
 microphone = "Ducktape uses the microphone for voice in huddles."
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839", version = "=0.1.0" }
 
 [dependencies]
 # the network's node -> announced-provider registry, behind the Shell's host
@@ -112,10 +112,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # works on every OS the app runs on.
 gethostname = "1"
 zeroize.workspace = true
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", default-features = false, features = ["log-timeline", "terminal"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
+# `fira-sans` is the wasm view modules' font: a module lays its text out
+# in the guest against the one family embedded there, and the host must
+# replay those lines with the same faces or every run lands a few pixels off.
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "fira-sans", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
+ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839", default-features = false, features = ["log-timeline", "terminal"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
+# A module's view runs as wasm inside the app (`src/backend/wasm_view.rs`):
+# the wire is what crosses between the guest and the widget that shows it,
+# and wasmtime — the workspace's one pinned runtime — runs the module.
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839", version = "=0.1.0" }
+wasmtime.workspace = true
 
 # The native notification leg (`src/backend/notify.rs`): being @mentioned or
 # DM'd raises a real macOS banner, not just the in-app bell. objc2 0.5 and
@@ -139,4 +147,4 @@ commonware-cryptography.workspace = true
 iced_test = "=0.14.0"
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", version = "=0.1.0", default-features = false, features = ["test-runtime"] }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "78f123b9090ce05e730e5e59af087b27850d4839", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

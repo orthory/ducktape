@@ -86,6 +86,28 @@ fn stage_founding_set() {
         &checkout.join("crates/networking/netstack-machine/component.wasm"),
         &dest.join("netstack.component.wasm"),
     );
+    // A module's VIEW, when it ships one: the wasm the app runs as that
+    // module's screen (`app/src/backend/wasm_view.rs`), staged beside the
+    // component under the name the app looks for. Native or wasm alike — a
+    // view is the app's business, not the kernel's.
+    for spec in topology::TOPOLOGY.modules {
+        let Some(view) = view_artifact(&checkout, spec.id) else {
+            continue;
+        };
+        stage(&view, &dest.join(format!("{}.view.wasm", spec.id)));
+    }
+}
+
+/// `<module dir>/view.wasm` when the checkout carries one for the module,
+/// in either module home.
+fn view_artifact(checkout: &Path, id: &str) -> Option<PathBuf> {
+    [
+        checkout.join("crates/modules/apps").join(id),
+        checkout.join("crates/modules/system").join(id),
+    ]
+    .iter()
+    .map(|dir| dir.join("view.wasm"))
+    .find(|view| view.is_file())
 }
 
 /// the checkout directory a module's committed artifacts live in: the
