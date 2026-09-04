@@ -71,7 +71,6 @@ pub(super) async fn provision(
     // is cleaned up before a filesystem sample could reliably catch it).
     tracing::debug!(
         target: "ducktape::agent",
-        event = "run_dir_materialized",
         kind = "rw",
         path = %dir.display(),
         "run dir materialized kind=rw path={}", dir.display()
@@ -115,7 +114,6 @@ pub(super) async fn provision(
         // fact (see the rw marker above).
         tracing::debug!(
             target: "ducktape::agent",
-            event = "run_dir_materialized",
             kind = "ro",
             path = %ro_root.display(),
             "run dir materialized kind=ro path={}", ro_root.display()

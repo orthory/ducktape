@@ -99,7 +99,7 @@ const EVIDENCE_PROMPT: &str = "evidence-prompt.log";
 /// afterwards) have to be observed on the host — but a dir that lives only
 /// seconds and is gone before the assertions run can never be reliably
 /// caught by looking at the filesystem after the fact. The daemon's
-/// `run_dir_materialized` marker
+/// "run dir materialized" marker
 /// (`crates/noded/src/agent_provision/duckfs.rs`) fires the instant each
 /// checkout completes and lands in the process's continuously-drained
 /// output feed, so reading it back — after both runs finish, well after
@@ -427,10 +427,17 @@ fn a_portable_run_materializes_commits_and_chains_a_real_duckfs_workspace() {
         vec![runs_root_env.clone()],
     ]
     .concat();
+    // node 1's compute daemon prints the `run dir materialized` marker at
+    // debug under `ducktape::agent` (RUST_LOG appends to the daemon's info
+    // floor, it never replaces it), and `materialized_dirs` below reads it.
+    let agent_debug = (
+        "RUST_LOG".to_string(),
+        "ducktape::agent=debug".to_string(),
+    );
     cluster.env[1] = [
         provider.env(),
         hide_builtins(fixtures.path(), "node1"),
-        vec![runs_root_env.clone()],
+        vec![runs_root_env.clone(), agent_debug],
     ]
     .concat();
     cluster.env[2] = [hermetic_env(fixtures.path(), "node2"), vec![runs_root_env]].concat();
