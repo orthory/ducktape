@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::{Latch, NodeKey};
@@ -40,6 +40,10 @@ pub const REGISTRATION_TTL_SECS: u64 = 120;
 pub enum AdvertOutcome {
     Superseded,
     Stale,
+    /// A first-seen key whose source IP is already at
+    /// [`MAX_ADVERTS_PER_SOURCE_IP`]. Admission, not eviction: no existing
+    /// entry — from this source or any other — was touched.
+    Refused,
 }
 
 /// The reachability-plane reflexive registry: for each node key, the latest
@@ -69,6 +73,15 @@ pub enum AdvertOutcome {
 /// hands the choice back to whoever refreshes fastest, which is the attacker
 /// (an honest keepalive is 25 s apart; a sprayer picks its own rate).
 const MAX_ADVERTS: usize = 4096;
+
+/// Per-source-IP cap on distinct keys the coordinator admits from ONE
+/// observed IP. Mirrors `relay.rs`'s `MAX_SESSIONS_PER_IP`: this bounds
+/// admission, not eviction, so it does nothing against a botnet spread
+/// across many addresses — it only stops one host from claiming an
+/// unbounded share of [`MAX_ADVERTS`] by spraying keys from a single
+/// source. A handful is generous for any real host (a home gateway, a small
+/// rack) running several nodes behind one address.
+const MAX_ADVERTS_PER_SOURCE_IP: usize = 8;
 
 pub struct AdvertBook {
     latest: HashMap<NodeKey, ReflexiveAdvert>,
@@ -121,23 +134,32 @@ impl AdvertBook {
         match self.latest.get(&key) {
             Some(prev) if !self.expired(prev, now) && (prev.nonce > 0 || prev.reflexive != src) => {
             }
-            _ => self.insert_fresh(key, src, 0, now),
+            // A refusal (source at its per-IP cap) leaves nothing to react
+            // to here: no mapping existed before and none exists after.
+            _ => {
+                self.insert_fresh(key, src, 0, now);
+            }
         }
     }
 
     /// The one accepted-advert write path (`observe` and `readvertise` both
     /// end here): keep the key's existing seniority, or take a fresh admission
     /// slot for a first-seen key, then store the advert with its life restarted
-    /// at `now`.
-    fn insert_fresh(&mut self, key: NodeKey, src: SocketAddr, nonce: u64, now: u64) {
+    /// at `now`. Returns `false`, leaving state untouched, only when this is a
+    /// first-seen key AND [`Self::admit`] refuses it (its source is at
+    /// [`MAX_ADVERTS_PER_SOURCE_IP`]) — an existing key always succeeds,
+    /// refresh or not.
+    fn insert_fresh(&mut self, key: NodeKey, src: SocketAddr, nonce: u64, now: u64) -> bool {
         // Seniority belongs to the KEY and survives every refresh: a member
         // that re-advertises keeps the slot it earned instead of becoming the
         // newest arrival (and so the next victim).
-        let admitted = self
-            .latest
-            .get(&key)
-            .map(|prev| prev.admitted)
-            .unwrap_or_else(|| self.admit(now));
+        let admitted = match self.latest.get(&key) {
+            Some(prev) => prev.admitted,
+            None => match self.admit(src, now) {
+                Some(admitted) => admitted,
+                None => return false,
+            },
+        };
         self.latest.insert(
             key,
             ReflexiveAdvert {
@@ -147,15 +169,49 @@ impl AdvertBook {
                 admitted,
             },
         );
+        true
     }
 
-    /// Take an admission slot for a FIRST-SEEN key: reclaim space if the book
-    /// is at the cap, then stamp the next admission sequence.
-    fn admit(&mut self, now: u64) -> u64 {
+    /// Take an admission slot for a FIRST-SEEN key: refuse it outright if its
+    /// source IP already holds [`MAX_ADVERTS_PER_SOURCE_IP`] live entries —
+    /// never evicting one of them, so an at-cap source can never bump another
+    /// source out — otherwise reclaim space if the book itself is at
+    /// [`MAX_ADVERTS`], then stamp the next admission sequence.
+    fn admit(&mut self, src: SocketAddr, now: u64) -> Option<u64> {
+        if self.live_adverts_from(src.ip(), now) >= MAX_ADVERTS_PER_SOURCE_IP {
+            // peer-driven and unauthenticated by definition (any key can
+            // spray from one address), so this is latched like every other
+            // refusal in this crate — the count is the diagnosis.
+            static SOURCE_CAP: Latch = Latch::new();
+            if let Some(occurrences) = SOURCE_CAP.hit("advert_source_cap") {
+                tracing::warn!(
+                    target: "ducktape::reachability",
+                    event = "advert_refused",
+                    reason = "advert_source_cap",
+                    source = %src.ip(),
+                    cap = MAX_ADVERTS_PER_SOURCE_IP,
+                    occurrences,
+                    "source IP at its per-source advert cap — new key refused"
+                );
+            }
+            return None;
+        }
         self.evict_if_full(now);
         let admitted = self.next_admission;
         self.next_admission += 1;
-        admitted
+        Some(admitted)
+    }
+
+    /// Count of `ip`'s currently-live entries — what a fresh
+    /// [`MAX_ADVERTS_PER_SOURCE_IP`] check weighs. An expired entry no longer
+    /// counts: it is dead weight, exactly as `evict_if_full` treats it for
+    /// the whole book, so a source's slots free up as its members' keepalives
+    /// lapse rather than staying pinned until something else reclaims them.
+    fn live_adverts_from(&self, ip: IpAddr, now: u64) -> usize {
+        self.latest
+            .values()
+            .filter(|a| a.reflexive.ip() == ip && !self.expired(a, now))
+            .count()
     }
 
     /// Reclaim one slot for a first-seen key at the cap: an expired corpse if
@@ -232,12 +288,17 @@ impl AdvertBook {
         nonce: u64,
         now: u64,
     ) -> AdvertOutcome {
-        match self.latest.get(&key) {
-            Some(prev) if nonce <= prev.nonce && !self.expired(prev, now) => AdvertOutcome::Stale,
-            _ => {
-                self.insert_fresh(key, src, nonce, now);
-                AdvertOutcome::Superseded
-            }
+        let stale = matches!(
+            self.latest.get(&key),
+            Some(prev) if nonce <= prev.nonce && !self.expired(prev, now)
+        );
+        if stale {
+            return AdvertOutcome::Stale;
+        }
+        if self.insert_fresh(key, src, nonce, now) {
+            AdvertOutcome::Superseded
+        } else {
+            AdvertOutcome::Refused
         }
     }
 
@@ -422,12 +483,26 @@ mod tests {
         assert_eq!(book.current(NodeKey([0xcc; 32]), 0), None);
     }
 
+    /// Spread `i` across enough distinct source IPs that a `MAX_ADVERTS`-size
+    /// fill never trips [`MAX_ADVERTS_PER_SOURCE_IP`] — `MAX_ADVERTS_PER_SOURCE_IP`
+    /// keys share each synthetic `10.0.x.y` address before moving to the next
+    /// one. These pre-#1470 fills used ONE fixed address for every key; now
+    /// that a fixed address alone caps out at 8, scattering is what it takes
+    /// to keep exercising the GLOBAL cap's seniority-ordered eviction.
+    fn scattered_addr(i: u64) -> SocketAddr {
+        let group = i / MAX_ADVERTS_PER_SOURCE_IP as u64;
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, (group >> 8) as u8, group as u8)),
+            4000 + (i % MAX_ADVERTS_PER_SOURCE_IP as u64) as u16,
+        )
+    }
+
     /// Fill the book with `count` distinct keys registered at `now`.
     fn fill(book: &mut AdvertBook, count: u64, now: u64) {
         for i in 0..count {
             let mut k = [0u8; 32];
             k[..8].copy_from_slice(&i.to_le_bytes());
-            book.observe(NodeKey(k), addr(1, 4000), now);
+            book.observe(NodeKey(k), scattered_addr(i), now);
         }
     }
 
@@ -600,7 +675,7 @@ mod tests {
             k[..8].copy_from_slice(&i.to_le_bytes());
             // Promote everyone above the baseline so lowest-nonce eviction alone
             // cannot pick a deterministic victim...
-            book.readvertise(NodeKey(k), addr(1, 4000), 10, 1_000);
+            book.readvertise(NodeKey(k), scattered_addr(i), 10, 1_000);
         }
         // ...except one entry that is EXPIRED (its last accepted advert is far in
         // the past relative to the eviction moment).
@@ -618,5 +693,100 @@ mod tests {
         );
         assert_eq!(book.current(NodeKey(dead), 1_000), None);
         assert_eq!(book.latest.len(), MAX_ADVERTS);
+    }
+
+    /// One of `MAX_ADVERTS_PER_SOURCE_IP` distinct keys, all sharing ONE
+    /// source IP (`addr(200, ..)`) with a distinct port per key — the shape
+    /// of one host legitimately (or a sprayer illegitimately) running
+    /// several nodes behind the same address.
+    fn source_key(i: u64) -> NodeKey {
+        let mut k = [0x5Au8; 32];
+        k[..8].copy_from_slice(&i.to_le_bytes());
+        NodeKey(k)
+    }
+
+    #[test]
+    fn a_ninth_key_from_one_source_is_refused_while_another_source_stays() {
+        let mut book = AdvertBook::with_ttl(120);
+        let other = NodeKey([0x11; 32]);
+        book.observe(other, addr(9, 4000), 1_000);
+
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            book.observe(source_key(i), addr(200, 4000 + i as u16), 1_000);
+        }
+        assert_eq!(book.current(source_key(0), 1_000), Some(addr(200, 4000)));
+
+        // A NINTH key from the SAME source IP is refused outright: not
+        // admitted, and none of the eight already there is evicted to make
+        // room for it.
+        let ninth = source_key(MAX_ADVERTS_PER_SOURCE_IP as u64);
+        book.observe(ninth, addr(200, 9000), 1_000);
+        assert_eq!(
+            book.current(ninth, 1_000),
+            None,
+            "the 9th key from an at-cap source is refused"
+        );
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            assert_eq!(
+                book.current(source_key(i), 1_000),
+                Some(addr(200, 4000 + i as u16)),
+                "an at-cap source's own established keys are untouched"
+            );
+        }
+
+        // An established member from a DIFFERENT source IP is untouched too
+        // — the cap is per source, never global eviction pressure.
+        assert_eq!(
+            book.current(other, 1_000),
+            Some(addr(9, 4000)),
+            "an established member from a different source stays"
+        );
+    }
+
+    #[test]
+    fn a_refresh_from_a_capped_source_still_succeeds() {
+        let mut book = AdvertBook::with_ttl(120);
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            book.observe(source_key(i), addr(200, 4000 + i as u16), 1_000);
+        }
+
+        // The source IP is now at its cap; an EXISTING key from it still
+        // readvertises (a refresh is never an admission, so the cap never
+        // applies to it).
+        let member = source_key(3);
+        assert_eq!(
+            book.readvertise(member, addr(200, 4003), 1, 1_050),
+            AdvertOutcome::Superseded,
+            "a refresh from an already-held key is never refused by the source cap"
+        );
+        assert_eq!(book.current(member, 1_050), Some(addr(200, 4003)));
+
+        // ...and a plain re-observe (same source, still live) refreshes too.
+        book.observe(member, addr(200, 4003), 1_060);
+        assert_eq!(book.current(member, 1_060), Some(addr(200, 4003)));
+    }
+
+    #[test]
+    fn expiry_frees_a_capped_sources_slot() {
+        let mut book = AdvertBook::with_ttl(120);
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            book.observe(source_key(i), addr(200, 4000 + i as u16), 1_000);
+        }
+        let ninth = source_key(MAX_ADVERTS_PER_SOURCE_IP as u64);
+
+        // Refused while all eight are still alive.
+        book.observe(ninth, addr(200, 9000), 1_000);
+        assert_eq!(book.current(ninth, 1_000), None);
+
+        // Past the TTL (120s, per `with_ttl` above) every one of the eight
+        // is expired — dead weight, not counted against the cap — so the
+        // ninth key is now admitted.
+        let past_ttl = 1_000 + 120 + 1;
+        book.observe(ninth, addr(200, 9000), past_ttl);
+        assert_eq!(
+            book.current(ninth, past_ttl),
+            Some(addr(200, 9000)),
+            "expiry of the source's held slots frees room for a new key"
+        );
     }
 }
