@@ -611,6 +611,9 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         coordination: None,
         modules,
         genesis: hex_bytes(&genesis_hash),
+        // the founding beat: stated once here, carried by the invite, and
+        // inherited by every joiner — it is a genesis fact, not plumbing.
+        block_time_ms: args.block_time_ms,
     };
     if let Some(addr) = config::dialable(Some(&plumbing.advertised), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);

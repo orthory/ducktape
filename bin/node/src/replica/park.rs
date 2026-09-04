@@ -506,6 +506,11 @@ pub(super) async fn park(
         std::collections::BTreeMap::new();
     let mut warned_builds: std::collections::BTreeSet<(String, String)> =
         std::collections::BTreeSet::new();
+    // peer key hex -> how many times that peer's finalized root disagreed
+    // with ours at the SAME height — the divergence warn's latch memory; see
+    // `sync::divergence::note_peer_root`.
+    let mut peer_root_skew: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
 
     // ---- the RESIDENT's serving lanes ------------------------------
     //
@@ -1935,6 +1940,18 @@ pub(super) async fn park(
             &mut peer_builds,
             &mut warned_builds,
         );
+        // and the ROOT rode along with it. the stamp is a proxy that is wrong
+        // in both directions (every rebuild skews it while the state agrees;
+        // identical binaries still diverge on a corrupt store) — this is the
+        // invariant itself, and it was already on the wire.
+        if let Some(mine) = serving.as_ref().and_then(|(_, node_r)| node_r.finalized()) {
+            crate::sync::divergence::note_peer_root(
+                (mine.height, mine.root_hash),
+                &hex_bytes(source.as_ref()),
+                (tip.height, tip.root_hash),
+                &mut peer_root_skew,
+            );
+        }
         // A SOURCE JUST ANSWERED THIS NODE — the one event a refused index
         // backfill is waiting for. The walk is re-issued here and nowhere
         // else, so an unreachable source costs this loop nothing but the

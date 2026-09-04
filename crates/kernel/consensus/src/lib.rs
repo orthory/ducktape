@@ -467,10 +467,12 @@ impl ConsensusHandle {
 /// which is what keeps the 1-tx-1-block regime dead without a timer. raising it
 /// slows the idle height tick 1:1.
 ///
-/// the cadence is per-node policy (node.toml `block_time_ms`), not part of
-/// agreement: every timer below is a fixed multiple of the beat, so a node on
-/// a faster beat keeps the one relation that matters — the node's heartbeat
-/// never outpaces the hold it lands in.
+/// the cadence is a NETWORK fact, not per-node policy: it is founded into the
+/// network descriptor (`network.toml` `block_time_ms`, inside the genesis
+/// fingerprint) and every member inherits it off the invite. it has to be —
+/// every timer below is a fixed multiple of the LOCAL beat, so the relation
+/// that keeps a view advancing by one finalized block (`leader_timeout` >=
+/// the leader's `idle_hold`) only holds while every member beats the same.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cadence {
     pub block_time: std::time::Duration,

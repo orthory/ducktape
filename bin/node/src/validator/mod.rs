@@ -164,6 +164,7 @@ pub(crate) async fn run_validator(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
         relay_ingress,
     } = wiring::finish(
@@ -321,6 +322,15 @@ pub(crate) async fn run_validator(
         blob_client.clone(),
         blobs.clone(),
         forge_repo.clone(),
+        label.clone(),
+    ));
+    // the same lane again, for this validator's OWN state: poll a co-peer's
+    // finalized `(height, root)` and name a disagreement. a validator polls
+    // nobody otherwise, so a fold that silently diverged is invisible on a
+    // validator-only network — see `sync::divergence`.
+    tokio::spawn(crate::sync::divergence::watch_root_divergence(
+        blob_client.clone(),
+        sync_state_tx,
         label.clone(),
     ));
 
@@ -549,6 +559,7 @@ pub(crate) async fn run_promoted(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
     } = wiring::wire_serve_lanes(
         &context,
@@ -561,6 +572,15 @@ pub(crate) async fn run_promoted(
         sync_tx,
         sync_rx,
     );
+    // the seat's own root divergence watch, exactly the fresh boot's: the
+    // parked life's poll died with `park()`, and a promoted node — seated
+    // from a synced boundary — is the one most worth comparing against its
+    // co-validators. see `sync::divergence`.
+    tokio::spawn(crate::sync::divergence::watch_root_divergence(
+        blob_client.clone(),
+        sync_state_tx,
+        label.clone(),
+    ));
 
     // the books the parked role already runs its planes over follow the
     // seat's transport union.

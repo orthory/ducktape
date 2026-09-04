@@ -926,7 +926,7 @@ async fn the_live_subscription_waits_for_the_ui_to_drop_its_publication() {
 /// A TIP MOVES THE HEAD AND MUST FETCH NOTHING.
 ///
 /// The heartbeat rides every block, and an idle chain nop-fills once per
-/// block time (node.toml `block_time_ms`) — so anything this update
+/// block time (network.toml `block_time_ms`) — so anything this update
 /// triggers runs at ~1 Hz forever, on a chain where nothing happened. A load
 /// hung off it would be a poll wearing a consensus costume, and `/v1/query` is
 /// checkpoint-gated (`backend/live.rs`), so that poll would also be the thing
