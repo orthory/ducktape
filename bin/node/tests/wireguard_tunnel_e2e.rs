@@ -437,8 +437,7 @@ fn tunnel_first_invite_carries_the_mesh_with_no_tcp_ingress() {
         .args([
             "--wireguard-listen",
             &format!("{JOINER_UNDERLAY}:{WG_PORT}"),
-        ])
-        .args(["--block-time-ms", &block_time]);
+        ]);
     verb(join, "node join");
 
     // the blob IS the VPN credential (§5): it must carry the inviter's

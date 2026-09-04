@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     CoordRef, Coordination, ModuleCode, NetworkDescriptor, Reach, ReachHint, decode_key, hex_bytes,
-    unhex, validate_module_id,
+    unhex, validate_block_time_ms, validate_module_id,
 };
 
 /// the invite blob prefix. UNVERSIONED on purpose (bootstrapping posture): the
@@ -548,6 +548,10 @@ fn pack_invite(
     // what a joiner checks the fetched (or handed-out) genesis against
     // before installing a byte of it.
     out.extend_from_slice(&d.genesis_hash()?);
+    // the network's beat — the last fingerprint fact, and the one the joiner
+    // has no other source for: it runs consensus off this before it holds a
+    // block.
+    out.extend_from_slice(&d.block_time_ms.to_le_bytes());
 
     let hints = d.reach_hints()?;
     out.push(
@@ -669,6 +673,8 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
     }
     modules.sort_by(|a, b| a.id.cmp(&b.id));
     let genesis = hex_bytes(r.take(32)?);
+    let block_time_ms = u64::from_le_bytes(r.take(8)?.try_into().expect("8 bytes"));
+    validate_block_time_ms(block_time_ms)?;
 
     let hcount = r.u8()? as usize;
     let mut reach = Vec::with_capacity(hcount);
@@ -781,6 +787,7 @@ fn unpack_invite(bytes: &[u8], now_unix_secs: u64) -> Result<Invite, String> {
             reach,
             coordination,
             genesis,
+            block_time_ms,
             modules,
         },
         token,
@@ -865,6 +872,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
@@ -924,6 +932,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: test_modules(),
         };
@@ -949,6 +958,47 @@ mod tests {
         assert_eq!(invite.descriptor.genesis_namespace(), d.genesis_namespace());
     }
 
+    /// the beat rides the blob, because a joiner has no other source for it —
+    /// it runs consensus off the invite before it holds a single block. It is
+    /// also fingerprinted, so a member that somehow disagrees cannot handshake.
+    #[test]
+    fn the_invite_carries_the_networks_beat() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: 250,
+            genesis: "ab".repeat(32),
+            modules: test_modules(),
+        };
+        let invite = decode_invite(&encode_test_invite(&d, &issuer, None)).expect("roundtrip");
+        assert_eq!(invite.descriptor.block_time_ms, 250);
+        assert_eq!(invite.descriptor.genesis_namespace(), d.genesis_namespace());
+    }
+
+    /// a zero beat collapses every consensus timer, and a blob is untrusted
+    /// input — the decoder refuses it before the envelope is even verified.
+    #[test]
+    fn a_zero_beat_is_refused_at_decode() {
+        let issuer = ed25519::PrivateKey::from_seed(7);
+        let d = NetworkDescriptor {
+            chain_id: "ducktape#a1b2c3d4".into(),
+            validators: vec![hex_bytes(issuer.public_key().as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: 0,
+            genesis: "ab".repeat(32),
+            modules: Vec::new(),
+        };
+        let err = decode_invite(&encode_test_invite(&d, &issuer, None))
+            .expect_err("a zero beat never decodes");
+        assert!(err.contains("block_time_ms"), "{err}");
+    }
+
     #[test]
     fn a_malformed_module_hash_is_refused_at_encode_naming_the_module() {
         let issuer = ed25519::PrivateKey::from_seed(7);
@@ -958,6 +1008,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: vec![ModuleCode {
                 id: "pages".into(),
@@ -979,6 +1030,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: vec![ModuleCode {
                 id: "pages".into(),
@@ -1009,6 +1061,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: test_modules(),
         };
@@ -1071,6 +1124,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
@@ -1102,6 +1156,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
@@ -1151,6 +1206,7 @@ mod tests {
             // a `None` source resolves to Private, so it decodes as an EXPLICIT
             // "private" (semantically identical — see `coordination()`).
             coordination: Some("private".into()),
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
@@ -1175,6 +1231,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: Some("private".into()),
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
@@ -1205,6 +1262,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: Some("private".into()),
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         }
@@ -1356,6 +1414,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
@@ -1401,6 +1460,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         };
@@ -1433,6 +1493,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: "ab".repeat(32),
             modules: Vec::new(),
         }

@@ -860,6 +860,7 @@ fn workspace_facts_come_from_the_crate_that_wrote_them() {
         bootstrap: vec![],
         reach: vec![],
         coordination: None,
+        block_time_ms: workspace_config::DEFAULT_BLOCK_TIME_MS,
         modules: vec![],
         genesis: String::new(),
     }
@@ -886,7 +887,6 @@ wireguard_advertised = "auto"
 primary_coordinator = "none"
 coordinator_relay = "none"
 checkpoint_blocks = 32
-block_time_ms = 1000
 "#,
     )
     .unwrap();
