@@ -78,11 +78,6 @@ const TIME_BASED_WAITS: &[(&str, usize, &str)] = &[
         1,
         "SETTLE is a window of p2p tracker rounds, which are clocked, not block-paced",
     ),
-    (
-        "portable_workspace_e2e.rs",
-        1,
-        "the run-dir sampler witnesses directories that exist for seconds",
-    ),
 ];
 
 #[test]

@@ -1539,6 +1539,29 @@ impl Cluster {
             })
     }
 
+    /// every value that followed `marker` on a line of node `idx`'s COMPUTE
+    /// DAEMON output, in the order the daemon printed them.
+    ///
+    /// unlike `wait_compute_marker` (blocks for the FIRST match) this reads
+    /// what the continuously-drained feed already holds: a fact this quick to
+    /// fire and this transient on disk — a run dir materializes and is
+    /// cleaned up inside one run — can only be witnessed as an event stream,
+    /// never a filesystem sample that might land between the create and the
+    /// cleanup. See `portable_workspace_e2e`'s `materialized_dirs`.
+    pub fn compute_markers(&self, idx: usize, marker: &str) -> Vec<String> {
+        let daemon = self.daemons[idx]
+            .as_ref()
+            .expect("node has a compute daemon (set `compute_grant` before spawn)");
+        daemon
+            .text()
+            .lines()
+            .filter_map(|line| {
+                line.find(marker)
+                    .map(|at| line[at + marker.len()..].trim().to_string())
+            })
+            .collect()
+    }
+
     /// Wait until `probe` answers, re-evaluating it on node `idx`'s heartbeat.
     ///
     /// Replaces a 300ms client-side sleep-and-retry with a thread that blocks on
