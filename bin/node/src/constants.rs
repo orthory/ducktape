@@ -27,7 +27,7 @@ pub(crate) const NOP_TARGET: &str = noded::projection::NOP_TARGET;
 // pending ops the moment nothing of ours is in flight (`pump_eager_flush`),
 // so the network's own agreement speed paces blocks and ops aggregate behind
 // the one batch in flight. IDLE is the only timed cadence: the heartbeat
-// beats one nop block per block time (node.toml `block_time_ms`) so an idle
+// beats one nop block per block time (network.toml `block_time_ms`) so an idle
 // chain still finalizes (its height keeps ticking) and any pending cutover
 // still crosses — paced to the same interval the leader's idle-propose holds
 // a view open, so the idle beat never outpaces the view hold.
