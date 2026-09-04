@@ -25,66 +25,59 @@ const BLOCKS_DEFAULT_LIMIT: usize = 256;
 // passing its own genesis module list.
 // ---------------------------------------------------------------------------
 
-/// the index guests a node installs: id → mapper bytes for every module the
-/// topology declares one for. Each module's fluentabi mapper is built by
-/// `guest-builder --index` and committed beside its crate (`make
-/// wasm-modules` refreshes the set); a network's genesis carries the set its
-/// founder built, so every node on that network folds with the same mapper.
-///
-/// Declared-equals-actual either way it is built: a module the topology says
-/// ships a guest that the source lacks is a refusal by name, never a bare
-/// index quietly serving nothing.
+/// the index guests a node installs: id → mapper bytes for every module that
+/// ships one. Each module's fluentabi mapper is built by `guest-builder
+/// --index` and committed beside its crate (`make wasm-modules` refreshes the
+/// set); the build stages it into the founding set as `<id>.index.wasm` iff
+/// the crate declares the guest (`src/index_guest.rs`), and a network's
+/// genesis carries the set its founder built, so every node on that network
+/// folds with the same mapper. the artifact's presence IS the declaration:
+/// a module with no `<id>.index.wasm` ships no guest, and a database with
+/// no guest serves a bare feed.
 pub struct IndexGuests(BTreeMap<String, Vec<u8>>);
 
 impl IndexGuests {
     /// the guests a founding set holds for `module_ids` — the daemons that
-    /// run no network (noded, simnode, the dev shape) install from here.
+    /// run no network (noded, simnode, the dev shape) install from here. an
+    /// absent file is a module that ships no guest; any other read failure
+    /// names its path.
     pub fn from_dir<S: AsRef<str>>(dir: &std::path::Path, module_ids: &[S]) -> Result<Self, String> {
         let mut guests = BTreeMap::new();
-        for id in declared_index_guests(module_ids) {
+        for id in module_ids {
+            let id = id.as_ref();
             let path = workspace_config::index_guest_path(dir, id);
-            let bytes = std::fs::read(&path).map_err(|err| {
-                format!(
-                    "module {id} ships an index guest but {} is unreadable: {err} \
-                     (run `make wasm-modules`, or `cargo build` to stage the founding set)",
-                    path.display()
-                )
-            })?;
-            guests.insert(id.to_string(), bytes);
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    guests.insert(id.to_string(), bytes);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(format!(
+                        "module {id}: {} is unreadable: {err} \
+                         (run `make wasm-modules`, or `cargo build` to stage the founding set)",
+                        path.display()
+                    ));
+                }
+            }
         }
         Ok(Self(guests))
     }
 
-    /// the guests a genesis carries for `module_ids` — a node on a network
-    /// installs from its workspace genesis, never from a directory.
-    pub fn from_genesis<S: AsRef<str>>(
-        genesis: &workspace_config::Genesis,
-        module_ids: &[S],
-    ) -> Result<Self, String> {
-        let mut guests = BTreeMap::new();
-        for id in declared_index_guests(module_ids) {
-            let bytes = genesis.index_guest(id).ok_or_else(|| {
-                format!(
-                    "module {id} ships an index guest but the genesis carries none for it — \
-                     this genesis was composed from a different topology"
-                )
-            })?;
-            guests.insert(id.to_string(), bytes.to_vec());
-        }
-        Ok(Self(guests))
+    /// the guests a genesis carries — a node on a network installs from its
+    /// workspace genesis, never from a directory.
+    pub fn from_genesis(genesis: &workspace_config::Genesis) -> Self {
+        Self(
+            genesis
+                .index_guests
+                .iter()
+                .map(|a| (a.id.clone(), a.bytes.clone()))
+                .collect(),
+        )
     }
 
     fn get(&self, id: &str) -> Option<&[u8]> {
         self.0.get(id).map(Vec::as_slice)
     }
-}
-
-/// the ids of `module_ids` whose topology spec declares an index guest.
-fn declared_index_guests<S: AsRef<str>>(module_ids: &[S]) -> impl Iterator<Item = &str> {
-    module_ids
-        .iter()
-        .map(AsRef::as_ref)
-        .filter(|id| topology::TOPOLOGY.spec(id).is_some_and(|m| m.index_guest))
 }
 
 /// open the per-module index store under `<storage>/index`, deciding nothing
@@ -117,8 +110,9 @@ pub fn converge_index_guests(
     index: &indexer::IndexStore,
     guests: &IndexGuests,
 ) -> Result<(), String> {
-    let modules: Vec<indexer::IndexModule> = index
-        .module_ids()
+    let ids = index.module_ids();
+    let modules: Vec<indexer::IndexModule> = ids
+        .iter()
         .map(|id| indexer::IndexModule {
             id,
             guest: guests.get(id),
@@ -130,6 +124,29 @@ pub fn converge_index_guests(
             index.base().display()
         )
     })
+}
+
+/// the index covers every module the host runs: open a database for each id
+/// of `modules` the store lacks — a module the modules registry admitted
+/// after the store opened — leaving the ones it holds untouched. idempotent,
+/// and free when nothing was admitted. called after every compose and before
+/// every block fold, so an admitted module's feed begins at the block that
+/// seated it. a database opened here holds no guest (an admission ships
+/// none through the genesis) and serves a bare feed.
+pub fn index_host_modules<'a>(
+    index: &indexer::IndexStore,
+    modules: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    for id in modules {
+        index.open_module(id).map_err(|err| {
+            format!(
+                "open index database for module {id} at {}: {err} \
+                 (derived tier — delete the directory to rebuild)",
+                index.base().display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// flatten a dispatch origin into the index's plain origin tag: external
@@ -206,7 +223,7 @@ pub fn stale_modules(
     index: &indexer::IndexStore,
     boundary: u64,
 ) -> Result<Vec<String>, indexer::Error> {
-    let modules: Vec<String> = index.module_ids().map(str::to_string).collect();
+    let modules = index.module_ids();
     let mut stale = Vec::new();
     for module in modules {
         if index.applied_height(&module)? >= boundary {
@@ -325,20 +342,20 @@ pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
     let mut backfilled = serde_json::Map::new();
     let mut fold = serde_json::Map::new();
     for id in store.module_ids() {
-        match store.applied_height(id) {
+        match store.applied_height(&id) {
             Ok(height) => {
                 modules.insert(id.to_string(), height.into());
             }
             Err(err) => return index_error(err),
         }
-        match store.backfill_height(id) {
+        match store.backfill_height(&id) {
             Ok(Some(floor)) => {
                 backfilled.insert(id.to_string(), floor.into());
             }
             Ok(None) => {}
             Err(err) => return index_error(err),
         }
-        match store.fold_status(id) {
+        match store.fold_status(&id) {
             Ok(Some(status)) => match serde_json::to_value(&status) {
                 Ok(value) => {
                     fold.insert(id.to_string(), value);

@@ -149,13 +149,20 @@ impl CodeSource for NoCodeSource {
 
 /// instantiates a freshly-ADMITTED module from its verified component bytes at
 /// the activation boundary — the constructor twin of [`CodeSource`]. the node
-/// wires the wasm runtime's `from_bytes` here; the host itself stays
-/// wasm-runtime-agnostic. a host without a factory FAILS CLOSED (loudly) when
-/// an admission arms, and a net that never admits modules never notices.
+/// wires its module composer here (the one path every wasm module enters a
+/// host through); the host itself stays wasm-runtime-agnostic. a host without
+/// a factory FAILS CLOSED (loudly) when an admission arms, and a net that
+/// never admits modules never notices. async like [`CodeSource::fetch`]: a
+/// store-backed admission opens its store, and stores open asynchronously.
+#[async_trait::async_trait(?Send)]
 pub trait ModuleFactory: Send + Sync {
     /// a module instance for `id` from component bytes already verified
     /// against the committed code hash.
-    fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Box<dyn Module>, Error>;
+    async fn instantiate(
+        &self,
+        id: &str,
+        component_bytes: &[u8],
+    ) -> Result<Box<dyn Module>, Error>;
 }
 
 /// sha256 content hash of component bytes — the verify side of a code swap.
@@ -564,7 +571,7 @@ impl Host {
     }
 
     /// wire the constructor for post-genesis module admissions (the node
-    /// injects the wasm runtime's `from_bytes`; same shape as `CodeSource`).
+    /// injects its module composer; same shape as `CodeSource`).
     pub fn set_module_factory(&mut self, factory: Box<dyn ModuleFactory>) {
         self.module_factory = Some(factory);
     }
@@ -830,7 +837,7 @@ impl Host {
                             m.module_id,
                         )));
                     };
-                    let module = factory.instantiate(&m.module_id, &bytes)?;
+                    let module = factory.instantiate(&m.module_id, &bytes).await?;
                     if module.id() != m.module_id {
                         return Err(Error::Module(format!(
                             "module factory instantiated `{}` for admission `{}` — fail-closed",

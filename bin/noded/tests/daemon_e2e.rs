@@ -488,7 +488,9 @@ fn full_surface_blocks_authorship_and_ws() {
     let storage = tempfile::TempDir::new().expect("storage dir");
     let daemon = Daemon::spawn(storage.path());
 
-    // status at genesis: build version, height 0, every registered module root.
+    // status at genesis: build version, height 0, every registered module
+    // root — the host's live set, sorted by id (a registry admission joins
+    // it later, so no selection order could list it).
     let status = daemon.status();
     assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(status["height"], 0);
@@ -498,7 +500,9 @@ fn full_surface_blocks_authorship_and_ws() {
         .iter()
         .map(|m| m["id"].as_str().expect("module id"))
         .collect();
-    assert_eq!(modules, topology::SIM_BASE);
+    let mut genesis_set = topology::SIM_BASE.to_vec();
+    genesis_set.sort_unstable();
+    assert_eq!(modules, genesis_set);
     let genesis_hash = status["root_hash"].as_str().expect("root_hash").to_string();
 
     // connect before submitting: the stream heartbeats without a subscription,

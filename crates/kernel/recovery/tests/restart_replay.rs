@@ -55,9 +55,9 @@ async fn get_on(host: &Host, target: &str, key: &str) -> Option<String> {
 }
 
 /// a module admitted AFTER the checkpoint: the manifest never captured it, and
-/// the composer adopts it EMPTY (`adopt_admitted_modules`). the first block
-/// that touches it must replay from that empty pre-root — not be classed torn
-/// because the manifest holds no root for it.
+/// the composer starts it FRESH (its first activation is past the checkpoint
+/// height). the first block that touches it must replay from that empty
+/// pre-root — not be classed torn because the manifest holds no root for it.
 ///
 /// the module's op must be the FIRST thing sealed after the checkpoint: every
 /// seal records every host root, so an earlier replayed block would carry

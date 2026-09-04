@@ -30,8 +30,8 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use host::{BlockContext, Host, SubmitError};
 use indexer::IndexStore;
-use noded::bundle::{DirCodeSource, host_from, qmdb_stores};
-use noded::compose::{Bindings, Boot, Substrates, compose};
+use noded::bundle::{DirCodeSource, qmdb_stores};
+use noded::compose::{Admissions, Bindings, Boot, Substrates, compose};
 use noded::{
     BlockDisposition, BlockRecord, BlockSummary, LOCAL_CHAIN_ID, ModuleCategory, ModuleStatus,
     NodeCommand, NodeHandle, NodeMetrics, NodeStatus, ORACLE_ORIGIN, StreamHub, block_row,
@@ -40,10 +40,10 @@ use noded::{
 use sdk::{Event, Msg, Origin};
 use topology::TOPOLOGY;
 
-/// every module registered at genesis, in registry order — the `sim_base`
-/// selection of the single-source [`topology`] (identical to simnode's
-/// default set). status reports use this list, and `run_node` composes exactly
-/// these ids through the topology composer.
+/// every module registered at genesis — the `sim_base` selection of the
+/// single-source [`topology`] (identical to simnode's default set). `run_node` composes exactly these ids through the topology
+/// composer; status reports list the host's live set, which grows with the
+/// modules registry's admissions.
 const MODULE_IDS: &[&str] = topology::SIM_BASE;
 
 mod echo_oracle;
@@ -247,22 +247,23 @@ fn run_node(
             // no governance in this set, so nothing reads an invite namespace.
             invite: b"",
             chain_id: LOCAL_CHAIN_ID,
-            // and no valset: the single-writer daemon has no validators.
-            validators: &[],
-            code_hashes: &code_hashes,
         };
         let mut stores = qmdb_stores(&context);
-        let modules = compose(
+        let mut host = compose(
             MODULE_IDS,
             &code,
             &mut stores,
             &substrates,
             &bindings,
-            Boot::Genesis,
+            Boot::Genesis {
+                // no valset: the single-writer daemon has no validators.
+                validators: &[],
+                bundle: &code_hashes,
+            },
         )
         .await
         .expect("noded genesis composes");
-        let mut host = host_from(modules).expect("genesis");
+        host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &bindings)));
 
         tracing::info!(
             target: "ducktape::consensus",
@@ -542,19 +543,20 @@ fn publish_status(
     metrics.update_storage(
         0,
         index.is_poisoned(),
-        MODULE_IDS.iter().map(|id| {
-            ((*id).to_string(), index.applied_height(id).unwrap_or_default())
+        index.module_ids().into_iter().map(|id| {
+            let height = index.applied_height(&id).unwrap_or_default();
+            (id, height)
         }),
     );
-    let modules = MODULE_IDS
-        .iter()
-        .map(|id| ModuleStatus {
-            id: (*id).into(),
-            root: host
-                .module_root(id)
-                .map(|root| hex_root(&root))
-                .unwrap_or_default(),
-            category: ModuleCategory::of(id),
+    // the host's live set, sorted by id: the genesis selection plus every
+    // module the registry admitted since.
+    let modules = host
+        .module_roots()
+        .into_iter()
+        .map(|(id, root)| ModuleStatus {
+            category: ModuleCategory::of(&id),
+            root: hex_root(&root),
+            id,
         })
         .collect();
     status.publish(NodeStatus {
@@ -651,6 +653,7 @@ async fn submit_one(
         consensus_time,
         record,
         &out.dispatches,
+        &host.module_roots(),
     );
 
     // fan the block out live after the derived index had its chance to

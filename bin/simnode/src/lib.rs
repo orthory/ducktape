@@ -137,8 +137,8 @@ use host::BlockOp;
 use host::worker;
 use indexer::IndexStore;
 use node::{ConsensusTimePolicy, DrainedFrame, NullSink, OrderedNode, StepHandle, StepOrderer};
-use noded::bundle::{DirCodeSource, host_from, qmdb_stores};
-use noded::compose::{Bindings, Boot, Substrates, compose};
+use noded::bundle::{DirCodeSource, qmdb_stores};
+use noded::compose::{Admissions, Bindings, Boot, Substrates, compose};
 use noded::{
     BlockDisposition, BlockSummary, LOCAL_CHAIN_ID, ModuleCategory, ModuleStatus, NodeCommand,
     NodeHandle, NodeStatus, ORACLE_ORIGIN, StreamHub, hex_bytes, hex_root,
@@ -756,9 +756,6 @@ struct Sim {
     blobs: blobstore::BlobHandle,
     index: Arc<IndexStore>,
     stream_hub: StreamHub,
-    /// the registered module ids, in registry order — the exact set `status`
-    /// reports (topology `sim_base`, or that plus `sim_valset` under the flag).
-    module_ids: Vec<&'static str>,
     /// the fabricated mesh identity `status` reports (`--node-key`), or empty
     /// for the default "no peer-routed features here". no mesh sits behind it.
     public_key: String,
@@ -815,21 +812,22 @@ fn run_sim(
         let bindings = Bindings {
             invite: &invite_binding,
             chain_id: LOCAL_CHAIN_ID,
-            validators: &valset_keys,
-            code_hashes: &code_hashes,
         };
         let mut stores = qmdb_stores(&context);
-        let modules = compose(
+        let mut host = compose(
             selection,
             &code,
             &mut stores,
             &substrates,
             &bindings,
-            Boot::Genesis,
+            Boot::Genesis {
+                validators: &valset_keys,
+                bundle: &code_hashes,
+            },
         )
         .await
         .expect("sim genesis composes");
-        let host = host_from(modules).expect("genesis");
+        host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &bindings)));
 
         // a lib must not write to stdout — this is a once-per-boot lifecycle
         // fact, so it rides tracing (visible on the binary's stderr + ring under
@@ -878,7 +876,6 @@ fn run_sim(
             blobs,
             index,
             stream_hub,
-            module_ids,
             public_key,
             handle,
             fatal,
@@ -1160,6 +1157,7 @@ impl Sim {
                 time,
                 projection.record,
                 &projection.dispatches,
+                &self.node.host().module_roots(),
             );
             if let Some(root_hash) = projection.sealed_hash {
                 self.stream_hub.publish_block(
@@ -1333,16 +1331,15 @@ impl Sim {
 
     fn status(&self) -> NodeStatus {
         let host = self.node.host();
-        let modules = self
-            .module_ids
-            .iter()
-            .map(|id| ModuleStatus {
-                id: (*id).into(),
-                root: host
-                    .module_root(id)
-                    .map(|root| hex_root(&root))
-                    .unwrap_or_default(),
-                category: ModuleCategory::of(id),
+        // the host's live set, sorted by id: the genesis selection plus every
+        // module the registry admitted since.
+        let modules = host
+            .module_roots()
+            .into_iter()
+            .map(|(id, root)| ModuleStatus {
+                category: ModuleCategory::of(&id),
+                root: hex_root(&root),
+                id,
             })
             .collect();
         NodeStatus {

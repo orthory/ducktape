@@ -114,7 +114,7 @@ impl<'a> IndexFold<'a> {
     fn min_watermark(&self) -> Option<u64> {
         let mut min: Option<u64> = None;
         for id in self.index.module_ids() {
-            match self.index.applied_height(id) {
+            match self.index.applied_height(&id) {
                 Ok(h) => min = Some(min.map_or(h, |m| m.min(h))),
                 Err(_) => return None,
             }
@@ -129,6 +129,23 @@ impl recovery::ReplaySink for IndexFold<'_> {
             return;
         }
         let height = block.height;
+        // the index covers every module the host runs at this block: one the
+        // boundary admitted gets its database before its first op folds.
+        let covered = noded::index_host_modules(
+            self.index,
+            block.roots.iter().map(|(id, _)| id.as_str()),
+        );
+        if let Err(err) = covered {
+            tracing::error!(
+                target: "ducktape::modules",
+                event = "node_index_poisoned",
+                height,
+                error = %err,
+                "module index fold stopped"
+            );
+            self.stopped = true;
+            return;
+        }
         let ops = indexer::BlockOps {
             record: sealed_frame_block_row(&*self.blobs, block),
             // the validator's consensus time IS the height (see BlockContext).
@@ -320,9 +337,10 @@ pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
     let mut floored: Vec<(String, u64)> = Vec::new();
     for id in index
         .module_ids()
+        .into_iter()
         .filter(|id| !stale.iter().any(|stale| stale == id))
     {
-        match index.backfill_height(id) {
+        match index.backfill_height(&id) {
             Ok(Some(floor)) => floored.push((id.to_string(), floor)),
             Ok(None) => {}
             Err(err) => tracing::warn!(

@@ -86,8 +86,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -300,12 +300,19 @@ impl ModuleIndex {
     }
 }
 
-/// the per-module index store: one fluent31 database per registered module,
-/// one host writer (the block loop), the engine's trigger runner folding
-/// behind it, snapshot readers everywhere else.
+/// the per-module index store: one fluent31 database per module the host
+/// runs, one host writer (the block loop), the engine's trigger runner
+/// folding behind it, snapshot readers everywhere else.
+///
+/// the module set GROWS while the store is open: a module the modules
+/// registry admits after boot gets its database at the block that seats it
+/// ([`IndexStore::open_module`]), so the set is behind a lock. it never
+/// shrinks — a database, once open, serves until the process ends.
 pub struct IndexStore {
     base: PathBuf,
-    modules: BTreeMap<String, ModuleIndex>,
+    /// the open options every module database shares.
+    opts: Options,
+    modules: RwLock<BTreeMap<String, Arc<ModuleIndex>>>,
     /// the internal blocks database: `blk/…` explorer rows plus its own
     /// `meta/height` watermark. never listed in `modules` — it is not a
     /// module, must not surface on the per-module scan routes, and never
@@ -349,36 +356,67 @@ impl IndexStore {
             io_backend: IoBackend::Std,
             ..Options::default()
         };
-        let mut open = BTreeMap::new();
-        for id in module_ids {
-            let db = Arc::new(Db::open(base.join(id), opts.clone())?);
-            let (has_fold, has_view) = installed_roles(&db)?;
-            open.insert(
-                (*id).to_string(),
-                ModuleIndex {
-                    db,
-                    has_fold: AtomicBool::new(has_fold),
-                    has_view: AtomicBool::new(has_view),
-                },
-            );
-        }
-        let blocks = Arc::new(Db::open(base.join(BLOCKS_DB_ID), opts)?);
+        let blocks = Arc::new(Db::open(base.join(BLOCKS_DB_ID), opts.clone())?);
         let store = Self {
             base,
-            modules: open,
+            opts,
+            modules: RwLock::new(BTreeMap::new()),
             blocks,
             poisoned: AtomicBool::new(false),
         };
+        for id in module_ids {
+            store.open_database(id)?;
+        }
         // the height the node resumes above — read here, not inside the
         // macro, so a read failure refuses the open at every filter level.
         let height = store.resume_height()?;
         tracing::info!(
             target: "ducktape::index",
             height,
-            modules = store.modules.len(),
+            modules = module_ids.len(),
             "index store opened"
         );
         Ok(store)
+    }
+
+    /// open (creating if missing) the database for one more module, deciding
+    /// nothing about its guest (roles read back from the marker, exactly as
+    /// [`Self::open_bare`] does). idempotent and free for a module this
+    /// store already holds. this is how the index keeps covering every module
+    /// the host runs: a module the modules registry admits after boot gets
+    /// its database here, before the block that seats it folds, so its feed
+    /// begins at that block.
+    pub fn open_module(&self, id: &str) -> Result<()> {
+        if self.modules().contains_key(id) {
+            return Ok(());
+        }
+        // a write path like the folds: refused once poisoned, and a failure
+        // poisons — the block that needed the database cannot fold without it.
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        self.poison_on_err("open_module", self.open_database(id))
+    }
+
+    fn open_database(&self, id: &str) -> Result<()> {
+        let db = Arc::new(Db::open(self.base.join(id), self.opts.clone())?);
+        let (has_fold, has_view) = installed_roles(&db)?;
+        let module = ModuleIndex {
+            db,
+            has_fold: AtomicBool::new(has_fold),
+            has_view: AtomicBool::new(has_view),
+        };
+        self.modules
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_string(), Arc::new(module));
+        Ok(())
+    }
+
+    /// the module map for readers; a poisoned lock is recovered, since every
+    /// writer only ever inserts a fully built entry.
+    fn modules(&self) -> RwLockReadGuard<'_, BTreeMap<String, Arc<ModuleIndex>>> {
+        self.modules.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// converge every named module's database onto its declared index guest:
@@ -399,22 +437,24 @@ impl IndexStore {
         &self.base
     }
 
-    pub fn module_ids(&self) -> impl Iterator<Item = &str> {
-        self.modules.keys().map(String::as_str)
+    /// every module this store holds a database for, sorted by id.
+    pub fn module_ids(&self) -> Vec<String> {
+        self.modules().keys().cloned().collect()
     }
 
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
     }
 
-    fn module(&self, module: &str) -> Result<&ModuleIndex> {
-        self.modules
+    fn module(&self, module: &str) -> Result<Arc<ModuleIndex>> {
+        self.modules()
             .get(module)
+            .cloned()
             .ok_or_else(|| Error::UnknownModule(module.to_string()))
     }
 
-    fn db(&self, module: &str) -> Result<&Arc<Db>> {
-        Ok(&self.module(module)?.db)
+    fn db(&self, module: &str) -> Result<Arc<Db>> {
+        Ok(self.module(module)?.db.clone())
     }
 
     /// the ONE place the store poisons. every write path hands its outcome
@@ -440,7 +480,7 @@ impl IndexStore {
     /// view, which trails by [`IndexStore::fold_status`]'s backlog.
     pub fn applied_height(&self, module: &str) -> Result<u64> {
         let db = self.db(module)?;
-        Ok(read_height(db)?)
+        Ok(read_height(&db)?)
     }
 
     /// the height the node's block counter must resume ABOVE: the max
@@ -451,7 +491,7 @@ impl IndexStore {
     /// them all: it only advances when a block carries an explorer row.
     pub fn resume_height(&self) -> Result<u64> {
         let mut max = read_height(&self.blocks)?;
-        for module in self.modules.values() {
+        for module in self.modules().values() {
             max = max.max(read_height(&module.db)?);
         }
         Ok(max)
@@ -484,7 +524,8 @@ impl IndexStore {
     /// the backfill floor: when present, the module was stamped at a boundary
     /// — its op feed (and everything derived) visibly begins above it.
     pub fn backfill_height(&self, module: &str) -> Result<Option<u64>> {
-        Ok(read_backfill(self.db(module)?)?)
+        let db = self.db(module)?;
+        Ok(read_backfill(&db)?)
     }
 
     /// the fold trigger's backlog + last drain error, `None` for a module
@@ -518,16 +559,17 @@ impl IndexStore {
     }
 
     fn apply_inner(&self, block: &BlockOps) -> Result<()> {
-        // group by module, keeping the block-wide dispatch index as seq. a
-        // module this store does not index — one admitted after boot by the
-        // modules registry, whose guest (if any) is not bundled — writes no
-        // rows: the index is a read model over the DECLARED tenants, and
-        // skipping an undeclared op on every block leaves nothing torn.
-        // refusing it poisoned every node on a real network for the rest of
-        // its life the first time a live-registered module received an op.
+        // group by module, keeping the block-wide dispatch index as seq. the
+        // host applies a dispatch only to a module it runs, and the caller
+        // opened a database for every module the host runs before this fold
+        // (`open_module`), so an op naming a module this store lacks is a
+        // caller that skipped that step: the index is a read model, so the op
+        // is dropped rather than poisoning every later block, and the gap
+        // is visible as a module the status route never lists.
+        let modules = self.modules();
         let mut per: BTreeMap<&str, Vec<(u32, &AppliedOp)>> = BTreeMap::new();
         for (seq, op) in block.ops.iter().enumerate() {
-            let indexed = self.modules.contains_key(op.module.as_str());
+            let indexed = modules.contains_key(op.module.as_str());
             if !indexed {
                 continue;
             }
@@ -539,7 +581,7 @@ impl IndexStore {
         // mean "blocks are missing", never "the module was quiet" — that is
         // what lets the staleness check tell a wiped database from a lagging
         // one. a quiet module's batch is the watermark key alone.
-        for (id, module) in &self.modules {
+        for (id, module) in modules.iter() {
             if read_height(&module.db)? >= block.height {
                 continue; // replay of an already-folded block — idempotent skip
             }
@@ -577,7 +619,7 @@ impl IndexStore {
     /// `wait_flushed` progress-wait idiom. `Err` = a fold failed with a
     /// backlog still pending — the views cannot catch up.
     pub fn wait_folds_drained(&self) -> Result<()> {
-        for (id, m) in &self.modules {
+        for (id, m) in self.modules().iter() {
             if !m.folds() {
                 continue;
             }
@@ -800,7 +842,7 @@ impl IndexStore {
         }
         let db = self.db(module)?;
         let out = (|| -> Result<()> {
-            if read_height(db)? >= height {
+            if read_height(&db)? >= height {
                 return Ok(());
             }
             db.put(META_HEIGHT, height.to_be_bytes())?;

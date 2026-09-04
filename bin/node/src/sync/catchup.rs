@@ -114,6 +114,7 @@ where
             disposition: seal.disposition,
             root_hash: seal.root_hash,
             dispatches: &dispatches,
+            roots: &seal.roots,
         });
     }
     Ok(())

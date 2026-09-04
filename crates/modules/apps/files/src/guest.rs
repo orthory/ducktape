@@ -294,6 +294,12 @@ mod entry {
     struct Component;
 
     impl guest_adapter::Guest for Component {
+        /// an odb port: the host wraps this component over the duckfs
+        /// substrate it provides for the module's id.
+        fn shape() -> host::ModuleShape {
+            guest_adapter::odb_shape()
+        }
+
         fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
             FilesGuest::execute(payload)
         }

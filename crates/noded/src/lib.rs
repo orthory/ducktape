@@ -116,7 +116,8 @@ pub use term_consensus::{command_blocks, command_text, session_channel};
 mod index;
 pub use index::{
     BlocksParams, FOLDED_HEADER, IndexGuests, IndexScanParams, converge_index_guests,
-    index_block_ops, index_origin, open_index_store, stale_modules, stamp_stale_modules,
+    index_block_ops, index_host_modules, index_origin, open_index_store, stale_modules,
+    stamp_stale_modules,
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;

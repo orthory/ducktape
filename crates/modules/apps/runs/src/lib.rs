@@ -519,7 +519,7 @@ pub struct RunsModule {
     /// a failure).
     pages: Option<ModuleId>,
     /// this network's chain id, from the genesis `__config` record
-    /// (`topology::CONFIG_CHAIN_ID`) — the ONLY way a fixed component learns
+    /// (`sdk::genesis_config::CHAIN_ID`) — the ONLY way a fixed component learns
     /// which network it is running on. Genesis config, NOT committed state
     /// (never in `root()`). Every `duck://` link this module renders into an
     /// agent's context stamps its `?net=` half from it; empty (dev tools,

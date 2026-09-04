@@ -1149,6 +1149,10 @@ pub struct FoldedBlock<'a> {
     pub disposition: Disposition,
     pub root_hash: StateRoot,
     pub dispatches: &'a [DispatchRecord],
+    /// the host's module set after this block — what the seal records. a
+    /// module the block's boundary admitted appears here for the first
+    /// time, so a derived tier can cover it before its first op folds.
+    pub roots: &'a [(ModuleId, StateRoot)],
 }
 
 /// observer of every sealed block the journal replay walks, in height order —
@@ -1395,6 +1399,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &[],
+                                    roots: &roots,
                                 }),
                                 // an applied block whose ops moved no root:
                                 // its trace existed at runtime but is not
@@ -1458,6 +1463,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
+                                    roots: &host.module_roots(),
                                 });
                             }
                             for (id, root) in &changed {
@@ -1536,6 +1542,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
+                                    roots: &host.module_roots(),
                                 });
                             }
                             // every re-committed and exact-post module must now
@@ -1593,6 +1600,7 @@ where
                         // below; this is that same post-block boundary.
                         root_hash: host.root_hash(),
                         dispatches: &dispatches,
+                        roots: &host.module_roots(),
                     });
                 }
                 disposition
@@ -1661,6 +1669,7 @@ where
                             disposition,
                             root_hash: host.root_hash(),
                             dispatches: &dispatches,
+                            roots: &host.module_roots(),
                         });
                     }
                     disposition

@@ -67,6 +67,7 @@ use guest_adapter::WitStore;
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: SagaModule,
+    shape: guest_adapter::store_shape(),
     new: SagaModule::with_assignment(
         MODULE_ID,
         Box::new(WitStore),

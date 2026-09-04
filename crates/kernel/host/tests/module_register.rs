@@ -55,8 +55,9 @@ impl CodeSource for MapSource {
 /// the node-shaped factory: admissions instantiate through the wasm runtime.
 struct WasmFactory;
 
+#[async_trait::async_trait(?Send)]
 impl ModuleFactory for WasmFactory {
-    fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Box<dyn sdk::Module>, Error> {
+    async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Box<dyn sdk::Module>, Error> {
         Ok(Box::new(WasmModule::from_bytes(id, bytes)?))
     }
 }

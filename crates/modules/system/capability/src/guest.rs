@@ -67,5 +67,6 @@ use guest_adapter::WitStore;
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: CapabilityRegistry,
+    shape: guest_adapter::store_shape(),
     new: CapabilityRegistry::new(MODULE_ID, Box::new(WitStore), Some("valset".into())),
 }

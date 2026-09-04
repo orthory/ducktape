@@ -302,10 +302,22 @@ fn init_writes_module_hashes_and_the_genesis() {
             m.id
         );
     }
+    // the index guests are exactly the `<id>.index.wasm` files the founding
+    // set holds for the genesis set: the build stages one iff the module's
+    // crate declares a guest, so presence is the declaration.
     let guests: Vec<&str> = genesis.index_guests.iter().map(|a| a.id.as_str()).collect();
-    let mut want = topology::TOPOLOGY.index_guest_ids(topology::PRODUCTION);
+    let founding_set = std::path::Path::new(common::founding_set());
+    let mut want: Vec<&str> = topology::TOPOLOGY
+        .wasm_ids(topology::PRODUCTION)
+        .into_iter()
+        .filter(|id| workspace_config::index_guest_path(founding_set, id).is_file())
+        .collect();
     want.sort_unstable();
-    assert_eq!(guests, want, "every declared index guest rides in the genesis");
+    assert!(
+        want.contains(&"chat"),
+        "the founding set carries chat's index guest, or this pin proves nothing"
+    );
+    assert_eq!(guests, want, "every index guest the set holds rides in the genesis");
 }
 
 /// with no `--modules` and no `$DUCKTAPE_MODULES_DIR`, `init` founds from the

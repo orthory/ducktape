@@ -65,6 +65,44 @@ pub mod bindings {
 pub use bindings::ducktape::module::host;
 pub use bindings::{export_module, Guest};
 
+// ============================================================================
+// the declared shape — what the host must know to run this component
+// ============================================================================
+
+/// the shape of a STORE-BACKED port ([`WitStore`]) that is not network-bound:
+/// the host wraps the component over its qmdb store. a port that needs a
+/// genesis parameter or the committed-query lane widens it by struct update:
+/// `ModuleShape { config: vec![sdk::genesis_config::CHAIN_ID.into()],
+/// ..store_shape() }`.
+pub fn store_shape() -> host::ModuleShape {
+    host::ModuleShape {
+        backing: host::Backing::Store,
+        config: Vec::new(),
+        committed_queries: false,
+    }
+}
+
+/// the shape of a whole-state port ([`load_state`] / [`save_state`]) or any
+/// guest over plain host-KV keys: the host wraps the component over a
+/// key/value map it owns.
+pub fn map_shape() -> host::ModuleShape {
+    host::ModuleShape {
+        backing: host::Backing::Map,
+        config: Vec::new(),
+        committed_queries: false,
+    }
+}
+
+/// the shape of an odb port ([`GuestOdb`]): the host wraps the component over
+/// the content-addressed substrate it provides for the module's id.
+pub fn odb_shape() -> host::ModuleShape {
+    host::ModuleShape {
+        backing: host::Backing::Odb,
+        config: Vec::new(),
+        committed_queries: false,
+    }
+}
+
 use sdk::{
     Ctx, Env, Error, Event, MerkleStore, Msg, Origin, ResolverSyncTarget, StateRoot, ROOT_LEN,
 };
@@ -450,7 +488,7 @@ pub fn store_genesis_chain_id(module_label: &str) -> Result<String, host::Error>
 fn decode_chain_id(raw: &[u8], module_label: &str) -> Result<String, host::Error> {
     let params = sdk::genesis_config::decode_config(raw)
         .map_err(|e| host::Error::Rejected(format!("{module_label} genesis config: {e}")))?;
-    let chain_id = sdk::genesis_config::find(&params, "chain_id").ok_or_else(|| {
+    let chain_id = sdk::genesis_config::find(&params, sdk::genesis_config::CHAIN_ID).ok_or_else(|| {
         host::Error::Rejected(format!("{module_label} genesis config carries no chain_id"))
     })?;
     String::from_utf8(chain_id.to_vec())
@@ -473,16 +511,20 @@ fn decode_chain_id(raw: &[u8], module_label: &str) -> Result<String, host::Error
 //   host owns the real store and the module is rebuilt fresh per dispatch.
 //
 // both take `id` (the module id const, used as the dispatch `Env::me`/target
-// and threaded into the reload label) and `new` (the native constructor
-// expression, written against the guest's own consts — and, for the chain_id
-// twins, [`genesis_chain_id`]). runs stays hand-written: its delivered-runs
-// ring rides a third `__history` key the shell does not model.
+// and threaded into the reload label), `shape` (the component's declared
+// shape — [`store_shape`] / [`map_shape`], widened for a config key or the
+// committed-query lane) and `new` (the native constructor expression, written
+// against the guest's own consts — and, for the chain_id twins,
+// [`genesis_chain_id`]). runs stays hand-written: its delivered-runs ring
+// rides a third `__history` key the shell does not model.
 
-/// whole-state (`SnapshotBytes`) guest shell. `new` is the native constructor
-/// (may use `?` — the loader returns `Result<_, host::Error>`).
+/// whole-state (`SnapshotBytes`) guest shell. `shape` is the component's
+/// declared shape ([`map_shape`], widened for a config key); `new` is the
+/// native constructor (may use `?` — the loader returns
+/// `Result<_, host::Error>`).
 #[macro_export]
 macro_rules! snapshot_guest {
-    (id: $id:expr, module: $module:ty, new: $new:expr $(,)?) => {
+    (id: $id:expr, module: $module:ty, shape: $shape:expr, new: $new:expr $(,)?) => {
         struct Component;
 
         /// the native module at THIS dispatch's state: the `new` shape when
@@ -514,6 +556,10 @@ macro_rules! snapshot_guest {
         }
 
         impl $crate::Guest for Component {
+            fn shape() -> $crate::host::ModuleShape {
+                $shape
+            }
+
             fn execute(
                 payload: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<(), $crate::host::Error> {
@@ -550,14 +596,16 @@ macro_rules! snapshot_guest {
     };
 }
 
-/// store-backed guest shell (pages, chat). `new` is the native constructor over
-/// [`WitStore`] (may use `?` — the loader returns `Result<_, host::Error>`, the
-/// [`snapshot_guest!`] contract, so a config-carrying tenant can thread
-/// [`load_store_config`] through its builder); there is NO snapshot — the host
-/// owns the real store, and the module is rebuilt fresh per dispatch.
+/// store-backed guest shell (pages, chat). `shape` is the component's declared
+/// shape ([`store_shape`], widened for a config key or the committed-query
+/// lane); `new` is the native constructor over [`WitStore`] (may use `?` — the
+/// loader returns `Result<_, host::Error>`, the [`snapshot_guest!`] contract,
+/// so a config-carrying tenant can thread [`load_store_config`] through its
+/// builder); there is NO snapshot — the host owns the real store, and the
+/// module is rebuilt fresh per dispatch.
 #[macro_export]
 macro_rules! store_guest {
-    (id: $id:expr, module: $module:ty, new: $new:expr $(,)?) => {
+    (id: $id:expr, module: $module:ty, shape: $shape:expr, new: $new:expr $(,)?) => {
         struct Component;
 
         /// the native module over the host's real store, rebuilt fresh per
@@ -579,6 +627,10 @@ macro_rules! store_guest {
         }
 
         impl $crate::Guest for Component {
+            fn shape() -> $crate::host::ModuleShape {
+                $shape
+            }
+
             fn execute(
                 payload: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<(), $crate::host::Error> {
