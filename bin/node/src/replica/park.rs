@@ -329,7 +329,7 @@ pub(super) async fn park(
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
     manifest: &Option<Manifest>,
-    recovery: Recovery<commonware_runtime::tokio::Context>,
+    mut recovery: Recovery<commonware_runtime::tokio::Context>,
     genesis: &crate::config::GenesisModules,
 ) -> crate::validator::PromotionBaton {
     let ReplicaChannels {
@@ -574,6 +574,15 @@ pub(super) async fn park(
         forge_repo.clone(),
         label.clone(),
     ));
+    // ONE source for every fold path this role runs. the journal arrives from
+    // the boot wiring holding the LOCAL-ONLY blob source, and both ascension
+    // sites below seat the live node's source off this same handle —
+    // so installing the fetching source HERE, before the journal is ever read
+    // or handed on, is what makes the live fold, the recovery replay and the
+    // catch-up apply resolve committed component bytes identically. a resident
+    // is not a module-code PUSH fan-out target (that plane is members-only), so
+    // a local-only live fold is a guaranteed halt at the first code swap.
+    recovery.set_code_source(code_source.clone());
     let mut recovery_slot = Some(recovery);
     let mut recovery_reopens = 0u32;
     // fold-driver state, all epoch-scoped and reset at (re)ascension:
@@ -692,9 +701,9 @@ pub(super) async fn park(
         let tip = rec.height.unwrap_or(rec.view_base);
         let root = rec.root_hash;
         let follower = consensus::FollowerOrderer::new(replica_store.clone());
-        // the replica fold realizes code-registry swaps through the SAME source
-        // recovery replay used (wired at Recovery::open).
-        let code_source = recovery.code_source();
+        // the live replica fold realizes code-registry swaps through the SAME
+        // source recovery replay just used — the park loop's one fetching
+        // source, installed on this journal above.
         let mut node_r = node::OrderedNode::resume(
             host,
             follower,
@@ -705,7 +714,7 @@ pub(super) async fn park(
             }),
             rec.view_base,
         );
-        node_r.set_code_source(code_source);
+        node_r.set_code_source(code_source.clone());
         replica_scheme = Some(replica_verifier(&namespace, &rec.participants));
         replica_orchestrator = Some(replica_orchestrator_at(
             rec.epoch,
@@ -2198,7 +2207,6 @@ pub(super) async fn park(
                             // the driver backfills over the Frames
                             // lane.
                             let follower = consensus::FollowerOrderer::new(replica_store.clone());
-                            let code_source = recovery.code_source();
                             let mut node_r = node::OrderedNode::resume(
                                 host,
                                 follower,
@@ -2209,7 +2217,7 @@ pub(super) async fn park(
                                 }),
                                 m.view_base,
                             );
-                            node_r.set_code_source(code_source);
+                            node_r.set_code_source(code_source.clone());
                             replica_scheme = Some(replica_verifier(&namespace, &m.participants));
                             replica_orchestrator = Some(replica_orchestrator_at(
                                 m.epoch,
@@ -2632,5 +2640,44 @@ mod tests {
         );
         assert_eq!(builds.get("dd").map(String::as_str), Some("def5678"));
         assert_eq!(warned.len(), 1, "only the real disagreement was named");
+    }
+
+    /// the seam this role BRICKS on when it drifts: a resident is not a
+    /// module-code PUSH fan-out target, so every fold it runs — live fold,
+    /// recovery replay, catch-up apply — must resolve committed component
+    /// bytes through the park loop's ONE fetching source. the journal arrives
+    /// from the boot wiring holding the local-only blob source, so the install
+    /// below is what makes that true; a live node seated from
+    /// the journal's own accessor is how the local-only source reached the
+    /// live fold and halted a serving resident at the first code swap.
+    #[test]
+    fn every_resident_fold_is_seated_from_the_parks_fetching_code_source() {
+        let source = include_str!("park.rs");
+        let install = "recovery.set_code_source(code_source.clone());";
+        let slot = "let mut recovery_slot = Some(recovery);";
+        let installed_at = source
+            .find(install)
+            .expect("park installs the fetching source on the recovery journal");
+        let slot_at = source.find(slot).expect("park fills the journal slot");
+        assert!(
+            installed_at < slot_at,
+            "the fetching source must be installed BEFORE the journal is handed on"
+        );
+        // spelled in parts so this lint does not match itself.
+        let journal_accessor = format!("recovery.code_{}()", "source");
+        assert!(
+            !source.contains(&journal_accessor),
+            "seat a live node from the park loop's `code_source`, never from \
+             whatever source the journal was handed at boot"
+        );
+        let call = format!(".set_code_{}(", "source");
+        for line in source.lines().filter(|l| l.contains(&call)) {
+            let seats_the_parks_source = line.contains("code_source.clone()");
+            let promotion_handback = line.contains("BlobCodeSource");
+            assert!(
+                seats_the_parks_source || promotion_handback,
+                "unexpected code source wired in the replica park: {line}"
+            );
+        }
     }
 }
