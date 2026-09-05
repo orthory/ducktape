@@ -313,6 +313,7 @@ pub(super) async fn park(
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     session_manager: Option<noded::TerminalSessions>,
     session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    remote_sessions: noded::RemoteSessions,
     local_gateway_via: String,
     node_api_ports: Vec<u16>,
     stream_hub: &noded::StreamHub,
@@ -401,6 +402,7 @@ pub(super) async fn park(
             local_gateway_via,
             workspace.clone(),
             session_requests,
+            remote_sessions,
         );
         Some(tracked)
     } else {

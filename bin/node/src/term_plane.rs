@@ -35,8 +35,8 @@ use data_plane::{
 use futures::SinkExt as _;
 use futures::channel::{mpsc as fmpsc, oneshot};
 use noded::{
-    CreatedSession, NodeCommand, PeerAttach, SessionInputWire, SessionJob, TermCommandEvent,
-    TermCommandRing, TermError, TermFeedEvent, TermRing, TerminalSessions,
+    CreatedSession, NodeCommand, PeerAttach, RemoteSessions, SessionInputWire, SessionJob,
+    TermCommandEvent, TermCommandRing, TermError, TermFeedEvent, TermRing, TerminalSessions,
 };
 use provider_host::ResolvedCredential;
 use serde::Serialize;
@@ -167,6 +167,7 @@ pub(crate) fn spawn(
     local_gateway_via: String,
     workspace: std::path::PathBuf,
     jobs: tokio::sync::mpsc::Receiver<SessionJob>,
+    remote_sessions: RemoteSessions,
 ) {
     tokio::spawn(async move {
         let own = peers.own_ip(&me);
@@ -209,6 +210,7 @@ pub(crate) fn spawn(
             term_commands,
             control,
             jobs,
+            remote_sessions,
         )
         .await;
     });
@@ -224,6 +226,7 @@ async fn run_bound<T: DataPlaneTransport>(
     term_commands: TermCommandRing,
     control: Arc<ControlState>,
     jobs: tokio::sync::mpsc::Receiver<SessionJob>,
+    remote_sessions: RemoteSessions,
 ) {
     let _plane = plane;
     tokio::select! {
@@ -233,6 +236,7 @@ async fn run_bound<T: DataPlaneTransport>(
             terminals.clone(),
             term_commands.clone(),
             Arc::clone(&control),
+            remote_sessions,
         ) => {}
         _ = fanout_loop(Arc::clone(&service), Arc::clone(&peers), me, terminals, term_commands) => {}
         _ = client_loop(service, control, jobs) => {}
@@ -245,6 +249,7 @@ async fn accept_loop<T: DataPlaneTransport>(
     terminals: TermRing,
     term_commands: TermCommandRing,
     control: Arc<ControlState>,
+    remote_sessions: RemoteSessions,
 ) {
     // one live inbound stream per (peer, feed): the long-lived feeds (chunk /
     // command / input) hold one stream per (peer, intent), so the dedupe key
@@ -270,10 +275,15 @@ async fn accept_loop<T: DataPlaneTransport>(
         let term_commands = term_commands.clone();
         let control = Arc::clone(&control);
         let active = Arc::clone(&active);
+        let remote_sessions = remote_sessions.clone();
         tokio::spawn(async move {
             let _ = match intent {
-                CHUNK_INTENT => receive_chunks(stream, peer, peers, terminals).await,
-                COMMAND_INTENT => receive_commands(stream, peer, peers, term_commands).await,
+                CHUNK_INTENT => {
+                    receive_chunks(stream, peer, peers, terminals, remote_sessions).await
+                }
+                COMMAND_INTENT => {
+                    receive_commands(stream, peer, peers, term_commands, remote_sessions).await
+                }
                 INPUT_INTENT => receive_input(stream, peer, peers, control).await,
                 CONTROL_INTENT => serve_control(stream, peer, control).await,
                 _ => Ok(()),
@@ -285,11 +295,49 @@ async fn accept_loop<T: DataPlaneTransport>(
     }
 }
 
+/// per-frame refusals on the inbound feeds: a peer drives these — one frame per
+/// output chunk — so an unlatched line is a log bomb. Keyed per (reason, peer)
+/// like [`CREATE_REFUSED`], so one peer's flood never silences another's first
+/// refusal.
+static FEED_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
+
+/// the host gate on an inbound feed grain: this node takes a session's output
+/// and command rows ONLY from the peer it recorded as that session's host when
+/// its own remote create returned.
+///
+/// A session id authorizes nothing on its own — every forwarded session's grains
+/// fan out to EVERY peer, so the ids are public to the mesh. Without this bind,
+/// any member could end a session it does not host, inject bytes into its
+/// scrollback, or forge attributed command rows, on any id — including one this
+/// node hosts locally, where the ring is keyed in the same namespace.
+///
+/// An id this node is not mirroring (`None`) is refused too: a session this node
+/// never created is not one it has any reason to ring.
+fn feed_permitted(remote: &RemoteSessions, session: &str, peer: PeerId) -> bool {
+    remote.host_of(session) == Some(peer.0)
+}
+
+/// log one refused feed grain, latched. The peer's NODE key is public routing
+/// metadata already logged at boot; without it the operator is told "something
+/// was dropped" with no way to find out who is sending it.
+fn feed_refused(peer: PeerId) {
+    if let Some(occurrences) = FEED_REFUSED.hit("feed_not_session_host", peer) {
+        tracing::warn!(
+            target: "ducktape::term",
+            reason = "feed_not_session_host",
+            node = %crate::config::hex_bytes(&peer.0[..4]),
+            occurrences,
+            "term feed grain dropped"
+        );
+    }
+}
+
 async fn receive_chunks<S: AsyncRead + Unpin>(
     mut stream: S,
     peer: PeerId,
     peers: Arc<OverlayPeers>,
     ring: TermRing,
+    remote_sessions: RemoteSessions,
 ) -> io::Result<()> {
     while peers.contains(peer) {
         let Some(event) = read_frame::<_, TermFeedEvent>(&mut stream).await? else {
@@ -301,6 +349,10 @@ async fn receive_chunks<S: AsyncRead + Unpin>(
         // a peer sending a malformed session id is a bug, not consensus — skip
         // the grain and keep the stream (best-effort, observational).
         if !agent_service::wire::valid_session(event.session()) {
+            continue;
+        }
+        if !feed_permitted(&remote_sessions, event.session(), peer) {
+            feed_refused(peer);
             continue;
         }
         match event {
@@ -321,6 +373,7 @@ async fn receive_commands<S: AsyncRead + Unpin>(
     peer: PeerId,
     peers: Arc<OverlayPeers>,
     ring: TermCommandRing,
+    remote_sessions: RemoteSessions,
 ) -> io::Result<()> {
     while peers.contains(peer) {
         let Some(event) = read_frame::<_, TermCommandEvent>(&mut stream).await? else {
@@ -329,11 +382,18 @@ async fn receive_commands<S: AsyncRead + Unpin>(
         if !peers.contains(peer) {
             return Ok(());
         }
-        if agent_service::wire::valid_session(&event.session) {
-            // append_remote replays the origin's seq verbatim — the peer shows
-            // the same total order and never re-stamps it.
-            ring.append_remote(event);
+        if !agent_service::wire::valid_session(&event.session) {
+            continue;
         }
+        // only the session's host may append attributed rows to its command log;
+        // a local command takes the `append` path, never this one.
+        if !feed_permitted(&remote_sessions, &event.session, peer) {
+            feed_refused(peer);
+            continue;
+        }
+        // the ring validates the seq against its own cursor — a peer's number is
+        // checked, never assigned.
+        ring.append_remote(event);
     }
     Ok(())
 }
@@ -1226,6 +1286,20 @@ mod tests {
         // ...but peer B's FIRST hit on the SAME reason still logs: the whole
         // point is that one peer's refusal never silences another's.
         assert_eq!(latch.hit("no_sandbox", b), Some(1));
+    }
+
+    #[test]
+    fn a_feed_grain_binds_to_the_session_host() {
+        let remote = RemoteSessions::default();
+        let host = PeerId([7u8; 32]);
+        let stranger = PeerId([9u8; 32]);
+        remote.remember("00000000deadbeef".into(), host.0);
+        assert!(feed_permitted(&remote, "00000000deadbeef", host));
+        // the same id from any other member is not this session's output.
+        assert!(!feed_permitted(&remote, "00000000deadbeef", stranger));
+        // an id this node is not mirroring — one it hosts locally, or one a peer
+        // invented — is bound to no peer at all.
+        assert!(!feed_permitted(&remote, "00000000cafef00d", host));
     }
 
     #[test]

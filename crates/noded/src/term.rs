@@ -1575,6 +1575,12 @@ pub async fn close_session(State(handle): State<NodeHandle>, Path(id): Path<Stri
                 })
                 .await;
         }
+        // end the mirror here rather than waiting for the host's `Ended` grain:
+        // forgetting the binding is what makes that grain unroutable (the feed
+        // gate binds every grain to the session's host), and a `term:<id>`
+        // subscriber blocked on a topic that will never append again is the
+        // wedge `TermEnded` exists to prevent.
+        handle.stream_hub().terminals().mark_ended_local_only(&id);
         handle.remote_sessions().forget(&id);
         return StatusCode::NO_CONTENT.into_response();
     }
