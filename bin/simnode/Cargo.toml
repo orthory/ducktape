@@ -44,7 +44,10 @@ blobstore = { workspace = true }
 duckfs-core = { workspace = true }
 # the sim installs the SAME subscriber the real node does (noded::log), so a
 # scenario sees the module breadcrumbs a wasm guest has no other way to emit.
-noded = { path = "../../crates/noded" }
+# `wasm-cache` forwards to wasm-host's opt-in sim/test wasmtime compilation
+# cache (DUCKTAPE_WASM_CACHE_DIR): simnode is the ONLY consumer that enables
+# it, so a production node never even compiles that code path.
+noded = { path = "../../crates/noded", features = ["wasm-cache"] }
 tracing = { workspace = true }
 # the replication layer: the sim actor runs on `OrderedNode<StepOrderer,
 # NullSink>` — the SAME apply/drain/projection engine the validator uses, with
