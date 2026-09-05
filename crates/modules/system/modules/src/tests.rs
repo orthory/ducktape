@@ -52,7 +52,12 @@ fn hash(seed: u8) -> Vec<u8> {
     vec![seed; CODE_HASH_LEN]
 }
 fn fresh() -> Modules {
-    Modules::new("modules", Box::new(sdk_testkit::MemStore::new()), "valset")
+    Modules::new(
+        "modules",
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+        "governance",
+    )
 }
 
 /// the root of a store that never committed anything — the store-backed twin
@@ -153,6 +158,45 @@ fn armed_at(lc: &Modules, height: u64) -> Vec<ArmedSwap> {
 // ============================================================================
 // module-code path
 // ============================================================================
+
+/// the network-capture gate: a module origin that is NOT governance is refused
+/// on every authoring op. an admitted app module's follow-up carries
+/// `Origin::Module("chat")`, and accepting it would let that one module
+/// schedule a swap of governance itself — no ballot, total capture.
+#[test]
+fn a_non_governance_module_authors_nothing() {
+    let mut lc = fresh();
+    register_module(&mut lc, "governance", 1);
+    let mut chat = ctx(Origin::Module("chat".into()), 0);
+    let refused = [
+        msg(ModulesMsg::RegisterModule {
+            module_id: "kanban".into(),
+            code_hash: hash(1),
+        }),
+        schedule_swap("governance", "capture", 10, 9),
+        schedule_register("kanban", "capture", 10, 9),
+        cancel_swap("governance", "capture"),
+    ];
+    for m in &refused {
+        assert!(
+            matches!(run(&mut lc, &mut chat, m), Err(Error::Module(_))),
+            "a chat-module origin authored {m:?}"
+        );
+    }
+    // the SAME ops from governance's own follow-up pass the gate.
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
+    run(
+        &mut lc,
+        &mut gov,
+        &schedule_swap("governance", "upgrade", 10, 9),
+    )
+    .unwrap();
+    commit(&mut lc);
+    assert_eq!(
+        module_status(&lc)[0].pending.as_ref().unwrap().code_hash,
+        hash(9)
+    );
+}
 
 #[test]
 fn register_and_schedule_origin_gate() {

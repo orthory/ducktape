@@ -5,8 +5,9 @@
 //! members vote before a consensus-time deadline, and anyone may trigger
 //! `Execute` once the outcome is decidable. a passing membership action emits
 //! the valset op as a host-drained follow-up in the SAME block — and the
-//! valset module only accepts membership ops from module origins, so
-//! governance is the sole authorized author of membership change.
+//! valset module only accepts membership ops from THIS module's origin (its
+//! wired `governance_id`, never a bare module origin), so governance is the
+//! sole authorized author of membership change.
 //!
 //! ## why authorship is trustworthy
 //!

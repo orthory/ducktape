@@ -36,7 +36,7 @@ fn member_key(seed: u8) -> Vec<u8> {
 
 /// a host with governance gating a valset seeded with members 1 and 2.
 async fn gov_host() -> Host {
-    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
     valset.seed(member_key(1)).await.expect("seed valset");
     valset.seed(member_key(2)).await.expect("seed valset");
     valset.finish_seed().await.expect("seed valset");
@@ -459,7 +459,7 @@ fn a_single_member_ballot_is_a_deciding_majority() {
     block_on(async {
         let founder = member_key(1);
         let friend = member_key(9);
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
         valset.seed(founder.clone()).await.expect("seed valset");
         valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
@@ -551,7 +551,7 @@ fn a_single_member_ballot_is_a_deciding_majority() {
 fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
     block_on(async {
         let founder = member_key(1);
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
         valset.seed(founder.clone()).await.expect("seed valset");
         valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
@@ -630,7 +630,7 @@ fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
 fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
     block_on(async {
         let founder = member_key(1);
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
         valset.seed(founder.clone()).await.expect("seed valset");
         valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![Box::new(valset)]).expect("genesis");
