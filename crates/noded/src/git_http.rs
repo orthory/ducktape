@@ -76,6 +76,16 @@ const GIT_ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const GIT_OID_RAW_LEN: usize = 20;
 /// the flush-pkt: a zero-length pkt that ends a pkt-line stream or section.
 const GIT_FLUSH_PKT: &[u8] = b"0000";
+/// max pkt-lines parsed out of one request — the command/want section
+/// ([`parse_pkt_lines`]) and the upload-pack negotiation tail
+/// ([`parse_upload_pack_request`]'s haves loop) each stop here. a real push
+/// updates at most a few thousand refs (a monorepo touching every branch);
+/// a real fetch negotiation trades at most a few thousand haves before a
+/// client gives up and sends the full closure instead. 65536 gives generous
+/// headroom over that while still bounding what a body of minimal pkt-lines
+/// can force: at the cap, the line list costs on the order of 1.5 MB of `Vec`
+/// headers, not the ~1 GB an unbounded 95 MiB body of 5-byte lines allocates.
+const MAX_GIT_PKT_LINES: usize = 65_536;
 
 /// encode one git pkt-line: a 4-hex length (INCLUDING the 4 length bytes)
 /// followed by the payload. every line this bridge emits is tiny, well under
@@ -109,6 +119,9 @@ fn parse_pkt_lines(buf: &[u8]) -> Result<(Vec<Vec<u8>>, &[u8]), String> {
         }
         if len < 4 || len > rest.len() {
             return Err("pkt-line length out of range".into());
+        }
+        if lines.len() >= MAX_GIT_PKT_LINES {
+            return Err("too many pkt-lines in request".into());
         }
         lines.push(rest[4..len].to_vec());
         rest = &rest[len..];
@@ -162,6 +175,7 @@ fn parse_upload_pack_request(body: &[u8]) -> Result<UploadPackRequest, String> {
 
     let mut haves = Vec::new();
     let mut done = false;
+    let mut negotiation_lines = 0usize;
     while !rest.is_empty() {
         if done {
             return Err("upload-pack negotiation continued after done".into());
@@ -169,6 +183,10 @@ fn parse_upload_pack_request(body: &[u8]) -> Result<UploadPackRequest, String> {
         if rest.len() < 4 {
             return Err("truncated negotiation pkt-line length header".into());
         }
+        if negotiation_lines >= MAX_GIT_PKT_LINES {
+            return Err("too many negotiation pkt-lines in request".into());
+        }
+        negotiation_lines += 1;
         let hdr = std::str::from_utf8(&rest[..4])
             .map_err(|_| "non-ascii negotiation pkt-line length".to_string())?;
         let len = usize::from_str_radix(hdr, 16)
@@ -309,6 +327,19 @@ struct PushCommands {
 const PUSH_CERT_LINE: &str = "push-cert";
 const PUSH_CERT_END: &str = "push-cert-end";
 const SSHSIG_ARMOR_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
+
+/// cheap pre-check for whether a receive-pack request is even worth the
+/// certificate parse (base64 dearmor + certificate text parse in
+/// [`parse_push_commands`]): an operator credential header needs no body
+/// content at all, and a signed push is identifiable by its first command
+/// line alone, without decoding the certificate it introduces. a request
+/// with neither signal carries no possible proof and is refused here.
+fn push_may_carry_proof(commands: &[Vec<u8>], has_operator: bool) -> bool {
+    has_operator
+        || commands
+            .first()
+            .is_some_and(|first| command_text(first) == PUSH_CERT_LINE)
+}
 
 /// decode the command list. a stock push sends `<old> <new> <refname>` lines
 /// (capabilities after a NUL on the first). a signed push (send-pack.c
@@ -736,18 +767,6 @@ pub(crate) async fn git_receive_pack(
             .into_response();
     }
 
-    // the command list: plain `<old> <new> <refname>` lines, or — a signed
-    // push — the certificate they live in. one push may update several
-    // branches, and forge applies them ATOMICALLY.
-    let nonce = push_cert_nonce(&handle, &repo);
-    let PushCommands { cmds, cert } = match parse_push_commands(&commands, nonce.as_deref()) {
-        Ok(parsed) => parsed,
-        Err(msg) => {
-            push_refused(&repo, push_refusal_reason(&msg), &msg);
-            return error_response(StatusCode::BAD_REQUEST, &msg);
-        }
-    };
-
     // A PUSH MUST PROVE ITSELF, exactly like every other mutating route — and
     // it proves itself one of the two ways git can carry:
     //
@@ -763,12 +782,30 @@ pub(crate) async fn git_receive_pack(
     // pubkey the permanent owner and every later signed push was refused as
     // "only the owner" (#1292). The data-plane signature is NOT a third way:
     // it covers a body digest, and `git push` computes the packfile itself.
-    if cert.is_none() && operator.is_none() {
+    //
+    // checked here, BEFORE `parse_push_commands` (a signed push's certificate
+    // parse: base64 dearmor + certificate text parse), rather than after: a
+    // request with neither an operator header nor anything claiming to be a
+    // certificate is refused at the cost of a cheap peek at the first command
+    // line, not a full certificate parse.
+    if !push_may_carry_proof(&commands, operator.is_some()) {
         const REFUSAL: &str = "this push carries no proof: sign it (`git push --signed`) \
                                or present this node's operator credential";
         push_refused(&repo, "push_unauthenticated", REFUSAL);
         return error_response(StatusCode::UNAUTHORIZED, REFUSAL);
     }
+
+    // the command list: plain `<old> <new> <refname>` lines, or — a signed
+    // push — the certificate they live in. one push may update several
+    // branches, and forge applies them ATOMICALLY.
+    let nonce = push_cert_nonce(&handle, &repo);
+    let PushCommands { cmds, cert } = match parse_push_commands(&commands, nonce.as_deref()) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            push_refused(&repo, push_refusal_reason(&msg), &msg);
+            return error_response(StatusCode::BAD_REQUEST, &msg);
+        }
+    };
 
     // only branches are pushable (no tags/notes). consume-and-refuse: the pack
     // was fully received; reporting `ng` (not an http error) lets git print a
@@ -1175,6 +1212,33 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
         assert_eq!(parsed.cmds[1].2, "refs/heads/old");
         assert!(parse_push_commands(&[b"junk\n".to_vec()], None).is_err());
     }
+
+    /// receive-pack refuses a credential-less push BEFORE it ever attempts
+    /// the certificate parse — checked on a command list that would fail
+    /// `parse_push_commands` outright (neither valid triples nor a
+    /// certificate), so a wrongly-late gate would surface as a parse error
+    /// (400) rather than the auth refusal (401) this checks for.
+    #[test]
+    fn a_credential_less_push_is_refused_before_the_certificate_parse() {
+        let unparseable_junk = vec![b"junk\n".to_vec()];
+        assert!(
+            !push_may_carry_proof(&unparseable_junk, false),
+            "no operator header and no push-cert claim: refused pre-parse"
+        );
+        assert!(
+            parse_push_commands(&unparseable_junk, None).is_err(),
+            "would ALSO fail to parse"
+        );
+
+        assert!(
+            push_may_carry_proof(&unparseable_junk, true),
+            "an operator credential is proof enough regardless of body content"
+        );
+        assert!(
+            push_may_carry_proof(&signed_commands(), false),
+            "a body claiming push-cert earns the (cheap) certificate parse"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1325,5 +1389,24 @@ mod upload_pack_tests {
             .expect("unknown negotiation line must fail");
 
         assert!(err.contains("unexpected upload-pack negotiation line"));
+    }
+
+    /// a body entirely of minimal 5-byte pkt-lines (`0005A`, one byte of
+    /// payload) is refused once it passes `MAX_GIT_PKT_LINES`, before it can
+    /// force the ~1 GB of small allocations an unbounded parse would make.
+    #[test]
+    fn a_body_of_minimal_pkt_lines_past_the_cap_is_refused() {
+        let one_line = b"0005A".to_vec();
+        let under_cap: Vec<u8> = one_line.repeat(MAX_GIT_PKT_LINES);
+        let over_cap: Vec<u8> = one_line.repeat(MAX_GIT_PKT_LINES + 1);
+
+        // exactly at the cap: parse_pkt_lines runs out of buffer looking for
+        // the terminating flush, which is its own (unrelated) truncation
+        // error — the point here is it is NOT the "too many" error.
+        let under = parse_pkt_lines(&under_cap).unwrap_err();
+        assert!(!under.contains("too many"), "{under}");
+
+        let over = parse_pkt_lines(&over_cap).unwrap_err();
+        assert!(over.contains("too many pkt-lines in request"), "{over}");
     }
 }
