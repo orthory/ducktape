@@ -169,6 +169,59 @@ pub const MAX_STORE_READS: usize = 4096;
 /// (the files guest) ever accrue against it; every other tenant leaves it at 0.
 pub const MAX_OBJECT_READS: usize = 4096;
 
+/// hard ceiling on a guest's LINEAR MEMORY, in bytes. Without it a `memory.grow`
+/// succeeds or fails according to how much RAM the validator's process happens
+/// to have free — the same bytes and the same inputs then write state A on a
+/// 64 GiB node and state B on a 4 GiB one, a fork out of host hardware. With it
+/// the refusal is a protocol constant: a grow past the ceiling returns -1
+/// identically everywhere (the limiter does not trap on grow failure, so the
+/// guest sees the wasm-defined -1 and may branch on it — deterministically).
+///
+/// 256 MiB is the ceiling because it is far above what any consensus guest
+/// legitimately needs (a dispatch's whole working set is one op, its staged
+/// writes, and the objects it walked) and far below the memory a validator can
+/// lose without the node itself failing.
+pub const MAX_GUEST_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+
+/// hard ceiling on the elements of one guest table (LLVM emits a funcref table
+/// per module). `table.grow` past it returns -1, like the memory ceiling.
+pub const MAX_GUEST_TABLE_ELEMENTS: usize = 1 << 20;
+
+/// hard ceiling on the core instances / tables / memories one component may
+/// bring up in a store. A `ducktape:module` component is a handful of core
+/// instances (the guest plus its adapters); these are generous by an order of
+/// magnitude and exist so the count is a protocol constant rather than
+/// wasmtime's default of 10000.
+pub const MAX_GUEST_INSTANCES: usize = 256;
+pub const MAX_GUEST_TABLES: usize = 128;
+pub const MAX_GUEST_MEMORIES: usize = 16;
+
+/// the native stack a guest call may use, pinned rather than inherited: a
+/// recursion depth that traps here must trap at the same depth on every
+/// validator, and wasmtime's default is free to move between releases. This IS
+/// that default today (512 KiB) — the point is that it stops being a default.
+pub const MAX_GUEST_STACK_BYTES: usize = 512 * 1024;
+
+/// the store-resource ceilings every [`Store`] this crate builds installs (see
+/// [`MAX_GUEST_MEMORY_BYTES`]). Growth past a ceiling is refused, not trapped,
+/// so the guest observes the ordinary wasm -1. It is the `Default`, so no
+/// [`HostData`] — however it is built — can back a store with no ceilings.
+struct GuestLimits(wasmtime::StoreLimits);
+
+impl Default for GuestLimits {
+    fn default() -> Self {
+        Self(
+            wasmtime::StoreLimitsBuilder::new()
+                .memory_size(MAX_GUEST_MEMORY_BYTES)
+                .table_elements(MAX_GUEST_TABLE_ELEMENTS)
+                .instances(MAX_GUEST_INSTANCES)
+                .tables(MAX_GUEST_TABLES)
+                .memories(MAX_GUEST_MEMORIES)
+                .build(),
+        )
+    }
+}
+
 /// the host-side content-addressed object store a wasm odb tenant reads from
 /// and stages puts against. Task 1 ships only the trait + the plumbing that
 /// routes the object imports here; NO backing is wired (`WasmModule::odb` is
@@ -429,6 +482,11 @@ struct HostData {
     out_msgs: Vec<(String, Vec<u8>)>,
     out_events: Vec<(String, Vec<u8>)>,
     out_assigned: Vec<u8>,
+    /// the store-resource ceilings this round runs under ([`GuestLimits`]).
+    /// Lives in the store DATA because a wasmtime limiter is a projection out
+    /// of `T` — every `Store::new` in this crate pairs with a `.limiter()` that
+    /// hands wasmtime this field.
+    limits: GuestLimits,
 }
 
 impl host::Host for HostData {
@@ -672,6 +730,7 @@ fn read_shape(
     component: &Component,
 ) -> Result<Shape, SdkError> {
     let mut store = Store::new(engine, HostData::default());
+    store.limiter(|d| &mut d.limits.0);
     store.set_fuel(DEFAULT_FUEL).map_err(module_err)?;
     let instance = ModuleWorld::instantiate(&mut store, component, linker).map_err(module_err)?;
     let declared = instance.call_shape(&mut store).map_err(module_err)?;
@@ -1001,8 +1060,10 @@ impl WasmModule {
             out_msgs: Vec::new(),
             out_events: Vec::new(),
             out_assigned: Vec::new(),
+            limits: GuestLimits::default(),
         };
         let mut store = Store::new(&self.engine, data);
+        store.limiter(|d| &mut d.limits.0);
         let call: Result<Result<Vec<u8>, WitError>, SdkError> = match store.set_fuel(fuel) {
             Err(e) => Err(module_err(e)),
             Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker) {
@@ -1104,9 +1165,11 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, SdkError> {
 }
 
 /// The determinism envelope for module execution: fuel-metered termination, no
-/// ambient imports, canonical NaNs, and every wasm proposal the integer/bytes
-/// component ABI does not need switched OFF — the envelope is identical on
-/// every validator, so the same guest bytes behave identically everywhere.
+/// ambient imports, canonical NaNs, a pinned native-stack ceiling, and every
+/// wasm proposal the integer/bytes component ABI does not need switched OFF —
+/// the envelope is identical on every validator, so the same guest bytes behave
+/// identically everywhere. The memory/table ceilings ride the store's limiter
+/// ([`GuestLimits`]), which a `Config` cannot carry.
 ///
 /// Kept ON (the componentized-Rust baseline): bulk-memory, multi-value,
 /// reference-types (LLVM output uses funcref tables), and multi-memory
@@ -1129,6 +1192,11 @@ fn deterministic_config() -> Config {
     c.wasm_stack_switching(false);
     c.wasm_custom_page_sizes(false);
     c.wasm_wide_arithmetic(false);
+    // the recursion ceiling is OURS, not whatever this wasmtime release
+    // defaults to: a guest that recurses too deep must trap at the same depth
+    // on every validator. the per-store memory/table ceilings are the limiter's
+    // ([`GuestLimits`]) — a Config cannot express them.
+    c.max_wasm_stack(MAX_GUEST_STACK_BYTES);
     if let Some(dir) = COMPILATION_CACHE_DIR.get() {
         let mut cfg = wasmtime::CacheConfig::new();
         cfg.with_directory(dir);
@@ -1363,8 +1431,10 @@ impl Module for WasmModule {
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
                 out_assigned: Vec::new(),
+                limits: GuestLimits::default(),
             };
             let mut store = Store::new(&self.engine, data);
+            store.limiter(|d| &mut d.limits.0);
 
             let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(fuel_left) {
                 Err(e) => Err(module_err(e)),
@@ -1691,6 +1761,62 @@ mod bounds {
             nine_rounds >= one_round * 4,
             "nine replay rounds needed {nine_rounds} fuel against {one_round} for one — \
              the budget is being re-granted per round"
+        );
+    }
+
+    /// growth past the ceiling is REFUSED (the guest sees wasm's -1), and it is
+    /// refused on the constant alone — the `maximum` wasmtime derives from the
+    /// host's own reservation never enters the decision, so every validator
+    /// answers the same guest the same way.
+    #[test]
+    fn memory_growth_is_capped_by_the_protocol_constant() {
+        use wasmtime::ResourceLimiter;
+
+        let mut limits = GuestLimits::default().0;
+        assert!(
+            limits
+                .memory_growing(0, MAX_GUEST_MEMORY_BYTES, None)
+                .expect("at the ceiling"),
+            "growth to the ceiling is allowed"
+        );
+        assert!(
+            !limits
+                .memory_growing(0, MAX_GUEST_MEMORY_BYTES + 1, None)
+                .expect("over the ceiling"),
+            "growth past the ceiling must be refused, not sized by host RAM"
+        );
+        assert!(
+            !limits
+                .table_growing(0, MAX_GUEST_TABLE_ELEMENTS + 1, None)
+                .expect("over the table ceiling"),
+            "table growth past the ceiling must be refused"
+        );
+    }
+
+    /// the ceilings reach the guest only if EVERY store this crate builds
+    /// installs them — the default `HostData` carries them, and each
+    /// `Store::new` pairs with a `.limiter()`. The pairing is load-bearing and
+    /// invisible to types, so it is checked against the source.
+    #[test]
+    fn every_store_installs_the_limiter() {
+        use wasmtime::ResourceLimiter;
+
+        let mut default_data = HostData::default();
+        assert!(
+            !default_data
+                .limits
+                .0
+                .memory_growing(0, MAX_GUEST_MEMORY_BYTES + 1, None)
+                .expect("over the ceiling"),
+            "an unconfigured HostData would run a store with no ceiling at all"
+        );
+
+        let src = include_str!("lib.rs");
+        let stores = src.matches(concat!("Store", "::new(")).count();
+        let limiters = src.matches(concat!("store", ".limiter(")).count();
+        assert_eq!(
+            stores, limiters,
+            "{stores} Store::new sites against {limiters} store.limiter calls"
         );
     }
 }
