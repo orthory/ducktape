@@ -106,8 +106,14 @@ struct AppState {
     /// The boundary is [`AppState::grant_check`], which decides who may open a
     /// session at all.
     budgets: Mutex<HashMap<String, u32>>,
-    /// Per-name sealed-request nonces already served — replay dedupe. Bounded
-    /// by the request budget per name; dies with the process like every key.
+    /// Per-name sealed-request nonces already served — replay dedupe. It lives
+    /// with the session whose replays it catches: a `/session` open refills the
+    /// budget and CLEARS this set, and an entry only ever lands beside a spent
+    /// request (the nonce is recorded after the AEAD opened the blob and after
+    /// the budget spend), so it holds at most `max_requests` entries per name.
+    /// Both orderings are the bound — recording an unauthenticated 12-byte
+    /// prefix let anyone holding a bearer grow this map for free, forever.
+    /// Dies with the process like every key.
     seen_nonces: Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
     /// The co-hosted-lending grant gate (see [`GrantCheck`]). `None` on gateways
     /// that never lend, where every known credential opens without a grant check.
@@ -693,7 +699,15 @@ async fn session(
         eph: req.client_eph_pk_b64.clone(),
         seal: req.body_seal,
     };
-    st.budgets.lock().unwrap().insert(req.sub, st.cfg.max_requests);
+    // The replay window opens with the budget it is bounded by: this refill is
+    // what makes another `max_requests` sealed bodies spendable, so the set of
+    // nonces those must be distinct from starts empty here. What a clearing
+    // lets through is a blob resealed under THIS session's request key, which
+    // is derived from the caller's own ephemeral secret — so replaying a
+    // captured one means opening a session under the victim's ephemeral pk,
+    // which is a grant-gated act that spends budget of its own.
+    st.budgets.lock().unwrap().insert(req.sub.clone(), st.cfg.max_requests);
+    st.seen_nonces.lock().unwrap().remove(&req.sub);
     let token = token::issue(&st.sess_sk, &claims);
     let sealed = handshake::seal_token(&keys.session, token.as_bytes());
     Ok(Json(SessionResponse { sealed_token_b64: BASE64.encode(sealed) }))
@@ -779,25 +793,10 @@ async fn proxy_inner(
         == Some(bodyseal::SEAL_V1);
     let binding = bodyseal::request_binding(&body);
     let body = match (&seal_keys, sealed_request) {
-        (Some(keys), true) => {
-            let replayed = !st
-                .seen_nonces
-                .lock()
-                .unwrap()
-                .entry(claims.sub.clone())
-                .or_default()
-                .insert(binding.clone());
-            if replayed {
-                return Err(AppErr(
-                    StatusCode::BAD_REQUEST,
-                    "airlock: replayed sealed request".into(),
-                ));
-            }
-            Bytes::from(
-                bodyseal::open_request(keys, &body)
-                    .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
-            )
-        }
+        (Some(keys), true) => Bytes::from(
+            bodyseal::open_request(keys, &body)
+                .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
+        ),
         (Some(_), false) if !body.is_empty() => {
             return Err(AppErr(
                 StatusCode::BAD_REQUEST,
@@ -839,6 +838,28 @@ async fn proxy_inner(
             ));
         }
         *rem -= 1;
+    }
+
+    // Replay dedupe, LAST of the three admission steps and deliberately so: the
+    // AEAD proved the blob is this session's request, and the spend above paid
+    // for it, so one entry here always costs one request of the budget — which
+    // is the whole of this set's bound, since `/session` clears it as it
+    // refills. Recording the nonce first made an unauthenticated 12-byte body a
+    // free, permanent allocation for any bearer holder.
+    if sealed_request {
+        let fresh = st
+            .seen_nonces
+            .lock()
+            .unwrap()
+            .entry(claims.sub.clone())
+            .or_default()
+            .insert(binding.clone());
+        if !fresh {
+            return Err(AppErr(
+                StatusCode::BAD_REQUEST,
+                "airlock: replayed sealed request".into(),
+            ));
+        }
     }
 
     // Ensure a fresh access token, then swap session token -> real credential.
@@ -1000,5 +1021,121 @@ mod tests {
         assert_eq!(upstream_path(CredentialKind::Claude, "/v1/messages"), "/v1/messages");
         // A codex path already without `/v1` is left alone.
         assert_eq!(upstream_path(CredentialKind::Codex, "/responses"), "/responses");
+    }
+
+    /// A gateway with one seeded bearer credential and an upstream that cannot
+    /// be reached: every admission decision this module owns happens before the
+    /// proxied call, so a dead upstream is the cheapest way to observe them.
+    fn test_state(name: &str, max_requests: u32) -> Arc<AppState> {
+        let seal_kp = SealKeypair::generate();
+        let sess_sk = SigningKey::generate(&mut OsRng);
+        let sess_pk = sess_sk.verifying_key();
+        let entry = cred_entry(
+            CredentialKind::Claude,
+            CredentialPayload::Bearer { access_token: "tok".into() },
+        )
+        .unwrap();
+        Arc::new(AppState {
+            seal_kp,
+            sess_sk,
+            sess_pk,
+            quote: Vec::new(),
+            vendor: "self-host".into(),
+            http: reqwest::Client::new(),
+            cfg: Config {
+                // port 1 is never listening: connect is refused at once, so the
+                // proxied call fails without waiting on anything.
+                anthropic_base: "http://127.0.0.1:1".into(),
+                openai_base: String::new(),
+                oauth_token_url: String::new(),
+                oauth_client_id: String::new(),
+                session_ttl_secs: 3600,
+                max_requests,
+            },
+            creds: Mutex::new(HashMap::from([(name.to_string(), Arc::new(entry))])),
+            budgets: Mutex::new(HashMap::new()),
+            seen_nonces: Mutex::new(HashMap::new()),
+            grant_check: None,
+            reload: None,
+        })
+    }
+
+    fn recorded_nonces(st: &AppState, name: &str) -> usize {
+        st.seen_nonces.lock().unwrap().get(name).map_or(0, |set| set.len())
+    }
+
+    fn sealed_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        headers.insert(bodyseal::SEAL_HEADER, bodyseal::SEAL_V1.parse().unwrap());
+        headers
+    }
+
+    async fn post_sealed(st: &Arc<AppState>, token: &str, body: Vec<u8>) -> StatusCode {
+        let uri: axum::http::Uri = "/v1/messages".parse().unwrap();
+        proxy_inner(st, Method::POST, &uri, &sealed_headers(token), Bytes::from(body))
+            .await
+            .err()
+            .expect("the upstream is unreachable, so every call ends in an error")
+            .0
+    }
+
+    /// The replay set costs a request of the budget to grow and nothing else:
+    /// a body the AEAD refuses records NOTHING (that write was free for anyone
+    /// holding a bearer, and permanent), and a `/session` refill clears the set
+    /// it bounds.
+    #[tokio::test]
+    async fn the_replay_set_only_grows_with_authenticated_spent_requests() {
+        let st = test_state("a", 8);
+        let (client_eph_pk, keys) = handshake::client_handshake(&st.seal_kp.public_bytes());
+        let eph_b64 = BASE64.encode(client_eph_pk);
+        let open = |st: &Arc<AppState>| {
+            session(
+                State(st.clone()),
+                HeaderMap::new(),
+                Json(SessionRequest {
+                    sub: "a".into(),
+                    client_eph_pk_b64: eph_b64.clone(),
+                    body_seal: true,
+                    work: WorkRef::Direct,
+                }),
+            )
+        };
+        assert!(open(&st).await.is_ok(), "a seeded credential opens a session");
+        let claims = Claims {
+            sub: "a".into(),
+            iat: now_secs(),
+            exp: now_secs() + 3600,
+            eph: eph_b64.clone(),
+            seal: true,
+        };
+        let token = token::issue(&st.sess_sk, &claims);
+
+        // Garbage under the seal header: refused, and it leaves no trace.
+        let status = post_sealed(&st, &token, vec![7u8; 32]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(recorded_nonces(&st, "a"), 0, "an unauthenticated body must record nothing");
+        assert_eq!(st.budgets.lock().unwrap()["a"], 8, "and must cost nothing");
+
+        // Authentic sealed bodies each record one nonce and spend one request.
+        let blobs: Vec<Vec<u8>> =
+            (0..3u8).map(|i| bodyseal::seal_request(&keys, &[i; 16])).collect();
+        for blob in &blobs {
+            let status = post_sealed(&st, &token, blob.clone()).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "admitted, then the upstream is dead");
+        }
+        assert_eq!(recorded_nonces(&st, "a"), 3);
+        assert_eq!(st.budgets.lock().unwrap()["a"], 5);
+
+        // The same blob again is the replay this set exists to catch.
+        let status = post_sealed(&st, &token, blobs[0].clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(recorded_nonces(&st, "a"), 3, "a replay adds nothing");
+
+        // Reopening the session refills the budget — and clears the set that
+        // bounds it, which is what keeps the two in step.
+        assert!(open(&st).await.is_ok(), "the session reopens");
+        assert_eq!(recorded_nonces(&st, "a"), 0);
+        assert_eq!(st.budgets.lock().unwrap()["a"], 8);
     }
 }
