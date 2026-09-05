@@ -145,16 +145,27 @@ impl AdvertBook {
     /// The one accepted-advert write path (`observe` and `readvertise` both
     /// end here): keep the key's existing seniority, or take a fresh admission
     /// slot for a first-seen key, then store the advert with its life restarted
-    /// at `now`. Returns `false`, leaving state untouched, only when this is a
-    /// first-seen key AND [`Self::admit`] refuses it (its source is at
-    /// [`MAX_ADVERTS_PER_SOURCE_IP`]) — an existing key always succeeds,
-    /// refresh or not.
+    /// at `now`. Returns `false`, leaving state untouched, when the write
+    /// would add a LIVE entry to `src.ip()` — a first-seen key, an expired
+    /// key's refresh, or a migration to a new source — and that source is
+    /// already at [`MAX_ADVERTS_PER_SOURCE_IP`]. A refresh from the SAME live
+    /// source never re-runs the cap check: it isn't adding a live entry
+    /// anywhere, just extending the one already counted.
     fn insert_fresh(&mut self, key: NodeKey, src: SocketAddr, nonce: u64, now: u64) -> bool {
+        let prev = self.latest.get(&key).copied();
         // Seniority belongs to the KEY and survives every refresh: a member
         // that re-advertises keeps the slot it earned instead of becoming the
         // newest arrival (and so the next victim).
-        let admitted = match self.latest.get(&key) {
-            Some(prev) => prev.admitted,
+        let admitted = match prev {
+            Some(prev) if !self.expired(&prev, now) && prev.reflexive.ip() == src.ip() => {
+                prev.admitted
+            }
+            Some(prev) => {
+                if !self.cap_check(src.ip(), now) {
+                    return false;
+                }
+                prev.admitted
+            }
             None => match self.admit(src, now) {
                 Some(admitted) => admitted,
                 None => return false,
@@ -172,28 +183,42 @@ impl AdvertBook {
         true
     }
 
-    /// Take an admission slot for a FIRST-SEEN key: refuse it outright if its
-    /// source IP already holds [`MAX_ADVERTS_PER_SOURCE_IP`] live entries —
-    /// never evicting one of them, so an at-cap source can never bump another
-    /// source out — otherwise reclaim space if the book itself is at
-    /// [`MAX_ADVERTS`], then stamp the next admission sequence.
+    /// Refuse a write to `ip` outright if it already holds
+    /// [`MAX_ADVERTS_PER_SOURCE_IP`] live entries — never evicting one of
+    /// them, so an at-cap source can never bump another source out. Shared by
+    /// a first-seen key's admission and by a refresh that is about to add a
+    /// live entry under a DIFFERENT ip than the one it's replacing (an
+    /// expired-key reclaim or a migrated key) — both would otherwise grow
+    /// that source's live share past the cap the same way a brand-new key
+    /// would.
+    fn cap_check(&mut self, ip: IpAddr, now: u64) -> bool {
+        if self.live_adverts_from(ip, now) < MAX_ADVERTS_PER_SOURCE_IP {
+            return true;
+        }
+        // peer-driven and unauthenticated by definition (any key can spray
+        // from one address), so this is latched like every other refusal in
+        // this crate — the count is the diagnosis.
+        static SOURCE_CAP: Latch = Latch::new();
+        if let Some(occurrences) = SOURCE_CAP.hit("advert_source_cap") {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                event = "advert_refused",
+                reason = "advert_source_cap",
+                source = %ip,
+                cap = MAX_ADVERTS_PER_SOURCE_IP,
+                occurrences,
+                "source IP at its per-source advert cap — new key refused"
+            );
+        }
+        false
+    }
+
+    /// Take an admission slot for a FIRST-SEEN key: refuse it via
+    /// [`Self::cap_check`] if its source IP is already at
+    /// [`MAX_ADVERTS_PER_SOURCE_IP`], otherwise reclaim space if the book
+    /// itself is at [`MAX_ADVERTS`], then stamp the next admission sequence.
     fn admit(&mut self, src: SocketAddr, now: u64) -> Option<u64> {
-        if self.live_adverts_from(src.ip(), now) >= MAX_ADVERTS_PER_SOURCE_IP {
-            // peer-driven and unauthenticated by definition (any key can
-            // spray from one address), so this is latched like every other
-            // refusal in this crate — the count is the diagnosis.
-            static SOURCE_CAP: Latch = Latch::new();
-            if let Some(occurrences) = SOURCE_CAP.hit("advert_source_cap") {
-                tracing::warn!(
-                    target: "ducktape::reachability",
-                    event = "advert_refused",
-                    reason = "advert_source_cap",
-                    source = %src.ip(),
-                    cap = MAX_ADVERTS_PER_SOURCE_IP,
-                    occurrences,
-                    "source IP at its per-source advert cap — new key refused"
-                );
-            }
+        if !self.cap_check(src.ip(), now) {
             return None;
         }
         self.evict_if_full(now);
@@ -786,6 +811,54 @@ mod tests {
             book.current(ninth, past_ttl),
             Some(addr(200, 9000)),
             "expiry of the source's held slots frees room for a new key"
+        );
+    }
+
+    #[test]
+    fn an_expired_keys_refresh_still_obeys_the_source_cap() {
+        // A key already IN the book (as a corpse) is not exempt from the cap
+        // just because `latest` already has an entry for it: reviving it at
+        // an at-cap source must be refused exactly like a first-seen key.
+        let mut book = AdvertBook::with_ttl(120);
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            book.observe(source_key(i), addr(200, 4000 + i as u16), 0);
+        }
+        let stale_key = NodeKey([0x99; 32]);
+        book.observe(stale_key, addr(9, 4000), 0);
+        // Keep the capped source's eight entries alive while `stale_key`'s
+        // own mapping (last touched at t=0) ages past its ttl.
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            book.readvertise(source_key(i), addr(200, 4000 + i as u16), 1, 50);
+        }
+        assert_eq!(book.current(stale_key, 170), None, "stale_key has expired");
+        book.observe(stale_key, addr(200, 9999), 170);
+        assert_eq!(
+            book.current(stale_key, 170),
+            None,
+            "reviving an expired key at an at-cap source obeys the cap"
+        );
+    }
+
+    #[test]
+    fn a_readvertise_migrating_to_an_at_cap_source_is_refused() {
+        // A key LIVE at one source that re-advertises to a DIFFERENT source
+        // must still be checked against the destination's cap — moving is
+        // just as much an admission at the new IP as a first-seen key.
+        let mut book = AdvertBook::with_ttl(120);
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            book.observe(source_key(i), addr(200, 4000 + i as u16), 1_000);
+        }
+        let member = NodeKey([0x42; 32]);
+        book.observe(member, addr(1, 4000), 1_000);
+        assert_eq!(
+            book.readvertise(member, addr(200, 9999), 1, 1_010),
+            AdvertOutcome::Refused,
+            "migrating to an at-cap source is refused"
+        );
+        assert_eq!(
+            book.current(member, 1_010),
+            Some(addr(1, 4000)),
+            "a refused migration leaves the old live mapping untouched"
         );
     }
 }
