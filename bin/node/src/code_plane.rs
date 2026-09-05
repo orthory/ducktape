@@ -219,24 +219,17 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
         stream.write_all(&[ACK_ALREADY_HAVE]).await?;
         return stream.write_all(&0u64.to_be_bytes()).await;
     }
-    if !inflight.lock().expect("inflight lock").insert(digest) {
-        return refuse(stream, "already_inflight").await;
-    }
-    // hold the slot for the whole transfer; released on every exit below.
-    let release = |budget_taken: u64| {
-        inflight.lock().expect("inflight lock").remove(&digest);
-        budget.fetch_sub(budget_taken, Ordering::Relaxed);
+    // the admission is a GUARD, not a closure the exit paths must remember to
+    // call: the two ack writes below use `?`, and a connection dropped in that
+    // window used to return with the digest still inflight and its length still
+    // charged — permanently, for the life of the process.
+    let _admission = match PushSlot::acquire(&inflight, &budget, digest, len) {
+        Ok(slot) => slot,
+        Err(reason) => return refuse(stream, reason).await,
     };
-    if budget.fetch_add(len, Ordering::Relaxed) + len > STAGING_BUDGET {
-        release(len);
-        return refuse(stream, "staging_budget_exhausted").await;
-    }
     let mut slot = match blobs.stage(digest, len) {
         Ok(slot) => slot,
-        Err(_) => {
-            release(len);
-            return refuse(stream, "stage_open_failed").await;
-        }
+        Err(_) => return refuse(stream, "stage_open_failed").await,
     };
     stream.write_all(&[ACK_SEND_FROM]).await?;
     stream.write_all(&slot.offset().to_be_bytes()).await?;
@@ -245,15 +238,12 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     while slot.offset() < len {
         let want = buf.len().min((len - slot.offset()) as usize);
         let n = match stream.read(&mut buf[..want]).await {
-            Ok(0) | Err(_) => {
-                // dropped mid-transfer: staging stays for a resume.
-                release(len);
-                return Ok(());
-            }
+            // dropped mid-transfer: staging stays for a resume, inside the
+            // store's resume window.
+            Ok(0) | Err(_) => return Ok(()),
             Ok(n) => n,
         };
         if slot.append(&buf[..n]).is_err() {
-            release(len);
             return stream.write_all(&[RESULT_STAGE_FAILED]).await;
         }
     }
@@ -273,8 +263,54 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
         }
         Err(_) => RESULT_STAGE_FAILED,
     };
-    release(len);
     stream.write_all(&[result]).await
+}
+
+/// one push's admission: the digest's inflight slot and its charge against the
+/// process-wide staging budget. both are released by `Drop`, so every exit
+/// path — including an io error on a write with `?` — returns them.
+struct PushSlot {
+    inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
+    budget: Arc<AtomicU64>,
+    digest: [u8; 32],
+    charged: u64,
+}
+
+impl PushSlot {
+    /// `Err` carries the refusal reason for the ack frame.
+    fn acquire(
+        inflight: &Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
+        budget: &Arc<AtomicU64>,
+        digest: [u8; 32],
+        len: u64,
+    ) -> Result<Self, &'static str> {
+        if !inflight.lock().expect("inflight lock").insert(digest) {
+            return Err("already_inflight");
+        }
+        budget.fetch_add(len, Ordering::Relaxed);
+        let slot = Self {
+            inflight: Arc::clone(inflight),
+            budget: Arc::clone(budget),
+            digest,
+            charged: len,
+        };
+        // over budget: dropping `slot` here is what returns both the inflight
+        // entry and the charge.
+        if budget.load(Ordering::Relaxed) > STAGING_BUDGET {
+            return Err("staging_budget_exhausted");
+        }
+        Ok(slot)
+    }
+}
+
+impl Drop for PushSlot {
+    fn drop(&mut self) {
+        self.inflight
+            .lock()
+            .expect("inflight lock")
+            .remove(&self.digest);
+        self.budget.fetch_sub(self.charged, Ordering::Relaxed);
+    }
 }
 
 /// serve one pull: a status+len header, then the raw bytes from `offset`.
@@ -550,6 +586,66 @@ mod tests {
             .await
             .expect_err("unknown kind refused");
         assert!(err.contains("refused"), "got: {err}");
+    }
+
+    /// a peer that vanished between the meta and the ack: every write fails.
+    struct DeadStream;
+
+    impl AsyncRead for DeadStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+        }
+    }
+
+    impl AsyncWrite for DeadStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_ack_write_releases_the_slot_and_the_budget() {
+        let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
+        let budget = Arc::new(AtomicU64::new(0));
+        let digest = [9u8; 32];
+
+        let outcome = receive_push(
+            DeadStream,
+            KIND_MODULE_CODE,
+            digest,
+            4096,
+            blobstore::BlobHandle::default(),
+            Arc::clone(&inflight),
+            Arc::clone(&budget),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "the ack write must fail");
+        assert!(
+            inflight.lock().expect("inflight lock").is_empty(),
+            "the inflight slot leaked"
+        );
+        assert_eq!(budget.load(Ordering::Relaxed), 0, "the budget leaked");
     }
 
     #[tokio::test(start_paused = true)]
