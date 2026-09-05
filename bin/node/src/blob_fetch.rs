@@ -86,17 +86,36 @@ pub enum CoClientVerdict {
     /// answers "what does THIS node see" — its whole value is who said it, and
     /// it carries no proof. drop, never complete.
     PeerMismatch,
+    /// a reply with no waiter left: the request timed out at
+    /// [`COCLIENT_TIMEOUT`] and the peer answered afterwards. drop it quietly —
+    /// falling through would run the reply into the proof gate and warn
+    /// `sync_proof_invalid` at a peer that did nothing but answer the question
+    /// we asked, late.
+    LateReply,
 }
 
 /// the demux decision. mirrors the joiner-side client's rule ("only a candidate
 /// source may complete requests", `statesync::p2p`), tightened to the single
 /// peer the request was addressed to.
+/// `unsigned` says the frame's envelope carries ZEROED requester+proof — the
+/// shape a REPLY rides (the transport authenticates a reply, so the server
+/// zero-fills those fields). every genuine request carries a signed standing
+/// proof, so a co-client-range id with no waiter and no signature is our own
+/// answer landing after its timeout. the id space alone cannot say this: both
+/// ends of a link draw their co-client ids from the same range, so a peer's
+/// REQUEST arrives here with a high id too.
 pub fn classify_coclient_frame(
+    rpc_id: u64,
     peer: &ed25519::PublicKey,
     addressed_to: Option<&ed25519::PublicKey>,
+    unsigned: bool,
 ) -> CoClientVerdict {
     let Some(addressed_to) = addressed_to else {
-        return CoClientVerdict::PeerRequest;
+        let we_asked_this = rpc_id >= COCLIENT_ID_BASE && unsigned;
+        return match we_asked_this {
+            true => CoClientVerdict::LateReply,
+            false => CoClientVerdict::PeerRequest,
+        };
     };
     if addressed_to != peer {
         return CoClientVerdict::PeerMismatch;
@@ -771,19 +790,43 @@ mod tests {
         let (asked, other) = (key(1), key(2));
 
         assert_eq!(
-            classify_coclient_frame(&asked, Some(&asked)),
+            classify_coclient_frame(fresh_coclient_id(), &asked, Some(&asked), true),
             CoClientVerdict::Response,
             "the peer we asked answers our request"
         );
         assert_eq!(
-            classify_coclient_frame(&other, Some(&asked)),
+            classify_coclient_frame(fresh_coclient_id(), &other, Some(&asked), true),
             CoClientVerdict::PeerMismatch,
             "a third party may not answer a request addressed elsewhere"
         );
         assert_eq!(
-            classify_coclient_frame(&other, None),
+            classify_coclient_frame(7, &other, None, false),
             CoClientVerdict::PeerRequest,
-            "an id we hold no waiter for is a peer's own request"
+            "a signed frame with no waiter is a peer's own request"
+        );
+    }
+
+    /// a peer that answers after our 6 s timeout is honest and late. the demux
+    /// must recognise its own id space and drop the frame, never let it reach
+    /// the proof gate — our replies ride zeroed auth fields, so the gate would
+    /// warn `sync_proof_invalid` at a co-validator that did nothing wrong.
+    #[test]
+    fn a_reply_that_missed_its_timeout_is_dropped_not_refused() {
+        assert_eq!(
+            classify_coclient_frame(fresh_coclient_id(), &key(3), None, true),
+            CoClientVerdict::LateReply,
+            "an unsigned frame on our own id with no waiter left is a late reply"
+        );
+        assert_eq!(
+            classify_coclient_frame(fresh_coclient_id(), &key(3), None, false),
+            CoClientVerdict::PeerRequest,
+            "a peer's own request draws its id from the same range — a SIGNED \
+             frame is always a request, whatever its id"
+        );
+        assert_eq!(
+            classify_coclient_frame(COCLIENT_ID_BASE - 1, &key(3), None, true),
+            CoClientVerdict::PeerRequest,
+            "the id space below the base was never ours to have asked on"
         );
     }
 

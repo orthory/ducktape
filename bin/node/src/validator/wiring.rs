@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{Signer, ed25519};
+use commonware_cryptography::{ed25519, Signer};
 use commonware_p2p::authenticated::lookup::{self, Network};
 use commonware_p2p::{Ingress, Receiver as P2pReceiver, Recipients, Sender as P2pSender};
 use commonware_runtime::{IoBuf, Quota, Spawner, Supervisor};
@@ -21,9 +21,9 @@ use crate::constants::*;
 use crate::explorer::heal_index;
 use crate::host_reads::{read_valset_residents, resume_member_keys};
 use crate::join_gate;
-use crate::reachability_plane::{GateHook, GateOutcomes, wire_reachability_plane};
+use crate::reachability_plane::{wire_reachability_plane, GateHook, GateOutcomes};
 use crate::sync::catchup::derive_pending_boot;
-use crate::sync::serve::{SyncStateRequest, drive_sync_request};
+use crate::sync::serve::{drive_sync_request, SyncStateRequest};
 use crate::{overlay_book, voice};
 use futures::StreamExt as _;
 use statesync::SyncServer;
@@ -387,15 +387,20 @@ pub(super) fn wire_serve_lanes(
                     .expect("pending blob lock")
                     .get(&rpc_id)
                     .map(|fetch| fetch.peer.clone());
-                match blob_fetch::classify_coclient_frame(&peer, addressed_to.as_ref()) {
+                let unsigned = requester.iter().all(|b| *b == 0) && proof.iter().all(|b| *b == 0);
+                match blob_fetch::classify_coclient_frame(
+                    rpc_id,
+                    &peer,
+                    addressed_to.as_ref(),
+                    unsigned,
+                ) {
                     blob_fetch::CoClientVerdict::PeerRequest => {}
                     blob_fetch::CoClientVerdict::Response => {
                         let waiter = blob_pending
                             .lock()
                             .expect("pending blob lock")
                             .remove(&rpc_id);
-                        if let (Some(waiter), Ok(resp)) =
-                            (waiter, statesync::decode_response(body))
+                        if let (Some(waiter), Ok(resp)) = (waiter, statesync::decode_response(body))
                         {
                             let _ = waiter.reply.send(resp);
                         }
@@ -410,6 +415,19 @@ pub(super) fn wire_serve_lanes(
                                 attempts,
                                 "co-client reply dropped — it came from a peer this \
                                  request was not addressed to"
+                            );
+                        }
+                        continue;
+                    }
+                    blob_fetch::CoClientVerdict::LateReply => {
+                        if let Some(attempts) = COCLIENT_DROP.hit("late_reply") {
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                reason = "late_reply",
+                                attempts,
+                                "co-client reply dropped — it arrived after its \
+                                 request had already timed out"
                             );
                         }
                         continue;
