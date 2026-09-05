@@ -5501,6 +5501,7 @@ dependencies = [
  "ducktape-home",
  "rand 0.8.6",
  "tempfile",
+ "tracing",
  "zeroize",
 ]
 
