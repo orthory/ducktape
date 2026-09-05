@@ -54,12 +54,37 @@ pub struct SpeakerStats {
     pub peer: PeerId,
     pub jitter: JitterStats,
     pub decode_errors: u64,
+    /// Packets this peer sent that the codec boundary refused outright
+    /// (off-contract TOC, too short, or an unwind out of the library).
+    pub bad_packets: u64,
 }
+
+/// A refused packet logs on the first and every hundredth occurrence per
+/// lane: a peer can send one per datagram, and a warn per datagram is a log
+/// bomb that evicts the ring the operator is reading.
+const BAD_PACKET_EVERY: u64 = 100;
 
 struct Lane {
     jitter: MinimalJitter,
     decoder: VoiceDecoder,
     decode_errors: u64,
+    bad_packets: u64,
+}
+
+impl Lane {
+    fn note_bad_packet(&mut self, peer: &PeerId, reason: &'static str) {
+        self.bad_packets += 1;
+        let occurrences = self.bad_packets;
+        if occurrences == 1 || occurrences.is_multiple_of(BAD_PACKET_EVERY) {
+            tracing::warn!(
+                target: "ducktape::voice",
+                reason,
+                peer = %peer_label(peer),
+                occurrences,
+                "refused a peer's opus packet"
+            );
+        }
+    }
 }
 
 type Lanes = Arc<Mutex<HashMap<PeerId, Lane>>>;
@@ -137,7 +162,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
     pub fn playout(&self) -> [i16; FRAME_SAMPLES] {
         let mut mix = [0i32; FRAME_SAMPLES];
         let mut lanes = self.lanes.lock().expect("lanes lock");
-        for lane in lanes.values_mut() {
+        for (peer, lane) in lanes.iter_mut() {
             let decoded = match lane.jitter.tick() {
                 // Buffering and Gap both render as silence: nothing to add.
                 PlayoutStep::Buffering | PlayoutStep::Gap => None,
@@ -146,9 +171,14 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
             let pcm = match decoded {
                 None => continue,
                 Some(Ok(pcm)) => pcm,
-                Some(Err(_)) => {
-                    // A peer's undecodable payload must not silence the rest
-                    // of the mix: count it and keep going.
+                // A peer's undecodable payload must not silence the rest of
+                // the mix: count it and keep going. A refused packet is the
+                // hostile-or-broken case and says so by reason.
+                Some(Err(CodecError::BadPacket(reason))) => {
+                    lane.note_bad_packet(peer, reason);
+                    continue;
+                }
+                Some(Err(CodecError::Opus(_))) => {
                     lane.decode_errors += 1;
                     continue;
                 }
@@ -187,6 +217,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
                 peer: *peer,
                 jitter: lane.jitter.stats(),
                 decode_errors: lane.decode_errors,
+                bad_packets: lane.bad_packets,
             })
             .collect()
     }
@@ -238,6 +269,7 @@ async fn pump<T: DataPlaneTransport>(
                     jitter: MinimalJitter::new(config.prefill_frames, config.max_depth_frames),
                     decoder,
                     decode_errors: 0,
+                    bad_packets: 0,
                 })
             }
         };
