@@ -719,11 +719,28 @@ pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
 }
 
 /// guard a join against clobbering a DIFFERENT network's descriptor: a
-/// workspace dir only ever holds one chain-id. a refreshed invite for the
-/// SAME chain-id (the documented re-join after a pre-genesis admit) may
+/// workspace dir only ever holds one network. a refreshed invite for the
+/// SAME network (the documented re-join after a pre-genesis admit) may
 /// replace it; anything else is almost certainly a paste into the wrong dir —
 /// and for a founder, an unrecoverable one (the time-salted chain-id cannot
 /// be re-minted).
+///
+/// the chain-id alone cannot decide that: it is free text an invite carries
+/// verbatim, it appears in every invite the network ever hands out, and
+/// `decode_invite_at` proves only that a blob is self-consistent — never that
+/// its issuer belongs to the network it names. so an attacker who copies a
+/// victim's chain-id onto a descriptor of their OWN validators mints a blob
+/// that resolves to the victim's registry directory and overwrites a live
+/// network's descriptor, stranding its identity and history.
+///
+/// what actually identifies a network is the genesis fingerprint
+/// ([`NetworkDescriptor::genesis_namespace`]) — the mesh handshake, the
+/// simplex scheme and the epoch floor are all domain-separated by it, so two
+/// descriptors that differ in it can never exchange a frame. the ONE
+/// legitimate way it changes under a workspace is the pre-genesis `admit`
+/// refresh, which only ever GROWS the validator set over the same genesis pin,
+/// module set and beat. so that is the exemption, spelled out: anything else
+/// is a foreign descriptor.
 pub fn guard_join_descriptor(dir: &Path, incoming: &NetworkDescriptor) -> Result<(), String> {
     let path = dir.join("network.toml");
     if !path.exists() {
@@ -739,7 +756,33 @@ pub fn guard_join_descriptor(dir: &Path, incoming: &NetworkDescriptor) -> Result
             incoming.chain_id
         ));
     }
+    let same_genesis = existing.genesis_namespace() == incoming.genesis_namespace();
+    let admit_refresh = existing.genesis == incoming.genesis
+        && existing.modules == incoming.modules
+        && existing.block_time_ms == incoming.block_time_ms
+        && validator_set(&existing).is_subset(&validator_set(incoming));
+    if !same_genesis && !admit_refresh {
+        return Err(format!(
+            "{} already belongs to genesis {} — refusing to replace its descriptor with an \
+             invite that reuses the chain-id {} over a DIFFERENT genesis {} (its validators, \
+             genesis pin, modules or beat are not yours); that invite was not issued by your \
+             network",
+            dir.display(),
+            existing.genesis_namespace(),
+            incoming.chain_id,
+            incoming.genesis_namespace(),
+        ));
+    }
     Ok(())
+}
+
+/// the validator entries as [`NetworkDescriptor::genesis_namespace`]
+/// fingerprints them — trimmed and lowercased, order-independent.
+fn validator_set(d: &NetworkDescriptor) -> std::collections::BTreeSet<String> {
+    d.validators
+        .iter()
+        .map(|v| v.trim().to_ascii_lowercase())
+        .collect()
 }
 
 /// the `host:port` peers should dial, if one is real: prefer `advertised`, else
@@ -1636,6 +1679,61 @@ mod tests {
         assert!(
             err.contains("home#11111111"),
             "error names the resident network: {err}"
+        );
+    }
+
+    #[test]
+    fn join_guard_refuses_an_invite_that_reuses_the_chain_id_over_a_foreign_genesis() {
+        let ours_key = ed25519::PrivateKey::from_seed(31).public_key();
+        let theirs = ed25519::PrivateKey::from_seed(32).public_key();
+        let dir = tmp("joinguard-genesis");
+        let ours = NetworkDescriptor {
+            chain_id: "home#33333333".into(),
+            validators: vec![hex_bytes(ours_key.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: "11".repeat(32),
+            modules: Vec::new(),
+        };
+        ours.save(&dir.join("network.toml")).expect("save");
+
+        // the whole attack: the chain-id is public, so it is copied verbatim;
+        // everything that decides which network this is belongs to the attacker.
+        let hostile = NetworkDescriptor {
+            validators: vec![hex_bytes(theirs.as_ref())],
+            genesis: "22".repeat(32),
+            ..ours.clone()
+        };
+        let err = guard_join_descriptor(&dir, &hostile).expect_err("foreign genesis refused");
+        assert!(
+            err.contains(&ours.genesis_namespace()) && err.contains(&hostile.genesis_namespace()),
+            "error names both genesis fingerprints: {err}"
+        );
+
+        // and the beat alone is enough to make it a different network.
+        let faster = NetworkDescriptor {
+            block_time_ms: ours.block_time_ms + 1,
+            ..ours.clone()
+        };
+        assert!(guard_join_descriptor(&dir, &faster).is_err(), "beat differs");
+
+        // the pre-genesis admit refresh stays allowed: same genesis pin,
+        // modules and beat, and our validator is still in the set.
+        let mut admitted = ours.clone();
+        admitted.admit(&theirs);
+        assert_ne!(admitted.genesis_namespace(), ours.genesis_namespace());
+        guard_join_descriptor(&dir, &admitted).expect("the admit refresh is the re-join");
+
+        // dropping a validator we already trust is NOT a refresh.
+        let evicted = NetworkDescriptor {
+            validators: vec![hex_bytes(theirs.as_ref())],
+            ..ours.clone()
+        };
+        assert!(
+            guard_join_descriptor(&dir, &evicted).is_err(),
+            "a set that drops our own validator is not an admit refresh"
         );
     }
 
