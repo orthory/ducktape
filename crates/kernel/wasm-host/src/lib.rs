@@ -40,6 +40,8 @@
 //!     overlay and the commit/abort boundary are identical in both backings.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -1090,33 +1092,32 @@ fn deterministic_config() -> Config {
     c.wasm_stack_switching(false);
     c.wasm_custom_page_sizes(false);
     c.wasm_wide_arithmetic(false);
-    if let Some(cache) = sim_wasm_cache() {
-        c.cache(Some(cache));
+    if let Some(dir) = COMPILATION_CACHE_DIR.get() {
+        let mut cfg = wasmtime::CacheConfig::new();
+        cfg.with_directory(dir);
+        if let Ok(cache) = wasmtime::Cache::new(cfg) {
+            c.cache(Some(cache));
+        }
+        // `Cache::new` failing (e.g. the directory is unwritable) just means
+        // no cache: the sim runs correctly, only slower.
     }
     c
 }
 
-/// Opt-in cranelift artifact cache for the sim/test lane, gated behind the
-/// `wasm-cache` feature: only `bin/simnode` (via `noded/wasm-cache`) turns it
-/// on, so a production node's build never even contains this code path —
-/// setting `DUCKTAPE_WASM_CACHE_DIR` on a real node's environment does
-/// nothing. When the sim/test harness sets it (a directory under the
-/// workspace, shared by every `cargo test -p simnode` binary), the SAME
-/// 15-module genesis compiled by the first binary is loaded from disk by the
-/// rest instead of re-cranelift-compiling it: a cache hit changes wall time,
-/// never the compiled artifact's semantics, so it cannot affect the
-/// root-hash.
-#[cfg(feature = "wasm-cache")]
-fn sim_wasm_cache() -> Option<wasmtime::Cache> {
-    let dir = std::env::var_os("DUCKTAPE_WASM_CACHE_DIR")?;
-    let mut cfg = wasmtime::CacheConfig::new();
-    cfg.with_directory(dir);
-    wasmtime::Cache::new(cfg).ok()
-}
+/// Set once, by the sim/test lane only, before it composes its first module.
+static COMPILATION_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-#[cfg(not(feature = "wasm-cache"))]
-fn sim_wasm_cache() -> Option<wasmtime::Cache> {
-    None
+/// Turn on wasmtime's own cranelift artifact cache (`Config::cache`) for
+/// every engine this process builds from here on. A node binary NEVER calls
+/// this — there is no environment variable or flag that turns the cache on
+/// in production, only this function, and only `bin/simnode` calls it (from
+/// its own boot, reading `DUCKTAPE_WASM_CACHE_DIR`). The sim/test harness's
+/// 13-plus binaries all compile the same genesis; a cache hit changes wall
+/// time, never the compiled artifact's semantics, so it cannot affect the
+/// root-hash. A second call is ignored (the sim boots repeatedly within one
+/// test process).
+pub fn enable_compilation_cache(dir: PathBuf) {
+    let _ = COMPILATION_CACHE_DIR.set(dir);
 }
 
 fn to_wit_env(env: &SdkEnv) -> WitEnv {

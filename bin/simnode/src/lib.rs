@@ -369,6 +369,14 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
         modules_dir,
         install_log,
     } = opts;
+    // opt-in wasmtime compilation cache for the sim/test lane only: the sim
+    // suite's 13-plus test binaries all compile the same genesis, so sharing
+    // a cache dir across them turns wall time way down. A real node binary
+    // never calls this hook, so no environment variable can turn the cache
+    // on in production.
+    if let Some(dir) = std::env::var_os("DUCKTAPE_WASM_CACHE_DIR") {
+        wasm_host::enable_compilation_cache(std::path::PathBuf::from(dir));
+    }
     // the founding set every wasm tenant (and every index guest) composes
     // from. the default is the set the build staged beside this executable —
     // the sim is a dev tool that must boot from a bare checkout, and a bare

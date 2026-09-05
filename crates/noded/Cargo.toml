@@ -18,10 +18,6 @@ version.workspace = true
 # loopback threads, for e2e harnesses. dev-only — consumers enable it as a
 # dev-dependency feature, so it never compiles into the shipping node.
 testkit = ["dep:nettest"]
-# forwards wasm-host's sim/test-lane wasmtime compilation cache. dev-only —
-# only bin/simnode enables it, so a shipping node never even COMPILES the
-# code path that reads DUCKTAPE_WASM_CACHE_DIR, let alone runs it.
-wasm-cache = ["wasm-host/wasm-cache"]
 # forwards to `provider-host/verify` (real TEE quote verification for the
 # airlock `Attested` trust arm, off by default) — `ducktape-noded` reaches
 # that arm through `provider-host`'s dispatch worker the same as `ducktape`

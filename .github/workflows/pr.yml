@@ -62,7 +62,8 @@ jobs:
   # gate exercising it.
   #
   # DUCKTAPE_WASM_CACHE_DIR turns on wasmtime's own compilation cache
-  # (wasm-host's `sim_wasm_cache`) for this job ONLY: the 13 test binaries all
+  # (`simnode::boot` calls `wasm_host::enable_compilation_cache`) for this job
+  # ONLY: the 13 test binaries all
   # boot the SAME 15-module `topology::SIM_BASE` genesis, so after the first
   # binary compiles it, every later one loads the cranelift artifacts from
   # disk instead of recompiling them. A node never sets this env var, so
