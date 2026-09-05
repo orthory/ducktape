@@ -24,9 +24,11 @@ cannot read the credential out of it.
   it: folding `ducktape` in would churn the pinned measurement on every unrelated
   release.
 - **`broker-host`** (`crates/services/broker`) — the Computation Provider's local
-  api-snatch. Verifies the gateway quote, handshakes once, and exposes a loopback
-  `ANTHROPIC_BASE_URL` for an unmodified sandbox (the real `claude` CLI). The
-  sandbox holds only an opaque per-run bearer.
+  api-snatch. With a `--features verify` build it verifies the gateway quote and
+  handshakes once; without it, an `Attested` trust config is refused by name
+  rather than silently trusting an unverified gateway. Either way it exposes a
+  loopback `ANTHROPIC_BASE_URL` for an unmodified sandbox (the real `claude`
+  CLI). The sandbox holds only an opaque per-run bearer.
 - **`ducktape user cred`** (`bin/node`) — the operator verbs. `add`/`list`/
   `grant`/`revoke`/`remove` manage a self-hosted credential and its on-chain
   record; `inspect` (pin an enclave's measurement) and `seal` (verify the quote,
@@ -51,8 +53,14 @@ canonical, executable recipe (two real WireGuard nodes, in-process gateway + moc
 upstream); run it where inline 2-node WireGuard works:
 
 ```sh
-cargo test -p node-bin --test airlock_gateway_e2e -- --nocapture
+cargo test -p node-bin --test airlock_gateway_e2e --features verify -- --nocapture
 ```
+
+Real quote verification is the opt-in `verify` feature — the test file compiles
+to zero tests without it, and the recipe below needs a `ducktape` built with
+`cargo build -p node-bin --features verify` (a default build refuses an
+`Attested` trust config by name, and its `user cred inspect`/`seal`
+subcommands don't exist at all).
 
 For a real cross-machine deployment there are two lender shapes. Both publish
 the same `airlock.<handle>.duck` route; they differ only in where trust comes
@@ -106,8 +114,11 @@ instead of `--host`; the `via` is read from this node's own browser gateway, so
 the operator never pastes it. Attestation stays strictly bilateral either way —
 the node is asked for nothing but that base.
 
-**Compute node** (runs the sandbox): point the broker at the remote gateway — no
-credential is held locally:
+**Compute node** (runs the sandbox): needs a `ducktape` built with
+`cargo build -p node-bin --features verify` (a default build refuses this
+`Attested` trust config by name instead of silently trusting an unverified
+gateway). Point the broker at the remote gateway — no credential is held
+locally:
 
 ```sh
 export DUCKTAPE_AIRLOCK_REMOTE=airlock.<handle>.duck
@@ -235,7 +246,10 @@ credential: set
 (the pinned audited-image hex) and `DUCKTAPE_AIRLOCK_ATTEST` (`tdx`/`snp`; no
 default). For snp, `DUCKTAPE_AIRLOCK_SNP_PRODUCT` pins the platform generation
 (optional `DUCKTAPE_AIRLOCK_SNP_VCEK` file, `DUCKTAPE_AIRLOCK_PCCS_URL` for
-tdx) — all parsed once at the config boundary. The run's
+tdx) — read once at the config boundary (`AirlockConfig::from_env`), so
+misconfig fails there rather than mid-verify, except `attest` and
+`DUCKTAPE_AIRLOCK_SNP_PRODUCT` themselves, which stay raw strings until
+`attested::verify` parses them, still before any network call. The run's
 `claude` traffic is then verified, handshaked, and forwarded to the gateway with
 a scoped session token (re-minted on a gateway 401). The local path is exercised
 end-to-end by in-process tests (`cargo test -p broker-host airlock`),
