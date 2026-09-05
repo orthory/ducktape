@@ -94,6 +94,10 @@ struct Stats {
     rogue_datagrams: AtomicU64,
     rogue_streams: AtomicU64,
     malformed_datagrams: AtomicU64,
+    /// Datagrams the transport could not hand over intact — an arrival too
+    /// big for the receive buffer on the userspace backend. The packet is
+    /// already gone from the socket; the drop is ours to count.
+    undeliverable_datagrams: AtomicU64,
     unregistered_datagrams: AtomicU64,
     unregistered_streams: AtomicU64,
     /// Inbound streams whose opener never completed a well-formed hello
@@ -117,11 +121,31 @@ impl Stats {
             .or_insert(0) += 1;
     }
 
+    /// One datagram the transport could not deliver intact. Rate-limited
+    /// hard: a peer can produce one of these per packet it sends, and an
+    /// unconditional line would evict the ring it belongs in. First
+    /// arrival, then every 1000th, carrying the count — the counter IS the
+    /// diagnosis.
+    fn note_undeliverable_datagram(&self, err: &io::Error) {
+        let dropped = self.undeliverable_datagrams.fetch_add(1, Ordering::Relaxed) + 1;
+        if dropped == 1 || dropped.is_multiple_of(1000) {
+            tracing::debug!(
+                target: "ducktape::dataplane",
+                dropped,
+                kind = ?err.kind(),
+                reason = "undeliverable_datagram",
+                "dropped one arrival the socket could not hand over intact — \
+                 the pump keeps receiving"
+            );
+        }
+    }
+
     fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             rogue_datagrams: self.rogue_datagrams.load(Ordering::Relaxed),
             rogue_streams: self.rogue_streams.load(Ordering::Relaxed),
             malformed_datagrams: self.malformed_datagrams.load(Ordering::Relaxed),
+            undeliverable_datagrams: self.undeliverable_datagrams.load(Ordering::Relaxed),
             unregistered_datagrams: self.unregistered_datagrams.load(Ordering::Relaxed),
             unregistered_streams: self.unregistered_streams.load(Ordering::Relaxed),
             hello_failed_streams: self.hello_failed_streams.load(Ordering::Relaxed),
@@ -198,6 +222,8 @@ pub struct StatsSnapshot {
     pub rogue_datagrams: u64,
     pub rogue_streams: u64,
     pub malformed_datagrams: u64,
+    /// Datagrams the transport could not deliver intact (oversized arrival).
+    pub undeliverable_datagrams: u64,
     pub unregistered_datagrams: u64,
     pub unregistered_streams: u64,
     /// Inbound streams dropped for a missing or malformed hello.
@@ -424,23 +450,43 @@ impl<T: DataPlaneTransport> DataPlane<T> {
     }
 }
 
+/// Does this receive error belong to ONE datagram rather than to the socket?
+///
+/// The userspace backend reports an arrival too big for the receive buffer
+/// this way: smoltcp's `recv_slice` dequeues the packet and then returns
+/// `udp::RecvError::Truncated`, which the virtual socket maps to
+/// `InvalidData`. The packet is gone, the socket is healthy, and the next
+/// receive will succeed — so the pump must count the drop and keep going.
+/// Halting on one of those silences the plane for the life of the process.
+/// `InvalidInput` is the same shape from the send/address side. Everything
+/// else is the socket itself failing, which ends the pump.
+fn is_per_datagram_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput
+    )
+}
+
 /// The pumps block on the transport while holding only a `Weak` to the plane
 /// state; a receive that lands after the last handle dropped finds no plane
 /// and ends the pump (the abort in [`Shared::drop`] normally gets there
 /// first — this is the race's other arm).
 async fn demux_loop<T: DataPlaneTransport>(transport: Arc<T>, plane: Weak<Shared<T>>) {
     loop {
-        let (from, frame) = match transport.recv_datagram().await {
-            Ok(inbound) => inbound,
-            Err(_) => {
-                if let Some(shared) = plane.upgrade() {
-                    shared.traffic.halted.store(true, Ordering::Relaxed);
-                }
-                return;
-            }
-        };
+        let received = transport.recv_datagram().await;
         let Some(shared) = plane.upgrade() else {
             return;
+        };
+        let (from, frame) = match received {
+            Ok(inbound) => inbound,
+            Err(TransportError::Io(err)) if is_per_datagram_error(&err) => {
+                shared.stats.note_undeliverable_datagram(&err);
+                continue;
+            }
+            Err(_) => {
+                shared.traffic.halted.store(true, Ordering::Relaxed);
+                return;
+            }
         };
         let (service, flow, payload) = match wire::decode_datagram(&frame) {
             Ok(parts) => parts,
@@ -842,5 +888,127 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PacedStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::DuplexStream;
+
+    /// A transport the test feeds by hand: every inbound datagram and every
+    /// accepted stream arrives because the test sent it, so the pumps'
+    /// behaviour is observed with no clock in the loop.
+    struct StubTransport {
+        datagrams: tokio::sync::Mutex<mpsc::Receiver<Result<(PeerId, Vec<u8>), TransportError>>>,
+        accepts: tokio::sync::Mutex<mpsc::Receiver<(PeerId, DuplexStream)>>,
+    }
+
+    impl DataPlaneTransport for StubTransport {
+        type Stream = DuplexStream;
+
+        async fn send_datagram(&self, _to: PeerId, _frame: Vec<u8>) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        async fn recv_datagram(&self) -> Result<(PeerId, Vec<u8>), TransportError> {
+            match self.datagrams.lock().await.recv().await {
+                Some(next) => next,
+                // The feed is exhausted, not closed: block like a quiet socket.
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn connect(&self, to: PeerId) -> Result<Self::Stream, TransportError> {
+            Err(TransportError::Unreachable(to))
+        }
+
+        async fn accept(&self) -> Result<(PeerId, Self::Stream), TransportError> {
+            match self.accepts.lock().await.recv().await {
+                Some(inbound) => Ok(inbound),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    struct AllowAll;
+
+    impl AdmissionPolicy for AllowAll {
+        fn permits(&self, _peer: PeerId, _service: Service, _flow: FlowId) -> bool {
+            true
+        }
+    }
+
+    type Feeds = (
+        mpsc::Sender<Result<(PeerId, Vec<u8>), TransportError>>,
+        mpsc::Sender<(PeerId, DuplexStream)>,
+        DataPlane<StubTransport>,
+    );
+
+    fn stub_plane() -> Feeds {
+        let (datagram_tx, datagram_rx) = mpsc::channel(16);
+        let (accept_tx, accept_rx) = mpsc::channel(64);
+        let plane = DataPlane::new(
+            StubTransport {
+                datagrams: tokio::sync::Mutex::new(datagram_rx),
+                accepts: tokio::sync::Mutex::new(accept_rx),
+            },
+            Arc::new(AllowAll),
+            PlaneConfig {
+                bulk_bytes_per_sec: 1_000_000,
+                bulk_burst_bytes: 16 * 1024,
+            },
+        );
+        (datagram_tx, accept_tx, plane)
+    }
+
+    /// The exact error the userspace backend's `VirtualUdpSocket::recv_from`
+    /// builds for smoltcp's `udp::RecvError::Truncated` — an overlay datagram
+    /// bigger than `MAX_DATAGRAM`.
+    fn truncated_datagram_error() -> TransportError {
+        TransportError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "datagram larger than the provided buffer",
+        ))
+    }
+
+    #[test]
+    fn a_truncated_datagram_is_per_datagram_but_a_dead_socket_is_not() {
+        let TransportError::Io(truncated) = truncated_datagram_error() else {
+            unreachable!("truncation is an io error");
+        };
+        assert!(is_per_datagram_error(&truncated));
+        assert!(!is_per_datagram_error(&io::Error::from(
+            io::ErrorKind::NotConnected
+        )));
+        assert!(!is_per_datagram_error(&io::Error::from(
+            io::ErrorKind::BrokenPipe
+        )));
+    }
+
+    /// One oversized arrival used to end the demux pump for the life of the
+    /// process. It is now a counted drop, and the datagram behind it lands.
+    #[tokio::test]
+    async fn an_oversized_datagram_is_dropped_and_the_pump_keeps_receiving() {
+        let (datagrams, _accepts, plane) = stub_plane();
+        let flow = FlowId::from_raw(7);
+        let handle = plane
+            .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 4 })
+            .expect("register flow");
+
+        let peer = PeerId([1u8; 32]);
+        datagrams
+            .send(Err(truncated_datagram_error()))
+            .await
+            .unwrap();
+        let frame = wire::encode_datagram(Service::Voice, flow, b"after").unwrap();
+        datagrams.send(Ok((peer, frame))).await.unwrap();
+
+        // The delivery IS the proof the pump survived the error before it.
+        let (from, payload) = handle.recv().await;
+        assert_eq!(from, peer);
+        assert_eq!(payload, b"after");
+        assert_eq!(plane.stats().undeliverable_datagrams, 1);
+        assert!(!plane.traffic().halted);
     }
 }
