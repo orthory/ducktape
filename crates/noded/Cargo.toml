@@ -18,6 +18,11 @@ version.workspace = true
 # loopback threads, for e2e harnesses. dev-only — consumers enable it as a
 # dev-dependency feature, so it never compiles into the shipping node.
 testkit = ["dep:nettest"]
+# forwards to `provider-host/verify` (real TEE quote verification for the
+# airlock `Attested` trust arm, off by default) — `ducktape-noded` reaches
+# that arm through `provider-host`'s dispatch worker the same as `ducktape`
+# does, so it needs the same opt-in flag.
+verify = ["provider-host/verify"]
 
 [dependencies]
 # the shared raw-http/port/poll test client — only pulled by the `testkit`
