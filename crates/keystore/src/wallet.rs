@@ -159,7 +159,9 @@ pub fn active_name(duck: &Path) -> Option<String> {
 }
 
 /// Point `active` at `name` — which must exist. Atomic (tmp + rename) so a
-/// concurrent reader never sees a torn pointer.
+/// concurrent reader never sees a torn pointer, and the tmp is per-process so
+/// two writers (the CLI and the app activating at once) never share one inode:
+/// each renames its own file, and the last rename wins whole.
 pub fn set_active(duck: &Path, name: &str) -> Result<(), String> {
     valid_name(name)?;
     if !key_file(duck, name).exists() {
@@ -167,7 +169,7 @@ pub fn set_active(duck: &Path, name: &str) -> Result<(), String> {
     }
     let keys = keys_dir(duck);
     std::fs::create_dir_all(&keys).map_err(|e| format!("create {}: {e}", keys.display()))?;
-    let tmp = keys.join(format!("{ACTIVE_FILE}.tmp"));
+    let tmp = keys.join(format!("{ACTIVE_FILE}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, format!("{name}\n")).map_err(|e| format!("write {}: {e}", tmp.display()))?;
     std::fs::rename(&tmp, keys.join(ACTIVE_FILE)).map_err(|e| format!("activate {name}: {e}"))
 }
