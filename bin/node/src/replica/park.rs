@@ -1970,17 +1970,20 @@ pub(super) async fn park(
         // else, so an unreachable source costs this loop nothing but the
         // poll it was already pacing.
         retry_owed_backfill(&mut backfill_debt, &index, &client, &label).await;
-        // follow the mesh rotation while parked: track the tip's
-        // REPLICATED generation window — the identical snapshots every
-        // member tracks, so a parked joiner's tracked sets can never
-        // diverge from the network's (the coordinates are unverified
-        // serving hints; promotion re-derives everything from verified
-        // state). the epoch stays the CHANNEL/book coordinate below.
-        mesh_window.track_new(
-            oracle,
-            &mesh_book,
-            &crate::mesh_window::window_from_sync(&tip.mesh_window),
-        );
+        // follow the mesh rotation while parked. the tip's window is an
+        // UNVERIFIED serving hint from an untrusted server, so it never
+        // installs a peer set and never advances the tracker's latch — the
+        // latch is monotone and this tracker rides `PromotionBaton`, so one
+        // bogus generation would deafen this node to every real membership
+        // change for the process's life, validator role included. all a hint
+        // may do is say the COMMITTED read is behind; the committed window is
+        // what gets tracked. the epoch stays the CHANNEL/book coordinate
+        // below.
+        let hinted_ahead = mesh_window.hint_owes_committed_read(&tip.mesh_window);
+        if hinted_ahead && let Some((_, node_r)) = serving.as_ref() {
+            let committed_window = read_valset_mesh_window(node_r.host()).await;
+            mesh_window.track_new(oracle, &mesh_book, &committed_window);
+        }
         if tip.epoch > last_tip_epoch {
             if !lane_bank.covers(tip.epoch) {
                 tracing::warn!(
