@@ -65,9 +65,8 @@ mod config;
 mod constants;
 mod cred_cli;
 // the enclave-operator verbs (`user cred inspect|seal`) — real TEE quote
-// verification, the opt-in `verify` feature. `cred_cli` gates the two
-// subcommands that reach this module behind the same feature.
-#[cfg(feature = "verify")]
+// verification behind the opt-in `verify` feature. The verbs and their flags
+// exist in every build; without the feature they refuse at dispatch.
 mod cred_seal;
 mod drain_actions;
 mod executors;

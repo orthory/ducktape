@@ -89,7 +89,6 @@ pub(crate) enum CredCmd {
     },
     /// read a TEE gateway's enclave measurement out of its quote, so it can be
     /// pinned as `seal --measurement` (needs a `--features verify` build)
-    #[cfg(feature = "verify")]
     Inspect {
         #[command(flatten)]
         gateway: crate::cred_seal::GatewayArgs,
@@ -98,7 +97,6 @@ pub(crate) enum CredCmd {
     },
     /// verify a TEE gateway's quote, then seal a credential under the attested
     /// key and upload it (needs a `--features verify` build)
-    #[cfg(feature = "verify")]
     Seal {
         #[command(flatten)]
         gateway: crate::cred_seal::GatewayArgs,
@@ -197,11 +195,9 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
         // the enclave verbs resolve the node base LAZILY: only `--remote` needs
         // it (to read this node's browser-gateway base), so a purely local
         // `--host` inspect must not demand a workspace it never reads.
-        #[cfg(feature = "verify")]
         CredCmd::Inspect { gateway, attest } => {
             crate::cred_seal::cmd_inspect(gateway, attest, || ctx.http_base())
         }
-        #[cfg(feature = "verify")]
         CredCmd::Seal {
             gateway,
             attest,

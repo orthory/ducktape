@@ -21,11 +21,20 @@
 //! gateway base, which is the transport that carries `<handle>.duck` onto the
 //! overlay.
 
+// The verbs and their flags exist in EVERY build so the CLI surface (and the
+// shipped completions) never depends on how the binary was compiled; only the
+// bodies need the `verify` feature, and without it the verb refuses at
+// dispatch with the same sentence its help text carries.
+#[cfg(feature = "verify")]
 use anyhow::Context as _;
 
+#[cfg(feature = "verify")]
 use airlock::attest::{self, AttestMode, Measurement};
+#[cfg(feature = "verify")]
 use airlock::client::Gateway;
+#[cfg(feature = "verify")]
 use airlock::verify::{SnpProduct, SnpRoots, TdxRoots, TrustRoots, VcekSource};
+#[cfg(feature = "verify")]
 use airlock::wire::{CredentialKind, CredentialPayload};
 
 use crate::cred_cli::CredResult;
@@ -119,6 +128,30 @@ pub(crate) enum SealKind {
     Refresh,
 }
 
+#[cfg(not(feature = "verify"))]
+const NEEDS_VERIFY_BUILD: &str =
+    "this verb verifies a TEE quote and needs a `--features verify` build of ducktape";
+
+#[cfg(not(feature = "verify"))]
+pub(crate) fn cmd_inspect(
+    _gateway: GatewayArgs,
+    _attest_args: AttestArgs,
+    _node_base: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
+) -> CredResult {
+    Err(NEEDS_VERIFY_BUILD.into())
+}
+
+#[cfg(not(feature = "verify"))]
+pub(crate) fn cmd_seal(
+    _gateway: GatewayArgs,
+    _attest_args: AttestArgs,
+    _seal: SealArgs,
+    _node_base: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
+) -> CredResult {
+    Err(NEEDS_VERIFY_BUILD.into())
+}
+
+#[cfg(feature = "verify")]
 impl AttestArgs {
     fn mode(&self) -> AttestMode {
         match self.attest {
@@ -159,6 +192,7 @@ impl AttestArgs {
 /// Build the gateway handle. Remote mode reads the node's own browser-gateway
 /// base — the transport that carries a `.duck` authority onto the overlay —
 /// rather than making the operator paste it.
+#[cfg(feature = "verify")]
 fn resolve_gateway(
     args: &GatewayArgs,
     node_base: impl FnOnce() -> Result<String, Box<dyn std::error::Error>>,
@@ -183,6 +217,7 @@ fn resolve_gateway(
 /// TOFU for bootstrap: in production the measurement comes from the audited
 /// build, not from the enclave being asked to describe itself. Printing it is a
 /// convenience for pinning, never a verification.
+#[cfg(feature = "verify")]
 pub(crate) fn cmd_inspect(
     gateway: GatewayArgs,
     attest_args: AttestArgs,
@@ -213,6 +248,7 @@ pub(crate) fn cmd_inspect(
 /// The credential is released ONLY after the quote proves the pinned
 /// measurement: seal_pk is trusted because [`airlock::verify::verify_quote`]
 /// verified the chain that binds it, never because the gateway asserted it.
+#[cfg(feature = "verify")]
 pub(crate) fn cmd_seal(
     gateway: GatewayArgs,
     attest_args: AttestArgs,
@@ -253,6 +289,7 @@ pub(crate) fn cmd_seal(
 }
 
 /// Which secret to seal. Direct flags win; otherwise read the vendor artifact.
+#[cfg(feature = "verify")]
 fn resolve_credential(seal: &SealArgs) -> Result<CredentialPayload, Box<dyn std::error::Error>> {
     if let Some(access_token) = seal.access_token.clone() {
         return Ok(CredentialPayload::Bearer { access_token });
@@ -292,6 +329,7 @@ fn resolve_credential(seal: &SealArgs) -> Result<CredentialPayload, Box<dyn std:
 
 /// The `cred` family is a synchronous CLI; the airlock client is async. One
 /// current-thread runtime per verb, built where it is used.
+#[cfg(feature = "verify")]
 fn block_on<T>(
     future: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> Result<T, Box<dyn std::error::Error>> {
