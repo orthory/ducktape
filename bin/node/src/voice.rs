@@ -50,12 +50,15 @@ use tokio::sync::{mpsc, watch};
 
 use crate::overlay_book::OverlayPeers;
 
-/// Inbound audio queue per flow: ~2.5 s of one speaker's frames. Overflow
-/// drops the oldest inside the flow (the plane's drop-oldest contract).
+/// Inbound audio queue per speaker: ~2.5 s of one speaker's frames. Overflow
+/// drops that speaker's oldest (the plane's per-sender drop-oldest contract).
 const FLOW_QUEUE: usize = 128;
-/// Inbound camera queue per flow: ~2 keyframe-burst frames of fragments.
+/// Inbound camera queue per sender: ~2 keyframe-burst frames of fragments
+/// (a frame is at most `media_service::video::MAX_FRAGS`). Per SENDER, not
+/// per flow: every huddle participant's camera rides one flow, and a shared
+/// budget would let one peer's keyframe burst evict the others' fragments.
 const VIDEO_FLOW_QUEUE: usize = 256;
-/// Inbound call-control queue per flow: tiny, one message per event.
+/// Inbound call-control queue per sender: tiny, one message per event.
 const CTL_FLOW_QUEUE: usize = 32;
 /// Webview↔hub pcm lanes: a small cushion (8 × 20 ms); late audio is dead
 /// audio, so both sides drop rather than backpressure when it fills.
