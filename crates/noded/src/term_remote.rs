@@ -7,7 +7,7 @@
 //! job carries plain data plus a oneshot the client half resolves — exactly the
 //! `GatewayJob` shape — so this crate stays free of any data-plane dependency.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
@@ -43,14 +43,15 @@ pub enum SessionJob {
 
 pub type SessionLane = mpsc::Sender<SessionJob>;
 
-/// how many MIRRORED sessions a node keeps a first-sender host binding for.
+/// how many mirrored sessions ONE peer may hold a first-sender binding for.
 ///
-/// `ponytail:` a flat FIFO cap. Every forged grain naming an id this node has
-/// never seen mints one binding, so the map needs a ceiling; the oldest goes
-/// first, and a session whose binding was evicted simply re-binds on its host's
-/// next grain. Make it an LRU keyed to the ring's own session set if a node ever
-/// mirrors more sessions than this at once.
-const MAX_OBSERVED_SESSIONS: usize = 64;
+/// Per peer, never node-wide: every forged grain naming an unseen id mints a
+/// binding, so there must be a ceiling, and a shared one would be an eviction
+/// vector — a peer could flood ids until an honest host's binding aged out and
+/// then claim that session for itself. A budget nobody else spends means a
+/// flooder can only exhaust its own, and the bindings it would have evicted are
+/// untouched. Over budget, the grain is refused and binds nothing.
+const MAX_OBSERVED_PER_PEER: usize = 64;
 
 /// guest-side registry: session id → the node that hosts its pty.
 ///
@@ -64,7 +65,8 @@ const MAX_OBSERVED_SESSIONS: usize = 64;
 ///   the FIRST peer to deliver a grain for the id is bound to it and every other
 ///   peer is refused from then on. A session id is 16 hex of randomness the host
 ///   mints, so a third party cannot pre-claim an id before the host's own grains
-///   start arriving.
+///   start arriving, and no peer can displace another's binding — each spends
+///   only its own [`MAX_OBSERVED_PER_PEER`] budget.
 ///
 /// `Arc<Mutex<..>>` like the gateway's ws-token store.
 #[derive(Clone, Default)]
@@ -76,8 +78,6 @@ struct Bindings {
     created: HashMap<String, [u8; 32]>,
     /// sessions this node only mirrors, bound to their first sender.
     observed: HashMap<String, [u8; 32]>,
-    /// `observed` insertion order, for the FIFO cap.
-    seen: VecDeque<String>,
 }
 
 impl RemoteSessions {
@@ -96,24 +96,31 @@ impl RemoteSessions {
 
     /// the node whose grains this session accepts, binding `sender` to it if
     /// nothing is bound yet. A directed create's host always wins; otherwise the
-    /// first sender claims the id and holds it until [`Self::forget`].
-    pub fn feed_host(&self, session: &str, sender: [u8; 32]) -> [u8; 32] {
+    /// first sender claims the id and holds it until [`Self::forget`]. `None`
+    /// when `sender` has already spent its [`MAX_OBSERVED_PER_PEER`] budget on
+    /// unknown ids — nothing is bound and the grain is refused.
+    pub fn feed_host(&self, session: &str, sender: [u8; 32]) -> Option<[u8; 32]> {
         let mut bindings = self.lock();
         if let Some(host) = bindings.created.get(session) {
-            return *host;
+            return Some(*host);
         }
         if let Some(host) = bindings.observed.get(session) {
-            return *host;
+            return Some(*host);
         }
-        while bindings.observed.len() >= MAX_OBSERVED_SESSIONS {
-            let Some(oldest) = bindings.seen.pop_front() else {
-                break;
-            };
-            bindings.observed.remove(&oldest);
+        // ponytail: counted by scanning this peer's bindings — bounded by
+        // MAX_OBSERVED_PER_PEER × peers and reached only on an id never seen
+        // before. Keep a per-peer counter beside the map if a node ever mirrors
+        // enough sessions for the scan to show.
+        let held = bindings
+            .observed
+            .values()
+            .filter(|host| **host == sender)
+            .count();
+        if held >= MAX_OBSERVED_PER_PEER {
+            return None;
         }
         bindings.observed.insert(session.to_string(), sender);
-        bindings.seen.push_back(session.to_string());
-        sender
+        Some(sender)
     }
 
     /// drop the binding: the session closed, or its host said it ended.
@@ -152,31 +159,49 @@ mod tests {
         let b = [2u8; 32];
         // an id nobody told this node about: the first peer to deliver a grain
         // for it IS its host from then on...
-        assert_eq!(sessions.feed_host("00000000deadbeef", a), a);
+        assert_eq!(sessions.feed_host("00000000deadbeef", a), Some(a));
         // ...so a second peer naming the same id gets A back, not itself — which
         // is how the feed gate refuses it.
-        assert_eq!(sessions.feed_host("00000000deadbeef", b), a);
+        assert_eq!(sessions.feed_host("00000000deadbeef", b), Some(a));
         // a directed create's host wins over any first sender: B claims the id
         // first, then this node learns it created the session on A.
-        assert_eq!(sessions.feed_host("00000000cafef00d", b), b);
+        assert_eq!(sessions.feed_host("00000000cafef00d", b), Some(b));
         sessions.remember("00000000cafef00d".into(), a);
-        assert_eq!(sessions.feed_host("00000000cafef00d", b), a);
+        assert_eq!(sessions.feed_host("00000000cafef00d", b), Some(a));
         // and the id is free again once the session is done.
         sessions.forget("00000000deadbeef");
-        assert_eq!(sessions.feed_host("00000000deadbeef", b), b);
+        assert_eq!(sessions.feed_host("00000000deadbeef", b), Some(b));
     }
 
     #[test]
-    fn observed_bindings_are_capped_and_evict_oldest_first() {
+    fn a_flooding_peer_spends_only_its_own_binding_budget() {
         let sessions = RemoteSessions::default();
-        let attacker = [9u8; 32];
+        let flooder = [9u8; 32];
         let host = [1u8; 32];
-        assert_eq!(sessions.feed_host("00000000deadbeef", host), host);
-        for i in 0..MAX_OBSERVED_SESSIONS {
-            assert_eq!(sessions.feed_host(&format!("{i:016x}"), attacker), attacker);
+        // an honest session, mirrored from the node that hosts it.
+        assert_eq!(sessions.feed_host("00000000deadbeef", host), Some(host));
+        for i in 0..MAX_OBSERVED_PER_PEER {
+            assert_eq!(
+                sessions.feed_host(&format!("{i:016x}"), flooder),
+                Some(flooder)
+            );
         }
-        // the oldest binding aged out, so the id re-binds to whoever sends next
-        // — the real host, whose grains never stopped.
-        assert_eq!(sessions.feed_host("00000000deadbeef", host), host);
+        // at its cap the flooder binds nothing more — the refusal falls on the
+        // NEW id, not on the oldest one it already holds.
+        assert_eq!(sessions.feed_host("00000000cafef00d", flooder), None);
+        assert_eq!(
+            sessions.feed_host("0000000000000000", flooder),
+            Some(flooder),
+            "a peer keeps the bindings it already had"
+        );
+        // and the honest binding is untouched, so the flood cannot take it over.
+        assert_eq!(sessions.feed_host("00000000deadbeef", flooder), Some(host));
+        assert_eq!(sessions.feed_host("00000000deadbeef", host), Some(host));
+        // a peer with its own budget is unaffected by the flooder's.
+        assert_eq!(
+            sessions.feed_host("00000000cafef00d", host),
+            Some(host),
+            "one peer's flood never spends another's budget"
+        );
     }
 }

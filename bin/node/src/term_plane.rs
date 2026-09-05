@@ -314,18 +314,25 @@ static FEED_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
 /// [`RemoteSessions::feed_host`] answers who that peer is: the host of a session
 /// this node directed, else the first peer that ever delivered a grain for the
 /// id. The binding is dropped when its host says the session ended.
-fn feed_permitted(remote: &RemoteSessions, session: &str, peer: PeerId) -> bool {
-    remote.feed_host(session, peer.0) == peer.0
+///
+/// `None` when the grain is taken; otherwise the stable `reason` it was dropped
+/// for — the sender is not this session's host, or it has spent its whole
+/// budget of first-sender bindings on ids nobody else has ever named.
+fn feed_refusal(remote: &RemoteSessions, session: &str, peer: PeerId) -> Option<&'static str> {
+    let Some(host) = remote.feed_host(session, peer.0) else {
+        return Some("observed_bindings_capped");
+    };
+    (host != peer.0).then_some("feed_not_session_host")
 }
 
 /// log one refused feed grain, latched. The peer's NODE key is public routing
 /// metadata already logged at boot; without it the operator is told "something
 /// was dropped" with no way to find out who is sending it.
-fn feed_refused(peer: PeerId) {
-    if let Some(occurrences) = FEED_REFUSED.hit("feed_not_session_host", peer) {
+fn feed_refused(reason: &'static str, peer: PeerId) {
+    if let Some(occurrences) = FEED_REFUSED.hit(reason, peer) {
         tracing::warn!(
             target: "ducktape::term",
-            reason = "feed_not_session_host",
+            reason,
             node = %crate::config::hex_bytes(&peer.0[..4]),
             occurrences,
             "term feed grain dropped"
@@ -352,8 +359,8 @@ async fn receive_chunks<S: AsyncRead + Unpin>(
         if !agent_service::wire::valid_session(event.session()) {
             continue;
         }
-        if !feed_permitted(&remote_sessions, event.session(), peer) {
-            feed_refused(peer);
+        if let Some(reason) = feed_refusal(&remote_sessions, event.session(), peer) {
+            feed_refused(reason, peer);
             continue;
         }
         match event {
@@ -394,8 +401,8 @@ async fn receive_commands<S: AsyncRead + Unpin>(
         }
         // only the session's host may append attributed rows to its command log;
         // a local command takes the `append` path, never this one.
-        if !feed_permitted(&remote_sessions, &event.session, peer) {
-            feed_refused(peer);
+        if let Some(reason) = feed_refusal(&remote_sessions, &event.session, peer) {
+            feed_refused(reason, peer);
             continue;
         }
         // the ring validates the seq against its own cursor — a peer's number is
@@ -1302,14 +1309,21 @@ mod tests {
         let stranger = PeerId([9u8; 32]);
         // a session this node directed: its known host is the only sender.
         remote.remember("00000000deadbeef".into(), host.0);
-        assert!(feed_permitted(&remote, "00000000deadbeef", host));
-        assert!(!feed_permitted(&remote, "00000000deadbeef", stranger));
+        assert_eq!(feed_refusal(&remote, "00000000deadbeef", host), None);
+        assert_eq!(
+            feed_refusal(&remote, "00000000deadbeef", stranger),
+            Some("feed_not_session_host")
+        );
         // a session this node only mirrors: the first sender binds the id, and
         // every other peer is refused from then on.
-        assert!(feed_permitted(&remote, "00000000cafef00d", host));
-        assert!(!feed_permitted(&remote, "00000000cafef00d", stranger));
-        assert!(
-            feed_permitted(&remote, "00000000cafef00d", host),
+        assert_eq!(feed_refusal(&remote, "00000000cafef00d", host), None);
+        assert_eq!(
+            feed_refusal(&remote, "00000000cafef00d", stranger),
+            Some("feed_not_session_host")
+        );
+        assert_eq!(
+            feed_refusal(&remote, "00000000cafef00d", host),
+            None,
             "the bound host keeps streaming"
         );
     }
