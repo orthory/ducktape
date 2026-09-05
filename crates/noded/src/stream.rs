@@ -3072,8 +3072,8 @@ mod tests {
         assert!(matches!(state, TopicState::TermCommand { .. }));
 
         let ring = crate::term::TermCommandRing::default();
-        ring.append("s", "alice", "list files");
-        ring.append("s", "", "run tests"); // empty origin = "local" (attribution kept verbatim)
+        let _ = ring.append("s", "alice", "list files");
+        let _ = ring.append("s", "", "run tests"); // empty origin = "local" (attribution kept verbatim)
         let mut seq = 0u64;
         let result = catch_up_term_command("term-cmd:s", "s", &mut seq, &ring);
         assert!(!result.drop_topic);

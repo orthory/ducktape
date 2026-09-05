@@ -487,8 +487,11 @@ impl NodeHandle {
         self.session_lane.as_ref()
     }
 
-    /// the guest-side session-id → host-node registry (always present).
-    pub(crate) fn remote_sessions(&self) -> &crate::term_remote::RemoteSessions {
+    /// the guest-side session-id → host-node registry (always present). Public
+    /// because the term plane's inbound feeds gate on it: a session's chunks and
+    /// command rows are accepted only from the peer this registry names as its
+    /// host.
+    pub fn remote_sessions(&self) -> &crate::term_remote::RemoteSessions {
         &self.remote_sessions
     }
 

@@ -136,9 +136,11 @@ impl TermFeedEvent {
 /// one entry of a session's ordered, attributed command log, as its serial
 /// consumer stamped it — the wire grain `term_plane` forwards to peer nodes.
 /// Unlike [`TermChunkEvent`] it carries `seq`: that is the AUTHORITATIVE total
-/// order the origin node's single consumer assigned, and a peer replays it
-/// verbatim via [`TermCommandRing::append_remote`] (which never re-stamps),
-/// so every node shows the same order. `text` can carry secrets — never logged.
+/// order the origin node's single consumer assigned, and a mirror rings it under
+/// that same number via [`TermCommandRing::append_remote`] (which never
+/// re-stamps), so every node shows the same order. The mirror still CHECKS the
+/// number against its own cursor — it is a claim from the wire, not an
+/// instruction. `text` can carry secrets — never logged.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TermCommandEvent {
     pub session: String,
@@ -411,22 +413,56 @@ impl Default for TermCommandRing {
     }
 }
 
+/// the seq a session's command ring will stamp next, given its cursor and — for
+/// a grain from a peer — the seq that grain carries. The RING owns the cursor: a
+/// local append advances it by one, and a peer's number is CHECKED before it may
+/// move it, never taken as given.
+///
+/// A mirror must tolerate a GAP (the forwarder feed drops grains when a peer
+/// stream lags, and a stalled command log would never recover), so a peer's seq
+/// only has to move the cursor FORWARD — but it may not reach `u64::MAX`, which
+/// would leave the cursor nowhere to advance to. Adopting one unchecked is what
+/// let a single frame carrying `u64::MAX` park the cursor at the ceiling: the
+/// next locally stamped command then overflowed it, panicking inside the ring
+/// mutex in a debug build (poisoning it and killing the command path node-wide)
+/// and wrapping to 0 in release (hiding the command from every `read_after`).
+///
+/// Pure, so the rule is testable without a ring. `Err` is a stable `reason`.
+fn next_command_seq(cursor: u64, seq_override: Option<u64>) -> Result<u64, &'static str> {
+    // the local step. Unreachable at the ceiling while a wire seq can never
+    // park the cursor there, and stated as a refusal rather than a wrap anyway.
+    let Some(wire) = seq_override else {
+        return cursor.checked_add(1).ok_or("command_seq_overflow");
+    };
+    let moves_backward = wire <= cursor;
+    if moves_backward {
+        return Err("command_seq_out_of_order");
+    }
+    let leaves_no_room = wire == u64::MAX;
+    if leaves_no_room {
+        return Err("command_seq_overflow");
+    }
+    Ok(wire)
+}
+
 impl TermCommandRing {
     /// append one accepted command from THIS node's serial consumer: rings it,
     /// wakes the node-local ws subscribers, AND publishes it on the forwarder
     /// feed so `term_plane` fans it out. Returns the assigned monotonic `seq` —
     /// the total order (starting at 1). The single per-session consumer is the
-    /// only local appender, so this ring's `next_seq` IS that order.
-    pub fn append(&self, session: &str, origin: &str, text: &str) -> u64 {
+    /// only local appender, so this ring's `next_seq` IS that order. `None` when
+    /// the ring refused the command (see [`Self::push`]).
+    pub fn append(&self, session: &str, origin: &str, text: &str) -> Option<u64> {
         self.push(session, None, origin, text, true)
     }
 
     /// append one command received FROM a peer node without re-broadcasting it —
-    /// the ring-only path that breaks the fan-out loop. Preserves the origin
-    /// node's `seq` VERBATIM (never re-stamps): that node's serial consumer owns
-    /// the authoritative total order, so a peer replaying it must show the same
-    /// order. Off-consensus and observational, so this stays honest to the
-    /// origin's numbering rather than inventing a local one.
+    /// the ring-only path that breaks the fan-out loop. The origin node's serial
+    /// consumer owns the authoritative total order, so the grain carries its
+    /// `seq` and this ring never re-stamps one — but it CHECKS it: the number
+    /// must move this ring's cursor forward (a gap is fine; the feed drops
+    /// grains when a peer stream lags) and must leave room to advance. A replay,
+    /// a reorder, or `u64::MAX` is dropped, never adopted.
     pub fn append_remote(&self, event: TermCommandEvent) {
         self.push(
             &event.session,
@@ -437,6 +473,9 @@ impl TermCommandRing {
         );
     }
 
+    /// ring one command and return the seq it was stamped with, or `None` when
+    /// the ring refused it (a peer's seq that is not the one this ring will
+    /// stamp next). Every refusal carries a stable `reason`.
     fn push(
         &self,
         session: &str,
@@ -444,27 +483,34 @@ impl TermCommandRing {
         origin: &str,
         text: &str,
         publish: bool,
-    ) -> u64 {
+    ) -> Option<u64> {
         let mut inner = self.inner.lock().expect("term command ring lock poisoned");
+        let cursor = inner.sessions.get(session).map_or(0, |ring| ring.next_seq);
+        // decided BEFORE anything is mutated, so a refusal leaves the ring — and
+        // its cursor — exactly as it was.
+        let seq = match next_command_seq(cursor, seq_override) {
+            Ok(seq) => seq,
+            Err(reason) => {
+                drop(inner);
+                if let Some(occurrences) = TERM_WARN.hit(reason) {
+                    tracing::warn!(
+                        target: "ducktape::term",
+                        session = %session,
+                        reason,
+                        occurrences,
+                        "term command dropped"
+                    );
+                }
+                return None;
+            }
+        };
         inner.version += 1;
         inner.touch += 1;
         let version = inner.version;
         let touch = inner.touch;
         let ring = inner.sessions.entry(session.to_string()).or_default();
         ring.touched = touch;
-        // a local append stamps the next serial seq; a remote one carries the
-        // origin's seq verbatim (bump `next_seq` past it only to keep the local
-        // cursor monotonic — a peer never appends locally, so it is bookkeeping).
-        let seq = match seq_override {
-            Some(seq) => {
-                ring.next_seq = ring.next_seq.max(seq);
-                seq
-            }
-            None => {
-                ring.next_seq += 1;
-                ring.next_seq
-            }
-        };
+        ring.next_seq = seq;
         ring.commands
             .push_back((seq, origin.to_string(), text.to_string()));
         // evict oldest commands until under the count cap, always keeping the last.
@@ -496,7 +542,7 @@ impl TermCommandRing {
                 text: text.to_string(),
             });
         }
-        seq
+        Some(seq)
     }
 
     /// subscribe the peer-forwarder feed: every LOCAL append (never a remote
@@ -1268,7 +1314,12 @@ impl TerminalSessions {
             while let Some(Command { origin, text }) = rx.recv().await {
                 // record + wake subscribers BEFORE the pty write. Never log the
                 // command text — it can carry secrets.
-                let seq = bridge.0.cmd_ring.append(&id, &origin, &text);
+                // a refused stamp (the ring warns with its reason) means the
+                // command is in no log; feeding the pty anyway would leave
+                // output no row accounts for.
+                let Some(seq) = bridge.0.cmd_ring.append(&id, &origin, &text) else {
+                    continue;
+                };
                 tracing::debug!(target: "ducktape::term", session = %id, seq, %origin, "term_command");
                 // one write, not two: a submitted line is `text` plus the
                 // carriage return that submits it.
@@ -1575,6 +1626,12 @@ pub async fn close_session(State(handle): State<NodeHandle>, Path(id): Path<Stri
                 })
                 .await;
         }
+        // end the mirror here rather than waiting for the host's `Ended` grain:
+        // forgetting the binding is what makes that grain unroutable (the feed
+        // gate binds every grain to the session's host), and a `term:<id>`
+        // subscriber blocked on a topic that will never append again is the
+        // wedge `TermEnded` exists to prevent.
+        handle.stream_hub().terminals().mark_ended_local_only(&id);
         handle.remote_sessions().forget(&id);
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -1700,8 +1757,8 @@ mod tests {
     fn command_ring_assigns_monotonic_seq_and_catches_up() {
         let ring = TermCommandRing::default();
         // the consumer's seq is the ring's next_seq — monotonic, starting at 1.
-        assert_eq!(ring.append("s", "alice", "hello"), 1);
-        assert_eq!(ring.append("s", "bob", "world"), 2);
+        assert_eq!(ring.append("s", "alice", "hello"), Some(1));
+        assert_eq!(ring.append("s", "bob", "world"), Some(2));
         // a fresh subscriber (cursor 0) replays both commands in order.
         let (rows, floor) = ring.read_after("s", 0, 64);
         assert_eq!(floor, 0);
@@ -1721,10 +1778,10 @@ mod tests {
         for i in 0..TERM_CMD_RING_MAX_COMMANDS {
             assert_eq!(
                 ring.append("s", &format!("m{i}"), &format!("cmd-{i}")),
-                (i + 1) as u64
+                Some((i + 1) as u64)
             );
         }
-        ring.append("s", "over", "cmd-overflow"); // forces eviction of the first
+        let _ = ring.append("s", "over", "cmd-overflow"); // forces eviction of the first
         let (rows, floor) = ring.read_after("s", 0, TERM_CMD_RING_MAX_COMMANDS + 8);
         assert_eq!(floor, 1, "the evicted command's seq is the reported floor");
         assert_eq!(rows.len(), TERM_CMD_RING_MAX_COMMANDS);
@@ -1788,14 +1845,15 @@ mod tests {
         let ring = TermCommandRing::default();
         let mut appends = ring.subscribe_appends();
         // a LOCAL append stamps seq 1 and publishes the grain.
-        assert_eq!(ring.append("00000000deadbeef", "alice", "ls"), 1);
+        assert_eq!(ring.append("00000000deadbeef", "alice", "ls"), Some(1));
         let event = appends.try_recv().expect("a local append publishes");
         assert_eq!(
             (event.seq, event.origin.as_str(), event.text.as_str()),
             (1, "alice", "ls")
         );
-        // a peer's command carries the ORIGIN's seq; append_remote preserves it
-        // verbatim (never renumbers to 2) and does not re-broadcast.
+        // a peer's command carries the ORIGIN's seq and rings under it verbatim,
+        // without re-broadcasting — including across a gap, since the forwarder
+        // feed drops grains when a peer stream lags.
         ring.append_remote(TermCommandEvent {
             session: "00000000deadbeef".into(),
             seq: 42,
@@ -1816,10 +1874,52 @@ mod tests {
     }
 
     #[test]
+    fn command_ring_takes_a_forward_peer_seq_and_refuses_the_rest() {
+        // the ring owns the cursor: a wire number may only move it FORWARD, and
+        // never to the ceiling. u64::MAX used to be adopted, and the next LOCAL
+        // append then overflowed the cursor.
+        assert_eq!(next_command_seq(0, None), Ok(1));
+        assert_eq!(next_command_seq(1, Some(2)), Ok(2));
+        assert_eq!(next_command_seq(1, Some(9)), Ok(9), "a gap is tolerated");
+        assert_eq!(
+            next_command_seq(1, Some(1)),
+            Err("command_seq_out_of_order"),
+            "a replay never moves the cursor"
+        );
+        assert_eq!(
+            next_command_seq(9, Some(2)),
+            Err("command_seq_out_of_order"),
+            "nor does a reorder"
+        );
+        assert_eq!(
+            next_command_seq(1, Some(u64::MAX)),
+            Err("command_seq_overflow")
+        );
+        assert_eq!(
+            next_command_seq(u64::MAX, None),
+            Err("command_seq_overflow")
+        );
+
+        let ring = TermCommandRing::default();
+        ring.append_remote(TermCommandEvent {
+            session: "00000000deadbeef".into(),
+            seq: u64::MAX,
+            origin: "attacker".into(),
+            text: "x".into(),
+        });
+        assert!(
+            ring.read_after("00000000deadbeef", 0, 8).0.is_empty(),
+            "a refused grain is not rung"
+        );
+        // and the cursor never moved: the next local command is still seq 1.
+        assert_eq!(ring.append("00000000deadbeef", "alice", "ls"), Some(1));
+    }
+
+    #[test]
     fn command_ring_evicts_least_recently_touched_sessions() {
         let ring = TermCommandRing::default();
         for i in 0..=TERM_RING_MAX_SESSIONS {
-            ring.append(&format!("s{i}"), "m", "x");
+            let _ = ring.append(&format!("s{i}"), "m", "x");
         }
         // the first-touched session aged out; the newest survives.
         assert!(ring.read_after("s0", 0, 8).0.is_empty());

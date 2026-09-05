@@ -1,4 +1,3 @@
-
 /// `run_node`'s out-of-runtime surface bring-up (phase P1): the listener
 /// binds that must fail as a clean startup error rather than an async
 /// surprise, plus the app-surface HTTP server's own OS thread and the
@@ -25,6 +24,10 @@ pub(crate) struct Surfaces {
     pub(crate) terminals: Option<noded::TerminalSessions>,
     /// the guest-side remote-session lane the term plane's client half drains.
     pub(crate) session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    /// the guest-side session-id → host-node registry the http handle writes on
+    /// a remote create. The term plane's inbound feeds gate on it: a session's
+    /// chunks and command rows are accepted only from the peer that hosts it.
+    pub(crate) remote_sessions: noded::RemoteSessions,
     /// the host's own browser-gateway base URL — the `via` a resolved credential
     /// routes through. Empty when no browser gateway is bound.
     pub(crate) local_gateway_via: String,
@@ -294,6 +297,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             http_handle
         }
     };
+    // the guest-side session→host registry, taken before the handle moves into
+    // the surface thread: the http routes write it on a remote create, the term
+    // plane's inbound feeds read it to bind a session's grains to its host.
+    let remote_sessions = http_handle.remote_sessions().clone();
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     let mut http_port = None;
@@ -373,6 +380,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         gateway_commands,
         terminals,
         session_requests,
+        remote_sessions,
         local_gateway_via,
         node_api_ports: [rpc_port, gateway_port, http_port]
             .into_iter()
