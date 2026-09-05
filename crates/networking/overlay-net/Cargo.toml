@@ -34,4 +34,6 @@ tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "io-util
 [dev-dependencies]
 # the `wg_interop` example speaks the `wg` tool's base64 key form on its CLI.
 base64 = { workspace = true }
+# the cookie-reply proof forges a valid mac1 by hand.
+blake2 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
