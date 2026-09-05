@@ -36,4 +36,9 @@ tokio = { workspace = true, features = ["rt", "time", "sync", "macros", "io-util
 base64 = { workspace = true }
 # the cookie-reply proof forges a valid mac1 by hand.
 blake2 = { workspace = true }
+# the inbound-cookie-reply roam proof forges a genuinely-decryptable cookie
+# reply by hand, exactly as an on-path attacker would: XChaCha20-Poly1305
+# under the peer's PUBLIC key, the same primitive boringtun's own
+# `receive_cookie_reply` uses.
+chacha20poly1305 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
