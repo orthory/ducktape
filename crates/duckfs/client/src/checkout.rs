@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::Path;
 
-use duckfs_core::{EntryInfo, EntryKindWire, MAX_PAGE, to_hex};
+use duckfs_core::{EntryInfo, EntryKindWire, MAX_PAGE, paths::canonical, to_hex};
 
 use crate::api::{ApiError, NodeApi};
 use crate::chunk::{chunk_ids, file_object_id};
@@ -47,6 +47,11 @@ pub enum CheckoutError {
          root: {0}"
     )]
     EscapingLink(String),
+    #[error(
+        "duckfs: checkout refused an entry path that is not a descendant of \
+         the checked-out prefix: {0}"
+    )]
+    EscapingPath(String),
     #[error(transparent)]
     Index(#[from] crate::index::IndexError),
 }
@@ -98,6 +103,29 @@ fn io<E: std::fmt::Display>(e: E) -> CheckoutError {
     CheckoutError::Io(e.to_string())
 }
 
+/// is `entry_path` (server-supplied `find` response data — never trusted) a
+/// canonical, strict, segment-wise descendant of the already-canonicalized
+/// `prefix_segments`?
+///
+/// `canonical` alone already refuses a `..`/`.` segment, but that is not
+/// enough: it says nothing about which subtree the path lands in, so a
+/// syntactically clean path outside `prefix` (or equal to it) would still
+/// pass through untouched. Every entry from `find` must run through this
+/// ONE check before its disk target is computed — not a per-arm check,
+/// because every arm (dir, file, symlink) joins the same untrusted path.
+fn path_stays_inside(prefix_segments: &[String], entry_path: &str) -> Result<(), CheckoutError> {
+    let escaping = |reason: String| CheckoutError::EscapingPath(format!("{entry_path}: {reason}"));
+    let segments = canonical(entry_path).map_err(escaping)?;
+    let is_strict_descendant = segments.len() > prefix_segments.len()
+        && segments[..prefix_segments.len()] == *prefix_segments;
+    if !is_strict_descendant {
+        return Err(escaping(
+            "not a descendant of the checked-out prefix".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// materialize `prefix`'s subtree (at head, or at `snapshot`) into `dir`, writing
 /// the `.duckfs` index. see [`checkout_with`] for options.
 pub fn checkout(
@@ -118,6 +146,8 @@ pub fn checkout_with(
     opts: &CheckoutOptions,
 ) -> Result<Index, CheckoutError> {
     let prefix = prefix.trim_end_matches('/').to_string();
+    let prefix_segments = canonical(&prefix)
+        .map_err(|reason| CheckoutError::EscapingPath(format!("{prefix}: {reason}")))?;
 
     // resolve the snapshot once: explicit, else head. a `None` head is the empty
     // filesystem (base `None`, nothing to materialize).
@@ -149,6 +179,7 @@ pub fn checkout_with(
 
     let mut recorded: BTreeMap<String, IndexEntry> = BTreeMap::new();
     for entry in &entries {
+        path_stays_inside(&prefix_segments, &entry.path)?;
         let disk = disk_path(dir, &prefix, &entry.path);
         if let Some(parent) = disk.parent() {
             std::fs::create_dir_all(parent).map_err(io)?;
