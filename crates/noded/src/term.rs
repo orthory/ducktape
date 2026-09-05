@@ -53,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::NodeHandle;
+use crate::stream::{SeqMemory, resume_within};
 
 /// how many commands may be in flight to the agent daemon before a sender
 /// waits. Deep enough that a burst of keystrokes never blocks the ws reader;
@@ -174,6 +175,29 @@ struct TermRingInner {
     version: u64,
     touch: u64,
     sessions: BTreeMap<String, SessionRing>,
+    /// the numbering of sessions whose whole ring the LRU shed — see
+    /// [`SeqMemory`]. A still-live session that prints again after its ring was
+    /// dropped resumes its seq instead of restarting at 1.
+    memory: SeqMemory<()>,
+}
+
+impl TermRingInner {
+    /// shed a session's ROWS, never its numbering.
+    fn evict(&mut self, session: &str) {
+        let Some(ring) = self.sessions.remove(session) else {
+            return;
+        };
+        self.memory.remember(session, ring.next_seq, ());
+    }
+
+    /// the head an entry being (re-)created continues from. With every row
+    /// gone, that head is also the new floor.
+    fn restored_head(&self, session: &str) -> Option<u64> {
+        if self.sessions.contains_key(session) {
+            return None;
+        }
+        self.memory.recall(session).map(|(head, ())| head)
+    }
 }
 
 #[derive(Default)]
@@ -255,8 +279,13 @@ impl TermRing {
         let mut inner = self.inner.lock().expect("term ring lock poisoned");
         let touch = inner.touch + 1;
         let version = inner.version + 1;
+        let restored = inner.restored_head(session);
         {
             let ring = inner.sessions.entry(session.to_string()).or_default();
+            if let Some(head) = restored {
+                ring.next_seq = head;
+                ring.floor_seq = head;
+            }
             if ring.ended {
                 return; // already ended — the double-close race is a no-op
             }
@@ -265,6 +294,9 @@ impl TermRing {
         }
         inner.touch = touch;
         inner.version = version;
+        if restored.is_some() {
+            inner.memory.forget(session);
+        }
         drop(inner);
         let _ = self.watch.send(version);
         // AFTER the local flag and the watch: a peer learning of the end before
@@ -289,7 +321,12 @@ impl TermRing {
         inner.touch += 1;
         let version = inner.version;
         let touch = inner.touch;
+        let restored = inner.restored_head(session);
         let ring = inner.sessions.entry(session.to_string()).or_default();
+        if let Some(head) = restored {
+            ring.next_seq = head;
+            ring.floor_seq = head;
+        }
         ring.touched = touch;
         ring.next_seq += 1;
         let seq = ring.next_seq;
@@ -315,7 +352,10 @@ impl TermRing {
             else {
                 break;
             };
-            inner.sessions.remove(&victim);
+            inner.evict(&victim);
+        }
+        if restored.is_some() {
+            inner.memory.forget(session);
         }
         drop(inner);
         let _ = self.watch.send(version);
@@ -345,7 +385,9 @@ impl TermRing {
         inner.touch += 1;
         let touch = inner.touch;
         let Some(ring) = inner.sessions.get_mut(session) else {
-            return (Vec::new(), 0);
+            // no ring, but the numbering may have outlived it: the evicted head
+            // is the floor, every row up to it being gone.
+            return (Vec::new(), inner.memory.head_of(session));
         };
         ring.touched = touch;
         let rows = ring
@@ -356,6 +398,16 @@ impl TermRing {
             .cloned()
             .collect();
         (rows, ring.floor_seq)
+    }
+
+    /// where a subscriber's cursor lands on this session's ring — see
+    /// [`resume_within`]. The catch-up path `Lagged`s whenever it moves.
+    pub fn resume_cursor(&self, session: &str, after: u64) -> u64 {
+        let inner = self.inner.lock().expect("term ring lock poisoned");
+        let Some(ring) = inner.sessions.get(session) else {
+            return inner.memory.head_of(session);
+        };
+        resume_within(after, ring.floor_seq, ring.next_seq)
     }
 
     /// wake on any append (the version counter), like the run-output watch.
@@ -390,6 +442,29 @@ struct TermCommandRingInner {
     version: u64,
     touch: u64,
     sessions: BTreeMap<String, CommandRing>,
+    /// the cursor of sessions whose whole command log the LRU shed — see
+    /// [`SeqMemory`]. THE fix for a shared session going quiet, being evicted,
+    /// and then taking another command: without it the next command restarts at
+    /// seq 1, which every mirror peer refuses as out-of-order forever.
+    memory: SeqMemory<()>,
+}
+
+impl TermCommandRingInner {
+    /// shed a session's COMMANDS, never its cursor.
+    fn evict(&mut self, session: &str) {
+        let Some(ring) = self.sessions.remove(session) else {
+            return;
+        };
+        self.memory.remember(session, ring.next_seq, ());
+    }
+
+    /// the cursor this session's log is at, whether or not it still holds one.
+    fn cursor(&self, session: &str) -> u64 {
+        match self.sessions.get(session) {
+            Some(ring) => ring.next_seq,
+            None => self.memory.head_of(session),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -484,7 +559,7 @@ impl TermCommandRing {
         publish: bool,
     ) -> Option<u64> {
         let mut inner = self.inner.lock().expect("term command ring lock poisoned");
-        let cursor = inner.sessions.get(session).map_or(0, |ring| ring.next_seq);
+        let cursor = inner.cursor(session);
         // decided BEFORE anything is mutated, so a refusal leaves the ring — and
         // its cursor — exactly as it was.
         let seq = match next_command_seq(cursor, seq_override) {
@@ -507,7 +582,16 @@ impl TermCommandRing {
         inner.touch += 1;
         let version = inner.version;
         let touch = inner.touch;
+        // a re-created log continues the evicted one's numbering; with every
+        // command gone, that cursor is also its floor.
+        let restored = (!inner.sessions.contains_key(session))
+            .then(|| inner.memory.recall(session))
+            .flatten()
+            .map(|(head, ())| head);
         let ring = inner.sessions.entry(session.to_string()).or_default();
+        if let Some(head) = restored {
+            ring.floor_seq = head;
+        }
         ring.touched = touch;
         ring.next_seq = seq;
         ring.commands
@@ -529,7 +613,10 @@ impl TermCommandRing {
             else {
                 break;
             };
-            inner.sessions.remove(&victim);
+            inner.evict(&victim);
+        }
+        if restored.is_some() {
+            inner.memory.forget(session);
         }
         drop(inner);
         let _ = self.watch.send(version);
@@ -563,7 +650,9 @@ impl TermCommandRing {
         inner.touch += 1;
         let touch = inner.touch;
         let Some(ring) = inner.sessions.get_mut(session) else {
-            return (Vec::new(), 0);
+            // no log, but the cursor may have outlived it: the evicted head is
+            // the floor, every command up to it being gone.
+            return (Vec::new(), inner.memory.head_of(session));
         };
         ring.touched = touch;
         let rows = ring
@@ -574,6 +663,16 @@ impl TermCommandRing {
             .cloned()
             .collect();
         (rows, ring.floor_seq)
+    }
+
+    /// where a subscriber's cursor lands on this session's command log — see
+    /// [`resume_within`]. The catch-up path `Lagged`s whenever it moves.
+    pub fn resume_cursor(&self, session: &str, after: u64) -> u64 {
+        let inner = self.inner.lock().expect("term command ring lock poisoned");
+        let Some(ring) = inner.sessions.get(session) else {
+            return inner.memory.head_of(session);
+        };
+        resume_within(after, ring.floor_seq, ring.next_seq)
     }
 
     /// wake on any append (the version counter), like the output ring's watch.
@@ -1924,10 +2023,84 @@ mod tests {
         assert!(ring.read_after("s0", 0, 8).0.is_empty());
         assert!(
             !ring
-            .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
-            .0
+                .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
+                .0
                 .is_empty()
         );
+    }
+
+    /// the eviction that used to restart a live session's numbering. S has
+    /// taken five commands and gone quiet; sixteen other sessions push its
+    /// entry out of the map. The next command on S must be seq 6 — a mirror
+    /// peer sitting at cursor 5 accepts only a number that moves it forward, so
+    /// a re-stamped 1 would be dropped as out-of-order for the rest of the
+    /// session's life.
+    #[test]
+    fn an_evicted_command_log_keeps_numbering_where_it_left_off() {
+        let ring = TermCommandRing::default();
+        for _ in 0..5 {
+            assert!(ring.append("S", "alice", "ls").is_some());
+        }
+        for i in 0..TERM_RING_MAX_SESSIONS {
+            let _ = ring.append(&format!("s{i}"), "m", "x");
+        }
+        assert!(
+            ring.read_after("S", 0, 8).0.is_empty(),
+            "the rows are gone — that half of eviction is the point"
+        );
+        assert_eq!(
+            ring.read_after("S", 0, 8).1,
+            5,
+            "and the floor says so: everything up to 5 is unreachable"
+        );
+
+        let seq = ring.append("S", "bob", "pwd").expect("the command is rung");
+        assert_eq!(seq, 6, "the cursor outlived the rows");
+
+        // the mirror half: a peer node that has seen S's first five commands.
+        let mirror = TermCommandRing::default();
+        for i in 1..=5 {
+            mirror.append_remote(TermCommandEvent {
+                session: "S".into(),
+                seq: i,
+                origin: "alice".into(),
+                text: "ls".into(),
+            });
+        }
+        mirror.append_remote(TermCommandEvent {
+            session: "S".into(),
+            seq,
+            origin: "bob".into(),
+            text: "pwd".into(),
+        });
+        let (rows, _) = mirror.read_after("S", 5, 8);
+        assert_eq!(
+            rows,
+            vec![(6, "bob".to_string(), "pwd".to_string())],
+            "the mirror at cursor 5 accepts the host's next command"
+        );
+    }
+
+    /// the output ring's half of the same rule, plus what a subscriber sees: a
+    /// cursor that is now above the ring's head is rewound to it rather than
+    /// waiting forever on rows that were renumbered away.
+    #[test]
+    fn an_evicted_output_ring_keeps_numbering_and_rewinds_a_stale_cursor() {
+        let ring = TermRing::default();
+        for _ in 0..5 {
+            ring.append("S", STANDARD.encode(b"x"));
+        }
+        for i in 0..TERM_RING_MAX_SESSIONS {
+            ring.append(&format!("s{i}"), STANDARD.encode(b"x"));
+        }
+        assert_eq!(ring.resume_cursor("S", 3), 5, "a lagging cursor climbs");
+        assert_eq!(ring.resume_cursor("S", 9), 5, "a stale one is rewound");
+
+        ring.append("S", STANDARD.encode(b"more"));
+        let (rows, floor) = ring.read_after("S", 5, 8);
+        assert_eq!(floor, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 6, "the re-created ring continues at 6");
     }
 
     #[test]

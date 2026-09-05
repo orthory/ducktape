@@ -700,6 +700,112 @@ impl Drop for LogRingWriter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the numbering that outlives a ring entry
+// ---------------------------------------------------------------------------
+
+/// how many evicted ids keep their numbering.
+///
+/// Basis: a record is one `u64`, a `Copy` mark and the id string — under a
+/// hundred bytes — while the ONE ring entry it stands in for holds up to
+/// [`RUN_OUTPUT_MAX_LINES`] lines or a quarter megabyte of scrollback. So the
+/// bound sits orders of magnitude above the entry caps it backs (32 runs, 16
+/// terminal sessions): every id a node plausibly touches keeps its numbering,
+/// and the cap is here only so a peer minting fresh ids cannot grow the map
+/// without end.
+const SEQ_MEMORY_MAX_IDS: usize = 2_048;
+
+/// the per-id numbering that survives a whole-entry eviction.
+///
+/// Every ring in this crate is bounded twice: by rows within an id, and by id
+/// count across the map. Shedding ROWS is the point — the bytes are
+/// observational. Shedding the id's COUNTERS with them is not: the next append
+/// to that still-live id would restart at seq 1, which every mirror peer
+/// refuses as out-of-order and every subscribed cursor sits above forever. So
+/// eviction hands the id's head here on the way out, a re-created entry
+/// continues numbering from it, and while no entry exists this is what the id
+/// reports as BOTH head and floor — with no rows left, everything up to the
+/// head really is gone, which is what turns a stale cursor into a `Lagged`
+/// frame instead of silence.
+pub(crate) struct SeqMemory<M> {
+    records: BTreeMap<String, SeqRecord<M>>,
+    touch: u64,
+}
+
+struct SeqRecord<M> {
+    /// the last seq the evicted entry stamped: its head, and — no rows having
+    /// survived — its floor.
+    head: u64,
+    mark: M,
+    remembered: u64,
+}
+
+impl<M> Default for SeqMemory<M> {
+    fn default() -> Self {
+        Self {
+            records: BTreeMap::new(),
+            touch: 0,
+        }
+    }
+}
+
+impl<M: Copy> SeqMemory<M> {
+    /// stash an id's numbering as its entry is dropped. Oldest-first eviction
+    /// past [`SEQ_MEMORY_MAX_IDS`], by the order records were remembered.
+    pub(crate) fn remember(&mut self, id: &str, head: u64, mark: M) {
+        self.touch += 1;
+        let remembered = self.touch;
+        self.records.insert(
+            id.to_string(),
+            SeqRecord {
+                head,
+                mark,
+                remembered,
+            },
+        );
+        while self.records.len() > SEQ_MEMORY_MAX_IDS {
+            let Some(oldest) = self
+                .records
+                .iter()
+                .min_by_key(|(_, record)| record.remembered)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.records.remove(&oldest);
+        }
+    }
+
+    /// the head a re-created entry continues from, and the mark the evicted one
+    /// carried.
+    pub(crate) fn recall(&self, id: &str) -> Option<(u64, M)> {
+        self.records
+            .get(id)
+            .map(|record| (record.head, record.mark))
+    }
+
+    /// what an id with no entry reports as its head and floor. `0` — a cursor
+    /// of 0 is not behind — for an id this ring has never held.
+    pub(crate) fn head_of(&self, id: &str) -> u64 {
+        self.records.get(id).map_or(0, |record| record.head)
+    }
+
+    /// the entry owns the numbering again.
+    pub(crate) fn forget(&mut self, id: &str) {
+        self.records.remove(id);
+    }
+}
+
+/// where a subscriber's cursor actually lands on a ring: up to `floor`
+/// (everything at or below it was evicted) and down to `head` (a cursor above
+/// the last stamped seq belongs to numbering this ring no longer has — a
+/// restart, or an entry evicted and re-created). The catch-up path emits
+/// `Lagged` whenever this moves the cursor, which is what keeps an impossible
+/// cursor from waiting on rows that will never come.
+pub(crate) fn resume_within(after: u64, floor: u64, head: u64) -> u64 {
+    after.max(floor).min(head)
+}
+
 #[derive(Clone)]
 pub struct RunOutputRegistry {
     inner: Arc<Mutex<RunOutputInner>>,
@@ -722,6 +828,22 @@ struct RunOutputInner {
     version: u64,
     touch: u64,
     runs: BTreeMap<String, RunRing>,
+    /// the numbering (and origin) of runs whose whole ring the cap evicted —
+    /// see [`SeqMemory`]. A run that keeps printing after its ring was shed
+    /// continues its seq from here instead of restarting at 1.
+    memory: SeqMemory<RunOrigin>,
+}
+
+impl RunOutputInner {
+    /// shed a ring's ROWS, never its numbering: the id's head and origin move
+    /// to [`Self::memory`], so a run that keeps printing after the cap dropped
+    /// its ring resumes its seq instead of restarting at 1.
+    fn evict(&mut self, id: &str) {
+        let Some(ring) = self.runs.remove(id) else {
+            return;
+        };
+        self.memory.remember(id, ring.next_seq, ring.origin);
+    }
 }
 
 /// who fed this ring its lines. A run this node hosts is never writable by a
@@ -822,9 +944,16 @@ impl RunOutputRegistry {
     /// Returns whether the line was admitted.
     fn push(&self, id: String, stream: RunStream, line: String, origin: RunOrigin) -> bool {
         let mut inner = self.inner.lock().expect("run output lock poisoned");
-        match (origin, inner.runs.get(&id).map(|ring| ring.origin)) {
+        let held = inner.runs.get(&id).map(|ring| ring.origin);
+        // the Local/Remote mark outlives the rows: a local run whose ring the
+        // cap shed is still a run this node hosts, and a peer may no more claim
+        // it after the eviction than before.
+        let known = held.or_else(|| inner.memory.recall(&id).map(|(_, mark)| mark));
+        // the cap counts RINGS, so only an id holding none can grow the map.
+        let needs_slot = held.is_none() && inner.runs.len() >= RUN_OUTPUT_MAX_RUNS;
+        match (origin, known) {
             (RunOrigin::Remote, Some(RunOrigin::Local)) => return false,
-            (RunOrigin::Remote, None) if inner.runs.len() >= RUN_OUTPUT_MAX_RUNS => {
+            (RunOrigin::Remote, _) if needs_slot => {
                 let victim = inner
                     .runs
                     .iter()
@@ -832,14 +961,19 @@ impl RunOutputRegistry {
                     .min_by_key(|(_, ring)| ring.touched)
                     .map(|(run_id, _)| run_id.clone());
                 match victim {
-                    Some(victim) => {
-                        inner.runs.remove(&victim);
-                    }
+                    Some(victim) => inner.evict(&victim),
                     None => return false,
                 }
             }
             _ => {}
         }
+        // a re-created ring continues the evicted one's numbering; with every
+        // row gone, that head is also its floor.
+        let restored = held
+            .is_none()
+            .then(|| inner.memory.recall(&id))
+            .flatten()
+            .map(|(head, _)| head);
         inner.version += 1;
         inner.touch += 1;
         let version = inner.version;
@@ -848,6 +982,10 @@ impl RunOutputRegistry {
             .runs
             .entry(id.clone())
             .or_insert_with(|| RunRing::new(origin));
+        if let Some(head) = restored {
+            ring.next_seq = head;
+            ring.floor_seq = head;
+        }
         ring.touched = touch;
         ring.next_seq += 1;
         let seq = ring.next_seq;
@@ -868,8 +1006,11 @@ impl RunOutputRegistry {
                 else {
                     break;
                 };
-                inner.runs.remove(&victim);
+                inner.evict(&victim);
             }
+        }
+        if restored.is_some() {
+            inner.memory.forget(&id);
         }
         drop(inner);
         let _ = self.watch.send(version);
@@ -889,7 +1030,9 @@ impl RunOutputRegistry {
         inner.touch += 1;
         let touch = inner.touch;
         let Some(ring) = inner.runs.get_mut(id) else {
-            return (Vec::new(), 0);
+            // no ring, but the numbering may have outlived it: report the
+            // evicted head as the floor, since every row up to it is gone.
+            return (Vec::new(), inner.memory.head_of(id));
         };
         ring.touched = touch;
         let rows = ring
@@ -900,6 +1043,16 @@ impl RunOutputRegistry {
             .cloned()
             .collect();
         (rows, ring.floor_seq)
+    }
+
+    /// where a subscriber's cursor lands on this run's ring — see
+    /// [`resume_within`]. The catch-up path `Lagged`s whenever it moves.
+    pub fn resume_cursor(&self, id: &str, after: u64) -> u64 {
+        let inner = self.inner.lock().expect("run output lock poisoned");
+        let Some(ring) = inner.runs.get(id) else {
+            return inner.memory.head_of(id);
+        };
+        resume_within(after, ring.floor_seq, ring.next_seq)
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -2386,12 +2539,17 @@ fn catch_up_run_output(
     runs: &RunOutputRegistry,
 ) -> CatchUpResult {
     let mut frames = Vec::new();
-    let (_, floor) = runs.read_after(id, *seq, STREAM_CATCHUP_BUDGET);
-    if *seq < floor {
-        *seq = floor;
+    // BOTH directions: below the floor the rows were evicted, above the head
+    // the cursor names numbering this ring no longer has (a restart, or an
+    // entry evicted and re-created). Either way the reader must be told, or it
+    // waits on rows that will never come.
+    let resume = runs.resume_cursor(id, *seq);
+    let rewound = resume != *seq;
+    if rewound {
+        *seq = resume;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
-            cursor: floor.to_string(),
+            cursor: resume.to_string(),
         });
     }
     loop {
@@ -2426,12 +2584,17 @@ fn catch_up_term(
     ring: &crate::term::TermRing,
 ) -> CatchUpResult {
     let mut frames = Vec::new();
-    let (_, floor) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
-    if *seq < floor {
-        *seq = floor;
+    // BOTH directions: below the floor the rows were evicted, above the head
+    // the cursor names numbering this ring no longer has (a restart, or an
+    // entry evicted and re-created). Either way the reader must be told, or it
+    // waits on rows that will never come.
+    let resume = ring.resume_cursor(session, *seq);
+    let rewound = resume != *seq;
+    if rewound {
+        *seq = resume;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
-            cursor: floor.to_string(),
+            cursor: resume.to_string(),
         });
     }
     loop {
@@ -2477,12 +2640,17 @@ fn catch_up_term_command(
     ring: &crate::term::TermCommandRing,
 ) -> CatchUpResult {
     let mut frames = Vec::new();
-    let (_, floor) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
-    if *seq < floor {
-        *seq = floor;
+    // BOTH directions: below the floor the rows were evicted, above the head
+    // the cursor names numbering this ring no longer has (a restart, or an
+    // entry evicted and re-created). Either way the reader must be told, or it
+    // waits on rows that will never come.
+    let resume = ring.resume_cursor(session, *seq);
+    let rewound = resume != *seq;
+    if rewound {
+        *seq = resume;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
-            cursor: floor.to_string(),
+            cursor: resume.to_string(),
         });
     }
     loop {
@@ -3050,8 +3218,64 @@ mod tests {
             runs.append(format!("run-{i}"), RunStream::Stderr, "x");
         }
         let (rows, floor) = runs.read_after("active", 0, 1);
-        assert!(rows.is_empty());
-        assert_eq!(floor, 0);
+        assert!(rows.is_empty(), "the rows went with the ring");
+        assert_eq!(
+            floor,
+            (RUN_OUTPUT_MAX_LINES + 1) as u64,
+            "but the numbering did not: the floor still names what was dropped"
+        );
+    }
+
+    /// a run whose ring the cap shed while a pane was subscribed to it. The
+    /// pane's cursor sits at the old high-water; the run keeps printing. Before
+    /// the numbering survived eviction the ring restarted at 1, every new line
+    /// failed the `> cursor` filter, the floor read 0 so no `Lagged` fired, and
+    /// the pane sat frozen for the life of the connection.
+    #[test]
+    fn a_re_created_run_ring_lags_the_subscriber_instead_of_going_silent() {
+        let runs = RunOutputRegistry::default();
+        for i in 0..600 {
+            runs.append("active", RunStream::Stdout, format!("line-{i}"));
+        }
+        // the pane has consumed the first 500 lines.
+        let mut seq = 500;
+        for i in 0..RUN_OUTPUT_MAX_RUNS {
+            runs.append(format!("run-{i}"), RunStream::Stderr, "x");
+        }
+        runs.append("active", RunStream::Stdout, "after the eviction");
+
+        let result = catch_up_run_output("run-output:active", "active", &mut seq, &runs);
+        assert!(
+            matches!(result.frames.first(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "600"),
+            "the 100 lines evicted under the cursor are announced, not swallowed"
+        );
+        assert!(matches!(
+            result.frames.last(),
+            Some(ServerFrame::Tail { cursor, .. }) if cursor == "601"
+        ));
+        assert_eq!(seq, 601, "and the pane is live again on the new numbering");
+    }
+
+    /// the same blind spot with no eviction at all: a client resumes with a seq
+    /// it saved before a restart, so the cursor is above a fresh ring's head.
+    /// It must be rewound and told, never left waiting for seq 901.
+    #[test]
+    fn a_resume_cursor_above_the_head_lags_rather_than_waits() {
+        let runs = RunOutputRegistry::default();
+        let mut seq = 900;
+        let result = catch_up_run_output("run-output:fresh", "fresh", &mut seq, &runs);
+        assert!(
+            matches!(result.frames.first(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "0")
+        );
+        assert_eq!(seq, 0);
+
+        runs.append("fresh", RunStream::Stdout, "first");
+        let result = catch_up_run_output("run-output:fresh", "fresh", &mut seq, &runs);
+        assert!(matches!(
+            result.frames.first(),
+            Some(ServerFrame::Tail { cursor, .. }) if cursor == "1"
+        ));
+        assert_eq!(seq, 1);
     }
 
     #[test]
