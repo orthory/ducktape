@@ -443,8 +443,7 @@ impl NetworkDescriptor {
             // plane's tunnels apply, so letting it evict the underlay hint
             // strands the member behind a plane that has not assembled yet
             // (first join, promotion reboot, same-host tests).
-            if matches!(hint.reach, Reach::Direct(_)) && !self.overlay_route(&hint)?
-            {
+            if matches!(hint.reach, Reach::Direct(_)) && !self.overlay_route(&hint)? {
                 typed_keys.insert(hint.expected_key.as_ref().to_vec());
             }
             typed.push(hint);
@@ -743,11 +742,14 @@ pub fn load_coord_cap(dir: &Path) -> Option<nat_traversal::CoordCap> {
 ///
 /// `issuer` is the invite's verified issuer: `decode_invite_at` checks the
 /// envelope signature against it before anything here runs, so it is the one
-/// value in a pasted blob an attacker cannot choose freely. the refresh is
-/// admitted only when that key is already a validator in the descriptor ON
-/// DISK — the set we trusted before this blob arrived. an attacker who copies
-/// our validators into their own descriptor satisfies the SHAPE of a refresh,
-/// but signing as one of those keys needs a key they do not have.
+/// value in a pasted blob an attacker cannot choose freely. ANY join into a
+/// live workspace — the same-fingerprint re-join as much as the admit refresh
+/// — is admitted only when that key is already a validator in the descriptor
+/// ON DISK, the set we trusted before this blob arrived. an attacker who
+/// copies our genesis facts into their own descriptor satisfies the SHAPE of a
+/// re-join (and can match the fingerprint outright, since the reach hints,
+/// coordination mode, fronts and WireGuard bootstrap it rewrites are all
+/// outside it), but signing as one of those keys needs a key they do not have.
 pub fn guard_join_descriptor(
     dir: &Path,
     incoming: &NetworkDescriptor,
@@ -769,14 +771,11 @@ pub fn guard_join_descriptor(
     }
     let ours = validator_set(&existing);
     let same_genesis = existing.genesis_namespace() == incoming.genesis_namespace();
-    if same_genesis {
-        return Ok(());
-    }
     let admit_shape = existing.genesis == incoming.genesis
         && existing.modules == incoming.modules
         && existing.block_time_ms == incoming.block_time_ms
         && ours.is_subset(&validator_set(incoming));
-    if !admit_shape {
+    if !same_genesis && !admit_shape {
         return Err(format!(
             "foreign_genesis: {} already belongs to genesis {} — refusing to replace its \
              descriptor with an invite that reuses the chain-id {} over a DIFFERENT genesis {} \
@@ -788,13 +787,22 @@ pub fn guard_join_descriptor(
             incoming.genesis_namespace(),
         ));
     }
+    // BOTH legitimate shapes land here, and BOTH need the signature. a
+    // matching fingerprint is not proof of membership: `genesis_namespace`
+    // covers the chain-id, validators, modules, genesis pin and beat and
+    // NOTHING else — `reach`, `coordination`, the invite's fronts and its
+    // WireGuard bootstrap all ride outside it, and `join_workspace` writes
+    // every one of them wholesale. so a stranger who copies a leaked invite's
+    // genesis facts verbatim and re-points the hints at hosts they control
+    // mints a blob whose fingerprint MATCHES ours. the envelope signature is
+    // the one field they cannot choose.
     let signed_by_a_resident_validator = ours.contains(&hex_bytes(issuer.as_ref()));
     if !signed_by_a_resident_validator {
         return Err(format!(
-            "refresh_not_signed_by_a_member: {} already belongs to genesis {} — the invite \
-             carries the shape of an admit refresh, but it was signed by {}, which is not a \
-             validator of the descriptor on disk; anyone can copy your validator list into \
-             their own descriptor, only one of those validators can sign as one",
+            "join_not_signed_by_a_member: {} already belongs to genesis {} — the invite carries \
+             the shape of a re-join, but it was signed by {}, which is not a validator of the \
+             descriptor on disk; anyone can copy your validator list into their own descriptor, \
+             only one of those validators can sign as one",
             dir.display(),
             existing.genesis_namespace(),
             hex_bytes(issuer.as_ref()),
@@ -1843,7 +1851,7 @@ mod tests {
         let err = guard_join_descriptor(&dir, &refresh, &stranger)
             .expect_err("a refresh signed by a non-member is refused");
         assert!(
-            err.starts_with("refresh_not_signed_by_a_member:"),
+            err.starts_with("join_not_signed_by_a_member:"),
             "its own reason token: {err}"
         );
         assert!(
@@ -1855,6 +1863,55 @@ mod tests {
         // documented re-join.
         guard_join_descriptor(&dir, &refresh, &ours_key)
             .expect("a refresh signed by a resident validator is the re-join");
+    }
+
+    #[test]
+    fn join_guard_refuses_a_same_genesis_blob_signed_by_a_stranger() {
+        let ours_key = ed25519::PrivateKey::from_seed(51).public_key();
+        let stranger = ed25519::PrivateKey::from_seed(52).public_key();
+        let dir = tmp("joinguard-same-genesis");
+        let ours = NetworkDescriptor {
+            chain_id: "home#55555555".into(),
+            validators: vec![hex_bytes(ours_key.as_ref())],
+            bootstrap: vec![],
+            reach: vec!["10.0.0.1:52200".into()],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: "11".repeat(32),
+            modules: Vec::new(),
+        };
+        ours.save(&dir.join("network.toml")).expect("save");
+
+        // every genesis fact copied verbatim from a leaked invite, so the
+        // fingerprint MATCHES; only what rides outside it — the reach hints,
+        // the coordination mode, and (in the invite) the fronts and WireGuard
+        // bootstrap `join_workspace` writes wholesale — points at the
+        // attacker.
+        let hijack = NetworkDescriptor {
+            reach: vec!["attacker.example.com:52200".into()],
+            coordination: Some("public".into()),
+            ..ours.clone()
+        };
+        assert_eq!(
+            hijack.genesis_namespace(),
+            ours.genesis_namespace(),
+            "the hints this blob rewrites are outside the fingerprint"
+        );
+
+        let err = guard_join_descriptor(&dir, &hijack, &stranger)
+            .expect_err("a same-genesis blob signed by a non-member is refused");
+        assert!(
+            err.starts_with("join_not_signed_by_a_member:"),
+            "its own reason token: {err}"
+        );
+        assert!(
+            err.contains(&hex_bytes(stranger.as_ref())),
+            "error names the issuer that signed it: {err}"
+        );
+
+        // the same blob from a validator on disk is the documented re-join.
+        guard_join_descriptor(&dir, &hijack, &ours_key)
+            .expect("a same-genesis re-join signed by a resident validator is admitted");
     }
 
     #[test]
