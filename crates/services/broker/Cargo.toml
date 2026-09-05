@@ -37,7 +37,7 @@ tracing = { workspace = true }
 testkit = []
 # Real TEE quote verification (dcap-qvl/sev/a second reqwest-0.13 stack):
 # the `AirlockTrust::Attested` arm (env-triggered by DUCKTAPE_AIRLOCK_ATTEST)
-# and `verify_gateway`. Off by default — the everyday self-hosted lender path
+# and `attested::verify`. Off by default — the everyday self-hosted lender path
 # (`AirlockTrust::PinnedSealPk`) never attests; an off build refuses an
 # Attested trust by name (see `open_airlock_session`) instead of silently
 # falling back to a host credential.

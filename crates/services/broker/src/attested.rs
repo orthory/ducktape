@@ -22,9 +22,9 @@ pub(crate) async fn verify(
     let mode: AttestMode = attest.parse().map_err(|e| format!("airlock attest mode: {e}"))?;
     let expected =
         Measurement::from_hex(measurement).map_err(|e| format!("airlock measurement: {e}"))?;
+    let roots = trust_roots(cfg, mode)?;
     let (quote, _vendor) =
         gateway.fetch_quote().await.map_err(|e| format!("airlock fetch quote: {e}"))?;
-    let roots = trust_roots(cfg, mode)?;
     let report_data = airlock::verify::verify_quote(&quote, &expected, &roots)
         .await
         .map_err(|e| format!("airlock verify: {e}"))?;
