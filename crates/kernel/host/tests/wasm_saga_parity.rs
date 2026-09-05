@@ -66,7 +66,11 @@ fn key(tag: u8) -> Vec<u8> {
 }
 
 async fn seeded_valset(members: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut valset = Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     for m in members {
         valset.seed(m.clone()).await.expect("seed valset");
     }

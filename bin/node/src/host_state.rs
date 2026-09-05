@@ -767,7 +767,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "e996a7408b4338ffd82fb3a715382deee2f845aca9a28ceffb65b5b700d07442";
+        "d7edbcb3cf88991c9d4f828f57173dcf09f98815c8dd0bf46203d46be26619ba";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
@@ -919,8 +919,12 @@ mod tests {
             ),
             (Origin::System, 50, ModulesMsg::Advance),
         ];
-        let mut registry =
-            Modules::new("modules", Box::new(sdk_testkit::MemStore::new()), "valset");
+        let mut registry = Modules::new(
+            "modules",
+            Box::new(sdk_testkit::MemStore::new()),
+            "valset",
+            "governance",
+        );
         futures::executor::block_on(async {
             for (origin, height, m) in steps {
                 let mut ctx = ctx(origin, height);
