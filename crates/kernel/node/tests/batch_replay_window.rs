@@ -158,3 +158,44 @@ fn a_seeded_window_refuses_what_a_previous_process_journaled() {
         );
     });
 }
+
+#[test]
+fn a_cold_synced_seat_refuses_what_the_boundary_it_synced_had_applied() {
+    block_on(async {
+        // the SYNCED BOUNDARY case: this node folded nothing of its own, so
+        // the only thing that can tell it a batch already applied is the
+        // window the boundary carried (`statesync::Manifest::applied_frames`,
+        // installed through `recovery::Recovered::applied_frames`). without
+        // it the seat applies a re-proposed batch every long-running peer
+        // refuses, and one batch is two roots.
+        let replayed = batch(0, "applied below the boundary");
+        let host = Host::genesis(vec![Box::new(Directory::new("directory"))]).expect("genesis");
+        let root_hash = host.root_hash();
+        let mut node = OrderedNode::resume(
+            host,
+            ScriptedOrderer {
+                // re-proposed ABOVE the boundary, at a height this seat has
+                // never seen — the applied floor cannot catch it.
+                script: vec![(8_200, replayed.clone())],
+            },
+            NullSink,
+            Some(host::FinalizedBlock {
+                height: 8_192,
+                root_hash,
+            }),
+            0,
+        );
+        node.seed_replay_window([(8_190, frame_id(&replayed))]);
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
+        assert_eq!(
+            get(&node).await,
+            None,
+            "a batch that applied below the synced boundary never applies again"
+        );
+        let drained = node.take_drained();
+        assert_eq!(drained[0].disposition, node::Disposition::Rejected);
+        assert_eq!(drained[0].reason.as_deref(), Some("batch replayed"));
+        // the agreed height still seals identically on every node.
+        assert_eq!(node.finalized().expect("boundary").height, 8_200);
+    });
+}

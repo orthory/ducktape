@@ -549,3 +549,119 @@ fn range_read_refuses_below_the_retained_floor() {
         assert_eq!(frames[0].height, 2);
     });
 }
+
+/// THE REPLAY WINDOW IS PERSISTED STATE, NOT UPTIME. the journal suffix a
+/// checkpoint leaves behind is shallower than the protocol window on purpose
+/// — that is what checkpointing is for — so a restart that rebuilt the guard
+/// from the suffix alone would refuse fewer replayed batches than a peer that
+/// never restarted, and the two fork on the first batch in the difference.
+/// the checkpoint carries the window; the suffix extends it, one entry per
+/// height.
+#[test]
+fn recovery_restores_the_checkpoint_window_and_extends_it_with_the_suffix() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let recovery = Recovery::open(context.child("w1"))
+            .await
+            .expect("open recovery");
+        let mut node = OrderedNode::with_sink(fresh_host(), RoundOrderer::new(), recovery);
+        let signer = sk(3);
+
+        // one block, then a checkpoint carrying a window whose ids are
+        // SENTINELS: nothing in this journal can produce them, so finding one
+        // in the restored window proves it came off the checkpoint.
+        node.submit(&signer, 0, set("k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
+        let checkpoint_height = node.finalized().expect("boundary").height;
+        let inherited = vec![(checkpoint_height, [0xC1; 32])];
+
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest = Manifest::capture(
+            node.host(),
+            Some(checkpoint_height),
+            0,
+            0,
+            vec![],
+            vec![],
+            None,
+            pos,
+            1,
+        )
+        .expect("capture")
+        .with_replay_window(inherited.clone());
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write manifest");
+
+        // two more blocks above the checkpoint: the suffix the replay walks.
+        node.submit(&signer, 1, set("k1", "v1"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        node.submit(&signer, 2, set("k2", "v2"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        let tip_height = node.finalized().expect("boundary").height;
+        let live_window = node.replay_window();
+        drop(node);
+
+        let mut recovery = Recovery::open(context.child("w2"))
+            .await
+            .expect("reopen recovery");
+        let restored = recovery
+            .manifest()
+            .expect("manifest decodes")
+            .expect("manifest present");
+        assert_eq!(
+            restored.applied_frames, inherited,
+            "the window survives the checkpoint codec"
+        );
+
+        let mut directory = Directory::new("directory");
+        directory
+            .install(
+                restored.snapshot("directory").expect("directory snapshot"),
+                restored.root("directory").expect("directory root"),
+            )
+            .expect("install");
+        let mut host = Host::genesis(vec![Box::new(directory)]).expect("genesis");
+        let recovered = recovery
+            .recover(&mut host, &restored)
+            .await
+            .expect("replay the suffix");
+
+        // the checkpoint's entry is IN the restored window, sentinel id and
+        // all — and it did not double up with the same height the retained
+        // journal still holds.
+        assert!(
+            recovered
+                .applied_frames
+                .contains(&(checkpoint_height, [0xC1; 32])),
+            "the checkpoint window seeds the restored one"
+        );
+        let heights: Vec<u64> = recovered.applied_frames.iter().map(|(h, _)| *h).collect();
+        let mut one_per_height = heights.clone();
+        one_per_height.sort_unstable();
+        one_per_height.dedup();
+        assert_eq!(
+            heights, one_per_height,
+            "ascending, one entry per height — a duplicate costs a window slot"
+        );
+        // and every block the suffix walked extends it, up to the tip.
+        for (height, id) in live_window {
+            if height > checkpoint_height {
+                assert!(
+                    recovered.applied_frames.contains(&(height, id)),
+                    "the suffix block at {height} extends the restored window"
+                );
+            }
+        }
+        assert_eq!(heights.last().copied(), Some(tip_height));
+    });
+}
