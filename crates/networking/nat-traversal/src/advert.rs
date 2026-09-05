@@ -51,6 +51,14 @@ pub enum AdvertOutcome {
     /// untouched. Not a refusal — nothing was refused, there was simply
     /// nothing to do.
     NoOp,
+    /// `readvertise` found a LIVE mapping whose stored reflexive differs from
+    /// the datagram's observed source, even though the nonce clears the
+    /// staleness check. `verify_request_using` is not bound to the datagram
+    /// source (same as `Register`'s authenticator), so a captured keepalive
+    /// replayed from a different source is otherwise indistinguishable from a
+    /// genuine rebind by nonce alone — this mirrors `observe`'s own
+    /// different-source guard. The stored mapping is left untouched.
+    SourceMismatch,
 }
 
 /// A book-mutating call's side effect that is worth a log line. Returned
@@ -369,6 +377,17 @@ impl AdvertBook {
     /// datagram cannot keep a mapping alive. No prior entry, or an EXPIRED one,
     /// -> accepted as a first advert (the nonce guard protects live mappings,
     /// not corpses — a rebooted node restarts its nonce sequence).
+    ///
+    /// A THIRD case sits alongside those two: a strictly-higher nonce against
+    /// a LIVE mapping from a DIFFERENT source (`SourceMismatch`). The
+    /// authenticator is not bound to the datagram source, so this is exactly
+    /// as unverifiable as the register-hijack `observe` already guards
+    /// against — an on-path attacker who captures a victim's keepalive and
+    /// replays the identical bytes from its own socket produces this same
+    /// shape (fresh nonce, wrong source) as a genuine NAT rebind would. Since
+    /// the two are indistinguishable from the wire alone, the live mapping is
+    /// never repointed by it; only the mapping's own expiry (the old pinhole
+    /// going silent) frees the slot for a new source.
     pub fn readvertise(
         &mut self,
         key: NodeKey,
@@ -376,13 +395,21 @@ impl AdvertBook {
         nonce: u64,
         now: u64,
     ) -> Admission {
-        let stale = matches!(
-            self.latest.get(&key),
-            Some(prev) if nonce <= prev.nonce && !self.expired(prev, now)
-        );
+        let live = self
+            .latest
+            .get(&key)
+            .filter(|prev| !self.expired(prev, now));
+        let stale = matches!(live, Some(prev) if nonce <= prev.nonce);
         if stale {
             return Admission {
                 outcome: AdvertOutcome::Stale,
+                event: None,
+            };
+        }
+        let source_mismatch = matches!(live, Some(prev) if prev.reflexive != src);
+        if source_mismatch {
+            return Admission {
+                outcome: AdvertOutcome::SourceMismatch,
                 event: None,
             };
         }
@@ -457,13 +484,15 @@ mod tests {
         book.observe(key, addr(1, 4000), 0); // boot: nonce 0
         assert_eq!(book.current(key, 0), Some(addr(1, 4000)));
 
-        // A rebind advertises the NEW reflexive under a strictly-higher nonce:
-        // it supersedes the stale mapping.
+        // A same-source keepalive under a strictly-higher nonce supersedes the
+        // baseline. (A cross-source rebind against this still-live mapping is
+        // exercised separately by the source-mismatch tests below — it is
+        // refused, not applied.)
         assert_eq!(
-            book.readvertise(key, addr(2, 5000), 1, 0),
+            book.readvertise(key, addr(1, 4000), 1, 0),
             AdvertOutcome::Superseded
         );
-        assert_eq!(book.current(key, 0), Some(addr(2, 5000)));
+        assert_eq!(book.current(key, 0), Some(addr(1, 4000)));
     }
 
     #[test]
@@ -472,12 +501,13 @@ mod tests {
         let mut book = AdvertBook::default();
         book.observe(key, addr(1, 4000), 0); // nonce 0
         assert_eq!(
-            book.readvertise(key, addr(2, 5000), 2, 0),
+            book.readvertise(key, addr(1, 4000), 2, 0),
             AdvertOutcome::Superseded
         );
 
         // A replayed / equal-nonce advert must not clobber the fresher mapping
-        // (mirrors StaleDuplicateAdvertisement: nonce <= prev).
+        // (mirrors StaleDuplicateAdvertisement: nonce <= prev). Sent from a
+        // different source too, to show staleness is checked BEFORE source.
         assert_eq!(
             book.readvertise(key, addr(9, 9999), 2, 0),
             AdvertOutcome::Stale
@@ -488,7 +518,7 @@ mod tests {
         );
         assert_eq!(
             book.current(key, 0),
-            Some(addr(2, 5000)),
+            Some(addr(1, 4000)),
             "stale adverts leave state untouched"
         );
     }
@@ -499,7 +529,7 @@ mod tests {
         let mut book = AdvertBook::default();
         book.observe(key, addr(1, 4000), 0); // boot: nonce 0
         assert_eq!(
-            book.readvertise(key, addr(2, 5000), 1, 0),
+            book.readvertise(key, addr(1, 4000), 1, 0),
             AdvertOutcome::Superseded
         );
 
@@ -508,7 +538,7 @@ mod tests {
         book.observe(key, addr(1, 4000), 0);
         assert_eq!(
             book.current(key, 0),
-            Some(addr(2, 5000)),
+            Some(addr(1, 4000)),
             "a stale nonce-0 register cannot clobber a rebind re-advertisement"
         );
     }
@@ -564,13 +594,43 @@ mod tests {
             Some(victim_src),
             "the replayed register cannot hijack the victim's reflexive mapping"
         );
-        // The victim's own keepalive readvertise (strictly-higher nonce) still
-        // works normally afterward — a genuine rebind is unaffected.
+        // The victim's own keepalive readvertise (strictly-higher nonce, SAME
+        // source) still works normally afterward.
         assert_eq!(
-            book.readvertise(victim, addr(1, 5000), 1_011, 1_020),
+            book.readvertise(victim, victim_src, 1_011, 1_020),
             AdvertOutcome::Superseded
         );
-        assert_eq!(book.current(victim, 1_020), Some(addr(1, 5000)));
+        assert_eq!(book.current(victim, 1_020), Some(victim_src));
+    }
+
+    #[test]
+    fn replayed_readvertise_from_another_source_cannot_hijack_a_live_mapping() {
+        // The same H3 shape as the register-hijack, on the keepalive path: an
+        // on-path attacker captures V's Readvertise (whose nonce is now
+        // strictly higher than the stored one) and replays the identical
+        // datagram from its own socket. `readvertise`'s nonce check alone
+        // would accept it (nonce > prev.nonce), so the different-source guard
+        // must catch it before `insert_fresh` ever runs.
+        let victim = NodeKey([0x88; 32]);
+        let victim_src = addr(1, 4000);
+        let attacker_src = addr(9, 6666);
+        let mut book = AdvertBook::with_ttl(120);
+        book.observe(victim, victim_src, 1_000);
+        assert_eq!(
+            book.readvertise(victim, attacker_src, 1, 1_010),
+            AdvertOutcome::SourceMismatch,
+            "a replayed keepalive from a different source is refused, not applied"
+        );
+        assert_eq!(
+            book.current(victim, 1_010),
+            Some(victim_src),
+            "the replayed keepalive cannot hijack the victim's reflexive mapping"
+        );
+        // The victim's own next keepalive, from its own source, still works.
+        assert_eq!(
+            book.readvertise(victim, victim_src, 2, 1_020),
+            AdvertOutcome::Superseded
+        );
     }
 
     #[test]
@@ -619,13 +679,13 @@ mod tests {
         let mut kept = [0u8; 32];
         kept[..8].copy_from_slice(&7u64.to_le_bytes());
         assert_eq!(
-            book.readvertise(NodeKey(kept), addr(2, 5000), 9, 0),
+            book.readvertise(NodeKey(kept), scattered_addr(7), 9, 0),
             AdvertOutcome::Superseded
         );
         // one more spray key stays at the cap and does not evict the established one.
         book.observe(NodeKey([0xff; 32]), addr(3, 6000), 0);
         assert_eq!(book.latest.len(), MAX_ADVERTS);
-        assert_eq!(book.current(NodeKey(kept), 0), Some(addr(2, 5000)));
+        assert_eq!(book.current(NodeKey(kept), 0), Some(scattered_addr(7)));
     }
 
     #[test]
@@ -777,7 +837,7 @@ mod tests {
         let mut dead = [0u8; 32];
         dead[..8].copy_from_slice(&3u64.to_le_bytes());
         assert_eq!(
-            book.readvertise(NodeKey(dead), addr(1, 4000), 11, 500),
+            book.readvertise(NodeKey(dead), scattered_addr(3), 11, 500),
             AdvertOutcome::Superseded
         );
         // A fresh key at the cap must evict the EXPIRED entry, not a live one.
@@ -910,29 +970,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_readvertise_migrating_to_an_at_cap_source_is_refused() {
-        // A key LIVE at one source that re-advertises to a DIFFERENT source
-        // must still be checked against the destination's cap — moving is
-        // just as much an admission at the new IP as a first-seen key.
-        let mut book = AdvertBook::with_ttl(120);
-        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
-            book.observe(source_key(i), addr(200, 4000 + i as u16), 1_000);
-        }
-        let member = NodeKey([0x42; 32]);
-        book.observe(member, addr(1, 4000), 1_000);
-        assert_eq!(
-            book.readvertise(member, addr(200, 9999), 1, 1_010),
-            AdvertOutcome::Refused,
-            "migrating to an at-cap source is refused"
-        );
-        assert_eq!(
-            book.current(member, 1_010),
-            Some(addr(1, 4000)),
-            "a refused migration leaves the old live mapping untouched"
-        );
-    }
-
     /// One of `MAX_ADVERTS_PER_SOURCE_IP + 1` distinct addresses inside the
     /// SAME routed /64 (`2001:db8::/64`) — the shape of one IPv6 host
     /// spraying keys from addresses it alone controls, no botnet needed.
@@ -964,5 +1001,41 @@ mod tests {
                 "the /64's own established keys are untouched"
             );
         }
+    }
+
+    #[test]
+    fn a_readvertise_migrating_to_an_at_cap_source_is_refused() {
+        // A key whose mapping has EXPIRED — the live different-source guard
+        // only protects a LIVE mapping, so an expired one still reaches
+        // `insert_fresh` — that re-advertises to a DIFFERENT source must
+        // still be checked against the destination's cap — moving is just as
+        // much an admission at the new IP as a first-seen key.
+        let mut book = AdvertBook::with_ttl(120);
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            book.observe(source_key(i), addr(200, 4000 + i as u16), 0);
+        }
+        let member = NodeKey([0x42; 32]);
+        book.observe(member, addr(1, 4000), 0);
+        // Keep the capped source's eight entries alive while `member`'s own
+        // mapping (last touched at t=0) ages past its ttl.
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            book.readvertise(source_key(i), addr(200, 4000 + i as u16), 1, 50);
+        }
+        let past_ttl = 121;
+        assert_eq!(
+            book.current(member, past_ttl),
+            None,
+            "member's own mapping has expired"
+        );
+        assert_eq!(
+            book.readvertise(member, addr(200, 9999), 1, past_ttl),
+            AdvertOutcome::Refused,
+            "migrating an expired mapping to an at-cap source is refused"
+        );
+        assert_eq!(
+            book.current(member, past_ttl),
+            None,
+            "a refused migration leaves the expired mapping as it was"
+        );
     }
 }
