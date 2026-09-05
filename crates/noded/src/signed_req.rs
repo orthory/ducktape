@@ -39,23 +39,36 @@
 //! present what `/v1/admin/*` already asks of a local daemon
 //! ([`crate::admin::ADMIN_TOKEN_HEADER`]): this boot's 0600 workspace secret,
 //! from a loopback peer. "can read the node's own workspace", never "can dial
-//! the port" — and a sandbox guest, which reaches this listener through a vsock
-//! tunnel with no workspace, holds neither credential and so writes nothing.
+//! the port" — a sandbox guest, which reaches this listener through a vsock
+//! tunnel with no workspace, cannot read it.
 //!
-//! EITHER admits a mutating request; nothing else does. which one was presented
-//! decides the ACTING identity, and that is the whole of the difference: a
+//! ## TWO layers, because a PoP is not a credential
+//!
+//! a PoP proves POSSESSION of the key named in the headers and nothing else:
+//! there is no ACL read here, so ANY well-formed key may act — a caller with no
+//! standing anywhere mints a keypair and signs. that is the right bar for a
+//! MODULE-BOUND mutation, where the verified key becomes the op's
+//! `Origin::External` ([`SignedBy`]) and the module's own `check_authority`
+//! decides; it is the same bar `/v1/submit/frame` sets.
+//!
+//! it is NOT a bar at all for a mutation that changes the NODE — minting a
+//! mesh invite, retuning the process-wide log filter, spawning a host pty,
+//! deleting a managed checkout dir. those handlers read no acting identity,
+//! so "any well-formed key" is "anyone who can dial the port", the sandbox
+//! guest's tunnelled loopback included. so [`Lane::authority`] classifies every
+//! mutating route, and a [`Authority::Operator`] one admits only:
+//!
+//! - the operator credential above, or
+//! - a PoP by the key this node knows as its operator's
+//!   ([`crate::AdminConfig::owner_key`] — the active wallet key read from this
+//!   host's keystore at boot, which is what `ducktape node log-filter` signs
+//!   with). no wallet on the host = no such key = the token is the only way in.
+//!
+//! nothing else. which credential was presented decides the ACTING identity: a
 //! signature acts as its key, the operator credential acts as the node.
 //!
-//! ## what this gate proves, and what it does not
-//!
-//! it proves POSSESSION of the key named in the headers, and hands the
-//! verified key to the handler as [`SignedBy`] — the acting identity is the
-//! caller's key, never the node's. it does NOT decide membership: there is no
-//! ACL read here, so any well-formed key may act. that is the same bar
-//! `/v1/submit/frame` sets (a frame's signer is whoever signed it), and
-//! authorization per module stays the modules' job.
-//!
-//! ponytail: possession, not membership; 30s replay window; TLS is the op's job.
+//! ponytail: possession per module, operator-key equality for the node's own
+//! mutations; 30s replay window; TLS is the op's job.
 
 use axum::Json;
 use axum::extract::State;
@@ -284,17 +297,41 @@ enum Lane {
     Files,
     /// `/v1/term/sessions…` — create and close a node-hosted pty.
     Term,
-    /// a fixed mutating path ([`SIGNED_POSTS`]).
-    Fixed,
+    /// `/v1/submit` — the frameless op lane ([`SUBMIT_PATH`]).
+    Submit,
+    /// a fixed path that mutates the NODE ([`NODE_LEVEL_POSTS`]).
+    NodeLevel,
     Open,
 }
 
-/// the exact mutating POST paths that are not a path family. an ALLOWLIST, not
-/// "every POST": `/v1/query`, `/v1/index/{m}/view` and `/v1/gateway/proxy` are
-/// POSTs that read, and `/v1/submit/frame` carries its own signature inside the
-/// frame (it is a longer path than `/v1/submit`, so the exact match leaves it
-/// open).
-const SIGNED_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite", "/v1/submit"];
+/// what a mutating request has to PROVE on its lane — the ONE thing that splits
+/// the module-bound routes from the node's own.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Authority {
+    /// possession of ANY key. the verified key rides on as [`SignedBy`], the
+    /// handler submits under it, and the module's `check_authority` is what
+    /// actually decides — so an unknown key gets a refusal from the module, not
+    /// from this gate.
+    Acting,
+    /// this node's OPERATOR. the handler reads no acting identity, so there is
+    /// no second decider downstream and possession proves nothing: only the
+    /// operator credential, or a PoP by [`crate::AdminConfig::owner_key`], gets
+    /// through.
+    Operator,
+}
+
+/// the exact mutating POST paths that mutate the NODE rather than module state:
+/// `/v1/log-filter` retunes this process's tracing filter (a `trace` fills the
+/// operator's disk through `daemon.log`) and `/v1/invite` mints a bearer right
+/// to join this mesh for up to a year. neither handler reads [`SignedBy`],
+/// which is exactly why neither may be admitted on possession alone.
+const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite"];
+
+/// the frameless op lane. an EXACT match, not a prefix: `/v1/submit/frame`
+/// carries its own signature inside the frame and stays open, and the other
+/// POSTs that read (`/v1/query`, `/v1/index/{m}/view`, `/v1/gateway/proxy`) are
+/// in neither table.
+const SUBMIT_PATH: &str = "/v1/submit";
 
 const WORKSPACE_PREFIX: &str = "/v1/fs/workspaces";
 const OBJECT_PREFIX: &str = "/v1/files/object/";
@@ -317,25 +354,36 @@ fn lane_of(path: &str) -> Lane {
     {
         return *lane;
     }
-    match SIGNED_POSTS.contains(&path) {
-        true => Lane::Fixed,
+    if NODE_LEVEL_POSTS.contains(&path) {
+        return Lane::NodeLevel;
+    }
+    match path == SUBMIT_PATH {
+        true => Lane::Submit,
         false => Lane::Open,
     }
 }
 
 impl Lane {
-    /// does this method MUTATE on this lane? one discriminant, one match — a
-    /// new route that mutates is added to [`lane_of`]'s table, never to a
-    /// scattered `if` at a call site.
-    fn mutates(self, method: &Method) -> bool {
+    /// does this method MUTATE on this lane, and what must it prove? `None` is
+    /// a read. one discriminant, one match — a new route that mutates is added
+    /// to [`lane_of`]'s table and classified HERE, never at a call site.
+    fn authority(self, method: &Method) -> Option<Authority> {
         let posts = *method == Method::POST;
         let removes = *method == Method::DELETE;
         let replaces = *method == Method::PUT;
         match self {
-            Lane::Workspace => posts || removes,
-            Lane::Object => replaces || removes,
-            Lane::Files | Lane::Term | Lane::Fixed => posts,
-            Lane::Open => false,
+            // POST creates and commits a managed checkout AS the acting key
+            // (`workspaces::acting_origin` → the duckfs authority check).
+            // DELETE `remove_dir_all`s the dir and reads no identity at all, so
+            // possession would let any caller wipe another run's checkout.
+            Lane::Workspace => posts
+                .then_some(Authority::Acting)
+                .or(removes.then_some(Authority::Operator)),
+            Lane::Object => (replaces || removes).then_some(Authority::Acting),
+            Lane::Files | Lane::Submit => posts.then_some(Authority::Acting),
+            // a pty/microVM on the HOST, and the two fixed node mutations.
+            Lane::Term | Lane::NodeLevel => posts.then_some(Authority::Operator),
+            Lane::Open => None,
         }
     }
 
@@ -358,17 +406,19 @@ impl Lane {
             // json bodies and the log-filter string. `Open` never reaches here
             // (the guard returns before asking), and takes the small cap so a
             // table that ever disagreed fails closed rather than wide.
-            Lane::Workspace | Lane::Term | Lane::Fixed | Lane::Open => DEFAULT_JSON_BODY_BYTES,
+            Lane::Workspace | Lane::Term | Lane::Submit | Lane::NodeLevel | Lane::Open => {
+                DEFAULT_JSON_BODY_BYTES
+            }
         }
     }
 }
 
-/// does this request mutate, and therefore need a credential? the guard itself
-/// asks [`Lane::mutates`] on the lane it already resolved, so this pairing of
+/// what this request must prove, or `None` if it is a read. the guard itself
+/// asks [`Lane::authority`] on the lane it already resolved, so this pairing of
 /// the two is only ever what the tests below assert against.
 #[cfg(test)]
-fn needs_signature(method: &Method, path: &str) -> bool {
-    lane_of(path).mutates(method)
+fn required_authority(method: &Method, path: &str) -> Option<Authority> {
+    lane_of(path).authority(method)
 }
 
 /// the plane a refusal is logged on. a files/duckfs mutation belongs to
@@ -401,6 +451,9 @@ pub enum WriteRefusal {
     SignatureMalformed,
     /// a well-formed signature that does not bind this request.
     SignatureInvalid,
+    /// a VALID signature, by a key this node does not know as its operator's,
+    /// on a route that changes the node rather than module state.
+    NotOperator,
     /// the body is larger than any gated route accepts (or its stream broke).
     BodyOverCap,
 }
@@ -413,18 +466,22 @@ impl WriteRefusal {
             Self::SignatureStale => "signature_stale",
             Self::SignatureMalformed => "signature_malformed",
             Self::SignatureInvalid => "signature_invalid",
+            Self::NotOperator => "not_operator",
             Self::BodyOverCap => "body_over_cap",
         }
     }
 
-    /// 401 for "you presented nothing usable"; 413 for a body this gate could
-    /// not read to hash.
+    /// 401 for "you presented nothing usable"; 403 for a credential that IS
+    /// usable and is not the one this route wants — retrying with a fresher
+    /// signature would not help, so it must not read as 401; 413 for a body
+    /// this gate could not read to hash.
     pub fn status(self) -> StatusCode {
         match self {
             Self::SignatureMissing
             | Self::SignatureStale
             | Self::SignatureMalformed
             | Self::SignatureInvalid => StatusCode::UNAUTHORIZED,
+            Self::NotOperator => StatusCode::FORBIDDEN,
             Self::BodyOverCap => StatusCode::PAYLOAD_TOO_LARGE,
         }
     }
@@ -439,6 +496,10 @@ impl WriteRefusal {
             Self::SignatureMalformed => "the request key or signature is not a valid ed25519 value",
             Self::SignatureInvalid => {
                 "the signature does not bind this method, path, node, timestamp and body"
+            }
+            Self::NotOperator => {
+                "this route changes the node itself, so it requires this node's operator \
+                 credential or a signature by its operator key"
             }
             Self::BodyOverCap => "the request body is larger than this node accepts",
         }
@@ -467,6 +528,20 @@ pub(crate) fn operator_credential_matches(
     on_box && crate::services::token_matches(offered, expected)
 }
 
+/// is this verified acting key the OPERATOR's? the one thing a node knows about
+/// who holds it: [`crate::AdminConfig::owner_key`] — the active wallet key read
+/// out of this host's keystore at boot (`bin/node`'s `operator_wallet_key`),
+/// which is the same key `ducktape node log-filter` signs its request with.
+///
+/// a node with no wallet on its host carries no such key and admits NOBODY
+/// here: the operator credential stays the only way past an
+/// [`Authority::Operator`] route, which is the closed direction to fail in.
+/// public keys, so an ordinary comparison — there is no secret to leak a
+/// timing on.
+pub(crate) fn operator_key_matches(cfg: &crate::AdminConfig, acting: &[u8]) -> bool {
+    cfg.owner_key.as_deref() == Some(acting)
+}
+
 /// the ONE gate over every mutating `/v1` route: decide, then run or refuse.
 /// an open (read) route is passed straight through, body untouched.
 pub(crate) async fn signed_write_guard(
@@ -487,9 +562,9 @@ pub(crate) async fn signed_write_guard(
         req.extensions_mut().insert(OperatorCredential);
     }
     let lane = lane_of(&path);
-    if !lane.mutates(&method) {
+    let Some(authority) = lane.authority(&method) else {
         return next.run(req).await;
-    }
+    };
     // admitted without touching the body: nothing is signed over it on this
     // path, so a whole packfile or a 4 MiB blob still streams to its handler
     // instead of buffering in middleware.
@@ -523,6 +598,16 @@ pub(crate) async fn signed_write_guard(
         Err(PopError::BadKey) => return refuse(&path, WriteRefusal::SignatureMalformed),
         Err(PopError::BadSig) => return refuse(&path, WriteRefusal::SignatureInvalid),
     };
+    // possession is the WHOLE proof on an `Acting` lane, because the module
+    // downstream reads the key and decides. a node-level handler reads nothing,
+    // so the key itself has to be one this node recognises.
+    let admitted = match authority {
+        Authority::Acting => true,
+        Authority::Operator => operator_key_matches(&handle.admin, &acting),
+    };
+    if !admitted {
+        return refuse(&path, WriteRefusal::NotOperator);
+    }
     let mut req = axum::extract::Request::from_parts(parts, axum::body::Body::from(body));
     req.extensions_mut().insert(SignedBy(acting));
     next.run(req).await
@@ -546,14 +631,14 @@ fn refuse(path: &str, refusal: WriteRefusal) -> Response {
                 reason = refusal.reason(),
                 status = refusal.status().as_u16(),
                 occurrences,
-                "mutating request refused: unsigned"
+                "mutating request refused"
             ),
             Plane::Node => tracing::warn!(
                 target: "ducktape::node",
                 reason = refusal.reason(),
                 status = refusal.status().as_u16(),
                 occurrences,
-                "mutating request refused: unsigned"
+                "mutating request refused"
             ),
         }
     }
@@ -747,34 +832,57 @@ mod tests {
         );
     }
 
-    /// the whole table, in one place: every mutating `/v1` route, and the reads
-    /// that must not be dragged in with them. the pairs that matter most are the
-    /// ones that share a path with their own read — `/v1/files/blob` (POST
-    /// writes, GET fetches), the object facade (PUT/DELETE write, GET reads) and
-    /// `/v1/submit` vs `/v1/submit/frame`.
+    /// the whole table, in one place: every mutating `/v1` route WITH the
+    /// authority it demands, and the reads that must not be dragged in with
+    /// them. the pairs that matter most are the ones that share a path with
+    /// their own read — `/v1/files/blob` (POST writes, GET fetches), the object
+    /// facade (PUT/DELETE write, GET reads) and `/v1/submit` vs
+    /// `/v1/submit/frame` — and the DELETE that shares its prefix with two
+    /// module-bound POSTs on the workspace lane.
     #[test]
     fn the_gate_covers_every_mutating_route() {
-        let gated: &[(Method, &str)] = &[
-            (Method::POST, "/v1/log-filter"),
-            (Method::POST, "/v1/invite"),
-            (Method::POST, "/v1/submit"),
-            (Method::POST, "/v1/fs/workspaces"),
-            (Method::POST, "/v1/fs/workspaces/abc/commit"),
-            (Method::DELETE, "/v1/fs/workspaces/abc"),
-            (Method::POST, "/v1/files/blob"),
-            (Method::POST, "/v1/files/stage"),
-            (Method::POST, "/v1/files/commit"),
-            (Method::POST, "/v1/files/pin"),
-            (Method::POST, "/v1/files/watch"),
-            (Method::PUT, "/v1/files/object/shared/a.txt"),
-            (Method::DELETE, "/v1/files/object/shared/a.txt"),
-            (Method::POST, "/v1/term/sessions"),
-            (Method::POST, "/v1/term/sessions/abc/close"),
+        let gated: &[(Method, &str, Authority)] = &[
+            // module-bound: the acting key rides on as `SignedBy` and the
+            // module decides.
+            (Method::POST, "/v1/submit", Authority::Acting),
+            (Method::POST, "/v1/fs/workspaces", Authority::Acting),
+            (
+                Method::POST,
+                "/v1/fs/workspaces/abc/commit",
+                Authority::Acting,
+            ),
+            (Method::POST, "/v1/files/blob", Authority::Acting),
+            (Method::POST, "/v1/files/stage", Authority::Acting),
+            (Method::POST, "/v1/files/commit", Authority::Acting),
+            (Method::POST, "/v1/files/pin", Authority::Acting),
+            (Method::POST, "/v1/files/watch", Authority::Acting),
+            (
+                Method::PUT,
+                "/v1/files/object/shared/a.txt",
+                Authority::Acting,
+            ),
+            (
+                Method::DELETE,
+                "/v1/files/object/shared/a.txt",
+                Authority::Acting,
+            ),
+            // node-level: the handler reads no identity, so possession of a
+            // self-chosen key must not be enough.
+            (Method::POST, "/v1/log-filter", Authority::Operator),
+            (Method::POST, "/v1/invite", Authority::Operator),
+            (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Operator),
+            (Method::POST, "/v1/term/sessions", Authority::Operator),
+            (
+                Method::POST,
+                "/v1/term/sessions/abc/close",
+                Authority::Operator,
+            ),
         ];
-        for (method, path) in gated {
-            assert!(
-                needs_signature(method, path),
-                "{method} {path} must be gated"
+        for (method, path, wanted) in gated {
+            assert_eq!(
+                required_authority(method, path),
+                Some(*wanted),
+                "{method} {path} is classified wrong"
             );
         }
         let open: &[(Method, &str)] = &[
@@ -794,11 +902,34 @@ mod tests {
             (Method::POST, "/forge/lab/git-receive-pack"),
         ];
         for (method, path) in open {
-            assert!(
-                !needs_signature(method, path),
+            assert_eq!(
+                required_authority(method, path),
+                None,
                 "{method} {path} must stay open"
             );
         }
+    }
+
+    /// the operator key is an EQUALITY against what the node was configured
+    /// with — not "a well-formed key", which is the bug this layer exists for.
+    /// a node that knows no operator key admits nobody by signature.
+    #[test]
+    fn only_the_configured_operator_key_matches() {
+        let operator = key(11);
+        let stranger = key(12);
+        let cfg = crate::AdminConfig {
+            owner_key: Some(operator.public_key().as_ref().to_vec()),
+            ..Default::default()
+        };
+        assert!(operator_key_matches(&cfg, operator.public_key().as_ref()));
+        assert!(!operator_key_matches(&cfg, stranger.public_key().as_ref()));
+        assert!(!operator_key_matches(&cfg, &[]));
+
+        let no_wallet = crate::AdminConfig::default();
+        assert!(!operator_key_matches(
+            &no_wallet,
+            operator.public_key().as_ref()
+        ));
     }
 
     /// the hashing cap is reached by an UNAUTHENTICATED caller, so no lane may
@@ -807,7 +938,10 @@ mod tests {
     #[test]
     fn no_lane_buffers_more_than_its_own_route_accepts() {
         let cap = |path: &str| lane_of(path).max_body();
-        assert_eq!(cap("/v1/files/object/shared/a.bin"), crate::MAX_OBJECT_BYTES);
+        assert_eq!(
+            cap("/v1/files/object/shared/a.bin"),
+            crate::MAX_OBJECT_BYTES
+        );
         assert_eq!(cap("/v1/files/stage"), crate::MAX_BLOB_BODY_BYTES);
         assert_eq!(cap("/v1/submit"), DEFAULT_JSON_BODY_BYTES);
         assert_eq!(cap("/v1/fs/workspaces"), DEFAULT_JSON_BODY_BYTES);
@@ -822,6 +956,7 @@ mod tests {
             WriteRefusal::SignatureStale,
             WriteRefusal::SignatureMalformed,
             WriteRefusal::SignatureInvalid,
+            WriteRefusal::NotOperator,
             WriteRefusal::BodyOverCap,
         ];
         let mut reasons: Vec<&str> = all.iter().map(|r| r.reason()).collect();

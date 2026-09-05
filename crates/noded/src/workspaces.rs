@@ -220,6 +220,11 @@ pub(crate) async fn commit_workspace(
 
 /// DELETE /v1/fs/workspaces/{id} — remove the managed checkout dir. idempotent:
 /// deleting an already-gone workspace is still `{ok:true}`.
+///
+/// AUTH: node-level (`signed_req`, `Authority::Operator`), unlike the
+/// create and commit above. It takes no acting identity and `remove_dir_all`s
+/// any valid-slug dir under the managed root, so a key that proved only
+/// possession would be able to wipe another run's checkout.
 pub(crate) async fn delete_workspace(
     State(handle): State<NodeHandle>,
     Path(id): Path<String>,

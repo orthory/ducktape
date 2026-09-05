@@ -392,6 +392,128 @@ async fn an_operator_credentialed_push_is_admitted() {
     );
 }
 
+/// THE NODE-LEVEL ROUTES, one per credential. `signed_write_guard` proves
+/// possession of a SELF-CHOSEN key, which is the right bar only where the key
+/// rides on to a module's `check_authority`. These four handlers read no acting
+/// identity at all — they mint a year-long mesh invite, retune the process's
+/// tracing filter, spawn a host pty, and `remove_dir_all` a managed checkout —
+/// so a fresh keypair must buy nothing on any of them.
+///
+/// The admitted half is the other half of the contract: the operator token and
+/// the node's configured operator key BOTH still work, which is what keeps
+/// `ducktape node log-filter` (the active wallet key) and the app's invite
+/// mint (the token) alive. A route that has nothing wired answers 503/400/204
+/// past the gate — the assertion is only that the gate did not stop it.
+#[tokio::test]
+async fn a_node_level_route_refuses_a_self_minted_key_and_admits_the_operator() {
+    // the operator's own wallet key, as `bin/node`'s `operator_wallet_key`
+    // reads it out of this host's keystore at boot.
+    let operator_key = commonware_cryptography::ed25519::PrivateKey::from_seed(4242);
+    let node = || {
+        let (handle, cmd_rx, events) = NodeHandle::channel();
+        let handle = handle.with_admin(AdminConfig {
+            operator_token: Some(OPERATOR.to_string()),
+            owner_key: Some(operator_key.public_key().as_ref().to_vec()),
+            ..Default::default()
+        });
+        (handle, cmd_rx, events)
+    };
+    let sign_as = |signer: &commonware_cryptography::ed25519::PrivateKey,
+                   method: &str,
+                   uri: &str,
+                   bytes: Vec<u8>| {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in noded::signed_req::request_headers(signer, method, uri, &[], &bytes) {
+            req = req.header(name, value);
+        }
+        req.body(Body::from(bytes)).unwrap()
+    };
+
+    for (method, uri, body) in [
+        ("POST", "/v1/invite", r#"{"ttl_days":365}"#),
+        ("POST", "/v1/log-filter", "info"),
+        (
+            "POST",
+            "/v1/term/sessions",
+            r#"{"agent":"echo","mode":"single"}"#,
+        ),
+        ("POST", "/v1/term/sessions/abc/close", ""),
+        ("DELETE", "/v1/fs/workspaces/abc", ""),
+    ] {
+        // a key nobody knows, signed correctly. the whole vector.
+        let (handle, _cmds, _events) = node();
+        let response = noded::router(handle)
+            .oneshot(sign_as(&caller(), method, uri, body.as_bytes().to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {uri} must refuse a self-minted key"
+        );
+        assert_eq!(body_json(response).await["reason"], "not_operator");
+
+        // the operator's key, which the node was told about.
+        let (handle, _cmds, _events) = node();
+        let response = noded::router(handle)
+            .oneshot(sign_as(
+                &operator_key,
+                method,
+                uri,
+                body.as_bytes().to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            response.status() != StatusCode::FORBIDDEN
+                && response.status() != StatusCode::UNAUTHORIZED,
+            "{method} {uri} must admit the operator key, got {}",
+            response.status()
+        );
+
+        // ...and the operator credential from a loopback peer.
+        let (handle, _cmds, _events) = node();
+        let request = with_operator(with_peer(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+            "127.0.0.1:40000",
+        ));
+        let response = noded::router(handle).oneshot(request).await.unwrap();
+        assert!(
+            response.status() != StatusCode::FORBIDDEN
+                && response.status() != StatusCode::UNAUTHORIZED,
+            "{method} {uri} must admit the operator credential, got {}",
+            response.status()
+        );
+    }
+}
+
+/// the OTHER half of the split: a module-bound route still takes any acting
+/// key, because the key becomes the op's origin and the module decides. A node
+/// that tightened these too would break every duckfs client.
+#[tokio::test]
+async fn a_module_bound_route_still_admits_any_acting_key() {
+    let (handle, _cmds, _events) = local_node();
+    let response = noded::router(handle)
+        .oneshot(signed(
+            "POST",
+            "/v1/fs/workspaces",
+            serde_json::json!({ "prefix": "/shared/x" }),
+        ))
+        .await
+        .unwrap();
+    // no workspace root wired → 503, which is PAST the gate. the point is that
+    // an unknown key was not refused.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
 /// a signature that does not bind THIS body is not a signature for THIS
 /// request: the gate hashes the body precisely so an authenticated caller's
 /// bytes cannot be swapped in flight.
