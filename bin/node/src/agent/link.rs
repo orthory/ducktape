@@ -56,6 +56,7 @@ pub(crate) async fn attach(
     // neither hides behind the other's silence.
     let mut failures: u64 = 0;
     let mut refusals: u64 = 0;
+    let mut token_unreadable: u64 = 0;
     loop {
         match tokio_tungstenite::connect_async(&ws_url).await {
             Ok((socket, _)) => {
@@ -81,10 +82,12 @@ pub(crate) async fn attach(
                     // dials at connect latency — a port-eating storm.
                     LinkEnd::Closed => {
                         refusals = 0;
+                        token_unreadable = 0;
                         tokio::time::sleep(REDIAL).await;
                     }
                     LinkEnd::Refused(detail) => {
                         refusals += 1;
+                        token_unreadable = 0;
                         if worth_logging(refusals) {
                             tracing::error!(
                                 target: "ducktape::service",
@@ -92,6 +95,26 @@ pub(crate) async fn attach(
                                 reason = "link_refused",
                                 %detail,
                                 "the node refused this agent daemon's link"
+                            );
+                        }
+                        tokio::time::sleep(REDIAL).await;
+                    }
+                    // the dial succeeded, so this is a LOCAL misconfiguration
+                    // (wrong workspace dir, wrong-user permissions on a 0600
+                    // token) on an otherwise healthy node — self-healing on an
+                    // operator fix, never on a fresh socket. Latched exactly
+                    // like the other two forever-retry paths: `warn`, not
+                    // `error` (the loop has not given up, it keeps redialing),
+                    // attempt 1 then every Nth, carrying `attempts`.
+                    LinkEnd::TokenUnreadable(detail) => {
+                        token_unreadable += 1;
+                        if worth_logging(token_unreadable) {
+                            tracing::warn!(
+                                target: "ducktape::service",
+                                attempts = token_unreadable,
+                                reason = "link_token_unreadable",
+                                %detail,
+                                "the agent daemon cannot present its node's service-link token"
                             );
                         }
                         tokio::time::sleep(REDIAL).await;
@@ -123,6 +146,10 @@ enum LinkEnd {
     Closed,
     /// the node refused this daemon's claim, carrying its reason.
     Refused(String),
+    /// this daemon could not read its own service-link token — a local
+    /// misconfiguration (permissions, wrong workspace dir), never sent to the
+    /// node at all.
+    TokenUnreadable(String),
 }
 
 /// One connection's lifetime: claim the link, then commands in and events out
@@ -153,14 +180,9 @@ where
     // a daemon holding a stale one would be refused forever.
     let token = match noded::services::read_link_token(workspace) {
         Ok(token) => token,
-        Err(error) => {
-            tracing::error!(
-                target: "ducktape::service",
-                reason = "link_token_unreadable",
-                "the agent daemon cannot present its node's service-link token: {error}"
-            );
-            return LinkEnd::Closed;
-        }
+        // latched by the caller, which owns the forever-retry counters and
+        // pace — never logged here, or every redial would log twice.
+        Err(error) => return LinkEnd::TokenUnreadable(error.to_string()),
     };
     let claim = serde_json::json!({
         "op": "service_attach",
