@@ -49,7 +49,10 @@ pub trait Blobs: Send + Sync + 'static {
     fn put_chunk(&self, bytes: Vec<u8>) -> [u8; 32];
     /// the whole blob, or `None` on an honest miss.
     fn get_chunk(&self, digest: &[u8; 32]) -> Option<Vec<u8>>;
-    /// whether the store holds (and can verify) the blob.
+    /// whether the store holds the blob. a PRESENCE query, priced like one: a
+    /// memory lookup or a metadata stat, never a read. integrity lives on the
+    /// read path ([`Blobs::get_chunk`] re-hashes what it returns), and the
+    /// bytes were verified once already at publish time.
     fn has_chunk(&self, digest: &[u8; 32]) -> bool;
     /// the blob's total length without materializing it.
     fn chunk_len(&self, digest: &[u8; 32]) -> Option<u64>;
@@ -226,8 +229,15 @@ impl BlobStore {
         Some(buf)
     }
 
+    /// presence, at the price of a stat — the same cheap path
+    /// [`BlobStore::chunk_len`] takes. it used to answer through `disk_chunk`,
+    /// so asking whether a 1 GiB module is here read and re-hashed the whole
+    /// file under the store mutex, and answered a bool: every caller that only
+    /// wanted "do I already hold this" (the push admission, the code-readiness
+    /// probe, the fetch short-circuit) paid a full read per ask, and a peer
+    /// could bill the node for one by opening a stream.
     pub fn has_chunk(&self, digest: &[u8; 32]) -> bool {
-        self.chunks.contains_key(digest) || self.disk_chunk(digest).is_some()
+        self.chunk_len(digest).is_some()
     }
 
     /// drop a blob this node staged — out of the memory map, and off disk
@@ -257,6 +267,11 @@ impl BlobStore {
     /// the disk fallback: read `<root>/<hex>` and REVERIFY the content hash.
     /// content-addressed blobs are self-verifying — a corrupt or truncated
     /// file is treated as absent (with a warning), never served.
+    ///
+    /// the re-hash is deliberate and stays on the READ path only: it is what
+    /// makes bad bytes unservable, and it costs a pass over the whole blob, so
+    /// nothing that merely asks about a blob (presence, length, a range) may
+    /// route through here.
     fn disk_chunk(&self, digest: &[u8; 32]) -> Option<Vec<u8>> {
         let path = self.root.as_ref()?.join(hex(digest));
         let bytes = std::fs::read(&path).ok()?;
@@ -559,7 +574,6 @@ mod tests {
 
         let fresh = BlobHandle::persistent(root.path()).unwrap();
         assert_eq!(fresh.get_chunk(&digest), None);
-        assert!(!fresh.has_chunk(&digest));
 
         // re-putting the true bytes heals the file (the F1 remedy flow:
         // re-save the prompt from the app).
@@ -572,6 +586,31 @@ mod tests {
                 .as_deref(),
             Some(b"original".as_ref())
         );
+    }
+
+    /// presence and length must cost a stat, not a read. the fixture is a
+    /// published file truncated behind the store's back: `get_chunk` re-hashes
+    /// and must miss, so any presence answer that agrees with it has read the
+    /// bytes — and the length it reports is the file's, from metadata alone.
+    #[test]
+    fn presence_and_length_never_read_the_blob() {
+        let root = tempfile::tempdir().unwrap();
+        let digest = BlobHandle::persistent(root.path())
+            .unwrap()
+            .put_chunk(vec![3u8; 8192]);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.path().join(hex(&digest)))
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+
+        // a fresh store: cold memory, so every answer comes off disk.
+        let fresh = BlobHandle::persistent(root.path()).unwrap();
+        assert_eq!(fresh.chunk_len(&digest), Some(4096));
+        assert!(fresh.has_chunk(&digest), "presence re-hashed the file");
+        // the read path still refuses the bytes — that is where integrity lives.
+        assert_eq!(fresh.get_chunk(&digest), None);
     }
 
     #[test]
