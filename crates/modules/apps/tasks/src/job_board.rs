@@ -47,8 +47,8 @@ use sdk::{Ctx, Error, ModuleId, Msg, Origin, StagedStore};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, encode_job_event,
-    stage_record,
+    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, actor_from_origin,
+    encode_job_event, stage_record,
 };
 
 /// max bytes of a `job_id` (non-empty).
@@ -507,17 +507,4 @@ pub(crate) async fn query(staged: &StagedStore, q: JobsQuery) -> Result<JobsRepl
             decode_job(&bytes).map(|job| JobsReply::Job(Some(job)))
         }
     }
-}
-
-/// derive the acting identity from the dispatch origin -- the ONLY authorship
-/// path. an empty external origin (the pre-consensus `Origin::External(vec![])`
-/// default) is not an authenticated submitter and is rejected; the string form
-/// is the shared [`Origin::actor_string`] convention.
-fn actor_from_origin(origin: &Origin) -> Result<String, Error> {
-    if matches!(origin, Origin::External(bytes) if bytes.is_empty()) {
-        return Err(Error::Module(
-            "external origin must carry a non-empty submitter id".into(),
-        ));
-    }
-    Ok(origin.actor_string())
 }

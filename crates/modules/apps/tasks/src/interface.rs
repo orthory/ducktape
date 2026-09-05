@@ -4,7 +4,9 @@
 //!
 //! * the **task board** (assigned-list kind): ordered human task lists. writes
 //!   go via [`TaskMsg`]; reads via [`TaskQuery`] -> [`TaskReply`]. no claims,
-//!   no origin-derived identity -- a plain shared list.
+//!   but [`Task::owner`] IS origin-derived identity, the same convention the
+//!   job board uses for `submitter`/`worker`: `UpdateStatus` and `DeleteTask`
+//!   are gated to the task's owner.
 //! * the **job board** (first-claim kind): a consensus-native work board. a
 //!   submitter posts a job, any worker claims it, exactly one claim wins by
 //!   consensus order, the claimant processes off-platform and reports a result.
@@ -35,15 +37,32 @@ pub struct Task {
     pub id: String,
     pub title: String,
     pub status: TaskStatus,
+    /// origin-derived creator identity (a module id verbatim, `"ext:"` +
+    /// lowercase-hex external key, or `"system"` -- the shared
+    /// [`sdk::Origin::actor_string`] convention [`crate::Job::submitter`]
+    /// also uses). set by the module, never carried on the wire. the ONLY
+    /// account [`TaskMsg::UpdateStatus`] and [`TaskMsg::DeleteTask`] accept.
+    pub owner: String,
     pub created_at: u64,
     pub updated_at: u64,
 }
 
+/// write intents against the task board. `owner` is never carried here -- it
+/// is derived from the dispatch origin at create time, the job board's
+/// `submitter` convention.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskMsg {
+    /// create a task owned by the caller. refused once the caller already
+    /// owns [`crate::MAX_OPEN_TASKS_PER_OWNER`] tasks, or the board is at
+    /// [`crate::MAX_TASKS`].
     CreateTask { task_id: String, title: String },
+    /// move a task's status. gated to [`Task::owner`] -- anyone else's op
+    /// fails the block.
     UpdateStatus { task_id: String, status: TaskStatus },
+    /// remove a task's record entirely and free its board slot. gated to
+    /// [`Task::owner`], the board's only way to recede from [`crate::MAX_TASKS`].
+    DeleteTask { task_id: String },
 }
 
 /// the task board's reads. BOTH are bounded: `Get` is one record, `List` one
