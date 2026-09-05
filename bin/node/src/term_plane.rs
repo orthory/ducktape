@@ -1013,36 +1013,112 @@ fn input_session(event: &SessionInputEvent) -> &str {
 // guest side: the client half draining the SessionJob lane
 // ---------------------------------------------------------------------------
 
-/// drain the guest's remote-session lane: a `Create`/`Close` is one CONTROL
-/// round-trip, an `Input` rides a persistent per-host INPUT stream. When the
-/// host is THIS node it short-circuits over a local duplex / straight to the
-/// manager, so a single node still exercises the real frame path.
+/// how many jobs may queue for ONE host before that host's lane refuses. Same
+/// depth as the node-wide lane feeding this router.
+const HOST_LANE_DEPTH: usize = 32;
+
+/// latch for the refusals the router hands out when a host's own lane backs up.
+static WEDGED_WARN: noded::log::Latch = noded::log::Latch::new(100);
+
+/// route the guest's remote-session lane onto ONE lane per host peer.
+///
+/// The router itself never awaits a peer: it only hands a job to that host's
+/// worker and moves on. Every await that can park on a remote node — the
+/// CONTROL round-trip, the INPUT stream open — lives in [`host_loop`], one task
+/// per host, so a host that accepts a stream and never answers wedges nothing
+/// but its own sessions. A host whose lane is already full is REFUSED with a
+/// reason instead of queuing behind it; the alternative is the router blocking,
+/// which is the wedge itself.
+///
+/// A worker is spawned on the first job for its host and lives for the node's
+/// lifetime — bounded by the peer set, and a host peer is contacted again the
+/// moment anyone types into one of its sessions.
 async fn client_loop<T: DataPlaneTransport>(
     service: Arc<StreamService<T>>,
     control: Arc<ControlState>,
     mut jobs: tokio::sync::mpsc::Receiver<SessionJob>,
 ) {
-    let mut input_streams: HashMap<[u8; 32], Box<dyn AsyncWrite + Unpin + Send>> = HashMap::new();
+    let mut hosts: HashMap<[u8; 32], tokio::sync::mpsc::Sender<SessionJob>> = HashMap::new();
+    while let Some(job) = jobs.recv().await {
+        let host = job.host();
+        let sent = hosts
+            .entry(host)
+            .or_insert_with(|| {
+                let (lane, rx) = tokio::sync::mpsc::channel(HOST_LANE_DEPTH);
+                tokio::spawn(host_loop(
+                    Arc::clone(&service),
+                    Arc::clone(&control),
+                    host,
+                    rx,
+                ));
+                lane
+            })
+            .try_send(job);
+        match sent {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => refuse_wedged(host, job),
+            // only a panicked worker closes its lane; drop the entry so the next
+            // job for this host starts a fresh one.
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => {
+                hosts.remove(&host);
+                refuse_wedged(host, job);
+            }
+        }
+    }
+}
+
+/// refuse one job for a host whose lane is backed up, with a stable reason.
+fn refuse_wedged(host: [u8; 32], job: SessionJob) {
+    if let Some(occurrences) = WEDGED_WARN.hit("host_lane_full") {
+        tracing::warn!(
+            target: "ducktape::term",
+            reason = "host_lane_full",
+            node = %crate::config::hex_bytes(&host[..4]),
+            occurrences,
+            "remote session job refused"
+        );
+    }
+    // a Close or an Input is dropped — the host's own lifecycle backstops hold,
+    // and a keystroke has no reply to carry a reason on. A Create has a caller
+    // waiting, and it is told why rather than left to its 30 s deadline.
+    if let SessionJob::Create { reply, .. } = job {
+        let _ = reply.send(Err(
+            "host_lane_full: this host peer is not answering; its session lane is backed up".into(),
+        ));
+    }
+}
+
+/// drain ONE host's lane: a `Create`/`Close` is one CONTROL round-trip, an
+/// `Input` rides this host's persistent INPUT stream. When the host is THIS node
+/// it short-circuits over a local duplex / straight to the manager, so a single
+/// node still exercises the real frame path.
+async fn host_loop<T: DataPlaneTransport>(
+    service: Arc<StreamService<T>>,
+    control: Arc<ControlState>,
+    host: [u8; 32],
+    mut jobs: tokio::sync::mpsc::Receiver<SessionJob>,
+) {
+    let mut input_stream: Option<Box<dyn AsyncWrite + Unpin + Send>> = None;
     while let Some(job) = jobs.recv().await {
         match job {
             SessionJob::Create {
-                host,
                 provider,
                 cred,
                 cpu,
                 mem_gb,
                 reply,
+                ..
             } => {
                 let result =
                     client_create(&service, &control, host, provider, cred, cpu, mem_gb).await;
                 let _ = reply.send(result);
             }
-            SessionJob::Close { host, session } => {
-                input_streams.remove(&host);
+            SessionJob::Close { session, .. } => {
+                input_stream = None;
                 client_close(&service, &control, host, session).await;
             }
-            SessionJob::Input { host, event } => {
-                client_input(&service, &control, &mut input_streams, host, event).await;
+            SessionJob::Input { event, .. } => {
+                client_input(&service, &control, &mut input_stream, host, event).await;
             }
         }
     }
@@ -1090,9 +1166,33 @@ async fn client_close<T: DataPlaneTransport>(
     .await;
 }
 
-/// one CONTROL round-trip: loopback over a local duplex when the host is this
-/// node (the creator is us), else open a CONTROL stream to the host peer.
+/// one CONTROL round-trip, bounded by [`noded::CONTROL_DEADLINE`] — the same
+/// number the HTTP route answers 504 on.
+///
+/// The bound is the point: the host side deliberately has NO timeout (a cold
+/// image pull legitimately takes minutes), so without one here the guest parks
+/// forever on a reply its caller stopped waiting for. On expiry the stream is
+/// dropped, which is also how the host learns the guest is gone and reaps what
+/// it spawned — see [`serve_control`].
 async fn client_control<T: DataPlaneTransport>(
+    service: &Arc<StreamService<T>>,
+    control: &Arc<ControlState>,
+    host: [u8; 32],
+    request: SessionControlRequest,
+) -> Result<SessionControlReply, String> {
+    tokio::time::timeout(
+        noded::CONTROL_DEADLINE,
+        control_round_trip(service, control, host, request),
+    )
+    .await
+    .map_err(|_| {
+        "control_timeout: the host did not reply within the control deadline".to_string()
+    })?
+}
+
+/// loopback over a local duplex when the host is this node (the creator is us),
+/// else one short CONTROL stream to the host peer.
+async fn control_round_trip<T: DataPlaneTransport>(
     service: &Arc<StreamService<T>>,
     control: &Arc<ControlState>,
     host: [u8; 32],
@@ -1127,12 +1227,12 @@ async fn client_control<T: DataPlaneTransport>(
 }
 
 /// forward one input event to the host: loopback straight to the local manager
-/// (same creator gate), else write it on the persistent per-host INPUT stream,
+/// (same creator gate), else write it on this host's persistent INPUT stream,
 /// reopening on error.
 async fn client_input<T: DataPlaneTransport>(
     service: &Arc<StreamService<T>>,
     control: &Arc<ControlState>,
-    input_streams: &mut HashMap<[u8; 32], Box<dyn AsyncWrite + Unpin + Send>>,
+    input_stream: &mut Option<Box<dyn AsyncWrite + Unpin + Send>>,
     host: [u8; 32],
     event: SessionInputWire,
 ) {
@@ -1143,15 +1243,14 @@ async fn client_input<T: DataPlaneTransport>(
         }
         return;
     }
-    // open lazily on the first frame for this host; the entry API can't span the
-    // async open, so this is a plain get-or-open, not a `contains_key`+`insert`.
-    if input_streams.get(&host).is_none() {
+    // open lazily on the first frame for this host.
+    if input_stream.is_none() {
         let opened = service
             .open(PeerId(host), term_flow(), INPUT_INTENT, Vec::new())
             .await;
         match opened {
             Ok(stream) => {
-                input_streams.insert(host, Box::new(stream));
+                *input_stream = Some(Box::new(stream));
             }
             Err(err) => {
                 if let Some(occurrences) = INPUT_WARN.hit("input_open_failed") {
@@ -1167,9 +1266,7 @@ async fn client_input<T: DataPlaneTransport>(
             }
         }
     }
-    let stream = input_streams
-        .get_mut(&host)
-        .expect("input stream just inserted");
+    let stream = input_stream.as_mut().expect("input stream just opened");
     if let Err(err) = write_frame(stream.as_mut(), &event).await {
         if let Some(occurrences) = INPUT_WARN.hit("input_write_failed") {
             tracing::warn!(
@@ -1180,7 +1277,7 @@ async fn client_input<T: DataPlaneTransport>(
                 "forwarded input dropped; reopening"
             );
         }
-        input_streams.remove(&host);
+        *input_stream = None;
     }
 }
 
@@ -1286,7 +1383,184 @@ async fn owner_airlock_authority(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_service::wire;
+    use commonware_cryptography::{Signer as _, ed25519};
+    use data_plane::PlaneConfig;
+    use data_plane::sim::{LinkModel, SimNet};
     use noded::TermChunkEvent;
+
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// `count` peers on one simulated net, all mutually linked and all in the
+    /// same overlay peer set.
+    fn term_net(count: u8) -> (Vec<PeerId>, Arc<OverlayPeers>, SimNet) {
+        let keys: Vec<_> = (1..=count)
+            .map(|seed| ed25519::PrivateKey::from_seed(seed as u64).public_key())
+            .collect();
+        let ids: Vec<_> = keys
+            .iter()
+            .map(|key| PeerId(key.as_ref().try_into().unwrap()))
+            .collect();
+        let peers = OverlayPeers::new("term-plane-test".into());
+        peers.set_peers(keys.iter());
+        let net = SimNet::new();
+        let link = LinkModel {
+            latency: Duration::from_millis(1),
+            bytes_per_sec: 50_000_000,
+            drop_every: None,
+            delay_every: None,
+        };
+        for a in &ids {
+            for b in &ids {
+                net.set_link(*a, *b, link);
+            }
+        }
+        (ids, peers, net)
+    }
+
+    fn term_service(
+        net: &SimNet,
+        peers: &Arc<OverlayPeers>,
+        id: PeerId,
+    ) -> Arc<StreamService<impl DataPlaneTransport>> {
+        let plane = DataPlane::new(
+            net.endpoint(id),
+            OverlayBook::<TermPlane>::new(Arc::clone(peers)),
+            PlaneConfig {
+                bulk_bytes_per_sec: 50_000_000,
+                bulk_burst_bytes: 256 * 1024,
+            },
+        );
+        let service = Arc::new(
+            plane
+                .stream_service(Service::TermSession, StreamPolicy { accept_backlog: 4 })
+                .expect("the term service binds once"),
+        );
+        // the plane must outlive the service; leak it for the test's lifetime.
+        std::mem::forget(plane);
+        service
+    }
+
+    fn test_control(me: [u8; 32], sessions: Option<TerminalSessions>) -> Arc<ControlState> {
+        let (commands, _no_reads) = fmpsc::channel(4);
+        Arc::new(ControlState {
+            sessions,
+            commands,
+            local_gateway_via: String::new(),
+            me,
+            workspace: std::path::PathBuf::from("/nonexistent-work-admission-workspace"),
+        })
+    }
+
+    fn create_job(host: [u8; 32]) -> (SessionJob, tokio::sync::oneshot::Receiver<CreateResult>) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        (
+            SessionJob::Create {
+                host,
+                provider: "claude".into(),
+                cred: "c".into(),
+                cpu: None,
+                mem_gb: None,
+                reply,
+            },
+            rx,
+        )
+    }
+
+    type CreateResult = Result<CreatedSession, String>;
+
+    /// **The wedge, and the shape that ends it.**
+    ///
+    /// A host that accepts the CONTROL stream and never answers used to park the
+    /// ONE lane every remote terminal on this node shares: after it, no
+    /// keystroke, no close, and no create for any other host moved again. One
+    /// lane per host peer means the silent host holds up only itself.
+    #[tokio::test]
+    async fn a_silent_host_holds_up_only_its_own_sessions() {
+        let (ids, peers, net) = term_net(3);
+        let (guest, silent, live) = (ids[0], ids[1], ids[2]);
+        let service = term_service(&net, &peers, guest);
+
+        // the silent host: it takes the create and sits on it forever.
+        let silent_service = term_service(&net, &peers, silent);
+        let (parked, mut parked_rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let (_peer, _hello, mut stream) =
+                silent_service.accept().await.expect("a control stream");
+            let _ = read_frame::<_, SessionControlRequest>(&mut stream).await;
+            parked.send(()).await.expect("the test is watching");
+            std::future::pending::<()>().await;
+        });
+
+        // the live host: it answers every create with a refusal.
+        let live_service = term_service(&net, &peers, live);
+        tokio::spawn(async move {
+            while let Some((_peer, _hello, mut stream)) = live_service.accept().await {
+                if read_frame::<_, SessionControlRequest>(&mut stream)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    let _ = write_frame(&mut stream, &refused("no_sandbox", "not here")).await;
+                }
+            }
+        });
+
+        let (lane, jobs) = tokio::sync::mpsc::channel(HOST_LANE_DEPTH);
+        tokio::spawn(client_loop(service, test_control(guest.0, None), jobs));
+
+        let (job, mut wedged_rx) = create_job(silent.0);
+        lane.send(job).await.expect("the client half is up");
+        // wait on the host's own event, not on time: the silent host now HAS the
+        // create and the guest's client half is parked on its reply.
+        parked_rx
+            .recv()
+            .await
+            .expect("the silent host took a create");
+
+        let (job, answered_rx) = create_job(live.0);
+        lane.send(job).await.expect("the client half is up");
+        let Err(answered) = answered_rx.await.expect("the live host answered") else {
+            panic!("the live host refuses; a Created here means the test host changed");
+        };
+        assert_eq!(
+            answered, "no_sandbox: not here",
+            "a second host is served while the first is still silent"
+        );
+        assert!(
+            wedged_rx.try_recv().is_err(),
+            "the silent host's own create is still parked — that is the only thing it holds up"
+        );
+    }
+
+    #[test]
+    fn every_session_job_names_the_host_it_routes_to() {
+        // the router's whole discriminant: a variant that answered the wrong
+        // host would put two hosts on one lane and rebuild the wedge.
+        let (create, _rx) = create_job([1u8; 32]);
+        assert_eq!(create.host(), [1u8; 32]);
+        assert_eq!(
+            SessionJob::Close {
+                host: [2u8; 32],
+                session: "00000000deadbeef".into(),
+            }
+            .host(),
+            [2u8; 32]
+        );
+        assert_eq!(
+            SessionJob::Input {
+                host: [3u8; 32],
+                event: SessionInputWire::Resize {
+                    session: "00000000deadbeef".into(),
+                    cols: 80,
+                    rows: 24,
+                },
+            }
+            .host(),
+            [3u8; 32]
+        );
+    }
 
     #[test]
     fn per_peer_latch_logs_each_peers_first_refusal() {

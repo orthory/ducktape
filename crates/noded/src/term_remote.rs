@@ -9,10 +9,21 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
 use crate::term::CreatedSession;
+
+/// how long a guest waits for a host's CONTROL reply before giving up.
+///
+/// ONE number for both halves on purpose. The HTTP route answers 504 on it, and
+/// the overlay client half bounds its own reply wait by it. A client half that
+/// waited longer would stay parked on a stream whose caller has already been
+/// answered — which is how one silent host used to wedge every remote terminal
+/// on the node — and a host that saw the stream close would have no bound on
+/// how long the guest had been gone.
+pub const CONTROL_DEADLINE: Duration = Duration::from_secs(30);
 
 /// the daemon-side twin of `term_plane`'s `SessionInputEvent` (kept here so
 /// noded carries no data-plane dep; `term_plane` maps one to the other 1:1).
@@ -39,6 +50,19 @@ pub enum SessionJob {
         host: [u8; 32],
         event: SessionInputWire,
     },
+}
+
+impl SessionJob {
+    /// the peer this job talks to. The client half routes on it: every job for
+    /// one host rides that host's own lane, so a host that never answers wedges
+    /// nothing but its own sessions.
+    pub fn host(&self) -> [u8; 32] {
+        match self {
+            Self::Create { host, .. } | Self::Close { host, .. } | Self::Input { host, .. } => {
+                *host
+            }
+        }
+    }
 }
 
 pub type SessionLane = mpsc::Sender<SessionJob>;
