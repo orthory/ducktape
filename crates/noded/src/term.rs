@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::NodeHandle;
-use crate::stream::SeqMemory;
+use crate::stream::{SeqMemory, resume_within};
 
 /// how many commands may be in flight to the agent daemon before a sender
 /// waits. Deep enough that a burst of keystrokes never blocks the ws reader;
@@ -400,6 +400,16 @@ impl TermRing {
         (rows, ring.floor_seq)
     }
 
+    /// where a subscriber's cursor lands on this session's ring — see
+    /// [`resume_within`]. The catch-up path `Lagged`s whenever it moves.
+    pub fn resume_cursor(&self, session: &str, after: u64) -> u64 {
+        let inner = self.inner.lock().expect("term ring lock poisoned");
+        let Some(ring) = inner.sessions.get(session) else {
+            return inner.memory.head_of(session);
+        };
+        resume_within(after, ring.floor_seq, ring.next_seq)
+    }
+
     /// wake on any append (the version counter), like the run-output watch.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.watch.subscribe()
@@ -653,6 +663,16 @@ impl TermCommandRing {
             .cloned()
             .collect();
         (rows, ring.floor_seq)
+    }
+
+    /// where a subscriber's cursor lands on this session's command log — see
+    /// [`resume_within`]. The catch-up path `Lagged`s whenever it moves.
+    pub fn resume_cursor(&self, session: &str, after: u64) -> u64 {
+        let inner = self.inner.lock().expect("term command ring lock poisoned");
+        let Some(ring) = inner.sessions.get(session) else {
+            return inner.memory.head_of(session);
+        };
+        resume_within(after, ring.floor_seq, ring.next_seq)
     }
 
     /// wake on any append (the version counter), like the output ring's watch.
@@ -2059,6 +2079,28 @@ mod tests {
             vec![(6, "bob".to_string(), "pwd".to_string())],
             "the mirror at cursor 5 accepts the host's next command"
         );
+    }
+
+    /// the output ring's half of the same rule, plus what a subscriber sees: a
+    /// cursor that is now above the ring's head is rewound to it rather than
+    /// waiting forever on rows that were renumbered away.
+    #[test]
+    fn an_evicted_output_ring_keeps_numbering_and_rewinds_a_stale_cursor() {
+        let ring = TermRing::default();
+        for _ in 0..5 {
+            ring.append("S", STANDARD.encode(b"x"));
+        }
+        for i in 0..TERM_RING_MAX_SESSIONS {
+            ring.append(&format!("s{i}"), STANDARD.encode(b"x"));
+        }
+        assert_eq!(ring.resume_cursor("S", 3), 5, "a lagging cursor climbs");
+        assert_eq!(ring.resume_cursor("S", 9), 5, "a stale one is rewound");
+
+        ring.append("S", STANDARD.encode(b"more"));
+        let (rows, floor) = ring.read_after("S", 5, 8);
+        assert_eq!(floor, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 6, "the re-created ring continues at 6");
     }
 
     #[test]
