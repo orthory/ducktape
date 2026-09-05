@@ -60,14 +60,26 @@ jobs:
   # was missing (#1433): `topology_set.rs`'s `DEFAULT_GENESIS_ROOT_HASH`
   # pins the sim's own genesis composition and drifted unnoticed with no PR
   # gate exercising it.
+  #
+  # DUCKTAPE_WASM_CACHE_DIR turns on wasmtime's own compilation cache
+  # (wasm-host's `sim_wasm_cache`) for this job ONLY: the 13 test binaries all
+  # boot the SAME 15-module `topology::SIM_BASE` genesis, so after the first
+  # binary compiles it, every later one loads the cranelift artifacts from
+  # disk instead of recompiling them. A node never sets this env var, so
+  # production boot behavior is unchanged. The dir lives under `target/` so
+  # Swatinem/rust-cache's `cache-directories` persists it across runs.
   simnode-suite:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      DUCKTAPE_WASM_CACHE_DIR: ${{ github.workspace }}/target/sim-wasm-cache
     steps:
       - uses: actions/checkout@v4
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: target/sim-wasm-cache
       - run: rustup show
       - run: cargo test --locked -p simnode
 
