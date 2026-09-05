@@ -92,7 +92,11 @@ pub fn join_workspace(
     // a paste simply admits whoever runs it.
     let (key, generated) = load_or_generate_identity(&dir.join("identity.key"))?;
     let identity = hex_bytes(key.public_key().as_ref());
-    guard_join_descriptor(&dir, &descriptor)?;
+    // the issuer `decode_invite` already verified the envelope against — the
+    // one field of a pasted blob an attacker cannot choose freely, and what
+    // separates a real admit refresh from a descriptor that merely copied our
+    // validator list.
+    guard_join_descriptor(&dir, &descriptor, &invite.token.issuer)?;
 
     // Computed BEFORE anything lands on disk, so a corrupt existing node.toml
     // aborts the join instead of leaving a half-written directory.
