@@ -125,10 +125,16 @@ pub fn classify_coclient_frame(
 
 /// answer a peer's blob request from this node's store — the serve loop's
 /// intercept arm (blobs are host state; `SyncServer` never sees these).
+///
+/// the cap is decided from the LENGTH, before any read. this used to read the
+/// blob and refuse it afterwards, so a one-line `Blob{digest}` naming a 1 GiB
+/// module made the node read and re-hash a gigabyte under the store mutex, in
+/// the validator's sequential serve loop, only to answer a miss.
 pub fn serve_blob(blobs: &dyn blobstore::Blobs, digest: &[u8; 32]) -> statesync::SyncResponse {
-    let bytes = blobs
-        .get_chunk(digest)
-        .filter(|b| b.len() <= MAX_SERVED_BLOB);
+    let servable = blobs
+        .chunk_len(digest)
+        .is_some_and(|len| len <= MAX_SERVED_BLOB as u64);
+    let bytes = servable.then(|| blobs.get_chunk(digest)).flatten();
     statesync::SyncResponse::Blob { bytes }
 }
 
@@ -1067,6 +1073,38 @@ mod tests {
         let big = blobs.put_chunk(vec![7u8; MAX_SERVED_BLOB + 1]);
         assert_eq!(
             serve_blob(&blobs, &big),
+            statesync::SyncResponse::Blob { bytes: None }
+        );
+    }
+
+    /// a store whose length is free and whose read is fatal: the whole point of
+    /// the over-cap refusal is that a peer naming a 1 GiB digest never makes
+    /// this node read one.
+    struct LengthOnlyBlobs(u64);
+
+    impl blobstore::Blobs for LengthOnlyBlobs {
+        fn put_chunk(&self, _: Vec<u8>) -> [u8; 32] {
+            unreachable!("serve_blob never writes")
+        }
+        fn get_chunk(&self, _: &[u8; 32]) -> Option<Vec<u8>> {
+            panic!("serve_blob read a blob it had already refused on length")
+        }
+        fn has_chunk(&self, _: &[u8; 32]) -> bool {
+            true
+        }
+        fn chunk_len(&self, _: &[u8; 32]) -> Option<u64> {
+            Some(self.0)
+        }
+        fn read_range(&self, _: &[u8; 32], _: u64, _: usize) -> Option<Vec<u8>> {
+            unreachable!("serve_blob never ranges")
+        }
+    }
+
+    #[test]
+    fn an_over_cap_blob_is_refused_without_reading_it() {
+        let blobs = LengthOnlyBlobs(1024 * 1024 * 1024);
+        assert_eq!(
+            serve_blob(&blobs, &[4u8; 32]),
             statesync::SyncResponse::Blob { bytes: None }
         );
     }
