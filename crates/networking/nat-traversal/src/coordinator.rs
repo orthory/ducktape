@@ -9,7 +9,8 @@ use lru::LruCache;
 
 use crate::AuthRequest;
 use crate::advert::{
-    AdmitEvent, AdvertBook, AdvertOutcome, MAX_ADVERTS, MAX_ADVERTS_PER_SOURCE_IP, SharedAdverts,
+    Admission, AdmitEvent, AdvertBook, AdvertOutcome, MAX_ADVERTS, MAX_ADVERTS_PER_SOURCE_IP,
+    SharedAdverts,
 };
 use crate::auth::{AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
 use crate::{Latch, Msg, NodeKey, short_key};
@@ -303,12 +304,11 @@ impl Coordinator {
             Msg::Register { key } => {
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
-                let outcome = adverts.observe(key, from, now);
-                let admit_event = adverts.take_admit_event();
+                let Admission { outcome, event } = adverts.observe(key, from, now);
                 // The book is done with; a log write (stderr, and a node's
                 // LogRing) must not happen under its lock.
                 drop(adverts);
-                log_admit_event(admit_event);
+                log_admit_event(event);
                 match outcome {
                     AdvertOutcome::Superseded => tracing::debug!(
                         target: "ducktape::reachability",
@@ -334,12 +334,11 @@ impl Coordinator {
                 // `AdvertBook` staleness guard rejects an equal-or-lower nonce, so
                 // a replayed/reordered datagram cannot supersede a fresh mapping
                 // — nor extend its life.
-                let outcome = adverts.readvertise(key, from, nonce, now);
-                let admit_event = adverts.take_admit_event();
+                let Admission { outcome, event } = adverts.readvertise(key, from, nonce, now);
                 // The book is done with; a log write must not happen under
                 // its lock.
                 drop(adverts);
-                log_admit_event(admit_event);
+                log_admit_event(event);
                 match outcome {
                     // the 25 s keepalive of every member: per-frame traffic.
                     AdvertOutcome::Superseded => tracing::trace!(
@@ -429,7 +428,12 @@ impl Coordinator {
         nonce: u64,
         now: u64,
     ) -> AdvertOutcome {
-        self.adverts.lock().readvertise(key, src, nonce, now)
+        // The MutexGuard `.lock()` produces is a temporary scoped to this
+        // statement — it drops before `log_admit_event` runs on the next
+        // line, so the log write still lands outside the book's lock.
+        let Admission { outcome, event } = self.adverts.lock().readvertise(key, src, nonce, now);
+        log_admit_event(event);
+        outcome
     }
 }
 

@@ -53,10 +53,11 @@ pub enum AdvertOutcome {
     NoOp,
 }
 
-/// A book-mutating call's side effect that is worth a log line, latched
-/// while [`AdvertBook`]'s lock is held and drained by the caller via
-/// [`AdvertBook::take_admit_event`] AFTER releasing it — logging is I/O and
-/// must never run while a `SharedAdverts` holder is blocked on the mutex.
+/// A book-mutating call's side effect that is worth a log line. Returned
+/// alongside the call's [`AdvertOutcome`] in [`Admission`] — never stashed on
+/// [`AdvertBook`] for the caller to remember to drain — so the caller can log
+/// it AFTER dropping the `SharedAdverts` lock; logging is I/O and must never
+/// run while a lock holder is blocked on the mutex.
 #[derive(Clone, Copy, Debug)]
 pub enum AdmitEvent {
     /// A write refused because its target source IP is at
@@ -65,6 +66,25 @@ pub enum AdmitEvent {
     /// The book was at [`MAX_ADVERTS`] and admitting a first-seen key evicted
     /// the youngest live entry.
     BookFull { occurrences: u64 },
+}
+
+/// `observe`/`readvertise`'s full result: the [`AdvertOutcome`] the caller
+/// dispatches on, plus the [`AdmitEvent`] (if any) the caller logs once it
+/// has dropped the book's lock.
+#[derive(Clone, Copy, Debug)]
+pub struct Admission {
+    pub outcome: AdvertOutcome,
+    pub event: Option<AdmitEvent>,
+}
+
+// Test convenience only: lets `assert_eq!(book.observe(...), AdvertOutcome::X)`
+// read like it did before `Admission` existed, without every call site
+// destructuring a field this crate's tests never assert on.
+#[cfg(test)]
+impl PartialEq<AdvertOutcome> for Admission {
+    fn eq(&self, other: &AdvertOutcome) -> bool {
+        self.outcome == *other
+    }
 }
 
 /// The reachability-plane reflexive registry: for each node key, the latest
@@ -111,9 +131,6 @@ pub struct AdvertBook {
     /// coordinator-owned: it is the eviction order, so it must never be
     /// derivable from anything a sender sends.
     next_admission: u64,
-    /// The latest [`AdmitEvent`] latched by this call, if any — see
-    /// [`Self::take_admit_event`].
-    pending_admit_event: Option<AdmitEvent>,
 }
 
 impl Default for AdvertBook {
@@ -130,15 +147,7 @@ impl AdvertBook {
             latest: HashMap::new(),
             ttl,
             next_admission: 0,
-            pending_admit_event: None,
         }
-    }
-
-    /// Drain the [`AdmitEvent`] the last `observe`/`readvertise` call
-    /// latched, if any. The caller logs it AFTER dropping the
-    /// [`SharedAdverts`] lock — this only moves data, it never emits.
-    pub fn take_admit_event(&mut self) -> Option<AdmitEvent> {
-        self.pending_admit_event.take()
     }
 
     fn expired(&self, advert: &ReflexiveAdvert, now: u64) -> bool {
@@ -162,50 +171,57 @@ impl AdvertBook {
     /// `Register` still refreshes liveness. An EXPIRED mapping is dead weight (its
     /// pinhole is gone), so both guards yield and the fresh register takes the
     /// slot back — the reboot case.
-    pub fn observe(&mut self, key: NodeKey, src: SocketAddr, now: u64) -> AdvertOutcome {
-        self.pending_admit_event = None;
+    pub fn observe(&mut self, key: NodeKey, src: SocketAddr, now: u64) -> Admission {
         match self.latest.get(&key) {
             Some(prev) if !self.expired(prev, now) && (prev.nonce > 0 || prev.reflexive != src) => {
-                AdvertOutcome::NoOp
-            }
-            _ => {
-                if self.insert_fresh(key, src, 0, now) {
-                    AdvertOutcome::Superseded
-                } else {
-                    AdvertOutcome::Refused
+                Admission {
+                    outcome: AdvertOutcome::NoOp,
+                    event: None,
                 }
             }
+            _ => match self.insert_fresh(key, src, 0, now) {
+                Ok(event) => Admission {
+                    outcome: AdvertOutcome::Superseded,
+                    event,
+                },
+                Err(event) => Admission {
+                    outcome: AdvertOutcome::Refused,
+                    event,
+                },
+            },
         }
     }
 
     /// The one accepted-advert write path (`observe` and `readvertise` both
     /// end here): keep the key's existing seniority, or take a fresh admission
     /// slot for a first-seen key, then store the advert with its life restarted
-    /// at `now`. Returns `false`, leaving state untouched, when the write
-    /// would add a LIVE entry to `src.ip()` — a first-seen key, an expired
-    /// key's refresh, or a migration to a new source — and that source is
-    /// already at [`MAX_ADVERTS_PER_SOURCE_IP`]. A refresh from the SAME live
-    /// source never re-runs the cap check: it isn't adding a live entry
-    /// anywhere, just extending the one already counted.
-    fn insert_fresh(&mut self, key: NodeKey, src: SocketAddr, nonce: u64, now: u64) -> bool {
+    /// at `now`. Returns `Err`, leaving state untouched, when the write would
+    /// add a LIVE entry to `src.ip()` — a first-seen key, an expired key's
+    /// refresh, or a migration to a new source — and that source is already
+    /// at [`MAX_ADVERTS_PER_SOURCE_IP`] (the `Err` payload is the refusal
+    /// event to log, if this occurrence should surface one). A refresh from
+    /// the SAME live source never re-runs the cap check: it isn't adding a
+    /// live entry anywhere, just extending the one already counted.
+    fn insert_fresh(
+        &mut self,
+        key: NodeKey,
+        src: SocketAddr,
+        nonce: u64,
+        now: u64,
+    ) -> Result<Option<AdmitEvent>, Option<AdmitEvent>> {
         let prev = self.latest.get(&key).copied();
         // Seniority belongs to the KEY and survives every refresh: a member
         // that re-advertises keeps the slot it earned instead of becoming the
         // newest arrival (and so the next victim).
-        let admitted = match prev {
+        let (admitted, event) = match prev {
             Some(prev) if !self.expired(&prev, now) && prev.reflexive.ip() == src.ip() => {
-                prev.admitted
+                (prev.admitted, None)
             }
             Some(prev) => {
-                if !self.cap_check(src.ip(), now) {
-                    return false;
-                }
-                prev.admitted
+                self.cap_check(src.ip(), now)?;
+                (prev.admitted, None)
             }
-            None => match self.admit(src, now) {
-                Some(admitted) => admitted,
-                None => return false,
-            },
+            None => self.admit(src, now)?,
         };
         self.latest.insert(
             key,
@@ -216,7 +232,7 @@ impl AdvertBook {
                 admitted,
             },
         );
-        true
+        Ok(event)
     }
 
     /// Refuse a write to `ip` outright if it already holds
@@ -226,36 +242,39 @@ impl AdvertBook {
     /// live entry under a DIFFERENT ip than the one it's replacing (an
     /// expired-key reclaim or a migrated key) — both would otherwise grow
     /// that source's live share past the cap the same way a brand-new key
-    /// would.
-    fn cap_check(&mut self, ip: IpAddr, now: u64) -> bool {
+    /// would. `Err`'s payload is `Some` only on the occurrence the shared
+    /// latch says should be logged.
+    fn cap_check(&self, ip: IpAddr, now: u64) -> Result<(), Option<AdmitEvent>> {
         if self.live_adverts_from(ip, now) < MAX_ADVERTS_PER_SOURCE_IP {
-            return true;
+            return Ok(());
         }
         // peer-driven and unauthenticated by definition (any key can spray
         // from one address), so this is latched like every other refusal in
         // this crate — the count is the diagnosis.
         static SOURCE_CAP: Latch = Latch::new();
-        if let Some(occurrences) = SOURCE_CAP.hit("advert_source_cap") {
-            self.pending_admit_event = Some(AdmitEvent::SourceCapped {
+        Err(SOURCE_CAP
+            .hit("advert_source_cap")
+            .map(|occurrences| AdmitEvent::SourceCapped {
                 source: ip,
                 occurrences,
-            });
-        }
-        false
+            }))
     }
 
     /// Take an admission slot for a FIRST-SEEN key: refuse it via
     /// [`Self::cap_check`] if its source IP is already at
     /// [`MAX_ADVERTS_PER_SOURCE_IP`], otherwise reclaim space if the book
-    /// itself is at [`MAX_ADVERTS`], then stamp the next admission sequence.
-    fn admit(&mut self, src: SocketAddr, now: u64) -> Option<u64> {
-        if !self.cap_check(src.ip(), now) {
-            return None;
-        }
-        self.evict_if_full(now);
+    /// itself is at [`MAX_ADVERTS`] (surfacing that eviction as the `Ok`
+    /// payload), then stamp the next admission sequence.
+    fn admit(
+        &mut self,
+        src: SocketAddr,
+        now: u64,
+    ) -> Result<(u64, Option<AdmitEvent>), Option<AdmitEvent>> {
+        self.cap_check(src.ip(), now)?;
+        let event = self.evict_if_full(now);
         let admitted = self.next_admission;
         self.next_admission += 1;
-        Some(admitted)
+        Ok((admitted, event))
     }
 
     /// Count of `ip`'s currently-live entries — what a fresh
@@ -289,9 +308,9 @@ impl AdvertBook {
     /// reclaimed after a >TTL outage) takes the revolving newest slot and the
     /// next spray packet displaces it, so that join retries until the flood
     /// stops. Everyone already in the book rides it out.
-    fn evict_if_full(&mut self, now: u64) {
+    fn evict_if_full(&mut self, now: u64) -> Option<AdmitEvent> {
         if self.latest.len() < MAX_ADVERTS {
-            return;
+            return None;
         }
         let corpse = self
             .latest
@@ -300,16 +319,14 @@ impl AdvertBook {
             .map(|(k, _)| *k);
         if let Some(corpse) = corpse {
             self.latest.remove(&corpse);
-            return;
+            return None;
         }
         let youngest = self
             .latest
             .iter()
             .max_by_key(|(_, a)| a.admitted)
             .map(|(k, _)| *k);
-        let Some(youngest) = youngest else {
-            return;
-        };
+        let youngest = youngest?;
         self.latest.remove(&youngest);
         // a full book of LIVE registrations is either a mesh past the cap or a
         // spray in progress; either way the operator wants to know that a
@@ -318,9 +335,9 @@ impl AdvertBook {
         // report, the victim is always the sprayer's own previous throwaway,
         // so the number of displacements is the whole diagnosis.
         static BOOK_FULL: Latch = Latch::new();
-        if let Some(occurrences) = BOOK_FULL.hit("book_full") {
-            self.pending_admit_event = Some(AdmitEvent::BookFull { occurrences });
-        }
+        BOOK_FULL
+            .hit("book_full")
+            .map(|occurrences| AdmitEvent::BookFull { occurrences })
     }
 
     /// Rebind re-advertisement. A strictly-higher `nonce` supersedes the stored
@@ -336,19 +353,26 @@ impl AdvertBook {
         src: SocketAddr,
         nonce: u64,
         now: u64,
-    ) -> AdvertOutcome {
-        self.pending_admit_event = None;
+    ) -> Admission {
         let stale = matches!(
             self.latest.get(&key),
             Some(prev) if nonce <= prev.nonce && !self.expired(prev, now)
         );
         if stale {
-            return AdvertOutcome::Stale;
+            return Admission {
+                outcome: AdvertOutcome::Stale,
+                event: None,
+            };
         }
-        if self.insert_fresh(key, src, nonce, now) {
-            AdvertOutcome::Superseded
-        } else {
-            AdvertOutcome::Refused
+        match self.insert_fresh(key, src, nonce, now) {
+            Ok(event) => Admission {
+                outcome: AdvertOutcome::Superseded,
+                event,
+            },
+            Err(event) => Admission {
+                outcome: AdvertOutcome::Refused,
+                event,
+            },
         }
     }
 
