@@ -293,10 +293,12 @@ impl Coordinator {
         msg: Msg,
         now: u64,
     ) -> CoordinatorReplies {
-        // One guard per request: this handler is sync (no awaits to hold it
-        // across) and both UDP loops are single-threaded, so the only other
-        // contender is a relay session's read-only resolution.
-        let mut adverts = self.adverts.lock();
+        // Each arm below takes its own guard, scoped to the single book
+        // operation it needs (this handler is sync, so nothing holds it
+        // across an await): a call that never touches the book — like
+        // `BindRequest` — never locks it, and every arm that does lock it
+        // drops the guard before its tracing call, so a stalled log
+        // consumer never parks a relay session's read-only resolution.
         match msg {
             Msg::BindRequest { .. } => {
                 CoordinatorReplies::from_iter([(from, Msg::BindResponse { reflexive: from })])
@@ -304,10 +306,9 @@ impl Coordinator {
             Msg::Register { key } => {
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
-                let Admission { outcome, event } = adverts.observe(key, from, now);
+                let Admission { outcome, event } = self.adverts.lock().observe(key, from, now);
                 // The book is done with; a log write (stderr, and a node's
                 // LogRing) must not happen under its lock.
-                drop(adverts);
                 log_admit_event(event);
                 match outcome {
                     AdvertOutcome::Superseded => tracing::debug!(
@@ -334,10 +335,10 @@ impl Coordinator {
                 // `AdvertBook` staleness guard rejects an equal-or-lower nonce, so
                 // a replayed/reordered datagram cannot supersede a fresh mapping
                 // — nor extend its life.
-                let Admission { outcome, event } = adverts.readvertise(key, from, nonce, now);
+                let Admission { outcome, event } =
+                    self.adverts.lock().readvertise(key, from, nonce, now);
                 // The book is done with; a log write must not happen under
                 // its lock.
-                drop(adverts);
                 log_admit_event(event);
                 match outcome {
                     // the 25 s keepalive of every member: per-frame traffic.
@@ -365,7 +366,11 @@ impl Coordinator {
                 CoordinatorReplies::new()
             }
             Msg::Lookup { key } => {
-                let target = adverts.current(key, now);
+                // Decide under the lock, then drop it before anything else —
+                // building the reply and the tracing call are both pure once
+                // `target` is known, and a stalled log write must never park
+                // a relay session's read-only resolution on this mutex.
+                let target = self.adverts.lock().current(key, now);
                 let response = (
                     from,
                     Msg::LookupResponse {
@@ -373,25 +378,7 @@ impl Coordinator {
                         reflexive: target,
                     },
                 );
-                if let Some(peer_addr) = target {
-                    CoordinatorReplies::from([
-                        response,
-                        (
-                            from,
-                            Msg::PunchSync {
-                                peer: key,
-                                peer_reflexive: peer_addr,
-                            },
-                        ),
-                        (
-                            peer_addr,
-                            Msg::PunchSync {
-                                peer: caller,
-                                peer_reflexive: from,
-                            },
-                        ),
-                    ])
-                } else {
+                let Some(peer_addr) = target else {
                     // the everyday reason a join stalls: the peer never
                     // registered, or its registration aged out of the book.
                     tracing::debug!(
@@ -402,8 +389,25 @@ impl Coordinator {
                         caller = short_key(caller),
                         "lookup answered None"
                     );
-                    CoordinatorReplies::from_iter([response])
-                }
+                    return CoordinatorReplies::from_iter([response]);
+                };
+                CoordinatorReplies::from([
+                    response,
+                    (
+                        from,
+                        Msg::PunchSync {
+                            peer: key,
+                            peer_reflexive: peer_addr,
+                        },
+                    ),
+                    (
+                        peer_addr,
+                        Msg::PunchSync {
+                            peer: caller,
+                            peer_reflexive: from,
+                        },
+                    ),
+                ])
             }
             // The coordinator never routes these through `handle`:
             // BindResponse/LookupResponse/PunchSync/Punch are node-directed.
