@@ -256,10 +256,15 @@ mod workspace_mark_tests {
         );
 
         std::fs::create_dir_all(path.join("storage")).unwrap();
-        assert_eq!(
+        // a re-created path is never the pinned workspace: on a fresh inode it
+        // is `Vanished`; when the filesystem hands the freed inode straight
+        // back (ext4 routinely does) it reads as `MarkLost`, the documented
+        // ceiling of the (device, inode) pin. Which one the kernel picks is
+        // not this test's to assert — that it is not `Intact` is.
+        assert_ne!(
             mark.presence(&path),
-            Presence::Vanished,
-            "a re-created workspace is a different one"
+            Presence::Intact,
+            "a re-created workspace is never the pinned one"
         );
     }
 
