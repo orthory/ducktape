@@ -134,9 +134,23 @@ pub type FrameId = [u8; 32];
 /// is what refuses it. the bound is a memory/coverage trade: 4096 entries is
 /// ~160 KiB and, at the ~1 block/s an idle chain heartbeats, a bit over an
 /// hour of history — long enough to cover an epoch cutover, a restart, and the
-/// journal suffix a checkpoint retains. a batch older than the window can
-/// still replay; a per-origin nonce enforced in replicated state is the
-/// unbounded successor, and it is not this seam.
+/// journal suffix a checkpoint retains.
+///
+/// the window is a property of PERSISTED STATE, not of uptime, and it has to
+/// stay that way: every boundary a node can start from carries it — the
+/// checkpoint (`recovery::Manifest::applied_frames`) and the synced boundary
+/// (`statesync::Manifest::applied_frames`) — so a cold seat and a validator
+/// that has been up for a month enforce the same depth. a node that started
+/// with an empty one would apply, for its first `REPLAY_WINDOW_HEIGHTS`
+/// blocks, a re-proposed batch its peers refuse: one batch, two roots.
+///
+/// a batch older than the window can still replay. a per-origin nonce
+/// enforced in replicated state is the unbounded successor and it is not this
+/// seam: there is no host-owned replicated store (`host::global_root`
+/// composes module roots and nothing else), and the node's own submit
+/// sequence does not survive a state-sync re-bootstrap — `bin/node` seats a
+/// re-bootstrapped identity at `next_seq = 1`, so a strictly-increasing
+/// per-origin check would refuse its every subsequent op.
 pub const REPLAY_WINDOW_HEIGHTS: usize = 4096;
 
 /// how often a standing code-swap stall re-warns: attempt 1, then every Nth.
