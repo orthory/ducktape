@@ -45,11 +45,12 @@
 //!   next-block delivery — the ONLY result intake);
 //! - `Origin::Module(jobs)` → a [`JobsEvent`] (the jobs-board intake);
 //! - `Origin::Module(agent)` → an [`AgentEvent`] (the registry hook): the
-//!   registry's same-block notification that an agent landed or changed
-//!   capability, answered here by registering/retuning the agent's
-//!   dispatch-plane recipe. unlike every other module intake this one MAY
-//!   error — it rides the registry write's own block, and aborting that
-//!   block is exactly the atomicity the recipe seam needs;
+//!   registry's same-block notification that an agent landed, changed
+//!   capability, or left the registry, answered here by
+//!   registering/retuning/removing the agent's dispatch-plane recipe. unlike
+//!   every other module intake this one MAY error — it rides the registry
+//!   write's own block, and aborting that block is exactly the atomicity the
+//!   recipe seam needs;
 //! - `Origin::Module(saga)` → a dead-letter no-op. nothing here rides the
 //!   saga directly, but any submitter can point a saga trigger's `reply_to`
 //!   at this module — the tombstone keeps that callback from ever aborting
