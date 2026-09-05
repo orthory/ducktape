@@ -1090,7 +1090,33 @@ fn deterministic_config() -> Config {
     c.wasm_stack_switching(false);
     c.wasm_custom_page_sizes(false);
     c.wasm_wide_arithmetic(false);
+    if let Some(cache) = sim_wasm_cache() {
+        c.cache(Some(cache));
+    }
     c
+}
+
+/// Opt-in cranelift artifact cache for the sim/test lane, gated behind the
+/// `wasm-cache` feature: only `bin/simnode` (via `noded/wasm-cache`) turns it
+/// on, so a production node's build never even contains this code path —
+/// setting `DUCKTAPE_WASM_CACHE_DIR` on a real node's environment does
+/// nothing. When the sim/test harness sets it (a directory under the
+/// workspace, shared by every `cargo test -p simnode` binary), the SAME
+/// 15-module genesis compiled by the first binary is loaded from disk by the
+/// rest instead of re-cranelift-compiling it: a cache hit changes wall time,
+/// never the compiled artifact's semantics, so it cannot affect the
+/// root-hash.
+#[cfg(feature = "wasm-cache")]
+fn sim_wasm_cache() -> Option<wasmtime::Cache> {
+    let dir = std::env::var_os("DUCKTAPE_WASM_CACHE_DIR")?;
+    let mut cfg = wasmtime::CacheConfig::new();
+    cfg.with_directory(dir);
+    wasmtime::Cache::new(cfg).ok()
+}
+
+#[cfg(not(feature = "wasm-cache"))]
+fn sim_wasm_cache() -> Option<wasmtime::Cache> {
+    None
 }
 
 fn to_wit_env(env: &SdkEnv) -> WitEnv {
