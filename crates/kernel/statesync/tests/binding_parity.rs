@@ -148,6 +148,7 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
                 kind: PayloadKind::Snapshot,
                 resolver_target: None,
             }],
+            applied_frames: vec![(41, [0x5A; 32]), (42, [0x5B; 32])],
         }),
         SyncRequest::Chunk { offset, .. } => SyncResponse::Chunk {
             total: 999,

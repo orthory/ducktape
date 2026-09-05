@@ -120,6 +120,14 @@ pub const FRAME_BATCH_LEN: usize = 64;
 /// budgeting the exact encoded response against the mesh message cap.
 pub const INDEX_OPS_BATCH_LEN: usize = 512;
 
+/// hard cap on [`Manifest::applied_frames`] — the replay-window depth a
+/// boundary carries. MUST equal the node's `REPLAY_WINDOW_HEIGHTS`: the
+/// window a joiner inherits has to be exactly as deep as the one its peers
+/// enforce, or the two disagree on a re-proposed batch and fork. this crate
+/// does not link `node`, so `bin/node` pins the equality with a compile-time
+/// assert. 4096 pairs is ~160 KiB on the wire, well inside the mesh cap.
+pub const MAX_APPLIED_FRAMES: usize = 4096;
+
 /// fixed bytes prepended to every authenticated statesync request and reply:
 /// requester(32) + proof(64) + request id(8).
 pub const RPC_HEADER_LEN: usize = 32 + 64 + 8;
@@ -287,6 +295,18 @@ pub struct Manifest {
     /// the epoch's genesis floor instead).
     pub floor_cert: Option<Vec<u8>>,
     pub entries: Vec<ManifestEntry>,
+    /// the serving node's REPLAY WINDOW at `height`: the `(height, batch id)`
+    /// pairs it has journaled, oldest first, capped at
+    /// [`MAX_APPLIED_FRAMES`]. a joiner seats with this as its own window, so
+    /// it refuses the same re-proposed batches its peers refuse instead of
+    /// applying one at a fresh height and forking the root. every entry is at
+    /// or below `height`.
+    ///
+    /// an unauthenticated serving hint like the coordinates above: a lying
+    /// window makes the joiner refuse a batch its peers apply, which diverges
+    /// its root — the same failure a lying `view_base` produces, and a
+    /// fabricated world still cannot vote.
+    pub applied_frames: Vec<(u64, [u8; 32])>,
 }
 
 impl Manifest {
@@ -745,6 +765,11 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
             for o in &m.residents {
                 wire::put_bytes(&mut out, o);
             }
+            out.extend_from_slice(&(m.applied_frames.len() as u64).to_le_bytes());
+            for (height, id) in &m.applied_frames {
+                out.extend_from_slice(&height.to_le_bytes());
+                out.extend_from_slice(id);
+            }
         }
         SyncResponse::Chunk { total, bytes } => {
             out.push(1u8);
@@ -1007,6 +1032,19 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
             for _ in 0..o {
                 residents.push(wire::take_bytes(&mut buf)?.to_vec());
             }
+            let w = wire::take_u64(&mut buf)?;
+            // the protocol depth is the cap, and a forged count can never
+            // drive allocation past it (each pair is a fixed 40 bytes).
+            if w > MAX_APPLIED_FRAMES as u64 {
+                return Err(WireError::Codec(format!(
+                    "replay window count {w} exceeds the {MAX_APPLIED_FRAMES}-entry cap"
+                )));
+            }
+            let mut applied_frames = Vec::with_capacity(w as usize);
+            for _ in 0..w {
+                let height = wire::take_u64(&mut buf)?;
+                applied_frames.push((height, wire::take_array::<32>(&mut buf)?));
+            }
             SyncResponse::Manifest(Manifest {
                 height,
                 root_hash,
@@ -1016,6 +1054,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 residents,
                 floor_cert,
                 entries,
+                applied_frames,
             })
         }
         1 => SyncResponse::Chunk {
@@ -1356,6 +1395,9 @@ pub struct BoundaryCoords {
     /// mesh's index namespace; see [`TipCoords::generation`].
     pub generation: u64,
     pub mesh_window: Vec<MeshWindowEntry>,
+    /// the serving node's replay window at this boundary, filtered to entries
+    /// at or below its height — see [`Manifest::applied_frames`].
+    pub applied_frames: Vec<(u64, [u8; 32])>,
 }
 
 /// a consistent boundary capture: every payload from ONE finalized boundary.
@@ -1579,6 +1621,7 @@ impl SyncServer {
             participants: capture.coords.participants.clone(),
             residents: capture.coords.residents.clone(),
             floor_cert: capture.coords.floor_cert.clone(),
+            applied_frames: capture.coords.applied_frames.clone(),
             entries: capture
                 .modules
                 .iter()
@@ -2436,6 +2479,8 @@ mod tests {
                         resolver_target: None,
                     },
                 ],
+                // non-empty: exercises the replay-window wire tail.
+                applied_frames: vec![(6, [0xE1; 32]), (7, [0xE2; 32])],
             }),
             // a fresh-epoch boundary: no finalization past the base yet, so
             // no floor certificate — the joiner spawns on the genesis floor.
@@ -2448,6 +2493,7 @@ mod tests {
                 residents: vec![],
                 floor_cert: None,
                 entries: vec![],
+                applied_frames: vec![],
             }),
             SyncResponse::Chunk {
                 total: 10,
@@ -2651,6 +2697,20 @@ mod tests {
         bytes.push(0); // floor_cert: None
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decode_response(&bytes).is_err());
+
+        // and the REPLAY WINDOW count: capped at the protocol depth, so a
+        // forged one is refused before it reserves 40 bytes an entry.
+        let mut bytes = vec![0u8];
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; ROOT_LEN]);
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&3u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // participants
+        bytes.push(0); // floor_cert: None
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // entries
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // residents
+        bytes.extend_from_slice(&(MAX_APPLIED_FRAMES as u64 + 1).to_le_bytes());
+        assert!(decode_response(&bytes).is_err());
     }
 
     #[test]
@@ -2666,9 +2726,10 @@ mod tests {
             residents: vec![],
             floor_cert: None,
             entries: vec![],
+            applied_frames: vec![(6, [0xE1; 32])],
         });
         let bytes = encode_response(&resp);
-        // Drop bytes from the trailing entry/resident counts.
+        // Drop bytes from the trailing entry/resident/replay-window counts.
         for cut in 1..=21 {
             let torn = &bytes[..bytes.len() - cut];
             assert!(
