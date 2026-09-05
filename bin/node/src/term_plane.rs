@@ -301,20 +301,21 @@ async fn accept_loop<T: DataPlaneTransport>(
 /// refusal.
 static FEED_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
 
-/// the host gate on an inbound feed grain: this node takes a session's output
-/// and command rows ONLY from the peer it recorded as that session's host when
-/// its own remote create returned.
+/// the host gate on an inbound feed grain: a session's output and command rows
+/// are taken from ONE peer — the node that hosts it — and from nobody else.
 ///
-/// A session id authorizes nothing on its own — every forwarded session's grains
-/// fan out to EVERY peer, so the ids are public to the mesh. Without this bind,
-/// any member could end a session it does not host, inject bytes into its
-/// scrollback, or forge attributed command rows, on any id — including one this
-/// node hosts locally, where the ring is keyed in the same namespace.
+/// A session id authorizes nothing on its own. Every forwarded session's grains
+/// fan out to EVERY peer (that is what makes a Shared session watchable from any
+/// node, like a huddle), so the ids are not secret. Without this bind, any member
+/// could end a session it does not host, inject bytes into its scrollback, or
+/// forge attributed command rows, on any id — including one this node hosts
+/// locally, where the ring is keyed in the same namespace.
 ///
-/// An id this node is not mirroring (`None`) is refused too: a session this node
-/// never created is not one it has any reason to ring.
+/// [`RemoteSessions::feed_host`] answers who that peer is: the host of a session
+/// this node directed, else the first peer that ever delivered a grain for the
+/// id. The binding is dropped when its host says the session ended.
 fn feed_permitted(remote: &RemoteSessions, session: &str, peer: PeerId) -> bool {
-    remote.host_of(session) == Some(peer.0)
+    remote.feed_host(session, peer.0) == peer.0
 }
 
 /// log one refused feed grain, latched. The peer's NODE key is public routing
@@ -362,7 +363,13 @@ async fn receive_chunks<S: AsyncRead + Unpin>(
             // grain back out. Flagging it is what lets this node's `term:<id>`
             // catch-up emit `TermEnded` and release the `agent pty` client that
             // has been blocked on the topic since the child exited.
-            TermFeedEvent::Ended { session } => ring.mark_ended_local_only(&session),
+            TermFeedEvent::Ended { session } => {
+                ring.mark_ended_local_only(&session);
+                // the host says the session is over, so its id is free: the next
+                // grain naming it binds afresh rather than being refused forever
+                // by a binding nothing will ever end.
+                remote_sessions.forget(&session);
+            }
         }
     }
     Ok(())
@@ -1293,13 +1300,18 @@ mod tests {
         let remote = RemoteSessions::default();
         let host = PeerId([7u8; 32]);
         let stranger = PeerId([9u8; 32]);
+        // a session this node directed: its known host is the only sender.
         remote.remember("00000000deadbeef".into(), host.0);
         assert!(feed_permitted(&remote, "00000000deadbeef", host));
-        // the same id from any other member is not this session's output.
         assert!(!feed_permitted(&remote, "00000000deadbeef", stranger));
-        // an id this node is not mirroring — one it hosts locally, or one a peer
-        // invented — is bound to no peer at all.
-        assert!(!feed_permitted(&remote, "00000000cafef00d", host));
+        // a session this node only mirrors: the first sender binds the id, and
+        // every other peer is refused from then on.
+        assert!(feed_permitted(&remote, "00000000cafef00d", host));
+        assert!(!feed_permitted(&remote, "00000000cafef00d", stranger));
+        assert!(
+            feed_permitted(&remote, "00000000cafef00d", host),
+            "the bound host keeps streaming"
+        );
     }
 
     #[test]
