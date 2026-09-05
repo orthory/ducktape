@@ -330,7 +330,10 @@ pub fn load_or_create_seal_keypair(root: &Path) -> Result<SealKeypair, String> {
 }
 
 /// Write secret bytes to a fresh 0600 file (mirrors `userkey::write_user_key_new`).
-fn write_secret_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// `pub` so `bin/node`'s `cred add` can write the vendor OAuth artifact through
+/// the same hardened path `seal.key` uses, instead of `std::fs::copy` (which
+/// replicates the SOURCE file's mode onto the destination).
+pub fn write_secret_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -342,6 +345,22 @@ fn write_secret_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Err(e) = std::io::Write::write_all(&mut file, bytes) {
         let _ = std::fs::remove_file(path);
         return Err(format!("write {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// Create a directory only this user can read (mirrors `provider-host`'s
+/// `create_private_dir`). Used for `airlock-creds/` and each credential's
+/// `<name>/` subdirectory: the vendor OAuth artifact inside is worth strictly
+/// more than the seal key beside it, so it gets the same 0700 dir + 0600 file
+/// treatment.
+pub fn create_private_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("restrict {} permissions: {e}", path.display()))?;
     }
     Ok(())
 }
@@ -496,6 +515,26 @@ mod tests {
         load_or_create_seal_keypair(&root).unwrap();
         let mode = std::fs::metadata(root.join("seal.key")).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_dir_is_0700_and_secret_write_is_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cred_store_root(tmp.path());
+        let cred_dir = root.join("alice-claude-1");
+        create_private_dir(&root).unwrap();
+        create_private_dir(&cred_dir).unwrap();
+        let root_mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        let cred_dir_mode = std::fs::metadata(&cred_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(root_mode, 0o700);
+        assert_eq!(cred_dir_mode, 0o700);
+
+        let artifact = cred_dir.join(".credentials.json");
+        write_secret_0600(&artifact, b"{}").unwrap();
+        let artifact_mode = std::fs::metadata(&artifact).unwrap().permissions().mode() & 0o777;
+        assert_eq!(artifact_mode, 0o600);
     }
 
     #[test]

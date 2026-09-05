@@ -202,7 +202,7 @@ pub(crate) fn run(args: CredArgs, stdin: &mut impl BufRead) -> CredResult {
             gateway,
             attest,
             seal,
-        } => crate::cred_seal::cmd_seal(gateway, attest, seal, || ctx.http_base()),
+        } => crate::cred_seal::cmd_seal(gateway, attest, seal, || ctx.http_base(), stdin),
     }
 }
 
@@ -441,10 +441,14 @@ fn cmd_add(
     };
     gateway::validate_credential_name(&name)?;
 
-    // capture the login artifact into the on-disk store, keyed by name.
+    // capture the login artifact into the on-disk store, keyed by name. Both
+    // `airlock-creds/` and the credential's own dir are 0700: the artifact
+    // inside is a live vendor OAuth secret, worth strictly more than the
+    // `seal.key` beside it.
     let store = airlock_service::cred_store_root(&resolved.service.storage_dir);
     let dir = store.join(&name);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    airlock_service::create_private_dir(&store)?;
+    airlock_service::create_private_dir(&dir)?;
     // `DUCKTAPE_CRED_REUSE_ARTIFACT=<path>` imports an ALREADY-authenticated
     // vendor login artifact (a `.credentials.json` / `auth.json` the operator
     // already produced) instead of driving the vendor's browser OAuth flow —
@@ -456,7 +460,16 @@ fn cmd_add(
         .filter(|src| !src.is_empty());
     match reuse {
         Some(src) => {
-            std::fs::copy(&src, dir.join(provider.artifact()))
+            // Read-then-write-0600 rather than `std::fs::copy`, which on Unix
+            // replicates the SOURCE file's mode onto the destination — a
+            // 0644-umask export would otherwise land world-readable inside a
+            // 0700 dir. Stale-file removal mirrors the browser arm below, so a
+            // retry after a prior failed attempt is unambiguous, not a
+            // silent leftover.
+            let bytes = std::fs::read(&src).map_err(|e| format!("reuse artifact {src}: {e}"))?;
+            let artifact_path = dir.join(provider.artifact());
+            let _ = std::fs::remove_file(&artifact_path);
+            airlock_service::write_secret_0600(&artifact_path, &bytes)
                 .map_err(|e| format!("reuse artifact {src}: {e}"))?;
         }
         None => {
