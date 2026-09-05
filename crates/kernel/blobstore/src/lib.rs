@@ -240,6 +240,48 @@ impl BlobStore {
         self.chunk_len(digest).is_some()
     }
 
+    /// presence, VERIFIED — the deliberate integrity read, and the only
+    /// presence answer a hydration gate may trust.
+    ///
+    /// [`BlobStore::has_chunk`] answers a stat, which is right where the asker
+    /// is attacker-paced (the serve cap, the push admission: a peer must not be
+    /// able to bill this node for a 1 GiB read) and WRONG where "present" gates
+    /// a loop that hydrates the bytes. A corrupt file has a size, so the cheap
+    /// answer is `true` while every reader still misses on the hash: the fetch
+    /// short-circuits on a blob nothing can use, nothing re-fetches it, and
+    /// whatever waits on those bytes waits forever.
+    ///
+    /// So this reads and re-hashes, and a file that fails is UNLINKED — the
+    /// bytes are garbage no reader will ever accept, and dropping them is what
+    /// lets the next fetch or seed hydrate the digest.
+    pub fn has_verified_chunk(&mut self, digest: &[u8; 32]) -> bool {
+        if self.chunks.contains_key(digest) {
+            return true;
+        }
+        if self.disk_chunk(digest).is_some() {
+            return true;
+        }
+        // absent, or here and corrupt — `disk_chunk` cannot tell us which, but
+        // a length can: the file exists and did not verify.
+        let corrupt_file_remains = self.chunk_len(digest).is_some();
+        if corrupt_file_remains {
+            // one line per fault, then every Nth: a hot digest re-reads on
+            // every miss, and the ring is the evidence.
+            static DROPPED: Latch = Latch::new();
+            if let Some(occurrences) = DROPPED.hit() {
+                tracing::warn!(
+                    target: "ducktape::blobstore",
+                    reason = "blob_corrupt_dropped",
+                    digest = digest_prefix(digest),
+                    occurrences,
+                    "blob file fails its content hash — unlinked so it can be re-fetched"
+                );
+            }
+            self.forget(digest);
+        }
+        false
+    }
+
     /// drop a blob this node staged — out of the memory map, and off disk
     /// when a root holds it. best-effort: a failed unlink leaves the blob
     /// exactly where it was, which is the behaviour that existed before.
@@ -346,6 +388,14 @@ impl BlobHandle {
             .lock()
             .expect("blob store poisoned")
             .has_chunk(digest)
+    }
+
+    /// see [`BlobStore::has_verified_chunk`].
+    pub fn has_verified_chunk(&self, digest: &[u8; 32]) -> bool {
+        self.0
+            .lock()
+            .expect("blob store poisoned")
+            .has_verified_chunk(digest)
     }
 
     /// see [`BlobStore::chunk_len`].
@@ -586,6 +636,36 @@ mod tests {
                 .as_deref(),
             Some(b"original".as_ref())
         );
+    }
+
+    /// the verifying query is what a hydration gate asks: a corrupt file is
+    /// NOT verified-present, and it is gone afterwards, so the next fetch or
+    /// seed can re-land the digest instead of short-circuiting on garbage.
+    #[test]
+    fn a_corrupt_disk_blob_is_not_verified_present_and_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let digest = BlobHandle::persistent(root.path())
+            .unwrap()
+            .put_chunk(b"original".to_vec());
+        std::fs::write(root.path().join(hex(&digest)), b"tampered").unwrap();
+
+        let fresh = BlobHandle::persistent(root.path()).unwrap();
+        // the cheap answer is a stat, so the corrupt file still has a size.
+        assert!(fresh.has_chunk(&digest));
+        assert!(!fresh.has_verified_chunk(&digest));
+        assert!(
+            !root.path().join(hex(&digest)).exists(),
+            "the corrupt file was left where no lane would ever re-fetch it"
+        );
+        // and now the digest reads as the honest miss it is, on every surface.
+        assert!(!fresh.has_chunk(&digest));
+        assert_eq!(fresh.chunk_len(&digest), None);
+
+        // a healthy blob is verified-present and stays on disk.
+        let good = fresh.put_chunk(b"original".to_vec());
+        assert_eq!(good, digest);
+        assert!(fresh.has_verified_chunk(&digest));
+        assert!(root.path().join(hex(&digest)).is_file());
     }
 
     /// presence and length must cost a stat, not a read. the fixture is a

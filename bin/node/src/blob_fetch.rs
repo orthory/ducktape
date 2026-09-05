@@ -297,7 +297,13 @@ pub async fn fetch_blob<C: SyncClient + SourceRotate>(
     cap: u64,
     attempts: usize,
 ) -> Result<(), BlobFetchError> {
-    if blobs.has_chunk(digest) {
+    // VERIFIED-resident, not merely present. this gate is the one place where a
+    // stat-shaped answer wedges the node: a corrupt local file has a size, so a
+    // cheap check returns Ok here, the readiness probe's `get_chunk` keeps
+    // missing on the hash, and the swap waiting on these bytes retries forever
+    // against a fetch that never runs. the verifying query drops the bad file,
+    // so the attempt below re-lands it.
+    if blobs.has_verified_chunk(digest) {
         return Ok(());
     }
     let mut last = BlobFetchError::Miss;
@@ -648,7 +654,10 @@ async fn sweep_packs_once<C: SyncClient + SourceRotate>(
     };
     let mut pulled = 0usize;
     for pending in outstanding {
-        if blobs.has_chunk(&pending.digest) {
+        // VERIFYING, not cheap: this decides whether the sweep pulls at all, so
+        // a corrupt pack file answering "held" would park the digest here
+        // forever — and the verifying query drops it, so the pull below lands.
+        if blobs.has_verified_chunk(&pending.digest) {
             continue; // held already; forge materializes it on its own.
         }
         // the pushed pack first: it is the exact answer, and while any node
@@ -1007,6 +1016,40 @@ mod tests {
             .expect_err("a lying source must never publish");
         assert!(matches!(err, BlobFetchError::Corrupt), "got {err}");
         assert!(!local.has_chunk(&digest));
+    }
+
+    /// the wedge the verifying gate exists to stop: a corrupt local file has a
+    /// size, so a stat-shaped presence check would answer the fetch "already
+    /// held" while the readiness probe's `get_chunk` keeps missing on the hash
+    /// — a swap that retries forever against a fetch that never runs.
+    #[tokio::test]
+    async fn a_corrupt_local_copy_is_refetched_not_reported_held() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let truth = payload();
+        let source = blobstore::BlobHandle::default();
+        let digest = source.put_chunk(truth.clone());
+
+        let local = blobstore::BlobHandle::persistent(root.path()).expect("blob root");
+        local.put_chunk(truth.clone());
+        std::fs::write(root.path().join(hex_name(&digest)), b"rotted").expect("corrupt the file");
+        // cold memory: the corrupt file is all this node has.
+        let local = blobstore::BlobHandle::persistent(root.path()).expect("blob root");
+        assert_eq!(local.get_chunk(&digest), None, "the local copy is unusable");
+
+        fetch_blob(
+            &StoreClient::new(vec![source]),
+            &local,
+            &digest,
+            u64::MAX,
+            1,
+        )
+        .await
+        .expect("the fetch must run and heal the digest");
+        assert_eq!(local.get_chunk(&digest), Some(truth));
+    }
+
+    fn hex_name(digest: &[u8; 32]) -> String {
+        digest.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     #[tokio::test]

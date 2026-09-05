@@ -242,7 +242,9 @@ fn seed_workspace_genesis(
         verify_genesis(&bytes, hash, want).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut seeded = 0usize;
     for (id, digest) in want {
-        if blobs.has_chunk(digest) {
+        // the VERIFYING query: seeding is what heals a corrupt component, and a
+        // stat-shaped "present" would skip exactly the file that needs it.
+        if blobs.has_verified_chunk(digest) {
             continue;
         }
         // verified above: every id in `want` is a component hashing to `digest`.
@@ -252,7 +254,7 @@ fn seed_workspace_genesis(
         blobs.put_chunk(component.to_vec());
         seeded += 1;
     }
-    if !blobs.has_chunk(hash) {
+    if !blobs.has_verified_chunk(hash) {
         blobs.put_chunk(bytes);
     }
     // a lifecycle fact: bytes entered the store (a restart over a seeded store
@@ -282,7 +284,8 @@ fn seed_founding_set(
 ) -> Result<(), String> {
     let mut seeded = 0usize;
     for (id, digest) in want {
-        if blobs.has_chunk(digest) {
+        // verifying, for the same reason as the genesis seed above.
+        if blobs.has_verified_chunk(digest) {
             continue;
         }
         let path = component_path(dir, id);
