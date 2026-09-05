@@ -559,10 +559,7 @@ async fn forward_responses(
     }
     let status =
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = upstream
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok());
+    let content_type = upstream_content_type(upstream.headers());
     let content_type_str = upstream
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -636,6 +633,50 @@ async fn forward_responses(
     response
 }
 
+/// Headers we never forward to either upstream call — hop-by-hop framing, the
+/// child's own credentials (replaced with the operator's), and the overlay
+/// routing header (OURS to set, never the child's: reqwest `.header()`
+/// APPENDS, and the browser-gateway reads the FIRST `x-duck-authority` — a
+/// child value left in would let the sandbox redirect the request, carrying
+/// the scoped session token, to an attacker-chosen overlay node; `route()`
+/// re-adds our own authority). `x-api-key` is Anthropic-only and
+/// `accept-encoding` is stripped for both providers: our reqwest is built
+/// without the gzip/brotli features (Cargo.toml), so it never
+/// auto-decompresses, and the response side forwards only `content-type` —
+/// leave `accept-encoding` in and a compressed reply reaches the sandbox
+/// mislabeled and fails to parse (live-verified against api.anthropic.com).
+/// Stripping a header a given provider never sends is a harmless no-op for it.
+fn is_stripped_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization"
+            | "x-api-key"
+            | "host"
+            | "content-length"
+            | "connection"
+            | "transfer-encoding"
+            | "x-duck-authority"
+            | "origin"
+            | "accept-encoding"
+    )
+}
+
+/// Copy the upstream response's `content-type` through to the sandbox. We
+/// never forward `content-encoding`: `accept-encoding` is stripped on the way
+/// up (see [`is_stripped_request_header`]), so a well-behaved upstream never
+/// compresses the reply — asserted here so a provider that ignores
+/// `accept-encoding` fails loudly in tests rather than silently mislabeling a
+/// compressed body as plain.
+fn upstream_content_type(headers: &reqwest::header::HeaderMap) -> Option<HeaderValue> {
+    debug_assert!(
+        !headers.contains_key(reqwest::header::CONTENT_ENCODING),
+        "upstream sent content-encoding despite accept-encoding being stripped"
+    );
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok())
+}
+
 /// Build the codex upstream request (target URL + forwarded headers + the
 /// current credential) and send it, WITHOUT consuming the body — so a gateway
 /// 401 can be retried after an airlock re-handshake. Returns the response plus
@@ -652,16 +693,7 @@ async fn send_codex(
     // The overlay routing headers are OURS to set on the airlock path, never the
     // child's (see the anthropic broker's note) — drop any it injected.
     for (name, value) in headers {
-        if matches!(
-            name.as_str(),
-            "authorization"
-                | "host"
-                | "content-length"
-                | "connection"
-                | "transfer-encoding"
-                | "x-duck-authority"
-                | "origin"
-        ) {
+        if is_stripped_request_header(name.as_str()) {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -1847,30 +1879,7 @@ async fn send_upstream(
     // replace with the operator's upstream credential (or, in airlock mode, the
     // scoped session token — see [`AnthropicAuth::authorize`]).
     for (name, value) in headers {
-        if matches!(
-            name.as_str(),
-            "authorization"
-                | "x-api-key"
-                | "host"
-                | "content-length"
-                | "connection"
-                | "transfer-encoding"
-                // SECURITY: the overlay routing headers are OURS to set, never
-                // the child's. reqwest `.header()` APPENDS, and the browser-gateway
-                // reads the FIRST `x-duck-authority` (+ derives its Origin check
-                // from it); leaving a child value in would let the sandbox redirect
-                // this request — carrying the scoped session token — to an
-                // attacker-chosen overlay node. `route()` re-adds our own authority.
-                | "x-duck-authority"
-                | "origin"
-                // Drop accept-encoding so upstream replies UNCOMPRESSED: our
-                // reqwest is built without the gzip/brotli features, so it does
-                // NOT auto-decompress, and we forward only content-type (not
-                // content-encoding) — leave it in and the client would get gzip
-                // bytes labelled as plain and fail with "Failed to parse JSON"
-                // (live-verified against api.anthropic.com).
-                | "accept-encoding"
-        ) {
+        if is_stripped_request_header(name.as_str()) {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -1997,10 +2006,7 @@ async fn forward_messages(
         StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     // Pass the upstream content-type through (text/event-stream for SSE). The
     // BODY streams through unbuffered below — buffering would stall the TUI.
-    let content_type = upstream
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok());
+    let content_type = upstream_content_type(upstream.headers());
 
     // STREAM the upstream body through as a bounded stream. Error bodies flow
     // through this same path unmodified (Claude Code's retry/downgrade matches
@@ -2282,6 +2288,59 @@ mod tests {
         upstream_task.abort();
     }
 
+    /// A codex child that sends `accept-encoding: gzip` must never have it
+    /// relayed upstream — our reqwest client has no gzip/brotli feature, so it
+    /// never decompresses, and the response side forwards only content-type
+    /// (see `upstream_content_type`). Leaving the header in gets a compressed
+    /// reply back mislabeled as plain text/event-stream.
+    #[tokio::test]
+    async fn codex_strips_accept_encoding_upstream() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let seen_handler = seen.clone();
+        let upstream = Router::new().route(
+            "/responses",
+            post(move |headers: HeaderMap| async move {
+                *seen_handler.lock().unwrap() = Some(headers);
+                (StatusCode::OK, "ok")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let broker = RunBroker::start_with(UpstreamCredential {
+            bearer: "unused".into(),
+            account_id: None,
+            url: format!("http://{addr}/responses"),
+        })
+        .await
+        .unwrap();
+        let invocation = broker.begin_invocation();
+        invocation.arm(tokio::time::Instant::now() + Duration::from_secs(60));
+        let client = reqwest::Client::new();
+        let endpoint = format!("{}/responses", invocation.endpoint.base_url);
+
+        let resp = client
+            .post(&endpoint)
+            .bearer_auth(&invocation.endpoint.run_bearer)
+            .header("accept-encoding", "gzip")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let headers = seen.lock().unwrap().take().unwrap();
+        assert!(
+            headers.get("accept-encoding").is_none(),
+            "accept-encoding must not reach the codex upstream: {headers:?}"
+        );
+        upstream_task.abort();
+    }
+
     // ---- Anthropic Messages broker -----------------------------------------
 
     use std::sync::Mutex;
@@ -2438,6 +2497,36 @@ mod tests {
         assert_eq!(
             headers["anthropic-beta"],
             "oauth-2025-04-20,fine-grained-tool-streaming-2025-05-14"
+        );
+        upstream.abort();
+    }
+
+    /// Same guarantee as `codex_strips_accept_encoding_upstream`, for the
+    /// Anthropic path: `accept-encoding` never reaches the messages upstream.
+    #[tokio::test]
+    async fn anthropic_strips_accept_encoding_upstream() {
+        let (url, seen, upstream) =
+            mock_upstream(StatusCode::OK, "application/json", "{\"ok\":true}").await;
+        let broker =
+            start_anthropic_pointed_at(AnthropicAuth::ApiKey("host-secret".into()), url).await;
+        let client = reqwest::Client::new();
+        let endpoint = format!("{}/v1/messages", broker.endpoint.base_url);
+
+        let resp = client
+            .post(&endpoint)
+            .bearer_auth(&broker.endpoint.run_bearer)
+            .header("accept-encoding", "gzip")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        let seen = seen.lock().unwrap();
+        let headers = seen.headers.as_ref().unwrap();
+        assert!(
+            headers.get("accept-encoding").is_none(),
+            "accept-encoding must not reach the anthropic upstream: {headers:?}"
         );
         upstream.abort();
     }
