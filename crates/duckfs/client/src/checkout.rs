@@ -42,8 +42,56 @@ pub enum CheckoutError {
         .0.join(", ")
     )]
     CaseCollision(Vec<String>),
+    #[error(
+        "duckfs: checkout refused a symlink whose target leaves the checkout \
+         root: {0}"
+    )]
+    EscapingLink(String),
     #[error(transparent)]
     Index(#[from] crate::index::IndexError),
+}
+
+/// does `target`, published for the symlink landing at `entry`, resolve back
+/// inside the checkout `root`?
+///
+/// A published symlink's target is whatever the publisher wrote — an absolute
+/// path names something on the CHECKING-OUT machine (an operator's keystore,
+/// their ssh keys), and a `..` target walks out of the checkout to the same
+/// effect. Neither means anything inside the tree, so neither is materialized.
+///
+/// Purely lexical: it decides without touching the disk, so a target that does
+/// not exist yet cannot talk it into a yes.
+///
+/// The sandbox's asset stager carries the same ten lines. Sharing them would
+/// put a duckfs dependency on the sandbox crate (or a sandbox one on duckfs)
+/// for a lexical path check, which is a worse trade than the duplication.
+fn link_stays_inside(root: &Path, entry: &Path, target: &Path) -> bool {
+    use std::path::Component;
+    if target.is_absolute() {
+        return false;
+    }
+    let Ok(relative) = entry.strip_prefix(root) else {
+        return false;
+    };
+    // start where the link itself lands, then walk its target from there.
+    let mut walked: Vec<Component<'_>> = match relative.parent() {
+        Some(parent) => parent.components().collect(),
+        None => Vec::new(),
+    };
+    for part in target.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if walked.pop().is_none() {
+                    return false;
+                }
+            }
+            Component::Normal(name) => walked.push(Component::Normal(name)),
+            // a root or a windows prefix is an absolute target by another name.
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
 }
 
 fn io<E: std::fmt::Display>(e: E) -> CheckoutError {
@@ -158,6 +206,9 @@ pub fn checkout_with(
                 let target = String::from_utf8(target_bytes).map_err(|_| {
                     CheckoutError::Verify(format!("{}: non-utf8 target", entry.path))
                 })?;
+                if !link_stays_inside(dir, &disk, Path::new(&target)) {
+                    return Err(CheckoutError::EscapingLink(entry.path.clone()));
+                }
                 // resumable: remove an existing entry before re-linking.
                 if disk.symlink_metadata().is_ok() {
                     std::fs::remove_file(&disk).map_err(io)?;

@@ -196,3 +196,37 @@ fn checkout_is_resumable_over_a_half_materialized_dir() {
         "converged clean"
     );
 }
+
+/// a published symlink's target is whatever the PUBLISHER wrote. Recreating
+/// `notes -> /home/<op>/.ducktape` verbatim hands whatever reads the checkout
+/// next — the sandbox asset stager, the agent run itself — a door out of the
+/// tree onto the checking-out machine's own files.
+#[test]
+fn a_symlink_leaving_the_checkout_root_is_refused() {
+    for target in ["/home/op/.ducktape", "../../escape"] {
+        let node = ModuleNode::new();
+        node.seed_commit(
+            None,
+            "seed",
+            vec![
+                put_inline(&format!("{PREFIX}/readme.txt"), b"hello duckfs", false),
+                Change::Symlink {
+                    path: format!("{PREFIX}/sub/notes"),
+                    target: target.into(),
+                },
+            ],
+        )
+        .expect("seed commit");
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = checkout(&node, dir.path(), PREFIX, None).expect_err("refused");
+        assert!(
+            matches!(err, CheckoutError::EscapingLink(_)),
+            "{target} must be refused, got {err}"
+        );
+        assert!(
+            dir.path().join("sub/notes").symlink_metadata().is_err(),
+            "{target} must not be materialized"
+        );
+    }
+}
