@@ -390,8 +390,14 @@ impl Modules {
                 "scheduled code_hash equals the active code (no-op swap)".into(),
             ));
         }
-        // at most one pending swap per module.
-        if entry.pending.is_some() {
+        // at most one pending swap per module — but a STALE pending (past its
+        // activation height with readiness never latched) never arms, so a new
+        // schedule REPLACES it rather than being refused forever.
+        let in_flight = entry
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.stale_at(ctx.env().height));
+        if in_flight {
             return Err(Error::Module(format!(
                 "module {module_id} already has a pending swap (cancel it first)"
             )));
@@ -474,17 +480,19 @@ impl Modules {
             .entry(&module_id)
             .await?
             .ok_or_else(|| Error::Module(format!("no such module {module_id}")))?;
-        match &entry.pending {
-            // can only cancel BEFORE the boundary — never race an arming swap.
-            Some(swap) if swap.name == name && height < swap.activation_height => {}
-            Some(swap) if swap.name == name => {
-                return Err(Error::Module(
-                    "cannot cancel: activation height already reached".into(),
-                ));
-            }
-            _ => {
-                return Err(Error::Module("no matching pending swap to cancel".into()));
-            }
+        let matching = entry.pending.as_ref().filter(|swap| swap.name == name);
+        let Some(swap) = matching else {
+            return Err(Error::Module("no matching pending swap to cancel".into()));
+        };
+        // never race an ARMING swap: one whose readiness latched and whose
+        // activation height is reached is the boundary's business now. a stale
+        // pending (due, never latched) is still governance's to withdraw.
+        let due = swap.activation_height <= height;
+        let cancellable = !due || swap.stale_at(height);
+        if !cancellable {
+            return Err(Error::Module(
+                "cannot cancel: activation height already reached".into(),
+            ));
         }
         entry.pending = None;
         // cancelling an ADMISSION (no activation yet: the module never ran)

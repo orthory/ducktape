@@ -399,12 +399,80 @@ fn swap_cancel_guards_and_clears() {
     .unwrap();
     commit(&mut lc);
     assert!(run(&mut lc, &mut sys, &cancel_swap("hello", "vX")).is_err());
+    // ARMED (readiness latched) and past its activation height: the boundary's
+    // business, not governance's.
+    make_swap_ready(&mut lc, "hello", "replacement");
     let mut late = ctx(Origin::System, 10);
     assert!(run(&mut lc, &mut late, &cancel_swap("hello", "replacement")).is_err());
     run(&mut lc, &mut sys, &cancel_swap("hello", "replacement")).unwrap();
     commit(&mut lc);
     assert!(module_status(&lc)[0].pending.is_none());
     assert_eq!(module_status(&lc)[0].active_code_hash, hash(1));
+}
+
+/// a pending that PASSED its activation height without ever latching readiness
+/// never arms — the shape a designation for a component no validator can probe
+/// takes. governance may replace it and may cancel it; an armed or not-yet-due
+/// pending still refuses both.
+#[test]
+fn a_stale_pending_swap_is_replaceable_and_cancellable() {
+    // replace: reschedule to a new hash past the dead activation height.
+    let mut lc = fresh();
+    register_module(&mut lc, "hello", 1);
+    let mut sys = ctx(Origin::System, 0);
+    run(&mut lc, &mut sys, &schedule_swap("hello", "dead", 10, 2)).unwrap();
+    commit(&mut lc);
+    // not yet due: still refuses a second schedule and a cancel is allowed.
+    let mut early = ctx(Origin::System, 9);
+    assert!(run(&mut lc, &mut early, &schedule_swap("hello", "next", 40, 3)).is_err());
+    let mut past = ctx(Origin::System, 30);
+    run(&mut lc, &mut past, &schedule_swap("hello", "next", 40, 3)).unwrap();
+    commit(&mut lc);
+    let pending = module_status(&lc)[0].pending.clone().unwrap();
+    assert_eq!(pending.name, "next");
+    assert_eq!(pending.code_hash, hash(3));
+    assert!(armed_at(&lc, 30).is_empty());
+
+    // cancel: the same stale pending, withdrawn instead of replaced.
+    let mut lc = fresh();
+    register_module(&mut lc, "hello", 1);
+    run(&mut lc, &mut sys, &schedule_swap("hello", "dead", 10, 2)).unwrap();
+    commit(&mut lc);
+    let mut past = ctx(Origin::System, 30);
+    run(&mut lc, &mut past, &cancel_swap("hello", "dead")).unwrap();
+    commit(&mut lc);
+    assert!(module_status(&lc)[0].pending.is_none());
+
+    // ARMED past its height: neither replaceable nor cancellable.
+    let mut lc = fresh();
+    register_module(&mut lc, "hello", 1);
+    run(&mut lc, &mut sys, &schedule_swap("hello", "armed", 10, 2)).unwrap();
+    commit(&mut lc);
+    make_swap_ready(&mut lc, "hello", "armed");
+    let mut past = ctx(Origin::System, 30);
+    assert!(run(&mut lc, &mut past, &schedule_swap("hello", "next", 40, 3)).is_err());
+    assert!(run(&mut lc, &mut past, &cancel_swap("hello", "armed")).is_err());
+}
+
+/// the netstack shape: an ADMISSION (never activated, so no readiness probe can
+/// ever latch it) is re-designated by a later schedule once it is past due.
+#[test]
+fn a_stale_admission_is_re_designated() {
+    let mut lc = fresh();
+    let mut sys = ctx(Origin::System, 0);
+    run(
+        &mut lc,
+        &mut sys,
+        &schedule_register("netstack", "v1", 10, 2),
+    )
+    .unwrap();
+    commit(&mut lc);
+    let mut past = ctx(Origin::System, 30);
+    run(&mut lc, &mut past, &schedule_swap("netstack", "v2", 40, 3)).unwrap();
+    commit(&mut lc);
+    let entry = &module_status(&lc)[0];
+    assert!(entry.active_code_hash.is_empty());
+    assert_eq!(entry.pending.as_ref().unwrap().code_hash, hash(3));
 }
 
 // ---- admission (ScheduleRegister) -------------------------------------------
