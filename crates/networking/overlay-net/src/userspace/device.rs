@@ -348,6 +348,18 @@ impl PeerState {
             // pass is the drain, which flushes packets WE queued and so
             // proves nothing about the peer.
             let carries_peer_input = op.is_some();
+            // an inbound cookie reply decrypts under a PUBLIC key (this
+            // peer's static public, hashed) with a plaintext aad
+            // (`last_mac1`) and a plaintext routing field (`receiver_idx`) —
+            // both fields of the handshake initiation WE just sent in the
+            // clear. it proves nothing about the peer and boringtun answers
+            // it with `TunnResult::Done`, indistinguishable from an
+            // authenticated keepalive unless we classify the input first.
+            let is_inbound_cookie_reply = matches!(
+                &op,
+                Some(TunnOp::Decapsulate { datagram, .. })
+                    if matches!(Tunn::parse_incoming_packet(datagram), Ok(Packet::PacketCookieReply(_)))
+            );
             let result = match op.take() {
                 Some(TunnOp::Decapsulate { src, datagram }) => {
                     tunn.decapsulate(Some(src), datagram, &mut buf[..])
@@ -394,10 +406,12 @@ impl PeerState {
                     break;
                 }
                 // `Done` on the first pass is an authenticated no-op (a
-                // keepalive, a cookie absorbed); on a drain pass it just ends
+                // keepalive) UNLESS the input was a cookie reply, which
+                // proves nothing (see `is_inbound_cookie_reply` above) and
+                // must never roam the endpoint; on a drain pass it just ends
                 // the flush, leaving `authenticated` as the first pass set it.
                 TunnResult::Done => {
-                    out.authenticated |= carries_peer_input;
+                    out.authenticated |= carries_peer_input && !is_inbound_cookie_reply;
                     break;
                 }
                 TunnResult::Err(WireGuardError::ConnectionExpired) => {
@@ -849,6 +863,8 @@ mod tests {
     use blake2::digest::consts::U16;
     use blake2::digest::{FixedOutput, KeyInit, Update};
     use blake2::{Blake2s256, Blake2sMac, Digest};
+    use chacha20poly1305::aead::{Aead, Payload};
+    use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
     use super::*;
 
@@ -857,6 +873,50 @@ mod tests {
     /// mac1(16) mac2(16).
     const HANDSHAKE_RESP_SZ: usize = 92;
     const MAC1_OFFSET: usize = HANDSHAKE_RESP_SZ - 32;
+
+    /// wire size of the handshake-initiation message, from the WireGuard
+    /// spec: type(4) sender(4) ephemeral(32) static(48) timestamp(28)
+    /// mac1(16) mac2(16).
+    const HANDSHAKE_INIT_SZ: usize = 148;
+
+    /// the label boringtun hashes with a peer's static public key to derive
+    /// the key a cookie reply is encrypted under (`noise::handshake::LABEL_COOKIE`,
+    /// private to that crate — this is its published value, not a secret).
+    const LABEL_COOKIE: &[u8; 8] = b"cookie--";
+
+    /// a GENUINELY decryptable cookie reply, built exactly as an on-path
+    /// attacker would: `key = HASH(LABEL_COOKIE || responder_public)` is a
+    /// hash of a PUBLIC key, and `aad = last_mac1` is a plaintext field of
+    /// the handshake initiation the attacker captured — no private key
+    /// material goes into this at all.
+    fn forged_cookie_reply(
+        receiver_idx: u32,
+        last_mac1: &[u8; 16],
+        responder_public: &PublicKey,
+    ) -> Vec<u8> {
+        let mut hash = Blake2s256::new();
+        Digest::update(&mut hash, LABEL_COOKIE);
+        Digest::update(&mut hash, responder_public.as_bytes());
+        let key: [u8; 32] = hash.finalize().into();
+        let nonce = XNonce::default(); // any nonce decrypts; content is opaque cookie bytes
+        let cipher = XChaCha20Poly1305::new(&key.into());
+        let ciphertext = cipher
+            .encrypt(
+                &nonce,
+                Payload {
+                    msg: &[0u8; 16], // the "cookie" payload; its content is never checked by us
+                    aad: last_mac1,
+                },
+            )
+            .expect("encrypt forged cookie");
+
+        let mut pkt = vec![0u8; 64];
+        pkt[0] = 3; // message type: cookie reply
+        pkt[4..8].copy_from_slice(&receiver_idx.to_le_bytes());
+        pkt[8..32].copy_from_slice(nonce.as_slice());
+        pkt[32..64].copy_from_slice(&ciphertext);
+        pkt
+    }
 
     /// a handshake-response-shaped datagram addressed at `receiver_idx`, with
     /// a CORRECT mac1 (anyone can compute it — the key is a hash of the
@@ -1042,6 +1102,100 @@ mod tests {
                 Ok(Packet::HandshakeResponse(_))
             ),
             "a reset limiter must answer a real handshake with a real response, not a cookie"
+        );
+    }
+
+    /// a forged cookie reply is NOT peer authentication (issue: an inbound
+    /// cookie reply decrypts under the peer's PUBLIC key with a plaintext
+    /// aad — see `forged_cookie_reply`), so it must never roam the peer's
+    /// endpoint. the attacker here needs no private key: it captures the
+    /// device's real handshake initiation (reading `sender_idx` and `mac1`
+    /// straight off the wire, exactly as an on-path attacker would) and
+    /// replies with a cookie that decrypts successfully but proves nothing
+    /// about who sent it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_forged_cookie_reply_never_roams_the_endpoint() {
+        let handle = tokio::runtime::Handle::current();
+        let secret = StaticSecret::from([21u8; 32]);
+        let public = PublicKey::from(&secret);
+        let peer_secret = StaticSecret::from([23u8; 32]);
+        let peer_public = PublicKey::from(&peer_secret);
+
+        let underlay = UnderlaySocket::bind(&handle, 0).expect("bind underlay");
+        let (to_stack, _stack_rx) = mpsc::channel(16);
+        let (_stack_tx, from_stack) = mpsc::channel(16);
+        let device = WgDevice::spawn(&handle, underlay, secret, to_stack, from_stack);
+
+        // the real peer's socket: it receives the device's genuine handshake
+        // initiation (so the test can read the real `sender_idx`/`mac1` off
+        // it, exactly as an on-path attacker sniffing the same datagram
+        // would) but never answers — this proof is about what an UNANSWERED
+        // initiation's forged cookie reply can do, not about a completed
+        // handshake.
+        let real_endpoint_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind real endpoint");
+        let real_endpoint = real_endpoint_socket
+            .local_addr()
+            .expect("real endpoint addr");
+
+        let peer_ip: Ipv6Addr = "fd00::4".parse().expect("peer ula");
+        device.replace_peers(&[PeerConfig {
+            public_key: peer_public.to_bytes(),
+            endpoint: Some(real_endpoint),
+            persistent_keepalive: None,
+            allowed_ips: vec![peer_ip],
+        }]);
+        let peer = device.peer_by_ip(peer_ip).expect("peer installed");
+
+        device
+            .initiate_handshake(peer_ip, true)
+            .await
+            .expect("initiate handshake");
+        let mut init = [0u8; MAX_PACKET];
+        let init_len = real_endpoint_socket
+            .recv(&mut init)
+            .await
+            .expect("recv handshake initiation");
+        assert_eq!(init_len, HANDSHAKE_INIT_SZ, "must be a plain initiation");
+        let sender_idx = u32::from_le_bytes(init[4..8].try_into().expect("sender idx bytes"));
+        let mac1_offset = HANDSHAKE_INIT_SZ - 32;
+        let last_mac1: [u8; 16] = init[mac1_offset..mac1_offset + 16]
+            .try_into()
+            .expect("mac1 bytes");
+
+        // the attacker: an address distinct from the real endpoint — if the
+        // forged reply were credited, this is where the tunnel would
+        // black-hole to. an absorbed cookie reply emits nothing back, so
+        // there is no network event to wait on; this drives the exact op
+        // `inbound_pump` drives (`TunnOp::Decapsulate` on the real `Tunn`,
+        // through the real boringtun crypto) directly, then applies
+        // `inbound_pump`'s own roaming decision (`device.rs`'s
+        // `if out.authenticated { ... }`) to the result — deterministic,
+        // no timing assumption.
+        let attacker_addr: SocketAddr = "203.0.113.66:4444".parse().expect("attacker addr");
+        let forged = forged_cookie_reply(sender_idx, &last_mac1, &public);
+        let mut buf = Box::new([0u8; MAX_PACKET]);
+        let out = peer.tunn_call(
+            TunnOp::Decapsulate {
+                src: attacker_addr.ip(),
+                datagram: &forged,
+            },
+            &mut buf,
+        );
+        assert!(
+            !out.authenticated,
+            "an inbound cookie reply must never be credited as authenticated"
+        );
+        if out.authenticated {
+            *peer.endpoint.write().expect("endpoint lock poisoned") = Some(attacker_addr);
+        }
+
+        let endpoint = *peer.endpoint.read().expect("endpoint lock poisoned");
+        assert_eq!(
+            endpoint,
+            Some(real_endpoint),
+            "a forged cookie reply roamed the peer's endpoint"
         );
     }
 }
