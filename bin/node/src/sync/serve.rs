@@ -317,6 +317,22 @@ pub(crate) fn sync_lease_active(lease: &std::sync::atomic::AtomicU64) -> bool {
     unix_now_secs().saturating_sub(last_served) < SYNC_LEASE_SECS
 }
 
+/// whether serving `req` should renew the retention lease above. only the
+/// lanes that read a boundary the oplog prune can invalidate need it:
+/// Manifest/Chunk/Module capture one, and Frames reads the oplog journal
+/// directly. TipCoords (the coordinates-only detection lane, polled every
+/// `ROOT_POLL_TICK` by every peer) and IndexOps (node-local derived index
+/// rows the oplog prune never touches — see `SyncRequest::IndexOps`) carry
+/// no such risk, so they must NOT renew it: a fleet's routine TipCoords
+/// polling alone would otherwise keep the lease permanently active and the
+/// drain's oplog prune would never fire.
+pub(crate) fn renews_sync_lease(req: &statesync::SyncRequest) -> bool {
+    !matches!(
+        req,
+        statesync::SyncRequest::TipCoords | statesync::SyncRequest::IndexOps { .. }
+    )
+}
+
 pub(crate) fn to_node_disposition(disposition: statesync::FrameDisposition) -> node::Disposition {
     match disposition {
         statesync::FrameDisposition::Applied => node::Disposition::Applied,
@@ -805,6 +821,41 @@ pub(crate) async fn drive_sync_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tip_coords_and_index_ops_do_not_renew_the_lease() {
+        assert!(!renews_sync_lease(&statesync::SyncRequest::TipCoords));
+        assert!(!renews_sync_lease(&statesync::SyncRequest::IndexOps {
+            boundary: 1,
+            module: "m".to_string(),
+            after: None,
+        }));
+    }
+
+    #[test]
+    fn state_bearing_lanes_renew_the_lease() {
+        assert!(renews_sync_lease(&statesync::SyncRequest::Manifest));
+        assert!(renews_sync_lease(&statesync::SyncRequest::Chunk {
+            boundary: statesync::BoundaryId {
+                height: 1,
+                root_hash: StateRoot::ZERO,
+            },
+            module_id: "m".to_string(),
+            offset: 0,
+        }));
+        assert!(renews_sync_lease(&statesync::SyncRequest::Module {
+            boundary: statesync::BoundaryId {
+                height: 1,
+                root_hash: StateRoot::ZERO,
+            },
+            module_id: "m".to_string(),
+            body: Vec::new(),
+        }));
+        assert!(renews_sync_lease(&statesync::SyncRequest::Frames {
+            after_height: 0,
+            up_to_height: 1,
+        }));
+    }
 
     fn frame(height: u64, payload_len: usize) -> statesync::FinalizedFrame {
         statesync::FinalizedFrame {

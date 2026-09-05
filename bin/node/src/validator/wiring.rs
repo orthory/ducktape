@@ -502,11 +502,17 @@ pub(super) fn wire_serve_lanes(
                     req => {
                         // renew the sync retention lease: this node is
                         // actively serving a syncer, so the drain defers
-                        // oplog pruning until the lease lapses.
-                        sync_lease_serve.store(
-                            crate::sync::serve::unix_now_secs(),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        // oplog pruning until the lease lapses. only the
+                        // state-bearing lanes renew it (see
+                        // `sync::serve::renews_sync_lease`) — the
+                        // coordinates-only TipCoords poll and the
+                        // never-pruned IndexOps backfill must not.
+                        if crate::sync::serve::renews_sync_lease(&req) {
+                            sync_lease_serve.store(
+                                crate::sync::serve::unix_now_secs(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
                         drive_sync_request(&mut server, &mut pager, &state_tx, req).await
                     }
                 };
