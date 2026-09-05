@@ -93,6 +93,14 @@ pub const MAX_SESSION_FORWARDS: u32 = 64;
 /// 2 s, so 250 ms only ever bites abuse (a too-fast retransmit is dropped, not
 /// fatal).
 pub const MIN_FORWARD_GAP: Duration = Duration::from_millis(250);
+/// Cap on retry Intro frames RECEIVED, forwarded or not. `MAX_SESSION_FORWARDS`
+/// only bounds frames that clear the pacing floor; a frame the floor drops
+/// still costs a channel recv and a frame decode, so a flood that never once
+/// clears `MIN_FORWARD_GAP` would otherwise run the full `SESSION_TTL` for
+/// free. Sized at 4x `MAX_SESSION_FORWARDS` — generous slack over what a
+/// legitimate joiner's ~2 s cadence produces (~45 frames in 90 s), tight
+/// enough to close a flood long before it matters.
+pub const MAX_SESSION_FRAMES: u32 = MAX_SESSION_FORWARDS * 4;
 /// Bound on one relay->joiner frame write. A joiner that stops READING its
 /// TCP stream would otherwise park the session inside an unbounded
 /// `write_all` once the kernel send buffer fills — a state the TTL branch
@@ -634,6 +642,8 @@ impl Session {
         let target = intro.target;
         let mut forwards: u32 = 1;
         let mut replies: u32 = 0;
+        let mut frames: u32 = 0;
+        let mut frames_dropped: u32 = 0;
         let mut last_forward = Instant::now();
         let deadline = Instant::now() + SESSION_TTL;
         let mut buf = [0u8; MAX_FRAME_LEN];
@@ -650,16 +660,30 @@ impl Session {
                             if retry.caller != caller || retry.target != target {
                                 return SessionEnd::Refused(REASON_MALFORMED);
                             }
-                            if verify_intro(&self.policy, &retry).is_err() {
-                                return SessionEnd::Refused(REASON_NOT_AUTHORIZED);
+                            // Frame budget FIRST: bounds sheer frame churn on
+                            // this connection, independent of whether frames
+                            // clear pacing or the forward budget below.
+                            frames += 1;
+                            if frames > MAX_SESSION_FRAMES {
+                                note_frame_budget_exceeded(caller, target, frames_dropped);
+                                return SessionEnd::Closed;
                             }
-                            // Pacing floor: the joiner's 2 s cadence never trips
-                            // this; a flood does, and is dropped without malice.
+                            // Pacing floor next, still ahead of the ed25519
+                            // verify: the joiner's 2 s cadence never trips
+                            // this, a flood does, and is dropped without
+                            // malice or a signature check.
                             if last_forward.elapsed() < MIN_FORWARD_GAP {
+                                frames_dropped += 1;
                                 continue;
                             }
                             if forwards >= MAX_SESSION_FORWARDS {
                                 return SessionEnd::Closed;
+                            }
+                            // The verify is the expensive gate, so it runs
+                            // last, only for a frame that already cleared
+                            // pacing and the forward budget.
+                            if verify_intro(&self.policy, &retry).is_err() {
+                                return SessionEnd::Refused(REASON_NOT_AUTHORIZED);
                             }
                             // Re-resolve: the member may have rebound (new
                             // reflexive) since the last forward.
@@ -742,6 +766,26 @@ fn note_refused(peer: SocketAddr, reason: &'static [u8]) {
             peer = %peer,
             occurrences,
             "relay session refused"
+        );
+    }
+}
+
+/// One session closed for exceeding `MAX_SESSION_FRAMES`, latched: a flood
+/// that never once clears `MIN_FORWARD_GAP` still drives this arm once per
+/// frame, and a per-frame log line would be the very bomb this cap exists to
+/// prevent.
+fn note_frame_budget_exceeded(caller: NodeKey, target: NodeKey, frames_dropped: u32) {
+    static EXCEEDED: Latch = Latch::new();
+    if let Some(occurrences) = EXCEEDED.hit("frame_budget_exceeded") {
+        tracing::warn!(
+            target: "ducktape::reachability",
+            event = "relay_session_frame_budget_exceeded",
+            reason = "frame_budget_exceeded",
+            caller = short_key(caller),
+            member = short_key(target),
+            frames_dropped,
+            occurrences,
+            "relay session closed: frame budget exceeded"
         );
     }
 }
@@ -1223,6 +1267,53 @@ mod tests {
         let (_, second) = expect_datagram(&member).await;
         assert_eq!(second, SEALED_INTRO);
         wait_for(&rig.metrics, "two forwards", |m| m.forwards == 2).await;
+    }
+
+    /// The exploit from the issue: one valid, signed intro replayed back to
+    /// back so every retry lands inside `MIN_FORWARD_GAP` and never once
+    /// clears pacing to trip `MAX_SESSION_FORWARDS`. Before the fix that ran
+    /// `verify_intro` for every one of these for the full `SESSION_TTL`; now
+    /// pacing runs (and drops) BEFORE verify, and the frame budget closes the
+    /// session long before the TTL regardless.
+    #[tokio::test]
+    async fn frame_flood_that_never_clears_pacing_closes_on_the_frame_budget() {
+        let rig = rig(AuthPolicy::Public).await;
+        let (_member, member_key) = register_member(&rig, 50).await;
+
+        let (joiner_signer, joiner_key) = keypair(51);
+        let mut conn = RelayConn::connect(rig.relay_addr, Duration::from_secs(2))
+            .await
+            .unwrap();
+        let intro = sign_relay_intro(
+            &joiner_signer,
+            joiner_key,
+            member_key,
+            SEALED_INTRO.to_vec(),
+            now_secs(),
+            None,
+        );
+        // Opens the session and forwards once.
+        conn.send(&RelayFrame::Intro(intro.clone())).await.unwrap();
+
+        // Flood the identical, validly-signed retry as fast as the socket
+        // takes it. Every one lands well inside MIN_FORWARD_GAP, so none of
+        // them can ever reach the (already-passed) MAX_SESSION_FORWARDS
+        // check — only the frame budget can end this.
+        for _ in 0..=MAX_SESSION_FRAMES {
+            conn.send(&RelayFrame::Intro(intro.clone())).await.unwrap();
+        }
+
+        // `Closed` (not `Refused`) sends no frame back: the read side just
+        // observes the relay end of the stream close.
+        assert!(
+            conn.recv(Duration::from_secs(2)).await.is_err(),
+            "the session must close once the frame budget is exceeded"
+        );
+
+        // Only the single pacing-clearing FIRST frame was ever forwarded;
+        // every flooded retry was paced out before it could re-verify or
+        // re-forward.
+        assert_eq!(rig.metrics.snapshot().forwards, 1);
     }
 
     #[tokio::test]
