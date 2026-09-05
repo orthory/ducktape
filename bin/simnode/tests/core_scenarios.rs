@@ -90,10 +90,12 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
 
     // the LOGICAL clock is the lease clock: walk it with filler blocks to the
     // last in-lease height. a reclaim executing AT the deadline still fails…
+    // each tick delivers to the "filler" origin's OWN queue: inbox refuses an
+    // external `Deliver` anywhere else.
     for i in 0..8 {
         sim.submit_ok(
             "inbox",
-            serde_json::json!({ "deliver": { "member": "filler", "kind": "tick", "body": format!("{i}") } }),
+            serde_json::json!({ "deliver": { "member": harness::ext_actor("filler"), "kind": "tick", "body": format!("{i}") } }),
             Some("filler"),
         );
     } // heights 4..=11 — the next op executes at 12 == deadline
@@ -106,7 +108,7 @@ fn an_expired_lease_reclaims_exactly_past_its_deadline() {
     // …and one block later the permissionless reclaim requeues the job.
     sim.submit_ok(
         "inbox",
-        serde_json::json!({ "deliver": { "member": "filler", "kind": "tick", "body": "last" } }),
+        serde_json::json!({ "deliver": { "member": harness::ext_actor("filler"), "kind": "tick", "body": "last" } }),
         Some("filler"),
     ); // height 13
     sim.submit_ok("tasks", reclaim, Some("scavenger")); // height 14 > deadline
