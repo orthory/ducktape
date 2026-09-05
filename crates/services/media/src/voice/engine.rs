@@ -64,14 +64,58 @@ pub struct SpeakerStats {
 /// bomb that evicts the ring the operator is reading.
 const BAD_PACKET_EVERY: u64 = 100;
 
+/// An epoch change is a per-session lifecycle fact, but a peer chooses the
+/// field: latch it the same way, first and every hundredth.
+const EPOCH_CHANGE_EVERY: u64 = 100;
+
 struct Lane {
     jitter: MinimalJitter,
     decoder: VoiceDecoder,
     decode_errors: u64,
     bad_packets: u64,
+    /// which of the sender's engines this lane is following.
+    epoch: u32,
+    epoch_changes: u64,
 }
 
 impl Lane {
+    fn new(epoch: u32, decoder: VoiceDecoder, config: VoiceConfig) -> Self {
+        Lane {
+            jitter: MinimalJitter::new(config.prefill_frames, config.max_depth_frames),
+            decoder,
+            decode_errors: 0,
+            bad_packets: 0,
+            epoch,
+            epoch_changes: 0,
+        }
+    }
+
+    /// The peer restarted their media without leaving the roster. Their seq
+    /// went back to 0, so a jitter buffer anchored at the old high seq would
+    /// count the whole new stream late: start the lane over.
+    fn follow_new_epoch(
+        &mut self,
+        epoch: u32,
+        decoder: VoiceDecoder,
+        config: VoiceConfig,
+        peer: &PeerId,
+    ) {
+        self.jitter = MinimalJitter::new(config.prefill_frames, config.max_depth_frames);
+        self.decoder = decoder;
+        self.epoch = epoch;
+        self.epoch_changes += 1;
+        let occurrences = self.epoch_changes;
+        if occurrences == 1 || occurrences.is_multiple_of(EPOCH_CHANGE_EVERY) {
+            tracing::info!(
+                target: "ducktape::voice",
+                reason = "media_epoch_changed",
+                peer = %peer_label(peer),
+                occurrences,
+                "peer's media restarted — speaker lane reopened"
+            );
+        }
+    }
+
     fn note_bad_packet(&mut self, peer: &PeerId, reason: &'static str) {
         self.bad_packets += 1;
         let occurrences = self.bad_packets;
@@ -93,6 +137,9 @@ type Lanes = Arc<Mutex<HashMap<PeerId, Lane>>>;
 pub struct VoiceEngine<T: DataPlaneTransport> {
     flow: Arc<DatagramFlow<T>>,
     encoder: VoiceEncoder,
+    /// this engine instance, stamped on every media and video frame it sends
+    /// so a receiver can tell a restart from stale traffic.
+    epoch: u32,
     seq: u16,
     timestamp: u32,
     lanes: Lanes,
@@ -118,6 +165,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         Ok(VoiceEngine {
             flow,
             encoder,
+            epoch: rand::random(),
             seq: 0,
             timestamp: 0,
             lanes,
@@ -137,6 +185,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         let payload = self.encoder.encode(pcm)?;
         let frame = media::encode_frame(
             MediaHeader {
+                epoch: self.epoch,
                 seq: self.seq,
                 timestamp: self.timestamp,
             },
@@ -194,11 +243,10 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         out
     }
 
-    /// Drop a speaker's lane. Call it when the peer leaves the roster: a
-    /// rejoiner builds a FRESH engine whose seq restarts at 0, and a retained
-    /// jitter buffer anchored at their old high seq counts every one of those
-    /// frames late and discards it — for as many frames as they previously
-    /// sent. Their next frame after this opens a clean lane instead.
+    /// Drop a speaker's lane. Call it when the peer leaves the roster: their
+    /// buffered audio and decoder state are dead weight from that moment, and
+    /// a lane per departed peer accumulates for the life of the call. A peer
+    /// who comes back is re-anchored by their media epoch, not by this.
     /// Returns whether a lane was there to drop.
     pub fn forget_peer(&self, peer: PeerId) -> bool {
         self.lanes
@@ -220,6 +268,12 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
                 bad_packets: lane.bad_packets,
             })
             .collect()
+    }
+
+    /// This engine instance. The video plane stamps the same value, so both
+    /// of a peer's streams restart together.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
     }
 
     /// Datagrams that failed media decoding (bad version/truncated).
@@ -265,14 +319,16 @@ async fn pump<T: DataPlaneTransport>(
                     peer = %peer_label(&peer),
                     "first media frame from peer — speaker lane opened"
                 );
-                vacant.insert(Lane {
-                    jitter: MinimalJitter::new(config.prefill_frames, config.max_depth_frames),
-                    decoder,
-                    decode_errors: 0,
-                    bad_packets: 0,
-                })
+                vacant.insert(Lane::new(header.epoch, decoder, config))
             }
         };
+        if lane.epoch != header.epoch {
+            let Ok(decoder) = VoiceDecoder::new() else {
+                malformed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            lane.follow_new_epoch(header.epoch, decoder, config, &peer);
+        }
         lane.jitter.insert(header.seq, payload.to_vec());
     }
 }

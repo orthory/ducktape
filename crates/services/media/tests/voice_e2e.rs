@@ -151,9 +151,10 @@ async fn forgetting_a_departed_peer_admits_their_rejoined_stream() {
     let (engine_a, flow_b, a, b) = rejoin_rig();
     let mut encoder = VoiceEncoder::new(32_000).expect("encoder");
     let payload = encoder.encode(&tone(440.0, 0)).expect("encode");
-    let voice = |seq: u16| {
+    let voice = |epoch: u32, seq: u16| {
         media::encode_frame(
             MediaHeader {
+                epoch,
                 seq,
                 timestamp: u32::from(seq).wrapping_mul(FRAME_SAMPLES as u32),
             },
@@ -164,7 +165,7 @@ async fn forgetting_a_departed_peer_admits_their_rejoined_stream() {
 
     // B has been speaking for two minutes: their seq is near 6000.
     for seq in 6_000..6_003u16 {
-        flow_b.send_to(a, &voice(seq)).await.expect("send");
+        flow_b.send_to(a, &voice(1, seq)).await.expect("send");
     }
     sleep(TICK).await;
     for _ in 0..3 {
@@ -173,7 +174,9 @@ async fn forgetting_a_departed_peer_admits_their_rejoined_stream() {
     assert_eq!(engine_a.speaker_stats()[0].jitter.played, 3);
 
     // B leaves and rejoins mid-call; their new session's first frame is seq 0.
-    flow_b.send_to(a, &voice(0)).await.expect("send");
+    // Same epoch here: this is the roster-departure path, where the lane is
+    // evicted rather than re-anchored.
+    flow_b.send_to(a, &voice(1, 0)).await.expect("send");
     sleep(TICK).await;
     assert_eq!(
         engine_a.speaker_stats()[0].jitter.late_dropped,
@@ -184,7 +187,7 @@ async fn forgetting_a_departed_peer_admits_their_rejoined_stream() {
     // The roster departure evicts the lane; the same frames now land.
     assert!(engine_a.forget_peer(b));
     for seq in 0..4u16 {
-        flow_b.send_to(a, &voice(seq)).await.expect("send");
+        flow_b.send_to(a, &voice(1, seq)).await.expect("send");
     }
     sleep(TICK).await;
     for _ in 0..4 {
@@ -199,6 +202,57 @@ async fn forgetting_a_departed_peer_admits_their_rejoined_stream() {
     );
     assert_eq!(jitter.played, 4, "rejoiner inaudible: {jitter:?}");
     assert_eq!(stats[0].decode_errors, 0);
+}
+
+/// The case no eviction can reach: a peer who restarts their media WITHOUT
+/// leaving the roster (webview reload, reconnect). Their seq goes back to 0
+/// under the same node key, so the only thing that can distinguish a restart
+/// from stale traffic is the epoch they stamp on it.
+#[tokio::test(start_paused = true)]
+async fn a_new_epoch_reopens_the_lane_without_a_roster_departure() {
+    let (engine_a, flow_b, a, _b) = rejoin_rig();
+    let mut encoder = VoiceEncoder::new(32_000).expect("encoder");
+    let payload = encoder.encode(&tone(440.0, 0)).expect("encode");
+    let voice = |epoch: u32, seq: u16| {
+        media::encode_frame(
+            MediaHeader {
+                epoch,
+                seq,
+                timestamp: u32::from(seq).wrapping_mul(FRAME_SAMPLES as u32),
+            },
+            &payload,
+        )
+        .expect("media frame")
+    };
+
+    // B has been speaking a while under epoch 7.
+    for seq in 6_000..6_003u16 {
+        flow_b.send_to(a, &voice(7, seq)).await.expect("send");
+    }
+    sleep(TICK).await;
+    for _ in 0..3 {
+        engine_a.playout();
+    }
+    assert_eq!(engine_a.speaker_stats()[0].jitter.played, 3);
+
+    // B's media restarts: a new engine, a new epoch, seq back at 0. The
+    // roster never changed, so nothing evicts the lane — the epoch must.
+    for seq in 0..4u16 {
+        flow_b.send_to(a, &voice(8, seq)).await.expect("send");
+    }
+    sleep(TICK).await;
+    for _ in 0..4 {
+        engine_a.playout();
+    }
+    let stats = engine_a.speaker_stats();
+    assert_eq!(stats.len(), 1, "the restart reuses the peer's one lane");
+    let jitter = stats[0].jitter;
+    assert_eq!(
+        jitter.late_dropped, 0,
+        "restarted stream still dropped as late: {jitter:?}"
+    );
+    assert_eq!(jitter.played, 4, "restarted peer inaudible: {jitter:?}");
+    assert_eq!(stats[0].bad_packets, 0);
 }
 
 fn test_config() -> VoiceConfig {
