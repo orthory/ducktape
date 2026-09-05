@@ -15,10 +15,12 @@
 //! name is `origin.actor_string()` is OWNED by that origin, which is what makes
 //! an ack authorizable at all.
 //!
-//! DELIVERING and ACKING are different authorities. any origin may `Deliver` to
-//! any member (a module follow-up is the primary writer, and an external
-//! submitter may self-deliver); only the queue's OWN member may `MarkRead` or
-//! `Clear` it, and only an authenticated external submitter owns a queue.
+//! DELIVERING and ACKING are different authorities. a module/system origin (a
+//! follow-up from chat, tasks, automations, …) may `Deliver` to any member;
+//! an external origin may `Deliver` only to its OWN queue (an unattributed
+//! signed op cannot mint a fabricated member or flood a stranger's queue).
+//! only the queue's OWN member may `MarkRead` or `Clear` it, and only an
+//! authenticated external submitter owns a queue.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
@@ -68,9 +70,10 @@ pub struct Notification {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum InboxMsg {
-    /// enqueue a notification for `member`. accepted from ANY origin: module
-    /// follow-ups are the primary writers, but an external submitter may
-    /// self-deliver a note. `source` is derived from the origin, not this msg.
+    /// enqueue a notification for `member`. a module/system origin may
+    /// deliver to any member (module follow-ups are the primary writers); an
+    /// external origin may deliver only to its OWN queue (self-delivery).
+    /// `source` is derived from the origin, not this msg.
     Deliver {
         member: String,
         kind: String,
