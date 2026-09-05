@@ -369,7 +369,10 @@ where
         pos,
         1,
     ) {
-        Ok(m) => m,
+        // this checkpoint IS the journal's genesis for a synced identity, so
+        // the boundary's replay window is the only thing a restart from it
+        // could restore — carry it rather than re-open replay at every reboot.
+        Ok(m) => m.with_replay_window(boundary.applied_frames.clone()),
         Err(e) => {
             fatal!(label, "{diag_tag} capture: {e}");
         }

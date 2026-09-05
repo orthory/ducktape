@@ -251,9 +251,11 @@ pub(super) fn synced_recovered(boundary: &statesync::Manifest) -> recovery::Reco
         residents: boundary.residents.clone(),
         frames: Vec::new(),
         blocks: Vec::new(),
-        // a synced boundary replayed nothing, so it seeds no replay window:
-        // this seat starts refusing only the batches it applies from here.
-        applied_frames: Vec::new(),
+        // a synced boundary replays nothing, so the window comes off the
+        // BOUNDARY: without it this seat would apply, for its first
+        // `REPLAY_WINDOW_HEIGHTS` blocks, a re-proposed batch every
+        // long-running peer refuses — one replayed batch, two roots.
+        applied_frames: boundary.applied_frames.clone(),
         applied: 0,
         skipped: 0,
         rolled_forward: false,
@@ -792,6 +794,7 @@ mod tests {
             residents: vec![vec![3; 32]],
             floor_cert: Some(vec![9; 8]),
             entries: Vec::new(),
+            applied_frames: vec![(8_190, [0xA1; 32]), (8_192, [0xA2; 32])],
         };
         let rec = synced_recovered(&boundary);
         assert_eq!(rec.height, Some(8_192));
@@ -805,6 +808,10 @@ mod tests {
         // and no pre-checkpoint block to derive a pending cutover from.
         assert!(rec.frames.is_empty(), "a synced seat replays nothing");
         assert!(rec.blocks.is_empty(), "a synced seat folds nothing");
+        // the ONE thing a synced seat does inherit: the boundary's replay
+        // window. an empty one here is a cold node applying a re-proposed
+        // batch its peers refuse — one batch, two roots.
+        assert_eq!(rec.applied_frames, boundary.applied_frames);
         assert_eq!(rec.applied, 0);
         assert_eq!(rec.skipped, 0);
         assert!(!rec.rolled_forward);
