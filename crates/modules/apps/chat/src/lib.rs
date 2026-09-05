@@ -177,12 +177,10 @@ fn collect_mentions(blocks: &[Block]) -> Vec<AuthorRef> {
 fn tag_author(author: &AuthorRef) -> tagging::Author {
     match author {
         AuthorRef::User(key) => tagging::Author::User(key.clone()),
-        AuthorRef::Agent { module, agent_id } => {
-            tagging::Author::Entity(tagging::EntityRef {
-                module: module.clone(),
-                entity: agent_id.clone(),
-            })
-        }
+        AuthorRef::Agent { module, agent_id } => tagging::Author::Entity(tagging::EntityRef {
+            module: module.clone(),
+            entity: agent_id.clone(),
+        }),
         AuthorRef::Module(module) => tagging::Author::Module(module.clone()),
         AuthorRef::System => tagging::Author::System,
     }
@@ -353,6 +351,31 @@ impl Chat {
             }
             _ => Ok(()),
         }
+    }
+
+    /// one external user's standing in one channel, answered from chat's own
+    /// gates — [`ChatQuery::Access`]. a module that acts on a user's behalf
+    /// (automations firing that user's rule) asks HERE instead of re-deriving
+    /// the admission rule, because a second copy of it is a second rule.
+    /// an unknown channel answers `false` to both: the caller fails closed.
+    async fn channel_access(&self, channel_id: &str, user: &[u8]) -> Result<ChannelAccess, Error> {
+        let Some(channel) = self.channel(channel_id).await? else {
+            return Ok(ChannelAccess {
+                may_read: false,
+                may_post: false,
+            });
+        };
+        // reading is not policied per-message: an OPEN channel is readable by
+        // any authenticated user, a members-only one only by its members.
+        let is_open = matches!(channel.post_policy, PostPolicy::Open);
+        let may_read = is_open || self.is_member(channel_id, user).await?;
+        // the post answer is the post GATE, run verbatim — archival and policy
+        // included — so the two can never drift apart.
+        let may_post = self
+            .check_post_policy(&channel, &AuthorRef::User(user.to_vec()))
+            .await
+            .is_ok();
+        Ok(ChannelAccess { may_read, may_post })
     }
 
     /// enforce the reserved channel-id namespace: ids containing ':' belong
@@ -885,7 +908,10 @@ impl Chat {
         // idempotent: an unchanged membership stages nothing, so the qmdb op
         // log — and the root — is byte-identical to no write at all. the point
         // record is the policy read; the roster VIEW lives on the index tier.
-        let already_member = self.get_raw(&member_key(channel_id, &user)).await?.is_some();
+        let already_member = self
+            .get_raw(&member_key(channel_id, &user))
+            .await?
+            .is_some();
         if already_member == member {
             return Ok(());
         }
@@ -1103,7 +1129,10 @@ impl Module for Chat {
             ChatMsg::SetChannelArchived {
                 channel_id,
                 archived,
-            } => self.stage_set_archived(&author, &channel_id, archived).await,
+            } => {
+                self.stage_set_archived(&author, &channel_id, archived)
+                    .await
+            }
             ChatMsg::PostMessage {
                 channel_id,
                 message_id,
@@ -1256,6 +1285,9 @@ impl Module for Chat {
             ))),
             ChatQuery::Message { message_id } => Ok(encode_reply(&ChatReply::Message(
                 self.message_by_id(&message_id).await?,
+            ))),
+            ChatQuery::Access { channel_id, user } => Ok(encode_reply(&ChatReply::Access(
+                self.channel_access(&channel_id, &user).await?,
             ))),
         }
     }
