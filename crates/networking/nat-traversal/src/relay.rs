@@ -34,10 +34,11 @@ use commonware_cryptography::ed25519;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, timeout};
 
 pub use crate::advert::SharedAdverts;
+use crate::advert::{Bucket, source_bucket};
 use crate::auth::{
     AuthError, AuthPolicy, Authenticator, CoordCap, DEFAULT_FRESHNESS_WINDOW_SECS, now_secs,
     sign_authenticator, verify_request,
@@ -98,6 +99,15 @@ pub const MIN_FORWARD_GAP: Duration = Duration::from_millis(250);
 /// cannot preempt, because the select is not polling while the write is
 /// awaited inline.
 const FORWARD_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap on refusal writes in flight at once. A `session_limit` refusal frame
+/// is a few bytes, so a generous handful is plenty for real traffic; it
+/// exists only to bound the worst case — a peer that never reads leaves its
+/// accepted socket (and the task writing to it) alive for up to 5 s, and the
+/// accept loop that spawns these tasks does not itself slow down under a
+/// connect flood. Past this many outstanding writes, a refused socket is
+/// dropped with no frame at all: closer to what a flood deserves than an
+/// unbounded task per connection.
+const MAX_PENDING_REFUSAL_WRITES: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Error reasons — stable snake_case tokens (greppable and countable), never
@@ -395,6 +405,7 @@ struct RelayMetricsInner {
     forwards: AtomicU64,
     replies: AtomicU64,
     expired: AtomicU64,
+    refusal_writes_dropped: AtomicU64,
 }
 
 /// Cheap live counters for the relay lane, mirroring `CoordinatorMetrics`:
@@ -415,6 +426,11 @@ pub struct RelayMetricsSnapshot {
     pub replies: u64,
     /// Sessions that hit the TTL.
     pub expired: u64,
+    /// A `session_limit` refusal that was never told to the peer: the
+    /// bounded refusal-write budget ([`MAX_PENDING_REFUSAL_WRITES`]) was
+    /// exhausted, so the socket was dropped in silence instead of spawning
+    /// another write task.
+    pub refusal_writes_dropped: u64,
 }
 
 impl RelayMetrics {
@@ -426,6 +442,7 @@ impl RelayMetrics {
             forwards: load(&self.0.forwards),
             replies: load(&self.0.replies),
             expired: load(&self.0.expired),
+            refusal_writes_dropped: load(&self.0.refusal_writes_dropped),
         }
     }
 
@@ -440,7 +457,9 @@ impl RelayMetrics {
 #[derive(Default)]
 struct SessionTable {
     total: usize,
-    per_ip: std::collections::HashMap<std::net::IpAddr, usize>,
+    // Keyed by Bucket, not IpAddr: an IPv6 /64 is one host (RFC 6177), same
+    // as the advert book's per-source cap (#1505) — see `source_bucket`.
+    per_ip: std::collections::HashMap<Bucket, usize>,
 }
 
 /// RAII admission slot: holds this session's place in the global and per-IP
@@ -448,7 +467,7 @@ struct SessionTable {
 /// a panic unwinding the task) frees it.
 struct SessionSlot {
     table: Arc<Mutex<SessionTable>>,
-    ip: std::net::IpAddr,
+    bucket: Bucket,
 }
 
 fn lock_table(table: &Mutex<SessionTable>) -> std::sync::MutexGuard<'_, SessionTable> {
@@ -459,16 +478,17 @@ fn lock_table(table: &Mutex<SessionTable>) -> std::sync::MutexGuard<'_, SessionT
 
 impl SessionSlot {
     fn try_acquire(table: &Arc<Mutex<SessionTable>>, ip: std::net::IpAddr) -> Option<Self> {
+        let bucket = source_bucket(ip);
         let mut t = lock_table(table);
-        let ip_count = t.per_ip.get(&ip).copied().unwrap_or(0);
+        let ip_count = t.per_ip.get(&bucket).copied().unwrap_or(0);
         if t.total >= MAX_RELAY_SESSIONS || ip_count >= MAX_SESSIONS_PER_IP {
             return None;
         }
         t.total += 1;
-        *t.per_ip.entry(ip).or_insert(0) += 1;
+        *t.per_ip.entry(bucket).or_insert(0) += 1;
         Some(Self {
             table: table.clone(),
-            ip,
+            bucket,
         })
     }
 }
@@ -477,10 +497,10 @@ impl Drop for SessionSlot {
     fn drop(&mut self) {
         let mut t = lock_table(&self.table);
         t.total = t.total.saturating_sub(1);
-        if let Some(count) = t.per_ip.get_mut(&self.ip) {
+        if let Some(count) = t.per_ip.get_mut(&self.bucket) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                t.per_ip.remove(&self.ip);
+                t.per_ip.remove(&self.bucket);
             }
         }
     }
@@ -726,6 +746,50 @@ fn note_refused(peer: SocketAddr, reason: &'static [u8]) {
     }
 }
 
+/// A `session_limit` refusal write that never happened: the bounded refusal
+/// budget was exhausted, so the socket was dropped rather than spawning yet
+/// another write task. Latched like every other stranger-driven refusal.
+fn note_refusal_write_dropped(peer: SocketAddr) {
+    static DROPPED: Latch = Latch::new();
+    if let Some(occurrences) = DROPPED.hit("refusal_write_dropped") {
+        tracing::debug!(
+            target: "ducktape::reachability",
+            event = "relay_refusal_write_dropped",
+            reason = "refusal_budget_exhausted",
+            peer = %peer,
+            occurrences,
+            "dropped a session_limit refusal write: budget exhausted"
+        );
+    }
+}
+
+/// Tell a refused peer it was the cap, not a dead relay — but only if a
+/// refusal-write permit is free. Without one the accepted socket is simply
+/// dropped (closing it): a session_limit refusal frame is a courtesy, not a
+/// promise, and an unbounded task per refusal is exactly the hole the cap
+/// exists to close (issue: refused connections holding a socket for up to 5 s
+/// with no bound on how many exist at once).
+fn spawn_refusal_write(
+    permits: &Arc<Semaphore>,
+    stream: TcpStream,
+    peer: SocketAddr,
+    metrics: &RelayMetrics,
+) {
+    let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
+        RelayMetrics::increment(&metrics.0.refusal_writes_dropped);
+        note_refusal_write_dropped(peer);
+        return;
+    };
+    tokio::spawn(async move {
+        let _permit = permit; // held for the write; released on task exit
+        let mut stream = stream;
+        let refusal = RelayFrame::Error {
+            reason: REASON_SESSION_LIMIT.to_vec(),
+        };
+        let _ = timeout(Duration::from_secs(5), write_frame(&mut stream, &refusal)).await;
+    });
+}
+
 async fn run_session(
     stream: TcpStream,
     peer: SocketAddr,
@@ -773,6 +837,7 @@ pub async fn run_relay_listener(
     metrics: RelayMetrics,
 ) {
     let sessions: Arc<Mutex<SessionTable>> = Arc::default();
+    let refusal_permits = Arc::new(Semaphore::new(MAX_PENDING_REFUSAL_WRITES));
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -799,16 +864,7 @@ pub async fn run_relay_listener(
         let Some(slot) = SessionSlot::try_acquire(&sessions, peer.ip()) else {
             RelayMetrics::increment(&metrics.0.sessions_rejected);
             note_refused(peer, REASON_SESSION_LIMIT);
-            // Tell the joiner it was the cap, not a dead relay — but from a
-            // spawned task with a bounded write, so a stalled peer can never
-            // block the accept loop.
-            tokio::spawn(async move {
-                let mut stream = stream;
-                let refusal = RelayFrame::Error {
-                    reason: REASON_SESSION_LIMIT.to_vec(),
-                };
-                let _ = timeout(Duration::from_secs(5), write_frame(&mut stream, &refusal)).await;
-            });
+            spawn_refusal_write(&refusal_permits, stream, peer, &metrics);
             continue;
         };
         tokio::spawn(run_session(
@@ -1307,5 +1363,58 @@ mod tests {
         assert!(refused, "the fifth same-IP connection is refused");
         assert!(rig.metrics.snapshot().sessions_rejected >= 1);
         drop(held);
+    }
+
+    #[test]
+    fn per_ip_cap_buckets_ipv6_by_64_not_by_exact_address() {
+        // Five DISTINCT addresses inside one /64: a single host with a routed
+        // prefix (RFC 6177) can pick any of 2^64 of these for free. Bucketing
+        // by the /64 (mirrors advert.rs's `source_bucket`, #1505) must count
+        // them as one source, so the fifth hits MAX_SESSIONS_PER_IP (4).
+        let table: Arc<Mutex<SessionTable>> = Arc::default();
+        let addr_in_prefix = |host: u16| {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, host))
+        };
+        let mut held = Vec::new();
+        for host in 0..MAX_SESSIONS_PER_IP as u16 {
+            let slot = SessionSlot::try_acquire(&table, addr_in_prefix(host));
+            assert!(slot.is_some(), "session {host} within the cap must admit");
+            held.push(slot.unwrap());
+        }
+        assert!(
+            SessionSlot::try_acquire(&table, addr_in_prefix(MAX_SESSIONS_PER_IP as u16)).is_none(),
+            "a fifth address in the same /64 must be refused as the same source"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn exhausted_refusal_budget_drops_the_socket_with_no_task_and_no_frame() {
+        // A permit-less semaphore models the budget already fully spent by
+        // other refusals in flight.
+        let permits = Arc::new(Semaphore::new(0));
+        let metrics = RelayMetrics::default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connector = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut client = connector.await.unwrap();
+
+        spawn_refusal_write(&permits, stream, peer, &metrics);
+
+        // If a task had been spawned it would hold the write open for up to
+        // the 5 s FORWARD-style timeout; with no permit, no task exists at
+        // all, so the accepted socket is simply dropped and the peer sees
+        // EOF right away, not a session_limit frame.
+        let mut buf = [0u8; 8];
+        let n = timeout(Duration::from_millis(500), client.read(&mut buf))
+            .await
+            .expect("closes immediately; must not wait anywhere near the write timeout")
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "no frame is ever written when the budget is exhausted"
+        );
+        assert_eq!(metrics.snapshot().refusal_writes_dropped, 1);
     }
 }
