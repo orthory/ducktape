@@ -16,6 +16,8 @@
 //! Admission is default-deny per the plane's contract: members only, one
 //! live transfer per digest, per-kind size caps, and a process-wide staging
 //! byte budget — a rogue member can waste bounded disk, never poison a blob.
+//! What a dropped transfer leaves behind is bounded too: an abandoned partial
+//! is resumable for [`blobstore::STAGING_RESUME_WINDOW`] and then swept.
 
 use std::collections::HashSet;
 use std::io;
@@ -184,7 +186,8 @@ async fn accept_loop<T: DataPlaneTransport>(
 /// the receive half of one push: admission-check, ack with the resume
 /// offset, stream the tail into a disk-staged slot, verify-then-publish,
 /// answer one result frame. a transport drop mid-stream KEEPS the staging —
-/// the custodian's retry resumes at the high-water.
+/// the custodian's retry resumes at the high-water, for as long as
+/// [`blobstore::STAGING_RESUME_WINDOW`]; past that the partial is reclaimed.
 async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     kind: u8,
@@ -223,7 +226,7 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     // call: the two ack writes below use `?`, and a connection dropped in that
     // window used to return with the digest still inflight and its length still
     // charged — permanently, for the life of the process.
-    let _admission = match PushSlot::acquire(&inflight, &budget, digest, len) {
+    let _admission = match PushSlot::acquire(&inflight, &budget, &blobs, digest, len) {
         Ok(slot) => slot,
         Err(reason) => return refuse(stream, reason).await,
     };
@@ -272,6 +275,7 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
 struct PushSlot {
     inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
     budget: Arc<AtomicU64>,
+    blobs: blobstore::BlobHandle,
     digest: [u8; 32],
     charged: u64,
 }
@@ -281,6 +285,7 @@ impl PushSlot {
     fn acquire(
         inflight: &Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
         budget: &Arc<AtomicU64>,
+        blobs: &blobstore::BlobHandle,
         digest: [u8; 32],
         len: u64,
     ) -> Result<Self, &'static str> {
@@ -291,6 +296,7 @@ impl PushSlot {
         let slot = Self {
             inflight: Arc::clone(inflight),
             budget: Arc::clone(budget),
+            blobs: blobs.clone(),
             digest,
             charged: len,
         };
@@ -310,6 +316,18 @@ impl Drop for PushSlot {
             .expect("inflight lock")
             .remove(&self.digest);
         self.budget.fetch_sub(self.charged, Ordering::Relaxed);
+        // this push may have left a partial behind. it stays resumable for
+        // `STAGING_RESUME_WINDOW` — this pass reclaims the ones that outlived
+        // that window, so a member that pushes-and-drops in a loop cannot fill
+        // the disk. a directory listing plus a few unlinks, no blocking reads.
+        if let Err(error) = self.blobs.sweep_staging(blobstore::STAGING_RESUME_WINDOW) {
+            tracing::warn!(
+                target: "ducktape::modules",
+                reason = "staging_sweep_failed",
+                error = %error,
+                "cannot reclaim abandoned module-code staging"
+            );
+        }
     }
 }
 
@@ -646,6 +664,89 @@ mod tests {
             "the inflight slot leaked"
         );
         assert_eq!(budget.load(Ordering::Relaxed), 0, "the budget leaked");
+    }
+
+    /// a sender that streams `head` and then drops the connection.
+    struct DropsMidStream {
+        head: Vec<u8>,
+    }
+
+    impl AsyncRead for DropsMidStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let n = self.head.len().min(buf.remaining());
+            let head: Vec<u8> = self.head.drain(..n).collect();
+            buf.put_slice(&head);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for DropsMidStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_push_reclaims_the_partials_nobody_will_resume() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let blobs = blobstore::BlobHandle::persistent(root.path()).expect("blob root");
+        let staging = root.path().join("staging");
+
+        // a partial some earlier push abandoned long ago.
+        std::fs::create_dir_all(&staging).expect("staging dir");
+        let stale = staging.join("00".repeat(32));
+        std::fs::write(&stale, b"nobody is coming back for these").expect("stale partial");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&stale)
+            .expect("stale partial")
+            .set_modified(
+                std::time::SystemTime::now()
+                    - blobstore::STAGING_RESUME_WINDOW
+                    - Duration::from_secs(60),
+            )
+            .expect("backdate");
+
+        let digest = [7u8; 32];
+        receive_push(
+            DropsMidStream {
+                head: b"half of it".to_vec(),
+            },
+            KIND_MODULE_CODE,
+            digest,
+            4096,
+            blobs,
+            Default::default(),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("a mid-stream drop is not an error");
+
+        assert!(!stale.exists(), "the stale partial was not reclaimed");
+        assert!(
+            staging.join(noded::hex_bytes(&digest)).is_file(),
+            "this push's partial is still inside its resume window"
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -17,11 +17,19 @@
 //! appends.
 
 use std::io::{Read as _, Seek as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest as _, Sha256};
 
 use crate::{BlobHandle, hex};
+
+/// how long an abandoned staging file stays resumable. past it the partial is
+/// garbage: no sender is coming back for it, and nothing else on the node ever
+/// asks for a file under the staging name. this is what bounds the disk a
+/// dropped (or deliberately abandoned) transfer can leave behind — a live
+/// transfer keeps its file's mtime fresh, so only the dead ones age out.
+pub const STAGING_RESUME_WINDOW: Duration = Duration::from_secs(600);
 
 /// blobs at or below this size are cached in the store's memory map on put /
 /// get; larger blobs live on disk only (persistent stores) so a 1 GB
@@ -126,6 +134,62 @@ impl BlobHandle {
             written,
             sink,
         })
+    }
+}
+
+/// delete every staging file under `root` that has not been touched within
+/// `keep_within`, and report how many went. a partial nobody resumed inside
+/// the window is bytes no lane will ever ask for again.
+pub(crate) fn sweep_staging_dir(root: &Path, keep_within: Duration) -> std::io::Result<usize> {
+    let dir = root.join("staging");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // no staging directory means nothing was ever staged here.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut swept = 0usize;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let abandoned = meta
+            .modified()
+            .ok()
+            .and_then(|m| SystemTime::now().duration_since(m).ok())
+            .is_some_and(|age| age >= keep_within);
+        if !meta.is_file() || !abandoned {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {
+                swept += 1;
+                tracing::debug!(
+                    target: "ducktape::blobstore",
+                    reason = "staging_abandoned",
+                    file = %entry.file_name().to_string_lossy(),
+                    bytes = meta.len(),
+                    "reclaimed an abandoned staging file"
+                );
+            }
+            Err(error) => tracing::warn!(
+                target: "ducktape::blobstore",
+                reason = "staging_sweep_failed",
+                file = %entry.file_name().to_string_lossy(),
+                error = %error,
+                "cannot reclaim an abandoned staging file"
+            ),
+        }
+    }
+    Ok(swept)
+}
+
+impl BlobHandle {
+    /// reclaim abandoned staging files — see [`sweep_staging_dir`]. a rootless
+    /// store stages into memory and has nothing to sweep.
+    pub fn sweep_staging(&self, keep_within: Duration) -> std::io::Result<usize> {
+        match self.persistence_root() {
+            None => Ok(0),
+            Some(root) => sweep_staging_dir(&root, keep_within),
+        }
     }
 }
 
@@ -247,6 +311,36 @@ mod tests {
             store.get_chunk(&digest).as_deref(),
             Some(payload.as_slice())
         );
+    }
+
+    #[test]
+    fn an_abandoned_partial_survives_its_window_and_is_swept_past_it() {
+        let root = tempfile::tempdir().unwrap();
+        let digest = sha(b"long gone");
+        let path = root.path().join("staging").join(hex(&digest));
+        {
+            let store = BlobHandle::persistent(root.path()).unwrap();
+            let mut slot = store.stage(digest, 9).unwrap();
+            slot.append(b"long").unwrap();
+        }
+        assert!(path.is_file(), "a dropped transfer keeps its partial");
+
+        // a fresh partial is resumable, so re-opening the store keeps it.
+        let store = BlobHandle::persistent(root.path()).unwrap();
+        assert_eq!(store.sweep_staging(STAGING_RESUME_WINDOW).unwrap(), 0);
+        assert!(path.is_file());
+        drop(store);
+
+        // past the window nothing will ever resume it, and a store opened over
+        // the root (a node boot) reclaims it.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - STAGING_RESUME_WINDOW - Duration::from_secs(60))
+            .unwrap();
+        let _store = BlobHandle::persistent(root.path()).unwrap();
+        assert!(!path.exists(), "the stale partial was not reclaimed");
     }
 
     #[test]

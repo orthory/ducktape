@@ -20,7 +20,7 @@
 //! duckfs. don't start a third.
 
 mod staging;
-pub use staging::{LARGE_BLOB_CACHE_BYTES, StageError, StagedBlob};
+pub use staging::{LARGE_BLOB_CACHE_BYTES, STAGING_RESUME_WINDOW, StageError, StagedBlob};
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -80,6 +80,17 @@ impl BlobStore {
     pub fn persistent(root: impl Into<PathBuf>) -> std::io::Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
+        // boot sweep: a transfer that died with the process left a partial
+        // behind, and nothing else ever reclaims one.
+        if let Err(error) = staging::sweep_staging_dir(&root, staging::STAGING_RESUME_WINDOW) {
+            tracing::warn!(
+                target: "ducktape::blobstore",
+                reason = "staging_sweep_failed",
+                root = %root.display(),
+                error = %error,
+                "cannot sweep the staging directory at open"
+            );
+        }
         Ok(Self {
             root: Some(root),
             ..Self::default()
