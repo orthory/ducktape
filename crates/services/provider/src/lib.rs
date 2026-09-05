@@ -67,6 +67,24 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// own callers.
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// hard cap on a run's accumulated stdout, checked as each chunk arrives.
+/// Matches [`saga::MAX_RESULT_BYTES`] (crates/modules/system/saga/src/interface.rs,
+/// restated here rather than depended on to avoid a host-crate → consensus-module
+/// edge) — the actual cap the recorder keeps: a run's parsed answer is
+/// truncated to that many bytes before it can ever land
+/// (compute::provision::assemble_runner_result). Buffering more raw stdout
+/// than the recorder will ever keep is pure host RAM with no payoff, so a
+/// guest that writes past this line has its run TERMINATED outright — never
+/// silently truncated, since a truncated JSON/JSONL blob would parse into
+/// garbage and land as the run's answer.
+const MAX_RUN_OUTPUT_BYTES: usize = 256 * 1024;
+/// hard cap on the accumulated stderr TAIL (oldest bytes drop first). stderr
+/// never becomes the run's answer — only [`excerpt`]'s 400-char slice of it
+/// ever leaves this function, and only on the failure path — so a few KiB of
+/// trailing context is ample; unlike stdout this is a rolling tail, not a
+/// termination trigger.
+const MAX_RUN_STDERR_BYTES: usize = 16 * 1024;
+
 /// the ownership tag a provider set stamps on the runs it creates. Its VALUE
 /// names the owning service instance, so a compute daemon and an agent daemon
 /// on one node stay distinguishable in logs and status.
@@ -2499,6 +2517,16 @@ fn flush_pending_line(
     );
 }
 
+/// append `chunk` to `buf`, keeping only the last `cap` bytes: a bounded
+/// rolling tail rather than a truncation trigger. Used for stderr, which is
+/// never the run's answer and only ever surfaces as [`excerpt`]'s short slice.
+fn push_bounded_tail(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) {
+    buf.extend_from_slice(chunk);
+    if buf.len() > cap {
+        buf.drain(..buf.len() - cap);
+    }
+}
+
 fn effective_provider_deadline(
     last_activity: tokio::time::Instant,
     idle: Duration,
@@ -2658,6 +2686,25 @@ impl CliProvider {
                         out_bytes.extend_from_slice(&obuf[..n]);
                         forward_lines(&mut out_pending, &obuf[..n], OutputStream::Stdout, &output_sink, ctx);
                         last_activity = tokio::time::Instant::now();
+                        if out_bytes.len() > MAX_RUN_OUTPUT_BYTES {
+                            if let Some(invocation) = &broker_invocation {
+                                invocation.revoke();
+                            }
+                            control.terminate().await;
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "output_cap_exceeded",
+                                bin = %self.bin.display(),
+                                bytes = out_bytes.len(),
+                                cap = MAX_RUN_OUTPUT_BYTES,
+                                "run stdout exceeded the output cap (child killed)"
+                            );
+                            return Err(format!(
+                                "{} stdout exceeded the {MAX_RUN_OUTPUT_BYTES}-byte output cap \
+                                 (child killed): output_cap_exceeded",
+                                self.bin.display()
+                            ));
+                        }
                     }
                     Err(e) => {
                         if let Some(invocation) = &broker_invocation {
@@ -2676,7 +2723,7 @@ impl CliProvider {
                         flush_pending_line(&mut err_pending, OutputStream::Stderr, &output_sink, ctx);
                     }
                     Ok(n) => {
-                        err_bytes.extend_from_slice(&ebuf[..n]);
+                        push_bounded_tail(&mut err_bytes, &ebuf[..n], MAX_RUN_STDERR_BYTES);
                         forward_lines(&mut err_pending, &ebuf[..n], OutputStream::Stderr, &output_sink, ctx);
                         last_activity = tokio::time::Instant::now();
                     }
@@ -5002,6 +5049,36 @@ printf '{"type":"turn.completed"}\n'"#,
             p.hard_timeout_factor,
             start.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn a_run_writing_past_the_output_cap_is_terminated_not_truncated() {
+        // a continuously-writing guest must be TERMINATED at the cap, never
+        // truncated and parsed anyway — a truncated JSON/JSONL blob would
+        // otherwise land as the run's "answer". idle stays generous (5s) so
+        // the output cap fires first, not the idle/hard timeout.
+        let dir = scratch("output-cap");
+        let bin = fake_cli(
+            &dir,
+            "firehose",
+            "cat > /dev/null\nwhile true; do printf '%01024d' 0; done",
+        );
+        let p = mock_provider("firehose", "text", bin, "output-cap-wd")
+            .with_timeout(Duration::from_secs(5));
+        let err = p.run("x", &RunContext::default()).await.unwrap_err();
+        assert!(
+            err.contains("output_cap_exceeded"),
+            "names the outcome: {err}"
+        );
+    }
+
+    #[test]
+    fn push_bounded_tail_keeps_the_last_bytes_only() {
+        let mut buf = Vec::new();
+        push_bounded_tail(&mut buf, b"0123456789", 4);
+        assert_eq!(buf, b"6789", "oldest bytes drop first");
+        push_bounded_tail(&mut buf, b"ABC", 4);
+        assert_eq!(buf, b"9ABC", "the tail keeps rolling as more arrives");
     }
 
     #[tokio::test]
