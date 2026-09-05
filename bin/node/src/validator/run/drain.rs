@@ -746,7 +746,10 @@ impl ValidatorRuntime<'_> {
                     None,
                     pos,
                     *next_seq,
-                );
+                )
+                // the replay guard rides every checkpoint (see
+                // `recovery::Manifest::applied_frames`).
+                .map(|m| m.with_replay_window(node.replay_window()));
                 let post_cutover_started = context.current();
                 match captured {
                     Ok(m) => match node.sink_mut().write_manifest(&m).await {
@@ -864,7 +867,10 @@ impl ValidatorRuntime<'_> {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                 },
-            );
+            )
+            // the replay guard rides every checkpoint (see
+            // `recovery::Manifest::applied_frames`).
+            .map(|(m, cost)| (m.with_replay_window(node.replay_window()), cost));
             let captured_at = context.current();
             match captured {
                 Ok((m, capture_cost)) => match node.sink_mut().write_manifest(&m).await {

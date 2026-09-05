@@ -701,7 +701,7 @@ async fn graceful_checkpoint(
 ) {
     if let Some(f) = node.finalized() {
         let pos = node.sink_mut().oplog_pos().await;
-        if let Ok(manifest) = Manifest::capture(
+        let captured = Manifest::capture(
             node.host(),
             Some(f.height),
             orchestrator.epoch(),
@@ -713,7 +713,12 @@ async fn graceful_checkpoint(
                 .map(|cutover| cutover.cutover_view()),
             pos,
             next_seq,
-        ) {
+        );
+        // the replay guard rides the checkpoint: the journal suffix a
+        // checkpoint leaves is shallower than the protocol window, so a
+        // restart that rebuilt from the suffix alone would refuse fewer
+        // replayed batches than its peers.
+        if let Ok(manifest) = captured.map(|m| m.with_replay_window(node.replay_window())) {
             let _ = node.sink_mut().write_manifest(&manifest).await;
         }
     }
