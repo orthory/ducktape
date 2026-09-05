@@ -69,10 +69,12 @@ pub(super) async fn provision(
     // the rw checkout is materialized on disk NOW — the one host-observable
     // fact an e2e otherwise has to poll for (the dir lives only seconds and
     // is cleaned up before a filesystem sample could reliably catch it).
+    // the message text is the only carrier the harness reads (see
+    // `compute_markers`/`materialized_dirs`): a structured `kind`/`path` field
+    // here would duplicate the same pair after the fmt layer's coloured field
+    // list, corrupting the marker extraction.
     tracing::debug!(
         target: "ducktape::agent",
-        kind = "rw",
-        path = %dir.display(),
         "run dir materialized kind=rw path={}", dir.display()
     );
     // W6 skill ro mounts land at a SUFFIXED SIBLING of the rw checkout
@@ -112,10 +114,9 @@ pub(super) async fn provision(
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
         // the ro skill root is the sibling half of the same host-observable
         // fact (see the rw marker above).
+        // same reasoning as the rw marker above: message text only.
         tracing::debug!(
             target: "ducktape::agent",
-            kind = "ro",
-            path = %ro_root.display(),
             "run dir materialized kind=ro path={}", ro_root.display()
         );
         (Some(ro_root), Some(context_doc))
