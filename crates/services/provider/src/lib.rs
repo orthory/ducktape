@@ -67,17 +67,26 @@ const TERMINATION_GRACE: Duration = Duration::from_secs(2);
 /// own callers.
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// mirrors [`saga::MAX_RESULT_BYTES`] (crates/modules/system/saga/src/interface.rs)
+/// without depending on it (a host-crate → consensus-module edge). This is
+/// the cap `compute::provision::assemble_runner_result` already truncates a
+/// run's parsed answer to, WITH a note, before it can land — a run that
+/// finishes with an oversized answer already completes today, just trimmed.
+const RECORDED_RESULT_CAP_BYTES: usize = 256 * 1024;
 /// hard cap on a run's accumulated stdout, checked as each chunk arrives.
-/// Matches [`saga::MAX_RESULT_BYTES`] (crates/modules/system/saga/src/interface.rs,
-/// restated here rather than depended on to avoid a host-crate → consensus-module
-/// edge) — the actual cap the recorder keeps: a run's parsed answer is
-/// truncated to that many bytes before it can ever land
-/// (compute::provision::assemble_runner_result). Buffering more raw stdout
-/// than the recorder will ever keep is pure host RAM with no payoff, so a
-/// guest that writes past this line has its run TERMINATED outright — never
-/// silently truncated, since a truncated JSON/JSONL blob would parse into
+/// Deliberately NOT [`RECORDED_RESULT_CAP_BYTES`] itself: that cap is
+/// enforced downstream with truncation-plus-a-note, so a run whose full
+/// answer is a few hundred KiB over it still succeeds today. Killing the run
+/// at the same size would turn "completes, truncated" into "fails outright"
+/// for those runs — this cap exists only to stop UNBOUNDED accumulation from
+/// a firehose, not to enforce the result size, so it sits an order of
+/// magnitude above it. `codex`'s `jsonl-events` output in particular streams
+/// one JSON object per tool call/patch/diff for the whole turn, not just the
+/// final answer, and can legitimately run to several hundred KiB on an
+/// ordinary tool-calling turn. Past this line the run is TERMINATED outright
+/// — never truncated, since a truncated JSON/JSONL blob would parse into
 /// garbage and land as the run's answer.
-const MAX_RUN_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_RUN_OUTPUT_BYTES: usize = 16 * RECORDED_RESULT_CAP_BYTES; // 4 MiB
 /// hard cap on the accumulated stderr TAIL (oldest bytes drop first). stderr
 /// never becomes the run's answer — only [`excerpt`]'s 400-char slice of it
 /// ever leaves this function, and only on the failure path — so a few KiB of
@@ -5061,10 +5070,14 @@ printf '{"type":"turn.completed"}\n'"#,
         let bin = fake_cli(
             &dir,
             "firehose",
-            "cat > /dev/null\nwhile true; do printf '%01024d' 0; done",
+            // a 100_000-byte chunk per iteration (no per-byte forking) clears
+            // the 4 MiB cap in ~42 writes rather than thousands of small ones.
+            "cat > /dev/null\n\
+             big=$(printf '%0100000d' 0)\n\
+             while true; do printf '%s' \"$big\"; done",
         );
         let p = mock_provider("firehose", "text", bin, "output-cap-wd")
-            .with_timeout(Duration::from_secs(5));
+            .with_timeout(Duration::from_secs(10));
         let err = p.run("x", &RunContext::default()).await.unwrap_err();
         assert!(
             err.contains("output_cap_exceeded"),
