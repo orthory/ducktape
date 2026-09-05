@@ -513,6 +513,7 @@ impl NodeHandle {
         self.browser_gateway = Some(BrowserGateway {
             listen,
             ws_tokens: Arc::new(WsTokenStore::new()),
+            ws_doors: Arc::default(),
         });
         self
     }
