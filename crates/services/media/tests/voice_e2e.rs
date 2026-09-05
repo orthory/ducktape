@@ -6,11 +6,13 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use media_service::voice::{FRAME_SAMPLES, SAMPLE_RATE, VoiceConfig, VoiceEngine};
 use data_plane::sim::{LinkModel, SimNet};
 use data_plane::{
-    AdmissionPolicy, DataPlane, DatagramPolicy, FlowId, PeerId, PlaneConfig, Service,
+    AdmissionPolicy, DataPlane, DatagramFlow, DatagramPolicy, FlowId, PeerId, PlaneConfig, Service,
     sim::SimEndpoint,
+};
+use media_service::voice::{
+    FRAME_SAMPLES, MediaHeader, SAMPLE_RATE, VoiceConfig, VoiceEncoder, VoiceEngine, media,
 };
 use tokio::time::sleep;
 
@@ -90,6 +92,113 @@ fn mesh(n: u8, link: LinkModel, config: VoiceConfig) -> Vec<(PeerId, VoiceEngine
             (*p, VoiceEngine::new(flow_handle, config).expect("engine"))
         })
         .collect()
+}
+
+/// A's engine plus a RAW flow handle for B on the same voice flow, so a test
+/// can hand A frames at a chosen wire seq — a fresh session starts at 0, a
+/// two-minute-old one is near 6000, and only the raw handle can say which.
+fn rejoin_rig() -> (
+    VoiceEngine<SimEndpoint>,
+    DatagramFlow<SimEndpoint>,
+    PeerId,
+    PeerId,
+) {
+    let (a, b) = (peer(1), peer(2));
+    let net = SimNet::new();
+    net.set_link(
+        a,
+        b,
+        LinkModel {
+            latency: Duration::from_millis(5),
+            bytes_per_sec: 1_000_000,
+            drop_every: None,
+            delay_every: None,
+        },
+    );
+    let flow = FlowId::derive(b"voice-channel:rejoin");
+    let admission = Arc::new(TestAdmission::default());
+    admission.allow(a, Service::Voice, flow);
+    admission.allow(b, Service::Voice, flow);
+    let plane = |end| {
+        DataPlane::new(
+            end,
+            admission.clone(),
+            PlaneConfig {
+                bulk_bytes_per_sec: 600_000,
+                bulk_burst_bytes: 16 * 1024,
+            },
+        )
+    };
+    let flow_a = plane(net.endpoint(a))
+        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .expect("A flow");
+    let flow_b = plane(net.endpoint(b))
+        .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
+        .expect("B flow");
+    (
+        VoiceEngine::new(flow_a, test_config()).expect("engine"),
+        flow_b,
+        a,
+        b,
+    )
+}
+
+/// A peer who leaves and rejoins comes back with a fresh engine whose seq
+/// restarts at 0. Until their lane is forgotten, our jitter buffer — anchored
+/// at their old high seq — counts every one of those frames late.
+#[tokio::test(start_paused = true)]
+async fn forgetting_a_departed_peer_admits_their_rejoined_stream() {
+    let (engine_a, flow_b, a, b) = rejoin_rig();
+    let mut encoder = VoiceEncoder::new(32_000).expect("encoder");
+    let payload = encoder.encode(&tone(440.0, 0)).expect("encode");
+    let voice = |seq: u16| {
+        media::encode_frame(
+            MediaHeader {
+                seq,
+                timestamp: u32::from(seq).wrapping_mul(FRAME_SAMPLES as u32),
+            },
+            &payload,
+        )
+        .expect("media frame")
+    };
+
+    // B has been speaking for two minutes: their seq is near 6000.
+    for seq in 6_000..6_003u16 {
+        flow_b.send_to(a, &voice(seq)).await.expect("send");
+    }
+    sleep(TICK).await;
+    for _ in 0..3 {
+        engine_a.playout();
+    }
+    assert_eq!(engine_a.speaker_stats()[0].jitter.played, 3);
+
+    // B leaves and rejoins mid-call; their new session's first frame is seq 0.
+    flow_b.send_to(a, &voice(0)).await.expect("send");
+    sleep(TICK).await;
+    assert_eq!(
+        engine_a.speaker_stats()[0].jitter.late_dropped,
+        1,
+        "a retained lane must reject the restarted stream (the bug's mechanism)"
+    );
+
+    // The roster departure evicts the lane; the same frames now land.
+    assert!(engine_a.forget_peer(b));
+    for seq in 0..4u16 {
+        flow_b.send_to(a, &voice(seq)).await.expect("send");
+    }
+    sleep(TICK).await;
+    for _ in 0..4 {
+        engine_a.playout();
+    }
+    let stats = engine_a.speaker_stats();
+    assert_eq!(stats.len(), 1, "the rejoiner opened exactly one fresh lane");
+    let jitter = stats[0].jitter;
+    assert_eq!(
+        jitter.late_dropped, 0,
+        "rejoined stream still dropped as late: {jitter:?}"
+    );
+    assert_eq!(jitter.played, 4, "rejoiner inaudible: {jitter:?}");
+    assert_eq!(stats[0].decode_errors, 0);
 }
 
 fn test_config() -> VoiceConfig {

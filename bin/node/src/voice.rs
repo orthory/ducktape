@@ -50,12 +50,15 @@ use tokio::sync::{mpsc, watch};
 
 use crate::overlay_book::OverlayPeers;
 
-/// Inbound audio queue per flow: ~2.5 s of one speaker's frames. Overflow
-/// drops the oldest inside the flow (the plane's drop-oldest contract).
+/// Inbound audio queue per speaker: ~2.5 s of one speaker's frames. Overflow
+/// drops that speaker's oldest (the plane's per-sender drop-oldest contract).
 const FLOW_QUEUE: usize = 128;
-/// Inbound camera queue per flow: ~2 keyframe-burst frames of fragments.
+/// Inbound camera queue per sender: ~2 keyframe-burst frames of fragments
+/// (a frame is at most `media_service::video::MAX_FRAGS`). Per SENDER, not
+/// per flow: every huddle participant's camera rides one flow, and a shared
+/// budget would let one peer's keyframe burst evict the others' fragments.
 const VIDEO_FLOW_QUEUE: usize = 256;
-/// Inbound call-control queue per flow: tiny, one message per event.
+/// Inbound call-control queue per sender: tiny, one message per event.
 const CTL_FLOW_QUEUE: usize = 32;
 /// Webview↔hub pcm lanes: a small cushion (8 × 20 ms); late audio is dead
 /// audio, so both sides drop rather than backpressure when it fills.
@@ -926,12 +929,26 @@ async fn run_session<T: DataPlaneTransport>(
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
                 inbound_hints.retain(|peer, _| live.contains(peer));
-                // a peer who left frees their receive lane too: a rejoiner's new
-                // session restarts frame_no at 0, which a retained reassembler
-                // (high last_emitted) would reject as Stale forever — and Stale
-                // doesn't advance dropped_frames, so no keyframe request self-heals
-                // it. Evicting the lane means the rejoiner's next frame builds a
-                // fresh reassembler and their tile lights up.
+                // a peer who left frees BOTH receive lanes, video and audio: a
+                // rejoiner's new session restarts frame_no and seq at 0, which a
+                // retained reassembler (high last_emitted) rejects as Stale forever
+                // — and Stale doesn't advance dropped_frames, so no keyframe request
+                // self-heals it — while a retained jitter buffer (high seq anchor)
+                // counts every frame late and discards it for as long as they
+                // previously spoke. Evicting on the one departure event means the
+                // rejoiner's next frame builds a fresh reassembler and a fresh
+                // speaker lane, so their tile and their voice come back together.
+                // the speakers are the engine's own set, not `peer_lanes`: a peer
+                // who talks with their camera off never opens a video lane.
+                let departed: Vec<PeerId> = engine
+                    .speaker_stats()
+                    .iter()
+                    .map(|speaker| speaker.peer)
+                    .filter(|peer| !live.contains(&peer.0))
+                    .collect();
+                for peer in departed {
+                    engine.forget_peer(peer);
+                }
                 peer_lanes.retain(|peer, _| live.contains(peer));
                 push_effective_rate(&recipients, &inbound_hints, &mut effective_kbps, &control_out);
                 window += 1;

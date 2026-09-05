@@ -8,6 +8,9 @@
 //!   ahead of real-time datagrams.
 //! - **Flow isolation**: per-flow bounded queues; a datagram flow overflows
 //!   by dropping its own oldest, never a neighbor's.
+//! - **Sender isolation**: inside a flow the queue bound is spent per
+//!   sending peer, so a flow every call participant shares (camera video)
+//!   sheds a burst onto the peer that sent it, not onto its neighbours.
 //! - **Admission** (consensus-derived, injected): default-deny on receive
 //!   AND send. Unadmitted traffic is dropped at demux, counted, and
 //!   attributed; a correct node cannot emit rogue traffic because flow
@@ -240,7 +243,7 @@ struct Traffic {
     datagram_bytes_tx: AtomicU64,
     datagrams_rx: AtomicU64,
     datagram_bytes_rx: AtomicU64,
-    /// Datagrams shed by per-flow drop-oldest overflow, summed across all of
+    /// Datagrams shed by per-sender drop-oldest overflow, summed across all of
     /// this plane's flows (survives individual flow teardown, unlike
     /// [`DatagramFlow::dropped`]).
     datagrams_shed: AtomicU64,
@@ -314,9 +317,24 @@ pub struct StatsSnapshot {
     pub refused_sends: u64,
 }
 
+/// Arrival order plus what each sender currently occupies. The counts are
+/// derivable from `items`, but push is the hot path and must not walk the
+/// queue to learn one sender's depth.
+#[derive(Default)]
+struct Queued {
+    items: VecDeque<(PeerId, Vec<u8>)>,
+    per_peer: HashMap<PeerId, usize>,
+}
+
 struct DatagramQueue {
+    /// The budget is spent PER SENDER, not per flow: one flow carries every
+    /// participant of a call, and a flow-wide bound makes one peer's
+    /// keyframe burst evict the fragments of the peers it is racing — whose
+    /// frames then never reassemble, drawing keyframe requests that burst
+    /// the queue again. The flow's ceiling is `max` × its admitted senders,
+    /// and default-deny admission is what bounds that set.
     max: usize,
-    queue: Mutex<VecDeque<(PeerId, Vec<u8>)>>,
+    queue: Mutex<Queued>,
     dropped: AtomicU64,
     notify: Notify,
 }
@@ -325,23 +343,32 @@ impl DatagramQueue {
     fn new(max: usize) -> Self {
         DatagramQueue {
             max: max.max(1),
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(Queued::default()),
             dropped: AtomicU64::new(0),
             notify: Notify::new(),
         }
     }
 
-    /// Returns whether an oldest datagram was shed to make room.
+    /// Returns whether a datagram was shed to make room.
     fn push(&self, from: PeerId, payload: Vec<u8>) -> bool {
         let mut q = self.queue.lock().expect("queue lock");
-        let shed = q.len() == self.max;
+        let held = q.per_peer.get(&from).copied().unwrap_or(0);
+        let shed = held == self.max;
         if shed {
-            // Drop-oldest: for real-time traffic the newest datagram is the
-            // valuable one, and the overflow stays inside this flow.
-            q.pop_front();
+            // Drop-oldest WITHIN the sender: for real-time traffic the newest
+            // datagram is the valuable one, and the overflow is charged to
+            // the peer that caused it — never to a quieter one.
+            let oldest = q
+                .items
+                .iter()
+                .position(|(peer, _)| *peer == from)
+                .expect("a sender at its budget holds a queued datagram");
+            q.items.remove(oldest);
             self.dropped.fetch_add(1, Ordering::Relaxed);
+        } else {
+            *q.per_peer.entry(from).or_insert(0) += 1;
         }
-        q.push_back((from, payload));
+        q.items.push_back((from, payload));
         drop(q);
         self.notify.notify_one();
         shed
@@ -350,11 +377,22 @@ impl DatagramQueue {
     async fn recv(&self) -> (PeerId, Vec<u8>) {
         loop {
             let notified = self.notify.notified();
-            if let Some(item) = self.queue.lock().expect("queue lock").pop_front() {
+            if let Some(item) = self.take() {
                 return item;
             }
             notified.await;
         }
+    }
+
+    fn take(&self) -> Option<(PeerId, Vec<u8>)> {
+        let mut q = self.queue.lock().expect("queue lock");
+        let (from, payload) = q.items.pop_front()?;
+        let held = q.per_peer.get_mut(&from).expect("queued sender is counted");
+        *held -= 1;
+        if *held == 0 {
+            q.per_peer.remove(&from);
+        }
+        Some((from, payload))
     }
 }
 
