@@ -98,14 +98,20 @@ struct Sources<P> {
 }
 
 impl<P: Clone + PartialEq> Sources<P> {
+    /// the RAW cursor and the candidate it selects. the token is the raw
+    /// counter, never the modular index: [`Sources::advance_past`] compares
+    /// it against the same raw counter, so folding the wrap in here would
+    /// freeze the rotation on index 0 for the process's life the moment the
+    /// cursor passed `len`.
     fn current(&self) -> (usize, P) {
-        let at = self.cursor.load(Ordering::Relaxed) % self.candidates.len();
-        (at, self.candidates[at].clone())
+        let raw = self.cursor.load(Ordering::Relaxed);
+        (raw, self.candidates[raw % self.candidates.len()].clone())
     }
 
-    /// advance past the source at `observed` — exactly once per failure wave:
-    /// a concurrent request that saw the same source fail leaves the cursor
-    /// where the first advance put it.
+    /// advance past the source at `observed` (a RAW cursor token from
+    /// [`Sources::current`]) — exactly once per failure wave: a concurrent
+    /// request that saw the same source fail leaves the cursor where the
+    /// first advance put it.
     fn advance_past(&self, observed: usize) {
         let _ = self.cursor.compare_exchange(
             observed,
@@ -439,5 +445,27 @@ mod tests {
         assert_eq!(sources.current().1, "c");
         sources.advance_past(2);
         assert_eq!(sources.current().1, "a");
+
+        // and it keeps rotating PAST the wrap: the token stays the raw
+        // counter (3), so the fourth failure lands on "b" rather than
+        // freezing the cursor on the head forever.
+        let (at, wrapped) = sources.current();
+        assert_eq!((at, wrapped), (3, "a"));
+        sources.advance_past(at);
+        assert_eq!(sources.current(), (4, "b"));
+    }
+
+    #[test]
+    fn an_out_of_band_bump_does_not_freeze_the_rotation() {
+        // `advance_source` bumps the same raw cursor from another lane; the
+        // failure path must still rotate from wherever it left it.
+        let sources = Sources {
+            candidates: vec!["a", "b", "c"],
+            cursor: AtomicUsize::new(7),
+        };
+        let (at, server) = sources.current();
+        assert_eq!((at, server), (7, "b"));
+        sources.advance_past(at);
+        assert_eq!(sources.current().1, "c");
     }
 }

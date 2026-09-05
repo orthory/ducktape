@@ -31,8 +31,9 @@ use crate::replica;
 use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
 use crate::sync::catchup::{SuffixCatchupError, catch_up_suffix_frames};
 use crate::sync::serve::{
-    ServedSeal, reopen_preflight_synced_host, reopen_recovery, replica_backfill,
-    replica_orchestrator_at, replica_verifier, verify_manifest_floor, write_boundary_checkpoint,
+    SealVerdict, ServedSeal, check_served_seal, name_diverged_modules,
+    reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
+    replica_verifier, verify_manifest_floor, write_boundary_checkpoint,
 };
 use crate::util::{fatal, hex};
 use noded::projection::{BlockProjection, project_block};
@@ -1400,34 +1401,37 @@ pub(super) async fn park(
                     metrics.record_height(height);
                 }
                 metrics.record_op_outcomes(applied_ops, rejected_ops);
-                // a BACKFILLED height's trust is the served seal:
-                // what our fold produced must match it exactly, or
-                // this replica has diverged from the quorum's fold.
-                if let Some((_, served_hash, served_roots)) = pending_seal_checks.remove(&height)
-                    && sealed_hash.is_some_and(|h| h != served_hash)
-                {
-                    // name the diverging module(s) — the one lead an
-                    // operator (or the next debugger) needs first.
-                    for (module, served_root) in &served_roots {
-                        let ours = node_r.host().module_root(module);
-                        if ours.as_ref() != Some(served_root) {
-                            tracing::error!(
-                                target: "ducktape::consensus",
-                                node = %label,
-                                module,
-                                served = %hex(served_root),
-                                ours = %ours.map(|r| hex(&r)).unwrap_or_else(|| "none".into()),
-                                "replica module diverged"
-                            );
+                // a BACKFILLED height's trust is the served seal — the bytes
+                // entered the orderer with NO certificate check — so what our
+                // fold produced must match it on BOTH halves, disposition and
+                // root, or this replica has diverged from the quorum's fold.
+                if let Some(seal) = pending_seal_checks.remove(&height) {
+                    match check_served_seal(sealed_hash, applied, &seal) {
+                        SealVerdict::Agrees => {}
+                        SealVerdict::NothingSealed => fatal!(
+                            label,
+                            "backfilled height {height} sealed nothing (every frame \
+                             discarded) yet a source served a seal for it — no honest \
+                             journal holds that frame"
+                        ),
+                        SealVerdict::Disposition { ours, served } => fatal!(
+                            label,
+                            "backfilled height {height} folded as {ours:?} but the quorum \
+                             sealed it {served:?} — state diverged"
+                        ),
+                        SealVerdict::Root { ours, served } => {
+                            // name the diverging module(s) — the one lead an
+                            // operator (or the next debugger) needs first.
+                            name_diverged_modules(node_r.host(), &label, &seal.2);
+                            fatal!(
+                                label,
+                                "backfilled height {height} folded to {} but the quorum \
+                                 sealed {} — state diverged",
+                                hex(&ours),
+                                hex(&served)
+                            )
                         }
                     }
-                    fatal!(
-                        label,
-                        "backfilled height {height} folded to \
-                         {} but the quorum sealed {} — state diverged",
-                        hex(&sealed_hash.expect("checked above")),
-                        hex(&served_hash)
-                    );
                 }
                 let ops = indexer::BlockOps {
                     record,
@@ -1970,17 +1974,20 @@ pub(super) async fn park(
         // else, so an unreachable source costs this loop nothing but the
         // poll it was already pacing.
         retry_owed_backfill(&mut backfill_debt, &index, &client, &label).await;
-        // follow the mesh rotation while parked: track the tip's
-        // REPLICATED generation window — the identical snapshots every
-        // member tracks, so a parked joiner's tracked sets can never
-        // diverge from the network's (the coordinates are unverified
-        // serving hints; promotion re-derives everything from verified
-        // state). the epoch stays the CHANNEL/book coordinate below.
-        mesh_window.track_new(
-            oracle,
-            &mesh_book,
-            &crate::mesh_window::window_from_sync(&tip.mesh_window),
-        );
+        // follow the mesh rotation while parked. the tip's window is an
+        // UNVERIFIED serving hint from an untrusted server, so it never
+        // installs a peer set and never advances the tracker's latch — the
+        // latch is monotone and this tracker rides `PromotionBaton`, so one
+        // bogus generation would deafen this node to every real membership
+        // change for the process's life, validator role included. all a hint
+        // may do is say the COMMITTED read is behind; the committed window is
+        // what gets tracked. the epoch stays the CHANNEL/book coordinate
+        // below.
+        let hinted_ahead = mesh_window.hint_owes_committed_read(&tip.mesh_window);
+        if hinted_ahead && let Some((_, node_r)) = serving.as_ref() {
+            let committed_window = read_valset_mesh_window(node_r.host()).await;
+            mesh_window.track_new(oracle, &mesh_book, &committed_window);
+        }
         if tip.epoch > last_tip_epoch {
             if !lane_bank.covers(tip.epoch) {
                 tracing::warn!(

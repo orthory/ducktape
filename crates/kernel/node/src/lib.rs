@@ -1266,6 +1266,14 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.view_ceiling = Some(ceiling);
     }
 
+    /// the armed discard boundary, for a caller that must apply the SAME rule
+    /// before the drain does — a backfill lane taking frames from an
+    /// unverified source refuses what this node would discard, instead of
+    /// admitting the bytes and discovering the lie after the fold.
+    pub fn view_ceiling(&self) -> Option<u64> {
+        self.view_ceiling
+    }
+
     /// the last ENGINE-relative finalized view this node drained — the number
     /// the valset orchestrator observes. `None` since the last cutover.
     pub fn last_engine_view(&self) -> Option<u64> {
