@@ -45,7 +45,7 @@ pub use guest_paths::GuestLayout;
 #[cfg(unix)]
 pub use host_tools::{find_executable, find_on_path, find_system_tool};
 #[cfg(unix)]
-pub use microvm::{MicroVm, MicroVmIo};
+pub use microvm::{MicroVm, MicroVmIo, ScratchDir};
 pub use sandbox::{SandboxBackend, Vmm};
 pub use workspace_image::GuestAsset;
 
