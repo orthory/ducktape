@@ -417,6 +417,28 @@ impl Tracker {
         ))
     }
 
+    /// a PR's author plus its submitted reviewers — the merge-authorization
+    /// inputs `ForgeState::require_merge_authorized` reads. unlike
+    /// [`Self::pr_branches`] this does not require the PR still be open: a
+    /// merge's tracker-side gate already runs `pr_branches` first, and the
+    /// same participants own a re-check without a second open-state error.
+    pub fn pr_participants(
+        &self,
+        repo: &str,
+        number: u64,
+    ) -> Result<(AuthorRef, Vec<AuthorRef>), Error> {
+        let item = self.item(repo, number)?;
+        if item.kind != ItemKind::Pr {
+            return Err(Error::Module(format!(
+                "forge: item #{number} is an issue, not a pull request"
+            )));
+        }
+        Ok((
+            item.author.clone(),
+            item.reviews.iter().map(|r| r.author.clone()).collect(),
+        ))
+    }
+
     /// mint the next system-message id for an item's discussion channel.
     pub fn next_sys_message_id(&mut self, repo: &str, number: u64) -> Result<String, Error> {
         let item = self.item_mut(repo, number)?;
