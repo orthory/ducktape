@@ -9117,6 +9117,7 @@ dependencies = [
  "tokio",
  "topology",
  "tracing",
+ "wasm-host",
  "workspace-config",
 ]
 

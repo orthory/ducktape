@@ -8,14 +8,6 @@ name = "wasm-host"
 version.workspace = true
 edition.workspace = true
 
-[features]
-# opt-in cranelift artifact cache (wasmtime's own, via Config::cache) for the
-# sim/test lane only. Default OFF: with this feature off, `sim_wasm_cache`
-# doesn't exist at all (a `None`-returning stub instead), so a production
-# node's build can never read DUCKTAPE_WASM_CACHE_DIR or write a cache dir,
-# regardless of what an operator sets in its environment.
-wasm-cache = []
-
 [dependencies]
 sdk = { workspace = true }
 wasmtime = { workspace = true }
