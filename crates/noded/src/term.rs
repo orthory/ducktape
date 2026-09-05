@@ -1578,6 +1578,11 @@ fn create_route(
 /// ws topic. A local create spawns here; a directed (`node`/`cred`) create rides
 /// the guest lane to the host. Over the cap, missing sandbox, unknown agent, or a
 /// host refusal each return a clear error (never a panic, never a Direct spawn).
+///
+/// AUTH: node-level (`signed_req`, `Authority::Operator`). This spawns a pty /
+/// microVM ON THE HOST and reads no acting identity, so it takes the node's
+/// operator credential or a signature by its operator key — never a key the
+/// caller minted for itself.
 pub async fn create_session(
     State(handle): State<NodeHandle>,
     Json(body): Json<CreateSessionBody>,

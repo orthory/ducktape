@@ -750,7 +750,10 @@ pub fn router(handle: NodeHandle) -> Router {
             "/forge/{repo}/git-upload-pack",
             post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
         );
-    // EVERY mutating route above carries a user signature; the reads do not.
+    // EVERY mutating route above carries a credential; the reads do not. WHICH
+    // credential is `signed_req::Lane::authority`'s call: a module-bound write
+    // takes any acting key (the module decides), a node-level one takes this
+    // node's operator.
     // `route_layer`, NOT `layer`: a layer would also wrap the fallback, and an
     // unmatched path must 404 rather than be told it needs a signature.
     // `signed_req::lane_of` is the whole table — a new mutating route is added
@@ -1002,11 +1005,13 @@ pub(crate) async fn shutdown(State(handle): State<NodeHandle>) -> Response {
 /// tree is unreachable without a restart — and restarting a wedged node destroys
 /// the state you restarted it to look at.
 ///
-/// AUTH: it MUTATES the running process, so it carries a user signature like
-/// every other mutating route ([`signed_req`]). turning `ducktape::x=trace` on
-/// is a real denial-of-service against the node's own disk — `daemon.log` has
-/// no rate limit — and a bare `curl` from anything that could dial the port
-/// used to be enough. the operator verb signs for you.
+/// AUTH: it MUTATES the running PROCESS and reads no acting identity, so it is
+/// one of the node-level routes (`signed_req`, `Authority::Operator`): this
+/// node's operator credential, or a signature by the key it knows as its
+/// operator's. turning `ducktape::x=trace` on is a real denial-of-service
+/// against the node's own disk — `daemon.log` has no rate limit — and any key a
+/// caller minted for itself must not buy it. `ducktape node log-filter` signs
+/// with the active wallet key, which is the key the node read at boot.
 async fn log_filter(body: String) -> Response {
     match crate::log::set_filter(body.trim()) {
         Ok(()) => (StatusCode::OK, body).into_response(),
@@ -1030,11 +1035,12 @@ async fn log_filter(body: String) -> Response {
 /// descriptor to fold a hint into.
 ///
 /// AUTH: a bearer invite is a real capability — a right to join this mesh for
-/// up to 365 days — so minting one is behind the signed-write gate
-/// ([`signed_req`]) like every other mutation: a user signature, or this node's
-/// operator credential from a local process that can read its workspace. The
-/// desktop app presents the latter (it already reads the same workspace for the
-/// service-link token).
+/// up to 365 days — and this handler reads no acting identity, so possession of
+/// a self-minted key buys nothing here. It is node-level
+/// (`signed_req`, `Authority::Operator`): this node's operator credential from
+/// a local process that can read its workspace, or a signature by the key the
+/// node knows as its operator's. The desktop app presents the former (it
+/// already reads the same workspace for the service-link token).
 async fn mint_invite(
     State(handle): State<NodeHandle>,
     body: Option<Json<serde_json::Value>>,

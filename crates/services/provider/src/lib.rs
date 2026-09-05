@@ -1672,14 +1672,23 @@ impl Drop for ContextGuard {
 ///   caller passes by sending no headers. `/v1/gateway/browser` likewise.
 ///
 /// Out of reach: every other port and every other address on this host (no
-/// listener is bound for them, with or without a NIC); `/v1/admin/*`; and
-/// EVERY MUTATING `/v1` ROUTE — `/v1/submit`, `/v1/invite`, the duckfs writes,
-/// the object facade's PUT/DELETE, `/v1/fs/workspaces`, `/v1/term/sessions`
-/// and `/v1/log-filter` all want either a per-request user signature or this
-/// node's operator credential (`noded::signed_req`), and a run's env is an
-/// allowlist that carries neither. The forge's `git-receive-pack` takes the
-/// same two proofs in git's own shapes — a `git push --signed` certificate or
-/// that operator credential in a header — and a guest can present neither.
+/// listener is bound for them, with or without a NIC); `/v1/admin/*`; and the
+/// NODE-LEVEL mutations — `/v1/invite`, `/v1/log-filter`, `/v1/term/sessions`
+/// and `DELETE /v1/fs/workspaces/{id}` — which take either this node's
+/// operator credential (a 0600 file in a workspace the guest has no path to)
+/// or a signature by the key the node knows as its operator's
+/// (`noded::signed_req`), and a run's env carries neither. The forge's
+/// `git-receive-pack` takes the same two proofs in git's own shapes — a
+/// `git push --signed` certificate or that operator credential in a header —
+/// and a guest can present neither.
+///
+/// **In reach, on purpose:** the MODULE-BOUND mutations — `/v1/submit`, the
+/// duckfs writes, the object facade's PUT/DELETE, `POST /v1/fs/workspaces` and
+/// its commit. Those take a per-request signature by ANY key, because the
+/// verified key becomes the op's `Origin::External` and the module's
+/// `check_authority` is what decides. A guest can mint a keypair and sign, and
+/// what it can then do is exactly what that key is authorized to do on-chain —
+/// which for a fresh key is nothing.
 ///
 /// Narrowing the READS to a scoped lane is the open half of #1317, and this
 /// function is the one place such a lane would replace.
