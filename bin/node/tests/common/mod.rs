@@ -1649,14 +1649,7 @@ impl Cluster {
         let daemon = self.daemons[idx]
             .as_ref()
             .expect("node has a compute daemon (set `compute_grant` before spawn)");
-        daemon
-            .text()
-            .lines()
-            .filter_map(|line| {
-                line.find(marker)
-                    .map(|at| line[at + marker.len()..].trim().to_string())
-            })
-            .collect()
+        extract_markers(&daemon.text(), marker)
     }
 
     /// Wait until `probe` answers, re-evaluating it on node `idx`'s heartbeat.
@@ -2194,6 +2187,40 @@ fn find_marker(text: &str, marker: &str) -> Option<String> {
         line.find(marker)
             .map(|at| line[at + marker.len()..].trim().to_string())
     })
+}
+
+/// every value that followed `marker` on a line of `text`, ANSI-stripped
+/// first: unlike a message-only marker, `compute_markers` reads lines that
+/// can carry a coloured field list after the message (see `compute_markers`
+/// on `Cluster`), so slicing on the raw bytes risks handing back escape
+/// codes instead of the bare value.
+fn extract_markers(text: &str, marker: &str) -> Vec<String> {
+    strip_ansi(text)
+        .lines()
+        .filter_map(|line| {
+            line.find(marker)
+                .map(|at| line[at + marker.len()..].trim().to_string())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::extract_markers;
+
+    #[test]
+    fn extract_markers_strips_ansi_before_slicing() {
+        // shaped like a real fmt-layer capture: coloured level/target ANSI
+        // ahead of the message, then a trailing coloured field the message
+        // itself does not carry (e.g. another field on the same event).
+        // The marker sits in the plain-text message, but a naive byte slice
+        // to end-of-line would still hand back the trailing escape codes —
+        // extract_markers must return the bare path only.
+        let line = "\x1b[2m2026-09-05\x1b[0m \x1b[34mDEBUG\x1b[0m run dir materialized \
+                     kind=rw path=/tmp/run-1\x1b[2m note\x1b[0m\x1b[2m=\x1b[0mok";
+        let got = extract_markers(line, "run dir materialized kind=rw path=");
+        assert_eq!(got, vec!["/tmp/run-1 note=ok".to_string()]);
+    }
 }
 
 fn log_tail(text: &str, lines: usize) -> String {
