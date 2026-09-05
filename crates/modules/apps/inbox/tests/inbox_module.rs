@@ -6,9 +6,7 @@
 
 use futures::executor::block_on;
 use host::{BlockContext, Host};
-use inbox::{
-    Inbox, InboxMsg, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS, Notification, encode_msg,
-};
+use inbox::{Inbox, InboxMsg, MAX_ITEMS_PER_MEMBER, MAX_MEMBERS, Notification, encode_msg};
 use sdk::{Ctx, Env, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sdk_testkit::{MemStore, TestCtx};
 
@@ -158,6 +156,8 @@ fn source_is_derived_from_origin() {
     block_on(async {
         let mut inbox = fresh();
 
+        // module and system origins deliver to any member — "m" is neither's
+        // own queue, and that is exactly the point.
         inbox
             .execute(
                 &mut ctx(Origin::Module("chat".into()), 1),
@@ -166,38 +166,53 @@ fn source_is_derived_from_origin() {
             .await
             .expect("module deliver");
         inbox
-            .execute(
-                &mut ctx(Origin::External(vec![0xde, 0xad, 0xbe, 0xef]), 2),
-                &deliver("m", "k", "from external"),
-            )
-            .await
-            .expect("external deliver");
-        inbox
             .execute(&mut sys(3), &deliver("m", "k", "from system"))
             .await
             .expect("system deliver");
-        inbox
-            .execute(
-                &mut ctx(Origin::External(Vec::new()), 4),
-                &deliver("m", "k", "from anonymous external"),
-            )
-            .await
-            .expect("empty-external deliver");
         inbox.commit_block().await.expect("commit");
 
-        // source = module id verbatim / "ext:"+hex of external bytes /
-        // "system" — the ext: prefix domain-separates external keys from
-        // pure-hex module ids; never caller-supplied.
+        // source = module id verbatim / "system" — never caller-supplied.
         let (next, items) = queue(&inbox, "m").await.expect("m exists");
-        assert_eq!(next, 5);
+        assert_eq!(next, 3);
         assert_eq!(
             tuples(&items),
             vec![
                 t(1, "k", "from module", "chat", 1, false),
-                t(2, "k", "from external", "ext:deadbeef", 2, false),
-                t(3, "k", "from system", "system", 3, false),
-                t(4, "k", "from anonymous external", "ext:", 4, false),
+                t(2, "k", "from system", "system", 3, false),
             ]
+        );
+
+        // an authenticated external origin may deliver only to its OWN
+        // queue: self-delivery still derives `source` as "ext:"+hex, never
+        // caller-supplied.
+        let mut inbox = fresh();
+        let ext_key = vec![0xde, 0xad, 0xbe, 0xef];
+        let ext_member = Origin::External(ext_key.clone()).actor_string();
+        inbox
+            .execute(
+                &mut ctx(Origin::External(ext_key), 2),
+                &deliver(&ext_member, "k", "from external"),
+            )
+            .await
+            .expect("external self-deliver");
+        inbox.commit_block().await.expect("commit external");
+        let (_, items) = queue(&inbox, &ext_member).await.expect("ext member exists");
+        assert_eq!(
+            tuples(&items),
+            vec![t(1, "k", "from external", "ext:deadbeef", 2, false)]
+        );
+
+        // the pre-consensus anonymous-external default owns no queue at all,
+        // so it cannot even self-deliver to "ext:".
+        let err = inbox
+            .execute(
+                &mut ctx(Origin::External(Vec::new()), 4),
+                &deliver("ext:", "k", "from anonymous external"),
+            )
+            .await
+            .expect_err("an unauthenticated external must be refused");
+        assert!(
+            matches!(err, Error::Module(ref m) if m.contains("may only deliver to its own queue"))
         );
     });
 }
@@ -511,8 +526,8 @@ impl Module for ProducerWithAck {
 #[test]
 fn a_module_follow_up_cannot_ack_any_queue() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(fresh()), Box::new(ProducerWithAck)])
-            .expect("genesis");
+        let mut host =
+            Host::genesis(vec![Box::new(fresh()), Box::new(ProducerWithAck)]).expect("genesis");
         let app0 = host.root_hash();
 
         // fail CLOSED: the ack is refused, which aborts the cascade its own
@@ -550,7 +565,10 @@ fn only_the_queues_own_member_may_ack_it() {
         let alice = queue_of(ALICE_KEY);
         for _ in 0..3 {
             inbox
-                .execute(&mut ctx(Origin::Module("chat".into()), 1), &deliver(&alice, "k", "b"))
+                .execute(
+                    &mut ctx(Origin::Module("chat".into()), 1),
+                    &deliver(&alice, "k", "b"),
+                )
                 .await
                 .expect("a module delivers into alice's queue");
         }
@@ -586,8 +604,12 @@ fn only_the_queues_own_member_may_ack_it() {
             .await
             .expect("the member clears her own queue");
         inbox.commit_block().await.expect("commit alice's acks");
-        let (next, items) = queue(&inbox, &alice).await.expect("the meta survives");
-        assert_eq!((next, items.len()), (4, 0), "her own clear landed");
+        // the clear emptied her whole queue: the META record is deleted, not
+        // left behind item-less (see `clear_that_empties_a_queue...` below).
+        assert!(
+            queue(&inbox, &alice).await.is_none(),
+            "an emptied queue's meta record is deleted"
+        );
     });
 }
 
@@ -630,30 +652,162 @@ fn only_an_authenticated_external_submitter_owns_a_queue() {
 }
 
 #[test]
-fn delivering_is_ungated_and_stays_ungated() {
+fn module_and_system_origins_deliver_to_any_member() {
     block_on(async {
-        // the ack gate binds ACKS only. every origin shape still delivers to a
-        // queue it does not own — the module's entire purpose, and the reason
-        // the owner check lives in the ack arms and not above the match.
+        // a module/system follow-up delivers to a queue it does not own —
+        // the module's entire purpose, and unrestricted on purpose: that is
+        // the path every cross-module notification rides.
         let mut inbox = fresh();
         let alice = queue_of(ALICE_KEY);
-        for (height, origin) in [
-            Origin::Module("chat".into()),
-            Origin::System,
-            Origin::External(STRANGER_KEY.to_vec()),
-            Origin::External(Vec::new()),
-        ]
-        .into_iter()
-        .enumerate()
+        for (height, origin) in [Origin::Module("chat".into()), Origin::System]
+            .into_iter()
+            .enumerate()
         {
             inbox
                 .execute(&mut ctx(origin, height as u64), &deliver(&alice, "k", "b"))
                 .await
-                .expect("any origin delivers to any member");
+                .expect("a module/system origin delivers to any member");
         }
         inbox.commit_block().await.expect("commit");
         let (next, items) = queue(&inbox, &alice).await.expect("alice exists");
-        assert_eq!((next, items.len()), (5, 4));
+        assert_eq!((next, items.len()), (3, 2));
+    });
+}
+
+#[test]
+fn external_origin_delivering_to_another_members_queue_is_refused() {
+    block_on(async {
+        // the acl table is empty/open at genesis, so an external signed op
+        // reaches Deliver directly — it must not be able to mint a
+        // fabricated member (the one-way MAX_MEMBERS cap) or flood a real
+        // member's queue (evicting their genuine notifications).
+        let mut inbox = fresh();
+        let alice = queue_of(ALICE_KEY);
+
+        let err = inbox
+            .execute(
+                &mut submitter(STRANGER_KEY, 1),
+                &deliver(&alice, "k", "flood"),
+            )
+            .await
+            .expect_err("a stranger delivering to another member's queue must be refused");
+        assert!(
+            matches!(&err, Error::Module(m) if m.contains("may only deliver to its own queue")),
+            "unexpected refusal: {err:?}"
+        );
+
+        // to its OWN queue: accepted.
+        inbox
+            .execute(
+                &mut submitter(STRANGER_KEY, 2),
+                &deliver(&queue_of(STRANGER_KEY), "k", "self"),
+            )
+            .await
+            .expect("self-delivery is permitted");
+
+        inbox.commit_block().await.expect("commit");
+        assert!(
+            queue(&inbox, &alice).await.is_none(),
+            "the refused delivery never touched alice's queue"
+        );
+        let (_, items) = queue(&inbox, &queue_of(STRANGER_KEY))
+            .await
+            .expect("the stranger's own queue exists");
+        assert_eq!(items.len(), 1, "only the self-delivery landed");
+    });
+}
+
+// ---- the member counter falls -----------------------------------------------
+
+#[test]
+fn clear_that_empties_a_queue_frees_its_member_slot() {
+    block_on(async {
+        let mut inbox = fresh();
+        let alice = queue_of(ALICE_KEY);
+
+        // fill the member cap: MAX_MEMBERS-1 module-delivered members, plus
+        // alice's own single self-delivered item.
+        for i in 0..MAX_MEMBERS as u64 - 1 {
+            let member = format!("m{i}");
+            inbox
+                .execute(&mut sys(0), &deliver(&member, "k", ""))
+                .await
+                .expect("deliver to fresh member");
+        }
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 0), &deliver(&alice, "k", "hi"))
+            .await
+            .expect("alice self-delivers");
+        inbox.commit_block().await.expect("commit fill");
+        assert_eq!(inbox.member_count_view().await.unwrap(), MAX_MEMBERS as u64);
+
+        let err = inbox
+            .execute(&mut sys(0), &deliver("overflow", "k", ""))
+            .await
+            .expect_err("the cap is full");
+        assert!(matches!(err, Error::Module(ref m) if m.contains("member capacity")));
+
+        // alice clears her ONLY item: the queue empties, its meta record is
+        // deleted, and the member count falls by exactly one.
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 1), &clear(&alice, 1))
+            .await
+            .expect("alice clears her own queue");
+        inbox.commit_block().await.expect("commit clear");
+        assert!(
+            queue(&inbox, &alice).await.is_none(),
+            "an emptied queue's meta record is deleted"
+        );
+        assert_eq!(
+            inbox.member_count_view().await.unwrap(),
+            MAX_MEMBERS as u64 - 1,
+            "the member counter fell"
+        );
+
+        // the freed slot admits a fresh member again, right at the cap.
+        inbox
+            .execute(&mut sys(2), &deliver("newcomer", "k", ""))
+            .await
+            .expect("a fresh member is admitted again at the cap");
+        inbox.commit_block().await.expect("commit newcomer");
+        assert_eq!(inbox.member_count_view().await.unwrap(), MAX_MEMBERS as u64);
+
+        // the cap is full again (newcomer took the freed slot), so even
+        // alice's own re-delivery is rejected until another slot frees up —
+        // her old slot is gone, not reserved for her.
+        let err = inbox
+            .execute(&mut submitter(ALICE_KEY, 3), &deliver(&alice, "k", "again"))
+            .await
+            .expect_err("the freed slot was already spent on newcomer");
+        assert!(matches!(err, Error::Module(ref m) if m.contains("member capacity")));
+    });
+}
+
+// ---- overflow eviction stays visible -----------------------------------------
+
+#[test]
+fn overflow_eviction_is_counted_per_member() {
+    block_on(async {
+        let mut inbox = fresh();
+        let cap = MAX_ITEMS_PER_MEMBER as u64;
+        // two over the cap: two drops.
+        for i in 0..cap + 2 {
+            inbox
+                .execute(&mut sys(i), &deliver("alice", "k", "b"))
+                .await
+                .expect("deliver");
+        }
+        inbox.commit_block().await.expect("commit");
+        assert_eq!(
+            inbox.evicted_count("alice").await.unwrap(),
+            2,
+            "two overflow drops must be counted, not silent"
+        );
+        assert_eq!(
+            inbox.evicted_count("bob").await.unwrap(),
+            0,
+            "bob never overflowed"
+        );
     });
 }
 

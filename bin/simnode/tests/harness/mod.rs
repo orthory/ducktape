@@ -399,6 +399,18 @@ pub fn key_origin(key: &commonware_cryptography::ed25519::PrivateKey) -> String 
     format!("hex:{hex}")
 }
 
+/// the inbox queue a plain-string `/v1/submit` origin owns: mirrors
+/// [`sdk::Origin::actor_string`]'s `ext:` + lowercase-hex convention for an
+/// `Origin::External` whose key is the origin string's own ASCII bytes (the
+/// trusted-client convention `decode_origin` in `bin/simnode/src/lib.rs`
+/// passes through verbatim). inbox now refuses an external `Deliver` outside
+/// its own queue, so any harness helper that ticks the logical clock through
+/// inbox must target this, not the raw origin string.
+pub fn ext_actor(origin: &str) -> String {
+    let hex: String = origin.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("ext:{hex}")
+}
+
 /// the `Create` op founding an account for the submit ORIGIN (declared
 /// ed25519, so a 32-byte origin — an ASCII stand-in or a real key via
 /// [`key_origin`] — founds; anything else is refused as malformed). the

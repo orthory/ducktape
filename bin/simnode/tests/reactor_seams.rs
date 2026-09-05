@@ -342,10 +342,11 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
             json!({ "task": { "create_task": { "task_id": "t1", "title": "sweep" } } }),
             Some("owner".into()),
         ),
-        // inbox
+        // inbox — delivers to the "courier" origin's OWN queue: inbox refuses
+        // an external `Deliver` anywhere else.
         (
             "inbox",
-            json!({ "deliver": { "member": "alice", "kind": "note", "body": "hi" } }),
+            json!({ "deliver": { "member": harness::ext_actor("courier"), "kind": "note", "body": "hi" } }),
             Some("courier".into()),
         ),
         // the job board (the merged tasks module's `job` arm)
