@@ -1379,8 +1379,14 @@ pub(super) async fn park(
         // (no more healing), the explorer row, the ws block event,
         // the finalization floor, and the checkpoint cadence.
         if let Some((served_height, node_r)) = serving.as_mut() {
-            if let Err(e) = node_r.drain_delivered().await {
-                fatal!(label, "replica fold: {e}");
+            match node_r.drain_delivered().await {
+                Ok(_) => {}
+                // the fold is PAUSED awaiting module code, not faulted: the
+                // frame is still queued and the next pass retries it (the
+                // retry runs the fetch). the blocks it already folded are in
+                // `take_drained` below either way.
+                Err(node::Error::CodeStalled { .. }) => {}
+                Err(e) => fatal!(label, "replica fold: {e}"),
             }
             let drained = node_r.take_drained();
             // The same projection the validator consumes; this loop retains

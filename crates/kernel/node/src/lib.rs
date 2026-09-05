@@ -37,6 +37,18 @@ pub enum Error {
     /// no validator agreed on.
     #[error("delivered height {height} is at or below the applied height {applied}")]
     OutOfOrder { height: u64, applied: u64 },
+    /// the block at `height` designates module code whose bytes this node
+    /// cannot yet resolve, so the drain is PAUSED there — not broken. the
+    /// frame is still at the front of the deferred queue and `applied` blocks
+    /// settled ahead of it; the next drain retries, and the retry IS the
+    /// fetch pump. a caller that fail-stops on this halts a chain that was
+    /// only waiting: at n=3 the quorum is all three.
+    #[error("module code for block {height} is not resolvable yet: {reason}")]
+    CodeStalled {
+        height: u64,
+        applied: usize,
+        reason: String,
+    },
     /// this node's orderer is a follower — it holds no consensus proposal
     /// rights, so nothing it submits can enter the agreed order. loud so a
     /// miswired write path fails at the seam instead of silently vanishing;
@@ -126,6 +138,11 @@ pub type FrameId = [u8; 32];
 /// still replay; a per-origin nonce enforced in replicated state is the
 /// unbounded successor, and it is not this seam.
 pub const REPLAY_WINDOW_HEIGHTS: usize = 4096;
+
+/// how often a standing code-swap stall re-warns: attempt 1, then every Nth.
+/// the drain retries every tick, so an unconditional warn would evict the
+/// 4096-line ring in minutes — taking the evidence around the stall with it.
+const CODE_STALL_WARN_EVERY: u64 = 64;
 
 /// compute a frame's [`FrameId`] from its exact encoded bytes. public so a
 /// boot-time observer holding journaled frame bytes derives the SAME id the
@@ -1066,6 +1083,11 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// survives the boundary the cutover used to re-open. a restart restores
     /// it from the recovery journal via [`OrderedNode::seed_replay_window`].
     replay_window: std::collections::VecDeque<(u64, FrameId)>,
+    /// the code-swap stall: `(height, attempts)` for the block whose
+    /// component bytes have not landed. a forever-retry loop that warned every
+    /// tick would evict the ring; the COUNTER is the diagnosis, so it rides a
+    /// latched warn. cleared the moment a boundary realizes.
+    code_stall: Option<(u64, u64)>,
     /// how each block's `consensus_time` is derived from its height (see
     /// [`ConsensusTimePolicy`]). defaults to `HeightIsTime` — the validator
     /// lane's pre-policy behavior, byte-for-byte.
@@ -1114,6 +1136,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
             replay_window: std::collections::VecDeque::new(),
+            code_stall: None,
             time_policy: ConsensusTimePolicy::HeightIsTime,
             #[cfg(feature = "sim")]
             decoded: std::collections::HashMap::new(),
@@ -1154,6 +1177,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
             replay_window: std::collections::VecDeque::new(),
+            code_stall: None,
             time_policy: ConsensusTimePolicy::HeightIsTime,
             #[cfg(feature = "sim")]
             decoded: std::collections::HashMap::new(),
@@ -1609,15 +1633,23 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // not apply this block on stale code — put the frame back (nothing
             // journaled yet) and surface the stall; the drain retries once the
             // bytes arrive. NEVER a fork: every honest node holding the bytes
-            // realizes identically, and one that doesn't stops here.
+            // realizes identically, and one that doesn't stops here. STALLED,
+            // not fatal: the frame goes back at the FRONT (nothing journaled
+            // yet) and the next drain retries it — the retry is the fetch
+            // pump. a caller that fail-stops here halts a chain that was only
+            // waiting for bytes.
             if let Err(e) = self
                 .host
                 .realize_module_swaps(height, self.code_source.as_ref())
                 .await
             {
                 self.deferred.push_front((view, frame));
-                return Err(Error::Host(e));
+                // the stalled frame was counted as processed on pop; it was
+                // not, and it will be counted again on the retry.
+                return Err(self.note_code_stall(height, e, applied.saturating_sub(1)));
             }
+            // a realized boundary clears the stall: the next miss counts from 1.
+            self.code_stall = None;
             // below the ceiling this batch RESOLVES here as ONE block at ONE
             // height. WAL discipline: the batch bytes are finalized and about to
             // mutate state — journal them ONCE FIRST, so a crash mid-apply rolls
@@ -1878,6 +1910,34 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             }
         }
         Ok(applied)
+    }
+
+    /// count one code-swap stall at `height` and narrate it on the first
+    /// attempt and every [`CODE_STALL_WARN_EVERY`] after — an unconditional
+    /// warn in a forever-retry loop is a log bomb that evicts the evidence,
+    /// and the attempt COUNT is the diagnosis.
+    fn note_code_stall(&mut self, height: u64, e: sdk::Error, applied: usize) -> Error {
+        let attempts = self
+            .code_stall
+            .filter(|(stalled, _)| *stalled == height)
+            .map_or(1, |(_, seen)| seen + 1);
+        self.code_stall = Some((height, attempts));
+        let reason = e.to_string();
+        let narrate = attempts == 1 || attempts.is_multiple_of(CODE_STALL_WARN_EVERY);
+        if narrate {
+            tracing::warn!(
+                target: "ducktape::consensus",
+                height,
+                attempts,
+                reason = "module_code_unresolved",
+                "the drain is stalled awaiting module code: {reason}"
+            );
+        }
+        Error::CodeStalled {
+            height,
+            applied,
+            reason,
+        }
     }
 
     /// remember a batch this node journaled, evicting past
