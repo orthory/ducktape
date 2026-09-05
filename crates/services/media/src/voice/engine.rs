@@ -164,6 +164,20 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         out
     }
 
+    /// Drop a speaker's lane. Call it when the peer leaves the roster: a
+    /// rejoiner builds a FRESH engine whose seq restarts at 0, and a retained
+    /// jitter buffer anchored at their old high seq counts every one of those
+    /// frames late and discards it — for as many frames as they previously
+    /// sent. Their next frame after this opens a clean lane instead.
+    /// Returns whether a lane was there to drop.
+    pub fn forget_peer(&self, peer: PeerId) -> bool {
+        self.lanes
+            .lock()
+            .expect("lanes lock")
+            .remove(&peer)
+            .is_some()
+    }
+
     pub fn speaker_stats(&self) -> Vec<SpeakerStats> {
         self.lanes
             .lock()

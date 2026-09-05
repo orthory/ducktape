@@ -926,12 +926,26 @@ async fn run_session<T: DataPlaneTransport>(
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
                 inbound_hints.retain(|peer, _| live.contains(peer));
-                // a peer who left frees their receive lane too: a rejoiner's new
-                // session restarts frame_no at 0, which a retained reassembler
-                // (high last_emitted) would reject as Stale forever — and Stale
-                // doesn't advance dropped_frames, so no keyframe request self-heals
-                // it. Evicting the lane means the rejoiner's next frame builds a
-                // fresh reassembler and their tile lights up.
+                // a peer who left frees BOTH receive lanes, video and audio: a
+                // rejoiner's new session restarts frame_no and seq at 0, which a
+                // retained reassembler (high last_emitted) rejects as Stale forever
+                // — and Stale doesn't advance dropped_frames, so no keyframe request
+                // self-heals it — while a retained jitter buffer (high seq anchor)
+                // counts every frame late and discards it for as long as they
+                // previously spoke. Evicting on the one departure event means the
+                // rejoiner's next frame builds a fresh reassembler and a fresh
+                // speaker lane, so their tile and their voice come back together.
+                // the speakers are the engine's own set, not `peer_lanes`: a peer
+                // who talks with their camera off never opens a video lane.
+                let departed: Vec<PeerId> = engine
+                    .speaker_stats()
+                    .iter()
+                    .map(|speaker| speaker.peer)
+                    .filter(|peer| !live.contains(&peer.0))
+                    .collect();
+                for peer in departed {
+                    engine.forget_peer(peer);
+                }
                 peer_lanes.retain(|peer, _| live.contains(peer));
                 push_effective_rate(&recipients, &inbound_hints, &mut effective_kbps, &control_out);
                 window += 1;
