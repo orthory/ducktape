@@ -118,6 +118,12 @@ pub(crate) fn gate(
     ledger: &ResourceLedger,
     event: &Event,
 ) -> Gated {
+    // the pool's own event cadence is the beat a stale pending claim sweeps
+    // on (see `ResourceLedger::tick_and_sweep_pending`) — every event this
+    // worker is offered, not just a compute one, so a saga that dies with no
+    // observable follow-up (cancelled or timed out before any Accept ever
+    // landed) still gets swept by unrelated chain traffic.
+    ledger.tick_and_sweep_pending();
     let request = match decode_worker_request(&event.payload) {
         Ok(request) => request,
         Err(_) => return Gated::NotMine,
@@ -157,7 +163,9 @@ pub(crate) fn gate(
         None => {
             let key = pending_key(&request);
             let eligible = match work.admission {
-                AdmissionPolicy::Queue => ledger.claim_pending(key.clone(), &work.demands),
+                AdmissionPolicy::Queue => {
+                    ledger.claim_pending(key.clone(), &work.demands, request.deadline.is_some())
+                }
                 AdmissionPolicy::FailFast => ledger.within_capacity(&work.demands),
             };
             if !eligible {
@@ -329,13 +337,22 @@ format = "text"
     }
 
     fn effect_for_saga(saga_id: &str, spec: Vec<u8>, assignee: Option<&[u8]>) -> Event {
+        effect_for_saga_deadline(saga_id, spec, assignee, None)
+    }
+
+    fn effect_for_saga_deadline(
+        saga_id: &str,
+        spec: Vec<u8>,
+        assignee: Option<&[u8]>,
+        deadline: Option<u64>,
+    ) -> Event {
         Event {
             source: "saga".into(),
             payload: encode_worker_request(&WorkerRequest {
                 saga_id: saga_id.into(),
                 attempt: 0,
                 spec,
-                deadline: None,
+                deadline,
                 assignee: assignee.map(|a| a.to_vec()),
             }),
         }
@@ -746,5 +763,110 @@ format = "text"
         // the capacity is held exactly once by the converted reservation —
         // a double reservation would already have exhausted it twice over.
         assert!(!ledger.fits(&demands(&[("cores", 1)])));
+    }
+
+    /// an announcement whose demand names a dimension this ledger's capacity
+    /// never declared — always a deterministic Skip regardless of any
+    /// "cores" occupancy, so it can drive the pool's beat (gate() ticks it
+    /// on every call, before decoding) without claiming or contending for
+    /// capacity itself.
+    fn noise_event() -> Event {
+        effect_for_saga(
+            "noise",
+            work_spec_with_demands(demands(&[("gpu", 1)])),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_saga_cancelled_before_assignment_is_swept_after_its_beat_budget() {
+        // s0 is cancelled (or times out) before any Accept ever lands, so
+        // its `assignee` never leaves `None`: the saga's own
+        // `cancel_attempt`/`Crank` deliberately emit nothing for an
+        // unassigned attempt, so no event ever reaches this node telling it
+        // to release the claim. The bounded backstop is the only thing that
+        // frees the capacity.
+        let providers = servable_providers();
+        let ledger = ResourceLedger::new(demands(&[("cores", 8)]));
+        let full_demand = || work_spec_with_demands(demands(&[("cores", 8)]));
+
+        // this node accepts s0's announcement; it carries a saga deadline,
+        // so the claim is bounded.
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga_deadline("s0", full_demand(), None, Some(1)),
+            ),
+            Gated::Immediate(_)
+        ));
+
+        // capacity is claimed: an unrelated announcement in the same window
+        // does not fit.
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga("s1", full_demand(), None)
+            ),
+            Gated::Skip("announcement_over_capacity")
+        ));
+
+        // s0 never gets a follow-up. enough unrelated chain traffic passes
+        // (the pool's own beat, driven here by demand-mismatched noise that
+        // never itself claims anything) for the backstop to sweep it.
+        for _ in 0..ledger::PENDING_CLAIM_BEAT_BUDGET {
+            assert!(matches!(
+                gate(&providers, b"me", &ledger, &noise_event()),
+                Gated::Skip("announcement_over_capacity")
+            ));
+        }
+
+        // capacity is free again: the same announcement is now accepted.
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga("s1", full_demand(), None)
+            ),
+            Gated::Immediate(_)
+        ));
+    }
+
+    #[test]
+    fn an_unbounded_pending_claim_never_sweeps() {
+        // an announcement with no saga deadline mirrors the saga's own "no
+        // deadline, no lease: never expires" rule — the local beat backstop
+        // must not free it either, no matter how much traffic passes.
+        let providers = servable_providers();
+        let ledger = ResourceLedger::new(demands(&[("cores", 8)]));
+        let full_demand = || work_spec_with_demands(demands(&[("cores", 8)]));
+
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga("s0", full_demand(), None)
+            ),
+            Gated::Immediate(_)
+        ));
+
+        for _ in 0..ledger::PENDING_CLAIM_BEAT_BUDGET * 2 {
+            let _ = gate(&providers, b"me", &ledger, &noise_event());
+        }
+
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga("s1", full_demand(), None)
+            ),
+            Gated::Skip("announcement_over_capacity")
+        ));
     }
 }

@@ -2,11 +2,40 @@
 //! demands of currently RUNNING jobs. deliberately process-local (consensus
 //! never sees load); a crashed node's over-commitments die with its leases.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use provider_host::RunCancellation;
 use tokio::sync::Notify;
+
+/// how many subsequent `gate()` calls a BOUNDED pending claim (its
+/// announcement carried a saga deadline) may survive with no follow-up
+/// event before this node gives up on it. Backstop only: the saga assigning
+/// the lease elsewhere, or this node's own gate refusing it, both release
+/// the claim immediately by name — this budget exists solely for the path
+/// with no observable event at all (the saga is cancelled, or times out,
+/// while this node's Accept never lands and `assignee` never leaves `None`;
+/// the saga's own `cancel_attempt`/`Crank` deliberately emit nothing for an
+/// unassigned attempt, so no event ever reaches this node to release it).
+///
+/// ponytail: a call-count beat, not the saga's real height/view-denominated
+/// deadline — this crate has no way to read consensus height, and comparing
+/// wall-clock time against a HEIGHT number would be flatly wrong (the
+/// validator default `ConsensusTimePolicy::HeightIsTime` makes `deadline` a
+/// raw block count, not a timestamp). Upgrade path: thread the current
+/// height into `Worker::run` and compare directly.
+pub(crate) const PENDING_CLAIM_BEAT_BUDGET: u64 = 64;
+
+struct PendingClaim {
+    reservation: ReservationGuard,
+    /// whether the announcement carried a saga deadline at all — a claim
+    /// with none is never locally swept either, mirroring the saga's own
+    /// "no deadline, no lease: never expires" rule.
+    bounded: bool,
+    /// the ledger's beat counter at claim time; swept once the beat has
+    /// advanced past it by [`PENDING_CLAIM_BEAT_BUDGET`].
+    claimed_at_beat: u64,
+}
 
 pub struct ResourceLedger {
     capacity: BTreeMap<String, u64>,
@@ -19,7 +48,11 @@ pub struct ResourceLedger {
     /// to). Keyed by `"{saga_id}:{attempt}"`, same as a running reservation,
     /// so the winning own-lease request converts this exact guard instead
     /// of reserving twice.
-    pending: Arc<Mutex<std::collections::HashMap<String, ReservationGuard>>>,
+    pending: Arc<Mutex<HashMap<String, PendingClaim>>>,
+    /// incremented once per `gate()` call — the pool's own event-processing
+    /// cadence, used as [`Self::tick_and_sweep_pending`]'s beat. Not a timer:
+    /// nothing here ever sleeps or spawns to advance it.
+    beat: Mutex<u64>,
 }
 
 impl ResourceLedger {
@@ -28,7 +61,8 @@ impl ResourceLedger {
             capacity,
             running: Arc::new(Mutex::new(BTreeMap::new())),
             available: Arc::new(Notify::new()),
-            pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            beat: Mutex::new(0),
         }
     }
 
@@ -106,21 +140,30 @@ impl ResourceLedger {
         })
     }
 
-    /// Wait until the demands fit, then reserve them atomically. Register the
-    /// waiter before each optimistic reserve so a release between the failed
-    /// check and the await cannot be lost.
     /// Take a PENDING reservation for an announcement's Accept claim: same
     /// atomic check-and-reserve as [`Self::try_reserve`], tracked separately
     /// so [`Self::take_pending`] can hand the exact guard to the winning
-    /// own-lease request instead of reserving the same work twice.
-    pub(crate) fn claim_pending(&self, key: String, demands: &BTreeMap<String, u64>) -> bool {
+    /// own-lease request instead of reserving the same work twice. `bounded`
+    /// says whether the announcement carried a saga deadline — see
+    /// [`PENDING_CLAIM_BEAT_BUDGET`].
+    pub(crate) fn claim_pending(
+        &self,
+        key: String,
+        demands: &BTreeMap<String, u64>,
+        bounded: bool,
+    ) -> bool {
         let Some(reservation) = self.try_reserve(&key, demands) else {
             return false;
         };
-        self.pending
-            .lock()
-            .expect("ledger lock")
-            .insert(key, reservation);
+        let claimed_at_beat = *self.beat.lock().expect("ledger lock");
+        self.pending.lock().expect("ledger lock").insert(
+            key,
+            PendingClaim {
+                reservation,
+                bounded,
+                claimed_at_beat,
+            },
+        );
         true
     }
 
@@ -129,7 +172,11 @@ impl ResourceLedger {
     /// reservation; every other caller drops the returned guard immediately,
     /// releasing the claim.
     pub(crate) fn take_pending(&self, key: &str) -> Option<ReservationGuard> {
-        self.pending.lock().expect("ledger lock").remove(key)
+        self.pending
+            .lock()
+            .expect("ledger lock")
+            .remove(key)
+            .map(|claim| claim.reservation)
     }
 
     /// Release a pending claim this node will never run: the saga assigned
@@ -138,6 +185,30 @@ impl ResourceLedger {
         drop(self.take_pending(key));
     }
 
+    /// Advance the beat by one and sweep any BOUNDED pending claim whose
+    /// budget has elapsed — the backstop for a saga that dies with
+    /// `assignee` still `None` (cancelled or timed out before any Accept
+    /// landed), which emits no event this node could otherwise release on.
+    /// Called once per `gate()` invocation: the pool's own event cadence
+    /// IS the beat, so this never sleeps or spawns anything.
+    pub(crate) fn tick_and_sweep_pending(&self) {
+        let beat = {
+            let mut beat = self.beat.lock().expect("ledger lock");
+            *beat += 1;
+            *beat
+        };
+        self.pending
+            .lock()
+            .expect("ledger lock")
+            .retain(|_, claim| {
+                !claim.bounded
+                    || beat.saturating_sub(claim.claimed_at_beat) < PENDING_CLAIM_BEAT_BUDGET
+            });
+    }
+
+    /// Wait until the demands fit, then reserve them atomically. Register the
+    /// waiter before each optimistic reserve so a release between the failed
+    /// check and the await cannot be lost.
     pub(crate) async fn reserve_when_available(
         &self,
         key: &str,
