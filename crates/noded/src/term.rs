@@ -41,7 +41,6 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use agent_service::wire;
 use axum::Json;
@@ -1584,7 +1583,7 @@ async fn create_remote(handle: &NodeHandle, host: [u8; 32], body: CreateSessionB
         )
             .into_response();
     }
-    let created = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+    let created = match tokio::time::timeout(crate::term_remote::CONTROL_DEADLINE, rx).await {
         Ok(Ok(Ok(created))) => created,
         Ok(Ok(Err(msg))) => {
             return (

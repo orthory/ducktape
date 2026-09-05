@@ -102,7 +102,9 @@ pub mod services;
 /// A service daemon's handle on the node it serves: the `/v1` twin of the
 /// in-process `NodeCommand` actor lane. See [`node_link::NodeLink`].
 pub mod node_link;
-pub use term_remote::{RemoteSessions, SessionInputWire, SessionJob, SessionLane};
+pub use term_remote::{
+    CONTROL_DEADLINE, RemoteSessions, SessionInputWire, SessionJob, SessionLane,
+};
 // PR2 consensus command source: the chat<->pty bridge (channel scheme + the
 // off-loop projector that drives committed chat commands into a session's pty).
 mod term_consensus;
