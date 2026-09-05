@@ -433,9 +433,11 @@ fn an_expired_reclaim_fails_the_job_exactly_at_the_attempt_ceiling() {
         // the reclaim must execute at a height strictly past it.
         let deadline = claimed_at + tasks::MIN_LEASE_VIEWS;
         while sim.status()["height"].as_u64().expect("height") < deadline {
+            // delivers to the "filler" origin's OWN queue: inbox refuses an
+            // external `Deliver` anywhere else.
             sim.submit_ok(
                 "inbox",
-                serde_json::json!({ "deliver": { "member": "filler", "kind": "tick", "body": fill.to_string() } }),
+                serde_json::json!({ "deliver": { "member": harness::ext_actor("filler"), "kind": "tick", "body": fill.to_string() } }),
                 Some("filler"),
             );
             fill += 1;
