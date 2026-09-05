@@ -70,6 +70,22 @@ enum PickGate
   read_only
   probe
 
+// What the status item's "Open" has to do. Since closing a window no longer
+// ends the process, the daemon can be up with nothing tracked — and then there
+// is no window to raise, so the row has to open one.
+enum TrayOpen
+  open
+  raise
+
+// The command chords this app answers, as one discriminant. macOS binds ⌘Q and
+// ⌘W through an app menu this app does not have, so it reads them itself — and
+// they differ only in the letter, which is exactly the shape one enum and one
+// match are for.
+enum CommandChord
+  ignored
+  quit
+  close_window
+
 // The account probe's answer for the picked network's chain.
 enum AccountProbe
   found

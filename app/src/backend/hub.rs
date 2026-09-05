@@ -289,6 +289,21 @@ pub fn window_target_unless(keep: bool, current: Option<iced::window::Id>) -> ic
     }
 }
 
+/// What the status item's "Open" row has to do, as the discriminant the
+/// handler branches on once. Closing a window no longer ends the process, so
+/// the daemon can be running with both slots empty — and [`window_target`] on
+/// an empty slot names a FRESH id, whose focus is a no-op, which would make a
+/// raise-only row do nothing at all. With nothing tracked, open.
+pub fn tray_open_action(
+    console: Option<iced::window::Id>,
+    onboarding: Option<iced::window::Id>,
+) -> crate::TrayOpen {
+    match console.is_none() && onboarding.is_none() {
+        true => crate::TrayOpen::Open,
+        false => crate::TrayOpen::Raise,
+    }
+}
+
 /// Clear a tracked window id when it is the one that closed.
 pub fn without_window(
     current: Option<iced::window::Id>,
