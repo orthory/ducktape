@@ -132,6 +132,10 @@ struct Stats {
     /// Inbound streams closed on acceptance because the opener already held
     /// [`MAX_PENDING_INBOUND_PER_PEER`] streams awaiting a hello.
     pending_limit_refused_streams: AtomicU64,
+    /// `accept` attempts that failed for reasons belonging to that one
+    /// connection attempt (a reset opener, a listener slot that failed to
+    /// re-arm) rather than to the listener itself.
+    accept_errors: AtomicU64,
     refused_sends: AtomicU64,
     rogue_by_peer: Mutex<HashMap<PeerId, u64>>,
 }
@@ -188,6 +192,24 @@ impl Stats {
         }
     }
 
+    /// One `accept` that failed for reasons belonging to that one connection
+    /// attempt. Latched like every other per-attempt drop: first, then every
+    /// 100th, carrying the count and the io error kind — the counter IS the
+    /// diagnosis.
+    fn note_accept_error(&self, err: &io::Error) {
+        let dropped = self.accept_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        if dropped == 1 || dropped.is_multiple_of(100) {
+            tracing::debug!(
+                target: "ducktape::dataplane",
+                dropped,
+                kind = ?err.kind(),
+                reason = "per_accept_error",
+                "one accept failed for reasons belonging to that connection \
+                 attempt — the acceptor keeps accepting"
+            );
+        }
+    }
+
     fn snapshot(&self) -> StatsSnapshot {
         StatsSnapshot {
             rogue_datagrams: self.rogue_datagrams.load(Ordering::Relaxed),
@@ -201,6 +223,7 @@ impl Stats {
             pending_limit_refused_streams: self
                 .pending_limit_refused_streams
                 .load(Ordering::Relaxed),
+            accept_errors: self.accept_errors.load(Ordering::Relaxed),
             refused_sends: self.refused_sends.load(Ordering::Relaxed),
         }
     }
@@ -284,6 +307,10 @@ pub struct StatsSnapshot {
     /// Inbound streams closed on acceptance because the opener already held
     /// its budget of streams awaiting a hello.
     pub pending_limit_refused_streams: u64,
+    /// `accept` attempts that failed for reasons belonging to that one
+    /// connection attempt rather than to the listener (a reset opener, a
+    /// listener slot that failed to re-arm).
+    pub accept_errors: u64,
     pub refused_sends: u64,
 }
 
@@ -568,6 +595,25 @@ fn is_per_datagram_error(err: &io::Error) -> bool {
     )
 }
 
+/// Does this accept error belong to ONE connection attempt rather than to
+/// the listener socket?
+///
+/// A peer that connects and resets before `accept` hands back its socket
+/// surfaces as `ConnectionReset` on the real backend (OS `TcpListener`) — the
+/// listening socket is untouched and the next `accept` succeeds normally.
+/// The userspace backend hits the same shape from the other side:
+/// `VirtualTcpListener::accept` re-arms a fresh listening slot for the one it
+/// just handed out, and a slot that fails to re-listen surfaces as
+/// `AddrInUse` (`listen_slot`) — that one accept is lost, the remaining
+/// slots keep listening. Everything else is the listener itself failing,
+/// which ends the pump.
+fn is_per_accept_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::AddrInUse
+    )
+}
+
 /// The pumps block on the transport while holding only a `Weak` to the plane
 /// state; a receive that lands after the last handle dropped finds no plane
 /// and ends the pump (the abort in [`Shared::drop`] normally gets there
@@ -637,17 +683,20 @@ async fn demux_loop<T: DataPlaneTransport>(transport: Arc<T>, plane: Weak<Shared
 
 async fn accept_loop<T: DataPlaneTransport>(transport: Arc<T>, plane: Weak<Shared<T>>) {
     loop {
-        let (peer, stream) = match transport.accept().await {
-            Ok(inbound) => inbound,
-            Err(_) => {
-                if let Some(shared) = plane.upgrade() {
-                    shared.traffic.halted.store(true, Ordering::Relaxed);
-                }
-                return;
-            }
-        };
+        let accepted = transport.accept().await;
         let Some(shared) = plane.upgrade() else {
             return;
+        };
+        let (peer, stream) = match accepted {
+            Ok(inbound) => inbound,
+            Err(TransportError::Io(err)) if is_per_accept_error(&err) => {
+                shared.stats.note_accept_error(&err);
+                continue;
+            }
+            Err(_) => {
+                shared.traffic.halted.store(true, Ordering::Relaxed);
+                return;
+            }
         };
         // Charge the opener for the stream BEFORE anything holds it: until
         // the hello arrives we know nothing about this connection except
@@ -1017,12 +1066,16 @@ mod tests {
     /// behaviour is observed with no clock in the loop.
     struct StubTransport {
         datagrams: tokio::sync::Mutex<mpsc::Receiver<Arrival>>,
-        accepts: tokio::sync::Mutex<mpsc::Receiver<(PeerId, DuplexStream)>>,
+        accepts: tokio::sync::Mutex<mpsc::Receiver<AcceptArrival>>,
     }
 
     /// One thing the stub hands the demux pump: a datagram, or the socket
     /// error the test wants it to see instead.
     type Arrival = Result<(PeerId, Vec<u8>), TransportError>;
+
+    /// One thing the stub hands the acceptor: an accepted stream, or the
+    /// socket error the test wants it to see instead.
+    type AcceptArrival = Result<(PeerId, DuplexStream), TransportError>;
 
     impl DataPlaneTransport for StubTransport {
         type Stream = DuplexStream;
@@ -1045,7 +1098,7 @@ mod tests {
 
         async fn accept(&self) -> Result<(PeerId, Self::Stream), TransportError> {
             match self.accepts.lock().await.recv().await {
-                Some(inbound) => Ok(inbound),
+                Some(next) => next,
                 None => std::future::pending().await,
             }
         }
@@ -1061,7 +1114,7 @@ mod tests {
 
     type Feeds = (
         mpsc::Sender<Arrival>,
-        mpsc::Sender<(PeerId, DuplexStream)>,
+        mpsc::Sender<AcceptArrival>,
         DataPlane<StubTransport>,
     );
 
@@ -1102,6 +1155,25 @@ mod tests {
             io::ErrorKind::NotConnected
         )));
         assert!(!is_per_datagram_error(&io::Error::from(
+            io::ErrorKind::BrokenPipe
+        )));
+    }
+
+    /// `ConnectionReset` (an opener that reset, real backend) and `AddrInUse`
+    /// (a userspace listener slot that failed to re-arm) are per-attempt; a
+    /// listener that is actually dead is not.
+    #[test]
+    fn a_reset_or_unrearmed_accept_is_per_attempt_but_a_dead_listener_is_not() {
+        assert!(is_per_accept_error(&io::Error::from(
+            io::ErrorKind::ConnectionReset
+        )));
+        assert!(is_per_accept_error(&io::Error::from(
+            io::ErrorKind::AddrInUse
+        )));
+        assert!(!is_per_accept_error(&io::Error::from(
+            io::ErrorKind::NotConnected
+        )));
+        assert!(!is_per_accept_error(&io::Error::from(
             io::ErrorKind::BrokenPipe
         )));
     }
@@ -1169,7 +1241,7 @@ mod tests {
         let mut openers = Vec::new();
         for _ in 0..=MAX_PENDING_INBOUND_PER_PEER {
             let (ours, theirs) = tokio::io::duplex(64);
-            accepts.send((peer, theirs)).await.unwrap();
+            accepts.send(Ok((peer, theirs))).await.unwrap();
             openers.push(ours);
         }
 
@@ -1178,5 +1250,44 @@ mod tests {
         let refused = openers.last_mut().expect("one opener past the budget");
         assert_eq!(refused.read(&mut [0u8; 1]).await.unwrap(), 0);
         assert_eq!(plane.stats().pending_limit_refused_streams, 1);
+    }
+
+    /// One reset-opener error used to end the accept pump for the life of
+    /// the process. It is now a counted drop, and the connection behind it
+    /// is still accepted: its hello reaches the registered service.
+    #[tokio::test]
+    async fn a_reset_accept_is_dropped_and_the_pump_keeps_accepting() {
+        let (_datagrams, accepts, plane) = stub_plane();
+        let service = plane
+            .stream_service(Service::Voice, StreamPolicy { accept_backlog: 4 })
+            .expect("register service");
+        let peer = PeerId([5u8; 32]);
+
+        accepts
+            .send(Err(TransportError::Io(io::Error::from(
+                io::ErrorKind::ConnectionReset,
+            ))))
+            .await
+            .unwrap();
+        let (mut ours, theirs) = tokio::io::duplex(64);
+        accepts.send(Ok((peer, theirs))).await.unwrap();
+        wire::write_hello(
+            &mut ours,
+            &wire::Hello {
+                service: Service::Voice,
+                flow: FlowId::from_raw(1),
+                intent: 0,
+                meta: Vec::new(),
+            },
+        )
+        .await
+        .expect("write hello");
+
+        // The delivery IS the proof the pump survived the error before it.
+        let (from, hello, _stream) = service.accept().await.expect("stream accepted");
+        assert_eq!(from, peer);
+        assert_eq!(hello.flow, FlowId::from_raw(1));
+        assert_eq!(plane.stats().accept_errors, 1);
+        assert!(!plane.traffic().halted);
     }
 }
