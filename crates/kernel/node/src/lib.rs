@@ -29,6 +29,14 @@ pub enum Error {
     /// surfaces this and the caller fail-stops.
     #[error("recovery journal: {0}")]
     Journal(String),
+    /// the order delivered a block at a height this process has already
+    /// journaled. the composed qmdb root is op-log-order-dependent, so
+    /// applying out of order forks this node against every peer — and so does
+    /// silently dropping the block. as fatal as a boundary fault: the ordering
+    /// seam itself is broken, and the drain stops rather than compose a state
+    /// no validator agreed on.
+    #[error("delivered height {height} is at or below the applied height {applied}")]
+    OutOfOrder { height: u64, applied: u64 },
     /// this node's orderer is a follower — it holds no consensus proposal
     /// rights, so nothing it submits can enter the agreed order. loud so a
     /// miswired write path fails at the seam instead of silently vanishing;
@@ -977,7 +985,17 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// floor, and the exactly-once digest gate does not survive the process —
     /// so recovered history can be delivered again. skipping by the agreed
     /// height is deterministic; frames ABOVE the floor are genuinely new
-    /// (finalized pre-crash but never drained) and apply normally.
+    /// (finalized pre-crash but never drained) and apply normally. set ONCE at
+    /// [`OrderedNode::resume`] and never moved: it is the boundary between
+    /// "already durable elsewhere" and "this process applied it".
+    resume_floor: Option<u64>,
+    /// the highest app height this process has JOURNALED — advanced at every
+    /// block, right before its `pre_apply`. above `resume_floor` a delivered
+    /// height at or below this one cannot be a legitimate re-report: it is an
+    /// out-of-order delivery, and applying it would compose an op-log-ordered
+    /// qmdb root no peer can reproduce. the drain REFUSES it (see
+    /// [`Error::OutOfOrder`]) instead of skipping it silently — a silent skip
+    /// forks just as surely, and quietly.
     applied_floor: Option<u64>,
     /// the OBSERVATION BARRIER: when set, [`OrderedNode::drain_delivered`]
     /// ends its batch right after any block that CHANGES this module's root,
@@ -1060,6 +1078,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             last_engine_view: None,
             view_ceiling: None,
             sink,
+            resume_floor: None,
             applied_floor: None,
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
@@ -1098,6 +1117,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             last_engine_view: None,
             view_ceiling: None,
             sink,
+            resume_floor: finalized.map(|f| f.height),
             applied_floor: finalized.map(|f| f.height),
             watch_module: None,
             deferred: std::collections::VecDeque::new(),
@@ -1441,10 +1461,20 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // frame (it was applied and sealed before the restart); the engine
             // re-reported it from its reopened journal. dropping it by agreed
             // height is the same deterministic no-op everywhere.
-            if let Some(floor) = self.applied_floor
-                && height <= floor
-            {
+            let is_resume_replay = self.resume_floor.is_some_and(|floor| height <= floor);
+            if is_resume_replay {
                 continue;
+            }
+            // MONOTONICITY. above the resume floor every height is this
+            // process's own to journal, so a delivery at or below the last one
+            // it journaled is not history — it is an out-of-order delivery,
+            // and the composed qmdb root is op-log-order-dependent. refuse
+            // loudly: applying it forks this node against every peer, and
+            // skipping it forks it just as hard while looking healthy.
+            if let Some(applied) = self.applied_floor
+                && height <= applied
+            {
+                return Err(Error::OutOfOrder { height, applied });
             }
             let batch_id = frame_id(&frame);
             // the CUTOVER CEILING: a batch finalized at or past the agreed
@@ -1508,6 +1538,10 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // height. WAL discipline: the batch bytes are finalized and about to
             // mutate state — journal them ONCE FIRST, so a crash mid-apply rolls
             // forward from this record instead of losing a finalized batch.
+            // this height is now this process's own: journal it and advance the
+            // monotonicity floor together, so the next delivery below it is
+            // refused rather than composed into the root out of order.
+            self.applied_floor = Some(height);
             self.sink.pre_apply(height, &frame).await?;
             // an undecodable batch is a DETERMINISTIC whole-block no-op: every
             // honest node finalized the identical bytes and rejects them
