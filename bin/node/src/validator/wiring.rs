@@ -351,6 +351,10 @@ pub(super) fn wire_serve_lanes(
             // (nothing) to both parties. these paths are peer-drivable and a
             // blocked joiner retries forever, so they latch instead of flooding.
             static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
+            // the co-client demux's own drops latch on their OWN keys: a peer
+            // can drive these, and sharing REFUSED's counter would let them
+            // starve a genuine refusal of its stride-100 print.
+            static COCLIENT_DROP: noded::log::Latch = noded::log::Latch::new(100);
             while let Some((peer, bytes)) = ingress.next().await {
                 // mesh frames ride the AUTHENTICATED rpc envelope
                 // (requester ‖ proof ‖ id ‖ body — the id correlates).
@@ -368,19 +372,48 @@ pub(super) fn wire_serve_lanes(
                 };
                 // OUR blob-fetch answers ride the same authed envelope with
                 // ZEROED auth fields (the transport authenticates replies):
-                // complete the pending waiter by id BEFORE the proof gate
-                // below, which would otherwise drop them. a malformed body
-                // on a matched id drops the waiter — that fetch times out
-                // and rotates, never misreads as a peer's request.
-                if let Some(waiter) = blob_pending
+                // complete the pending waiter BEFORE the proof gate below,
+                // which would otherwise drop them. a malformed body on a
+                // matched id drops the waiter — that fetch times out and
+                // rotates, never misreads as a peer's request.
+                //
+                // the id ALONE never completes a waiter: the frame must also
+                // come from the peer the request was addressed to. `TipCoords`
+                // is the one lane here whose whole value is WHO answered, and
+                // it carries no proof, so a third party that guessed an id
+                // could otherwise speak for a co-validator.
+                let addressed_to = blob_pending
                     .lock()
                     .expect("pending blob lock")
-                    .remove(&rpc_id)
-                {
-                    if let Ok(resp) = statesync::decode_response(body) {
-                        let _ = waiter.send(resp);
+                    .get(&rpc_id)
+                    .map(|fetch| fetch.peer.clone());
+                match blob_fetch::classify_coclient_frame(&peer, addressed_to.as_ref()) {
+                    blob_fetch::CoClientVerdict::PeerRequest => {}
+                    blob_fetch::CoClientVerdict::Response => {
+                        let waiter = blob_pending
+                            .lock()
+                            .expect("pending blob lock")
+                            .remove(&rpc_id);
+                        if let (Some(waiter), Ok(resp)) =
+                            (waiter, statesync::decode_response(body))
+                        {
+                            let _ = waiter.reply.send(resp);
+                        }
+                        continue; // ours — never a request to serve.
                     }
-                    continue; // ours — never a request to serve.
+                    blob_fetch::CoClientVerdict::PeerMismatch => {
+                        if let Some(attempts) = COCLIENT_DROP.hit("coclient_peer_mismatch") {
+                            tracing::warn!(
+                                target: "ducktape::statesync",
+                                peer = %noded::hex_bytes(&peer.as_ref()[..4]),
+                                reason = "coclient_peer_mismatch",
+                                attempts,
+                                "co-client reply dropped — it came from a peer this \
+                                 request was not addressed to"
+                            );
+                        }
+                        continue;
+                    }
                 }
                 // FAIL-CLOSED. a transport-key standing gate is
                 // IMPOSSIBLE at this seam: a pre-admission joiner and an
