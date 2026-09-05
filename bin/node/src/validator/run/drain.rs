@@ -158,6 +158,14 @@ impl ValidatorRuntime<'_> {
         // restarts the node, which then re-joins via state sync.
         let drained_count = match node.drain_delivered().await {
             Ok(n) => n,
+            // STALLED, not faulted: the block at that height designates module
+            // code this node cannot resolve yet. the frame is still at the
+            // front of the drain queue and the blocks ahead of it settled — so
+            // keep the tick, keep the state, and let the next drain retry
+            // (which is what re-runs the fetch). halting here would stop a
+            // chain that was only waiting for bytes; the node narrates the
+            // stall with its attempt count.
+            Err(node::Error::CodeStalled { applied, .. }) => applied,
             Err(e) => {
                 fatal!(label, "{e} — halting");
             }

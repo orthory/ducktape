@@ -375,6 +375,7 @@ mod tests {
                 .iter()
                 .map(|h| (*h, vec![("valset".to_string(), VALSET_ROOT)]))
                 .collect(),
+            applied_frames: Vec::new(),
             applied: 0,
             skipped: 0,
             rolled_forward: false,

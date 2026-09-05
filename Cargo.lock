@@ -2155,6 +2155,7 @@ dependencies = [
  "sdk",
  "statesync",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -6241,6 +6242,7 @@ dependencies = [
  "keyscheme",
  "kv",
  "libc",
+ "modules",
  "node",
  "saga",
  "sdk",

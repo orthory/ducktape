@@ -505,6 +505,7 @@ pub(crate) async fn run_promoted(
         prev_ckpt,
         mesh_window,
         mesh_book,
+        replay_window,
     } = baton;
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
     tracing::info!(
@@ -757,6 +758,8 @@ pub(crate) async fn run_promoted(
         view_base,
     );
     node.set_code_source(code_source);
+    // the replay guard crosses the promotion seam with the state it guards.
+    node.seed_replay_window(replay_window);
     // the observation barrier (see engine::resume): every drain batch ends
     // AT a valset-moving block, so cutovers arm at the same view on every
     // validator.
@@ -972,6 +975,11 @@ pub(crate) struct PromotionBaton {
     pub(crate) mesh_window: crate::mesh_window::MeshWindowTracker,
     /// the mesh address book, carried with the tracker for the same reason.
     pub(crate) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
+    /// the replica node's replay window at the promotion boundary. it must
+    /// cross the seam: the seat writes a checkpoint here, so the journal
+    /// suffix a restart would restore from is empty, and a seat that started
+    /// with an empty window would apply a replayed batch its peers refuse.
+    pub(crate) replay_window: Vec<(u64, node::FrameId)>,
 }
 
 /// one epoch's slot in the [`LaneBank`].
