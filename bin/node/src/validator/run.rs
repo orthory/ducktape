@@ -138,6 +138,10 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) workspace: std::path::PathBuf,
 }
 
+/// one finished pending-swap code fetch: the digest, and the error if the
+/// bytes did not land.
+type FetchOutcome = ([u8; 32], Option<crate::blob_fetch::BlobFetchError>);
+
 struct ValidatorRuntime<'a> {
     context: &'a commonware_runtime::tokio::Context,
     node: ValidatorNode,
@@ -230,10 +234,12 @@ struct ValidatorRuntime<'a> {
     last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
     code_signaller: super::code_announce::CodeReadinessSignaller,
-    /// completed pending-swap code fetches, reaped at each readiness pump so
-    /// a failed fetch retries next tick (the sender rides in each task).
-    fetch_done_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
-    fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<[u8; 32]>,
+    /// completed pending-swap code fetches and their outcome (`None` = the
+    /// bytes landed), reaped at each readiness pump: a failed fetch is counted,
+    /// backed off and — on the first failure and every Nth after it — reported
+    /// there, where the attempt counter lives. The sender rides in each task.
+    fetch_done_tx: tokio::sync::mpsc::UnboundedSender<FetchOutcome>,
+    fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<FetchOutcome>,
     next_drain: std::time::SystemTime,
     /// the workspace directory as it was at boot, and the next instant the
     /// drain re-checks it is still there — the fail-stop for a workspace

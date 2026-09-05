@@ -21,9 +21,36 @@
 //! signaller): readiness must survive restart/late-join, so every decision
 //! re-derives from committed state instead of reacting to one-shot effects.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sdk::Msg;
+
+/// the ceiling on the fetch backoff, in DRAIN TICKS (the pump runs once per
+/// `DRAIN_TICK`, so 600 is a minute). Nobody serving the bytes is not a
+/// transient: the custodian may be down for hours and the pending swap is
+/// never cleared by the module, so the retry has to settle into a cadence a
+/// node can hold forever — while still healing within a minute of the bytes
+/// appearing.
+const FETCH_BACKOFF_MAX_TICKS: u32 = 600;
+
+/// one warning per failing digest, then one per this many further failures.
+/// The attempt COUNTER is the diagnosis; the repetition is a log bomb that
+/// evicts the 4096-line ring roughly every 7 minutes.
+const FETCH_WARN_EVERY: u32 = 10;
+
+/// what one failed fetch earns: the attempt number to report, and whether this
+/// attempt is one of the ones that speaks.
+pub(crate) struct FetchFailure {
+    pub(crate) attempts: u32,
+    pub(crate) speak: bool,
+}
+
+/// a digest whose last fetch failed: how many times, and how many drain ticks
+/// remain before the next attempt.
+struct FetchRetry {
+    attempts: u32,
+    wait_ticks: u32,
+}
 
 /// ONE pending swap's identity — the whole of it. A name is reusable: a stale
 /// pending is replaceable under the same name, by the same bytes at a new
@@ -59,8 +86,14 @@ pub(crate) struct CodeReadinessSignaller {
     /// finalization) — local dedupe atop the module's idempotence.
     pub(crate) signaled: BTreeSet<SwapKey>,
     /// digests a fetch is already running for — cleared by the pump when a
-    /// fetch task finishes (either way), so a failed fetch retries next tick.
+    /// fetch task finishes (either way), so a failed fetch retries.
     pub(crate) fetching: BTreeSet<[u8; 32]>,
+    /// digests whose last fetch FAILED, and are cooling off. Every failure
+    /// path here is fast, not slow — an empty blob peer book refuses
+    /// synchronously and an honest miss answers in one RTT — so without a
+    /// backoff the pump respawned a fetch (and warned) every 100 ms forever
+    /// for bytes nobody holds.
+    failed: BTreeMap<[u8; 32], FetchRetry>,
     /// (module id, digest) pairs this binary already refused. THE LATCH:
     /// loading a component compiles it, and the answer — can these bytes run
     /// HERE, under THIS id (the substrate the id offers) — cannot change
@@ -91,6 +124,7 @@ impl CodeReadinessSignaller {
             me,
             signaled: BTreeSet::new(),
             fetching: BTreeSet::new(),
+            failed: BTreeMap::new(),
             unloadable: BTreeSet::new(),
             loadable: BTreeSet::new(),
         }
@@ -164,13 +198,52 @@ impl CodeReadinessSignaller {
                     actions.refusals.push((key, detail));
                 }
                 CodeVerdict::Absent => {
-                    if self.fetching.insert(digest) {
+                    let cooling = self
+                        .failed
+                        .get(&digest)
+                        .is_some_and(|retry| retry.wait_ticks > 0);
+                    if !cooling && self.fetching.insert(digest) {
                         actions.fetches.push(digest);
                     }
                 }
             }
         }
         actions
+    }
+
+    /// one drain tick's worth of cooling for every digest waiting to retry.
+    /// The cadence is the pump's own tick count, never a timer: a retry that
+    /// slept would fire while the loop was inside a 60 s checkpoint.
+    pub(crate) fn tick_fetch_backoff(&mut self) {
+        for retry in self.failed.values_mut() {
+            retry.wait_ticks = retry.wait_ticks.saturating_sub(1);
+        }
+    }
+
+    /// a fetch finished with an error: count it, cool the digest off for
+    /// exponentially longer (capped), and say whether this attempt speaks.
+    pub(crate) fn fetch_failed(&mut self, digest: &[u8; 32]) -> FetchFailure {
+        self.fetching.remove(digest);
+        let retry = self.failed.entry(*digest).or_insert(FetchRetry {
+            attempts: 0,
+            wait_ticks: 0,
+        });
+        retry.attempts = retry.attempts.saturating_add(1);
+        retry.wait_ticks = 1u32
+            .checked_shl(retry.attempts.min(16))
+            .unwrap_or(FETCH_BACKOFF_MAX_TICKS)
+            .min(FETCH_BACKOFF_MAX_TICKS);
+        FetchFailure {
+            attempts: retry.attempts,
+            speak: retry.attempts == 1 || retry.attempts.is_multiple_of(FETCH_WARN_EVERY),
+        }
+    }
+
+    /// a fetch landed the bytes: the digest owes nothing and starts clean if
+    /// it is ever asked for again.
+    pub(crate) fn fetch_succeeded(&mut self, digest: &[u8; 32]) {
+        self.fetching.remove(digest);
+        self.failed.remove(digest);
     }
 
     /// un-latch a swap whose signal submit failed, so the next tick retries.
@@ -335,6 +408,64 @@ mod tests {
             s.decide(&replaced, |_, _| CodeVerdict::Loadable)
                 .signals
                 .is_empty()
+        );
+    }
+
+    /// BYTES NOBODY SERVES ARE A STEADY STATE, NOT A BLIP. The failure path is
+    /// fast (an empty peer book refuses synchronously) and the module never
+    /// clears a pending swap, so an unpaced pump respawned a fetch and warned
+    /// on every 100 ms drain tick forever: ~10 warns/s turned the 4096-line
+    /// ring over every ~7 minutes and issued ~30 BlobInfo requests/s at peers
+    /// for a blob that does not exist.
+    ///
+    /// Drain ticks are counted, never slept: the pump's own tick IS the clock,
+    /// so this walks ten minutes of a wedged node in microseconds.
+    #[test]
+    fn an_unservable_fetch_backs_off_and_stops_shouting() {
+        const TEN_MINUTES_OF_TICKS: u32 = 6000;
+        let mut s = CodeReadinessSignaller::new(me());
+        let modules = vec![pending("missing", "replacement", 2, false, &[])];
+        let digest = [2u8; 32];
+
+        let mut fetches = 0;
+        let mut warns = 0;
+        for _ in 0..TEN_MINUTES_OF_TICKS {
+            // the pump: reap the failed fetch, cool it off one tick, decide.
+            if s.fetching.contains(&digest) {
+                let failure = s.fetch_failed(&digest);
+                warns += u32::from(failure.speak);
+            }
+            s.tick_fetch_backoff();
+            fetches += s.decide(&modules, |_, _| CodeVerdict::Absent).fetches.len();
+        }
+
+        assert!(
+            fetches <= 20,
+            "ten minutes of a blob nobody holds must cost a handful of \
+             fetches, not one per tick — got {fetches}"
+        );
+        assert!(
+            (1..=3).contains(&warns),
+            "the first failure speaks, then one per {FETCH_WARN_EVERY} — \
+             got {warns} warnings"
+        );
+
+        // ...and the moment the bytes appear the swap signals: the backoff
+        // delays a retry, it never gives up on one.
+        for _ in 0..FETCH_BACKOFF_MAX_TICKS {
+            s.tick_fetch_backoff();
+        }
+        assert_eq!(
+            s.decide(&modules, |_, _| CodeVerdict::Absent).fetches,
+            vec![digest],
+            "a cooled-off digest is fetched again"
+        );
+        s.fetch_succeeded(&digest);
+        assert_eq!(
+            s.decide(&modules, |_, _| CodeVerdict::Loadable)
+                .signals
+                .len(),
+            1
         );
     }
 
