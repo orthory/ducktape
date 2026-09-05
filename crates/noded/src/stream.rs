@@ -2724,7 +2724,10 @@ pub(crate) fn unix_millis() -> u64 {
 
 fn live_cursor(store: &indexer::IndexStore, module: &str) -> Result<String, indexer::Error> {
     let applied = store.applied_height(module)?;
-    Ok(format!("{}{:016x}/ffff", indexer::OP_PREFIX, applied))
+    // the end of that height: every real row at it is at or below the widest
+    // seq, so the next scan starts at the height above. built through
+    // `op_key` so the field width can never drift from the rows it pages.
+    Ok(indexer::op_key(applied, u32::MAX))
 }
 
 fn cursor_height(cursor: &str) -> Option<u64> {
@@ -2855,7 +2858,7 @@ mod tests {
             })
             .expect("apply block");
 
-        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let mut cursor = "op/0000000000000000/ffffffff".to_string();
         let result = catch_up_files("files:watch", &mut cursor, &store);
         assert!(
             !result.drop_topic,
@@ -2880,18 +2883,18 @@ mod tests {
     fn module_catch_up_emits_rows_and_cursors() {
         let (_dir, store) = temp_store(&["chat"]);
         apply_chat(&store, 1, vec![json!({"one": 1}), json!({"two": 2})]);
-        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let mut cursor = "op/0000000000000000/ffffffff".to_string();
         let result = catch_up_module("module:chat", "chat", &mut cursor, &store);
         assert!(!result.drop_topic);
         assert_eq!(result.frames.len(), 2);
         match &result.frames[0] {
             ServerFrame::Event { cursor, op, .. } => {
-                assert_eq!(cursor, "op/0000000000000001/0000");
+                assert_eq!(cursor, "op/0000000000000001/00000000");
                 assert_eq!(op.payload, Some(json!({"one": 1})));
             }
             other => panic!("expected event, got {other:?}"),
         }
-        assert_eq!(cursor, "op/0000000000000001/0001");
+        assert_eq!(cursor, "op/0000000000000001/00000001");
     }
 
     /// A BLOCK THAT APPENDED NOTHING MUST NOT SEND ANYONE BACK TO THE STORE.
@@ -2936,13 +2939,13 @@ mod tests {
             .map(|i| json!({ "n": i }))
             .collect();
         apply_chat(&store, 1, payloads);
-        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let mut cursor = "op/0000000000000000/ffffffff".to_string();
         let result = catch_up_module("module:chat", "chat", &mut cursor, &store);
         assert_eq!(result.frames.len(), STREAM_CATCHUP_BUDGET + 1);
         assert!(
-            matches!(result.frames.last(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/0000000000000001/ffff")
+            matches!(result.frames.last(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/0000000000000001/ffffffff")
         );
-        assert_eq!(cursor, "op/0000000000000001/ffff");
+        assert_eq!(cursor, "op/0000000000000001/ffffffff");
     }
 
     #[test]
@@ -2952,7 +2955,7 @@ mod tests {
         let (state, lagged) =
             prepare_topic("module:chat", NO_SECRET, None, Some(&store)).expect("topic");
         assert!(lagged.is_none());
-        assert_eq!(state.cursor(), "op/0000000000000001/ffff");
+        assert_eq!(state.cursor(), "op/0000000000000001/ffffffff");
         let mut state = state;
         let result = catch_up_topic(
             "module:chat",
@@ -2970,13 +2973,13 @@ mod tests {
         let (state, lagged) = prepare_topic(
             "module:chat",
             NO_SECRET,
-            Some(&"op/0000000000000005/0000".to_string()),
+            Some(&"op/0000000000000005/00000000".to_string()),
             Some(&store),
         )
         .expect("topic");
-        assert_eq!(state.cursor(), "op/000000000000000a/ffff");
+        assert_eq!(state.cursor(), "op/000000000000000a/ffffffff");
         assert!(
-            matches!(lagged, Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/000000000000000a/ffff")
+            matches!(lagged, Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/000000000000000a/ffffffff")
         );
     }
 

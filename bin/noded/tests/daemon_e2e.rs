@@ -516,7 +516,7 @@ fn full_surface_blocks_authorship_and_ws() {
     let subscribed = Daemon::ws_read_type(&mut ws, "subscribed");
     assert_eq!(
         subscribed["topics"]["module:chat"],
-        "op/0000000000000000/ffff"
+        "op/0000000000000000/ffffffff"
     );
 
     // one msg = one block; the summary echoes the new height + root-hash.
@@ -545,8 +545,8 @@ fn full_surface_blocks_authorship_and_ws() {
     let event2 = Daemon::ws_read_type(&mut ws, "event");
     assert_eq!(event1["topic"], "module:chat");
     assert_eq!(event2["topic"], "module:chat");
-    assert_eq!(event1["cursor"], "op/0000000000000001/0000");
-    assert_eq!(event2["cursor"], "op/0000000000000002/0000");
+    assert_eq!(event1["cursor"], "op/0000000000000001/00000000");
+    assert_eq!(event2["cursor"], "op/0000000000000002/00000000");
 
     let (code, ops) = daemon.request("GET", "/v1/index/chat/ops?limit=10", None);
     assert_eq!(code, 200, "ops failed: {ops}");

@@ -131,10 +131,8 @@ impl recovery::ReplaySink for IndexFold<'_> {
         let height = block.height;
         // the index covers every module the host runs at this block: one the
         // boundary admitted gets its database before its first op folds.
-        let covered = noded::index_host_modules(
-            self.index,
-            block.roots.iter().map(|(id, _)| id.as_str()),
-        );
+        let covered =
+            noded::index_host_modules(self.index, block.roots.iter().map(|(id, _)| id.as_str()));
         if let Err(err) = covered {
             tracing::error!(
                 target: "ducktape::modules",
@@ -538,9 +536,26 @@ fn repair_read_model(
     false
 }
 
-/// lower a module's floor to the one the walk's source vouched for. NEVER
-/// raise it: a source's own history may begin above this node's feed, and a
-/// module with no floor at all already claims genesis.
+/// the floor a finished walk VOUCHES FOR, which is not always the one its
+/// source reported.
+///
+/// A walk that pulled the whole history below its boundary (`after: None`)
+/// fetched everything the source holds down to the source's own floor, so it
+/// may adopt it. A RESUME-shaped walk (`after: Some(..)`) fetched only the
+/// rows ABOVE this node's watermark: it says NOTHING about what lies below,
+/// so the floor this node already holds stands. Lowering a floor over rows a
+/// walk never fetched advertises a feed reaching genesis with the history
+/// under the floor absent forever.
+fn vouched_floor(done: &Backfilled, held: Option<u64>) -> Option<u64> {
+    match done.after {
+        Some(_) => held,
+        None => done.source_floor,
+    }
+}
+
+/// lower a module's floor to the one the walk vouched for. NEVER raise it: a
+/// source's own history may begin above this node's feed, and a module with
+/// no floor at all already claims genesis.
 fn lower_floor(index: &indexer::IndexStore, done: &Backfilled, label: &str) {
     let held = match index.backfill_height(&done.module) {
         Ok(held) => held,
@@ -559,11 +574,12 @@ fn lower_floor(index: &indexer::IndexStore, done: &Backfilled, label: &str) {
     let Some(floor) = held else {
         return; // nothing to lower: this feed already claims genesis.
     };
-    let drops = done.source_floor.is_none_or(|source| source < floor);
+    let vouched = vouched_floor(done, held);
+    let drops = vouched.is_none_or(|source| source < floor);
     if !drops {
         return;
     }
-    if let Err(err) = index.set_backfill_floor(&done.module, done.source_floor) {
+    if let Err(err) = index.set_backfill_floor(&done.module, vouched) {
         tracing::warn!(
             target: "ducktape::statesync",
             node = %label,
@@ -576,12 +592,15 @@ fn lower_floor(index: &indexer::IndexStore, done: &Backfilled, label: &str) {
 }
 
 /// one module whose op rows all landed: what the source said its floor was,
-/// and the last row position written (`None` for a module with no history
-/// below the boundary — nothing for the fold to consume).
+/// the last row position written (`None` for a module with no history below
+/// the boundary — nothing for the fold to consume), and the SHAPE of the walk
+/// that wrote them — the resume cursor it was issued with, which alone says
+/// how far down the walk actually reached ([`vouched_floor`]).
 struct Backfilled {
     module: String,
     source_floor: Option<u64>,
     last_row: Option<(u64, u32)>,
+    after: Option<(u64, u32)>,
 }
 
 /// what one module's turn at a seam left behind.
@@ -870,7 +889,8 @@ async fn resume_module<C: statesync::SyncClient>(
     }
     // the feed now reaches the boundary, so the watermark says so. the FLOOR
     // does not move: this node kept every row it already had, and nothing
-    // below it was ever claimed.
+    // below it was ever claimed — [`vouched_floor`] holds that for this walk
+    // and for the retry that re-issues it.
     if let Err(err) = index.advance_watermark(module, boundary) {
         tracing::warn!(
             target: "ducktape::statesync",
@@ -882,24 +902,7 @@ async fn resume_module<C: statesync::SyncClient>(
         );
         return Resume::Uncomposable;
     }
-    let held_floor = match index.backfill_height(module) {
-        Ok(floor) => floor,
-        Err(err) => {
-            tracing::warn!(
-                target: "ducktape::statesync",
-                node = %label,
-                module,
-                error = %err,
-                reason = "backfill_floor_unreadable",
-                "index floor unreadable after a resumed walk; stamping at the boundary instead"
-            );
-            return Resume::Uncomposable;
-        }
-    };
-    Resume::Filled(Backfilled {
-        source_floor: held_floor,
-        ..done
-    })
+    Resume::Filled(done)
 }
 
 /// what a REFUSED walk still left in the feed: the last row it wrote, `None`
@@ -1007,6 +1010,7 @@ async fn backfill_module<C: statesync::SyncClient>(
         module: module.to_string(),
         source_floor,
         last_row: last,
+        after,
     })
 }
 
@@ -1557,6 +1561,53 @@ mod tests {
             joiner.backfill_height("chat").expect("floor"),
             None,
             "only now does the floor drop: the feed reaches genesis"
+        );
+    }
+
+    /// A RETRIED RESUME LOWERS NO FLOOR. The retry re-issues the walk the
+    /// refusal owed, and a resume-shaped one fetches only the rows above this
+    /// node's own watermark — nothing below its floor. Adopting the SOURCE's
+    /// floor there advertises a feed reaching genesis over rows that were
+    /// never fetched: `/v1/index/status` lists no gap, a ws subscriber
+    /// resuming below the floor gets a silently short history with no
+    /// `Lagged` frame, and the next boot's floored pass never lists the
+    /// module again.
+    #[tokio::test]
+    async fn a_retried_resume_keeps_the_floor_it_never_walked_below() {
+        const FLOOR: u64 = 3;
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = store(joiner_dir.path());
+        // the source holds the WHOLE history, so it reports no floor at all.
+        for height in 1..=8 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        // the joiner joined at FLOOR and folded its own blocks on top, so it
+        // trails the boundary: the stale pass RESUMES it.
+        joiner.mark_backfilled("chat", FLOOR).expect("stamp");
+        for height in (FLOOR + 1)..=5 {
+            joiner.apply_block(&block(height)).expect("joiner folds");
+        }
+
+        let client = SourceNode::new(source);
+        client.set_reachable(false);
+        let mut debt = heal_and_backfill_index(&joiner, &client, 8, "resident").await;
+        assert!(!debt.is_empty(), "the refused resume is owed");
+
+        client.set_reachable(true);
+        retry_owed_backfill(&mut debt, &joiner, &client, "resident").await;
+
+        assert!(debt.is_empty(), "a settled walk is owed no longer");
+        assert_eq!(
+            op_rows(&joiner),
+            ((FLOOR + 1)..=8).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "the retry pulled the delta above the watermark and nothing below"
+        );
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            Some(FLOOR),
+            "and the floor stands: this walk never went below it"
         );
     }
 

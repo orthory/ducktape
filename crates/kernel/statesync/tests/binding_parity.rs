@@ -45,7 +45,7 @@ use statesync::{
 
 /// a canned op-row key at `height` — the responder's stand-in row.
 fn statesync_op_key(height: u64) -> String {
-    format!("op/{height:016x}/0000")
+    format!("op/{height:016x}/00000000")
 }
 
 fn boundary() -> BoundaryId {

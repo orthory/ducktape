@@ -18,7 +18,7 @@
 //!
 //! - **the host writer** (this crate, [`IndexStore::apply_block`], called by
 //!   the node's block loop): writes one borsh [`OpRow`] per dispatch under
-//!   `op/{height:016x}/{seq:04x}` plus the watermark, one atomic batch per
+//!   `op/{height:016x}/{seq:08x}` plus the watermark, one atomic batch per
 //!   module per block. NO domain logic lives host-side.
 //! - **the fold** (the module's index guest, installed IN the module's
 //!   database as fluentabi module `"index"`): a changes-mode trigger
@@ -1153,7 +1153,7 @@ fn refold_feed(db: &Db, module: &str) -> Result<()> {
 /// re-registering one over a populated range replays nothing. re-writing each
 /// row does: an identical put is still a committed change, and capture happens
 /// inside the commit critical section, so the guest receives the feed in key
-/// order — which for `op/{height:016x}/{seq:04x}` IS block-and-drain order.
+/// order — which for `op/{height:016x}/{seq:08x}` IS block-and-drain order.
 fn replay_op_feed(db: &Db) -> Result<u64> {
     let lo = OP_PREFIX.as_bytes();
     let hi = prefix_successor(lo);
