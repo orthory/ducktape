@@ -251,6 +251,9 @@ pub(super) fn synced_recovered(boundary: &statesync::Manifest) -> recovery::Reco
         residents: boundary.residents.clone(),
         frames: Vec::new(),
         blocks: Vec::new(),
+        // a synced boundary replayed nothing, so it seeds no replay window:
+        // this seat starts refusing only the batches it applies from here.
+        applied_frames: Vec::new(),
         applied: 0,
         skipped: 0,
         rolled_forward: false,

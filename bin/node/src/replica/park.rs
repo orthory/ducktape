@@ -726,6 +726,8 @@ pub(super) async fn park(
             rec.view_base,
         );
         node_r.set_code_source(code_source.clone());
+        // RESTORE the replay guard from the journal suffix the replay walked.
+        node_r.seed_replay_window(rec.applied_frames.iter().copied());
         replica_scheme = Some(replica_verifier(&namespace, &rec.participants));
         replica_orchestrator = Some(replica_orchestrator_at(
             rec.epoch,
@@ -1840,6 +1842,8 @@ pub(super) async fn park(
                 fatal!(label, "promotion cutover journal write: {e}");
             }
             let root_hash = node_r.host().root_hash();
+            // lifted BEFORE the dismantle: the seat rebuild is seeded with it.
+            let replay_window = node_r.replay_window();
             let (host, mut recovery) = node_r.into_parts();
             // the promotion checkpoint: the manifest seats this key, so a
             // crash from here re-enters role resolution with a valid state base.
@@ -1916,6 +1920,7 @@ pub(super) async fn park(
                 prev_ckpt: (Some(folded_tip), pos),
                 mesh_window,
                 mesh_book: mesh_book.clone(),
+                replay_window,
             };
         }
         resident_relay.expire(std::time::Instant::now());
@@ -2664,6 +2669,11 @@ pub(super) async fn park(
         prev_ckpt: (Some(boundary.height), pos),
         mesh_window,
         mesh_book,
+        // a COLD seat: it synced a boundary and folded nothing of its own, so
+        // it has no journaled batch ids to carry. it starts refusing only the
+        // batches it applies from here — a batch replayed from below its
+        // boundary is caught by the running validators, not by this one.
+        replay_window: Vec::new(),
     }
 }
 

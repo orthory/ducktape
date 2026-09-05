@@ -112,6 +112,21 @@ pub const FRAME_NS: &[u8] = b"ducktape:op-frame:v1";
 /// nothing requires it to equal the consensus lane's content digest.
 pub type FrameId = [u8; 32];
 
+/// how many recently-journaled blocks the replay window remembers — the
+/// protocol constant every validator applies, so the verdict on a re-finalized
+/// batch is the same everywhere.
+///
+/// a finalized batch that already applied can be re-proposed by anyone holding
+/// its bytes: consensus votes on availability alone, so it finalizes again at
+/// a NEW height and its members' signed ops execute a second time. this window
+/// is what refuses it. the bound is a memory/coverage trade: 4096 entries is
+/// ~160 KiB and, at the ~1 block/s an idle chain heartbeats, a bit over an
+/// hour of history — long enough to cover an epoch cutover, a restart, and the
+/// journal suffix a checkpoint retains. a batch older than the window can
+/// still replay; a per-origin nonce enforced in replicated state is the
+/// unbounded successor, and it is not this seam.
+pub const REPLAY_WINDOW_HEIGHTS: usize = 4096;
+
 /// compute a frame's [`FrameId`] from its exact encoded bytes. public so a
 /// boot-time observer holding journaled frame bytes derives the SAME id the
 /// live drain reported (one definition — never a re-derivation drifting).
@@ -1038,6 +1053,19 @@ pub struct OrderedNode<O: Orderer, S: BlockSink = NullSink> {
     /// boundary instead of silently running stale code. `Arc` so the node and
     /// its recovery sink can share the one source.
     code_source: std::sync::Arc<dyn host::CodeSource>,
+    /// THE REPLAY WINDOW: the batch [`FrameId`]s this node has already
+    /// journaled, newest last, bounded to [`REPLAY_WINDOW_HEIGHTS`] entries.
+    /// consulted in the APPLY path (never in gossip verification — a peer
+    /// votes on a digest purely because it holds the bytes, so an old batch
+    /// re-proposed byte-identically finalizes normally) and so consulted by
+    /// every validator, at the same block, with the same verdict.
+    ///
+    /// it lives on the NODE, not the orderer: the orderer is rebuilt at every
+    /// epoch cutover with a fresh content store and a fresh exactly-once
+    /// digest set, and [`OrderedNode::cutover`] keeps the node — so the guard
+    /// survives the boundary the cutover used to re-open. a restart restores
+    /// it from the recovery journal via [`OrderedNode::seed_replay_window`].
+    replay_window: std::collections::VecDeque<(u64, FrameId)>,
     /// how each block's `consensus_time` is derived from its height (see
     /// [`ConsensusTimePolicy`]). defaults to `HeightIsTime` — the validator
     /// lane's pre-policy behavior, byte-for-byte.
@@ -1085,6 +1113,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
+            replay_window: std::collections::VecDeque::new(),
             time_policy: ConsensusTimePolicy::HeightIsTime,
             #[cfg(feature = "sim")]
             decoded: std::collections::HashMap::new(),
@@ -1124,6 +1153,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             outstanding: std::collections::HashMap::new(),
             pending_batch: Vec::new(),
             code_source: std::sync::Arc::new(host::NoCodeSource),
+            replay_window: std::collections::VecDeque::new(),
             time_policy: ConsensusTimePolicy::HeightIsTime,
             #[cfg(feature = "sim")]
             decoded: std::collections::HashMap::new(),
@@ -1132,11 +1162,30 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         }
     }
 
+    /// RESTORE the replay window after a restart, from the journaled
+    /// `(height, batch frame id)` pairs a recovery replay walked — in
+    /// ascending height order. without this a restarted validator would apply
+    /// a batch its running peers refuse. the seed is truncated to the newest
+    /// [`REPLAY_WINDOW_HEIGHTS`] entries, exactly as the live path bounds it.
+    pub fn seed_replay_window(&mut self, applied: impl IntoIterator<Item = (u64, FrameId)>) {
+        self.replay_window.extend(applied);
+        while self.replay_window.len() > REPLAY_WINDOW_HEIGHTS {
+            self.replay_window.pop_front();
+        }
+    }
+
     /// wire the out-of-band component-byte source for code-registry swaps (the
     /// node injects a blobstore-backed one; tests inject an in-memory map). the
     /// default is [`host::NoCodeSource`] — see the field doc.
     pub fn set_code_source(&mut self, src: std::sync::Arc<dyn host::CodeSource>) {
         self.code_source = src;
+    }
+
+    /// the replay window as it stands, ascending by height — what a promotion
+    /// hands the validator-ordered rebuild so the new node keeps refusing the
+    /// batches the follower-ordered one already journaled.
+    pub fn replay_window(&self) -> Vec<(u64, FrameId)> {
+        self.replay_window.iter().copied().collect()
     }
 
     /// dismantle the node into its host and sink — the promotion seam: a
@@ -1515,6 +1564,41 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 }
                 continue;
             }
+            // THE REPLAY WINDOW: this exact batch already applied at a recent
+            // height. consensus cannot catch this — a validator votes for any
+            // digest whose bytes it holds, so anyone who kept a finalized
+            // batch can re-propose it byte-identically and have it finalize at
+            // a NEW height, executing every member's signed op a second time.
+            // the refusal lives HERE, in the apply path, keyed on a protocol
+            // constant, so every validator reaches it at the same block with
+            // the same verdict. journaled Rejected like any other deterministic
+            // whole-batch no-op, so the height still seals.
+            let replayed = self
+                .replay_window
+                .iter()
+                .any(|(_, applied)| *applied == batch_id);
+            if replayed {
+                self.drained.push(DrainedFrame {
+                    id: batch_id,
+                    height,
+                    disposition: Disposition::Rejected,
+                    root_hash: self.host.root_hash(),
+                    op: None,
+                    reason: Some("batch replayed".to_string()),
+                });
+                self.seal(height, Disposition::Rejected).await?;
+                self.applied_floor = Some(height);
+                self.remember_applied(height, batch_id);
+                last_sealed_view = Some(view);
+                tracing::warn!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    reason = "batch_replayed",
+                    "refused a batch this node already applied"
+                );
+                continue;
+            }
             // CODE-SWAP REALIZATION: reconcile every hot-swappable module's
             // running code against the committed code registry's decision for
             // `height`, BEFORE this block journals or applies — its dispatches
@@ -1559,6 +1643,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         reason: Some("batch decode failed".to_string()),
                     });
                     self.seal(height, Disposition::Rejected).await?;
+                    self.remember_applied(height, batch_id);
                     last_sealed_view = Some(view);
                     continue;
                 }
@@ -1567,9 +1652,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // dedup here on purpose: in honest operation a signed frame lives in
             // exactly ONE proposer's mempool (relays fan to one validator,
             // custody ends on apply, the cutover carry never double-applies), so
-            // a finalized batch never repeats a member; a byzantine duplicate is
-            // caught deterministically by the module's own (origin, seq) dedup —
-            // identically live and on recovery replay. a member that fails to
+            // a finalized batch never repeats a member. a byzantine proposer CAN
+            // repeat one inside a batch, and every honest node then executes it
+            // twice identically — a deterministic no-op on the ordering seam,
+            // not a fork. no module can catch it: `decode_frame` verifies the
+            // frame's `seq` and DISCARDS it, so a module only ever sees
+            // `Origin::External(pubkey)` and the msg. a per-origin nonce
+            // enforced in replicated state is what closes it; the batch-level
+            // replay window above covers only whole re-finalized batches. a
+            // member that fails to
             // decode is a deterministic no-op: EXCLUDED from the ops and recorded
             // Rejected after the block settles (it shares the block root-hash).
             // the rest carry their identity parallel to `ops`, in member (=
@@ -1644,6 +1735,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         reason: Some(member_reason(e.to_string())),
                     });
                     self.seal(height, Disposition::Rejected).await?;
+                    self.remember_applied(height, batch_id);
                     last_sealed_view = Some(view);
                     continue;
                 }
@@ -1734,6 +1826,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 Disposition::Rejected
             };
             self.seal(height, block_disp).await?;
+            self.remember_applied(height, batch_id);
             // the block spine. NOTHING in this repo ever said "height H produced
             // root-hash X" — and fork triage, upgrade verification, and "is my node
             // keeping up" all start exactly there.
@@ -1785,6 +1878,18 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             }
         }
         Ok(applied)
+    }
+
+    /// remember a batch this node journaled, evicting past
+    /// [`REPLAY_WINDOW_HEIGHTS`]. called once per SEALED block, whatever its
+    /// disposition: a rejected batch re-proposed later is the same replay, and
+    /// the bound must be a pure count of sealed heights or two validators
+    /// would remember different depths.
+    fn remember_applied(&mut self, height: u64, batch: FrameId) {
+        self.replay_window.push_back((height, batch));
+        while self.replay_window.len() > REPLAY_WINDOW_HEIGHTS {
+            self.replay_window.pop_front();
+        }
     }
 
     /// journal a settled block's outcome: disposition + the post-block root

@@ -1199,6 +1199,14 @@ pub struct Recovered {
     /// armed by a block ABOVE the checkpoint (the checkpoint itself records
     /// one armed at or below it via `pending_cutover_view`).
     pub blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)>,
+    /// every post-checkpoint sealed block's `(height, batch frame id)`, in
+    /// ascending height order — the boot path hands these to
+    /// `OrderedNode::seed_replay_window` so a restarted node keeps refusing
+    /// the batches it already journaled. bounded by the retained journal
+    /// suffix, which is what a checkpoint leaves behind: a node whose
+    /// checkpoint is newer than the protocol's replay window restores fewer
+    /// entries than a peer that never restarted.
+    pub applied_frames: Vec<(u64, node::FrameId)>,
     /// replay accounting, for the boot log line.
     pub applied: usize,
     pub skipped: usize,
@@ -1252,6 +1260,7 @@ where
         let mut residents = manifest.residents.clone();
         let mut frames: Vec<Vec<u8>> = Vec::new();
         let mut blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)> = Vec::new();
+        let mut applied_frames: Vec<(u64, node::FrameId)> = Vec::new();
         let mut pending: Option<(u64, Vec<u8>)> = None;
         let mut applied = 0usize;
         let mut skipped = 0usize;
@@ -1568,6 +1577,7 @@ where
                         }
                     }
                     blocks.push((height, roots.clone()));
+                    applied_frames.push((height, node::frame_id(&frame)));
                     for (id, root) in roots {
                         expected.insert(id, root);
                     }
@@ -1686,6 +1696,7 @@ where
                 .map_err(|e| Error::Storage(e.to_string()))?;
             self.journal.sync().await.map_err(storage_err)?;
             blocks.push((height, seal.roots.clone()));
+            applied_frames.push((height, node::frame_id(&frame)));
             tip_height = Some(height);
             tip_hash = host.root_hash();
             rolled_forward = true;
@@ -1722,6 +1733,7 @@ where
             residents,
             frames,
             blocks,
+            applied_frames,
             applied,
             skipped,
             rolled_forward,
