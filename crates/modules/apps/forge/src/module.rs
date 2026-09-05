@@ -2623,10 +2623,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    // an UNPROTECTED target used to accept a merge from anyone at all (issue
-    // #1634): a stranger with no standing on the PR must not be able to force
-    // it into the terminal `Merged` state, but the PR's author, one of its
-    // reviewers, or the repo owner still can.
+    // an UNPROTECTED target used to accept a merge from anyone at all: a
+    // stranger with no standing on the PR must not be able to force it into
+    // the terminal `Merged` state, but the PR's author, one of its reviewers,
+    // or the repo owner still can.
     #[test]
     fn merging_onto_an_unprotected_target_requires_standing() {
         let base = tmp_base("unprotected-merge");
