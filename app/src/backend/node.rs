@@ -192,22 +192,36 @@ pub fn node_log_timeline<'a>(
         family: iced::font::Family::Name(design::fonts::FAMILY_MONO),
         ..Font::DEFAULT
     };
-    let tail: iced::Element<'_, NodeLogTimelineEvent> = if inspection.following_tail {
-        text("LIVE")
-            .size(10)
-            .font(mono)
-            .color(DARK.palette.success)
-            .into()
-    } else {
-        button(
-            text(format!("RESUME · {} NEW", inspection.unread_count))
-                .size(10)
-                .font(mono),
-        )
-        .padding([3, 7])
-        .on_press(LogTimelineEvent::ResumeTail)
-        .into()
+    // ALWAYS A BUTTON, NEVER A BUTTON-OR-A-TEXT. A `button` carries widget
+    // state and a `text` carries none, so alternating the two at one position
+    // hands iced a state slot whose type changed under it — `Tree`'s downcast
+    // then aborts the process (`iced_core widget/tree.rs`), and this position
+    // flips the moment a line arrives while the reader is scrolled back. The
+    // resting state is the same button with no `on_press`, which is how iced
+    // spells "not pressable", and the label carries the difference.
+    let following_tail = inspection.following_tail;
+    let tail_label = match following_tail {
+        true => "LIVE".to_owned(),
+        false => format!("RESUME · {} NEW", inspection.unread_count),
     };
+    let tail_color = match following_tail {
+        true => DARK.palette.success,
+        false => DARK.palette.foreground,
+    };
+    let tail: iced::Element<'_, NodeLogTimelineEvent> =
+        button(text(tail_label).size(10).font(mono).color(tail_color))
+            .padding([3, 7])
+            .style(move |theme, status| match following_tail {
+                // resting: the word IS the status, so it wears no chrome
+                true => button::Style {
+                    background: None,
+                    text_color: DARK.palette.success,
+                    ..button::text(theme, status)
+                },
+                false => button::secondary(theme, status),
+            })
+            .on_press_maybe((!following_tail).then_some(LogTimelineEvent::ResumeTail))
+            .into();
     let header = row![
         text("NODE LOG")
             .size(10)
@@ -222,24 +236,18 @@ pub fn node_log_timeline<'a>(
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
-    let body: iced::Element<'_, NodeLogTimelineEvent> = if state.visible.is_empty() {
-        let message = if state.lines.is_empty() {
-            "Waiting for the node's log ring…"
-        } else {
-            "No lines match this filter."
-        };
-        container(
-            text(message)
-                .size(12)
-                .font(mono)
-                .color(DARK.palette.muted_foreground),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
-    } else {
-        log_timeline(
+    // THE LIST IS ALWAYS MOUNTED, and the empty note rides ON it rather than
+    // instead of it. `log_timeline` is a stateful virtual list and the note is
+    // a plain container: swapping one for the other at this position is the
+    // crash above, and this position swaps the FIRST time a line arrives —
+    // which is every visit to this tab. A stack keeps both children present
+    // with stable types; the note draws nothing when its text is empty.
+    let empty_note = match (state.visible.is_empty(), state.lines.is_empty()) {
+        (false, _) => "",
+        (true, true) => "Waiting for the node's log ring…",
+        (true, false) => "No lines match this filter.",
+    };
+    let timeline: iced::Element<'_, NodeLogTimelineEvent> = log_timeline(
             &state.timeline,
             &state.visible,
             node_log_timeline_config(),
@@ -279,8 +287,19 @@ pub fn node_log_timeline<'a>(
             },
             |event| event,
             &DARK,
+    );
+    let body = iced::widget::stack![
+        timeline,
+        container(
+            text(empty_note)
+                .size(12)
+                .font(mono)
+                .color(DARK.palette.muted_foreground),
         )
-    };
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_y(Length::Fill),
+    ];
     container(column![header, body].spacing(10))
         .width(Length::Fill)
         .height(Length::Fill)
