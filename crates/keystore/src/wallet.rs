@@ -216,7 +216,14 @@ pub fn active_user_key() -> Result<PathBuf, String> {
 pub fn create(duck: &Path, name: &str, password: &str) -> Result<(String, String), String> {
     let path = new_wallet_path(duck, name)?;
     let (words, key) = userkey::mint_user_key(&path, password)?;
-    activate_first_wallet(duck, name)?;
+    // The doc comment above is the contract: once the key file is on disk, its
+    // only recovery path is `words`, so a pointer-write failure here must
+    // never swallow them by propagating an `Err` — the caller (and the
+    // operator) still needs the phrase for the file this call already wrote.
+    // `ducktape wallet use <name>` (or the next `create`, via
+    // `activate_first_wallet`) is always available afterward to retry the
+    // pointer alone; the mint is not.
+    let _ = activate_first_wallet(duck, name);
     use commonware_cryptography::Signer as _;
     Ok((words, hex(key.public_key().as_ref())))
 }
@@ -345,6 +352,30 @@ mod tests {
                 .map(|r| r.name.as_str())
                 .collect::<Vec<_>>(),
             ["alice", "alice2", "bob"]
+        );
+    }
+
+    /// The mint is not allowed to be undone by a pointer-write failure: the
+    /// words are the only backup for a key file `create` already wrote to
+    /// disk, so a broken `active` write must not turn into a discarded
+    /// `Err(..)` that hides them. Forces the failure by occupying the
+    /// pointer's rename target with a directory instead of a file.
+    #[test]
+    fn create_returns_words_even_when_activation_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let duck = dir.path();
+        let keys = keys_dir(duck);
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::create_dir_all(keys.join(ACTIVE_FILE)).unwrap();
+
+        let (words, pubkey) = create(duck, "alice", "password-123").unwrap();
+        assert_eq!(words.split_whitespace().count(), 24);
+        assert_eq!(pubkey.len(), 64);
+        assert!(key_file(duck, "alice").exists(), "the mint must still land on disk");
+        assert_ne!(
+            active_name(duck).as_deref(),
+            Some("alice"),
+            "the pointer write failed, so alice must not read back as active"
         );
     }
 
