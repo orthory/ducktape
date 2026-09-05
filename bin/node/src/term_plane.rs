@@ -559,12 +559,20 @@ async fn read_frame<S: AsyncRead + Unpin, E: DeserializeOwned>(
 /// serve ONE guest→host control exchange: read the request, dispatch on its
 /// variant (one delegation each), write the single reply. No loop — CONTROL is a
 /// short stream per create/close.
+///
+/// A create is served while WATCHING the stream, and a reply that never reaches
+/// its guest closes the session it names. The host deliberately has no create
+/// timeout (a cold image pull takes minutes) while the guest gives up at
+/// [`noded::CONTROL_DEADLINE`], so a session spawned after that is one whose id
+/// reaches nobody: without this it would hold a session-cap slot until the
+/// wall-clock backstop hours later.
 async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
+    stream: S,
     peer: PeerId,
     control: Arc<ControlState>,
 ) -> io::Result<()> {
-    let Some(request) = read_frame::<_, SessionControlRequest>(&mut stream).await? else {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let Some(request) = read_frame::<_, SessionControlRequest>(&mut reader).await? else {
         return Ok(());
     };
     let reply = match request {
@@ -573,10 +581,77 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
             cred,
             cpu,
             mem_gb,
-        } => serve_create(&control, peer, &provider, &cred, cpu, mem_gb).await,
+        } => {
+            let creating = tokio::spawn({
+                let control = Arc::clone(&control);
+                async move { serve_create(&control, peer, &provider, &cred, cpu, mem_gb).await }
+            });
+            create_watching_the_caller(&mut reader, &control, creating).await
+        }
         SessionControlRequest::Close { session } => serve_close(&control, &session).await,
     };
-    write_frame(&mut stream, &reply).await
+    if let Err(error) = write_frame(&mut writer, &reply).await {
+        // the same orphan, found the other way: the reply never landed, so the
+        // guest has no id for the session this reply names.
+        close_abandoned(&control, &reply).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// await the host's create while watching the CONTROL stream for the guest
+/// hanging up, and close what the create spawned when it has.
+///
+/// `biased` on purpose: a caller already gone outranks a create that finished in
+/// the same poll, because that reply is going nowhere either way.
+async fn create_watching_the_caller<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    control: &ControlState,
+    mut creating: tokio::task::JoinHandle<SessionControlReply>,
+) -> SessionControlReply {
+    let mut byte = [0u8; 1];
+    tokio::select! {
+        biased;
+        // a guest sends nothing more on a CONTROL stream, so anything readable
+        // here is EOF or a transport error — either way the caller is gone.
+        _ = reader.read(&mut byte) => {}
+        finished = &mut creating => return joined(finished),
+    }
+    // the create is NOT cancelled: the daemon spawns the sandbox either way, and
+    // dropping the future here would lose the very id this exists to close.
+    let reply = joined(creating.await);
+    close_abandoned(control, &reply).await;
+    refused(
+        "creator_gone",
+        "the creator closed the control stream before the create completed",
+    )
+}
+
+fn joined(finished: Result<SessionControlReply, tokio::task::JoinError>) -> SessionControlReply {
+    match finished {
+        Ok(reply) => reply,
+        Err(error) => refused("create_failed", &error.to_string()),
+    }
+}
+
+/// close a session whose creator will never learn its id. A no-op for any reply
+/// that named no session.
+async fn close_abandoned(control: &ControlState, reply: &SessionControlReply) {
+    let SessionControlReply::Created { session, .. } = reply else {
+        return;
+    };
+    // once per abandoned create, and each one is a sandbox that would otherwise
+    // have run for hours unreachable — a lifecycle fact worth every line.
+    tracing::warn!(
+        target: "ducktape::term",
+        reason = "creator_gone",
+        session = %session,
+        "closing a session its creator abandoned"
+    );
+    let Some(sessions) = &control.sessions else {
+        return;
+    };
+    sessions.close(session).await;
 }
 
 /// the host's create path: resolve the named credential from committed gateway
@@ -1559,6 +1634,60 @@ mod tests {
             }
             .host(),
             [3u8; 32]
+        );
+    }
+
+    /// **The orphan, host-side.** The guest gave up at its 30 s deadline and
+    /// dropped the CONTROL stream; the host's create lands afterwards. Nobody
+    /// holds the id, so the host closes it here rather than leave a live sandbox
+    /// on a session-cap slot until the wall-clock backstop hours later.
+    #[tokio::test]
+    async fn a_create_whose_creator_gave_up_is_closed_on_the_host() {
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
+        let (_guard, mut daemon) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
+        let control = test_control([7u8; 32], Some(terminals));
+
+        // the CONTROL stream the guest already hung up on.
+        let (caller, server) = tokio::io::duplex(1024);
+        drop(caller);
+        let (mut reader, _writer) = tokio::io::split(server);
+
+        let (spawned, spawning) = tokio::sync::oneshot::channel();
+        let creating = tokio::spawn(async move {
+            let _ = spawning.await;
+            SessionControlReply::Created {
+                session: "00000000deadbeef".into(),
+                topic: "term:00000000deadbeef".into(),
+            }
+        });
+        let watching = tokio::spawn({
+            let control = Arc::clone(&control);
+            async move { create_watching_the_caller(&mut reader, &control, creating).await }
+        });
+        // the host finishes the cold spawn long after the guest is gone.
+        spawned.send(()).expect("the create task is waiting");
+
+        let reply = watching.await.expect("the watcher finished");
+        assert_eq!(
+            reply,
+            refused(
+                "creator_gone",
+                "the creator closed the control stream before the create completed"
+            )
+        );
+        let closed = loop {
+            let command = daemon.recv().await.expect("the daemon saw a command");
+            if let wire::Command::TermClose { session } = command {
+                break session;
+            }
+        };
+        assert_eq!(
+            closed, "00000000deadbeef",
+            "the host closes the session the guest will never name"
         );
     }
 
