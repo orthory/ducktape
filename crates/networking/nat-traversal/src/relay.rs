@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, timeout};
 
 pub use crate::advert::SharedAdverts;
+use crate::advert::{Bucket, source_bucket};
 use crate::auth::{
     AuthError, AuthPolicy, Authenticator, CoordCap, DEFAULT_FRESHNESS_WINDOW_SECS, now_secs,
     sign_authenticator, verify_request,
@@ -440,7 +441,9 @@ impl RelayMetrics {
 #[derive(Default)]
 struct SessionTable {
     total: usize,
-    per_ip: std::collections::HashMap<std::net::IpAddr, usize>,
+    // Keyed by Bucket, not IpAddr: an IPv6 /64 is one host (RFC 6177), same
+    // as the advert book's per-source cap (#1505) — see `source_bucket`.
+    per_ip: std::collections::HashMap<Bucket, usize>,
 }
 
 /// RAII admission slot: holds this session's place in the global and per-IP
@@ -448,7 +451,7 @@ struct SessionTable {
 /// a panic unwinding the task) frees it.
 struct SessionSlot {
     table: Arc<Mutex<SessionTable>>,
-    ip: std::net::IpAddr,
+    bucket: Bucket,
 }
 
 fn lock_table(table: &Mutex<SessionTable>) -> std::sync::MutexGuard<'_, SessionTable> {
@@ -459,16 +462,17 @@ fn lock_table(table: &Mutex<SessionTable>) -> std::sync::MutexGuard<'_, SessionT
 
 impl SessionSlot {
     fn try_acquire(table: &Arc<Mutex<SessionTable>>, ip: std::net::IpAddr) -> Option<Self> {
+        let bucket = source_bucket(ip);
         let mut t = lock_table(table);
-        let ip_count = t.per_ip.get(&ip).copied().unwrap_or(0);
+        let ip_count = t.per_ip.get(&bucket).copied().unwrap_or(0);
         if t.total >= MAX_RELAY_SESSIONS || ip_count >= MAX_SESSIONS_PER_IP {
             return None;
         }
         t.total += 1;
-        *t.per_ip.entry(ip).or_insert(0) += 1;
+        *t.per_ip.entry(bucket).or_insert(0) += 1;
         Some(Self {
             table: table.clone(),
-            ip,
+            bucket,
         })
     }
 }
@@ -477,10 +481,10 @@ impl Drop for SessionSlot {
     fn drop(&mut self) {
         let mut t = lock_table(&self.table);
         t.total = t.total.saturating_sub(1);
-        if let Some(count) = t.per_ip.get_mut(&self.ip) {
+        if let Some(count) = t.per_ip.get_mut(&self.bucket) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                t.per_ip.remove(&self.ip);
+                t.per_ip.remove(&self.bucket);
             }
         }
     }
@@ -1306,6 +1310,29 @@ mod tests {
         }
         assert!(refused, "the fifth same-IP connection is refused");
         assert!(rig.metrics.snapshot().sessions_rejected >= 1);
+        drop(held);
+    }
+
+    #[test]
+    fn per_ip_cap_buckets_ipv6_by_64_not_by_exact_address() {
+        // Five DISTINCT addresses inside one /64: a single host with a routed
+        // prefix (RFC 6177) can pick any of 2^64 of these for free. Bucketing
+        // by the /64 (mirrors advert.rs's `source_bucket`, #1505) must count
+        // them as one source, so the fifth hits MAX_SESSIONS_PER_IP (4).
+        let table: Arc<Mutex<SessionTable>> = Arc::default();
+        let addr_in_prefix = |host: u16| {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, host))
+        };
+        let mut held = Vec::new();
+        for host in 0..MAX_SESSIONS_PER_IP as u16 {
+            let slot = SessionSlot::try_acquire(&table, addr_in_prefix(host));
+            assert!(slot.is_some(), "session {host} within the cap must admit");
+            held.push(slot.unwrap());
+        }
+        assert!(
+            SessionSlot::try_acquire(&table, addr_in_prefix(MAX_SESSIONS_PER_IP as u16)).is_none(),
+            "a fifth address in the same /64 must be refused as the same source"
+        );
         drop(held);
     }
 }
