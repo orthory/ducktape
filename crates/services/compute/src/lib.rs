@@ -25,8 +25,8 @@
 
 use std::collections::BTreeMap;
 
-use provider_host::{ProviderOutput, ProviderSet};
 use dispatch::{AdmissionPolicy, WorkSpec, decode_work_spec};
+use provider_host::{ProviderOutput, ProviderSet};
 use saga::{SagaMsg, WorkerRequest, decode_worker_request, encode_msg};
 use sdk::{Event, Msg};
 
@@ -38,8 +38,8 @@ mod soul;
 mod workspace_source;
 pub use ledger::{ReservationGuard, ResourceLedger};
 pub use pool::{
-    AttemptControl, CredentialResolver, DeliverFn, DispatchPool, Resolved, SharedCredentialResolver,
-    SpawnFn, SpawnKind, max_concurrent_runs_from_env,
+    AttemptControl, CredentialResolver, DeliverFn, DispatchPool, Resolved,
+    SharedCredentialResolver, SpawnFn, SpawnKind, max_concurrent_runs_from_env,
 };
 pub use provision::{
     ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,
@@ -65,6 +65,10 @@ pub(crate) struct ExecJob {
     /// [`ResourceLedger`] before it starts executing.
     pub demands: BTreeMap<String, u64>,
     pub admission: AdmissionPolicy,
+    /// the PENDING reservation this node's own Accept already took for this
+    /// exact attempt, if any — converted into the running reservation on
+    /// execution instead of reserving the same demands a second time.
+    pub claimed: Option<ReservationGuard>,
 }
 
 pub(crate) struct AttemptOutput {
@@ -132,27 +136,50 @@ pub(crate) fn gate(
         // the lease gate, host side: someone else's assignment is a
         // claimed skip — it IS our effect type, but the assignee submits
         // the result.
-        Some(assignee) if *assignee != node_key => Gated::Skip("foreign_lease"),
+        Some(assignee) if *assignee != node_key => {
+            // this node lost the race (or never entered it): the saga
+            // assigned the lease elsewhere. release any pending claim this
+            // node's own Accept holds for it, so the capacity is free for
+            // the next announcement.
+            ledger.release_pending(&pending_key(&request));
+            Gated::Skip("foreign_lease")
+        }
         Some(_) => gate_own_lease(providers, ledger, &request, work),
         // an UNASSIGNED request is an announcement, not a work order:
         // running it would be one execution per capable node. claim it
         // with Accept when this host can actually run the capability AND
         // fit its demands — never claim what cannot fit; the re-emitted
-        // request naming the winner is what executes.
+        // request naming the winner is what executes. Queue admission takes
+        // a PENDING reservation atomically (not a pure read) so a second
+        // announcement offered in the same window sees the capacity as
+        // spoken-for; FailFast already reserves atomically at Execute time,
+        // so its eligibility check stays the total-capacity read.
         None => {
+            let key = pending_key(&request);
             let eligible = match work.admission {
-                AdmissionPolicy::Queue => ledger.fits(&work.demands),
+                AdmissionPolicy::Queue => ledger.claim_pending(key.clone(), &work.demands),
                 AdmissionPolicy::FailFast => ledger.within_capacity(&work.demands),
             };
             if !eligible {
                 return Gated::Skip("announcement_over_capacity");
             }
             if providers.resolve(&work.capability).is_err() {
+                if work.admission == AdmissionPolicy::Queue {
+                    ledger.release_pending(&key);
+                }
                 return Gated::Skip("announcement_capability_unresolved");
             }
             Gated::Immediate(accept_op(&request))
         }
     }
+}
+
+/// the ledger key one `(saga_id, attempt)` reserves under, from the Accept
+/// claim through to the running reservation — shared by the announcement's
+/// pending claim, its own-lease conversion, and the FailFast atomic reserve
+/// so a hand-off never re-reserves the same demands twice.
+fn pending_key(request: &WorkerRequest) -> String {
+    format!("{}:{}", request.saga_id, request.attempt)
 }
 
 /// gate an own-lease request down to an [`ExecJob`] — or the inline error
@@ -163,6 +190,11 @@ fn gate_own_lease(
     request: &WorkerRequest,
     work: WorkSpec,
 ) -> Gated {
+    // Convert this node's own pending Accept claim (if any) here: every path
+    // below either moves `claimed` into the executed job, or returns without
+    // touching it — dropping it and releasing the reservation. A directly
+    // pinned lease that was never announced simply finds nothing pending.
+    let claimed = ledger.take_pending(&pending_key(request));
     // payload shape first: this verdict must not depend on what happens
     // to be installed on this host.
     let input = match String::from_utf8(work.payload) {
@@ -199,6 +231,7 @@ fn gate_own_lease(
         input,
         demands: work.demands,
         admission: work.admission,
+        claimed,
     })
 }
 
@@ -292,10 +325,14 @@ format = "text"
     }
 
     fn effect_for(spec: Vec<u8>, assignee: Option<&[u8]>) -> Event {
+        effect_for_saga("s", spec, assignee)
+    }
+
+    fn effect_for_saga(saga_id: &str, spec: Vec<u8>, assignee: Option<&[u8]>) -> Event {
         Event {
             source: "saga".into(),
             payload: encode_worker_request(&WorkerRequest {
-                saga_id: "s".into(),
+                saga_id: saga_id.into(),
                 attempt: 0,
                 spec,
                 deadline: None,
@@ -601,5 +638,113 @@ format = "text"
             panic!("a partial sandbox run should fill its omitted dimensions")
         };
         assert_eq!(job.demands, demands(&[("cores", 2), ("mem_gb", 16)]));
+    }
+
+    #[test]
+    fn only_one_of_four_same_window_announcements_is_accepted() {
+        // capacity 8, four different sagas each announcing a demand of 8 in
+        // the same window: a pure `fits` read would accept all four since
+        // nothing is reserved between offers. Claiming a pending reservation
+        // on Accept must make exactly one of them fit.
+        let providers = servable_providers();
+        let ledger = ResourceLedger::new(demands(&[("cores", 8)]));
+        let accepted = (0..4)
+            .filter(|i| {
+                let spec = work_spec_with_demands(demands(&[("cores", 8)]));
+                let event = effect_for_saga(&format!("s{i}"), spec, None);
+                matches!(
+                    gate(&providers, b"me", &ledger, &event),
+                    Gated::Immediate(_)
+                )
+            })
+            .count();
+        assert_eq!(accepted, 1, "only one announcement may claim the capacity");
+    }
+
+    #[test]
+    fn a_lost_race_releases_its_pending_claim_for_a_later_announcement() {
+        let providers = servable_providers();
+        let ledger = ResourceLedger::new(demands(&[("cores", 8)]));
+        let spec0 = work_spec_with_demands(demands(&[("cores", 8)]));
+        let spec1 = work_spec_with_demands(demands(&[("cores", 8)]));
+
+        // this node accepts s0's announcement, claiming all 8 cores.
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga("s0", spec0.clone(), None)
+            ),
+            Gated::Immediate(_)
+        ));
+        // a second announcement in the same window finds no free capacity.
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga("s1", spec1.clone(), None)
+            ),
+            Gated::Skip("announcement_over_capacity")
+        ));
+
+        // the saga assigns s0's lease to another node: this node lost the
+        // race and must release its pending claim.
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga("s0", spec0, Some(b"other"))
+            ),
+            Gated::Skip("foreign_lease")
+        ));
+
+        // capacity is free again: the later announcement is now accepted.
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga("s1", spec1, None)
+            ),
+            Gated::Immediate(_)
+        ));
+    }
+
+    #[test]
+    fn a_won_announcement_converts_its_pending_claim_without_double_reserving() {
+        let providers = servable_providers();
+        let ledger = ResourceLedger::new(demands(&[("cores", 8)]));
+        let spec = work_spec_with_demands(demands(&[("cores", 8)]));
+
+        assert!(matches!(
+            gate(
+                &providers,
+                b"me",
+                &ledger,
+                &effect_for_saga("s0", spec.clone(), None)
+            ),
+            Gated::Immediate(_)
+        ));
+
+        // the saga re-emits the request naming this node the winner: the
+        // pending claim converts into the executed job's reservation.
+        let Gated::Execute(job) = gate(
+            &providers,
+            b"me",
+            &ledger,
+            &effect_for_saga("s0", spec, Some(b"me")),
+        ) else {
+            panic!("a won announcement converts to Execute")
+        };
+        assert!(
+            job.claimed.is_some(),
+            "the converted job carries the pending reservation"
+        );
+        // the capacity is held exactly once by the converted reservation —
+        // a double reservation would already have exhausted it twice over.
+        assert!(!ledger.fits(&demands(&[("cores", 1)])));
     }
 }

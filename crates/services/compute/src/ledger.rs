@@ -12,6 +12,14 @@ pub struct ResourceLedger {
     capacity: BTreeMap<String, u64>,
     running: Arc<Mutex<BTreeMap<String, BTreeMap<String, u64>>>>,
     available: Arc<Notify>,
+    /// PENDING claims: an announcement's Accept reserves here before the
+    /// saga has assigned anything, so a second announcement in the same
+    /// window sees the capacity as spoken-for (counted by `fits`/
+    /// `within_capacity` via the same `running` table `try_reserve` writes
+    /// to). Keyed by `"{saga_id}:{attempt}"`, same as a running reservation,
+    /// so the winning own-lease request converts this exact guard instead
+    /// of reserving twice.
+    pending: Arc<Mutex<std::collections::HashMap<String, ReservationGuard>>>,
 }
 
 impl ResourceLedger {
@@ -20,6 +28,7 @@ impl ResourceLedger {
             capacity,
             running: Arc::new(Mutex::new(BTreeMap::new())),
             available: Arc::new(Notify::new()),
+            pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -100,6 +109,35 @@ impl ResourceLedger {
     /// Wait until the demands fit, then reserve them atomically. Register the
     /// waiter before each optimistic reserve so a release between the failed
     /// check and the await cannot be lost.
+    /// Take a PENDING reservation for an announcement's Accept claim: same
+    /// atomic check-and-reserve as [`Self::try_reserve`], tracked separately
+    /// so [`Self::take_pending`] can hand the exact guard to the winning
+    /// own-lease request instead of reserving the same work twice.
+    pub(crate) fn claim_pending(&self, key: String, demands: &BTreeMap<String, u64>) -> bool {
+        let Some(reservation) = self.try_reserve(&key, demands) else {
+            return false;
+        };
+        self.pending
+            .lock()
+            .expect("ledger lock")
+            .insert(key, reservation);
+        true
+    }
+
+    /// Remove and return the pending claim for `key`, if this node holds
+    /// one — the winning own-lease request converts it into the running
+    /// reservation; every other caller drops the returned guard immediately,
+    /// releasing the claim.
+    pub(crate) fn take_pending(&self, key: &str) -> Option<ReservationGuard> {
+        self.pending.lock().expect("ledger lock").remove(key)
+    }
+
+    /// Release a pending claim this node will never run: the saga assigned
+    /// the lease elsewhere, or this node's own follow-up gate refused it.
+    pub(crate) fn release_pending(&self, key: &str) {
+        drop(self.take_pending(key));
+    }
+
     pub(crate) async fn reserve_when_available(
         &self,
         key: &str,
