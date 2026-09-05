@@ -333,6 +333,7 @@ pub(crate) async fn run_validator(
     tokio::spawn(crate::sync::divergence::watch_root_divergence(
         blob_client.clone(),
         sync_state_tx,
+        signer.public_key(),
         label.clone(),
     ));
 
@@ -581,6 +582,7 @@ pub(crate) async fn run_promoted(
     tokio::spawn(crate::sync::divergence::watch_root_divergence(
         blob_client.clone(),
         sync_state_tx,
+        signer.public_key(),
         label.clone(),
     ));
 

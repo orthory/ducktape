@@ -471,17 +471,6 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> ServeLaneBlobClient<S> {
         })
     }
 
-    /// the live peer book minus this node's own key — the co-validators and
-    /// residents a caller may address BY NAME (see [`Self::request_from`]).
-    pub fn other_peers(&self) -> Vec<ed25519::PublicKey> {
-        let peers = self.peers.read().expect("blob peers lock");
-        peers
-            .iter()
-            .filter(|peer| peer.as_ref() != self.requester.as_slice())
-            .cloned()
-            .collect()
-    }
-
     /// one request ADDRESSED to a named peer. [`SyncClient::request`] takes
     /// its peer off the rotating cursor, which every clone of this client
     /// shares — the forge pack sweeper rotates it on its own failures — so a
