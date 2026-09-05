@@ -486,9 +486,8 @@ mod tests {
     /// Spread `i` across enough distinct source IPs that a `MAX_ADVERTS`-size
     /// fill never trips [`MAX_ADVERTS_PER_SOURCE_IP`] — `MAX_ADVERTS_PER_SOURCE_IP`
     /// keys share each synthetic `10.0.x.y` address before moving to the next
-    /// one. These pre-#1470 fills used ONE fixed address for every key; now
-    /// that a fixed address alone caps out at 8, scattering is what it takes
-    /// to keep exercising the GLOBAL cap's seniority-ordered eviction.
+    /// one. A fixed address alone caps out at 8, so scattering is what it
+    /// takes to keep exercising the GLOBAL cap's seniority-ordered eviction.
     fn scattered_addr(i: u64) -> SocketAddr {
         let group = i / MAX_ADVERTS_PER_SOURCE_IP as u64;
         SocketAddr::new(
