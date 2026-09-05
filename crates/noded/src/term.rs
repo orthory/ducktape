@@ -414,25 +414,35 @@ impl Default for TermCommandRing {
 }
 
 /// the seq a session's command ring will stamp next, given its cursor and — for
-/// a grain from a peer — the seq that grain carries. The RING owns the cursor:
-/// it advances by exactly one per accepted command, and a number off the wire is
-/// only ever CHECKED against it, never assigned to it. A peer's seq that is not
-/// the next one is refused rather than adopted; adopting one let a single frame
-/// carrying `u64::MAX` park the cursor at the ceiling, and the next local append
-/// then overflowed it — a panic inside the ring mutex in a debug build (which
-/// poisons it and kills the command path node-wide), a wrap to 0 in release
-/// (which hides the command from every `read_after` catch-up).
+/// a grain from a peer — the seq that grain carries. The RING owns the cursor: a
+/// local append advances it by one, and a peer's number is CHECKED before it may
+/// move it, never taken as given.
+///
+/// A mirror must tolerate a GAP (the forwarder feed drops grains when a peer
+/// stream lags, and a stalled command log would never recover), so a peer's seq
+/// only has to move the cursor FORWARD — but it may not reach `u64::MAX`, which
+/// would leave the cursor nowhere to advance to. Adopting one unchecked is what
+/// let a single frame carrying `u64::MAX` park the cursor at the ceiling: the
+/// next locally stamped command then overflowed it, panicking inside the ring
+/// mutex in a debug build (poisoning it and killing the command path node-wide)
+/// and wrapping to 0 in release (hiding the command from every `read_after`).
 ///
 /// Pure, so the rule is testable without a ring. `Err` is a stable `reason`.
 fn next_command_seq(cursor: u64, seq_override: Option<u64>) -> Result<u64, &'static str> {
-    // unreachable while the cursor only ever steps by one, and stated as a
-    // refusal rather than an overflow for exactly that reason.
-    let next = cursor.checked_add(1).ok_or("command_seq_overflow")?;
-    let wire_disagrees = seq_override.is_some_and(|wire| wire != next);
-    if wire_disagrees {
+    // the local step. Unreachable at the ceiling while a wire seq can never
+    // park the cursor there, and stated as a refusal rather than a wrap anyway.
+    let Some(wire) = seq_override else {
+        return cursor.checked_add(1).ok_or("command_seq_overflow");
+    };
+    let moves_backward = wire <= cursor;
+    if moves_backward {
         return Err("command_seq_out_of_order");
     }
-    Ok(next)
+    let leaves_no_room = wire == u64::MAX;
+    if leaves_no_room {
+        return Err("command_seq_overflow");
+    }
+    Ok(wire)
 }
 
 impl TermCommandRing {
@@ -449,10 +459,10 @@ impl TermCommandRing {
     /// append one command received FROM a peer node without re-broadcasting it —
     /// the ring-only path that breaks the fan-out loop. The origin node's serial
     /// consumer owns the authoritative total order, so the grain carries its
-    /// `seq` and this ring never re-stamps one — but it CHECKS it: a mirror
-    /// follows its host from the session's first command, so the origin's number
-    /// and the mirror's next cursor agree, and a grain that disagrees is a
-    /// replay, a reorder, or a forgery. It is dropped, never adopted.
+    /// `seq` and this ring never re-stamps one — but it CHECKS it: the number
+    /// must move this ring's cursor forward (a gap is fine; the feed drops
+    /// grains when a peer stream lags) and must leave room to advance. A replay,
+    /// a reorder, or `u64::MAX` is dropped, never adopted.
     pub fn append_remote(&self, event: TermCommandEvent) {
         self.push(
             &event.session,
@@ -1841,12 +1851,12 @@ mod tests {
             (event.seq, event.origin.as_str(), event.text.as_str()),
             (1, "alice", "ls")
         );
-        // a peer's command carries the ORIGIN's seq — the next one this ring
-        // will stamp, because a mirror follows its host — and rings under it
-        // without re-broadcasting.
+        // a peer's command carries the ORIGIN's seq and rings under it verbatim,
+        // without re-broadcasting — including across a gap, since the forwarder
+        // feed drops grains when a peer stream lags.
         ring.append_remote(TermCommandEvent {
             session: "00000000deadbeef".into(),
-            seq: 2,
+            seq: 42,
             origin: "bob".into(),
             text: "pwd".into(),
         });
@@ -1856,23 +1866,34 @@ mod tests {
         ));
         let (rows, _) = ring.read_after("00000000deadbeef", 0, 8);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1], (2, "bob".to_string(), "pwd".to_string()));
+        assert_eq!(
+            rows[1],
+            (42, "bob".to_string(), "pwd".to_string()),
+            "the origin's seq is replayed verbatim, not re-stamped"
+        );
     }
 
     #[test]
-    fn command_ring_refuses_a_peer_seq_that_is_not_its_next_one() {
-        // the ring owns the cursor: a wire number is checked against it, never
-        // assigned to it. u64::MAX used to be adopted, and the next LOCAL append
-        // then overflowed the cursor.
+    fn command_ring_takes_a_forward_peer_seq_and_refuses_the_rest() {
+        // the ring owns the cursor: a wire number may only move it FORWARD, and
+        // never to the ceiling. u64::MAX used to be adopted, and the next LOCAL
+        // append then overflowed the cursor.
         assert_eq!(next_command_seq(0, None), Ok(1));
         assert_eq!(next_command_seq(1, Some(2)), Ok(2));
-        assert_eq!(
-            next_command_seq(1, Some(u64::MAX)),
-            Err("command_seq_out_of_order")
-        );
+        assert_eq!(next_command_seq(1, Some(9)), Ok(9), "a gap is tolerated");
         assert_eq!(
             next_command_seq(1, Some(1)),
-            Err("command_seq_out_of_order")
+            Err("command_seq_out_of_order"),
+            "a replay never moves the cursor"
+        );
+        assert_eq!(
+            next_command_seq(9, Some(2)),
+            Err("command_seq_out_of_order"),
+            "nor does a reorder"
+        );
+        assert_eq!(
+            next_command_seq(1, Some(u64::MAX)),
+            Err("command_seq_overflow")
         );
         assert_eq!(
             next_command_seq(u64::MAX, None),
