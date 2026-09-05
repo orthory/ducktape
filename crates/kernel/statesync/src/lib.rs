@@ -1960,10 +1960,10 @@ pub async fn fetch_snapshot<C: SyncClient>(
 /// this node when it accepted canonical state from it: your own sync source.
 /// what IS enforced here, once, at the trust boundary:
 ///
-/// * every key is BYTE-EXACTLY `op/{height:016x}/{seq:04x}` — not merely
+/// * every key is BYTE-EXACTLY `op/{height:016x}/{seq:08x}` — not merely
 ///   parseable as one. [`index_guest::parse_op_key`] reads hex with
 ///   `from_str_radix`, which accepts any width and a leading `+`, so `op/2/0`
-///   parses to `(2, 0)` while sorting AFTER `op/0000000000000009/0000`. a
+///   parses to `(2, 0)` while sorting AFTER `op/0000000000000009/00000000`. a
 ///   non-canonical key would pass every ascent check here and then break key
 ///   order in the store — which the next refold replays as history running
 ///   backwards. the fixed width IS the ordering, so it is checked as bytes;
@@ -2470,8 +2470,8 @@ mod tests {
             SyncResponse::Error("nope".into()),
             SyncResponse::IndexOps {
                 rows: vec![
-                    ("op/0000000000000001/0000".into(), vec![1, 2, 3]),
-                    ("op/0000000000000002/000a".into(), Vec::new()),
+                    ("op/0000000000000001/00000000".into(), vec![1, 2, 3]),
+                    ("op/0000000000000002/0000000a".into(), Vec::new()),
                 ],
                 next_after: Some((2, 10)),
                 source_floor: Some(1),
@@ -2522,8 +2522,8 @@ mod tests {
         // upper bound for every shape — which is what a serve-side binary
         // search against a transport cap needs to stay sound.
         let rows = vec![
-            ("op/0000000000000001/0000".to_string(), vec![0xAB; 31]),
-            ("op/0000000000000009/0007".to_string(), Vec::new()),
+            ("op/0000000000000001/00000000".to_string(), vec![0xAB; 31]),
+            ("op/0000000000000009/00000007".to_string(), Vec::new()),
         ];
         let widest = encode_response(&SyncResponse::IndexOps {
             rows: rows.clone(),
