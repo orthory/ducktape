@@ -218,18 +218,26 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     if len > cap {
         return refuse(stream, "over_kind_cap").await;
     }
-    if blobs.has_chunk(&digest) {
-        stream.write_all(&[ACK_ALREADY_HAVE]).await?;
-        return stream.write_all(&0u64.to_be_bytes()).await;
-    }
-    // the admission is a GUARD, not a closure the exit paths must remember to
-    // call: the two ack writes below use `?`, and a connection dropped in that
-    // window used to return with the digest still inflight and its length still
-    // charged — permanently, for the life of the process.
+    // ADMISSION FIRST, and only then the already-have check. the admission is a
+    // GUARD, not a closure the exit paths must remember to call: the two ack
+    // writes below use `?`, and a connection dropped in that window used to
+    // return with the digest still inflight and its length still charged —
+    // permanently, for the life of the process.
+    //
+    // the order is load-bearing. the already-have probe used to run first, so
+    // the per-digest dedupe that collapses N streams naming one digest never
+    // saw them: N peers replaying an already-resident digest each ran the probe
+    // concurrently. it is a stat now, but the dedupe still belongs in front of
+    // it — the cheap check is the one that runs per admitted push, not per
+    // stream a peer chooses to open.
     let _admission = match PushSlot::acquire(&inflight, &budget, &blobs, digest, len) {
         Ok(slot) => slot,
         Err(reason) => return refuse(stream, reason).await,
     };
+    if blobs.has_chunk(&digest) {
+        stream.write_all(&[ACK_ALREADY_HAVE]).await?;
+        return stream.write_all(&0u64.to_be_bytes()).await;
+    }
     let mut slot = match blobs.stage(digest, len) {
         Ok(slot) => slot,
         // the mesh fetch lane holds this digest's staging slot: it is landing
@@ -669,6 +677,73 @@ mod tests {
             "the inflight slot leaked"
         );
         assert_eq!(budget.load(Ordering::Relaxed), 0, "the budget leaked");
+    }
+
+    /// a stream that is at EOF and records every byte the receiver writes back.
+    #[derive(Clone, Default)]
+    struct Recorder(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl AsyncRead for Recorder {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Recorder {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.0.lock().expect("recorder").extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// the per-digest dedupe must run BEFORE the already-have probe: a peer
+    /// that opens a second stream for a digest already inflight is refused
+    /// there, never let through to run per-stream work of its own.
+    #[tokio::test]
+    async fn the_dedupe_runs_before_the_already_have_probe() {
+        let blobs = blobstore::BlobHandle::default();
+        let digest = blobs.put_chunk(b"resident".to_vec());
+        let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
+        inflight.lock().expect("inflight lock").insert(digest);
+
+        let wire = Recorder::default();
+        receive_push(
+            wire.clone(),
+            KIND_MODULE_CODE,
+            digest,
+            8,
+            blobs,
+            Arc::clone(&inflight),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("the refusal ack writes");
+
+        assert_eq!(
+            wire.0.lock().expect("recorder")[0],
+            ACK_REFUSED,
+            "a digest already inflight answered from the already-have path"
+        );
     }
 
     /// a sender that streams `head` and then drops the connection.
