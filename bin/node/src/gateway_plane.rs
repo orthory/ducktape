@@ -32,9 +32,47 @@ const PROXY_IO_TIMEOUT: Duration = Duration::from_secs(15);
 /// emits events/keepalives well inside this; a silent-forever upstream would
 /// otherwise pin its accept permit (16 total) and its serve task for good.
 const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Two-way silence that ends a bridged WebSocket. Nothing else bounds one: a
+/// socket lives until a peer closes it, and an idle bridge otherwise parks its
+/// upgrade permit and both pump tasks for good.
+const WS_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_ERROR_BYTES: usize = 512;
+/// One-shot HTTP exchanges either half runs at once.
+const MAX_CONCURRENT_REQUESTS: usize = 16;
+/// Live WebSocket bridges either half runs at once. A SEPARATE budget: an
+/// upgrade holds its permit for the socket's whole life, so sharing the
+/// request budget lets a handful of idle sockets starve every gateway request
+/// on the node — the airlock broker's credential relay included.
+const MAX_CONCURRENT_UPGRADES: usize = 64;
 
 type PlaneSlot = Arc<OnceLock<Arc<StreamService<OverlaySockets>>>>;
+
+/// The plane's two concurrency budgets, held by both halves. They are separate
+/// on purpose: a request permit is released at the response head, an upgrade
+/// permit at socket close, so one budget for both lets idle sockets starve
+/// every request. A request QUEUES for its permit; an upgrade is REFUSED,
+/// because queueing behind sockets that may never close is a hang.
+struct GatewayBudget {
+    requests: Arc<tokio::sync::Semaphore>,
+    upgrades: Arc<tokio::sync::Semaphore>,
+}
+
+impl GatewayBudget {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            requests: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            upgrades: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_UPGRADES)),
+        })
+    }
+
+    async fn admit_request(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.requests).acquire_owned().await.ok()
+    }
+
+    fn admit_upgrade(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.upgrades).try_acquire_owned().ok()
+    }
+}
 
 pub struct SpawnConfig {
     pub label: String,
@@ -97,18 +135,15 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         let commands = commands.clone();
         let client_workspace = workspace.clone();
         let client_ports = node_api_ports.clone();
-        let permits = Arc::new(tokio::sync::Semaphore::new(16));
+        let budget = GatewayBudget::new();
         tokio::spawn(async move {
             while let Some(job) = jobs.recv().await {
-                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-                    return;
-                };
                 let slot = Arc::clone(&slot);
                 let commands = commands.clone();
                 let workspace = client_workspace.clone();
                 let node_api_ports = client_ports.clone();
+                let budget = Arc::clone(&budget);
                 tokio::spawn(async move {
-                    let _permit = permit;
                     match job {
                         GatewayJob::Http {
                             publisher_node,
@@ -117,6 +152,12 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                             body,
                             reply,
                         } => {
+                            // The permit is taken HERE, not in the recv loop:
+                            // the loop must keep draining the lane, or a full
+                            // budget wedges every `lane.send` behind it.
+                            let Some(_permit) = budget.admit_request().await else {
+                                return;
+                            };
                             // The deadline covers everything up to the response
                             // HEAD; the body streams beyond it (WS precedent).
                             let result = tokio::time::timeout(PROXY_IO_TIMEOUT, async {
@@ -174,6 +215,19 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                             to_browser,
                             from_browser,
                         } => {
+                            // Its own budget, and the (N+1)th is REFUSED, not
+                            // queued: a queued upgrade would wait on sockets
+                            // that may never close.
+                            let Some(_permit) = budget.admit_upgrade() else {
+                                tracing::warn!(
+                                    target: "ducktape::gateway",
+                                    reason = "upgrade_budget_full",
+                                    open = MAX_CONCURRENT_UPGRADES,
+                                    "gateway upgrade refused"
+                                );
+                                let _ = to_browser.send(noded::GatewayWsMsg::Close(1013)).await;
+                                return;
+                            };
                             if publisher_node == own_node {
                                 // Loopback: pipe our own serve_ws to the caller
                                 // pump over a local duplex.
@@ -240,19 +294,19 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
         planes.register("gateway", Service::Gateway, plane.watch());
         let _ = slot.set(Arc::clone(&service));
         let _plane = plane;
-        let permits = Arc::new(tokio::sync::Semaphore::new(16));
+        let budget = GatewayBudget::new();
         loop {
             let Some((requester, hello, mut stream)) = service.accept().await else {
-                return;
-            };
-            let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
                 return;
             };
             let commands = commands.clone();
             let workspace = workspace.clone();
             let node_api_ports = node_api_ports.clone();
+            let budget = Arc::clone(&budget);
+            // Mirrors the client lane: which budget a stream draws on is only
+            // knowable after its head decodes, so the permit is taken inside
+            // the task and the accept loop keeps draining.
             tokio::spawn(async move {
-                let _permit = permit;
                 if hello.intent != gateway::PROXY_INTENT {
                     let _ = write_proxy_response(
                         &mut stream,
@@ -280,9 +334,28 @@ pub fn spawn(config: SpawnConfig, mut jobs: tokio::sync::mpsc::Receiver<GatewayJ
                 // A WebSocket upgrade is long-lived; it owns the stream and
                 // writes its own responses, so it bypasses the one-shot timeout.
                 if head.upgrade {
+                    let Some(_permit) = budget.admit_upgrade() else {
+                        tracing::warn!(
+                            target: "ducktape::gateway",
+                            reason = "upgrade_budget_full",
+                            open = MAX_CONCURRENT_UPGRADES,
+                            "inbound gateway upgrade refused"
+                        );
+                        let _ = write_proxy_response(
+                            &mut stream,
+                            Err(GatewayFailure::Unavailable(
+                                "gateway upgrade budget is full".into(),
+                            )),
+                        )
+                        .await;
+                        return;
+                    };
                     serve_ws(&commands, &scope, &requester.0, &head, stream).await;
                     return;
                 }
+                let Some(_permit) = budget.admit_request().await else {
+                    return;
+                };
                 serve_proxy_stream(&commands, &scope, &requester.0, head, None, stream).await;
             });
         }
@@ -1199,8 +1272,24 @@ async fn serve_ws<S>(
     ws_pump(stream, upstream).await;
 }
 
+/// Resolve once a bridged socket has been silent in BOTH directions for
+/// [`WS_IDLE_TIMEOUT`]. Each pump direction notifies on every message, so this
+/// waits on the bridge's own traffic with a deadline — not on a sleep loop.
+async fn ws_idle_deadline(activity: Arc<tokio::sync::Notify>) {
+    while tokio::time::timeout(WS_IDLE_TIMEOUT, activity.notified())
+        .await
+        .is_ok()
+    {}
+    tracing::debug!(
+        target: "ducktape::gateway",
+        reason = "ws_idle",
+        "gateway websocket bridge closed"
+    );
+}
+
 /// Two independent tasks (mesh→upstream, upstream→mesh); when either direction
-/// ends, the other is aborted so both sockets drop and each peer sees EOF.
+/// ends — or the bridge goes two-way idle — the others are aborted so both
+/// sockets drop and each peer sees EOF.
 async fn ws_pump<S, U>(stream: S, upstream: U)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1219,6 +1308,9 @@ where
     use tokio_tungstenite::tungstenite::Message;
     let (mut mesh_read, mut mesh_write) = tokio::io::split(stream);
     let (mut ws_tx, mut ws_rx) = upstream.split();
+    let activity = Arc::new(tokio::sync::Notify::new());
+    let to_upstream_activity = Arc::clone(&activity);
+    let to_mesh_activity = Arc::clone(&activity);
     let mut to_upstream = tokio::spawn(async move {
         let mut buf = Vec::new();
         loop {
@@ -1232,6 +1324,7 @@ where
                     if ws_tx.send(message).await.is_err() {
                         break;
                     }
+                    to_upstream_activity.notify_one();
                 }
                 _ => {
                     let _ = ws_tx.close().await;
@@ -1262,21 +1355,28 @@ where
                 break;
             }
             let _ = mesh_write.flush().await;
+            to_mesh_activity.notify_one();
             if closing {
                 break;
             }
         }
     });
+    let mut idle = tokio::spawn(ws_idle_deadline(activity));
     tokio::select! {
-        _ = &mut to_upstream => to_mesh.abort(),
-        _ = &mut to_mesh => to_upstream.abort(),
+        _ = &mut to_upstream => {}
+        _ = &mut to_mesh => {}
+        _ = &mut idle => {}
     }
+    to_upstream.abort();
+    to_mesh.abort();
+    idle.abort();
 }
 
 /// Caller side of a WebSocket upgrade: read the publisher's `101` ack, then
 /// bridge the browser's message channels to the mesh stream. Mirrors
 /// [`ws_pump`] with the roles reversed — the noded WS door owns the
-/// browser/axum translation. Returns once either direction closes. On a
+/// browser/axum translation. Returns once either direction closes, or once the
+/// bridge has been silent both ways for [`WS_IDLE_TIMEOUT`]. On a
 /// non-101 first frame (a `Failure` or garbage) it closes the browser side.
 async fn caller_ws_pump<S>(
     mut mesh: S,
@@ -1296,6 +1396,9 @@ async fn caller_ws_pump<S>(
         }
     }
     let (mut mesh_read, mut mesh_write) = tokio::io::split(mesh);
+    let activity = Arc::new(tokio::sync::Notify::new());
+    let to_browser_activity = Arc::clone(&activity);
+    let from_browser_activity = Arc::clone(&activity);
     let mut to_browser_task = tokio::spawn(async move {
         // Seed with any bytes already read past the 101 frame.
         loop {
@@ -1309,6 +1412,7 @@ async fn caller_ws_pump<S>(
                     if to_browser.send(message).await.is_err() {
                         break;
                     }
+                    to_browser_activity.notify_one();
                 }
                 Ok(gateway::ProxyFrame::WsClose { code }) => {
                     let _ = to_browser.send(GatewayWsMsg::Close(code)).await;
@@ -1336,15 +1440,21 @@ async fn caller_ws_pump<S>(
                 break;
             }
             let _ = mesh_write.flush().await;
+            from_browser_activity.notify_one();
             if closing {
                 break;
             }
         }
     });
+    let mut idle = tokio::spawn(ws_idle_deadline(activity));
     tokio::select! {
-        _ = &mut to_browser_task => from_browser_task.abort(),
-        _ = &mut from_browser_task => to_browser_task.abort(),
+        _ = &mut to_browser_task => {}
+        _ = &mut from_browser_task => {}
+        _ = &mut idle => {}
     }
+    to_browser_task.abort();
+    from_browser_task.abort();
+    idle.abort();
 }
 
 /// Drop any `Domain` attribute from a Set-Cookie value so gateway cookies stay
@@ -1610,6 +1720,37 @@ mod tests {
         };
         assert!(failure.detail.is_ascii(), "detail must not echo peer bytes");
         assert!(failure.detail.len() <= MAX_ERROR_BYTES);
+    }
+
+    /// The wedge: an upgrade holds its permit for the socket's whole life, so
+    /// a shared budget lets idle sockets starve every request on the node.
+    #[tokio::test]
+    async fn idle_upgrades_never_spend_the_request_budget() {
+        let budget = GatewayBudget::new();
+        let sockets: Vec<_> = (0..MAX_CONCURRENT_UPGRADES)
+            .map(|_| budget.admit_upgrade().expect("under the upgrade cap"))
+            .collect();
+        assert!(
+            budget.admit_upgrade().is_none(),
+            "the (N+1)th upgrade is refused, never queued behind live sockets"
+        );
+        // The whole point: requests still flow with every socket parked.
+        let requests: Vec<_> = (0..MAX_CONCURRENT_REQUESTS)
+            .map(|_| {
+                budget
+                    .requests
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("the request budget is untouched by upgrades")
+            })
+            .collect();
+        drop(requests);
+        assert!(budget.admit_request().await.is_some());
+        drop(sockets);
+        assert!(
+            budget.admit_upgrade().is_some(),
+            "a closed socket frees one"
+        );
     }
 
     #[test]
