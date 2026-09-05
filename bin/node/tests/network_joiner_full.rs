@@ -105,6 +105,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
         let valset = Valset::new(
             "valset",
             Box::new(QmdbStore::init(context.child("source_valset"), "valset").await),
+            "governance",
         );
         let forge = Forge::init("forge", source_dir.clone()).expect("forge init");
         let mut host = Host::genesis(vec![
@@ -354,6 +355,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
                     .await
                     .expect("sync_from"),
                 ),
+                "governance",
             );
             assert_eq!(join_valset.root(), valset_root);
 

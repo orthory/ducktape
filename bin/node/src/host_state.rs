@@ -919,8 +919,12 @@ mod tests {
             ),
             (Origin::System, 50, ModulesMsg::Advance),
         ];
-        let mut registry =
-            Modules::new("modules", Box::new(sdk_testkit::MemStore::new()), "valset");
+        let mut registry = Modules::new(
+            "modules",
+            Box::new(sdk_testkit::MemStore::new()),
+            "valset",
+            "governance",
+        );
         futures::executor::block_on(async {
             for (origin, height, m) in steps {
                 let mut ctx = ctx(origin, height);

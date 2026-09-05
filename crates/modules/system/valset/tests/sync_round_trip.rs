@@ -84,7 +84,7 @@ async fn replies(v: &Valset) -> Vec<ValsetReply> {
 }
 
 fn valset_over(store: Box<dyn sdk::MerkleStore>) -> Valset {
-    Valset::new("valset", store)
+    Valset::new("valset", store, "governance")
 }
 
 #[test]
