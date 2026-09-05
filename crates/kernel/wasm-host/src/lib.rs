@@ -11,7 +11,8 @@
 //!     `commit_block` / discarded at `abort_block` — byte-for-byte the native
 //!     module staging contract.
 //!   * determinism is by construction: fresh instance (no memory carryover),
-//!     fuel-metered termination, no ambient host imports, integer/bytes ABI.
+//!     a per-DISPATCH fuel budget ([`DEFAULT_FUEL`]) spent across the replay
+//!     rounds, no ambient host imports, integer/bytes ABI.
 //!   * cross-module reads (`module-root` / `query-module`) are MEMOIZED REPLAY:
 //!     the sync guest world cannot await the host's async `Ctx`, so a read the
 //!     per-dispatch memo can't answer pauses the run (a deterministic trap), the
@@ -124,10 +125,25 @@ impl Shape {
     }
 }
 
-/// default per-dispatch fuel budget: the deterministic termination bound. It is
-/// identical on every validator, so a runaway guest traps at the same point on
-/// all of them — a trap is a deterministic rejection, not a per-node fork.
-pub const DEFAULT_FUEL: u64 = 2_000_000_000;
+/// the fuel budget of one DISPATCH (and of one query): the deterministic
+/// termination bound. It is identical on every validator, so a runaway guest
+/// traps at the same point on all of them — a trap is a deterministic
+/// rejection, not a per-node fork.
+///
+/// It is spent ACROSS the memoized-replay rounds, not re-granted per round: a
+/// round starts with exactly what the previous round left, and a dispatch that
+/// runs out traps like any single-round fuel exhaustion. Replay re-treads the
+/// pure prefix and that repetition is the GUEST'S cost — otherwise a guest
+/// could buy a fresh full budget per forced replay, up to
+/// [`MAX_SIBLING_READS`] + [`MAX_STORE_READS`] + [`MAX_OBJECT_READS`] times in
+/// one op.
+///
+/// The number covers the replay overhead the read budgets imply: an op that
+/// spends its whole [`MAX_OBJECT_READS`] / [`MAX_STORE_READS`] budget re-treads
+/// a prefix growing by one read per round, so its rounds cost ~n²/2 read calls
+/// — just under 4e9 fuel for a full object-read budget with no guest logic at
+/// all. Half of this is that floor; the other half is the op's own work.
+pub const DEFAULT_FUEL: u64 = 8_000_000_000;
 
 /// per-dispatch bound on DISTINCT sibling reads (`module-root` + `query-module`).
 /// each unresolved read replays the pure guest once with the answer memoized, so
@@ -733,7 +749,11 @@ impl WasmModule {
     /// never another; a mismatch is a wiring bug refused by name, never a
     /// module silently computing a root over the wrong substrate) and its
     /// committed-query mode is taken as declared.
-    fn load(id: ModuleId, compiled: CompiledModule, backing: StateBacking) -> Result<Self, SdkError> {
+    fn load(
+        id: ModuleId,
+        compiled: CompiledModule,
+        backing: StateBacking,
+    ) -> Result<Self, SdkError> {
         Self::require_declared_backing(&id, &compiled.shape, backing.kind())?;
         Ok(Self {
             id,
@@ -947,14 +967,16 @@ impl WasmModule {
     /// query serves from its live struct (out of block the overlay is empty, so
     /// this is the committed projection). writes a guest attempts here land in
     /// the round's own copy and are dropped: read-only by construction. returns
-    /// the outcome plus the memo and any pending read the round paused on.
+    /// the outcome plus the memo, any pending read the round paused on, and the
+    /// fuel it left for the next one.
     fn query_round(
         &self,
         env: WitEnv,
         memo: SiblingMemo,
         sealed: bool,
         req: &[u8],
-    ) -> (Result<Vec<u8>, SdkError>, SiblingMemo, Option<PendingRead>) {
+        fuel: u64,
+    ) -> QueryRound {
         // committed-only tenants (opt-in) answer queries from committed state
         // alone: the staged overlay is dropped for this read. execute rounds are
         // untouched — and a query round never writes, so an empty stage is a pure
@@ -981,17 +1003,32 @@ impl WasmModule {
             out_assigned: Vec::new(),
         };
         let mut store = Store::new(&self.engine, data);
-        let call: Result<Result<Vec<u8>, WitError>, SdkError> = match store.set_fuel(self.fuel) {
+        let call: Result<Result<Vec<u8>, WitError>, SdkError> = match store.set_fuel(fuel) {
             Err(e) => Err(module_err(e)),
             Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker) {
                 Err(e) => Err(module_err(e)),
                 Ok(inst) => inst.call_query(&mut store, req).map_err(module_err),
             },
         };
+        let fuel_left = store.get_fuel().unwrap_or(0);
         let data = store.into_data();
-        let outcome = call.and_then(|r| r.map_err(wit_err));
-        (outcome, data.memo, data.pending)
+        QueryRound {
+            outcome: call.and_then(|r| r.map_err(wit_err)),
+            memo: data.memo,
+            pending: data.pending,
+            fuel_left,
+        }
     }
+}
+
+/// what one [`WasmModule::query_round`] round hands back to its driver.
+struct QueryRound {
+    outcome: Result<Vec<u8>, SdkError>,
+    memo: SiblingMemo,
+    pending: Option<PendingRead>,
+    /// the round's UNSPENT fuel — the next round's whole budget. one query
+    /// spends one [`DEFAULT_FUEL`], however many rounds it replays.
+    fuel_left: u64,
 }
 
 /// canonical `install`-able bytes (and their root) for a host-COMPUTED initial
@@ -1294,6 +1331,11 @@ impl Module for WasmModule {
         // its puts on top, so the overlay is identical across replay rounds.
         let staged_objects0 = std::mem::take(&mut self.staged_objects);
         let mut memo = SiblingMemo::default();
+        // ONE budget for the whole dispatch: each round starts with what the
+        // previous round left (see [`DEFAULT_FUEL`]). At zero the next round
+        // traps out of fuel immediately — the same deterministic rejection a
+        // single-round exhaustion produces.
+        let mut fuel_left = self.fuel;
         while memo.within_budgets() {
             // move map-backed committed + memo into owned per-round data;
             // staged is a copy. store-backed rounds carry an empty map and
@@ -1324,7 +1366,7 @@ impl Module for WasmModule {
             };
             let mut store = Store::new(&self.engine, data);
 
-            let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(self.fuel) {
+            let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(fuel_left) {
                 Err(e) => Err(module_err(e)),
                 Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
                 {
@@ -1334,6 +1376,8 @@ impl Module for WasmModule {
                         .map_err(module_err),
                 },
             };
+            // carry the unspent fuel into the next replay round.
+            fuel_left = store.get_fuel().unwrap_or(0);
 
             // reclaim state regardless of outcome (a trap leaves the moved-in
             // state in the store; take it back so the module is never left empty).
@@ -1428,11 +1472,13 @@ impl Module for WasmModule {
             origin: WitOrigin::System,
         };
         let mut memo = SiblingMemo::default();
+        let mut fuel_left = self.fuel;
         while memo.within_budgets() {
-            let (outcome, returned, pending) = self.query_round(env.clone(), memo, true, req);
-            memo = returned;
-            match pending {
-                None => return outcome,
+            let round = self.query_round(env.clone(), memo, true, req, fuel_left);
+            memo = round.memo;
+            fuel_left = round.fuel_left;
+            match round.pending {
+                None => return round.outcome,
                 Some(PendingRead::State(key)) => {
                     let answer = self.resolve_state_read(&key).await?;
                     memo.states.insert(key, answer);
@@ -1458,12 +1504,13 @@ impl Module for WasmModule {
             StateBacking::Map { .. } | StateBacking::Store { .. } => {}
         }
         let mut memo = SiblingMemo::default();
+        let mut fuel_left = self.fuel;
         while memo.within_budgets() {
-            let (outcome, returned, pending) =
-                self.query_round(to_wit_env(ctx.env()), memo, false, req);
-            memo = returned;
-            match pending {
-                None => return outcome,
+            let round = self.query_round(to_wit_env(ctx.env()), memo, false, req, fuel_left);
+            memo = round.memo;
+            fuel_left = round.fuel_left;
+            match round.pending {
+                None => return round.outcome,
                 Some(PendingRead::State(key)) => {
                     let answer = self.resolve_state_read(&key).await?;
                     memo.states.insert(key, answer);
@@ -1585,5 +1632,65 @@ impl Module for WasmModule {
             StateBacking::Map { .. } | StateBacking::Store { .. } => {}
         }
         Ok(())
+    }
+}
+
+// ============================================================================
+// the protocol bounds, proven from inside the crate: they read private state
+// (the fuel field) or drive the host imports directly, so they live here rather
+// than in `tests/`. The fixtures are the same committed guest artifacts the
+// integration proofs use.
+// ============================================================================
+
+#[cfg(test)]
+mod bounds {
+    use super::*;
+    use sdk_testkit::TestCtx;
+
+    const SIBLING: &[u8] = include_bytes!("../tests/fixtures/sibling.component.wasm");
+
+    /// `sibling-wasm`'s `'f'` op: `reads` DISTINCT sibling queries, i.e.
+    /// `reads + 1` memoized-replay rounds of the identical pure prefix.
+    fn distinct_reads(reads: u64) -> Msg {
+        let mut payload = b"f".to_vec();
+        payload.extend_from_slice(&reads.to_le_bytes());
+        Msg {
+            target: "sibling".into(),
+            payload,
+        }
+    }
+
+    /// the smallest power-of-two budget under which a `reads`-read dispatch
+    /// completes. The doubling search is deterministic — it waits on the
+    /// module's own answer, never on a clock — and every failing attempt ends
+    /// in a fuel trap, not a hang.
+    async fn min_fuel(reads: u64) -> u64 {
+        let mut fuel = 1 << 12;
+        while fuel <= DEFAULT_FUEL {
+            let mut m = WasmModule::from_bytes("sibling", SIBLING).expect("load");
+            m.fuel = fuel;
+            let mut ctx = TestCtx::at_height(1).on_query("noisy", |req| Ok(req.to_vec()));
+            if m.execute(&mut ctx, &distinct_reads(reads)).await.is_ok() {
+                return fuel;
+            }
+            fuel *= 2;
+        }
+        panic!("{reads} reads never completed inside DEFAULT_FUEL");
+    }
+
+    /// ONE budget per dispatch, spent across the replay rounds: nine rounds of
+    /// the same prefix cost about nine times one round. Re-granting the budget
+    /// per round would make the two budgets equal, and a guest could buy
+    /// `MAX_SIBLING_READS + MAX_STORE_READS + MAX_OBJECT_READS` full budgets
+    /// out of a single op.
+    #[tokio::test]
+    async fn fuel_is_one_budget_per_dispatch_not_per_replay_round() {
+        let one_round = min_fuel(0).await;
+        let nine_rounds = min_fuel(8).await;
+        assert!(
+            nine_rounds >= one_round * 4,
+            "nine replay rounds needed {nine_rounds} fuel against {one_round} for one — \
+             the budget is being re-granted per round"
+        );
     }
 }
