@@ -129,9 +129,9 @@ pub(crate) fn unix_ms() -> u64 {
 /// a value nothing but this process could have written: at boot this mints a
 /// random 128-bit token into `<workspace>/workspace.mark` (or reads one back,
 /// if the directory already carries one from an earlier boot of the same
-/// workspace). A directory that came back from `rm -rf` is empty, so the next
-/// read finds no token file and mints a fresh one on the spot — a random
-/// collision with the token from before deletion is not a real possibility.
+/// workspace). Every later check COMPARES that pinned token against what the
+/// directory carries — see [`WorkspaceMark::presence`], which is where the
+/// three outcomes and the deliberate limit of this scheme are spelled out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorkspaceMark {
     device: u64,
@@ -155,13 +155,11 @@ impl WorkspaceMark {
         })
     }
 
-    /// This directory's own identity token: read back one a prior boot left
-    /// behind, or mint and persist a fresh one when none is there yet — which
-    /// is exactly what happens the instant a deleted-and-recreated directory
-    /// is looked at again. A filesystem error persisting the fresh token
-    /// (read-only mount, no space) still returns it for THIS process's
-    /// comparisons; it just won't survive a restart, same ambiguity the mark
-    /// already had before this fix.
+    /// This directory's own identity token, minted ONCE at boot: read back one
+    /// a prior boot left behind, or mint and persist a fresh one when none is
+    /// there yet. A filesystem error persisting it (read-only mount, no space)
+    /// still returns it for this process's comparisons; it just won't survive
+    /// a restart.
     fn token(dir: &std::path::Path) -> [u8; 16] {
         let path = dir.join(Self::MARK_FILE);
         if let Ok(bytes) = std::fs::read(&path)
@@ -174,23 +172,71 @@ impl WorkspaceMark {
         fresh
     }
 
-    /// Is the pinned directory still the one sitting at `dir`? False when the
-    /// path is gone AND when something else — a re-created empty workspace —
-    /// now occupies it.
-    pub(crate) fn still_at(&self, dir: &std::path::Path) -> bool {
-        Self::read(dir) == Some(*self)
+    /// Is the pinned directory still the one this node booted on? COMPARES the
+    /// pinned token — it never re-mints, because minting is what a boot does:
+    /// a check that re-derives the token from scratch reports "different
+    /// workspace" for every state in which the mark file simply cannot be read
+    /// back, and fail-stops a healthy node.
+    ///
+    /// A missing or short mark file is therefore [`Presence::MarkLost`], not a
+    /// deletion: a backup that skipped an unrecognized extensionless file, a
+    /// full or read-only filesystem that never let the boot write it, a crash
+    /// between truncate and write. The cost of that ruling is the one case a
+    /// deleted-and-recreated directory lands back on the SAME (device, inode)
+    /// — ext4 hands a freed inode number straight out — and comes back empty:
+    /// that reads as MarkLost too. A recreated workspace far more often gets a
+    /// different inode, and the alternative was killing live nodes over a
+    /// missing 16-byte file.
+    pub(crate) fn presence(&self, dir: &std::path::Path) -> Presence {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(meta) = std::fs::metadata(dir) else {
+            return Presence::Vanished;
+        };
+        let same_directory = meta.dev() == self.device && meta.ino() == self.inode;
+        if !same_directory {
+            return Presence::Vanished;
+        }
+        match std::fs::read(dir.join(Self::MARK_FILE)) {
+            Ok(bytes) if bytes == self.token => Presence::Intact,
+            // a FULL-length token that is not ours was stamped by another
+            // process on this inode — a different workspace wearing our path.
+            Ok(bytes) if bytes.len() == self.token.len() => Presence::Vanished,
+            _ => Presence::MarkLost,
+        }
     }
+
+    /// Put the pinned token back, so a workspace whose mark file was lost to a
+    /// backup or a transient write failure heals on the next check. `false`
+    /// when the filesystem still refuses it.
+    pub(crate) fn restore(&self, dir: &std::path::Path) -> bool {
+        std::fs::write(dir.join(Self::MARK_FILE), self.token).is_ok()
+    }
+}
+
+/// What a [`WorkspaceMark`] check found at the pinned path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Presence {
+    /// The pinned directory, carrying the token this node stamped into it.
+    Intact,
+    /// The pinned directory, but its mark file is gone or truncated. NOT a
+    /// deletion — the node keeps running and rewrites the mark.
+    MarkLost,
+    /// Gone, unreadable, or a different (device, inode) — a re-created
+    /// workspace wearing the same path.
+    Vanished,
 }
 
 #[cfg(test)]
 mod workspace_mark_tests {
-    use super::WorkspaceMark;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::{Presence, WorkspaceMark};
 
     #[test]
     fn a_pinned_workspace_is_still_itself() {
         let dir = tempfile::tempdir().unwrap();
         let mark = WorkspaceMark::read(dir.path()).expect("a fresh dir stats");
-        assert!(mark.still_at(dir.path()));
+        assert_eq!(mark.presence(dir.path()), Presence::Intact);
     }
 
     #[test]
@@ -203,13 +249,70 @@ mod workspace_mark_tests {
         let mark = WorkspaceMark::read(&path).expect("a fresh dir stats");
 
         std::fs::remove_dir_all(&path).unwrap();
-        assert!(!mark.still_at(&path), "a missing path is not the workspace");
+        assert_eq!(
+            mark.presence(&path),
+            Presence::Vanished,
+            "a missing path is not the workspace"
+        );
 
         std::fs::create_dir_all(path.join("storage")).unwrap();
-        assert!(
-            !mark.still_at(&path),
+        assert_eq!(
+            mark.presence(&path),
+            Presence::Vanished,
             "a re-created workspace is a different one"
         );
+    }
+
+    #[test]
+    fn a_deleted_mark_file_is_not_a_deleted_workspace() {
+        // a backup that skipped the unrecognized extensionless file, or an
+        // operator tidying it away. the directory is untouched, so the node
+        // must keep running — and must be able to put the mark back.
+        let dir = tempfile::tempdir().unwrap();
+        let mark = WorkspaceMark::read(dir.path()).expect("a fresh dir stats");
+        std::fs::remove_file(dir.path().join(WorkspaceMark::MARK_FILE)).unwrap();
+
+        assert_eq!(mark.presence(dir.path()), Presence::MarkLost);
+        assert!(
+            mark.restore(dir.path()),
+            "a writable dir takes the mark back"
+        );
+        assert_eq!(mark.presence(dir.path()), Presence::Intact);
+    }
+
+    #[test]
+    fn a_truncated_mark_file_is_not_a_deleted_workspace() {
+        // a crash between truncate and write leaves 0 bytes behind.
+        let dir = tempfile::tempdir().unwrap();
+        let mark = WorkspaceMark::read(dir.path()).expect("a fresh dir stats");
+        std::fs::write(dir.path().join(WorkspaceMark::MARK_FILE), b"").unwrap();
+
+        assert_eq!(mark.presence(dir.path()), Presence::MarkLost);
+    }
+
+    #[test]
+    fn a_boot_that_could_not_write_the_mark_does_not_fail_stop() {
+        // ENOSPC or a read-only mount at boot: `read` mints a token it never
+        // manages to persist. Every later check must still say "this is my
+        // workspace", not kill the node within a second of boot.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let readonly = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(&workspace, readonly).unwrap();
+
+        let mark = WorkspaceMark::read(&workspace).expect("an unwritable dir still stats");
+        assert!(
+            !workspace.join(WorkspaceMark::MARK_FILE).exists(),
+            "the boot write could not land"
+        );
+        assert_eq!(mark.presence(&workspace), Presence::MarkLost);
+        assert!(
+            !mark.restore(&workspace),
+            "and the rewrite cannot land either"
+        );
+
+        std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -219,27 +322,18 @@ mod workspace_mark_tests {
     }
 
     /// The scenario `a_deleted_workspace_is_gone_even_once_the_path_is_back`
-    /// depends on the recreated directory getting a mark that differs from
-    /// the deleted one's even when the filesystem hands back the exact same
-    /// (device, inode) pair — which ext4 does, measured directly on this box.
-    /// Pin the mechanism directly: two marks that share device AND inode but
-    /// carry different tokens must still compare unequal.
+    /// depends on the (device, inode) pair NOT being the discriminator: ext4
+    /// hands a freed inode number straight back out, measured directly on this
+    /// box. Pin the mechanism directly — another process's token under our
+    /// pinned path is a different workspace even when the pair matches.
     #[test]
-    fn a_reused_inode_is_not_the_same_workspace() {
-        let same_device = 1;
-        let reused_inode = 42;
-        let born_first = WorkspaceMark {
-            device: same_device,
-            inode: reused_inode,
-            token: [1; 16],
-        };
-        let born_later = WorkspaceMark {
-            device: same_device,
-            inode: reused_inode,
-            token: [2; 16],
-        };
-        assert_ne!(
-            born_first, born_later,
+    fn a_reused_inode_carrying_another_token_is_not_the_same_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mark = WorkspaceMark::read(dir.path()).expect("a fresh dir stats");
+        std::fs::write(dir.path().join(WorkspaceMark::MARK_FILE), [0xAAu8; 16]).unwrap();
+        assert_eq!(
+            mark.presence(dir.path()),
+            Presence::Vanished,
             "a reused inode is not the workspace it used to be"
         );
     }

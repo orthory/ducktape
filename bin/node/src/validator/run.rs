@@ -241,6 +241,10 @@ struct ValidatorRuntime<'a> {
     /// the node then runs unguarded rather than dying over a stat.
     workspace_mark: Option<crate::util::WorkspaceMark>,
     next_workspace_check: std::time::SystemTime,
+    /// consecutive checks that found the workspace's mark file missing while
+    /// the directory itself was unchanged. Not a deletion — it paces the
+    /// warning for a filesystem that will never accept the rewrite.
+    workspace_mark_lost_checks: u64,
 }
 
 pub(super) async fn run(state: ValidatorLoopState<'_>) {
@@ -533,6 +537,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         next_drain: context.current() + DRAIN_TICK,
         workspace_mark,
         next_workspace_check: context.current() + WORKSPACE_CHECK_INTERVAL,
+        workspace_mark_lost_checks: 0,
     };
     // the startup snapshot: the RECOVERED boundary serves on /v1/status the
     // moment the loop exists, not after the first drain.
