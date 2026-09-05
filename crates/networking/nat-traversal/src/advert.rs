@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::{Latch, NodeKey};
@@ -123,6 +123,27 @@ pub(crate) const MAX_ADVERTS: usize = 4096;
 /// source. A handful is generous for any real host (a home gateway, a small
 /// rack) running several nodes behind one address.
 pub(crate) const MAX_ADVERTS_PER_SOURCE_IP: usize = 8;
+
+/// The unit [`MAX_ADVERTS_PER_SOURCE_IP`] counts against. An IPv4 address is
+/// one host, so it counts exactly. An IPv6 address is NOT: the smallest
+/// prefix a single host is assigned is a /64 (RFC 6177) — 2^64 addresses,
+/// every one of them a distinct `IpAddr` a spraying host can pick for free,
+/// no botnet and no spoofing required. Bucketing by /64 instead makes one
+/// IPv6 host cost exactly what one IPv4 host costs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Bucket {
+    V4(Ipv4Addr),
+    /// The top 64 bits of the address — its /64 routing prefix.
+    V6Prefix(u64),
+}
+
+/// Bucket a source `IpAddr` for the per-source cap. See [`Bucket`].
+pub(crate) fn source_bucket(ip: IpAddr) -> Bucket {
+    match ip {
+        IpAddr::V4(v4) => Bucket::V4(v4),
+        IpAddr::V6(v6) => Bucket::V6Prefix((u128::from(v6) >> 64) as u64),
+    }
+}
 
 pub struct AdvertBook {
     latest: HashMap<NodeKey, ReflexiveAdvert>,
@@ -283,9 +304,10 @@ impl AdvertBook {
     /// the whole book, so a source's slots free up as its members' keepalives
     /// lapse rather than staying pinned until something else reclaims them.
     fn live_adverts_from(&self, ip: IpAddr, now: u64) -> usize {
+        let bucket = source_bucket(ip);
         self.latest
             .values()
-            .filter(|a| a.reflexive.ip() == ip && !self.expired(a, now))
+            .filter(|a| source_bucket(a.reflexive.ip()) == bucket && !self.expired(a, now))
             .count()
     }
 
@@ -422,7 +444,7 @@ impl SharedAdverts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn addr(o: u8, p: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, o)), p)
@@ -909,5 +931,38 @@ mod tests {
             Some(addr(1, 4000)),
             "a refused migration leaves the old live mapping untouched"
         );
+    }
+
+    /// One of `MAX_ADVERTS_PER_SOURCE_IP + 1` distinct addresses inside the
+    /// SAME routed /64 (`2001:db8::/64`) — the shape of one IPv6 host
+    /// spraying keys from addresses it alone controls, no botnet needed.
+    fn v6_in_one_slash64(host: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, host)),
+            4000,
+        )
+    }
+
+    #[test]
+    fn nine_ipv6_addresses_in_one_slash64_hit_the_same_source_cap() {
+        let mut book = AdvertBook::with_ttl(120);
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            book.observe(source_key(i), v6_in_one_slash64(i as u16 + 1), 1_000);
+        }
+        // A NINTH key from a NINTH address in the same /64 is refused: every
+        // address differs, but they all bucket to the same /64 source.
+        let ninth = source_key(MAX_ADVERTS_PER_SOURCE_IP as u64);
+        book.observe(ninth, v6_in_one_slash64(9), 1_000);
+        assert_eq!(
+            book.current(ninth, 1_000),
+            None,
+            "a 9th key from a 9th address in the same /64 is refused"
+        );
+        for i in 0..MAX_ADVERTS_PER_SOURCE_IP as u64 {
+            assert!(
+                book.current(source_key(i), 1_000).is_some(),
+                "the /64's own established keys are untouched"
+            );
+        }
     }
 }
