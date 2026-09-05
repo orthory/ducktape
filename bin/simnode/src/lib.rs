@@ -1154,6 +1154,11 @@ impl Sim {
         // lane, so `project_block` fills it (where the old direct-host path left
         // it empty).
         for projection in noded::projection::project_block(&drained, system, &self.blobs) {
+            // a height that sealed nothing is not a block: never fold one (see
+            // `BlockProjection::sealed`).
+            if !projection.sealed() {
+                continue;
+            }
             let time = ConsensusTimePolicy::Epoch {
                 base_ms: SIM_EPOCH_MS,
                 block_ms: SIM_BLOCK_MS,

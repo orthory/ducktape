@@ -1383,6 +1383,16 @@ pub(super) async fn park(
             // The same projection the validator consumes; this loop retains
             // replica-only seal verification, streaming, and checkpoints.
             for projection in project_block(&drained, node_r.take_system_dispatches(), &blobs) {
+                // NOTHING SEALED AT THIS HEIGHT — the cutover ceiling discarded
+                // every frame in the batch, so there is no block to fold, count
+                // or publish (see `BlockProjection::sealed`). The fold POINTER
+                // still advances: this loop's cutover clock is
+                // `served_height - view_base`, and the discarded views are
+                // exactly the ones it must cross to cut over.
+                if !projection.sealed() {
+                    *served_height = projection.height;
+                    continue;
+                }
                 let BlockProjection {
                     height,
                     dispatches,

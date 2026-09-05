@@ -196,6 +196,14 @@ impl ValidatorRuntime<'_> {
             false => noded::BlockWake::TipOnly,
         };
         for projection in projections {
+            // NOTHING SEALED AT THIS HEIGHT — every frame in the batch was
+            // discarded by the cutover ceiling. There is no block here to
+            // project, and folding one would advance every module's watermark
+            // onto a height the NEW epoch is about to use (see
+            // `BlockProjection::sealed`).
+            if !projection.sealed() {
+                continue;
+            }
             let BlockProjection {
                 height,
                 dispatches,
