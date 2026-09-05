@@ -208,7 +208,7 @@ fn stdin_is_tty() -> bool {
 /// terminal. `payload-hex` is NOT a secret (it's a public op body) and is not
 /// masked.
 fn field_is_secret(field: &str) -> bool {
-    field.contains("password") || field.contains("mnemonic")
+    field.contains("password") || field.contains("mnemonic") || field.contains("token")
 }
 
 /// RAII guard that disables terminal echo on stdin and restores it on Drop —
