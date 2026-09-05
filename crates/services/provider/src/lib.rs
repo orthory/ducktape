@@ -785,10 +785,19 @@ impl CliProvider {
         let vcpus = vm_cores(&ctx.limits)?;
         let mem_mib = vm_mem_mib(&ctx.limits)?;
 
+        // BEFORE any directory exists: deriving the executors image stats the
+        // operator's executors directory and rebuilds it, and it refuses a
+        // foreign binary there on every single run. Creating the run's scratch
+        // first left one directory pair per refusal, unbounded.
+        let executors = sandbox_host::executor_image::ensure(executors)?;
+
         // ONE slot for both directories, drawn per boot: they are two halves of
-        // the same run's scratch and are removed together when the VM drops.
+        // the same run's scratch and are removed together when the VM drops —
+        // and until the VM exists, these guards are what removes them.
         let slot = run_slot();
-        let run_dir = microvm_run_dir(&slot)?;
+        let run_scratch = microvm_run_dir(&slot)?;
+        let socket_scratch = microvm_socket_dir(&slot)?;
+        let run_dir = run_scratch.path();
         let vm_config = firecracker_api::VmConfig {
             vmm,
             kernel: kernel.clone(),
@@ -797,13 +806,13 @@ impl CliProvider {
             agent_volume: self.agent_volume.clone(),
             assets: run_dir.join("assets.ext4"),
             workspace: run_dir.join("workspace.ext4"),
-            // Derived here, per boot, rather than at discovery: an operator who
-            // installs a CLI mid-life expects the next run to have it, and the
-            // check is two stats when the image is already current.
-            executors: sandbox_host::executor_image::ensure(executors)?,
+            // Derived above, per boot, rather than at discovery: an operator
+            // who installs a CLI mid-life expects the next run to have it, and
+            // the check is two stats when the image is already current.
+            executors,
             vcpus,
             mem_mib,
-            vsock_uds: microvm_socket(&slot)?,
+            vsock_uds: socket_scratch.path().join(MICROVM_SOCKET_NAME),
             // no tap: the guest has no NIC, so its whole reach is the vsock
             // tunnels above. That is no longer the same as "no egress" — those
             // tunnels now carry this node's ENTIRE http listener, not just the
@@ -825,7 +834,14 @@ impl CliProvider {
             pty: stdio == GuestStdio::Pty,
         };
 
-        microvm::MicroVm::boot(&run_dir, &workdir, &assets, &vm_config, &manifest).await
+        // every error path out of `boot` leaves both directories to the guards,
+        // which drop with this `?`.
+        let booted =
+            microvm::MicroVm::boot(run_dir, &workdir, &assets, &vm_config, &manifest).await?;
+        // the VM's own `Drop` removes them from here.
+        run_scratch.disarm();
+        socket_scratch.disarm();
+        Ok(booted)
     }
 
     /// the env carried into a sandbox.
@@ -1517,13 +1533,15 @@ fn guest_argv(bin: &Path, args: &[String], layout: &GuestLayout) -> Vec<String> 
 /// whole 9.1 GB of it and died with `No space left on device` — with the node's
 /// memory as the thing consumed. Only the socket belongs there; see
 /// [`microvm_socket`].
-fn microvm_run_dir(slot: &str) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!("dt-vm-{slot}"));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create run dir {}: {e}", dir.display()))?;
-    Ok(dir)
+fn microvm_run_dir(slot: &str) -> Result<microvm::ScratchDir, String> {
+    microvm::ScratchDir::create(std::env::temp_dir().join(format!("dt-vm-{slot}")))
 }
 
-/// the run's vsock socket path, which is the ONE thing that must be short.
+/// the leaf the guest dials, inside [`microvm_socket_dir`]. Firecracker appends
+/// `_<port>` to it.
+const MICROVM_SOCKET_NAME: &str = "v.sock";
+
+/// the run's vsock socket directory, which is the ONE thing that must be short.
 ///
 /// A unix socket path is capped near 108 bytes (`SUN_LEN`), and Firecracker
 /// appends `_<port>` to it. `XDG_RUNTIME_DIR` is the shortest per-user
@@ -1531,14 +1549,14 @@ fn microvm_run_dir(slot: &str) -> Result<PathBuf, String> {
 /// long home blows straight through the cap, and the failure is
 /// `path must be shorter than SUN_LEN` at bind time — after the images have
 /// already been built.
-fn microvm_socket(slot: &str) -> Result<PathBuf, String> {
+///
+/// It is a tmpfs, so a leaked directory here is the node's own RAM: the
+/// returned guard is what makes a refused run cost nothing.
+fn microvm_socket_dir(slot: &str) -> Result<microvm::ScratchDir, String> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let dir = base.join(format!("dt-vm-{slot}"));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("create socket dir {}: {e}", dir.display()))?;
-    Ok(dir.join("v.sock"))
+    microvm::ScratchDir::create(base.join(format!("dt-vm-{slot}")))
 }
 
 /// this run's directory name, DRAWN FRESH — never derived from the run's
@@ -5346,17 +5364,66 @@ printf '%s\n' "$PATH"
 
         for slot in &slots {
             assert_eq!(slot.len(), 16, "the slot is 16 hex chars: {slot}");
-            let socket = microvm_socket(slot).expect("socket path");
-            let dialled = format!("{}_{}", socket.display(), 1024);
+            let socket_dir = microvm_socket_dir(slot).expect("socket dir");
+            let dialled = format!(
+                "{}_{}",
+                socket_dir.path().join(MICROVM_SOCKET_NAME).display(),
+                1024
+            );
             assert!(
                 dialled.len() < 108,
                 "the guest dials {dialled} ({} bytes), past SUN_LEN",
                 dialled.len()
             );
-            if let Some(dir) = socket.parent() {
-                let _ = std::fs::remove_dir_all(dir);
-            }
+            // dropping the guard removes it, which is the property the next
+            // test pins.
         }
+    }
+
+    /// Nothing is created before the run can be REFUSED.
+    ///
+    /// `executor_image::ensure` refuses a foreign binary in the operator's
+    /// executors directory on every single run, and it used to run after both
+    /// of the run's directories existed — so a node in that state leaked a
+    /// directory pair per refused attempt, one of them on a tmpfs. A source
+    /// lint because the seam needs `/dev/kvm` and the guest artifacts: what is
+    /// checkable is the order.
+    #[test]
+    fn the_executors_image_is_derived_before_any_scratch_exists() {
+        let src = include_str!("lib.rs");
+        let (body, _) = src
+            .split_once("microvm::MicroVm::boot(")
+            .expect("the microVM boot call");
+        let (_, body) = body
+            .rsplit_once("async fn microvm_boot(")
+            .expect("microvm_boot");
+        let ensure = body
+            .find("executor_image::ensure(")
+            .expect("microvm_boot derives the executors image");
+        let scratch = body
+            .find("microvm_run_dir(")
+            .expect("microvm_boot creates the run directory");
+        assert!(
+            ensure < scratch,
+            "a refusal from executor_image::ensure must cost no directory"
+        );
+    }
+
+    /// A refused run leaves neither of its directories behind — the whole
+    /// point of handing both to guards.
+    #[test]
+    fn a_refused_run_leaves_neither_directory() {
+        let slot = run_slot();
+        let (run_dir, socket_dir) = {
+            let run = microvm_run_dir(&slot).expect("run dir");
+            let socket = microvm_socket_dir(&slot).expect("socket dir");
+            assert!(run.path().is_dir() && socket.path().is_dir());
+            (run.path().to_path_buf(), socket.path().to_path_buf())
+            // both guards drop here, as they do on every `?` in `microvm_boot`
+            // before the VM exists.
+        };
+        assert!(!run_dir.exists(), "{} survived", run_dir.display());
+        assert!(!socket_dir.exists(), "{} survived", socket_dir.display());
     }
 
     /// The production shape end to end: the operator's OWN installed CLI, in an

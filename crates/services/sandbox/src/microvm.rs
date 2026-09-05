@@ -177,6 +177,12 @@ impl MicroVm {
     /// path is capped near 108 bytes (`SUN_LEN`); a scratch directory under a
     /// long home blows straight through it with `path must be shorter than
     /// SUN_LEN`. Put it under `XDG_RUNTIME_DIR`.
+    ///
+    /// The CALLER owns `run_dir` and the socket directory until this returns
+    /// `Ok`: create both as [`ScratchDir`]s and `disarm` them only once the
+    /// returned [`MicroVm`] exists, because from here on its `Drop` is what
+    /// removes them. Every error path below leaves both directories to the
+    /// caller's guards.
     pub async fn boot(
         run_dir: &Path,
         workdir: &Path,
@@ -185,13 +191,6 @@ impl MicroVm {
         manifest: &RunManifest,
     ) -> Result<(Self, MicroVmIo), String> {
         let started = std::time::Instant::now();
-        std::fs::create_dir_all(run_dir)
-            .map_err(|e| format!("create run dir {}: {e}", run_dir.display()))?;
-        // From here until the `MicroVm` below exists, nothing owns this
-        // directory: every `?` in the setup steps — an oversized workspace, a
-        // vsock path over SUN_LEN, a VMM that will not spawn — used to leave it
-        // behind, and a node that refuses runs leaks one per attempt.
-        let mut run_dir_guard = RunDirGuard(Some(run_dir));
 
         // 1. the run's per-run block devices: what it is supposed to run, its
         //    read-only inputs, and the workspace that will be read back.
@@ -280,9 +279,9 @@ impl MicroVm {
             "VMM spawned; waiting for the guest"
         );
 
-        // the VM owns the directory from here: its `Drop` removes it on every
-        // path out, including the boot failures below.
-        run_dir_guard.0 = None;
+        // the VM owns both directories from here: its `Drop` removes them on
+        // every path out, including the boot failures below. The caller's
+        // `ScratchDir`s are disarmed against this same `Ok`.
         let mut vm = MicroVm {
             vmm,
             run_dir: run_dir.to_path_buf(),
@@ -297,7 +296,10 @@ impl MicroVm {
             Ok(Ok((stream, _))) => stream,
             Ok(Err(e)) => {
                 return Err(vm
-                    .boot_failure("guest_vsock_accept_failed", &format!("accept the guest vsock: {e}"))
+                    .boot_failure(
+                        "guest_vsock_accept_failed",
+                        &format!("accept the guest vsock: {e}"),
+                    )
                     .await);
             }
             Err(_) => {
@@ -443,21 +445,52 @@ async fn serve_tunnel(listener: UnixListener, service_port: u16) {
     }
 }
 
-/// Owns a run directory for the window in which nothing else does — from
-/// `create_dir_all` until the [`MicroVm`] that will remove it exists. Disarmed
-/// by setting its field to `None`.
-struct RunDirGuard<'a>(Option<&'a Path>);
+/// One directory a run owns: created here, removed when this value drops,
+/// unless [`Self::disarm`] hands it on.
+///
+/// It closes the window between a directory's `create_dir_all` and the
+/// [`MicroVm`] whose `Drop` removes the run's scratch. A run has two of them —
+/// the run directory and the vsock socket directory — and every `?` in between
+/// (an oversized workspace, a foreign binary in the executors directory, a
+/// vsock path over `SUN_LEN`, a VMM that will not spawn) used to leave them
+/// behind with nothing to reap them: a node that refuses runs leaked one pair
+/// per attempt, and the socket directory sits on a tmpfs, i.e. the node's own
+/// RAM.
+pub struct ScratchDir {
+    path: PathBuf,
+    owned: bool,
+}
 
-impl Drop for RunDirGuard<'_> {
+impl ScratchDir {
+    /// create `path` and own it from this moment.
+    pub fn create(path: PathBuf) -> Result<Self, String> {
+        std::fs::create_dir_all(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        Ok(Self { path, owned: true })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// stop owning it, because something whose own teardown removes it now
+    /// does — the booted [`MicroVm`].
+    pub fn disarm(mut self) {
+        self.owned = false;
+    }
+}
+
+impl Drop for ScratchDir {
     fn drop(&mut self) {
-        let Some(run_dir) = self.0 else { return };
-        if let Err(error) = std::fs::remove_dir_all(run_dir)
-            && run_dir.exists()
+        if !self.owned {
+            return;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&self.path)
+            && self.path.exists()
         {
             tracing::warn!(
                 target: "ducktape::sandbox",
                 reason = "run_dir_not_removed",
-                slot = %slot_of(run_dir),
+                slot = %slot_of(&self.path),
                 %error,
                 "a refused run left its directory behind"
             );
@@ -674,6 +707,31 @@ mod tests {
             feed.contains("std::future::pending::<()>().await"),
             "the feed task owns the write half and must park, never return:\n{feed}"
         );
+    }
+
+    /// The two halves of the ownership contract `boot` documents: a directory
+    /// that was never handed on is removed, and one that was is left to the
+    /// [`MicroVm`] that will remove it.
+    #[test]
+    fn a_scratch_dir_outlives_its_guard_only_once_disarmed() {
+        let base = std::env::temp_dir().join(format!("dt-scratch-{}", std::process::id()));
+        let refused = base.join("refused");
+        let booted = base.join("booted");
+
+        ScratchDir::create(refused.clone()).expect("create");
+        assert!(
+            !refused.exists(),
+            "a refused run left {}",
+            refused.display()
+        );
+
+        ScratchDir::create(booted.clone()).expect("create").disarm();
+        assert!(
+            booted.exists(),
+            "a disarmed guard removed {}",
+            booted.display()
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A unix socket path is capped near 108 bytes. The run directory is
