@@ -126,6 +126,9 @@ pub struct MicroVm {
     vsock_uds: PathBuf,
     /// the tunnel acceptors, aborted when the VM goes away.
     tunnels: Vec<tokio::task::JoinHandle<()>>,
+    /// when the VMM was spawned, which is where
+    /// [`firecracker_api::MAX_VM_LIFETIME`] is counted from.
+    booted_at: tokio::time::Instant,
 }
 
 impl Drop for MicroVm {
@@ -289,6 +292,7 @@ impl MicroVm {
             console: console.clone(),
             vsock_uds: cfg.vsock_uds.clone(),
             tunnels,
+            booted_at: tokio::time::Instant::now(),
         };
 
         // 4. the guest dials back
@@ -362,11 +366,33 @@ impl MicroVm {
     /// Ordered, not concurrent: the guest syncs and unmounts before it halts,
     /// so reading the image before the VMM is gone risks reading a filesystem
     /// with an open journal.
+    ///
+    /// BOUNDED by [`firecracker_api::MAX_VM_LIFETIME`], counted from the boot.
+    /// The invoke loop's timeouts bound the arrival of the guest's exit FRAME,
+    /// not the VM's exit — after that frame the guest still has to sync,
+    /// unmount and halt, and `duck-guest-init`'s halt ends in `pause()` when
+    /// `reboot(2)` fails. Unbounded, one such guest blocks this await forever:
+    /// the run's task never completes, and the VMM keeps its vcpus and its
+    /// whole memory footprint with no timer anywhere to reap it.
     pub async fn collect(mut self, workdir: &Path) -> Result<(), String> {
-        self.vmm
-            .wait()
+        let deadline = self.booted_at + firecracker_api::MAX_VM_LIFETIME;
+        let waited = tokio::time::timeout_at(deadline, self.vmm.wait())
             .await
-            .map_err(|e| format!("wait for the VMM: {e}"))?;
+            .ok()
+            .map(|exited| exited.map(|_| ()));
+        if waited.is_none() {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                reason = "vm_lifetime_exceeded",
+                slot = %slot_of(&self.run_dir),
+                lifetime_s = firecracker_api::MAX_VM_LIFETIME.as_secs(),
+                "the guest never halted inside the VM's lifetime; killing the VMM"
+            );
+            let _ = self.vmm.kill().await;
+        }
+        // either way `self` drops at the end of this fn, so the run's
+        // directories are reaped on the expiry path too.
+        vmm_exit_outcome(waited)?;
         let started = std::time::Instant::now();
         let read_back = crate::workspace_image::read_back(&self.workspace_image, workdir);
         // the workspace round trip is the run's longest non-model step (13.8 s
@@ -495,6 +521,24 @@ impl Drop for ScratchDir {
                 "a refused run left its directory behind"
             );
         }
+    }
+}
+
+/// what the bounded wait for the VMM means for the run. `None` is the wait
+/// hitting [`firecracker_api::MAX_VM_LIFETIME`].
+///
+/// A killed VM's workspace image is NOT read back: the guest never finished its
+/// unmount, so the filesystem on it has an open journal and whatever it holds is
+/// not the run's result. Losing the workspace is the honest outcome — reading a
+/// torn one silently would land it on the host as if the run had succeeded.
+fn vmm_exit_outcome(waited: Option<std::io::Result<()>>) -> Result<(), String> {
+    match waited {
+        Some(Ok(())) => Ok(()),
+        Some(Err(error)) => Err(format!("wait for the VMM: {error}")),
+        None => Err(format!(
+            "the guest did not halt within the microVM's {} s lifetime; the VMM was killed and the workspace was not read back",
+            firecracker_api::MAX_VM_LIFETIME.as_secs()
+        )),
     }
 }
 
@@ -736,6 +780,33 @@ mod tests {
             feed.contains("std::future::pending::<()>().await"),
             "the feed task owns the write half and must park, never return:\n{feed}"
         );
+    }
+
+    /// The lifetime backstop is WIRED, and an expiry is an error rather than a
+    /// silently torn workspace.
+    ///
+    /// `collect` used to await the VMM unbounded on the success path, and
+    /// `MAX_VM_LIFETIME` was referenced nowhere in the tree: a guest that
+    /// reported its exit code and then wedged on halt (a `umount` blocked by a
+    /// lingering grandchild, a kernel whose power-off returns) blocked the run's
+    /// task forever with the VM's whole memory footprint still charged.
+    ///
+    /// The mapping only, because the timeout itself is the runtime's and there
+    /// is no seam for a fake VMM handle: `collect` owns a real
+    /// `tokio::process::Child`.
+    #[test]
+    fn a_vm_that_outlives_its_lifetime_fails_the_run() {
+        assert!(vmm_exit_outcome(Some(Ok(()))).is_ok());
+
+        let expired = vmm_exit_outcome(None).expect_err("an expired lifetime fails the run");
+        assert!(
+            expired.contains("lifetime") && expired.contains("not read back"),
+            "the operator must be told the workspace is gone, not just that it took long: {expired}"
+        );
+
+        let failed = vmm_exit_outcome(Some(Err(std::io::Error::other("no child"))))
+            .expect_err("a wait error fails the run");
+        assert!(failed.contains("no child"), "{failed}");
     }
 
     /// A guest frame this host cannot parse ends the feed task too.
