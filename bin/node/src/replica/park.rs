@@ -1452,6 +1452,17 @@ pub(super) async fn park(
                 }
                 *served_height = height;
                 blocks_since_checkpoint += 1;
+                // once per folded block, independent of the checkpoint
+                // cadence: a rig that cuts the underlay mid-run and wants to
+                // prove folding kept going past a height bar has nothing
+                // else to ride (`node_checkpoint_written` fires only when
+                // `checkpoint_due` decides the root moved, see
+                // `bin/node/src/drain_actions.rs`).
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    "resident folded block"
+                );
             }
             if !drained.is_empty()
                 && metrics.operational_status().phase == noded::NodePhase::Syncing

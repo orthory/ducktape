@@ -1225,7 +1225,7 @@ async fn verify_attested(
 ) -> Result<[u8; 32], String> {
     Err(format!(
         "airlock quote verification is not compiled in (measurement={measurement} \
-         attest={attest}); rebuild broker-host with --features verify"
+         attest={attest}); rebuild ducktape with --features verify"
     ))
 }
 

@@ -22,6 +22,11 @@ testkit = ["dep:nettest"]
 # only bin/simnode enables it, so a shipping node never even COMPILES the
 # code path that reads DUCKTAPE_WASM_CACHE_DIR, let alone runs it.
 wasm-cache = ["wasm-host/wasm-cache"]
+# forwards to `provider-host/verify` (real TEE quote verification for the
+# airlock `Attested` trust arm, off by default) — `ducktape-noded` reaches
+# that arm through `provider-host`'s dispatch worker the same as `ducktape`
+# does, so it needs the same opt-in flag.
+verify = ["provider-host/verify"]
 
 [dependencies]
 # the shared raw-http/port/poll test client — only pulled by the `testkit`

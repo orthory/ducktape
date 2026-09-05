@@ -333,6 +333,32 @@ mod tests {
         assert_eq!(step(&replacing, ACTIVATION, None), Step::Swap(scheduled));
     }
 
+    /// A STALE designation IS REPLACEABLE — the registry lets governance
+    /// reschedule a pending that passed its activation height without ever
+    /// latching readiness, which is every netstack designation. The
+    /// replacement's own height is honoured like any other: below its floor
+    /// this node keeps the machine it has, and at the floor the new hash is a
+    /// designation this process has not answered.
+    #[test]
+    fn a_re_designation_waits_for_its_own_height_then_is_acted_on() {
+        let spent = [7; 32];
+        let next = [8; 32];
+        const REDESIGNATION: u64 = 40;
+        let mut replaced = entry(Some(next), &[]);
+        replaced.pending.as_mut().expect("pending").activation_height = REDESIGNATION;
+        let roster = vec![replaced];
+        assert_eq!(
+            step(&roster, REDESIGNATION - 1, Some(&spent)),
+            Step::Nothing,
+            "below the new cutover the replacement designates nothing yet"
+        );
+        assert_eq!(
+            step(&roster, REDESIGNATION, Some(&spent)),
+            Step::Swap(next),
+            "at its height the replacement is a designation this process has not answered"
+        );
+    }
+
     /// A designation is spent by an ANSWER. The plane's refusal is one (the
     /// same bytes buy it again forever); "no plane was running" is not, or a
     /// swap offered in the gap a promotion leaves between two planes would

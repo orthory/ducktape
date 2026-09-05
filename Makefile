@@ -270,8 +270,8 @@ test: wasm-modules-check wasm-embed-check
 # Every product/example module carries its own guest port (src/guest.rs behind
 # the `guest` feature); guest-builder synthesizes the packaging workspace and
 # writes the canonical component.wasm into the module directory itself. The
-# four kernel-fixture test guests (hello, hello-replacement, sibling, object) keep
-# their standalone crates/guests workspaces below.
+# five kernel-fixture test guests (hello, hello-replacement, sibling, object,
+# noop) keep their standalone crates/guests workspaces below.
 BUILDER_MODULES := \
   crates/examples/directory \
   crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
