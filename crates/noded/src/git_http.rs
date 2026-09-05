@@ -591,9 +591,24 @@ async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService
         .into_response()
 }
 
+/// the two ways [`decode_git_body`] can fail: a malformed gzip stream, or one
+/// that inflates past its cap — a would-be zip bomb.
+#[derive(Debug)]
+enum GitBodyError {
+    BadEncoding(String),
+    OverCap,
+}
+
 /// return the request body, gzip-inflated if `Content-Encoding: gzip`. git may
 /// compress a receive-pack request; any other encoding is passed through.
-fn decode_git_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> {
+///
+/// the inflate is read through `cap` — the SAME limit that bounds the
+/// compressed body (`GIT_PACK_BODY_LIMIT` at both call sites) — because gzip's
+/// max compression ratio is ~1030:1: an uncapped `read_to_end` on a body that
+/// already fits under the compressed-body limit could still allocate tens of
+/// gigabytes. a body that inflates to more than `cap` bytes is refused rather
+/// than fully materialized.
+fn decode_git_body(headers: &HeaderMap, body: &[u8], cap: usize) -> Result<Vec<u8>, GitBodyError> {
     let gzip = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -603,9 +618,15 @@ fn decode_git_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> 
     }
     use std::io::Read as _;
     let mut out = Vec::new();
+    // read one byte past `cap`: a body that inflates to EXACTLY `cap` bytes
+    // still decodes below, while anything larger trips the length check.
     flate2::read::GzDecoder::new(body)
+        .take(cap as u64 + 1)
         .read_to_end(&mut out)
-        .map_err(|e| format!("gzip inflate failed: {e}"))?;
+        .map_err(|e| GitBodyError::BadEncoding(format!("gzip inflate failed: {e}")))?;
+    if out.len() > cap {
+        return Err(GitBodyError::OverCap);
+    }
     Ok(out)
 }
 
@@ -670,9 +691,14 @@ pub(crate) async fn git_receive_pack(
             return error_response(rejection.status(), &rejection.body_text());
         }
     };
-    let body = match decode_git_body(&headers, &body) {
+    let body = match decode_git_body(&headers, &body, GIT_PACK_BODY_LIMIT) {
         Ok(bytes) => bytes,
-        Err(msg) => {
+        Err(GitBodyError::OverCap) => {
+            const REASON: &str = "gzip-inflated body exceeds the pack body limit";
+            push_refused(&repo, "gzip_bomb", REASON);
+            return error_response(StatusCode::BAD_REQUEST, REASON);
+        }
+        Err(GitBodyError::BadEncoding(msg)) => {
             push_refused(&repo, "bad_encoding", &msg);
             return error_response(StatusCode::BAD_REQUEST, &msg);
         }
@@ -899,9 +925,17 @@ pub(crate) async fn git_upload_pack(
         // the DefaultBodyLimit layer rejects an oversized request with 413.
         Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
     };
-    let body = match decode_git_body(&headers, &body) {
+    let body = match decode_git_body(&headers, &body, GIT_PACK_BODY_LIMIT) {
         Ok(bytes) => bytes,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(GitBodyError::OverCap) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "gzip-inflated body exceeds the pack body limit",
+            );
+        }
+        Err(GitBodyError::BadEncoding(msg)) => {
+            return error_response(StatusCode::BAD_REQUEST, &msg);
+        }
     };
 
     let request = match parse_upload_pack_request(&body) {
@@ -1033,6 +1067,39 @@ fn build_upload_pack(
     forge::pack_delta(&repo, &oids, &common)
         .map(|pack| (pack, Some(ack)))
         .map_err(|e| format!("build delta pack: {e}"))
+}
+
+#[cfg(test)]
+mod decode_git_body_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn gzip_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers
+    }
+
+    fn gzip_of_zeros(n: usize) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&vec![0u8; n]).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn a_gzip_body_that_inflates_past_the_cap_is_refused_one_under_it_decodes() {
+        let cap = 4096usize;
+        let headers = gzip_headers();
+
+        let at_cap = gzip_of_zeros(cap);
+        let decoded = decode_git_body(&headers, &at_cap, cap).expect("exactly at the cap decodes");
+        assert_eq!(decoded.len(), cap);
+
+        let over_cap = gzip_of_zeros(cap + 1);
+        let err = decode_git_body(&headers, &over_cap, cap)
+            .expect_err("past the cap must be refused, not fully inflated");
+        assert!(matches!(err, GitBodyError::OverCap));
+    }
 }
 
 #[cfg(test)]
