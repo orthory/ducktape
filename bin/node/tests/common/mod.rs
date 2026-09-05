@@ -2204,25 +2204,6 @@ fn extract_markers(text: &str, marker: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
-mod marker_tests {
-    use super::extract_markers;
-
-    #[test]
-    fn extract_markers_strips_ansi_before_slicing() {
-        // shaped like a real fmt-layer capture: coloured level/target ANSI
-        // ahead of the message, then a trailing coloured field the message
-        // itself does not carry (e.g. another field on the same event).
-        // The marker sits in the plain-text message, but a naive byte slice
-        // to end-of-line would still hand back the trailing escape codes —
-        // extract_markers must return the bare path only.
-        let line = "\x1b[2m2026-09-05\x1b[0m \x1b[34mDEBUG\x1b[0m run dir materialized \
-                     kind=rw path=/tmp/run-1\x1b[2m note\x1b[0m\x1b[2m=\x1b[0mok";
-        let got = extract_markers(line, "run dir materialized kind=rw path=");
-        assert_eq!(got, vec!["/tmp/run-1 note=ok".to_string()]);
-    }
-}
-
 fn log_tail(text: &str, lines: usize) -> String {
     let all: Vec<&str> = text.lines().collect();
     let from = all.len().saturating_sub(lines);
@@ -2396,4 +2377,23 @@ pub fn add_key(
         USER_LANE_FINALIZE,
         || account_of_key(cluster, idx, &joining),
     )
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::extract_markers;
+
+    #[test]
+    fn extract_markers_strips_ansi_before_slicing() {
+        // shaped like a real fmt-layer capture: coloured level/target ANSI
+        // ahead of the message, then a trailing coloured field the message
+        // itself does not carry (e.g. another field on the same event).
+        // The marker sits in the plain-text message, but a naive byte slice
+        // to end-of-line would still hand back the trailing escape codes —
+        // extract_markers must return the bare path only.
+        let line = "\x1b[2m2026-09-05\x1b[0m \x1b[34mDEBUG\x1b[0m run dir materialized \
+                     kind=rw path=/tmp/run-1\x1b[2m note\x1b[0m\x1b[2m=\x1b[0mok";
+        let got = extract_markers(line, "run dir materialized kind=rw path=");
+        assert_eq!(got, vec!["/tmp/run-1 note=ok".to_string()]);
+    }
 }
