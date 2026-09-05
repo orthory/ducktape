@@ -602,6 +602,13 @@ async fn pump_frames(
         // close is also the guest's signal that its exit frame landed.
         std::future::pending::<()>().await
     });
+    // From here every exit path ends that task, including the three that return
+    // early below. Dropping a bare `JoinHandle` does NOT abort a tokio task, so
+    // one unparseable guest frame used to leave the feed parked forever holding
+    // the vsock write half — one task and one fd per affected run, for the
+    // daemon's life, until the node's fd limit made every later run's listener
+    // bind fail.
+    let mut feed = AbortOnDrop(feed);
 
     // guest -> host
     let mut pending: Vec<u8> = Vec::new();
@@ -661,10 +668,32 @@ async fn pump_frames(
         }
     }
     // Awaited, not just aborted: the write half lives in that task, and the
-    // guest is blocked on this socket closing. Dropping the handle without
-    // awaiting leaves the close to whenever the runtime gets round to it.
-    feed.abort();
-    let _ = feed.await;
+    // guest is blocked on this socket closing. Letting the guard's `Drop` do it
+    // leaves the close to whenever the runtime gets round to it, and this is
+    // the one path where the guest is waiting on it.
+    feed.abort_and_join().await;
+}
+
+/// A spawned task this scope owns: aborted when the value drops.
+///
+/// The plain `JoinHandle` does not do this — dropping one DETACHES the task —
+/// so a scope with more than one exit path leaks every task it spawned on all
+/// but the path that remembered to abort.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    /// end the task and WAIT for it, on the path where something is waiting on
+    /// what its teardown does.
+    async fn abort_and_join(&mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]
@@ -707,6 +736,39 @@ mod tests {
             feed.contains("std::future::pending::<()>().await"),
             "the feed task owns the write half and must park, never return:\n{feed}"
         );
+    }
+
+    /// A guest frame this host cannot parse ends the feed task too.
+    ///
+    /// That arm is an early `return`, and dropping a `JoinHandle` DETACHES a
+    /// tokio task rather than aborting it — so the feed used to stay parked on
+    /// its `pending()` for the daemon's life, holding the run's vsock write
+    /// half. A compute daemon accumulated one task and one fd per affected run
+    /// until its fd limit made every later run's listener bind fail.
+    ///
+    /// The feed task owns the input receiver, so the sender closing IS that
+    /// task ending — no other observer of it exists.
+    #[tokio::test]
+    async fn a_decode_failure_ends_the_feed_task() {
+        let (host, guest) = UnixStream::pair().expect("socketpair");
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(INPUT_QUEUE);
+        let (out_task, _stdout) = tokio::io::duplex(1024);
+        let (err_task, _stderr) = tokio::io::duplex(1024);
+        let (exit_tx, _exit_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(pump_frames(host, input_rx, out_task, err_task, exit_tx));
+
+        // a header claiming more than MAX_FRAME_BYTES: refused by `decode`
+        // before a byte of payload is read.
+        let (_guest_read, mut guest_write) = guest.into_split();
+        guest_write
+            .write_all(&[0u8, 0xff, 0xff, 0xff, 0xff])
+            .await
+            .expect("write a frame the host cannot parse");
+
+        pump.await.expect("the pump returns on a decode failure");
+        tokio::time::timeout(std::time::Duration::from_secs(5), input_tx.closed())
+            .await
+            .expect("the feed task is still parked, holding the vsock write half");
     }
 
     /// The two halves of the ownership contract `boot` documents: a directory
