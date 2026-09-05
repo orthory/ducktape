@@ -68,10 +68,18 @@ mod bindings {
             "ducktape:module/host.query-module": trappable,
             // object reads pause on a memo miss exactly like the sibling reads:
             // the driver resolves them against the odb backing and replays.
-            // `object-put` is NOT trappable — the host computes the id purely
-            // and returns it, so it can never fail.
             "ducktape:module/host.object-stat": trappable,
             "ducktape:module/host.object-get": trappable,
+            // every WRITING import traps on one thing only: the bytes it would
+            // add push this dispatch past [`MAX_HOST_BYTES`]. the copy happens
+            // in host code, which fuel does not price, so this is the meter
+            // that bounds it. see `HostData::charge`.
+            "ducktape:module/host.state-set": trappable,
+            "ducktape:module/host.state-delete": trappable,
+            "ducktape:module/host.object-put": trappable,
+            "ducktape:module/host.emit-msg": trappable,
+            "ducktape:module/host.emit-event": trappable,
+            "ducktape:module/host.set-assigned": trappable,
         },
     });
 }
@@ -168,6 +176,29 @@ pub const MAX_STORE_READS: usize = 4096;
 /// identically on every validator. only tenants that call the object imports
 /// (the files guest) ever accrue against it; every other tenant leaves it at 0.
 pub const MAX_OBJECT_READS: usize = 4096;
+
+/// hard cap on the bytes a guest may hand the HOST: the running total across
+/// every guest-fed collection — staged state writes, staged object puts,
+/// emitted msgs and events, the assigned stamp. Fuel prices guest instructions;
+/// the canonical-ABI copy that materializes a `list<u8>` runs in host code and
+/// costs the guest ~10 fuel per call, so without this meter
+/// `loop { emit_msg("x", one_mib) }` allocates hundreds of GB inside one
+/// dispatch and OOM-kills the node before any fuel trap fires. The guest's own
+/// linear memory bounds ONE buffer, never the accumulation.
+///
+/// The counter is seeded with what the block already holds (the staged overlay
+/// and the block's staged objects both ride into every round), so this bounds
+/// the BLOCK's accumulation too — `staged_objects` grows across every dispatch
+/// until the boundary. 64 MiB is orders of magnitude above any real op (an op
+/// is a few hundred bytes and its writes a few KB) and far below what a
+/// validator can lose in a block.
+pub const MAX_HOST_BYTES: usize = 64 * 1024 * 1024;
+
+/// what one guest-fed ENTRY costs against [`MAX_HOST_BYTES`] beside its own
+/// bytes — the map node / vec slot the host allocates for it. Without it a
+/// `loop { emit_msg("", &[]) }` would be free of the meter and unbounded in
+/// count.
+const HOST_ENTRY_BYTES: usize = 64;
 
 /// hard ceiling on a guest's LINEAR MEMORY, in bytes. Without it a `memory.grow`
 /// succeeds or fails according to how much RAM the validator's process happens
@@ -487,6 +518,43 @@ struct HostData {
     /// of `T` — every `Store::new` in this crate pairs with a `.limiter()` that
     /// hands wasmtime this field.
     limits: GuestLimits,
+    /// bytes this run has fed the host across `staged`, `object_puts`,
+    /// `out_msgs`, `out_events` and `out_assigned` — seeded with what it
+    /// STARTED holding (the block's stage rides into every round) and charged
+    /// by every writing import. See [`MAX_HOST_BYTES`].
+    host_bytes: usize,
+}
+
+/// what the block's staged writes already cost against [`MAX_HOST_BYTES`] — a
+/// round starts on them, so it starts charged for them.
+fn staged_bytes(staged: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> usize {
+    staged
+        .iter()
+        .map(|(key, value)| HOST_ENTRY_BYTES + key.len() + value.as_ref().map_or(0, Vec::len))
+        .sum()
+}
+
+/// the same seed for the block's staged object puts.
+fn object_bytes(puts: &BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
+    puts.iter()
+        .map(|(id, tagged)| HOST_ENTRY_BYTES + id.len() + tagged.len())
+        .sum()
+}
+
+impl HostData {
+    /// charge `bytes` of guest-fed host allocation, or refuse the import. The
+    /// refusal is a trap, so it rejects the whole op — deterministically, at the
+    /// same call on every validator, because the counter is a pure function of
+    /// consensus state and the guest's own calls.
+    fn charge(&mut self, bytes: usize) -> wasmtime::Result<()> {
+        self.host_bytes = self.host_bytes.saturating_add(HOST_ENTRY_BYTES + bytes);
+        if self.host_bytes > MAX_HOST_BYTES {
+            return Err(wasmtime::Error::msg(format!(
+                "host-output budget exceeded ({MAX_HOST_BYTES} bytes)"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl host::Host for HostData {
@@ -509,11 +577,18 @@ impl host::Host for HostData {
         self.pending = Some(PendingRead::State(key));
         Err(wasmtime::Error::msg(PENDING_READ_TRAP))
     }
-    fn state_set(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    /// the meter charges every call, not the map's net growth: re-setting one
+    /// key in a loop still copies a fresh value per call, and that copy is the
+    /// cost being bounded.
+    fn state_set(&mut self, key: Vec<u8>, value: Vec<u8>) -> wasmtime::Result<()> {
+        self.charge(key.len() + value.len())?;
         self.staged.insert(key, Some(value));
+        Ok(())
     }
-    fn state_delete(&mut self, key: Vec<u8>) {
+    fn state_delete(&mut self, key: Vec<u8>) -> wasmtime::Result<()> {
+        self.charge(key.len())?;
         self.staged.insert(key, None);
+        Ok(())
     }
     fn module_root(&mut self, target: String) -> wasmtime::Result<Option<Vec<u8>>> {
         if let Some(answer) = self.memo.roots.get(&target) {
@@ -568,25 +643,45 @@ impl host::Host for HostData {
         Err(wasmtime::Error::msg(PENDING_READ_TRAP))
     }
     /// stage a put: the host computes `id = sha256(kind ‖ body)` and returns it
-    /// ALONE (a hash mismatch is impossible here — the fail-closed publish check
+    /// (a hash mismatch is impossible here — the fail-closed publish check
     /// rides the disk backing's staged→published seam). the tagged body lands
     /// in this round's overlay so a later stat/get of `id` answers immediately.
-    fn object_put(&mut self, kind: u8, body: Vec<u8>) -> Vec<u8> {
+    /// the ONE way it fails is the host-byte meter: staged objects accumulate
+    /// across the whole block, so they are the hungriest guest-fed collection.
+    fn object_put(&mut self, kind: u8, body: Vec<u8>) -> wasmtime::Result<Vec<u8>> {
+        self.charge(ROOT_LEN + 1 + body.len())?;
         let mut tagged = Vec::with_capacity(1 + body.len());
         tagged.push(kind);
         tagged.extend_from_slice(&body);
         let id = sha256(&tagged);
         self.object_puts.insert(id.clone(), tagged);
-        id
+        Ok(id)
     }
-    fn emit_msg(&mut self, target: String, payload: Vec<u8>) {
+    fn emit_msg(&mut self, target: String, payload: Vec<u8>) -> wasmtime::Result<()> {
+        self.charge(target.len() + payload.len())?;
         self.out_msgs.push((target, payload));
+        Ok(())
     }
-    fn emit_event(&mut self, source: String, payload: Vec<u8>) {
+    fn emit_event(&mut self, source: String, payload: Vec<u8>) -> wasmtime::Result<()> {
+        self.charge(source.len() + payload.len())?;
         self.out_events.push((source, payload));
+        Ok(())
     }
-    fn set_assigned(&mut self, stamp: Vec<u8>) {
+    /// the stamp carries the module-assigned scalars of one applied op, so it
+    /// is capped at [`sdk::MAX_ASSIGNED_BYTES`] — the SAME cap the host applies
+    /// after `execute` returns, moved to the call that allocates. a stamp
+    /// REPLACES the previous one, so only the meter charge accumulates.
+    fn set_assigned(&mut self, stamp: Vec<u8>) -> wasmtime::Result<()> {
+        if stamp.len() > sdk::MAX_ASSIGNED_BYTES {
+            return Err(wasmtime::Error::msg(format!(
+                "assigned stamp exceeds cap ({} > {})",
+                stamp.len(),
+                sdk::MAX_ASSIGNED_BYTES
+            )));
+        }
+        self.charge(stamp.len())?;
         self.out_assigned = stamp;
+        Ok(())
     }
 }
 
@@ -1045,6 +1140,10 @@ impl WasmModule {
         } else {
             self.staged.clone()
         };
+        // a round starts charged for what it already holds: the block's staged
+        // writes ride into every round, so the meter bounds the BLOCK, not just
+        // this call.
+        let host_bytes = staged_bytes(&staged);
         let data = HostData {
             env: Some(env),
             committed: self.committed_for_round(),
@@ -1061,6 +1160,7 @@ impl WasmModule {
             out_events: Vec::new(),
             out_assigned: Vec::new(),
             limits: GuestLimits::default(),
+            host_bytes,
         };
         let mut store = Store::new(&self.engine, data);
         store.limiter(|d| &mut d.limits.0);
@@ -1419,19 +1519,25 @@ impl Module for WasmModule {
                     BTreeMap::from([(REFS_KEY.to_vec(), backing.refs_bytes())])
                 }
             };
+            let round_staged = staged0.clone();
+            let round_objects = staged_objects0.clone();
+            // charged for the block's stage + staged objects before the guest
+            // adds a byte (see `MAX_HOST_BYTES`).
+            let host_bytes = staged_bytes(&round_staged) + object_bytes(&round_objects);
             let data = HostData {
                 env: Some(env.clone()),
                 committed: round_committed,
-                staged: staged0.clone(),
+                staged: round_staged,
                 memo: std::mem::take(&mut memo),
                 pending: None,
                 sealed: false,
                 store_backed: self.is_store_backed(),
-                object_puts: staged_objects0.clone(),
+                object_puts: round_objects,
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
                 out_assigned: Vec::new(),
                 limits: GuestLimits::default(),
+                host_bytes,
             };
             let mut store = Store::new(&self.engine, data);
             store.limiter(|d| &mut d.limits.0);
@@ -1817,6 +1923,67 @@ mod bounds {
         assert_eq!(
             stores, limiters,
             "{stores} Store::new sites against {limiters} store.limiter calls"
+        );
+    }
+
+    /// the unbounded-accumulation op from the report: the same 1 MiB buffer
+    /// handed to `emit_msg` in a tight loop. Fuel prices the loop, not the host
+    /// copy, so the meter is the only thing between this and the node's RSS.
+    #[test]
+    fn a_tight_emit_loop_hits_the_host_byte_meter() {
+        let one_mib = vec![0u8; 1 << 20];
+        let mut data = HostData::default();
+        let mut accepted = 0usize;
+        while host::Host::emit_msg(&mut data, "x".into(), one_mib.clone()).is_ok() {
+            accepted += 1;
+            assert!(
+                accepted <= MAX_HOST_BYTES / one_mib.len(),
+                "the meter never refused: {accepted} MiB accepted"
+            );
+        }
+        assert!(data.host_bytes > MAX_HOST_BYTES, "refused on the cap");
+    }
+
+    /// bytes are not the only cost: an empty-payload loop allocates a vec slot
+    /// per call, so entries are charged too ([`HOST_ENTRY_BYTES`]).
+    #[test]
+    fn empty_entries_are_charged_too() {
+        let mut data = HostData::default();
+        let mut accepted = 0usize;
+        while host::Host::emit_event(&mut data, String::new(), Vec::new()).is_ok() {
+            accepted += 1;
+            assert!(
+                accepted <= MAX_HOST_BYTES / HOST_ENTRY_BYTES,
+                "zero-byte entries were free: {accepted} accepted"
+            );
+        }
+        assert_eq!(data.out_events.len(), accepted);
+    }
+
+    /// staged objects live across the whole block, so a round starts charged
+    /// for what the block already staged — the meter bounds the block, not just
+    /// one dispatch.
+    #[test]
+    fn a_round_starts_charged_for_the_block_stage() {
+        let staged = BTreeMap::from([(b"k".to_vec(), Some(vec![0u8; 4096]))]);
+        let puts = BTreeMap::from([(vec![7u8; ROOT_LEN], vec![0u8; 4096])]);
+        assert_eq!(staged_bytes(&staged), HOST_ENTRY_BYTES + 1 + 4096);
+        assert_eq!(object_bytes(&puts), HOST_ENTRY_BYTES + ROOT_LEN + 4096);
+    }
+
+    /// the assigned stamp keeps its own, smaller cap — the one the host applied
+    /// after `execute` returned, now applied at the call that allocates, so the
+    /// two can never carry different numbers.
+    #[test]
+    fn the_assigned_stamp_keeps_its_own_cap() {
+        let mut data = HostData::default();
+        assert!(
+            host::Host::set_assigned(&mut data, vec![0u8; sdk::MAX_ASSIGNED_BYTES]).is_ok(),
+            "at the cap"
+        );
+        assert!(
+            host::Host::set_assigned(&mut data, vec![0u8; sdk::MAX_ASSIGNED_BYTES + 1]).is_err(),
+            "over the cap"
         );
     }
 }
