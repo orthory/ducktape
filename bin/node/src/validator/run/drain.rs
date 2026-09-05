@@ -1255,10 +1255,34 @@ impl ValidatorRuntime<'_> {
             fetch_done_rx,
             ..
         } = self;
-        // reap finished fetch tasks first, so a failed fetch retries.
-        while let Ok(digest) = fetch_done_rx.try_recv() {
-            code_signaller.fetching.remove(&digest);
+        // reap finished fetch tasks first, so a failed fetch retries — on a
+        // BACKOFF, and speaking only on the first failure and every Nth after
+        // it. Nobody serving these bytes is the steady state, not a blip: the
+        // peer book may be empty (refused synchronously) and the module never
+        // clears a pending swap, so an unpaced retry+warn here is a permanent
+        // ~10/s log bomb that evicts the ring an operator restarted to read.
+        // The warn lives HERE rather than in the task because this is where
+        // the attempt counter — the actual diagnosis — is.
+        while let Ok((digest, failure)) = fetch_done_rx.try_recv() {
+            let Some(error) = failure else {
+                code_signaller.fetch_succeeded(&digest);
+                continue;
+            };
+            let attempt = code_signaller.fetch_failed(&digest);
+            if !attempt.speak {
+                continue;
+            }
+            tracing::warn!(
+                target: "ducktape::modules",
+                node = %label,
+                reason = "code_fetch_unserved",
+                digest = %crate::config::hex_bytes(&digest),
+                attempts = attempt.attempts,
+                error = %error,
+                "pending-swap code fetch failed"
+            );
         }
+        code_signaller.tick_fetch_backoff();
         if !orchestrator
             .current_members()
             .contains(&signer.public_key())
@@ -1323,9 +1347,10 @@ impl ValidatorRuntime<'_> {
             let client = blob_client.clone();
             let blobs = blobs.clone();
             let done = fetch_done_tx.clone();
-            let label = label.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::blob_fetch::fetch_blob(
+                // the OUTCOME goes back to the pump, which owns the attempt
+                // counter, the backoff and the (latched) warning.
+                let failure = crate::blob_fetch::fetch_blob(
                     &client,
                     &blobs,
                     &digest,
@@ -1333,16 +1358,8 @@ impl ValidatorRuntime<'_> {
                     crate::constants::BLOB_FETCH_ATTEMPTS,
                 )
                 .await
-                {
-                    tracing::warn!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        digest = %crate::config::hex_bytes(&digest),
-                        error = %e,
-                        "pending-swap code fetch failed"
-                    );
-                }
-                let _ = done.send(digest);
+                .err();
+                let _ = done.send((digest, failure));
             });
         }
         for (key, msg) in actions.signals {
