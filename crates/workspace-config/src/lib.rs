@@ -983,7 +983,29 @@ pub fn workspaces_root() -> Result<PathBuf, String> {
 /// arbitrary text) are made inert — the registry resolves by descriptor
 /// content, so the directory name is display-only.
 pub fn default_workspace_dir(chain_id: &str) -> Result<PathBuf, String> {
-    Ok(workspaces_root()?.join(chain_id.replace(std::path::MAIN_SEPARATOR, "-")))
+    let name = chain_id.replace(std::path::MAIN_SEPARATOR, "-");
+    if !is_workspace_dir_name(&name) {
+        return Err(format!(
+            "chain id {chain_id:?} is not a workspace directory name — the registry holds one \
+             directory per network, so an id that resolves to the registry root or its parent \
+             would scatter identity.key and network.toml over the ducktape home instead; pass \
+             --dir to choose a destination"
+        ));
+    }
+    Ok(workspaces_root()?.join(name))
+}
+
+/// does this name address a directory INSIDE the registry, and only that one?
+/// a chain-id reaches here straight out of an untrusted invite (`unpack_invite`
+/// asks only for UTF-8 under 255 bytes), and `""`, `"."` and `".."` all join
+/// to the registry root or its parent — a workspace written there is invisible
+/// to `list_workspaces`/`find_workspace_config`, which scan subdirectories, so
+/// `-n <chain-id>` could never address it again. one real path component, and
+/// nothing else.
+fn is_workspace_dir_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    let single = matches!(components.next(), Some(std::path::Component::Normal(_)));
+    single && components.next().is_none()
 }
 
 /// resolve `--network <chain id>` to a workspace's node.toml: scan the
@@ -1363,6 +1385,29 @@ mod tests {
         assert!(find_workspace_config_in(&root, "nope").is_err());
         let err = find_workspace_config_in(&root, "").expect_err("ambiguous");
         assert!(err.contains("ambiguous"), "{err}");
+    }
+
+    #[test]
+    fn a_traversal_chain_id_never_becomes_a_workspace_directory() {
+        // straight out of an untrusted invite: each of these joins to the
+        // registry root or its parent instead of a per-network directory.
+        for hostile in ["", ".", ".."] {
+            let err = default_workspace_dir(hostile)
+                .expect_err("a traversal chain id has no default workspace");
+            assert!(
+                err.contains("not a workspace directory name"),
+                "{hostile:?}: {err}"
+            );
+        }
+        // separators stay display-only: they collapse into one component
+        // rather than descending, and a minted chain-id is untouched.
+        assert!(is_workspace_dir_name(
+            &"a/b".replace(std::path::MAIN_SEPARATOR, "-")
+        ));
+        assert!(is_workspace_dir_name(
+            &"../..".replace(std::path::MAIN_SEPARATOR, "-")
+        ));
+        assert!(is_workspace_dir_name("ducktape#a1b2c3d4"));
     }
 
     fn write_workspace(root: &Path, ws: &str, chain: &str, listen: &str, http: &str) -> PathBuf {
