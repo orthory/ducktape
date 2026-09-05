@@ -76,6 +76,16 @@ const GIT_ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const GIT_OID_RAW_LEN: usize = 20;
 /// the flush-pkt: a zero-length pkt that ends a pkt-line stream or section.
 const GIT_FLUSH_PKT: &[u8] = b"0000";
+/// max pkt-lines parsed out of one request — the command/want section
+/// ([`parse_pkt_lines`]) and the upload-pack negotiation tail
+/// ([`parse_upload_pack_request`]'s haves loop) each stop here. a real push
+/// updates at most a few thousand refs (a monorepo touching every branch);
+/// a real fetch negotiation trades at most a few thousand haves before a
+/// client gives up and sends the full closure instead. 65536 gives generous
+/// headroom over that while still bounding what a body of minimal pkt-lines
+/// can force: at the cap, the line list costs on the order of 1.5 MB of `Vec`
+/// headers, not the ~1 GB an unbounded 95 MiB body of 5-byte lines allocates.
+const MAX_GIT_PKT_LINES: usize = 65_536;
 
 /// encode one git pkt-line: a 4-hex length (INCLUDING the 4 length bytes)
 /// followed by the payload. every line this bridge emits is tiny, well under
@@ -109,6 +119,9 @@ fn parse_pkt_lines(buf: &[u8]) -> Result<(Vec<Vec<u8>>, &[u8]), String> {
         }
         if len < 4 || len > rest.len() {
             return Err("pkt-line length out of range".into());
+        }
+        if lines.len() >= MAX_GIT_PKT_LINES {
+            return Err("too many pkt-lines in request".into());
         }
         lines.push(rest[4..len].to_vec());
         rest = &rest[len..];
@@ -162,6 +175,7 @@ fn parse_upload_pack_request(body: &[u8]) -> Result<UploadPackRequest, String> {
 
     let mut haves = Vec::new();
     let mut done = false;
+    let mut negotiation_lines = 0usize;
     while !rest.is_empty() {
         if done {
             return Err("upload-pack negotiation continued after done".into());
@@ -169,6 +183,10 @@ fn parse_upload_pack_request(body: &[u8]) -> Result<UploadPackRequest, String> {
         if rest.len() < 4 {
             return Err("truncated negotiation pkt-line length header".into());
         }
+        if negotiation_lines >= MAX_GIT_PKT_LINES {
+            return Err("too many negotiation pkt-lines in request".into());
+        }
+        negotiation_lines += 1;
         let hdr = std::str::from_utf8(&rest[..4])
             .map_err(|_| "non-ascii negotiation pkt-line length".to_string())?;
         let len = usize::from_str_radix(hdr, 16)
@@ -309,6 +327,19 @@ struct PushCommands {
 const PUSH_CERT_LINE: &str = "push-cert";
 const PUSH_CERT_END: &str = "push-cert-end";
 const SSHSIG_ARMOR_BEGIN: &str = "-----BEGIN SSH SIGNATURE-----";
+
+/// cheap pre-check for whether a receive-pack request is even worth the
+/// certificate parse (base64 dearmor + certificate text parse in
+/// [`parse_push_commands`]): an operator credential header needs no body
+/// content at all, and a signed push is identifiable by its first command
+/// line alone, without decoding the certificate it introduces. a request
+/// with neither signal carries no possible proof and is refused here.
+fn push_may_carry_proof(commands: &[Vec<u8>], has_operator: bool) -> bool {
+    has_operator
+        || commands
+            .first()
+            .is_some_and(|first| command_text(first) == PUSH_CERT_LINE)
+}
 
 /// decode the command list. a stock push sends `<old> <new> <refname>` lines
 /// (capabilities after a NUL on the first). a signed push (send-pack.c
@@ -591,9 +622,24 @@ async fn git_advertise_refs(handle: &NodeHandle, repo: &str, service: GitService
         .into_response()
 }
 
+/// the two ways [`decode_git_body`] can fail: a malformed gzip stream, or one
+/// that inflates past its cap — a would-be zip bomb.
+#[derive(Debug)]
+enum GitBodyError {
+    BadEncoding(String),
+    OverCap,
+}
+
 /// return the request body, gzip-inflated if `Content-Encoding: gzip`. git may
 /// compress a receive-pack request; any other encoding is passed through.
-fn decode_git_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> {
+///
+/// the inflate is read through `cap` — the SAME limit that bounds the
+/// compressed body (`GIT_PACK_BODY_LIMIT` at both call sites) — because gzip's
+/// max compression ratio is ~1030:1: an uncapped `read_to_end` on a body that
+/// already fits under the compressed-body limit could still allocate tens of
+/// gigabytes. a body that inflates to more than `cap` bytes is refused rather
+/// than fully materialized.
+fn decode_git_body(headers: &HeaderMap, body: &[u8], cap: usize) -> Result<Vec<u8>, GitBodyError> {
     let gzip = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -603,9 +649,15 @@ fn decode_git_body(headers: &HeaderMap, body: &[u8]) -> Result<Vec<u8>, String> 
     }
     use std::io::Read as _;
     let mut out = Vec::new();
+    // read one byte past `cap`: a body that inflates to EXACTLY `cap` bytes
+    // still decodes below, while anything larger trips the length check.
     flate2::read::GzDecoder::new(body)
+        .take(cap as u64 + 1)
         .read_to_end(&mut out)
-        .map_err(|e| format!("gzip inflate failed: {e}"))?;
+        .map_err(|e| GitBodyError::BadEncoding(format!("gzip inflate failed: {e}")))?;
+    if out.len() > cap {
+        return Err(GitBodyError::OverCap);
+    }
     Ok(out)
 }
 
@@ -670,9 +722,14 @@ pub(crate) async fn git_receive_pack(
             return error_response(rejection.status(), &rejection.body_text());
         }
     };
-    let body = match decode_git_body(&headers, &body) {
+    let body = match decode_git_body(&headers, &body, GIT_PACK_BODY_LIMIT) {
         Ok(bytes) => bytes,
-        Err(msg) => {
+        Err(GitBodyError::OverCap) => {
+            const REASON: &str = "gzip-inflated body exceeds the pack body limit";
+            push_refused(&repo, "gzip_bomb", REASON);
+            return error_response(StatusCode::BAD_REQUEST, REASON);
+        }
+        Err(GitBodyError::BadEncoding(msg)) => {
             push_refused(&repo, "bad_encoding", &msg);
             return error_response(StatusCode::BAD_REQUEST, &msg);
         }
@@ -710,18 +767,6 @@ pub(crate) async fn git_receive_pack(
             .into_response();
     }
 
-    // the command list: plain `<old> <new> <refname>` lines, or — a signed
-    // push — the certificate they live in. one push may update several
-    // branches, and forge applies them ATOMICALLY.
-    let nonce = push_cert_nonce(&handle, &repo);
-    let PushCommands { cmds, cert } = match parse_push_commands(&commands, nonce.as_deref()) {
-        Ok(parsed) => parsed,
-        Err(msg) => {
-            push_refused(&repo, push_refusal_reason(&msg), &msg);
-            return error_response(StatusCode::BAD_REQUEST, &msg);
-        }
-    };
-
     // A PUSH MUST PROVE ITSELF, exactly like every other mutating route — and
     // it proves itself one of the two ways git can carry:
     //
@@ -737,12 +782,30 @@ pub(crate) async fn git_receive_pack(
     // pubkey the permanent owner and every later signed push was refused as
     // "only the owner" (#1292). The data-plane signature is NOT a third way:
     // it covers a body digest, and `git push` computes the packfile itself.
-    if cert.is_none() && operator.is_none() {
+    //
+    // checked here, BEFORE `parse_push_commands` (a signed push's certificate
+    // parse: base64 dearmor + certificate text parse), rather than after: a
+    // request with neither an operator header nor anything claiming to be a
+    // certificate is refused at the cost of a cheap peek at the first command
+    // line, not a full certificate parse.
+    if !push_may_carry_proof(&commands, operator.is_some()) {
         const REFUSAL: &str = "this push carries no proof: sign it (`git push --signed`) \
                                or present this node's operator credential";
         push_refused(&repo, "push_unauthenticated", REFUSAL);
         return error_response(StatusCode::UNAUTHORIZED, REFUSAL);
     }
+
+    // the command list: plain `<old> <new> <refname>` lines, or — a signed
+    // push — the certificate they live in. one push may update several
+    // branches, and forge applies them ATOMICALLY.
+    let nonce = push_cert_nonce(&handle, &repo);
+    let PushCommands { cmds, cert } = match parse_push_commands(&commands, nonce.as_deref()) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            push_refused(&repo, push_refusal_reason(&msg), &msg);
+            return error_response(StatusCode::BAD_REQUEST, &msg);
+        }
+    };
 
     // only branches are pushable (no tags/notes). consume-and-refuse: the pack
     // was fully received; reporting `ng` (not an http error) lets git print a
@@ -899,9 +962,17 @@ pub(crate) async fn git_upload_pack(
         // the DefaultBodyLimit layer rejects an oversized request with 413.
         Err(rejection) => return error_response(rejection.status(), &rejection.body_text()),
     };
-    let body = match decode_git_body(&headers, &body) {
+    let body = match decode_git_body(&headers, &body, GIT_PACK_BODY_LIMIT) {
         Ok(bytes) => bytes,
-        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(GitBodyError::OverCap) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "gzip-inflated body exceeds the pack body limit",
+            );
+        }
+        Err(GitBodyError::BadEncoding(msg)) => {
+            return error_response(StatusCode::BAD_REQUEST, &msg);
+        }
     };
 
     let request = match parse_upload_pack_request(&body) {
@@ -942,7 +1013,21 @@ pub(crate) async fn git_upload_pack(
             .await
         {
             Ok(Ok(built)) => built,
-            Ok(Err(msg)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+            Ok(Err(UploadPackError::RepoUnavailable(e))) => {
+                // the git2 detail (which carries the node's absolute forge
+                // path) never reaches the client or the warn-level ring; an
+                // absent/unopenable repo dir is just a 404 to the outside.
+                tracing::debug!(
+                    target: "ducktape::forge",
+                    repo = %repo,
+                    error = %e,
+                    "forge repo unavailable for upload-pack"
+                );
+                return error_response(StatusCode::NOT_FOUND, "no such repo");
+            }
+            Ok(Err(UploadPackError::Other(msg))) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg);
+            }
             Err(_) => {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -994,24 +1079,38 @@ pub(crate) async fn git_upload_pack(
         .into_response()
 }
 
+/// [`build_upload_pack`]'s failure modes. `RepoUnavailable` carries the raw
+/// git2 error — libgit2 puts the repo's absolute path verbatim in that
+/// message (`repository.c`'s "could not find repository at '%s'"), so it is
+/// NEVER surfaced to the client or put in the log ring's warn line; the
+/// handler answers a fixed 404 and logs this variant's detail at `debug`
+/// only. `Other` covers everything past a successfully opened repo (a bad
+/// want oid, a pack-write failure) and is not path-bearing.
+#[derive(Debug)]
+enum UploadPackError {
+    RepoUnavailable(git2::Error),
+    Other(String),
+}
+
 /// build the packfile answering `want_hexes`, bounded by the client's haves:
 /// every have this repo knows as a commit hides its closure from the walk
 /// (forge's `pack_delta`), so a mirror refresh downloads only what moved. a
 /// client with NO usable common base still gets the FULL self-contained
 /// closure (forge's `pack_closure_many` — ONE packing implementation for the
 /// module's snapshot pack and this fetch lane). returns the pack plus the
-/// first usable common base, which the handler ACKs. any git2 failure — a
-/// missing repo dir, an oid absent from the odb, a pack-write error — is
-/// returned as a message the handler surfaces.
+/// first usable common base, which the handler ACKs.
 fn build_upload_pack(
     repo_dir: &std::path::Path,
     want_hexes: &[String],
     have_hexes: &[String],
-) -> Result<(Vec<u8>, Option<String>), String> {
-    let repo = git2::Repository::open(repo_dir).map_err(|e| format!("open forge repo: {e}"))?;
+) -> Result<(Vec<u8>, Option<String>), UploadPackError> {
+    let repo = git2::Repository::open(repo_dir).map_err(UploadPackError::RepoUnavailable)?;
     let mut oids = Vec::with_capacity(want_hexes.len());
     for hex in want_hexes {
-        oids.push(git2::Oid::from_str(hex).map_err(|e| format!("bad want oid {hex}: {e}"))?);
+        oids.push(
+            git2::Oid::from_str(hex)
+                .map_err(|e| UploadPackError::Other(format!("bad want oid {hex}: {e}")))?,
+        );
     }
     // only haves this repo KNOWS as commits can bound the walk — a have from
     // history this node never saw simply doesn't help (and never errors).
@@ -1027,12 +1126,45 @@ fn build_upload_pack(
     if common.is_empty() {
         return forge::pack_closure_many(&repo, &oids)
             .map(|pack| (pack, None))
-            .map_err(|e| format!("build pack: {e}"));
+            .map_err(|e| UploadPackError::Other(format!("build pack: {e}")));
     }
     let ack = common[0].to_string();
     forge::pack_delta(&repo, &oids, &common)
         .map(|pack| (pack, Some(ack)))
-        .map_err(|e| format!("build delta pack: {e}"))
+        .map_err(|e| UploadPackError::Other(format!("build delta pack: {e}")))
+}
+
+#[cfg(test)]
+mod decode_git_body_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn gzip_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers
+    }
+
+    fn gzip_of_zeros(n: usize) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&vec![0u8; n]).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn a_gzip_body_that_inflates_past_the_cap_is_refused_one_under_it_decodes() {
+        let cap = 4096usize;
+        let headers = gzip_headers();
+
+        let at_cap = gzip_of_zeros(cap);
+        let decoded = decode_git_body(&headers, &at_cap, cap).expect("exactly at the cap decodes");
+        assert_eq!(decoded.len(), cap);
+
+        let over_cap = gzip_of_zeros(cap + 1);
+        let err = decode_git_body(&headers, &over_cap, cap)
+            .expect_err("past the cap must be refused, not fully inflated");
+        assert!(matches!(err, GitBodyError::OverCap));
+    }
 }
 
 #[cfg(test)]
@@ -1107,6 +1239,33 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
         assert_eq!(parsed.cmds.len(), 2);
         assert_eq!(parsed.cmds[1].2, "refs/heads/old");
         assert!(parse_push_commands(&[b"junk\n".to_vec()], None).is_err());
+    }
+
+    /// receive-pack refuses a credential-less push BEFORE it ever attempts
+    /// the certificate parse — checked on a command list that would fail
+    /// `parse_push_commands` outright (neither valid triples nor a
+    /// certificate), so a wrongly-late gate would surface as a parse error
+    /// (400) rather than the auth refusal (401) this checks for.
+    #[test]
+    fn a_credential_less_push_is_refused_before_the_certificate_parse() {
+        let unparseable_junk = vec![b"junk\n".to_vec()];
+        assert!(
+            !push_may_carry_proof(&unparseable_junk, false),
+            "no operator header and no push-cert claim: refused pre-parse"
+        );
+        assert!(
+            parse_push_commands(&unparseable_junk, None).is_err(),
+            "would ALSO fail to parse"
+        );
+
+        assert!(
+            push_may_carry_proof(&unparseable_junk, true),
+            "an operator credential is proof enough regardless of body content"
+        );
+        assert!(
+            push_may_carry_proof(&signed_commands(), false),
+            "a body claiming push-cert earns the (cheap) certificate parse"
+        );
     }
 }
 
@@ -1258,5 +1417,37 @@ mod upload_pack_tests {
             .expect("unknown negotiation line must fail");
 
         assert!(err.contains("unexpected upload-pack negotiation line"));
+    }
+
+    /// a body entirely of minimal 5-byte pkt-lines (`0005A`, one byte of
+    /// payload) is refused once it passes `MAX_GIT_PKT_LINES`, before it can
+    /// force the ~1 GB of small allocations an unbounded parse would make.
+    #[test]
+    fn a_body_of_minimal_pkt_lines_past_the_cap_is_refused() {
+        let one_line = b"0005A".to_vec();
+        let under_cap: Vec<u8> = one_line.repeat(MAX_GIT_PKT_LINES);
+        let over_cap: Vec<u8> = one_line.repeat(MAX_GIT_PKT_LINES + 1);
+
+        // exactly at the cap: parse_pkt_lines runs out of buffer looking for
+        // the terminating flush, which is its own (unrelated) truncation
+        // error — the point here is it is NOT the "too many" error.
+        let under = parse_pkt_lines(&under_cap).unwrap_err();
+        assert!(!under.contains("too many"), "{under}");
+
+        let over = parse_pkt_lines(&over_cap).unwrap_err();
+        assert!(over.contains("too many pkt-lines in request"), "{over}");
+    }
+
+    /// an absent repo dir maps to the path-bearing git2 error variant, not
+    /// the generic one — the handler turns this into a fixed 404 and never
+    /// surfaces the git2 message (which names the node's absolute path).
+    #[test]
+    fn an_absent_repo_dir_maps_to_the_path_bearing_error_variant() {
+        let base = tempfile::tempdir().unwrap();
+        let missing = base.path().join("no-such-repo");
+
+        let err = build_upload_pack(&missing, &[WANT.to_string()], &[]).unwrap_err();
+
+        assert!(matches!(err, UploadPackError::RepoUnavailable(_)));
     }
 }
