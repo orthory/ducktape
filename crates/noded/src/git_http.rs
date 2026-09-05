@@ -1013,7 +1013,21 @@ pub(crate) async fn git_upload_pack(
             .await
         {
             Ok(Ok(built)) => built,
-            Ok(Err(msg)) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+            Ok(Err(UploadPackError::RepoUnavailable(e))) => {
+                // the git2 detail (which carries the node's absolute forge
+                // path) never reaches the client or the warn-level ring; an
+                // absent/unopenable repo dir is just a 404 to the outside.
+                tracing::debug!(
+                    target: "ducktape::forge",
+                    repo = %repo,
+                    error = %e,
+                    "forge repo unavailable for upload-pack"
+                );
+                return error_response(StatusCode::NOT_FOUND, "no such repo");
+            }
+            Ok(Err(UploadPackError::Other(msg))) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg);
+            }
             Err(_) => {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1065,24 +1079,38 @@ pub(crate) async fn git_upload_pack(
         .into_response()
 }
 
+/// [`build_upload_pack`]'s failure modes. `RepoUnavailable` carries the raw
+/// git2 error — libgit2 puts the repo's absolute path verbatim in that
+/// message (`repository.c`'s "could not find repository at '%s'"), so it is
+/// NEVER surfaced to the client or put in the log ring's warn line; the
+/// handler answers a fixed 404 and logs this variant's detail at `debug`
+/// only. `Other` covers everything past a successfully opened repo (a bad
+/// want oid, a pack-write failure) and is not path-bearing.
+#[derive(Debug)]
+enum UploadPackError {
+    RepoUnavailable(git2::Error),
+    Other(String),
+}
+
 /// build the packfile answering `want_hexes`, bounded by the client's haves:
 /// every have this repo knows as a commit hides its closure from the walk
 /// (forge's `pack_delta`), so a mirror refresh downloads only what moved. a
 /// client with NO usable common base still gets the FULL self-contained
 /// closure (forge's `pack_closure_many` — ONE packing implementation for the
 /// module's snapshot pack and this fetch lane). returns the pack plus the
-/// first usable common base, which the handler ACKs. any git2 failure — a
-/// missing repo dir, an oid absent from the odb, a pack-write error — is
-/// returned as a message the handler surfaces.
+/// first usable common base, which the handler ACKs.
 fn build_upload_pack(
     repo_dir: &std::path::Path,
     want_hexes: &[String],
     have_hexes: &[String],
-) -> Result<(Vec<u8>, Option<String>), String> {
-    let repo = git2::Repository::open(repo_dir).map_err(|e| format!("open forge repo: {e}"))?;
+) -> Result<(Vec<u8>, Option<String>), UploadPackError> {
+    let repo = git2::Repository::open(repo_dir).map_err(UploadPackError::RepoUnavailable)?;
     let mut oids = Vec::with_capacity(want_hexes.len());
     for hex in want_hexes {
-        oids.push(git2::Oid::from_str(hex).map_err(|e| format!("bad want oid {hex}: {e}"))?);
+        oids.push(
+            git2::Oid::from_str(hex)
+                .map_err(|e| UploadPackError::Other(format!("bad want oid {hex}: {e}")))?,
+        );
     }
     // only haves this repo KNOWS as commits can bound the walk — a have from
     // history this node never saw simply doesn't help (and never errors).
@@ -1098,12 +1126,12 @@ fn build_upload_pack(
     if common.is_empty() {
         return forge::pack_closure_many(&repo, &oids)
             .map(|pack| (pack, None))
-            .map_err(|e| format!("build pack: {e}"));
+            .map_err(|e| UploadPackError::Other(format!("build pack: {e}")));
     }
     let ack = common[0].to_string();
     forge::pack_delta(&repo, &oids, &common)
         .map(|pack| (pack, Some(ack)))
-        .map_err(|e| format!("build delta pack: {e}"))
+        .map_err(|e| UploadPackError::Other(format!("build delta pack: {e}")))
 }
 
 #[cfg(test)]
@@ -1408,5 +1436,18 @@ mod upload_pack_tests {
 
         let over = parse_pkt_lines(&over_cap).unwrap_err();
         assert!(over.contains("too many pkt-lines in request"), "{over}");
+    }
+
+    /// an absent repo dir maps to the path-bearing git2 error variant, not
+    /// the generic one — the handler turns this into a fixed 404 and never
+    /// surfaces the git2 message (which names the node's absolute path).
+    #[test]
+    fn an_absent_repo_dir_maps_to_the_path_bearing_error_variant() {
+        let base = tempfile::tempdir().unwrap();
+        let missing = base.path().join("no-such-repo");
+
+        let err = build_upload_pack(&missing, &[WANT.to_string()], &[]).unwrap_err();
+
+        assert!(matches!(err, UploadPackError::RepoUnavailable(_)));
     }
 }
