@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use duckfs_core::{EntryInfo, EntryKindWire, MAX_PAGE, paths::canonical, to_hex};
 
@@ -126,6 +126,56 @@ fn path_stays_inside(prefix_segments: &[String], entry_path: &str) -> Result<(),
     Ok(())
 }
 
+/// remove whatever already sits at `disk` when it is not the right kind for
+/// `want` — a symlink (any target) or an entry of a different kind entirely.
+/// A checkout root is a working tree the operator (or an earlier checkout of
+/// a different snapshot) can have edited between runs, so `write`/`create_dir`
+/// must never simply follow a stale symlink or overwrite-through a wrong-kind
+/// entry: the old thing is unlinked first, exactly as the Symlink arm already
+/// does for itself, so a re-run converges on what the snapshot actually holds.
+fn clear_wrong_kind(disk: &Path, want: EntryKind) -> Result<(), CheckoutError> {
+    let Ok(meta) = disk.symlink_metadata() else {
+        return Ok(()); // nothing there yet — nothing to clear.
+    };
+    let file_type = meta.file_type();
+    let matches_kind = match want {
+        EntryKind::Dir => file_type.is_dir(),
+        EntryKind::File => file_type.is_file(),
+        EntryKind::Symlink => file_type.is_symlink(),
+    };
+    if matches_kind {
+        return Ok(());
+    }
+    if file_type.is_dir() {
+        std::fs::remove_dir_all(disk).map_err(io)
+    } else {
+        std::fs::remove_file(disk).map_err(io)
+    }
+}
+
+/// build every directory component of `parent` (which must be under `root`,
+/// already created), replacing a symlink or wrong-kind entry encountered along
+/// the way instead of writing through it — `create_dir_all` alone follows a
+/// symlinked ancestor into whatever it points at, silently, which is exactly
+/// how a File/Dir write escapes the checkout root through a stale link.
+fn create_dir_all_replacing(root: &Path, parent: &Path) -> Result<(), CheckoutError> {
+    let mut built = root.to_path_buf();
+    let suffix: PathBuf = match parent.strip_prefix(root) {
+        Ok(suffix) => suffix.to_path_buf(),
+        // `path_stays_inside` already refused any entry whose disk target
+        // would land outside root, so this only fires for `root` itself.
+        Err(_) => return Ok(()),
+    };
+    for component in suffix.components() {
+        built.push(component);
+        clear_wrong_kind(&built, EntryKind::Dir)?;
+        if built.symlink_metadata().is_err() {
+            std::fs::create_dir(&built).map_err(io)?;
+        }
+    }
+    Ok(())
+}
+
 /// materialize `prefix`'s subtree (at head, or at `snapshot`) into `dir`, writing
 /// the `.duckfs` index. see [`checkout_with`] for options.
 pub fn checkout(
@@ -182,11 +232,14 @@ pub fn checkout_with(
         path_stays_inside(&prefix_segments, &entry.path)?;
         let disk = disk_path(dir, &prefix, &entry.path);
         if let Some(parent) = disk.parent() {
-            std::fs::create_dir_all(parent).map_err(io)?;
+            create_dir_all_replacing(dir, parent)?;
         }
         match entry.kind {
             EntryKindWire::Dir => {
-                std::fs::create_dir_all(&disk).map_err(io)?;
+                clear_wrong_kind(&disk, EntryKind::Dir)?;
+                if disk.symlink_metadata().is_err() {
+                    std::fs::create_dir(&disk).map_err(io)?;
+                }
                 // record only EMPTY dirs — a non-empty dir is implied by its
                 // entries, an empty one needs an explicit Mkdir on commit.
                 let has_child = all_paths
@@ -211,6 +264,7 @@ pub fn checkout_with(
             EntryKindWire::File => {
                 let bytes = read_all(api, &entry.path, resolved.as_deref(), entry.size)?;
                 verify(entry, &bytes)?;
+                clear_wrong_kind(&disk, EntryKind::File)?;
                 std::fs::write(&disk, &bytes).map_err(io)?;
                 let mode = if entry.exec { 0o755 } else { 0o644 };
                 std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(mode))

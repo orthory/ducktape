@@ -369,3 +369,51 @@ fn a_find_reply_escaping_the_prefix_via_dotdot_is_refused() {
         "nothing must land inside the checkout root either"
     );
 }
+
+/// a checkout root swapped, between runs, from a real directory to a symlink
+/// pointing outside must be replaced by the committed directory, not written
+/// through (issue #1610).
+#[test]
+fn a_preexisting_symlink_in_place_of_a_dir_is_replaced_on_recheckout() {
+    let node = ModuleNode::new();
+    node.seed_commit(
+        None,
+        "seed",
+        vec![put_inline(
+            &format!("{PREFIX}/sub/inside.txt"),
+            b"committed body",
+            false,
+        )],
+    )
+    .expect("seed commit");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let outside = tempfile::tempdir().unwrap();
+
+    // the operator (or an earlier checkout) leaves `sub` as a symlink to a
+    // directory outside the checkout root.
+    fs::create_dir_all(root).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+
+    checkout(&node, root, PREFIX, None).expect("checkout converges");
+
+    // `sub` is now the committed real directory, not the stale symlink.
+    let sub_meta = fs::symlink_metadata(root.join("sub")).unwrap();
+    assert!(sub_meta.is_dir(), "sub is a real dir, not a symlink");
+    assert_eq!(
+        fs::read(root.join("sub/inside.txt")).unwrap(),
+        b"committed body"
+    );
+
+    // and nothing was written through the old link into `outside`.
+    assert!(
+        !outside.path().join("inside.txt").exists(),
+        "nothing landed outside the checkout root"
+    );
+
+    assert!(
+        duckfs_client::status::status(root).unwrap().clean,
+        "converged clean"
+    );
+}
