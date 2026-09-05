@@ -201,10 +201,13 @@ async fn run_action(
     headers: HeaderMap,
     Json(request): Json<ActionRequest>,
 ) -> Response<Body> {
+    // the listener is not loopback-bound (a child in a private netns must reach
+    // it), so the token IS the boundary: compare it in constant time like every
+    // other secret in this crate, never with a short-circuiting `==`.
     let authorized = headers
         .get(ACTION_HEADER)
         .and_then(|value| value.to_str().ok())
-        == Some(state.token.as_str());
+        .is_some_and(|presented| crate::services::token_matches(presented, &state.token));
     if !authorized {
         return action_response(StatusCode::UNAUTHORIZED, "action token rejected");
     }
