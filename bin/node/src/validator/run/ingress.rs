@@ -243,6 +243,7 @@ impl ValidatorRuntime<'_> {
                         .into(),
                     terminal: true,
                 },
+                context.current(),
             );
             return;
         }
@@ -265,6 +266,7 @@ impl ValidatorRuntime<'_> {
                         .into(),
                     terminal: false,
                 },
+                context.current(),
             );
             return;
         }
@@ -283,6 +285,7 @@ impl ValidatorRuntime<'_> {
                 gate_outcomes,
                 joiner_bytes,
                 join_gate::IntroReply::Admitted { height, cap },
+                context.current(),
             );
             return;
         }
@@ -372,6 +375,7 @@ impl ValidatorRuntime<'_> {
                         detail: format!("could not submit redemption: {e}"),
                         terminal: false,
                     },
+                    context.current(),
                 );
             }
         }

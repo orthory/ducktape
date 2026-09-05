@@ -14,7 +14,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use recovery::Manifest;
 
 use crate::constants::{DRAIN_TICK, WORKSPACE_CHECK_INTERVAL};
-use crate::reachability_plane::GateOutcomes;
+use crate::reachability_plane::{GateOutcomes, insert_gate_outcome};
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
@@ -42,12 +42,21 @@ struct GatePending {
 }
 
 /// write a resolved gate outcome where the intro doorbell reads it — the
-/// shared map the joiner's next retransmit is answered from.
-fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: join_gate::IntroReply) {
-    outcomes
-        .lock()
-        .expect("gate outcomes lock")
-        .insert(joiner, reply);
+/// shared map the joiner's next retransmit is answered from. `now` stamps
+/// the entry for [`crate::reachability_plane::sweep_gate_outcomes`] and the
+/// cap eviction in [`insert_gate_outcome`].
+fn settle_gate(
+    outcomes: &GateOutcomes,
+    joiner: Vec<u8>,
+    reply: join_gate::IntroReply,
+    now: std::time::SystemTime,
+) {
+    insert_gate_outcome(
+        &mut outcomes.lock().expect("gate outcomes lock"),
+        joiner,
+        reply,
+        now,
+    );
 }
 
 /// assemble this node's boundary facts and publish them into the shared

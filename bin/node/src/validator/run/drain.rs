@@ -309,7 +309,7 @@ impl ValidatorRuntime<'_> {
                     let window = read_valset_mesh_window(node.host()).await;
                     mesh_window.track_new(mesh_oracle, mesh_book, &window);
                 }
-                super::settle_gate(gate_outcomes, gate.joiner, reply);
+                super::settle_gate(gate_outcomes, gate.joiner, reply, context.current());
                 continue;
             }
             // resolve a relayed hold FIRST: a relayed frame has no
@@ -465,10 +465,25 @@ impl ValidatorRuntime<'_> {
                                 .into(),
                             terminal: false,
                         },
+                        now,
                     );
                 }
             }
         }
+        // sweep gate outcomes settled more than a join window ago — on the
+        // SAME beat as the held-gate expiry just above, no new timer. keyed
+        // on `INVITE_JOIN_WINDOW_MS` (the same clock the invite-peer tunnel
+        // table itself ages uncovered entries out by, `merge_invite_layer` in
+        // netstack-machine): a joiner has that long to retransmit before its
+        // outcome — `Admitted` included — is dead weight. Expiring `Admitted`
+        // is safe: a joiner that reappears later just re-runs the gate, and
+        // `on_gate_forward`'s V9 arm answers Admitted again for free (a
+        // committed-state read, no consensus round).
+        crate::reachability_plane::sweep_gate_outcomes(
+            &mut gate_outcomes.lock().expect("gate outcomes lock"),
+            context.current(),
+            std::time::Duration::from_millis(reachability::INVITE_JOIN_WINDOW_MS),
+        );
         // publish each newly-applied boundary to ws subscribers
         // (send only errs when nobody is subscribed — fine). the
         // drain loop above already folded each block into the
