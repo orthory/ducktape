@@ -17,7 +17,12 @@ use crate::drain_actions::{
     CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
-use crate::util::{fatal, hex, participant_bytes, resident_bytes};
+use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes};
+
+/// One warning when the workspace mark goes missing, then one per this many
+/// further checks (`WORKSPACE_CHECK_INTERVAL` apart) for a filesystem that
+/// never accepts the rewrite.
+const MARK_LOST_WARN_EVERY: u64 = 600;
 use crate::validator::code_announce::CodeVerdict;
 use crate::{join_gate, relay};
 use noded::projection::{BlockProjection, project_block};
@@ -56,13 +61,44 @@ impl ValidatorRuntime<'_> {
         let Some(mark) = self.workspace_mark else {
             return;
         };
-        if mark.still_at(&self.workspace) {
+        match mark.presence(&self.workspace) {
+            Presence::Intact => self.workspace_mark_lost_checks = 0,
+            Presence::MarkLost => self.report_lost_workspace_mark(),
+            Presence::Vanished => fatal!(
+                self.label,
+                reason = "storage_vanished",
+                "the workspace directory {} was deleted underneath this node — halting without a checkpoint",
+                self.workspace.display()
+            ),
+        }
+    }
+
+    /// The workspace is the one we booted on, but its mark file is gone or
+    /// short. Never fatal: put the token back, and say so — paced, because a
+    /// filesystem that refuses the write refuses it again every second, and an
+    /// unconditional warn in a forever-retry loop evicts the ring it is
+    /// supposed to explain.
+    fn report_lost_workspace_mark(&mut self) {
+        let Some(mark) = self.workspace_mark else {
+            return;
+        };
+        self.workspace_mark_lost_checks += 1;
+        let attempts = self.workspace_mark_lost_checks;
+        let restored = mark.restore(&self.workspace);
+        let speak = attempts == 1 || attempts.is_multiple_of(MARK_LOST_WARN_EVERY);
+        if !speak {
             return;
         }
-        fatal!(
-            self.label,
-            reason = "storage_vanished",
-            "the workspace directory {} was deleted underneath this node — halting without a checkpoint",
+        let reason = match restored {
+            true => "workspace_mark_restored",
+            false => "workspace_mark_unwritable",
+        };
+        tracing::warn!(
+            target: "ducktape::node",
+            node = %self.label,
+            reason,
+            attempts,
+            "the workspace mark under {} is missing — the directory is still the one this node booted on, so this is not a deletion",
             self.workspace.display()
         );
     }
