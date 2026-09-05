@@ -8,7 +8,9 @@ use commonware_cryptography::ed25519;
 use lru::LruCache;
 
 use crate::AuthRequest;
-use crate::advert::{AdvertBook, AdvertOutcome, SharedAdverts};
+use crate::advert::{
+    AdmitEvent, AdvertBook, AdvertOutcome, MAX_ADVERTS, MAX_ADVERTS_PER_SOURCE_IP, SharedAdverts,
+};
 use crate::auth::{AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
 use crate::{Latch, Msg, NodeKey, short_key};
 
@@ -29,6 +31,36 @@ fn resolve_auth_key(cache: &mut AuthKeyCache, key: NodeKey) -> Option<ed25519::P
         .get_or_insert_with(|| LruCache::new(AUTH_KEY_CACHE_SIZE))
         .put(key, parsed.clone());
     Some(parsed)
+}
+
+/// Emit the log line for an [`AdmitEvent`] latched by `AdvertBook::observe`
+/// or `readvertise`. Callers MUST call this only after dropping the
+/// `SharedAdverts` lock (`adverts.take_admit_event()` runs under it, but the
+/// actual tracing write — I/O — never should).
+fn log_admit_event(event: Option<AdmitEvent>) {
+    match event {
+        Some(AdmitEvent::SourceCapped {
+            source,
+            occurrences,
+        }) => tracing::warn!(
+            target: "ducktape::reachability",
+            event = "advert_refused",
+            reason = "advert_source_cap",
+            source = %source,
+            cap = MAX_ADVERTS_PER_SOURCE_IP,
+            occurrences,
+            "source IP at its per-source advert cap — new key refused"
+        ),
+        Some(AdmitEvent::BookFull { occurrences }) => tracing::warn!(
+            target: "ducktape::reachability",
+            event = "advert_evicted",
+            reason = "book_full",
+            capacity = MAX_ADVERTS,
+            occurrences,
+            "advert book at capacity — the newest registration lost its slot"
+        ),
+        None => {}
+    }
 }
 
 pub type CoordinatorReply = (SocketAddr, Msg);
@@ -272,9 +304,11 @@ impl Coordinator {
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
                 let outcome = adverts.observe(key, from, now);
+                let admit_event = adverts.take_admit_event();
                 // The book is done with; a log write (stderr, and a node's
                 // LogRing) must not happen under its lock.
                 drop(adverts);
+                log_admit_event(admit_event);
                 match outcome {
                     AdvertOutcome::Superseded => tracing::debug!(
                         target: "ducktape::reachability",
@@ -283,9 +317,7 @@ impl Coordinator {
                         reflexive = %from,
                         "registered a member at its observed source"
                     ),
-                    // AdvertBook::admit already logged the per-source refusal
-                    // (latched, reason "advert_source_cap") — nothing more to
-                    // do here.
+                    // the per-source cap already logged above via `admit_event`.
                     AdvertOutcome::Refused => {}
                     // a live mapping already ahead of this bare Register (a
                     // superseding nonce, or a different source): nothing
@@ -303,7 +335,11 @@ impl Coordinator {
                 // a replayed/reordered datagram cannot supersede a fresh mapping
                 // — nor extend its life.
                 let outcome = adverts.readvertise(key, from, nonce, now);
+                let admit_event = adverts.take_admit_event();
+                // The book is done with; a log write must not happen under
+                // its lock.
                 drop(adverts);
+                log_admit_event(admit_event);
                 match outcome {
                     // the 25 s keepalive of every member: per-frame traffic.
                     AdvertOutcome::Superseded => tracing::trace!(
@@ -322,9 +358,7 @@ impl Coordinator {
                         nonce,
                         "re-advertisement did not beat the stored nonce"
                     ),
-                    // AdvertBook::admit already logged the per-source refusal
-                    // (latched, reason "advert_source_cap") — nothing more to
-                    // do here.
+                    // the per-source cap already logged above via `admit_event`.
                     AdvertOutcome::Refused => {}
                     // `readvertise` never returns this — only `observe` does.
                     AdvertOutcome::NoOp => {}

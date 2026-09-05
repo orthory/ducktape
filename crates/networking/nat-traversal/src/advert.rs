@@ -53,6 +53,20 @@ pub enum AdvertOutcome {
     NoOp,
 }
 
+/// A book-mutating call's side effect that is worth a log line, latched
+/// while [`AdvertBook`]'s lock is held and drained by the caller via
+/// [`AdvertBook::take_admit_event`] AFTER releasing it — logging is I/O and
+/// must never run while a `SharedAdverts` holder is blocked on the mutex.
+#[derive(Clone, Copy, Debug)]
+pub enum AdmitEvent {
+    /// A write refused because its target source IP is at
+    /// [`MAX_ADVERTS_PER_SOURCE_IP`].
+    SourceCapped { source: IpAddr, occurrences: u64 },
+    /// The book was at [`MAX_ADVERTS`] and admitting a first-seen key evicted
+    /// the youngest live entry.
+    BookFull { occurrences: u64 },
+}
+
 /// The reachability-plane reflexive registry: for each node key, the latest
 /// accepted `ReflexiveAdvert`. `observe` is the unconditional boot/live
 /// registration (the observed source is authoritative); `readvertise` is the
@@ -79,7 +93,7 @@ pub enum AdvertOutcome {
 /// all. That is the deliberate trade — a last-seen LRU would rotate, but it
 /// hands the choice back to whoever refreshes fastest, which is the attacker
 /// (an honest keepalive is 25 s apart; a sprayer picks its own rate).
-const MAX_ADVERTS: usize = 4096;
+pub(crate) const MAX_ADVERTS: usize = 4096;
 
 /// Per-source-IP cap on distinct keys the coordinator admits from ONE
 /// observed IP. Mirrors `relay.rs`'s `MAX_SESSIONS_PER_IP`: this bounds
@@ -88,7 +102,7 @@ const MAX_ADVERTS: usize = 4096;
 /// unbounded share of [`MAX_ADVERTS`] by spraying keys from a single
 /// source. A handful is generous for any real host (a home gateway, a small
 /// rack) running several nodes behind one address.
-const MAX_ADVERTS_PER_SOURCE_IP: usize = 8;
+pub(crate) const MAX_ADVERTS_PER_SOURCE_IP: usize = 8;
 
 pub struct AdvertBook {
     latest: HashMap<NodeKey, ReflexiveAdvert>,
@@ -97,6 +111,9 @@ pub struct AdvertBook {
     /// coordinator-owned: it is the eviction order, so it must never be
     /// derivable from anything a sender sends.
     next_admission: u64,
+    /// The latest [`AdmitEvent`] latched by this call, if any — see
+    /// [`Self::take_admit_event`].
+    pending_admit_event: Option<AdmitEvent>,
 }
 
 impl Default for AdvertBook {
@@ -113,7 +130,15 @@ impl AdvertBook {
             latest: HashMap::new(),
             ttl,
             next_admission: 0,
+            pending_admit_event: None,
         }
+    }
+
+    /// Drain the [`AdmitEvent`] the last `observe`/`readvertise` call
+    /// latched, if any. The caller logs it AFTER dropping the
+    /// [`SharedAdverts`] lock — this only moves data, it never emits.
+    pub fn take_admit_event(&mut self) -> Option<AdmitEvent> {
+        self.pending_admit_event.take()
     }
 
     fn expired(&self, advert: &ReflexiveAdvert, now: u64) -> bool {
@@ -138,6 +163,7 @@ impl AdvertBook {
     /// pinhole is gone), so both guards yield and the fresh register takes the
     /// slot back — the reboot case.
     pub fn observe(&mut self, key: NodeKey, src: SocketAddr, now: u64) -> AdvertOutcome {
+        self.pending_admit_event = None;
         match self.latest.get(&key) {
             Some(prev) if !self.expired(prev, now) && (prev.nonce > 0 || prev.reflexive != src) => {
                 AdvertOutcome::NoOp
@@ -210,15 +236,10 @@ impl AdvertBook {
         // this crate — the count is the diagnosis.
         static SOURCE_CAP: Latch = Latch::new();
         if let Some(occurrences) = SOURCE_CAP.hit("advert_source_cap") {
-            tracing::warn!(
-                target: "ducktape::reachability",
-                event = "advert_refused",
-                reason = "advert_source_cap",
-                source = %ip,
-                cap = MAX_ADVERTS_PER_SOURCE_IP,
+            self.pending_admit_event = Some(AdmitEvent::SourceCapped {
+                source: ip,
                 occurrences,
-                "source IP at its per-source advert cap — new key refused"
-            );
+            });
         }
         false
     }
@@ -298,14 +319,7 @@ impl AdvertBook {
         // so the number of displacements is the whole diagnosis.
         static BOOK_FULL: Latch = Latch::new();
         if let Some(occurrences) = BOOK_FULL.hit("book_full") {
-            tracing::warn!(
-                target: "ducktape::reachability",
-                event = "advert_evicted",
-                reason = "book_full",
-                capacity = MAX_ADVERTS,
-                occurrences,
-                "advert book at capacity — the newest registration lost its slot"
-            );
+            self.pending_admit_event = Some(AdmitEvent::BookFull { occurrences });
         }
     }
 
@@ -323,6 +337,7 @@ impl AdvertBook {
         nonce: u64,
         now: u64,
     ) -> AdvertOutcome {
+        self.pending_admit_event = None;
         let stale = matches!(
             self.latest.get(&key),
             Some(prev) if nonce <= prev.nonce && !self.expired(prev, now)
