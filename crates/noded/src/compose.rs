@@ -300,7 +300,7 @@ async fn native(
     };
     match id {
         "valset" => {
-            let mut valset = valset::Valset::new(id, store);
+            let mut valset = valset::Valset::new(id, store, "governance");
             if let Some((validators, _)) = founding {
                 for key in validators {
                     valset
@@ -316,7 +316,7 @@ async fn native(
             Ok(Box::new(valset))
         }
         "modules" => {
-            let mut registry = modules::Modules::new(id, store, "valset");
+            let mut registry = modules::Modules::new(id, store, "valset", "governance");
             if let Some((_, bundle)) = founding {
                 for (module_id, hash) in bundle {
                     registry

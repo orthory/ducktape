@@ -162,7 +162,11 @@ async fn siblings(
         Box::new(Files::open("files", files_dir).expect("files open")),
     ];
     if let Some(members) = assignment_members {
-        let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+        let mut valset = Valset::new(
+            "valset",
+            Box::new(sdk_testkit::MemStore::new()),
+            "governance",
+        );
         for member in members {
             valset.seed(member.clone()).await.expect("seed valset");
         }

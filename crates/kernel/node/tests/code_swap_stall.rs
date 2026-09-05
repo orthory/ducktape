@@ -50,8 +50,12 @@ fn batch(seq: u64, key: &str) -> Vec<u8> {
 /// the default `NoCodeSource` misses every fetch, so every block's boundary
 /// realization fails closed — exactly the late-promoted validator's position.
 async fn host_awaiting_code() -> Host {
-    let mut registry =
-        modules::Modules::new(MODULES_ID, Box::new(sdk_testkit::MemStore::new()), "valset");
+    let mut registry = modules::Modules::new(
+        MODULES_ID,
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+        "governance",
+    );
     registry.seed("ghost", vec![9u8; 32]).await.expect("seed");
     registry.finish_seed().await.expect("finish seed");
     let mut host = Host::new();

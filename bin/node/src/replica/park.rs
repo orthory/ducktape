@@ -1730,7 +1730,10 @@ pub(super) async fn park(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                     },
-                );
+                )
+                // the replay guard rides every checkpoint (see
+                // `recovery::Manifest::applied_frames`).
+                .map(|(m, cost)| (m.with_replay_window(node_r.replay_window()), cost));
                 let captured_at = context.current();
                 match captured {
                     Ok((ckpt, capture_cost)) => match node_r.sink_mut().write_manifest(&ckpt).await
@@ -1867,7 +1870,10 @@ pub(super) async fn park(
                 pos,
                 1,
             ) {
-                Ok(ckpt) => ckpt,
+                // the window lifted above the dismantle: this checkpoint is
+                // the journal's base for the promoted seat, so a restart from
+                // it must not re-open replay.
+                Ok(ckpt) => ckpt.with_replay_window(replay_window.clone()),
                 Err(e) => {
                     fatal!(label, "promotion checkpoint capture: {e}");
                 }
@@ -2675,11 +2681,10 @@ pub(super) async fn park(
         prev_ckpt: (Some(boundary.height), pos),
         mesh_window,
         mesh_book,
-        // a COLD seat: it synced a boundary and folded nothing of its own, so
-        // it has no journaled batch ids to carry. it starts refusing only the
-        // batches it applies from here — a batch replayed from below its
-        // boundary is caught by the running validators, not by this one.
-        replay_window: Vec::new(),
+        // a COLD seat folded nothing of its own, so its replay guard comes
+        // off the BOUNDARY it synced — an empty window would have it apply a
+        // re-proposed batch its peers refuse, and one such batch is two roots.
+        replay_window: boundary.applied_frames.clone(),
     }
 }
 

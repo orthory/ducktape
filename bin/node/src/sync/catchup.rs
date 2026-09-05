@@ -356,6 +356,7 @@ mod tests {
             snapshots: Vec::new(),
             oplog_pos: 0,
             next_seq: 0,
+            applied_frames: Vec::new(),
         }
     }
 

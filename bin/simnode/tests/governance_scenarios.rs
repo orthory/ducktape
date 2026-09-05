@@ -779,8 +779,9 @@ fn a_direct_external_membership_op_is_refused_by_the_module_origin_gate() {
     let intruder = Ed::from_seed(80);
     let key = intruder.public_key().as_ref().to_vec();
 
-    // valset accepts membership ops only from a module (governance's follow-up)
-    // or system origin — never a raw external submit, even a well-formed key.
+    // valset accepts membership ops only from the GOVERNANCE module's own
+    // follow-up or a system origin — never a raw external submit (even a
+    // well-formed key), and never another module's follow-up.
     let error = sim.submit_rejected(
         "valset",
         json!({ "join": { "key": key.clone() } }),
