@@ -688,13 +688,13 @@ static CREATE_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
 /// Like [`noded::log::Latch`], but keyed on `(reason, peer)` instead of just
 /// `reason` — `Latch::hit` only takes a `&'static str`, and a peer id is not
 /// one. First occurrence per peer, then every `every`th, per peer.
-struct PerPeerLatch {
+pub(crate) struct PerPeerLatch {
     counts: std::sync::Mutex<std::collections::BTreeMap<(&'static str, PeerId), u64>>,
     every: u64,
 }
 
 impl PerPeerLatch {
-    const fn new(every: u64) -> Self {
+    pub(crate) const fn new(every: u64) -> Self {
         Self {
             counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             every,
@@ -703,7 +703,7 @@ impl PerPeerLatch {
 
     /// returns `Some(occurrences)` when this peer's occurrence of `reason`
     /// should be logged.
-    fn hit(&self, reason: &'static str, peer: PeerId) -> Option<u64> {
+    pub(crate) fn hit(&self, reason: &'static str, peer: PeerId) -> Option<u64> {
         let mut counts = self.counts.lock().expect("latch lock poisoned");
         let count = counts.entry((reason, peer)).or_insert(0);
         *count += 1;
