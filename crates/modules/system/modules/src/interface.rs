@@ -60,6 +60,21 @@ impl ScheduledSwap {
         let floor_reached = self.activation_height <= height;
         latched_before && floor_reached
     }
+
+    /// STALE at `height`: the activation height is reached and `ready_at` was
+    /// never latched. nothing armed this swap and [`ScheduledSwap::armed_at`]
+    /// cannot fire for it here — it is a dead designation, not a swap in
+    /// flight, so governance may REPLACE it with a new schedule or cancel it.
+    ///
+    /// without this, a pending no validator can ever signal — a component that
+    /// is not a `ducktape:module`, so no readiness probe can load it — is the
+    /// network's designation for life: `ScheduleSwap` refuses while a pending
+    /// exists and `CancelSwap` refuses once the activation height is reached.
+    pub fn stale_at(&self, height: u64) -> bool {
+        let past_due = self.activation_height <= height;
+        let never_latched = self.ready_at.is_none();
+        past_due && never_latched
+    }
 }
 
 /// one activation: `code_hash` became the module's running code FOR block
