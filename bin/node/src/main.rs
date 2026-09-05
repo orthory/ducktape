@@ -536,6 +536,7 @@ fn run_node(
         gateway_commands,
         terminals,
         session_requests,
+        remote_sessions,
         local_gateway_via,
         node_api_ports,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
@@ -838,6 +839,7 @@ fn run_node(
                 gateway_commands.clone(),
                 terminals,
                 session_requests,
+                remote_sessions.clone(),
                 local_gateway_via,
                 node_api_ports,
                 &stream_hub,
@@ -933,6 +935,7 @@ fn run_node(
             gateway_commands,
             terminals,
             session_requests,
+            remote_sessions,
             local_gateway_via,
             node_api_ports,
             stream_hub,
