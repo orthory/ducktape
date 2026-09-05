@@ -31,8 +31,9 @@ use crate::replica;
 use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
 use crate::sync::catchup::{SuffixCatchupError, catch_up_suffix_frames};
 use crate::sync::serve::{
-    ServedSeal, reopen_preflight_synced_host, reopen_recovery, replica_backfill,
-    replica_orchestrator_at, replica_verifier, verify_manifest_floor, write_boundary_checkpoint,
+    SealVerdict, ServedSeal, check_served_seal, name_diverged_modules,
+    reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
+    replica_verifier, verify_manifest_floor, write_boundary_checkpoint,
 };
 use crate::util::{fatal, hex};
 use noded::projection::{BlockProjection, project_block};
@@ -1400,34 +1401,37 @@ pub(super) async fn park(
                     metrics.record_height(height);
                 }
                 metrics.record_op_outcomes(applied_ops, rejected_ops);
-                // a BACKFILLED height's trust is the served seal:
-                // what our fold produced must match it exactly, or
-                // this replica has diverged from the quorum's fold.
-                if let Some((_, served_hash, served_roots)) = pending_seal_checks.remove(&height)
-                    && sealed_hash.is_some_and(|h| h != served_hash)
-                {
-                    // name the diverging module(s) — the one lead an
-                    // operator (or the next debugger) needs first.
-                    for (module, served_root) in &served_roots {
-                        let ours = node_r.host().module_root(module);
-                        if ours.as_ref() != Some(served_root) {
-                            tracing::error!(
-                                target: "ducktape::consensus",
-                                node = %label,
-                                module,
-                                served = %hex(served_root),
-                                ours = %ours.map(|r| hex(&r)).unwrap_or_else(|| "none".into()),
-                                "replica module diverged"
-                            );
+                // a BACKFILLED height's trust is the served seal — the bytes
+                // entered the orderer with NO certificate check — so what our
+                // fold produced must match it on BOTH halves, disposition and
+                // root, or this replica has diverged from the quorum's fold.
+                if let Some(seal) = pending_seal_checks.remove(&height) {
+                    match check_served_seal(sealed_hash, applied, &seal) {
+                        SealVerdict::Agrees => {}
+                        SealVerdict::NothingSealed => fatal!(
+                            label,
+                            "backfilled height {height} sealed nothing (every frame \
+                             discarded) yet a source served a seal for it — no honest \
+                             journal holds that frame"
+                        ),
+                        SealVerdict::Disposition { ours, served } => fatal!(
+                            label,
+                            "backfilled height {height} folded as {ours:?} but the quorum \
+                             sealed it {served:?} — state diverged"
+                        ),
+                        SealVerdict::Root { ours, served } => {
+                            // name the diverging module(s) — the one lead an
+                            // operator (or the next debugger) needs first.
+                            name_diverged_modules(node_r.host(), &label, &seal.2);
+                            fatal!(
+                                label,
+                                "backfilled height {height} folded to {} but the quorum \
+                                 sealed {} — state diverged",
+                                hex(&ours),
+                                hex(&served)
+                            )
                         }
                     }
-                    fatal!(
-                        label,
-                        "backfilled height {height} folded to \
-                         {} but the quorum sealed {} — state diverged",
-                        hex(&sealed_hash.expect("checked above")),
-                        hex(&served_hash)
-                    );
                 }
                 let ops = indexer::BlockOps {
                     record,

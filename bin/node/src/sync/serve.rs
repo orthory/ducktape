@@ -113,6 +113,85 @@ pub(crate) type ServedSeal = (
     Vec<(sdk::ModuleId, StateRoot)>,
 );
 
+/// the backfill lane's ONE trust check, as a decision:
+/// [`node::OrderedNode::admit_backfilled`] stores an unverified source's
+/// frame bytes with no certificate check, so what OUR fold produced must
+/// agree with the served seal on BOTH halves — the disposition and the
+/// root-hash — exactly as the post-reboot catch-up
+/// ([`crate::sync::catchup::apply_verified_suffix_frame`]) verifies them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealVerdict {
+    Agrees,
+    /// our fold sealed NOTHING at this height — every frame discarded. for a
+    /// backfilled height that is not an exemption from the check but the
+    /// loudest failure of it: a discard is never journaled, so no honest
+    /// source holds a seal to serve here at all.
+    NothingSealed,
+    Disposition {
+        ours: node::Disposition,
+        served: node::Disposition,
+    },
+    Root {
+        ours: StateRoot,
+        served: StateRoot,
+    },
+}
+
+/// compare one backfilled height's fold against its served seal. the fold is
+/// given in `project_block`'s own terms — `sealed_hash` is `None` when every
+/// frame at the height discarded, and `applied` is "any member applied",
+/// which is the batch-level disposition the served seal carries.
+pub(crate) fn check_served_seal(
+    sealed_hash: Option<StateRoot>,
+    applied: bool,
+    served: &ServedSeal,
+) -> SealVerdict {
+    let (served_disposition, served_hash, _) = served;
+    let Some(our_hash) = sealed_hash else {
+        return SealVerdict::NothingSealed;
+    };
+    let ours = if applied {
+        node::Disposition::Applied
+    } else {
+        node::Disposition::Rejected
+    };
+    if ours != *served_disposition {
+        return SealVerdict::Disposition {
+            ours,
+            served: *served_disposition,
+        };
+    }
+    if our_hash != *served_hash {
+        return SealVerdict::Root {
+            ours: our_hash,
+            served: *served_hash,
+        };
+    }
+    SealVerdict::Agrees
+}
+
+/// log the module(s) whose root disagrees with the served seal — the one lead
+/// an operator (or the next debugger) needs before the fatal.
+pub(crate) fn name_diverged_modules(
+    host: &Host,
+    label: &str,
+    served_roots: &[(sdk::ModuleId, StateRoot)],
+) {
+    for (module, served_root) in served_roots {
+        let ours = host.module_root(module);
+        if ours.as_ref() != Some(served_root) {
+            tracing::error!(
+                target: "ducktape::consensus",
+                node = %label,
+                module,
+                served = %hex(served_root),
+                ours = %ours.map(|r| hex(&r)).unwrap_or_else(|| "none".into()),
+                "replica module diverged"
+            );
+        }
+    }
+}
+
 /// a failed backfill, split by whether retrying the same range can ever
 /// succeed. `permanent` means the SOURCE no longer holds the frames — the
 /// range fell below its retention floor while this follower was suspended
@@ -162,8 +241,20 @@ where
         up_to_view,
         "replica backfill"
     );
+    let mut refused_past_ceiling = 0usize;
     for f in frames {
         let view = f.height.saturating_sub(view_base);
+        // THE CUTOVER CEILING IS AN ADMISSION RULE HERE TOO: a batch at or
+        // past the armed cutover view is discarded whole by every honest node
+        // and never journaled, so no honest source holds a seal to serve for
+        // it. refuse the bytes rather than admit them from an unverified
+        // source and discover the lie (or fail to, the fold sealing nothing)
+        // after the drain.
+        let past_ceiling = node_r.view_ceiling().is_some_and(|ceiling| view >= ceiling);
+        if past_ceiling {
+            refused_past_ceiling += 1;
+            continue;
+        }
         seal_checks.insert(
             f.height,
             (
@@ -175,6 +266,16 @@ where
         if node_r.orderer_mut().admit_backfilled(view, f.frame.clone()) {
             *watermark = Some(view);
         }
+    }
+    if refused_past_ceiling > 0 {
+        tracing::warn!(
+            target: "ducktape::statesync",
+            node = %label,
+            frames = refused_past_ceiling,
+            ceiling = node_r.view_ceiling(),
+            reason = "served_past_cutover_ceiling",
+            "refused backfilled frames a cutover discards"
+        );
     }
     Ok(())
 }
@@ -821,6 +922,41 @@ pub(crate) async fn drive_sync_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the backfill lane's trust check: BOTH halves, and a fold that sealed
+    /// nothing is a refusal, not an exemption.
+    #[test]
+    fn a_served_seal_is_checked_on_disposition_and_root_and_never_skipped() {
+        let root = |b: u8| -> StateRoot { StateRoot([b; sdk::ROOT_LEN]) };
+        let seal = |d: node::Disposition, r: u8| -> ServedSeal { (d, root(r), Vec::new()) };
+
+        assert_eq!(
+            check_served_seal(Some(root(1)), true, &seal(node::Disposition::Applied, 1)),
+            SealVerdict::Agrees
+        );
+        // a batch every frame discarded — the served-past-the-ceiling shape:
+        // the old `is_some_and` check short-circuited to "fine" here.
+        assert_eq!(
+            check_served_seal(None, false, &seal(node::Disposition::Applied, 1)),
+            SealVerdict::NothingSealed
+        );
+        // an unchanged root with the WRONG disposition: the half that was
+        // bound to `_` and never compared.
+        assert_eq!(
+            check_served_seal(Some(root(1)), false, &seal(node::Disposition::Applied, 1)),
+            SealVerdict::Disposition {
+                ours: node::Disposition::Rejected,
+                served: node::Disposition::Applied,
+            }
+        );
+        assert_eq!(
+            check_served_seal(Some(root(2)), true, &seal(node::Disposition::Applied, 1)),
+            SealVerdict::Root {
+                ours: root(2),
+                served: root(1),
+            }
+        );
+    }
 
     #[test]
     fn tip_coords_and_index_ops_do_not_renew_the_lease() {
