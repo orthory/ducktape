@@ -724,12 +724,33 @@ struct RunOutputInner {
     runs: BTreeMap<String, RunRing>,
 }
 
-#[derive(Default)]
+/// who fed this ring its lines. A run this node hosts is never writable by a
+/// peer, and the cap's eviction never sacrifices one to make room for a peer's
+/// — see [`RunOutputRegistry::push`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunOrigin {
+    Local,
+    Remote,
+}
+
 struct RunRing {
+    origin: RunOrigin,
     next_seq: u64,
     floor_seq: u64,
     touched: u64,
     lines: VecDeque<(u64, RunStream, String)>,
+}
+
+impl RunRing {
+    fn new(origin: RunOrigin) -> Self {
+        Self {
+            origin,
+            next_seq: 0,
+            floor_seq: 0,
+            touched: 0,
+            lines: VecDeque::new(),
+        }
+    }
 }
 
 impl Default for RunOutputRegistry {
@@ -760,21 +781,73 @@ impl RunOutputRegistry {
     }
 
     pub fn append(&self, id: impl Into<String>, stream: RunStream, line: impl Into<String>) {
-        self.push(id.into(), stream, line.into(), true);
+        self.push(id.into(), stream, line.into(), RunOrigin::Local);
     }
 
     /// Add a line received from another node without broadcasting it again.
-    pub fn append_remote(&self, event: RunOutputEvent) {
-        self.push(event.id, event.stream, event.line, false);
+    /// Refused (`false`) when `event.id` names a run this node hosts locally,
+    /// or when admitting a never-seen remote id would have to evict a local
+    /// ring to fit under [`RUN_OUTPUT_MAX_RUNS`] — see [`Self::push`].
+    #[must_use]
+    pub fn append_remote(&self, event: RunOutputEvent) -> bool {
+        self.push(event.id, event.stream, event.line, RunOrigin::Remote)
     }
 
-    fn push(&self, id: String, stream: RunStream, line: String, publish: bool) {
+    /// whether `id` names a run this node hosts locally. Checked by the agent
+    /// data plane before it even spends a peer's remote-binding budget on the
+    /// id: unlike a term session's 16-hex random id, a run id is consensus
+    /// state — every member can learn every hosted run's id — so "unseen id"
+    /// is not a signal a peer could not have forged for a run it does not own.
+    pub fn is_local(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("run output lock poisoned")
+            .runs
+            .get(id)
+            .is_some_and(|ring| ring.origin == RunOrigin::Local)
+    }
+
+    /// `origin` decides who this line may come from and how the run-count cap
+    /// is enforced:
+    /// - `Local` (this node's own provider output): always admitted, and
+    ///   growing past [`RUN_OUTPUT_MAX_RUNS`] evicts the globally
+    ///   least-recently-touched OTHER ring, local or remote — this node's own
+    ///   work always wins a slot.
+    /// - `Remote` (a peer's line): refused outright against an existing
+    ///   `Local` ring — a peer never appends to, or evicts, a run this node
+    ///   hosts. A brand-new remote id at the cap evicts only the
+    ///   least-recently-touched REMOTE ring; with none to evict (every held
+    ///   ring is local), the line is refused rather than growing past the cap.
+    ///
+    /// Returns whether the line was admitted.
+    fn push(&self, id: String, stream: RunStream, line: String, origin: RunOrigin) -> bool {
         let mut inner = self.inner.lock().expect("run output lock poisoned");
+        match (origin, inner.runs.get(&id).map(|ring| ring.origin)) {
+            (RunOrigin::Remote, Some(RunOrigin::Local)) => return false,
+            (RunOrigin::Remote, None) if inner.runs.len() >= RUN_OUTPUT_MAX_RUNS => {
+                let victim = inner
+                    .runs
+                    .iter()
+                    .filter(|(_, ring)| ring.origin == RunOrigin::Remote)
+                    .min_by_key(|(_, ring)| ring.touched)
+                    .map(|(run_id, _)| run_id.clone());
+                match victim {
+                    Some(victim) => {
+                        inner.runs.remove(&victim);
+                    }
+                    None => return false,
+                }
+            }
+            _ => {}
+        }
         inner.version += 1;
         inner.touch += 1;
         let version = inner.version;
         let touch = inner.touch;
-        let ring = inner.runs.entry(id.clone()).or_default();
+        let ring = inner
+            .runs
+            .entry(id.clone())
+            .or_insert_with(|| RunRing::new(origin));
         ring.touched = touch;
         ring.next_seq += 1;
         let seq = ring.next_seq;
@@ -784,23 +857,26 @@ impl RunOutputRegistry {
                 ring.floor_seq = evicted;
             }
         }
-        while inner.runs.len() > RUN_OUTPUT_MAX_RUNS {
-            let Some(victim) = inner
-                .runs
-                .iter()
-                .filter(|(run_id, _)| *run_id != &id)
-                .min_by_key(|(_, ring)| ring.touched)
-                .map(|(run_id, _)| run_id.clone())
-            else {
-                break;
-            };
-            inner.runs.remove(&victim);
+        if origin == RunOrigin::Local {
+            while inner.runs.len() > RUN_OUTPUT_MAX_RUNS {
+                let Some(victim) = inner
+                    .runs
+                    .iter()
+                    .filter(|(run_id, _)| *run_id != &id)
+                    .min_by_key(|(_, ring)| ring.touched)
+                    .map(|(run_id, _)| run_id.clone())
+                else {
+                    break;
+                };
+                inner.runs.remove(&victim);
+            }
         }
         drop(inner);
         let _ = self.watch.send(version);
-        if publish {
+        if origin == RunOrigin::Local {
             let _ = self.appends.send(RunOutputEvent { id, stream, line });
         }
+        true
     }
 
     pub fn read_after(
@@ -2982,18 +3058,61 @@ mod tests {
         runs.append("aa".repeat(32), RunStream::Stdout, "local");
         assert_eq!(appends.try_recv().unwrap().line, "local");
 
-        runs.append_remote(RunOutputEvent {
-            id: "aa".repeat(32),
+        // "bb"*32 is a run only a peer has ever named — a mirrored remote run,
+        // never one this node hosts.
+        assert!(runs.append_remote(RunOutputEvent {
+            id: "bb".repeat(32),
             stream: RunStream::Stderr,
             line: "remote".into(),
-        });
+        }));
         assert!(matches!(
             appends.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+        let (rows, _) = runs.read_after(&"bb".repeat(32), 0, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, "remote");
+    }
+
+    #[test]
+    fn a_locally_hosted_run_is_never_writable_by_a_peer() {
+        let runs = RunOutputRegistry::default();
+        runs.append("aa".repeat(32), RunStream::Stdout, "local");
+        assert!(runs.is_local(&"aa".repeat(32)));
+
+        assert!(!runs.append_remote(RunOutputEvent {
+            id: "aa".repeat(32),
+            stream: RunStream::Stderr,
+            line: "forged".into(),
+        }));
         let (rows, _) = runs.read_after(&"aa".repeat(32), 0, 10);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].2, "remote");
+        assert_eq!(rows.len(), 1, "the peer's line never entered the local ring");
+        assert_eq!(rows[0].2, "local");
+    }
+
+    #[test]
+    fn thirty_two_fabricated_remote_ids_never_evict_a_local_ring() {
+        let runs = RunOutputRegistry::default();
+        runs.append("aa".repeat(32), RunStream::Stdout, "local");
+        // fill every other slot with local runs too, so the registry sits at
+        // the cap holding nothing but locally hosted rings.
+        for i in 0..RUN_OUTPUT_MAX_RUNS - 1 {
+            runs.append(format!("{i:064x}"), RunStream::Stdout, "x");
+        }
+        for i in 0..RUN_OUTPUT_MAX_RUNS {
+            let forged = format!("{:064x}", i + 1_000);
+            assert!(
+                !runs.append_remote(RunOutputEvent {
+                    id: forged,
+                    stream: RunStream::Stdout,
+                    line: "flood".into(),
+                }),
+                "no remote ring exists to evict, so the flood is refused outright"
+            );
+        }
+        assert!(runs.is_local(&"aa".repeat(32)), "the local ring survives the flood");
+        let (rows, _) = runs.read_after(&"aa".repeat(32), 0, 10);
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

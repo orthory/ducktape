@@ -17,6 +17,7 @@ use noded::{RunOutputEvent, RunOutputRegistry};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::overlay_book::{BIND_RETRY, OverlayBook, OverlayPeers, Plane, StreamPlane};
+use crate::term_plane::PerPeerLatch;
 
 const RUN_OUTPUT_INTENT: u8 = 1;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
@@ -24,8 +25,85 @@ const MAX_EVENT_BYTES: usize = 64 * 1024;
 /// a failed open, and how often the fan-out re-reads the tracked set.
 const DIAL_RETRY: Duration = Duration::from_secs(3);
 
+/// how many distinct run ids ONE peer may hold a first-sender binding for.
+/// Same basis as term_plane's `MAX_OBSERVED_PER_PEER`: per peer, never
+/// node-wide, so a flooding peer only ever exhausts its own budget and never
+/// displaces another peer's bindings.
+const MAX_OBSERVED_RUNS_PER_PEER: usize = 64;
+
 fn run_output_flow() -> FlowId {
     FlowId::derive(b"ducktape:agent-run-output:v1")
+}
+
+/// which peer a mirrored (not locally hosted) run id accepts lines from.
+///
+/// A run id is consensus state — every member can learn every hosted run's
+/// id, unlike a term session's 16-hex random id — so "nobody has named this
+/// id yet" is not proof a peer owns it. What this DOES settle: once some peer
+/// has streamed lines for an id this node does not host, that peer is the
+/// only one that may keep streaming them. The first sender binds; every other
+/// peer is refused from then on, and [`MAX_OBSERVED_RUNS_PER_PEER`] bounds how
+/// many such bindings one peer may mint, so a flooding peer only ever spends
+/// its own budget. Mirrors [`noded::term_remote::RemoteSessions::feed_host`].
+#[derive(Default)]
+struct RemoteRunBindings(std::sync::Mutex<HashMap<String, PeerId>>);
+
+impl RemoteRunBindings {
+    /// the peer this id accepts lines from, binding `sender` if the id is
+    /// unbound. `None` when `sender` has already spent its whole budget of
+    /// first-sender bindings on ids nobody else has ever named.
+    fn bind(&self, id: &str, sender: PeerId) -> Option<PeerId> {
+        let mut bindings = self.0.lock().expect("run bindings lock poisoned");
+        if let Some(host) = bindings.get(id) {
+            return Some(*host);
+        }
+        // ponytail: counted by scanning this peer's bindings — bounded by
+        // MAX_OBSERVED_RUNS_PER_PEER × peers and reached only on an id never
+        // seen before. Keep a per-peer counter beside the map if a node ever
+        // mirrors enough runs for the scan to show.
+        let held = bindings.values().filter(|host| **host == sender).count();
+        if held >= MAX_OBSERVED_RUNS_PER_PEER {
+            return None;
+        }
+        bindings.insert(id.to_string(), sender);
+        Some(sender)
+    }
+}
+
+/// refused run-output grain, latched per (reason, peer) like term_plane's
+/// feed refusals: a peer drives this — one frame per output line — so an
+/// unlatched line is a log bomb.
+static RUN_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
+
+/// the host gate on an inbound run-output grain: refuses a line naming a run
+/// this node hosts locally, or one bound to a different peer, or one this
+/// peer has no bindings left to claim.
+fn run_refusal(
+    bindings: &RemoteRunBindings,
+    registry: &RunOutputRegistry,
+    event: &RunOutputEvent,
+    peer: PeerId,
+) -> Option<&'static str> {
+    if registry.is_local(&event.id) {
+        return Some("run_hosted_locally");
+    }
+    match bindings.bind(&event.id, peer) {
+        Some(host) if host == peer => None,
+        Some(_) => Some("run_not_bound_peer"),
+        None => Some("observed_runs_capped"),
+    }
+}
+
+fn run_refused(reason: &'static str, peer: PeerId) {
+    if let Some(occurrences) = RUN_REFUSED.hit(reason, peer) {
+        tracing::warn!(
+            target: "ducktape::agent",
+            reason,
+            node = %crate::config::hex_bytes(&peer.0[..4]),
+            occurrences,
+            "run output grain dropped"
+        );
+    }
 }
 
 /// the agent-telemetry plane's tag for the shared [`OverlayBook`]:
@@ -97,8 +175,9 @@ async fn run_bound<T: DataPlaneTransport>(
     registry: RunOutputRegistry,
 ) {
     let _plane = plane;
+    let bindings = Arc::new(RemoteRunBindings::default());
     tokio::select! {
-        _ = accept_loop(Arc::clone(&service), Arc::clone(&peers), registry.clone()) => {}
+        _ = accept_loop(Arc::clone(&service), Arc::clone(&peers), registry.clone(), bindings) => {}
         _ = fanout_loop(service, peers, me, registry) => {}
     }
 }
@@ -107,6 +186,7 @@ async fn accept_loop<T: DataPlaneTransport>(
     service: Arc<StreamService<T>>,
     peers: Arc<OverlayPeers>,
     registry: RunOutputRegistry,
+    bindings: Arc<RemoteRunBindings>,
 ) {
     let active = Arc::new(std::sync::Mutex::new(HashSet::new()));
     while let Some((peer, hello, stream)) = service.accept().await {
@@ -118,9 +198,10 @@ async fn accept_loop<T: DataPlaneTransport>(
         }
         let peers = Arc::clone(&peers);
         let registry = registry.clone();
+        let bindings = Arc::clone(&bindings);
         let active = Arc::clone(&active);
         tokio::spawn(async move {
-            let _ = receive_peer(stream, peer, peers, registry).await;
+            let _ = receive_peer(stream, peer, peers, registry, bindings).await;
             active.lock().expect("agent streams lock").remove(&peer);
         });
     }
@@ -131,6 +212,7 @@ async fn receive_peer<S: AsyncRead + Unpin>(
     peer: PeerId,
     peers: Arc<OverlayPeers>,
     registry: RunOutputRegistry,
+    bindings: Arc<RemoteRunBindings>,
 ) -> io::Result<()> {
     while peers.contains(peer) {
         let Some(mut event) = read_event(&mut stream).await? else {
@@ -139,6 +221,10 @@ async fn receive_peer<S: AsyncRead + Unpin>(
         if !peers.contains(peer) {
             return Ok(());
         }
+        if let Some(reason) = run_refusal(&bindings, &registry, &event, peer) {
+            run_refused(reason, peer);
+            continue;
+        }
         // The transport-authenticated source stays visible. Live output is
         // observational and must never masquerade as consensus-authored text.
         event.line = format!(
@@ -146,7 +232,9 @@ async fn receive_peer<S: AsyncRead + Unpin>(
             crate::config::hex_bytes(&peer.0[..4]),
             event.line
         );
-        registry.append_remote(event);
+        if !registry.append_remote(event) {
+            run_refused("run_registry_refused", peer);
+        }
     }
     Ok(())
 }
@@ -280,9 +368,78 @@ async fn read_event<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Option<R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::{Signer as _, ed25519};
-    use data_plane::PlaneConfig;
+    use commonware_cryptography::{ed25519, Signer as _};
     use data_plane::sim::{LinkModel, SimNet};
+    use data_plane::PlaneConfig;
+
+    #[test]
+    fn a_second_peer_is_refused_once_the_first_binds_a_run_id() {
+        let registry = RunOutputRegistry::default();
+        let bindings = RemoteRunBindings::default();
+        let a = PeerId([1u8; 32]);
+        let b = PeerId([2u8; 32]);
+        let id = "cc".repeat(32);
+        let event = RunOutputEvent {
+            id: id.clone(),
+            stream: noded::RunStream::Stdout,
+            line: "x".into(),
+        };
+        assert_eq!(run_refusal(&bindings, &registry, &event, a), None);
+        assert_eq!(
+            run_refusal(&bindings, &registry, &event, b),
+            Some("run_not_bound_peer")
+        );
+        // the bound peer keeps streaming.
+        assert_eq!(run_refusal(&bindings, &registry, &event, a), None);
+    }
+
+    #[test]
+    fn a_run_this_node_hosts_locally_refuses_every_peer() {
+        let registry = RunOutputRegistry::default();
+        registry.append("dd".repeat(32), noded::RunStream::Stdout, "local");
+        let bindings = RemoteRunBindings::default();
+        let peer = PeerId([3u8; 32]);
+        let event = RunOutputEvent {
+            id: "dd".repeat(32),
+            stream: noded::RunStream::Stdout,
+            line: "forged".into(),
+        };
+        assert_eq!(
+            run_refusal(&bindings, &registry, &event, peer),
+            Some("run_hosted_locally")
+        );
+    }
+
+    #[test]
+    fn a_peer_at_its_binding_budget_cannot_claim_a_new_id() {
+        let registry = RunOutputRegistry::default();
+        let bindings = RemoteRunBindings::default();
+        let flooder = PeerId([9u8; 32]);
+        for i in 0..MAX_OBSERVED_RUNS_PER_PEER {
+            let event = RunOutputEvent {
+                id: format!("{i:064x}"),
+                stream: noded::RunStream::Stdout,
+                line: "x".into(),
+            };
+            assert_eq!(run_refusal(&bindings, &registry, &event, flooder), None);
+        }
+        let over_budget = RunOutputEvent {
+            id: format!("{:064x}", MAX_OBSERVED_RUNS_PER_PEER + 1),
+            stream: noded::RunStream::Stdout,
+            line: "x".into(),
+        };
+        assert_eq!(
+            run_refusal(&bindings, &registry, &over_budget, flooder),
+            Some("observed_runs_capped")
+        );
+        // a peer with its own budget is unaffected by the flooder's.
+        let other = PeerId([10u8; 32]);
+        assert_eq!(
+            run_refusal(&bindings, &registry, &over_budget, other),
+            None,
+            "one peer's flood never spends another's budget"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn live_output_crosses_nodes_once_and_keeps_its_source() {
@@ -338,6 +495,7 @@ mod tests {
             service_b,
             Arc::clone(&peers),
             registry_b.clone(),
+            Arc::new(RemoteRunBindings::default()),
         ));
         let send = tokio::spawn(send_peer(
             service_a,
