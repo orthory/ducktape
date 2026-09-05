@@ -115,6 +115,7 @@ fn synced_store_reconstructs_source_root_registry_and_swaps() {
             msg(ModulesMsg::SwapReady {
                 name: "hello-replacement".into(),
                 module_id: "hello".into(),
+                code_hash: hash(9),
             }),
         )
         .await;

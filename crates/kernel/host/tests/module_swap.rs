@@ -126,6 +126,7 @@ fn signal_ready_msg() -> Msg {
     modules_msg(&ModulesMsg::SwapReady {
         name: "hello-replacement".into(),
         module_id: "hello".into(),
+        code_hash: sha(HELLO_REPLACEMENT),
     })
 }
 
@@ -306,9 +307,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     // reconstructs the identical record set over the MemStore double, and
     // the roots must agree), wasm module freshly wired from GENESIS (v1)
     // code.
-    let modreg_root = source
-        .module_root(MODULES_ID)
-        .expect("modreg root");
+    let modreg_root = source.module_root(MODULES_ID).expect("modreg root");
     let mut joiner = Host::new();
     joiner.register(Box::new(Modules::new(
         MODULES_ID,

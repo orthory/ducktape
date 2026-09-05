@@ -139,6 +139,7 @@ impl CodeReadinessSignaller {
                         payload: modules::encode_msg(&modules::ModulesMsg::SwapReady {
                             name: key.1.clone(),
                             module_id: key.0.clone(),
+                            code_hash: digest.to_vec(),
                         }),
                     };
                     actions.signals.push((key, msg));
@@ -288,7 +289,9 @@ mod tests {
         let mut s = CodeReadinessSignaller::new(me());
         let modules = vec![pending("a", "replacement", 1, false, &[])];
         assert_eq!(
-            s.decide(&modules, |_, _| CodeVerdict::Loadable).signals.len(),
+            s.decide(&modules, |_, _| CodeVerdict::Loadable)
+                .signals
+                .len(),
             1
         );
         assert!(

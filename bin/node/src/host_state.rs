@@ -100,7 +100,10 @@ enum Hydrated {
     /// the workspace genesis file is absent — a joiner before its first
     /// fetch — and nothing was installed. `hash` is the descriptor's pin the
     /// fetch asks the mesh for.
-    GenesisAbsent { file: std::path::PathBuf, hash: [u8; 32] },
+    GenesisAbsent {
+        file: std::path::PathBuf,
+        hash: [u8; 32],
+    },
 }
 
 /// install the genesis this node holds on disk: every component into the
@@ -235,14 +238,17 @@ fn seed_workspace_genesis(
             bytes
         }
     };
-    let genesis = verify_genesis(&bytes, hash, want).map_err(|e| format!("{}: {e}", file.display()))?;
+    let genesis =
+        verify_genesis(&bytes, hash, want).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut seeded = 0usize;
     for (id, digest) in want {
         if blobs.has_chunk(digest) {
             continue;
         }
         // verified above: every id in `want` is a component hashing to `digest`.
-        let component = genesis.component(id).expect("verified genesis carries every module");
+        let component = genesis
+            .component(id)
+            .expect("verified genesis carries every module");
         blobs.put_chunk(component.to_vec());
         seeded += 1;
     }
@@ -345,7 +351,11 @@ fn wire(
     net: &NetworkBindings<'_>,
     index: &indexer::IndexStore,
 ) -> Result<(), String> {
-    host.set_module_factory(Box::new(Admissions::new(context, substrates, &net.compose())));
+    host.set_module_factory(Box::new(Admissions::new(
+        context,
+        substrates,
+        &net.compose(),
+    )));
     index_host_modules(index, host.module_roots().iter().map(|(id, _)| id.as_str()))
 }
 
@@ -557,7 +567,8 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     // the runtime labels its children with static strings, and the resolver
     // lane names its module the same way; a module id comes off the registry
     // as a `String`, so each is leaked once per attempt — a bounded handful.
-    let static_label = |name: &str| -> &'static str { Box::leak(name.to_string().into_boxed_str()) };
+    let static_label =
+        |name: &str| -> &'static str { Box::leak(name.to_string().into_boxed_str()) };
     let pinned_target = |module: &'static str| -> Result<statesync::qmdb::SyncTarget, String> {
         let entry = manifest
             .entry(module)
@@ -900,15 +911,13 @@ mod tests {
                 ModulesMsg::SwapReady {
                     name: "next".into(),
                     module_id: "hello".into(),
+                    code_hash: second.to_vec(),
                 },
             ),
             (Origin::System, 50, ModulesMsg::Advance),
         ];
-        let mut registry = Modules::new(
-            "modules",
-            Box::new(sdk_testkit::MemStore::new()),
-            "valset",
-        );
+        let mut registry =
+            Modules::new("modules", Box::new(sdk_testkit::MemStore::new()), "valset");
         futures::executor::block_on(async {
             for (origin, height, m) in steps {
                 let mut ctx = ctx(origin, height);
@@ -1032,7 +1041,10 @@ mod tests {
             .expect("present");
         assert_eq!(loaded, genesis);
         assert!(blobs.has_chunk(&want["pages"]), "the component");
-        assert!(blobs.has_chunk(&hash), "the genesis itself, for the next joiner");
+        assert!(
+            blobs.has_chunk(&hash),
+            "the genesis itself, for the next joiner"
+        );
 
         // the file is the chunk's readable copy: lose it, and the seeded
         // store writes it back.
@@ -1075,13 +1087,13 @@ mod tests {
         assert!(blobs.has_chunk(&want["pages"]));
 
         std::fs::write(dir.path().join("pages.component.wasm"), b"tampered").expect("write");
-        let err = seed_founding_set(&blobstore::BlobHandle::default(), dir.path(), &want)
-            .unwrap_err();
+        let err =
+            seed_founding_set(&blobstore::BlobHandle::default(), dir.path(), &want).unwrap_err();
         assert!(err.contains("module pages"), "{err}");
 
         std::fs::remove_file(dir.path().join("pages.component.wasm")).expect("remove");
-        let err = seed_founding_set(&blobstore::BlobHandle::default(), dir.path(), &want)
-            .unwrap_err();
+        let err =
+            seed_founding_set(&blobstore::BlobHandle::default(), dir.path(), &want).unwrap_err();
         assert!(err.contains("pages.component.wasm"), "{err}");
         // a chunk the store already holds needs no file at all.
         seed_founding_set(&blobs, dir.path(), &want).expect("seeded store");
