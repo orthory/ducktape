@@ -530,8 +530,38 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
 /// CONTROL stream per create/close, and a peer that keeps retrying a refused
 /// create can open as many of those as it likes — so they latch by reason
 /// instead of flooding, the same discipline `sync::serve`'s statesync refusals
-/// use. First occurrence, then every 100th, carrying `occurrences`.
-static CREATE_REFUSED: noded::log::Latch = noded::log::Latch::new(100);
+/// use. First occurrence, then every 100th, carrying `occurrences` — but keyed
+/// per (reason, peer): the `node` field above exists so the operator knows
+/// whom to admit, and a latch keyed on the reason alone silences peer B's
+/// first refusal because peer A already hit the same reason.
+static CREATE_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
+
+/// Like [`noded::log::Latch`], but keyed on `(reason, peer)` instead of just
+/// `reason` — `Latch::hit` only takes a `&'static str`, and a peer id is not
+/// one. First occurrence per peer, then every `every`th, per peer.
+struct PerPeerLatch {
+    counts: std::sync::Mutex<std::collections::BTreeMap<(&'static str, PeerId), u64>>,
+    every: u64,
+}
+
+impl PerPeerLatch {
+    const fn new(every: u64) -> Self {
+        Self {
+            counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            every,
+        }
+    }
+
+    /// returns `Some(occurrences)` when this peer's occurrence of `reason`
+    /// should be logged.
+    fn hit(&self, reason: &'static str, peer: PeerId) -> Option<u64> {
+        let mut counts = self.counts.lock().expect("latch lock poisoned");
+        let count = counts.entry((reason, peer)).or_insert(0);
+        *count += 1;
+        let n = *count;
+        (n == 1 || n.is_multiple_of(self.every)).then_some(n)
+    }
+}
 
 async fn serve_create(
     control: &ControlState,
@@ -560,7 +590,7 @@ async fn serve_create(
             // routing metadata already logged at boot, and without it the
             // operator is told "someone was refused" with no way to find out
             // whom to admit.
-            if let Some(occurrences) = CREATE_REFUSED.hit(refusal.reason()) {
+            if let Some(occurrences) = CREATE_REFUSED.hit(refusal.reason(), peer) {
                 tracing::warn!(
                     target: "ducktape::term",
                     reason = refusal.reason(),
@@ -575,7 +605,7 @@ async fn serve_create(
         // caller is told to retry rather than sent to fix an admission that may
         // already exist.
         crate::work_admission::WorkVerdict::AuthorityUnavailable => {
-            if let Some(occurrences) = CREATE_REFUSED.hit("work_authority_unavailable") {
+            if let Some(occurrences) = CREATE_REFUSED.hit("work_authority_unavailable", peer) {
                 tracing::warn!(
                     target: "ducktape::term",
                     reason = "work_authority_unavailable",
@@ -591,7 +621,7 @@ async fn serve_create(
         }
     }
     let Some(sessions) = control.sessions.clone() else {
-        if let Some(occurrences) = CREATE_REFUSED.hit("no_sandbox") {
+        if let Some(occurrences) = CREATE_REFUSED.hit("no_sandbox", peer) {
             tracing::warn!(
                 target: "ducktape::term",
                 reason = "no_sandbox",
@@ -616,7 +646,7 @@ async fn serve_create(
     let admit = match admit_create(provider, record.as_ref(), cpu, mem_gb, sandbox_present) {
         Ok(admit) => admit,
         Err((reason, detail)) => {
-            if let Some(occurrences) = CREATE_REFUSED.hit(reason) {
+            if let Some(occurrences) = CREATE_REFUSED.hit(reason, peer) {
                 tracing::warn!(
                     target: "ducktape::term",
                     reason,
@@ -1183,6 +1213,20 @@ async fn owner_airlock_authority(
 mod tests {
     use super::*;
     use noded::TermChunkEvent;
+
+    #[test]
+    fn per_peer_latch_logs_each_peers_first_refusal() {
+        let latch = PerPeerLatch::new(100);
+        let a = PeerId([1u8; 32]);
+        let b = PeerId([2u8; 32]);
+        // peer A's first hit on a reason logs...
+        assert_eq!(latch.hit("no_sandbox", a), Some(1));
+        // ...its second does not, latched same as the crate-wide Latch...
+        assert_eq!(latch.hit("no_sandbox", a), None);
+        // ...but peer B's FIRST hit on the SAME reason still logs: the whole
+        // point is that one peer's refusal never silences another's.
+        assert_eq!(latch.hit("no_sandbox", b), Some(1));
+    }
 
     #[test]
     fn valid_session_accepts_16_hex_and_rejects_the_rest() {

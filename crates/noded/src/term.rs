@@ -784,12 +784,32 @@ impl TerminalSessions {
         // two reasons, not one: "this node minted no secret" is an operator's
         // node to fix and "you presented the wrong one" is the daemon's, and
         // collapsing them sends whoever reads the log to the wrong machine.
+        //
+        // latched, not once-per-session: `attach` is reached from a plain ws
+        // `ClientMsg::ServiceAttach` that any client can send in a loop, and
+        // the real agent daemon redials a refused link every 2s forever
+        // (`bin/node/src/agent/link.rs`'s `Refused` arm) — unlatched, a node
+        // with no minted token would warn ~1800x/h with no counter.
         if self.0.link_token.is_none() {
-            tracing::warn!(target: "ducktape::service", reason = "no_link_token", "agent service link refused");
+            if let Some(occurrences) = TERM_WARN.hit("no_link_token") {
+                tracing::warn!(
+                    target: "ducktape::service",
+                    reason = "no_link_token",
+                    occurrences,
+                    "agent service link refused"
+                );
+            }
             return None;
         }
         if !self.link_token_matches(token) {
-            tracing::warn!(target: "ducktape::service", reason = "bad_link_token", "agent service link refused");
+            if let Some(occurrences) = TERM_WARN.hit("bad_link_token") {
+                tracing::warn!(
+                    target: "ducktape::service",
+                    reason = "bad_link_token",
+                    occurrences,
+                    "agent service link refused"
+                );
+            }
             return None;
         }
         let mut link = self.0.link.lock().expect("term link lock poisoned");
@@ -817,9 +837,11 @@ impl TerminalSessions {
     /// fails closed.
     ///
     /// A pure predicate: it logs nothing, because its two callers must not log
-    /// alike. An attach is a once-per-daemon-session event worth a `warn`; a
-    /// subscribe is per-request and locally drivable in a loop, so a `warn`
-    /// there would evict the 4096-line ring. Each caller names its own level.
+    /// alike. An attach arrives over a plain ws client message that a client
+    /// (or a redialing agent daemon) can loop, so its `warn` is latched by
+    /// [`TERM_WARN`]; a subscribe is per-request and locally drivable in a
+    /// loop too, and it does not warn at all — a rejected subscription just
+    /// answers with an `unavailable` frame. Each caller names its own level.
     pub(crate) fn link_token_matches(&self, presented: &str) -> bool {
         self.0
             .link_token
