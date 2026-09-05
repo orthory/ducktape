@@ -118,9 +118,10 @@ struct AppState {
     /// The co-hosted-lending grant gate (see [`GrantCheck`]). `None` on gateways
     /// that never lend, where every known credential opens without a grant check.
     grant_check: Option<GrantCheck>,
-    /// Lazy store loader (see [`ReloadCredential`]): consulted on a session name
-    /// miss so a credential `cred add` wrote after boot is served without a
-    /// restart. `None` on gateways with no backing store (TEE, tests).
+    /// Lazy store loader (see [`ReloadCredential`]): consulted before every
+    /// session open and every proxied request, so a credential the operator
+    /// added, rotated or REMOVED after boot takes effect without a restart.
+    /// `None` on gateways with no backing store (TEE, tests).
     reload: Option<ReloadCredential>,
 }
 
@@ -193,12 +194,29 @@ pub struct GrantQuestion {
 pub type GrantCheck =
     Arc<dyn Fn(GrantQuestion) -> Pin<Box<dyn Future<Output = GrantAnswer> + Send>> + Send + Sync>;
 
-/// Lazy store loader: given a credential name, return its payload from the
-/// on-disk store, or `None` if absent. Lets a running gateway pick up a
-/// credential `cred add` wrote AFTER boot without a node restart — the session
-/// handler calls it on a name miss. `None` on gateways with no backing store.
-pub type ReloadCredential =
-    Arc<dyn Fn(&str) -> Option<(CredentialKind, CredentialPayload)> + Send + Sync>;
+/// What the on-disk store holds for one credential name, as the lazy loader
+/// found it.
+///
+/// THREE answers, not two: "the artifact has not changed" and "there is no
+/// artifact" are opposite instructions to a running gateway, and an `Option`
+/// spelled them the same way — which is how `user cred remove` left a deleted
+/// credential being spent by every outstanding session until a restart.
+pub enum StoreLoad {
+    /// An artifact the live entry was not built from: first sight of the name,
+    /// or one a re-login rotated in place. Adopt it.
+    Loaded(CredentialKind, CredentialPayload),
+    /// The store holds exactly what this gateway already serves.
+    Unchanged,
+    /// The store holds nothing under that name — `user cred remove`/`revoke`
+    /// deleted it. Forget it.
+    Absent,
+}
+
+/// Lazy store loader: given a credential name, say what the on-disk store holds
+/// for it. Lets a running gateway track `user cred add`/re-login/`remove`
+/// without a node restart — the session and proxy handlers both call it before
+/// resolving a name. `None` on gateways with no backing store (TEE, tests).
+pub type ReloadCredential = Arc<dyn Fn(&str) -> StoreLoad + Send + Sync>;
 
 /// Whether this gateway serves `POST /credential`.
 ///
@@ -624,27 +642,50 @@ async fn session_gate(
     }
 }
 
-/// Consult the lazy store loader for `name` and adopt whatever it hands back.
+/// Track the on-disk store for `name`: adopt what it added or rotated, forget
+/// what it removed.
 ///
-/// The loader is the one that decides there is anything to do: it answers
-/// `Some` for a credential the live store has never held AND for one whose
-/// backing artifact has changed since it was last read. So this runs on every
-/// session rather than only on a store miss — otherwise a re-login that rotated
-/// a credential in place would be served as the dead token until restart.
+/// The loader is the one that decides there is anything to do (see
+/// [`StoreLoad`]), so this runs on every session AND every proxied request
+/// rather than only on a store miss. All three restart-free cases are the same
+/// one call: a credential `cred add` wrote after boot, one a re-login rotated
+/// in place, and one `cred remove`/`revoke` deleted — which must stop being
+/// spent by the sessions already holding a token for it, not at the end of
+/// their TTL.
 ///
-/// A no-op when no loader is wired (an enclave has no backing store) or the
-/// loader has nothing new.
+/// A no-op when no loader is wired: an enclave has no backing store, so its
+/// credentials only ever arrive over the sealed upload.
 fn refresh_credential(st: &AppState, name: &str) {
     let Some(reload) = &st.reload else {
         return;
     };
-    let Some((kind, payload)) = reload(name) else {
-        return;
-    };
+    match reload(name) {
+        StoreLoad::Loaded(kind, payload) => adopt_credential(st, name, kind, payload),
+        StoreLoad::Unchanged => {}
+        StoreLoad::Absent => forget_credential(st, name),
+    }
+}
+
+/// Parse the store's artifact into live token state and serve it under `name`.
+/// An artifact that will not parse leaves the previous entry in place — the
+/// loader already logged what it skipped, and dropping a working credential on
+/// a half-written file would be the worse failure.
+fn adopt_credential(st: &AppState, name: &str, kind: CredentialKind, payload: CredentialPayload) {
     let Ok(entry) = cred_entry(kind, payload) else {
         return;
     };
     st.creds.lock().unwrap().insert(name.to_string(), Arc::new(entry));
+}
+
+/// Drop every trace of a credential the store no longer holds: the parsed entry
+/// (which carries the live access and refresh tokens), the budget its sessions
+/// spend, and their replay set. The next proxied request on an outstanding
+/// session finds no credential and is refused, so `user cred remove` stops the
+/// spend when the operator runs it rather than when the last token expires.
+fn forget_credential(st: &AppState, name: &str) {
+    st.creds.lock().unwrap().remove(name);
+    st.budgets.lock().unwrap().remove(name);
+    st.seen_nonces.lock().unwrap().remove(name);
 }
 
 async fn session(
@@ -763,6 +804,13 @@ async fn proxy_inner(
     }
     // The session's `sub` names the credential it draws on; resolve it now — its
     // kind selects the upstream and its own token state is what we refresh/spend.
+    //
+    // The store gets first refusal here as it does at `/session`, and for the
+    // same reason: a token minted an hour ago says nothing about whether the
+    // credential still exists. Checking only at session open let `user cred
+    // remove` be followed by a whole TTL of spending on the deleted credential.
+    // One stat per request, the same one the session path pays.
+    refresh_credential(st, &claims.sub);
     let entry = st
         .creds
         .lock()
@@ -1075,8 +1123,7 @@ mod tests {
         let uri: axum::http::Uri = "/v1/messages".parse().unwrap();
         proxy_inner(st, Method::POST, &uri, &sealed_headers(token), Bytes::from(body))
             .await
-            .err()
-            .expect("the upstream is unreachable, so every call ends in an error")
+            .expect_err("the upstream is unreachable, so every call ends in an error")
             .0
     }
 
