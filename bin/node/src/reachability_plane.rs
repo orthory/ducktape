@@ -30,11 +30,69 @@ pub(crate) enum IntroPath {
 /// its own socket, the coordinated receiver via `SendResolverDatagram`).
 /// Returns `false` once the plane's command channel is gone, telling the
 /// caller to exit its receive loop.
+/// one settled gate outcome plus the wall-clock instant it was written: what
+/// [`sweep_gate_outcomes`] ages out and [`insert_gate_outcome`] evicts by,
+/// oldest first, at the cap.
+pub(crate) struct GateOutcomeEntry {
+    pub(crate) reply: join_gate::IntroReply,
+    pub(crate) settled_at: std::time::SystemTime,
+}
+
+/// cap on live gate outcomes. An invite is bearer (`join_gate.rs`: no target
+/// lock, the join proof binds only the announced key), so one unexpired
+/// token mints unlimited joiner keys and each verified intro settles an
+/// entry — sized generously above the invite-peer table's own concurrency
+/// limit (`reachability::MAX_INVITE_PEERS`, 64 uncovered tunnels per join
+/// window) so ordinary churn never evicts a live outcome.
+pub(crate) const MAX_GATE_OUTCOMES: usize = 4096;
+
+pub(crate) type GateOutcomeMap = HashMap<Vec<u8>, GateOutcomeEntry>;
+
 /// the shared gate-outcome map (joiner key → its resolved [`join_gate::IntroReply`]):
 /// the run loop's drain WRITES the settled outcome, the intro doorbell READS it
 /// on the joiner's next retransmit and seals it back down the tunnel.
-pub(crate) type GateOutcomes =
-    std::sync::Arc<std::sync::Mutex<HashMap<Vec<u8>, join_gate::IntroReply>>>;
+pub(crate) type GateOutcomes = std::sync::Arc<std::sync::Mutex<GateOutcomeMap>>;
+
+/// Insert a freshly-settled outcome, capped at [`MAX_GATE_OUTCOMES`] live
+/// entries: past the cap the OLDEST entry is evicted to make room. A
+/// re-settle of a joiner already tracked (a held gate resolving after an
+/// earlier `Installed`/`Busy` write) never grows the map, so it never evicts.
+pub(crate) fn insert_gate_outcome(
+    map: &mut GateOutcomeMap,
+    joiner: Vec<u8>,
+    reply: join_gate::IntroReply,
+    now: std::time::SystemTime,
+) {
+    if map.len() >= MAX_GATE_OUTCOMES
+        && !map.contains_key(&joiner)
+        && let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, entry)| entry.settled_at)
+            .map(|(key, _)| key.clone())
+    {
+        map.remove(&oldest);
+    }
+    map.insert(
+        joiner,
+        GateOutcomeEntry {
+            reply,
+            settled_at: now,
+        },
+    );
+}
+
+/// Sweep every entry settled more than `window` ago — `Admitted` included. A
+/// joiner that never retransmits within the invite join window and shows up
+/// again later just re-runs the gate: `on_gate_forward`'s V9 arm ("already
+/// holding standing") answers it Admitted again for free, no consensus round
+/// — so letting a stale `Admitted` age out costs nothing but a re-read.
+pub(crate) fn sweep_gate_outcomes(
+    map: &mut GateOutcomeMap,
+    now: std::time::SystemTime,
+    window: std::time::Duration,
+) {
+    map.retain(|_, entry| now.duration_since(entry.settled_at).unwrap_or_default() <= window);
+}
 
 /// The handshake sampler's knowledge, published for the event pump: peer
 /// ULAs whose WireGuard tunnel is carrying traffic at the last sample. The
@@ -208,8 +266,11 @@ async fn gate_reply(
     let settled = {
         let mut outcomes = hook.outcomes.lock().expect("gate outcomes lock");
         match outcomes.get(&joiner_key) {
-            Some(admitted @ join_gate::IntroReply::Admitted { .. }) => Some(admitted.clone()),
-            Some(_) => outcomes.remove(&joiner_key),
+            Some(GateOutcomeEntry {
+                reply: admitted @ join_gate::IntroReply::Admitted { .. },
+                ..
+            }) => Some(admitted.clone()),
+            Some(_) => outcomes.remove(&joiner_key).map(|entry| entry.reply),
             None => None,
         }
     };
@@ -732,8 +793,9 @@ pub(crate) fn record_swap(metrics: &noded::NodeMetrics, answer: &SwapAnswer) {
             metrics.set_netstack_backend(backend.clone());
             metrics.record_netstack_swap(noded::NetstackSwapOutcome::Swapped, None);
         }
-        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => metrics
-            .record_netstack_swap(noded::NetstackSwapOutcome::Refused, Some(reason.clone())),
+        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => {
+            metrics.record_netstack_swap(noded::NetstackSwapOutcome::Refused, Some(reason.clone()))
+        }
     }
 }
 
