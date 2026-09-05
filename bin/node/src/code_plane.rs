@@ -232,6 +232,11 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let mut slot = match blobs.stage(digest, len) {
         Ok(slot) => slot,
+        // the mesh fetch lane holds this digest's staging slot: it is landing
+        // the same bytes, and staging is single-writer.
+        Err(blobstore::StageError::AlreadyStaging) => {
+            return refuse(stream, "already_staging").await;
+        }
         Err(_) => return refuse(stream, "stage_open_failed").await,
     };
     stream.write_all(&[ACK_SEND_FROM]).await?;

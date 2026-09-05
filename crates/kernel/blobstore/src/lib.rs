@@ -71,6 +71,11 @@ pub(crate) struct BlobStore {
     cache_bytes: usize,
     /// write-through persistence root; `None` = pure in-memory.
     root: Option<PathBuf>,
+    /// digests with a live [`StagedBlob`]. staging is single-writer per digest
+    /// — two lanes staging one digest share a file and a name, and the loser's
+    /// bytes end up published under the winner's hash — and this set is the
+    /// exclusion. it also tells the sweep which partials are alive.
+    staging: std::collections::HashSet<[u8; 32]>,
 }
 
 impl BlobStore {
@@ -82,7 +87,10 @@ impl BlobStore {
         std::fs::create_dir_all(&root)?;
         // boot sweep: a transfer that died with the process left a partial
         // behind, and nothing else ever reclaims one.
-        if let Err(error) = staging::sweep_staging_dir(&root, staging::STAGING_RESUME_WINDOW) {
+        // nothing can be staging into a store that is only now opening.
+        let live = std::collections::HashSet::new();
+        if let Err(error) = staging::sweep_staging_dir(&root, staging::STAGING_RESUME_WINDOW, &live)
+        {
             tracing::warn!(
                 target: "ducktape::blobstore",
                 reason = "staging_sweep_failed",
@@ -344,6 +352,34 @@ impl BlobHandle {
     /// see [`BlobStore::forget`].
     pub fn forget(&self, digest: &[u8; 32]) {
         self.0.lock().expect("blob store poisoned").forget(digest)
+    }
+
+    /// take this digest's staging slot; `false` when someone else holds it.
+    pub(crate) fn claim_staging(&self, digest: [u8; 32]) -> bool {
+        self.0
+            .lock()
+            .expect("blob store poisoned")
+            .staging
+            .insert(digest)
+    }
+
+    pub(crate) fn release_staging(&self, digest: &[u8; 32]) {
+        self.0
+            .lock()
+            .expect("blob store poisoned")
+            .staging
+            .remove(digest);
+    }
+
+    /// the staging file names a live writer holds right now.
+    pub(crate) fn staged_names(&self) -> std::collections::HashSet<String> {
+        self.0
+            .lock()
+            .expect("blob store poisoned")
+            .staging
+            .iter()
+            .map(hex)
+            .collect()
     }
 
     /// the write-through root, when persistent — where staging slots live.
