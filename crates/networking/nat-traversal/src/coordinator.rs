@@ -271,17 +271,28 @@ impl Coordinator {
             Msg::Register { key } => {
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
-                adverts.observe(key, from, now);
+                let outcome = adverts.observe(key, from, now);
                 // The book is done with; a log write (stderr, and a node's
                 // LogRing) must not happen under its lock.
                 drop(adverts);
-                tracing::debug!(
-                    target: "ducktape::reachability",
-                    event = "advert_registered",
-                    key = short_key(key),
-                    reflexive = %from,
-                    "registered a member at its observed source"
-                );
+                match outcome {
+                    AdvertOutcome::Superseded => tracing::debug!(
+                        target: "ducktape::reachability",
+                        event = "advert_registered",
+                        key = short_key(key),
+                        reflexive = %from,
+                        "registered a member at its observed source"
+                    ),
+                    // AdvertBook::admit already logged the per-source refusal
+                    // (latched, reason "advert_source_cap") — nothing more to
+                    // do here.
+                    AdvertOutcome::Refused => {}
+                    // a live mapping already ahead of this bare Register (a
+                    // superseding nonce, or a different source): nothing
+                    // changed, so nothing was "registered".
+                    AdvertOutcome::NoOp => {}
+                    AdvertOutcome::Stale => {}
+                }
                 CoordinatorReplies::new()
             }
             Msg::Readvertise { key, nonce } => {
@@ -315,6 +326,8 @@ impl Coordinator {
                     // (latched, reason "advert_source_cap") — nothing more to
                     // do here.
                     AdvertOutcome::Refused => {}
+                    // `readvertise` never returns this — only `observe` does.
+                    AdvertOutcome::NoOp => {}
                 }
                 CoordinatorReplies::new()
             }

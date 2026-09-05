@@ -40,10 +40,17 @@ pub const REGISTRATION_TTL_SECS: u64 = 120;
 pub enum AdvertOutcome {
     Superseded,
     Stale,
-    /// A first-seen key whose source IP is already at
-    /// [`MAX_ADVERTS_PER_SOURCE_IP`]. Admission, not eviction: no existing
-    /// entry — from this source or any other — was touched.
+    /// A write that would add a live entry to a source IP already at
+    /// [`MAX_ADVERTS_PER_SOURCE_IP`] — a first-seen key, an expired key's
+    /// refresh, or a readvertise that migrates a key to a new source. Admission,
+    /// not eviction: no existing entry — from this source or any other — was
+    /// touched.
     Refused,
+    /// `observe` found a mapping already ahead of the baseline (a superseding
+    /// nonce, or a live mapping from a different source) and left it
+    /// untouched. Not a refusal — nothing was refused, there was simply
+    /// nothing to do.
+    NoOp,
 }
 
 /// The reachability-plane reflexive registry: for each node key, the latest
@@ -130,14 +137,17 @@ impl AdvertBook {
     /// `Register` still refreshes liveness. An EXPIRED mapping is dead weight (its
     /// pinhole is gone), so both guards yield and the fresh register takes the
     /// slot back — the reboot case.
-    pub fn observe(&mut self, key: NodeKey, src: SocketAddr, now: u64) {
+    pub fn observe(&mut self, key: NodeKey, src: SocketAddr, now: u64) -> AdvertOutcome {
         match self.latest.get(&key) {
             Some(prev) if !self.expired(prev, now) && (prev.nonce > 0 || prev.reflexive != src) => {
+                AdvertOutcome::NoOp
             }
-            // A refusal (source at its per-IP cap) leaves nothing to react
-            // to here: no mapping existed before and none exists after.
             _ => {
-                self.insert_fresh(key, src, 0, now);
+                if self.insert_fresh(key, src, 0, now) {
+                    AdvertOutcome::Superseded
+                } else {
+                    AdvertOutcome::Refused
+                }
             }
         }
     }
