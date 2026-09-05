@@ -121,6 +121,7 @@ fn signal_ready_msg() -> Msg {
     modules_msg(&ModulesMsg::SwapReady {
         name: "kanban-v1".into(),
         module_id: "kanban".into(),
+        code_hash: sha(COMPONENT),
     })
 }
 
@@ -160,7 +161,12 @@ fn run_admission_scenario() -> (Host, StateRoot) {
 
     // governance-shaped admission + the member's byte-receipt signal.
     submit(&mut host, 3, Origin::System, schedule_register_msg());
-    submit(&mut host, 4, Origin::External(MEMBER.to_vec()), signal_ready_msg());
+    submit(
+        &mut host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
 
     // registered-not-running: modreg carries the admission (empty active hash,
     // one pending), the host does not know the module at all.
@@ -174,7 +180,10 @@ fn run_admission_scenario() -> (Host, StateRoot) {
 
     // below H nothing arms: realization is a no-op and the module stays absent.
     realize(&mut host, H - 1, &src).expect("below H is Ok");
-    assert!(host.module_root("kanban").is_none(), "not registered below H");
+    assert!(
+        host.module_root("kanban").is_none(),
+        "not registered below H"
+    );
 
     // THE BOUNDARY: realization instantiates + registers, growing the root-hash
     // by the new module's (empty) root — deterministically.
@@ -189,14 +198,22 @@ fn run_admission_scenario() -> (Host, StateRoot) {
     // idempotent: a second realization at the same height is a no-op.
     let after_first = host.root_hash();
     realize(&mut host, H, &src).expect("re-realize is Ok");
-    assert_eq!(host.root_hash(), after_first, "re-realization moves nothing");
+    assert_eq!(
+        host.root_hash(),
+        after_first,
+        "re-realization moves nothing"
+    );
 
     // block H: the module executes over fresh state; the drain's injected
     // Advance flips the committed active hash in the same block.
     submit(&mut host, H, Origin::External(vec![9; 32]), inc_msg());
     assert_eq!(count(&host), 1, "fresh state, first inc");
     let (active, pending) = kanban_entry(&host).expect("entry persists");
-    assert_eq!(active, sha(COMPONENT), "Advance flipped the committed hash at H");
+    assert_eq!(
+        active,
+        sha(COMPONENT),
+        "Advance flipped the committed hash at H"
+    );
     assert!(!pending, "the pending slot is freed at H");
 
     // after the boundary the module is an ordinary hot-swappable citizen.
@@ -236,6 +253,7 @@ fn a_module_that_touches_nothing_admits_over_the_empty_root_and_never_moves_it()
         modules_msg(&ModulesMsg::SwapReady {
             name: "noop-v1".into(),
             module_id: "noop".into(),
+            code_hash: sha(NOOP),
         }),
     );
     realize(&mut host, H, &src).expect("admission realizes at H");
@@ -281,7 +299,12 @@ fn admission_is_deterministic_across_nodes() {
 fn admission_fails_closed_on_missing_or_tampered_bytes() {
     let mut host = bare_host(true);
     submit(&mut host, 3, Origin::System, schedule_register_msg());
-    submit(&mut host, 4, Origin::External(MEMBER.to_vec()), signal_ready_msg());
+    submit(
+        &mut host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
 
     let empty = MapSource::with(&[]);
     assert!(
@@ -315,7 +338,12 @@ fn admission_fails_closed_without_a_module_factory() {
     realize(&mut host, H, &src).expect("no admissions, no factory needed");
 
     submit(&mut host, 3, Origin::System, schedule_register_msg());
-    submit(&mut host, 4, Origin::External(MEMBER.to_vec()), signal_ready_msg());
+    submit(
+        &mut host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
     realize(&mut host, H - 1, &src).expect("unarmed admission needs nothing");
     assert!(
         realize(&mut host, H, &src).is_err(),
@@ -358,6 +386,7 @@ fn a_foreign_abi_record_is_skipped_and_the_boundary_keeps_sealing() {
             modules_msg(&ModulesMsg::SwapReady {
                 name: name.into(),
                 module_id: id.into(),
+                code_hash: sha(code),
             }),
         );
     }
@@ -368,8 +397,15 @@ fn a_foreign_abi_record_is_skipped_and_the_boundary_keeps_sealing() {
         host.module_root("netstack").is_none(),
         "nothing seated for another plane's component"
     );
-    assert!(host.module_root("kanban").is_some(), "the real admission still lands");
-    assert_ne!(host.root_hash(), root_hash_before, "by exactly the real admission");
+    assert!(
+        host.module_root("kanban").is_some(),
+        "the real admission still lands"
+    );
+    assert_ne!(
+        host.root_hash(),
+        root_hash_before,
+        "by exactly the real admission"
+    );
 
     // the block seals: its ops apply and the drain-injected Advance flips both
     // committed hashes — the netstack record stays in the registry, which is

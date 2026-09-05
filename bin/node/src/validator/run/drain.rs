@@ -1207,8 +1207,7 @@ impl ValidatorRuntime<'_> {
         let Ok(bytes) = node.host().query(host::MODULES_ID, &req).await else {
             return; // registry absent: byte-identical drain on a baseline net.
         };
-        let Ok(modules::ModulesReply::ModuleStatus { modules }) =
-            modules::decode_reply(&bytes)
+        let Ok(modules::ModulesReply::ModuleStatus { modules }) = modules::decode_reply(&bytes)
         else {
             return;
         };
@@ -1250,8 +1249,8 @@ impl ValidatorRuntime<'_> {
             tracing::warn!(
                 target: "ducktape::modules",
                 node = %label,
-                module = %key.0,
-                swap = key.1,
+                module = %key.module_id,
+                swap = key.name,
                 reason = "code_not_loadable",
                 detail = %detail,
                 "pending-swap code refused: this binary cannot instantiate it, so \
@@ -1291,8 +1290,8 @@ impl ValidatorRuntime<'_> {
                 Ok(_) => tracing::info!(
                     target: "ducktape::modules",
                     node = %label,
-                    module = %key.0,
-                    swap = key.1,
+                    module = %key.module_id,
+                    swap = key.name,
                     "code-ready signaled"
                 ),
                 Err(e) => {

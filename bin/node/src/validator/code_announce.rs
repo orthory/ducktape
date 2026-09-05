@@ -25,8 +25,18 @@ use std::collections::BTreeSet;
 
 use sdk::Msg;
 
-/// one pending swap's identity: `(module_id, swap name)`.
-pub(crate) type SwapKey = (String, String);
+/// ONE pending swap's identity — the whole of it. A name is reusable: a stale
+/// pending is replaceable under the same name, by the same bytes at a new
+/// activation height (the module CLI derives the name FROM the hash, so a retry
+/// of the same artifact always does exactly that). Keyed by name alone, this
+/// node's in-flight latch would silence it for the replacement forever.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct SwapKey {
+    pub(crate) module_id: String,
+    pub(crate) name: String,
+    pub(crate) code_hash: [u8; 32],
+    pub(crate) activation_height: u64,
+}
 
 /// everything this node can truthfully say about one pending swap's bytes —
 /// ONE discriminant, so a new answer has to be routed rather than defaulted.
@@ -110,13 +120,18 @@ impl CodeReadinessSignaller {
             if pending.readiness.iter().any(|k| k == &self.me) {
                 continue;
             }
-            let key: SwapKey = (m.module_id.clone(), pending.name.clone());
-            if self.signaled.contains(&key) {
-                continue;
-            }
             let Ok(digest) = <[u8; 32]>::try_from(pending.code_hash.as_slice()) else {
                 continue; // malformed hash can never verify — stay silent.
             };
+            let key = SwapKey {
+                module_id: m.module_id.clone(),
+                name: pending.name.clone(),
+                code_hash: digest,
+                activation_height: pending.activation_height,
+            };
+            if self.signaled.contains(&key) {
+                continue;
+            }
             let latch = (m.module_id.clone(), digest);
             // already refused: this binary will not start loading bytes it
             // could not run, and re-deciding would recompile the component
@@ -137,8 +152,9 @@ impl CodeReadinessSignaller {
                     let msg = Msg {
                         target: host::MODULES_ID.into(),
                         payload: modules::encode_msg(&modules::ModulesMsg::SwapReady {
-                            name: key.1.clone(),
-                            module_id: key.0.clone(),
+                            name: key.name.clone(),
+                            module_id: key.module_id.clone(),
+                            code_hash: digest.to_vec(),
                         }),
                     };
                     actions.signals.push((key, msg));
@@ -169,6 +185,17 @@ mod tests {
 
     fn me() -> Vec<u8> {
         vec![7; 32]
+    }
+
+    /// the key `pending()` produces for one module/name/hash at the default
+    /// activation height.
+    fn key(module: &str, name: &str, hash: u8) -> SwapKey {
+        SwapKey {
+            module_id: module.into(),
+            name: name.into(),
+            code_hash: [hash; 32],
+            activation_height: 10,
+        }
     }
 
     fn pending(
@@ -209,7 +236,7 @@ mod tests {
         ];
         let acts = s.decide(&modules, |_, d| loadable(d, 1));
         assert_eq!(acts.signals.len(), 1);
-        assert_eq!(acts.signals[0].0, ("held".into(), "replacement".into()));
+        assert_eq!(acts.signals[0].0, key("held", "replacement", 1));
         assert_eq!(acts.fetches, vec![[2u8; 32]]);
 
         // second tick: the signal is latched, the fetch deduped.
@@ -222,7 +249,7 @@ mod tests {
         s.fetching.clear();
         let acts = s.decide(&modules, |_, _| CodeVerdict::Loadable);
         assert_eq!(acts.signals.len(), 1);
-        assert_eq!(acts.signals[0].0, ("missing".into(), "replacement".into()));
+        assert_eq!(acts.signals[0].0, key("missing", "replacement", 2));
     }
 
     /// BYTE RESIDENCY IS NOT READINESS. A validator whose binary cannot
@@ -247,7 +274,7 @@ mod tests {
             "the bytes are here; fetching is not the fix"
         );
         assert_eq!(acts.refusals.len(), 1);
-        assert_eq!(acts.refusals[0].0, ("chat".into(), "replacement".into()));
+        assert_eq!(acts.refusals[0].0, key("chat", "replacement", 1));
 
         // LATCHED: loading compiles the component and the answer cannot change
         // while this process lives, so neither the work nor the log repeats.
@@ -283,12 +310,42 @@ mod tests {
         assert!(acts.signals.is_empty() && acts.fetches.is_empty());
     }
 
+    /// A REPLACED PENDING IS A NEW SWAP. A stale schedule is replaceable under
+    /// the same name by the same bytes at a new activation height — exactly
+    /// what re-running the module CLI on one artifact produces. A latch keyed
+    /// by name alone silenced this validator for the replacement for the life
+    /// of the process, so the retry could never latch readiness.
+    #[test]
+    fn a_rescheduled_swap_under_the_same_name_signals_again() {
+        let mut s = CodeReadinessSignaller::new(me());
+        let first = vec![pending("chat", "chat@ab12", 1, false, &[])];
+        assert_eq!(
+            s.decide(&first, |_, _| CodeVerdict::Loadable).signals.len(),
+            1
+        );
+
+        // the pending goes stale and the SAME bytes are re-scheduled later.
+        let mut replaced = first.clone();
+        replaced[0].pending.as_mut().unwrap().activation_height = 200;
+        let acts = s.decide(&replaced, |_, _| CodeVerdict::Loadable);
+        assert_eq!(acts.signals.len(), 1, "the replacement is a new swap");
+        assert_eq!(acts.signals[0].0.activation_height, 200);
+        // ...and that one is latched in its own right.
+        assert!(
+            s.decide(&replaced, |_, _| CodeVerdict::Loadable)
+                .signals
+                .is_empty()
+        );
+    }
+
     #[test]
     fn unlatch_retries_a_failed_submit() {
         let mut s = CodeReadinessSignaller::new(me());
         let modules = vec![pending("a", "replacement", 1, false, &[])];
         assert_eq!(
-            s.decide(&modules, |_, _| CodeVerdict::Loadable).signals.len(),
+            s.decide(&modules, |_, _| CodeVerdict::Loadable)
+                .signals
+                .len(),
             1
         );
         assert!(
@@ -297,7 +354,7 @@ mod tests {
                 .is_empty(),
             "latched"
         );
-        s.unlatch(&("a".into(), "replacement".into()));
+        s.unlatch(&key("a", "replacement", 1));
         // ...and the retry does NOT re-compile: the digest already answered
         // once, so the probe is paid once per pending swap however many
         // submits fail.

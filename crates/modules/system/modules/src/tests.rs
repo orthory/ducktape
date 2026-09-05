@@ -114,16 +114,17 @@ fn cancel_swap(module_id: &str, name: &str) -> Msg {
         module_id: module_id.into(),
     })
 }
-fn swap_ready(module_id: &str, name: &str) -> Msg {
+fn swap_ready(module_id: &str, name: &str, code: u8) -> Msg {
     msg(ModulesMsg::SwapReady {
         name: name.into(),
         module_id: module_id.into(),
+        code_hash: hash(code),
     })
 }
 /// drive the full single-member readiness latch for a pending swap.
-fn make_swap_ready(lc: &mut Modules, module_id: &str, name: &str) {
+fn make_swap_ready(lc: &mut Modules, module_id: &str, name: &str, code: u8) {
     let mut ext = ctx(Origin::External(member(1)), 0);
-    run(lc, &mut ext, &swap_ready(module_id, name)).unwrap();
+    run(lc, &mut ext, &swap_ready(module_id, name, code)).unwrap();
     commit(lc);
 }
 fn module_status(lc: &Modules) -> Vec<ModuleCode> {
@@ -293,7 +294,7 @@ fn swap_advance_activates_at_height_and_frees_slot() {
     )
     .unwrap();
     commit(&mut lc);
-    make_swap_ready(&mut lc, "hello", "replacement");
+    make_swap_ready(&mut lc, "hello", "replacement", 2);
 
     // below activation: no-op.
     let root_before = lc.root();
@@ -328,7 +329,7 @@ fn swap_readiness_gate() {
 
     let two = vec![member(1), member(2)];
     let mut m1 = ctx(Origin::External(member(1)), 0).with_members(two.clone());
-    run(&mut lc, &mut m1, &swap_ready("hello", "replacement")).unwrap();
+    run(&mut lc, &mut m1, &swap_ready("hello", "replacement", 2)).unwrap();
     commit(&mut lc);
     assert!(
         module_status(&lc)[0]
@@ -342,7 +343,7 @@ fn swap_readiness_gate() {
 
     // the covering signal, in block 6: the latch records THAT height.
     let mut m2 = ctx(Origin::External(member(2)), 6).with_members(two);
-    run(&mut lc, &mut m2, &swap_ready("hello", "replacement")).unwrap();
+    run(&mut lc, &mut m2, &swap_ready("hello", "replacement", 2)).unwrap();
     commit(&mut lc);
     let latched = module_status(&lc)[0].pending.clone().unwrap();
     assert_eq!(latched.ready_at, Some(6));
@@ -379,11 +380,61 @@ fn swap_signal_gates_origin_and_identity() {
     )
     .unwrap();
     commit(&mut lc);
-    assert!(run(&mut lc, &mut sys, &swap_ready("hello", "replacement")).is_err());
+    assert!(run(&mut lc, &mut sys, &swap_ready("hello", "replacement", 2)).is_err());
     let mut stranger = ctx(Origin::External(member(9)), 0);
-    assert!(run(&mut lc, &mut stranger, &swap_ready("hello", "replacement")).is_err());
+    assert!(
+        run(
+            &mut lc,
+            &mut stranger,
+            &swap_ready("hello", "replacement", 2)
+        )
+        .is_err()
+    );
     let mut m1 = ctx(Origin::External(member(1)), 0);
-    assert!(run(&mut lc, &mut m1, &swap_ready("hello", "vX")).is_err());
+    assert!(run(&mut lc, &mut m1, &swap_ready("hello", "vX", 2)).is_err());
+}
+
+/// A SIGNAL NAMES BYTES, NOT A NAME. A schedule may replace a stale pending
+/// under the SAME name with a different hash; a signal written for the old
+/// pending and finalized after the replacement must be refused, not credited
+/// as readiness for code that validator never verified.
+#[test]
+fn swap_ready_for_a_replaced_pending_is_refused() {
+    let mut lc = fresh();
+    register_module(&mut lc, "hello", 1);
+    let mut sys = ctx(Origin::System, 0);
+    run(&mut lc, &mut sys, &schedule_swap("hello", "upgrade", 10, 2)).unwrap();
+    commit(&mut lc);
+
+    // the first pending goes stale and a NEW hash takes its name.
+    let mut past = ctx(Origin::System, 30);
+    run(
+        &mut lc,
+        &mut past,
+        &schedule_swap("hello", "upgrade", 40, 3),
+    )
+    .unwrap();
+    commit(&mut lc);
+
+    // the in-flight signal for hash 2 lands now: same name, wrong bytes.
+    let mut m1 = ctx(Origin::External(member(1)), 31);
+    assert!(run(&mut lc, &mut m1, &swap_ready("hello", "upgrade", 2)).is_err());
+    assert!(
+        module_status(&lc)[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .readiness
+            .is_empty(),
+        "a refused signal credits nothing"
+    );
+
+    // the signal for the bytes actually pending is accepted and latches.
+    run(&mut lc, &mut m1, &swap_ready("hello", "upgrade", 3)).unwrap();
+    commit(&mut lc);
+    let pending = module_status(&lc)[0].pending.clone().unwrap();
+    assert_eq!(pending.readiness, vec![member(1)]);
+    assert_eq!(pending.ready_at, Some(31));
 }
 
 #[test]
@@ -401,7 +452,7 @@ fn swap_cancel_guards_and_clears() {
     assert!(run(&mut lc, &mut sys, &cancel_swap("hello", "vX")).is_err());
     // ARMED (readiness latched) and past its activation height: the boundary's
     // business, not governance's.
-    make_swap_ready(&mut lc, "hello", "replacement");
+    make_swap_ready(&mut lc, "hello", "replacement", 2);
     let mut late = ctx(Origin::System, 10);
     assert!(run(&mut lc, &mut late, &cancel_swap("hello", "replacement")).is_err());
     run(&mut lc, &mut sys, &cancel_swap("hello", "replacement")).unwrap();
@@ -448,7 +499,7 @@ fn a_stale_pending_swap_is_replaceable_and_cancellable() {
     register_module(&mut lc, "hello", 1);
     run(&mut lc, &mut sys, &schedule_swap("hello", "armed", 10, 2)).unwrap();
     commit(&mut lc);
-    make_swap_ready(&mut lc, "hello", "armed");
+    make_swap_ready(&mut lc, "hello", "armed", 2);
     let mut past = ctx(Origin::System, 30);
     assert!(run(&mut lc, &mut past, &schedule_swap("hello", "next", 40, 3)).is_err());
     assert!(run(&mut lc, &mut past, &cancel_swap("hello", "armed")).is_err());
@@ -485,7 +536,7 @@ fn admission_realizes_and_refuses_bad_inputs() {
     commit(&mut lc);
     assert!(module_status(&lc)[0].active_code_hash.is_empty());
     assert!(armed_at(&lc, 10).is_empty(), "not armed until ready");
-    make_swap_ready(&mut lc, "kanban", "v1");
+    make_swap_ready(&mut lc, "kanban", "v1", 5);
     assert_eq!(armed_at(&lc, 10)[0].code_hash, hash(5));
     let mut at = ctx(Origin::System, 10);
     run(&mut lc, &mut at, &advance()).unwrap();
@@ -616,7 +667,7 @@ fn every_activation_is_appended_in_block_order() {
     )
     .unwrap();
     commit(&mut lc);
-    make_swap_ready(&mut lc, "hello", "replacement");
+    make_swap_ready(&mut lc, "hello", "replacement", 2);
     assert_eq!(
         module_status(&lc)[0].history,
         [activation(7, 1)],
@@ -636,7 +687,7 @@ fn every_activation_is_appended_in_block_order() {
     run(&mut lc, &mut sys, &schedule_register("kanban", "v1", 10, 5)).unwrap();
     commit(&mut lc);
     assert!(module_status(&lc)[0].history.is_empty());
-    make_swap_ready(&mut lc, "kanban", "v1");
+    make_swap_ready(&mut lc, "kanban", "v1", 5);
     let mut at10 = ctx(Origin::System, 10);
     run(&mut lc, &mut at10, &advance()).unwrap();
     commit(&mut lc);

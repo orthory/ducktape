@@ -174,7 +174,15 @@ pub enum ModulesMsg {
     /// a validator records that it HOLDS (verified locally) the pending swap's
     /// component bytes. `Origin::External(validator)` only, member-gated against
     /// the valset; the last covering signal latches the swap `ready`.
-    SwapReady { name: String, module_id: String },
+    /// `code_hash` names the BYTES this validator verified: a swap name is
+    /// reusable across schedules, so a signal that outlives the pending it was
+    /// written for must be refused rather than credited to whatever hash now
+    /// wears the name.
+    SwapReady {
+        name: String,
+        module_id: String,
+        code_hash: Vec<u8>,
+    },
 
     /// the system-injected boundary tick, keyed on `env.height`: activate every
     /// armed code swap. `Origin::System` only.
@@ -251,6 +259,7 @@ mod tests {
         rt_msg(ModulesMsg::SwapReady {
             name: "swap-hello".into(),
             module_id: "hello".into(),
+            code_hash: vec![2u8; CODE_HASH_LEN],
         });
         rt_msg(ModulesMsg::Advance);
 

@@ -520,6 +520,7 @@ impl Modules {
         ctx: &mut dyn Ctx,
         name: String,
         module_id: String,
+        code_hash: Vec<u8>,
     ) -> Result<(), Error> {
         // validator-origin only: the authenticated frame origin attributes the
         // signal to exactly one member key.
@@ -541,11 +542,15 @@ impl Modules {
             .entry(&module_id)
             .await?
             .ok_or_else(|| Error::Module(format!("no such module {module_id}")))?;
+        // the signal names the BYTES it verified. a name alone cannot tell two
+        // schedules apart — a stale pending is replaceable under the same name
+        // — so a signal for any hash but the pending's own is refused rather
+        // than credited to code this validator never saw.
         let swap = match &mut entry.pending {
-            Some(swap) if swap.name == name => swap,
+            Some(swap) if swap.name == name && swap.code_hash == code_hash => swap,
             _ => {
                 return Err(Error::Module(
-                    "SwapReady does not match the pending swap (name/module)".into(),
+                    "SwapReady does not match the pending swap (name/module/code_hash)".into(),
                 ));
             }
         };
@@ -707,8 +712,13 @@ impl Module for Modules {
             ModulesMsg::CancelSwap { name, module_id } => {
                 self.handle_cancel_swap(ctx, name, module_id).await
             }
-            ModulesMsg::SwapReady { name, module_id } => {
-                self.handle_swap_ready(ctx, name, module_id).await
+            ModulesMsg::SwapReady {
+                name,
+                module_id,
+                code_hash,
+            } => {
+                self.handle_swap_ready(ctx, name, module_id, code_hash)
+                    .await
             }
             ModulesMsg::Advance => self.handle_advance(ctx).await,
         }
