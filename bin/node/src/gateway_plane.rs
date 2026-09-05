@@ -1386,8 +1386,23 @@ fn failure_frame(failure: &GatewayFailure) -> gateway::ProxyFrame {
             "gateway publisher is unavailable".to_string(),
         ),
     };
-    detail.truncate(MAX_ERROR_BYTES);
+    truncate_at_char_boundary(&mut detail, MAX_ERROR_BYTES);
     gateway::ProxyFrame::Failure(gateway::ProxyFailure { kind, detail })
+}
+
+/// Bound a failure detail without splitting a UTF-8 character. `String::truncate`
+/// panics on a byte index that is not a char boundary, and a detail reaches here
+/// carrying remote-supplied text (a decode error names what the peer sent), so a
+/// plain byte cut is a remote panic on the serve task.
+fn truncate_at_char_boundary(detail: &mut String, max_bytes: usize) {
+    if detail.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail.truncate(end);
 }
 
 fn failure_from(failure: gateway::ProxyFailure) -> GatewayFailure {
@@ -1567,6 +1582,45 @@ use duckfs_core::to_hex as hex_bytes;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The accept loop turns a decode error straight into `Invalid`, and the
+    /// name a peer sends is neither ASCII nor short. Bounding that detail must
+    /// answer with a frame, not panic the serve task.
+    #[test]
+    fn a_multibyte_header_name_yields_a_failure_frame_and_no_non_ascii() {
+        let head = gateway::ProxyRequestHead {
+            account_id: 1,
+            name: gateway::RouteName::named("app"),
+            revision: 1,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/".into(),
+            headers: vec![gateway::ProxyHeader {
+                name: "€".repeat(200),
+                value: "v".into(),
+            }],
+            body_len: 0,
+            upgrade: false,
+            user_pop: None,
+        };
+        let meta = serde_json::to_vec(&head).expect("head serializes");
+        let error = gateway::decode_proxy_request_head(&meta).expect_err("name is malformed");
+        let frame = failure_frame(&GatewayFailure::Invalid(error));
+        let gateway::ProxyFrame::Failure(failure) = frame else {
+            panic!("a malformed head must map to a Failure frame");
+        };
+        assert!(failure.detail.is_ascii(), "detail must not echo peer bytes");
+        assert!(failure.detail.len() <= MAX_ERROR_BYTES);
+    }
+
+    #[test]
+    fn truncating_a_detail_never_splits_a_character() {
+        let mut detail = "€".repeat(400);
+        truncate_at_char_boundary(&mut detail, MAX_ERROR_BYTES);
+        assert_eq!(detail.len(), 510, "cut back to the last char boundary");
+        let mut short = "ok".to_string();
+        truncate_at_char_boundary(&mut short, MAX_ERROR_BYTES);
+        assert_eq!(short, "ok");
+    }
 
     #[tokio::test]
     async fn streamed_response_arrives_and_zero_cap_is_unbounded() {
