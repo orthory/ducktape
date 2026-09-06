@@ -108,7 +108,7 @@ use sdk::{
     StateRoot, StateSyncHandle,
 };
 use valset::{
-    ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
+    MAX_MEMBERS, ValsetMsg, ValsetQuery, ValsetReply, decode_reply as valset_decode_reply,
     encode_msg as valset_encode_msg, encode_query as valset_encode_query,
 };
 
@@ -124,6 +124,18 @@ const MAX_VOTING_PERIOD: u64 = 1_000_000_000;
 /// `deadline + EXECUTION_GRACE` the proposal is dead: refused on `Execute`
 /// and settled `Rejected` on the spot, same as any other reap.
 const EXECUTION_GRACE: u64 = 100_000;
+
+/// floor on `activation_lead` (`UpdateModule`/`RegisterModule`), validated at
+/// Propose: the lead is blocks after the EXECUTE height, and the modules
+/// registry itself refuses any `activation_height <= execute_height +
+/// modules::MIN_SWAP_LEAD` — so a lead this small can NEVER execute
+/// successfully. strictly above [`modules::MIN_SWAP_LEAD`] guarantees the
+/// registry's own floor is cleared whatever height Execute lands at.
+pub const MIN_ACTIVATION_LEAD: u64 = modules::MIN_SWAP_LEAD + 1;
+/// ceiling on `activation_lead` — a fat-fingered or hostile lead must not
+/// arm a swap so far in the future it is effectively unreachable. generous,
+/// same order as [`MAX_VOTING_PERIOD`].
+pub const MAX_ACTIVATION_LEAD: u64 = 1_000_000_000;
 
 /// Keep every share value and total exact in the JavaScript operator client.
 const MAX_SAFE_SHARES: u64 = 9_007_199_254_740_991;
@@ -576,6 +588,36 @@ impl Governance {
         Ok(total)
     }
 
+    /// #1777: would a policy of `standing` on `target` still let the
+    /// electorate that decides FUTURE governance proposals submit to
+    /// governance itself? only a target that GOVERNS governance matters —
+    /// its own module id, or the `"*"` wildcard fallback every unlisted
+    /// target resolves through. `standing: None` (clearing an entry) and
+    /// `Standing::Open` are always safe — they widen or leave access alone.
+    /// a validator-ballot electorate is bare node keys (never account
+    /// members — a node key is never an Identity account) holding
+    /// `Standing::Validator`/`Standing::Node`; a share-mode electorate is
+    /// Identity-account principals holding `Standing::User`. `SetPolicy` is
+    /// reachable only through governance, so a policy neither electorate
+    /// kind can satisfy would brick the module and everything gated behind
+    /// it, permanently.
+    fn electorate_can_still_submit(
+        share_mode: bool,
+        governance_id: &str,
+        target: &str,
+        standing: Option<acl::Standing>,
+    ) -> bool {
+        let governs_governance = target == governance_id || target == acl::WILDCARD_TARGET;
+        if !governs_governance {
+            return true;
+        }
+        match standing {
+            None | Some(acl::Standing::Open) => true,
+            Some(acl::Standing::User) => share_mode,
+            Some(acl::Standing::Node) | Some(acl::Standing::Validator) => !share_mode,
+        }
+    }
+
     fn threshold_rule(total: u64, action: &GovAction, share_mode: bool) -> VotingRule {
         if !share_mode {
             return VotingRule::Threshold {
@@ -859,13 +901,31 @@ impl Governance {
                 modules::CODE_HASH_LEN
             )));
         }
+        // the lead is RELATIVE to the EXECUTE height, not the propose height
+        // (issue #1775: an absolute height chosen here can go stale if the
+        // ballot outlasts it, permanently rejecting Execute). shape-checked
+        // here so a lead the registry can never accept is refused at the
+        // door, not discovered by every Execute retrying and failing forever.
+        if let GovAction::UpdateModule {
+            activation_lead, ..
+        }
+        | GovAction::RegisterModule {
+            activation_lead, ..
+        } = &action
+            && !(MIN_ACTIVATION_LEAD..=MAX_ACTIVATION_LEAD).contains(activation_lead)
+        {
+            return Err(Error::Module(format!(
+                "activation_lead must be in {MIN_ACTIVATION_LEAD}..={MAX_ACTIVATION_LEAD} blocks \
+                 after execution"
+            )));
+        }
         // acl policy authorizations: shape-checked at the door like the module
         // updates above (a proposal that can never execute is rejected here,
         // not at tally time); the acl module's own target validation is the
         // sole authority at ingest. a net without a wired acl module
         // deterministically rejects these (genesis wiring is identical on
         // every node).
-        if let GovAction::SetAclPolicy { target, .. } = &action {
+        if let GovAction::SetAclPolicy { target, standing } = &action {
             if self.acl_id.is_none() {
                 return Err(Error::Module(
                     "no acl module wired: submit-policy changes are not available on this network"
@@ -881,13 +941,33 @@ impl Governance {
                     acl::MAX_TARGET_LEN
                 )));
             }
+            // #1777: never let a proposal that CAN pass lock the electorate
+            // out of governance itself — SetPolicy is reachable only through
+            // this module, so a policy neither ballot kind can satisfy would
+            // brick the network permanently, with no repair proposal able to
+            // reach the door that just closed on it.
+            let share_mode = self.share_mode().await?;
+            if !Self::electorate_can_still_submit(share_mode, &self.id, target, *standing) {
+                return Err(Error::Module(
+                    "acl policy would lock the current electorate out of governance itself".into(),
+                ));
+            }
         }
-        let mut roster = self.roster().await?;
-        if roster.binary_search(&proposal_id).is_ok() {
+        // AN ID IS SPENT FOREVER, and the check is against the RECORD, not the
+        // roster. The roster holds OPEN ids only, while a settled proposal's
+        // record is kept under its own key for good — so a roster-only check
+        // let a second `Propose` reuse a settled id and OVERWRITE the record,
+        // erasing the settled outcome and its ballots. Worse, it is invisible:
+        // a driver that waits for "the proposal exists" is answered by the
+        // stale record before the new one lands, and reports the old outcome
+        // for a ceremony that never voted (#1766).
+        let id_is_spent = self.proposal(&proposal_id).await?.is_some();
+        if id_is_spent {
             return Err(Error::Module(format!(
                 "proposal already exists: {proposal_id}"
             )));
         }
+        let mut roster = self.roster().await?;
         let submitter = Self::external_origin(ctx)?;
         let (proposer, electorate) = self.frozen_electorate(ctx, &submitter, &action).await?;
         let now = ctx.env().consensus_time;
@@ -1049,10 +1129,26 @@ impl Governance {
             // op as a follow-up — the host drains it in this same block, and
             // valset accepts it because the origin is Module(governance).
             match &proposal.action {
-                GovAction::AddValidator { key } => ctx.emit_msg(Msg {
-                    target: self.valset_id.clone(),
-                    payload: valset_encode_msg(&ValsetMsg::Join { key: key.clone() }),
-                }),
+                GovAction::AddValidator { key } => {
+                    // mirror valset's own require_capacity: a key already
+                    // seated is an idempotent no-op Join (nothing to
+                    // pre-check), but admitting a NEW key past the validator
+                    // cap would Err out of the follow-up and reject the whole
+                    // Execute unit (#1776's AddValidator sibling case) — check
+                    // it here and settle Rejected instead, the same way the
+                    // set-emptying Leave above settles rather than errors.
+                    let members = self.members(ctx).await?;
+                    let already_seated = members.iter().any(|m| m == key);
+                    let would_overflow_capacity = !already_seated && members.len() >= MAX_MEMBERS;
+                    if would_overflow_capacity {
+                        proposal.status = ProposalStatus::Rejected;
+                    } else {
+                        ctx.emit_msg(Msg {
+                            target: self.valset_id.clone(),
+                            payload: valset_encode_msg(&ValsetMsg::Join { key: key.clone() }),
+                        });
+                    }
+                }
                 GovAction::RemoveValidator { key } => {
                     // never enact a removal that would empty the validator set: a
                     // zero-validator orderer hits commonware `quorum(0)`, which
@@ -1082,18 +1178,24 @@ impl Governance {
                 GovAction::UpdateModule {
                     name,
                     module_id,
-                    activation_height,
+                    activation_lead,
                     code_hash,
                 } => match &self.code_registry_id {
-                    Some(registry) => ctx.emit_msg(Msg {
-                        target: registry.clone(),
-                        payload: modules_encode_msg(&ModulesMsg::ScheduleSwap {
-                            name: name.clone(),
-                            module_id: module_id.clone(),
-                            activation_height: *activation_height,
-                            code_hash: code_hash.clone(),
-                        }),
-                    }),
+                    Some(registry) => {
+                        // relative to THIS execute height, not the propose
+                        // height (#1775) — a ballot that outlives its lead
+                        // still schedules cleanly whenever it finally executes.
+                        let activation_height = ctx.env().height.saturating_add(*activation_lead);
+                        ctx.emit_msg(Msg {
+                            target: registry.clone(),
+                            payload: modules_encode_msg(&ModulesMsg::ScheduleSwap {
+                                name: name.clone(),
+                                module_id: module_id.clone(),
+                                activation_height,
+                                code_hash: code_hash.clone(),
+                            }),
+                        })
+                    }
                     None => proposal.status = ProposalStatus::Rejected,
                 },
                 // a passing ADMISSION is performed the same way; the code
@@ -1102,18 +1204,21 @@ impl Governance {
                 GovAction::RegisterModule {
                     name,
                     module_id,
-                    activation_height,
+                    activation_lead,
                     code_hash,
                 } => match &self.code_registry_id {
-                    Some(registry) => ctx.emit_msg(Msg {
-                        target: registry.clone(),
-                        payload: modules_encode_msg(&ModulesMsg::ScheduleRegister {
-                            name: name.clone(),
-                            module_id: module_id.clone(),
-                            activation_height: *activation_height,
-                            code_hash: code_hash.clone(),
-                        }),
-                    }),
+                    Some(registry) => {
+                        let activation_height = ctx.env().height.saturating_add(*activation_lead);
+                        ctx.emit_msg(Msg {
+                            target: registry.clone(),
+                            payload: modules_encode_msg(&ModulesMsg::ScheduleRegister {
+                                name: name.clone(),
+                                module_id: module_id.clone(),
+                                activation_height,
+                                code_hash: code_hash.clone(),
+                            }),
+                        })
+                    }
                     None => proposal.status = ProposalStatus::Rejected,
                 },
                 GovAction::CancelModuleUpdate { name, module_id } => match &self.code_registry_id {
@@ -1126,12 +1231,36 @@ impl Governance {
                     }),
                     None => proposal.status = ProposalStatus::Rejected,
                 },
-                // the staged-admission grant/revoke: valset owns the
-                // validator-overlap rule.
-                GovAction::AddResident { key } => ctx.emit_msg(Msg {
-                    target: self.valset_id.clone(),
-                    payload: valset_encode_msg(&ValsetMsg::Grant { key: key.clone() }),
-                }),
+                // the staged-admission grant/revoke: mirror handle_redeem's
+                // own pre-checks (#1776) — valset's handle_grant Errs when the
+                // key already sits in the validator tier ("resident standing
+                // is the pre-promotion tier"), which would reject the whole
+                // Execute unit forever if the key was promoted after this
+                // proposal opened. a stale mandate settles cleanly Rejected
+                // instead. an already-resident key is left to valset's own
+                // idempotent no-op (like AddValidator's already-seated case
+                // above), and the resident cap is pre-checked the same way
+                // the validator cap is.
+                GovAction::AddResident { key } => {
+                    let members = self.members(ctx).await?;
+                    let already_validator = members.iter().any(|m| m == key);
+                    if already_validator {
+                        proposal.status = ProposalStatus::Rejected;
+                    } else {
+                        let residents = self.residents(ctx).await?;
+                        let already_resident = residents.iter().any(|o| o == key);
+                        let would_overflow_capacity =
+                            !already_resident && residents.len() >= MAX_MEMBERS;
+                        if would_overflow_capacity {
+                            proposal.status = ProposalStatus::Rejected;
+                        } else {
+                            ctx.emit_msg(Msg {
+                                target: self.valset_id.clone(),
+                                payload: valset_encode_msg(&ValsetMsg::Grant { key: key.clone() }),
+                            });
+                        }
+                    }
+                }
                 GovAction::RemoveResident { key } => ctx.emit_msg(Msg {
                     target: self.valset_id.clone(),
                     payload: valset_encode_msg(&ValsetMsg::Revoke { key: key.clone() }),
@@ -1181,13 +1310,27 @@ impl Governance {
                     // the propose-time gate refused an unwired net, so this arm
                     // only rejects on a wiring change between propose and pass.
                     None => proposal.status = ProposalStatus::Rejected,
-                    Some(acl_id) => ctx.emit_msg(Msg {
-                        target: acl_id.clone(),
-                        payload: acl::encode_msg(&acl::AclMsg::SetPolicy {
-                            target: target.clone(),
-                            standing: *standing,
-                        }),
-                    }),
+                    Some(acl_id) => {
+                        // #1777: re-check at Execute — a DIFFERENT proposal may
+                        // have flipped share_mode since this one opened, and
+                        // the frozen electorate is a ballot snapshot, not a
+                        // guarantee about who submits AFTER this lands.
+                        let share_mode = self.share_mode().await?;
+                        let safe = Self::electorate_can_still_submit(
+                            share_mode, &self.id, target, *standing,
+                        );
+                        if safe {
+                            ctx.emit_msg(Msg {
+                                target: acl_id.clone(),
+                                payload: acl::encode_msg(&acl::AclMsg::SetPolicy {
+                                    target: target.clone(),
+                                    standing: *standing,
+                                }),
+                            });
+                        } else {
+                            proposal.status = ProposalStatus::Rejected;
+                        }
+                    }
                 },
                 GovAction::Signal { .. } => {}
             }
@@ -1432,3 +1575,105 @@ impl Module for Governance {
 // build.
 #[cfg(feature = "guest")]
 mod guest;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #1777: `electorate_can_still_submit` is the one place the self-lockout
+    // rule lives — unit-tested directly against both electorate kinds, since
+    // the end-to-end host tests (governance_gates_acl.rs) cannot cheaply drive
+    // share mode's full AdoptShares/identity ceremony for every case.
+
+    #[test]
+    fn none_and_open_are_always_permitted_on_governance() {
+        for share_mode in [false, true] {
+            assert!(Governance::electorate_can_still_submit(
+                share_mode,
+                "governance",
+                "governance",
+                None
+            ));
+            assert!(Governance::electorate_can_still_submit(
+                share_mode,
+                "governance",
+                "governance",
+                Some(acl::Standing::Open)
+            ));
+        }
+    }
+
+    #[test]
+    fn validator_mode_electorate_cannot_satisfy_user_standing_on_governance_or_wildcard() {
+        // a validator-ballot electorate is bare node keys — never account
+        // members — so User is the one standing that would brick it.
+        assert!(!Governance::electorate_can_still_submit(
+            false,
+            "governance",
+            "governance",
+            Some(acl::Standing::User)
+        ));
+        assert!(!Governance::electorate_can_still_submit(
+            false,
+            "governance",
+            acl::WILDCARD_TARGET,
+            Some(acl::Standing::User)
+        ));
+        // Node and Validator are exactly what the electorate already holds.
+        assert!(Governance::electorate_can_still_submit(
+            false,
+            "governance",
+            "governance",
+            Some(acl::Standing::Node)
+        ));
+        assert!(Governance::electorate_can_still_submit(
+            false,
+            "governance",
+            "governance",
+            Some(acl::Standing::Validator)
+        ));
+    }
+
+    #[test]
+    fn share_mode_electorate_cannot_satisfy_node_or_validator_standing_on_governance_or_wildcard() {
+        // a share-mode electorate is Identity-account principals — not
+        // guaranteed to be node keys at all.
+        assert!(!Governance::electorate_can_still_submit(
+            true,
+            "governance",
+            "governance",
+            Some(acl::Standing::Node)
+        ));
+        assert!(!Governance::electorate_can_still_submit(
+            true,
+            "governance",
+            acl::WILDCARD_TARGET,
+            Some(acl::Standing::Validator)
+        ));
+        // User is exactly what the electorate already holds.
+        assert!(Governance::electorate_can_still_submit(
+            true,
+            "governance",
+            "governance",
+            Some(acl::Standing::User)
+        ));
+    }
+
+    #[test]
+    fn a_target_that_does_not_govern_governance_is_always_permitted() {
+        // any standing on an unrelated target never bricks governance itself
+        // — this rule guards only "governance" and the "*" fallback.
+        assert!(Governance::electorate_can_still_submit(
+            false,
+            "governance",
+            "chat",
+            Some(acl::Standing::User)
+        ));
+        assert!(Governance::electorate_can_still_submit(
+            true,
+            "governance",
+            "chat",
+            Some(acl::Standing::Node)
+        ));
+    }
+}

@@ -306,3 +306,20 @@ pub(crate) fn hex_decode(value: &str) -> Result<Vec<u8>, String> {
         })
         .collect()
 }
+
+/// THE MESSAGE ROW'S PLATE, as one discriminant instead of a ladder of
+/// booleans over the same box. A row is at most one of these, and they are
+/// ordered by how much they mean: the row you are ON outranks a row that
+/// merely sits inside a copy range, and a deleted row wears neither — its body
+/// is a tombstone, and tinting it would say there is something there to lift.
+///
+/// The colours stay in `theme.ice`, which is the only place that holds a
+/// palette; this says WHICH plate, never what it is made of.
+pub fn message_plate(deleted: bool, selected: bool, in_range: bool) -> crate::RowPlate {
+    match (deleted, selected, in_range) {
+        (true, _, _) => crate::RowPlate::Plain,
+        (false, true, _) => crate::RowPlate::Selected,
+        (false, false, true) => crate::RowPlate::Ranged,
+        (false, false, false) => crate::RowPlate::Plain,
+    }
+}

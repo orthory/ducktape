@@ -188,7 +188,7 @@ fn a_passing_update_module_lands_a_pending_swap_in_the_registry() {
             GovAction::UpdateModule {
                 name: "hello-replacement".into(),
                 module_id: "hello".into(),
-                activation_height: 500,
+                activation_lead: 500,
                 code_hash: hash(2),
             },
         )
@@ -202,8 +202,85 @@ fn a_passing_update_module_lands_a_pending_swap_in_the_registry() {
         assert_eq!(code.active_code_hash, hash(1), "active untouched until H");
         let pending = code.pending.expect("pending swap landed");
         assert_eq!(pending.name, "hello-replacement");
-        assert_eq!(pending.activation_height, 500);
+        // activation_lead (500) is RELATIVE to the EXECUTE height (base 1,
+        // `pass` executes at base+3=4): 4 + 500 = 504.
+        assert_eq!(pending.activation_height, 504);
         assert_eq!(pending.code_hash, hash(2));
+    });
+}
+
+/// regression for #1775: a ballot that outlasts a SHORT voting period must
+/// still schedule cleanly when it finally executes, long after propose. an
+/// absolute `activation_height` chosen at propose time would already be
+/// behind `execute_height + MIN_SWAP_LEAD` by the time this executes,
+/// permanently rejecting the Execute op — the lead is relative to the
+/// EXECUTE height instead, so a long-running ballot is never doomed by its
+/// own duration.
+#[test]
+fn a_ballot_that_outlasts_its_lead_still_schedules_at_execute_time() {
+    block_on(async {
+        let mut host = gov_host_with_modreg().await;
+        let (m1, m2) = (member_key(1), member_key(2));
+        // a short activation_lead (just above the door's floor) and a voting
+        // period long enough that Execute lands far past what would have
+        // been the original propose-time absolute height.
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "mod-late".into(),
+                action: GovAction::UpdateModule {
+                    name: "hello-replacement".into(),
+                    module_id: "hello".into(),
+                    activation_lead: governance::MIN_ACTIVATION_LEAD,
+                    code_hash: hash(2),
+                },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("propose");
+        for (who, at) in [(&m1, 2u64), (&m2, 3u64)] {
+            submit_as(
+                &mut host,
+                who,
+                at,
+                gov_encode(&GovMsg::Vote {
+                    proposal_id: "mod-late".into(),
+                    approve: true,
+                }),
+            )
+            .await
+            .expect("vote");
+        }
+        // deadline is 1 + 100 = 101; execute long after — an absolute height
+        // computed AT PROPOSE (height 1) would be ancient history by now.
+        let execute_height = 5_000;
+        submit_as(
+            &mut host,
+            &m2,
+            execute_height,
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "mod-late".into(),
+            }),
+        )
+        .await
+        .expect("a long-outstanding ballot still schedules cleanly at execute time");
+
+        assert_eq!(
+            proposal_status(&host, "mod-late").await,
+            Some(ProposalStatus::Passed)
+        );
+        let pending = hello_code(&host)
+            .await
+            .pending
+            .expect("pending swap landed despite the long ballot");
+        assert_eq!(
+            pending.activation_height,
+            execute_height + governance::MIN_ACTIVATION_LEAD,
+            "activation is relative to the EXECUTE height, not the propose height"
+        );
     });
 }
 
@@ -219,7 +296,7 @@ fn a_passing_cancel_module_update_clears_the_pending_swap() {
             GovAction::UpdateModule {
                 name: "hello-replacement".into(),
                 module_id: "hello".into(),
-                activation_height: 500,
+                activation_lead: 500,
                 code_hash: hash(2),
             },
         )
@@ -258,7 +335,7 @@ fn a_refused_schedule_fails_execute_atomically() {
                 action: GovAction::UpdateModule {
                     name: "replacement".into(),
                     module_id: "ghost".into(), // never registered
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: hash(2),
                 },
                 voting_period: 100,
@@ -315,7 +392,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
                 action: GovAction::UpdateModule {
                     name: "replacement".into(),
                     module_id: "hello".into(),
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: vec![1, 2, 3],
                 },
                 voting_period: 100,
@@ -352,7 +429,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
                 action: GovAction::UpdateModule {
                     name: "replacement".into(),
                     module_id: "hello".into(),
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: hash(2),
                 },
                 voting_period: 100,
@@ -364,6 +441,40 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
             matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("registry")),
             "got {err:?}"
         );
+    });
+}
+
+/// door check: an `activation_lead` at or under the registry's own floor
+/// (`modules::MIN_SWAP_LEAD`) can never schedule successfully, whatever
+/// height Execute lands at — refused at Propose, not discovered by every
+/// Execute retrying and failing forever (#1775).
+#[test]
+fn door_check_refuses_a_lead_too_short_to_ever_schedule() {
+    block_on(async {
+        let mut host = gov_host_with_modreg().await;
+        let m1 = member_key(1);
+        let err = submit_as(
+            &mut host,
+            &m1,
+            1,
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "mod-short-lead".into(),
+                action: GovAction::UpdateModule {
+                    name: "replacement".into(),
+                    module_id: "hello".into(),
+                    activation_lead: modules::MIN_SWAP_LEAD,
+                    code_hash: hash(2),
+                },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect_err("a lead at the registry's own floor can never schedule");
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("activation_lead")),
+            "got {err:?}"
+        );
+        assert_eq!(proposal_status(&host, "mod-short-lead").await, None);
     });
 }
 
@@ -394,7 +505,7 @@ fn a_passing_register_module_admits_a_new_pending_entry() {
             GovAction::RegisterModule {
                 name: "kanban-v1".into(),
                 module_id: "kanban".into(),
-                activation_height: 500,
+                activation_lead: 500,
                 code_hash: hash(7),
             },
         )
@@ -408,7 +519,8 @@ fn a_passing_register_module_admits_a_new_pending_entry() {
         assert!(code.active_code_hash.is_empty(), "no active code until H");
         let pending = code.pending.expect("pending initial code landed");
         assert_eq!(pending.name, "kanban-v1");
-        assert_eq!(pending.activation_height, 500);
+        // same relative-lead arithmetic as the UpdateModule case above.
+        assert_eq!(pending.activation_height, 504);
         assert_eq!(pending.code_hash, hash(7));
     });
 }
@@ -426,7 +538,7 @@ fn a_passing_cancel_removes_an_admission_entry_entirely() {
             GovAction::RegisterModule {
                 name: "kanban-v1".into(),
                 module_id: "kanban".into(),
-                activation_height: 500,
+                activation_lead: 500,
                 code_hash: hash(7),
             },
         )
@@ -469,7 +581,7 @@ fn register_module_of_an_existing_id_fails_execute_atomically() {
                 action: GovAction::RegisterModule {
                     name: "hello-again".into(),
                     module_id: "hello".into(),
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: hash(9),
                 },
                 voting_period: 100,

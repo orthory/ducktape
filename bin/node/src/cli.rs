@@ -1455,10 +1455,23 @@ pub(super) fn drive_proposal_ceremony(
         }
         None => {
             let prefix: String = pubkey_hex.chars().take(16).collect();
+            // MINT AGAINST THE RECORD, not the roster. `GovQuery::Proposals`
+            // walks the OPEN roster, but a settled proposal's record is kept
+            // forever under its id — so an id missing from that list can still
+            // be taken by an earlier ceremony for the same key. Reusing one
+            // makes every wait below adopt that stale record: `await_proposal`
+            // sees it the instant it is asked, `cast_yes_once` returns early on
+            // its settled status, `Execute` is skipped, and the verb reports
+            // the PREVIOUS ceremony's outcome while this one votes on nothing
+            // (a re-grant that silently changes no state — #1766).
             let id = (0u64..)
                 .map(|n| format!("{id_prefix}{prefix}:{n}"))
-                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
-                .expect("the id space is unbounded");
+                .find_map(|candidate| match read_proposal(node.rpc(), &candidate) {
+                    Ok(None) => Some(Ok(candidate)),
+                    Ok(Some(_)) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .expect("the id space is unbounded")?;
             signer.submit(
                 node.rpc(),
                 &GovMsg::Propose {
@@ -1916,9 +1929,9 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // read BEFORE anything lands on disk: a mistyped path is refused with
     // nothing written, like a bad blob.
     let genesis_bytes = match &args.genesis {
-        Some(file) => Some(
-            std::fs::read(file).map_err(|e| format!("read genesis {}: {e}", file.display()))?,
-        ),
+        Some(file) => {
+            Some(std::fs::read(file).map_err(|e| format!("read genesis {}: {e}", file.display()))?)
+        }
         None => None,
     };
     // argv words are rejoined (a blob pasted unquoted splits on its wrapped
@@ -2181,9 +2194,10 @@ mod tests {
         );
     }
 
-    /// a module verb must JOIN the founder's open proposal even though every
-    /// member computed its own activation height, so the matcher — not action
-    /// equality — decides which fields identify "the same proposal".
+    /// a module verb must JOIN the founder's open proposal by whichever
+    /// fields ITS OWN matcher cares about, not full action equality — a
+    /// caller whose matcher ignores a field (here, `activation_lead`) still
+    /// finds the right open proposal among unrelated ones.
     #[test]
     fn open_proposal_matching_ignores_fields_the_matcher_ignores() {
         use super::open_proposal_matching;
@@ -2207,9 +2221,8 @@ mod tests {
             GovAction::UpdateModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                // the founder computed 61; this member computes 60 below —
-                // the matcher must join anyway.
-                activation_height: 61,
+                // a lead the matcher below does not compare against.
+                activation_lead: 61,
                 code_hash: hash.clone(),
             },
         );
@@ -2219,7 +2232,7 @@ mod tests {
             GovAction::UpdateModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                activation_height: 60,
+                activation_lead: 60,
                 code_hash: hash.clone(),
             },
         );
@@ -2229,13 +2242,13 @@ mod tests {
             GovAction::RegisterModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                activation_height: 60,
+                activation_lead: 60,
                 code_hash: hash.clone(),
             },
         );
         let views = vec![settled, other, founders];
-        // the second member computed height 61, not 60 — equality on the whole
-        // action would never join the founder's proposal.
+        // the matcher below cares only about module_id and code_hash — a
+        // different activation_lead must not stop it from joining "founders".
         let matches = |a: &GovAction| {
             matches!(a, GovAction::UpdateModule { module_id, code_hash, .. }
                 if module_id == "hello" && *code_hash == hash)

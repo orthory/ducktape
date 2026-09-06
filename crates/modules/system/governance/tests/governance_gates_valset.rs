@@ -280,6 +280,105 @@ fn an_add_resident_proposal_grants_resident_standing() {
     });
 }
 
+/// regression for #1776: an AddResident whose subject was promoted to
+/// validator IN THE MEANTIME must settle cleanly instead of erroring the
+/// whole Execute unit forever. valset's `handle_grant` Errs when the key is
+/// already a validator ("resident standing is the pre-promotion tier") — an
+/// unconditional emit would propagate that Err out of the follow-up and
+/// reject Execute on every retry (the exact repro from the issue: an
+/// AddResident and an AddValidator open for the same key at once, the
+/// AddValidator executes first).
+#[test]
+fn an_add_resident_proposal_settles_cleanly_when_its_subject_is_already_a_validator() {
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2, key) = (member_key(1), member_key(2), member_key(9));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p1-resident".into(),
+                action: GovAction::AddResident { key: key.clone() },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("propose AddResident");
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p2-validator".into(),
+                action: GovAction::AddValidator { key: key.clone() },
+                voting_period: 100,
+            }),
+        )
+        .await
+        .expect("propose AddValidator");
+        for id in ["p1-resident", "p2-validator"] {
+            for (who, at) in [(&m1, 2u64), (&m2, 3u64)] {
+                submit_as(
+                    &mut host,
+                    who,
+                    at,
+                    "governance",
+                    gov_encode(&GovMsg::Vote {
+                        proposal_id: id.into(),
+                        approve: true,
+                    }),
+                )
+                .await
+                .expect("vote");
+            }
+        }
+
+        // execute the validator admission FIRST: the key is seated.
+        submit_as(
+            &mut host,
+            &m2,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "p2-validator".into(),
+            }),
+        )
+        .await
+        .expect("execute AddValidator");
+        assert!(validators(&host).await.contains(&key));
+
+        // now the stale AddResident mandate executes: valset would Err a
+        // Grant for an already-seated validator — governance must pre-check
+        // this and settle the proposal cleanly (Rejected) instead of
+        // rejecting the whole Execute op.
+        submit_as(
+            &mut host,
+            &m2,
+            5,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "p1-resident".into(),
+            }),
+        )
+        .await
+        .expect("a stale AddResident settles cleanly, not with a rejected Execute op");
+
+        assert_eq!(
+            proposal_status(&host, "p1-resident").await,
+            Some(ProposalStatus::Rejected),
+            "a mandate that can never apply settles Rejected, not stuck Open forever"
+        );
+        assert!(
+            !residents(&host).await.contains(&key),
+            "the already-promoted key never lands as a resident too"
+        );
+    });
+}
+
 #[test]
 fn a_passing_proposal_removes_the_validator_and_emits_leave() {
     block_on(async {
@@ -927,6 +1026,94 @@ fn a_settled_proposal_frees_its_roster_slot() {
             open_proposal_count(&host).await,
             0,
             "the settled id left the open-proposal roster"
+        );
+    });
+}
+
+#[test]
+fn a_settled_id_can_never_be_proposed_again() {
+    // regression (#1766): a settled id leaves the roster but its RECORD is
+    // kept forever, so a roster-only duplicate check let a second Propose
+    // OVERWRITE the settled record with a fresh Open proposal. That erases a
+    // decided outcome, and it is silent: a ceremony driver that waits for
+    // "the proposal exists" is answered by the STALE record before its own
+    // Propose lands, reports that old outcome, and votes on nothing.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2) = (member_key(1), member_key(2));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "spent".into(),
+                action: GovAction::Signal { text: "hi".into() },
+                voting_period: 10,
+            }),
+        )
+        .await
+        .expect("propose");
+        for (member, seq) in [(&m1, 2u64), (&m2, 3)] {
+            submit_as(
+                &mut host,
+                member,
+                seq,
+                "governance",
+                gov_encode(&GovMsg::Vote {
+                    proposal_id: "spent".into(),
+                    approve: true,
+                }),
+            )
+            .await
+            .expect("vote");
+        }
+        submit_as(
+            &mut host,
+            &m2,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "spent".into(),
+            }),
+        )
+        .await
+        .expect("execute");
+        assert_eq!(
+            proposal_status(&host, "spent").await,
+            Some(ProposalStatus::Passed),
+            "the id is settled Passed"
+        );
+        assert_eq!(
+            open_proposal_count(&host).await,
+            0,
+            "and it left the open roster"
+        );
+
+        let reused = submit_as(
+            &mut host,
+            &m1,
+            5,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "spent".into(),
+                action: GovAction::Signal {
+                    text: "again".into(),
+                },
+                voting_period: 10,
+            }),
+        )
+        .await
+        .expect_err("re-proposing a settled id must be refused");
+        assert!(
+            reused.to_string().contains("proposal already exists"),
+            "unexpected refusal: {reused}"
+        );
+        assert_eq!(
+            proposal_status(&host, "spent").await,
+            Some(ProposalStatus::Passed),
+            "the settled record is untouched by the refused reuse"
         );
     });
 }
