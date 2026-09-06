@@ -21,6 +21,12 @@
 //!   member's oldest row, exactly like the module.
 //! - `nunread/{hex(member)}` — the member's unread count (u64 BE), so
 //!   `unread` is one point read.
+//! - `nread/{hex(member)}`   — the member's read watermark (u64 BE), mirrored
+//!   from the module's own `MarkRead` semantics: everything at or below it
+//!   reads as read. `read` on a [`NotificationRow`] is therefore DERIVED at
+//!   query/fold time from `seq <= watermark`, never stored authoritatively —
+//!   `MarkRead` costs one point read and one point write here too, never a
+//!   scan-and-rewrite of every row in range.
 //!
 //! this file is the DECISION core — pure functions over [`StateRead`],
 //! compiled natively and unit-tested against a plain map. the wasm shell
@@ -59,6 +65,10 @@ pub struct NotificationRow {
     pub source: String,
     pub height: u64,
     pub created_at: u64,
+    /// DERIVED at query time from the member's read watermark (`seq <=
+    /// watermark`) — never an authoritative stored bit. always `false` as
+    /// persisted; a caller sees the real value only through [`serve_view`],
+    /// which overwrites it before returning.
     pub read: bool,
 }
 
@@ -113,6 +123,10 @@ fn count_key(member: &str) -> String {
 
 fn unread_key(member: &str) -> String {
     format!("nunread/{}", hex_lower(member.as_bytes()))
+}
+
+fn watermark_key(member: &str) -> String {
+    format!("nread/{}", hex_lower(member.as_bytes()))
 }
 
 /// rendered delivering origin.
@@ -192,13 +206,12 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 if let Some((key, value)) = page.entries.first() {
                     let oldest: NotificationRow = serde_json::from_slice(value)
                         .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
-                    if !oldest.read {
+                    let watermark = read_u64(read, &watermark_key(&member));
+                    let oldest_was_unread = oldest.seq > watermark;
+                    if oldest_was_unread {
                         unread = unread.saturating_sub(1);
                     }
-                    index_guest::delete(
-                        &mut out,
-                        String::from_utf8_lossy(key).to_string(),
-                    );
+                    index_guest::delete(&mut out, String::from_utf8_lossy(key).to_string());
                     count -= 1;
                 }
             }
@@ -219,26 +232,38 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             )?;
         }
         InboxMsg::MarkRead { member, up_to_seq } => {
-            let mut newly_read = 0u64;
-            for_items_up_to(read, &member, up_to_seq, |mut row| {
-                if row.read {
-                    return Ok(());
+            // O(1): one point read of the watermark plus (at most) the point
+            // reads the unread delta needs — never a scan or a per-row write.
+            // the live seqs form a contiguous range [last_seq-count+1,
+            // last_seq] (both eviction and Clear only ever remove the LOW
+            // end), so the count of live items newly covered by raising the
+            // watermark is a closed-form intersection, not a walk.
+            let old_watermark = read_u64(read, &watermark_key(&member));
+            let new_watermark = old_watermark.max(up_to_seq);
+            if new_watermark > old_watermark {
+                let count = read_u64(read, &count_key(&member));
+                if count > 0 {
+                    let last_seq = read_u64(read, &seq_key(&member));
+                    let lowest_live = last_seq + 1 - count;
+                    let lo = (old_watermark + 1).max(lowest_live);
+                    let hi = new_watermark.min(last_seq);
+                    if hi >= lo {
+                        let newly_read = hi - lo + 1;
+                        let unread =
+                            read_u64(read, &unread_key(&member)).saturating_sub(newly_read);
+                        put_u64(&mut out, unread_key(&member), unread);
+                    }
                 }
-                newly_read += 1;
-                row.read = true;
-                put_row(&mut out, &row)
-            })?;
-            if newly_read > 0 {
-                let unread = read_u64(read, &unread_key(&member)).saturating_sub(newly_read);
-                put_u64(&mut out, unread_key(&member), unread);
+                put_u64(&mut out, watermark_key(&member), new_watermark);
             }
         }
         InboxMsg::Clear { member, up_to_seq } => {
+            let watermark = read_u64(read, &watermark_key(&member));
             let mut dropped = 0u64;
             let mut dropped_unread = 0u64;
             for_items_up_to(read, &member, up_to_seq, |row| {
                 dropped += 1;
-                if !row.read {
+                if row.seq > watermark {
                     dropped_unread += 1;
                 }
                 index_guest::delete(&mut out, item_key(&row.member, row.seq));
@@ -247,9 +272,15 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             if dropped > 0 {
                 let count = read_u64(read, &count_key(&member)).saturating_sub(dropped);
                 put_u64(&mut out, count_key(&member), count);
-                let unread =
-                    read_u64(read, &unread_key(&member)).saturating_sub(dropped_unread);
+                let unread = read_u64(read, &unread_key(&member)).saturating_sub(dropped_unread);
                 put_u64(&mut out, unread_key(&member), unread);
+                if count == 0 {
+                    // the queue is now empty: the module deletes the
+                    // member's META record (a later delivery re-mints fresh
+                    // seqs from 1), so a stale watermark here would wrongly
+                    // mark those NEW items read on arrival.
+                    index_guest::delete(&mut out, watermark_key(&member));
+                }
             }
         }
     }
@@ -274,12 +305,15 @@ pub fn serve_view(read: &impl StateRead, req: &[u8]) -> Result<Vec<u8>, Fail> {
                 after.as_deref(),
                 limit.unwrap_or(DEFAULT_LIST_LIMIT).clamp(1, MAX_LIST_LIMIT),
             );
+            let watermark = read_u64(read, &watermark_key(&member));
             let mut items = Vec::with_capacity(page.entries.len());
             for (_key, value) in &page.entries {
-                items.push(
-                    serde_json::from_slice(value)
-                        .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?,
-                );
+                let mut row: NotificationRow = serde_json::from_slice(value)
+                    .map_err(|e| Fail::new(FAIL_ROW_DECODE, e.to_string()))?;
+                // DERIVED, never the stored (always-false) bit — see
+                // `NotificationRow::read`.
+                row.read = row.seq <= watermark;
+                items.push(row);
             }
             InboxViewReply::Items(items)
         }
@@ -356,7 +390,11 @@ mod tests {
     #[test]
     fn deliveries_page_per_member_and_track_unread() {
         let mut map = Map::new();
-        fold(&mut map, 1, &deliver("alice", "mention", "you were mentioned"));
+        fold(
+            &mut map,
+            1,
+            &deliver("alice", "mention", "you were mentioned"),
+        );
         fold(&mut map, 2, &deliver("alice", "reply", "someone replied"));
         fold(&mut map, 3, &deliver("bob", "mention", "bob's own"));
 
@@ -419,7 +457,11 @@ mod tests {
         let rows = items(&map, serde_json::json!({"list": {"member": "alice"}}));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].seq, 3);
-        assert_eq!(unread(&map, "alice"), 1, "the unread survivor stays counted");
+        assert_eq!(
+            unread(&map, "alice"),
+            1,
+            "the unread survivor stays counted"
+        );
 
         // a new delivery continues the seq space — Clear never rewinds it.
         fold(&mut map, 7, &deliver("alice", "k", "n4"));

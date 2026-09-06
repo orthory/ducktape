@@ -4,9 +4,9 @@
 //! discriminating property the rest of the store-backed family proves, over
 //! the meta + item + member-count layout.
 //!
-//! the source delivers to two members, marks one item read (record
-//! overwrite), and fully clears the other (the op log carries item DELETES
-//! plus a META delete and a member-count decrement), so the joiner must
+//! the source delivers to two members, marks one item read (a meta
+//! read-watermark bump), and fully clears the other (the op log carries item
+//! DELETES plus a META delete and a member-count decrement), so the joiner must
 //! reconstruct every record family — and a post-sync delivery to the cleared
 //! member must re-mint from seq 1, since its meta record no longer exists.
 

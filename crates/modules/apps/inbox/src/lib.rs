@@ -42,7 +42,8 @@
 //! ## State model
 //!
 //! pure logic over a host-injected [`sdk::MerkleStore`]: one META record per
-//! member (`meta\0{member}` → next_seq + the sorted live-seq list, borsh),
+//! member (`meta\0{member}` → next_seq + the sorted live-seq list + the read
+//! watermark, borsh),
 //! one record per live notification (`item\0{len|member}{seq}`), and the
 //! `member_count` scalar the distinct-member cap reads — every record is
 //! bounded by the field caps below, and NOTHING enumerates members (the
@@ -77,6 +78,17 @@
 //! tolerance is scoped to the seq/member LOOKUP and stops at the owner gate: a
 //! foreign member is a hard rejection, and no cascade is at risk from it
 //! because nothing in the tree emits an ack as a follow-up.
+//!
+//! READ TRACKING is a per-member WATERMARK ([`MemberMeta::read_watermark`]),
+//! never a per-item flag: `stage_mark_read` costs exactly one meta read and
+//! (at most) one meta write, regardless of queue length. A queue at
+//! [`MAX_ITEMS_PER_MEMBER`] would otherwise need one distinct store read per
+//! live item to flip each `read` bit — with the wasm host's per-dispatch
+//! store-read budget also capped at 4096, a full queue's `MarkRead` could
+//! never complete. Nothing marks a single item read in isolation (`MarkRead`
+//! is always a range), so there is no per-item `read` field to keep in sync:
+//! every read path (the index guest's list/unread view) derives `read` as
+//! `seq <= read_watermark`.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -196,12 +208,16 @@ const MEMBER_COUNT_KEY: &[u8] = b"member_count";
 /// fresh `MemberMeta` starting at seq 1. `seqs` is bounded by construction: at
 /// most [`MAX_ITEMS_PER_MEMBER`] entries. `evicted` counts every item this
 /// member has ever lost to the overflow drop below — the queue's own
-/// visible tally of otherwise-silent loss.
+/// visible tally of otherwise-silent loss. `read_watermark` is the seq up to
+/// which every item is read: `MarkRead` only ever raises it, so a read item
+/// is exactly one whose `seq <= read_watermark` — no per-item flag exists to
+/// desync from it.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 struct MemberMeta {
     next_seq: u64,
     seqs: Vec<u64>,
     evicted: u64,
+    read_watermark: u64,
 }
 
 impl MemberMeta {
@@ -210,6 +226,7 @@ impl MemberMeta {
             next_seq: 1,
             seqs: Vec::new(),
             evicted: 0,
+            read_watermark: 0,
         }
     }
 }
@@ -262,7 +279,10 @@ impl Inbox {
     }
 
     /// a live item the meta's seq list points at. a listed seq without its
-    /// record is a store bug — loud, never skipped.
+    /// record is a store bug — loud, never skipped. only `queue_view`
+    /// (testkit) still reads individual items: every real read path derives
+    /// `read` from the watermark instead of loading records one at a time.
+    #[cfg(feature = "testkit")]
     async fn item(&self, member: &str, seq: u64) -> Result<Notification, Error> {
         self.load(&item_key(member, seq))
             .await?
@@ -345,13 +365,15 @@ impl Inbox {
                 body,
                 source,
                 created_at,
-                read: false,
             },
         );
         self.store(meta_key(&member), &meta);
         Ok(seq)
     }
 
+    /// O(1): one meta read, at most one meta write — never a per-item read or
+    /// write. `read_watermark` only ever rises, so an `up_to_seq` at or below
+    /// it is a byte-identical no-op (idempotent re-acks never move the root).
     async fn stage_mark_read(
         &mut self,
         origin: &Origin,
@@ -363,16 +385,14 @@ impl Inbox {
         // which answer comes back.
         check_queue_owner(origin, &member)?;
         // unknown member: deterministic no-op (never stage, never error).
-        let Some(meta) = self.meta(&member).await? else {
+        let Some(mut meta) = self.meta(&member).await? else {
             return Ok(());
         };
-        for seq in meta.seqs.iter().take_while(|s| **s <= up_to_seq) {
-            let mut item = self.item(&member, *seq).await?;
-            if !item.read {
-                item.read = true;
-                self.store(item_key(&member, *seq), &item);
-            }
+        if up_to_seq <= meta.read_watermark {
+            return Ok(());
         }
+        meta.read_watermark = up_to_seq;
+        self.store(meta_key(&member), &meta);
         Ok(())
     }
 
@@ -525,6 +545,22 @@ impl Inbox {
     /// assert it actually falls, not just that a fresh member is admitted.
     pub async fn member_count_view(&self) -> Result<u64, Error> {
         self.member_count().await
+    }
+
+    /// a member's read watermark — everything at or below it reads as read.
+    /// `0` (never marked) for a member never delivered to.
+    pub async fn read_watermark_view(&self, member: &str) -> Result<u64, Error> {
+        Ok(self
+            .meta(member)
+            .await?
+            .map(|m| m.read_watermark)
+            .unwrap_or(0))
+    }
+
+    /// whether `seq` in `member`'s queue currently reads as read — derived
+    /// from the watermark, exactly like every real read path.
+    pub async fn is_read(&self, member: &str, seq: u64) -> Result<bool, Error> {
+        Ok(seq <= self.read_watermark_view(member).await?)
     }
 
     /// stage a member whose seq space is one delivery from exhaustion — the
