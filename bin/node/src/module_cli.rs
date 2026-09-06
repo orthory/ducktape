@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 
 use commonware_cryptography::Signer as _;
-use topology::PRODUCTION;
 
 use crate::cli::{CeremonyOutcome, GovSigner, rpc_call, rpc_query};
 use crate::cli_args::{Selector, StatusArgs};
@@ -182,7 +181,14 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     // 1. the registry's static rules, before anything is staged or proposed:
     //    each would reject governance's execute in-kernel and leave a
     //    proposal open for its whole voting period.
-    let precheck = registry_precheck(verb, &read_module_status(rpc_addr)?, &args.id, &code_hash)?;
+    let live_modules = read_live_modules(rpc_addr)?;
+    let precheck = registry_precheck(
+        verb,
+        &read_module_status(rpc_addr)?,
+        &live_modules,
+        &args.id,
+        &code_hash,
+    )?;
     match precheck {
         Precheck::Proceed => {}
         // a member running the verb after the deciding ballot (or after the
@@ -357,22 +363,19 @@ impl Held {
 fn registry_precheck(
     verb: Verb,
     modules: &[modules::ModuleCode],
+    live_modules: &[String],
     id: &str,
     code_hash: &[u8; 32],
 ) -> Result<Precheck, String> {
-    // a genesis id is code this host already runs, so the registry's
-    // `handle_schedule_register` refuses to re-admit it (`ctx.module_root`) —
-    // and that refusal lands in-kernel, leaving the proposal open for its whole
-    // voting period. the registry read cannot see it: a NATIVE module carries no
-    // registry entry at all.
-    let registering_a_genesis_module = matches!(verb, Verb::Register) && PRODUCTION.contains(&id);
-    if registering_a_genesis_module {
-        return Err(format!(
-            "{id} is a genesis module — its code changes with `module update`, not `register`"
-        ));
-    }
     if let Some(held) = registry_holds(modules, id, code_hash) {
         return Ok(Precheck::AlreadyHeld(held));
+    }
+    let already_live = live_modules.iter().any(|live| live == id);
+    let registering_live_module = matches!(verb, Verb::Register) && already_live;
+    if registering_live_module {
+        return Err(format!(
+            "module {id} is already registered (code changes go through `module update`)"
+        ));
     }
     let entry = modules.iter().find(|m| m.module_id == id);
     let other_swap_pending = entry.map(|m| m.pending.is_some());
@@ -414,6 +417,20 @@ fn registry_holds(modules: &[modules::ModuleCode], id: &str, code_hash: &[u8; 32
     }
     let already_active = entry.active_code_hash == code_hash;
     already_active.then_some(Held::Active)
+}
+
+/// The running host determines which ids are occupied, including modules
+/// with no code-registry record. A default build catalog says nothing about
+/// the module set of this network.
+fn read_live_modules(rpc_addr: &str) -> Result<Vec<String>, String> {
+    let reply = rpc_call(rpc_addr, &serde_json::json!({ "cmd": "status" }))?;
+    if reply["ok"] != true {
+        return Err(format!("status: {}", reply["error"]));
+    }
+    let Some(modules) = reply["status"]["modules"].as_object() else {
+        return Err("node status carries no module roster".into());
+    };
+    Ok(modules.keys().cloned().collect())
 }
 
 /// this node's committed height, from the rpc status snapshot.
@@ -784,7 +801,7 @@ mod tests {
             history: Vec::new(),
         };
         let precheck =
-            |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, "hello", &ours);
+            |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, &[], "hello", &ours);
 
         // register: a free id proceeds; any existing entry refuses
         assert!(matches!(
@@ -829,12 +846,15 @@ mod tests {
             "scheduled"
         );
         assert_eq!(Held::Active.word(), "active");
-        // a genesis id carries no registry entry when it is native, so only the
-        // topology set catches it — the registry would refuse it in-kernel
-        let err = registry_precheck(Verb::Register, &[], "identity", &ours).unwrap_err();
-        assert!(err.contains("genesis module"), "{err}");
-        // update is how a genesis module's code changes: no genesis refusal
-        let err = registry_precheck(Verb::Update, &[], "identity", &ours).unwrap_err();
+        // A familiar name is available when this network does not run it.
+        assert!(matches!(
+            registry_precheck(Verb::Register, &[], &[], "identity", &ours),
+            Ok(Precheck::Proceed)
+        ));
+        let live = vec!["identity".to_string()];
+        let err = registry_precheck(Verb::Register, &[], &live, "identity", &ours).unwrap_err();
+        assert!(err.contains("already registered"), "{err}");
+        let err = registry_precheck(Verb::Update, &[], &live, "identity", &ours).unwrap_err();
         assert!(err.contains("unregistered module identity"), "{err}");
     }
 

@@ -320,6 +320,52 @@ fn init_writes_module_hashes_and_the_genesis() {
     assert_eq!(guests, want, "every index guest the set holds rides in the genesis");
 }
 
+#[test]
+fn init_accepts_a_module_absent_from_the_binary_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("supplied");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/examples/directory/component.wasm"),
+        workspace_config::component_path(&source, "directory"),
+    )
+    .unwrap();
+    let workspace = tmp.path().join("network");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args([
+            "node",
+            "init",
+            "--name",
+            "custom",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+        ])
+        .arg(&workspace)
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--advertised",
+            "127.0.0.1:1",
+            "--modules",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_ok(&output, "init with supplied directory module");
+    let genesis = workspace_config::Genesis::load(&workspace.join("genesis")).unwrap();
+    assert_eq!(
+        genesis
+            .components
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect::<Vec<_>>(),
+        ["directory"]
+    );
+    assert!(genesis.index_guests.is_empty());
+}
+
 /// with no `--modules` and no `$DUCKTAPE_MODULES_DIR`, `init` founds from the
 /// set `cargo build` staged beside the binary — the operator's plain build is
 /// enough to found a network.

@@ -74,10 +74,8 @@ pub enum Boot<'a, 'b> {
     /// modules registry from `bundle` — and the wasm set IS `bundle` (module
     /// id → the sha256 of its genesis component: the code source is asked for
     /// these bytes, checked against the hash). every module starts
-    /// [`Start::Fresh`]. PRECONDITION: `bundle`'s key set is EXACTLY the
-    /// selection's wasm ids — every entry lands in the modules root, so a
-    /// stray key would move the genesis root; [`compose`] refuses any drift
-    /// by name.
+    /// [`Start::Fresh`]. The bundle determines the Wasm module set; its ids
+    /// do not need entries in the binary's default module catalog.
     Genesis {
         validators: &'a [Vec<u8>],
         bundle: &'a BTreeMap<String, [u8; 32]>,
@@ -135,6 +133,17 @@ pub async fn compose(
                 .ok_or_else(|| format!("module {id} is not in the topology"))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if let Boot::Genesis { bundle, .. } = &boot {
+        for id in bundle.keys() {
+            workspace_config::validate_module_id(id)?;
+            let collides_with_native = specs
+                .iter()
+                .any(|spec| spec.id == id && spec.code == Code::Native);
+            if collides_with_native {
+                return Err(format!("duplicate module id: {id}"));
+            }
+        }
+    }
     let mut host = Host::new();
     for spec in &specs {
         match spec.code {
@@ -143,17 +152,14 @@ pub async fn compose(
         }
     }
     let active = match &boot {
-        Boot::Genesis { bundle, .. } => {
-            check_bundle_keys(selection, bundle)?;
-            bundle
-                .iter()
-                .map(|(id, hash)| ActiveCode {
-                    id: id.clone(),
-                    hash: *hash,
-                    seat: Seat::Fresh,
-                })
-                .collect()
-        }
+        Boot::Genesis { bundle, .. } => bundle
+            .iter()
+            .map(|(id, hash)| ActiveCode {
+                id: id.clone(),
+                hash: *hash,
+                seat: Seat::Fresh,
+            })
+            .collect(),
         Boot::Reopen { height, .. } => registry_active_set(&host, *height).await?,
     };
     for entry in active {
@@ -239,26 +245,6 @@ async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>
             })
         })
         .collect())
-}
-
-/// the bundle's key set is EXACTLY the selection's wasm ids: every entry
-/// seeds the modules registry (a stray key moves the genesis root) and every
-/// wasm tenant needs one (a missing key cannot compose). named both ways.
-fn check_bundle_keys(
-    selection: &[&'static str],
-    bundle: &BTreeMap<String, [u8; 32]>,
-) -> Result<(), String> {
-    let wanted: BTreeSet<&str> = TOPOLOGY.wasm_ids(selection).into_iter().collect();
-    let given: BTreeSet<&str> = bundle.keys().map(String::as_str).collect();
-    let missing: Vec<&str> = wanted.difference(&given).copied().collect();
-    let extra: Vec<&str> = given.difference(&wanted).copied().collect();
-    let is_exact = missing.is_empty() && extra.is_empty();
-    if is_exact {
-        return Ok(());
-    }
-    Err(format!(
-        "the bundle must key exactly the selection's wasm modules: missing {missing:?}, extra {extra:?}"
-    ))
 }
 
 /// the component bytes for `id` at `hash`, verified. a code source is a

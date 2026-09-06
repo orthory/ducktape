@@ -144,16 +144,18 @@ pub struct ModuleCode {
     pub code_hash: String,
 }
 
-/// a module id is a bare identifier: non-empty, no `=`, no newline — the two
-/// bytes the genesis fingerprint uses as delimiters, so no two module sets can
-/// fold to one namespace. checked at every boundary a descriptor enters
-/// through (`from_toml`, the invite decoder, `module_hashes`).
+/// A module id is one filesystem name and contains none of the genesis
+/// fingerprint's delimiters. The same id addresses a module in consensus
+/// state, a descriptor, and the workspace's artifact directory.
 pub fn validate_module_id(id: &str) -> Result<(), String> {
     let is_empty = id.is_empty();
     let has_delimiter = id.contains('=') || id.contains('\n');
-    if is_empty || has_delimiter {
+    let has_path_separator = id.contains('/') || id.contains('\\') || id.contains('\0');
+    let is_relative_directory = matches!(id, "." | "..");
+    let invalid = is_empty || has_delimiter || has_path_separator || is_relative_directory;
+    if invalid {
         return Err(format!(
-            "module id {id:?} is not a bare identifier (empty, or contains '=' / newline)"
+            "module id {id:?} is not a bare identifier (empty, a path, or contains '=' / newline)"
         ));
     }
     Ok(())

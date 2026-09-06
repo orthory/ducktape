@@ -141,15 +141,14 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
 }
 
 #[test]
-fn bundle_drift_and_unknown_ids_are_refused_by_name() {
+fn genesis_module_membership_comes_from_the_bundle() {
     run(|context, dir| {
         Box::pin(async move {
-            let (code, by_id) = DirCodeSource::open(&fixtures(), &["acl"]).unwrap();
-            let (_, with_extra) = DirCodeSource::open(&fixtures(), &["acl", "governance"]).unwrap();
+            let (code, by_id) = DirCodeSource::open(&fixtures(), &["directory"]).unwrap();
             let substrates = substrates(&dir);
             let mut stores = qmdb_stores(&context);
-            let Err(err) = compose(
-                &["acl", "governance"],
+            let genesis = compose(
+                SELECTION,
                 &code,
                 &mut stores,
                 &substrates,
@@ -160,53 +159,42 @@ fn bundle_drift_and_unknown_ids_are_refused_by_name() {
                 },
             )
             .await
-            else {
-                panic!("a wasm module with no genesis code hash composed");
-            };
-            assert!(
-                err.contains("governance"),
-                "the refusal names the module: {err}"
-            );
-            let Err(err) = compose(
-                &["not-a-module"],
-                &code,
-                &mut stores,
-                &substrates,
-                &BINDINGS,
-                Boot::Genesis {
-                    validators: &[],
-                    bundle: &by_id,
-                },
-            )
-            .await
-            else {
-                panic!("an id outside the topology composed");
-            };
-            assert!(
-                err.contains("not-a-module"),
-                "an unknown id is refused by name: {err}"
-            );
-            // a stray extra hash would seed the modules registry (and move
-            // the genesis root) for a module the selection never composes.
-            let Err(err) = compose(
-                &["acl"],
-                &code,
-                &mut stores,
-                &substrates,
-                &BINDINGS,
-                Boot::Genesis {
-                    validators: &[],
-                    bundle: &with_extra,
-                },
-            )
-            .await
-            else {
-                panic!("an extra code hash composed");
-            };
-            assert!(
-                err.contains("governance"),
-                "the extra key is refused by name: {err}"
-            );
+            .unwrap();
+            assert!(genesis.module_root("directory").is_some());
+            assert!(genesis.module_root("acl").is_none());
+            assert!(genesis.module_root("runs").is_none());
+            let roster = genesis.module_status().await.unwrap();
+            assert_eq!(roster.len(), 1);
+            assert_eq!(roster[0].module_id, "directory");
+            assert_eq!(roster[0].active_code_hash, by_id["directory"]);
+        })
+    });
+}
+
+#[test]
+fn genesis_refuses_unsafe_ids_and_duplicate_native_ids() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let (code, by_id) = DirCodeSource::open(&fixtures(), &["directory"]).unwrap();
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            for id in ["../outside", "valset"] {
+                let bundle =
+                    std::collections::BTreeMap::from([(id.to_string(), by_id["directory"])]);
+                let result = compose(
+                    SELECTION,
+                    &code,
+                    &mut stores,
+                    &substrates,
+                    &BINDINGS,
+                    Boot::Genesis {
+                        validators: &[],
+                        bundle: &bundle,
+                    },
+                )
+                .await;
+                assert!(result.is_err(), "{id}");
+            }
         })
     });
 }

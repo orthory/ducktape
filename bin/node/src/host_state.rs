@@ -120,7 +120,8 @@ fn hydrate_from_disk(
     let guests = match &genesis.source {
         GenesisSource::FoundingSet(dir) => {
             seed_founding_set(blobs, dir, &genesis.hashes)?;
-            IndexGuests::from_dir(dir, PRODUCTION)?
+            let ids: Vec<&str> = genesis.hashes.keys().map(String::as_str).collect();
+            IndexGuests::from_dir(dir, &ids)?
         }
         GenesisSource::Workspace { file, hash } => {
             let Some(loaded) = seed_workspace_genesis(blobs, file, hash, &genesis.hashes)? else {
@@ -137,6 +138,7 @@ fn hydrate_from_disk(
             IndexGuests::from_genesis(&loaded)
         }
     };
+    index_host_modules(index, genesis.hashes.keys().map(String::as_str))?;
     converge_index_guests(index, &guests)?;
     Ok(Hydrated::Installed)
 }
@@ -798,7 +800,7 @@ mod tests {
     /// never embedded.
     fn fixture_genesis() -> GenesisModules {
         let dir = workspace_config::modules_dir().expect("the build stages the founding set");
-        let hashes = crate::config::hash_bundle(&dir, &topology::TOPOLOGY.wasm_ids(PRODUCTION))
+        let hashes = noded::bundle::hash_bundle(&dir, &topology::TOPOLOGY.wasm_ids(PRODUCTION))
             .expect("founding set");
         GenesisModules {
             hashes,
