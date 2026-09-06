@@ -318,11 +318,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
         StateRoot::ZERO,
         "agent has no ZERO sentinel"
     );
-    assert_eq!(
-        root_of(&native),
-        root_of(&wasm),
-        "genesis roots diverge"
-    );
+    assert_eq!(root_of(&native), root_of(&wasm), "genesis roots diverge");
     assert!(native.block_durable_ids().contains("agent"));
     assert!(wasm.block_durable_ids().contains("agent"));
 
@@ -741,7 +737,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 &Reg {
                     skills: Some(vec![SkillRef {
                         name: String::new(),
-                        source_prefix: "p".into(),
+                        source_prefix: "/shared/skills/p".into(),
                         source_snapshot: None,
                         load: LoadMode::OnDemand,
                     }]),
@@ -749,7 +745,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 }
                 .into(),
             ),
-            "skill name must not be empty",
+            "not a safe mount directory name",
         ),
         (
             owner.clone(),
@@ -782,6 +778,46 @@ async fn rejections_inner(context: &deterministic::Context) {
                 .into(),
             ),
             "source_snapshot must not be empty when set",
+        ),
+        (
+            owner.clone(),
+            agent_op(
+                &Reg {
+                    skills: Some(vec![SkillRef {
+                        name: "not a mount name".into(),
+                        source_prefix: "/shared/skills/r13".into(),
+                        source_snapshot: None,
+                        load: LoadMode::OnDemand,
+                    }]),
+                    ..reg("r13")
+                }
+                .into(),
+            ),
+            "not a safe mount directory name",
+        ),
+        (
+            owner.clone(),
+            agent_op(
+                &Reg {
+                    skills: Some(vec![
+                        SkillRef {
+                            name: "dup".into(),
+                            source_prefix: "/shared/skills/dup-a".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                        SkillRef {
+                            name: "dup".into(),
+                            source_prefix: "/shared/skills/dup-b".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                    ]),
+                    ..reg("r14")
+                }
+                .into(),
+            ),
+            "duplicate skill name",
         ),
         // the record size gate: a display name past MAX_AGENT_RECORD_BYTES.
         (

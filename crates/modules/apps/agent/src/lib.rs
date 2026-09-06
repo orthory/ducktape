@@ -308,9 +308,12 @@ impl AgentModule {
         Ok(caps)
     }
 
-    /// a v4 skill ref must carry a non-empty name and source_prefix; a pinned
-    /// snapshot, when present, must be non-empty. order is preserved verbatim
-    /// (skills are an ordered override list).
+    /// a v4 skill ref must carry a name that is [`is_skill_mount_name`] (the
+    /// SAME predicate the noded provisioner's `mount_dir_name` calls — one
+    /// rule, not two that could drift) and unique within the record, plus a
+    /// non-empty source_prefix. a pinned snapshot, when present, must be
+    /// non-empty. order is preserved verbatim (skills are an ordered override
+    /// list).
     ///
     /// the COUNT is capped ([`MAX_SKILLS_PER_AGENT`]) for the same reason the
     /// record's bytes are: the list is replicated state, and it is also the run's
@@ -325,9 +328,20 @@ impl AgentModule {
                 skills.len()
             )));
         }
+        let mut names = BTreeSet::new();
         for skill in skills {
-            if skill.name.is_empty() {
-                return Err(Error::Module("skill name must not be empty".into()));
+            if !is_skill_mount_name(&skill.name) {
+                return Err(Error::Module(format!(
+                    "skill name {:?} is not a safe mount directory name (want \
+                     [a-zA-Z0-9._-]+, at most {MAX_SKILL_NAME_BYTES} bytes, not \".\" or \"..\")",
+                    skill.name
+                )));
+            }
+            if !names.insert(skill.name.as_str()) {
+                return Err(Error::Module(format!(
+                    "duplicate skill name {:?}",
+                    skill.name
+                )));
             }
             if skill.source_prefix.is_empty() {
                 return Err(Error::Module(
@@ -890,6 +904,49 @@ mod tests {
         assert!(AgentModule::validate_skills(&skills[..MAX_SKILLS_PER_AGENT]).is_ok());
     }
 
+    /// the mount-name shape rule, exercised straight against the validator:
+    /// a name the provisioner's `mount_dir_name` would refuse (a space, a
+    /// slash, a non-ASCII byte) must never reach a committed record.
+    #[test]
+    fn a_skill_name_the_provisioner_would_refuse_is_refused_at_registration() {
+        let skill = |name: &str| SkillRef {
+            name: name.into(),
+            source_prefix: "/shared/skills/x".into(),
+            source_snapshot: None,
+            load: LoadMode::OnDemand,
+        };
+        for bad in ["code review", "a/b", "..", ".", "", "café"] {
+            let err = AgentModule::validate_skills(&[skill(bad)]).unwrap_err();
+            assert!(
+                matches!(&err, Error::Module(m) if m.contains("safe mount directory name")),
+                "{bad:?} must be refused as an unsafe mount name: {err:?}"
+            );
+        }
+        assert!(AgentModule::validate_skills(&[skill("code-review")]).is_ok());
+    }
+
+    /// two skills curated under the same name would collide at mount time —
+    /// refused before either reaches a run.
+    #[test]
+    fn duplicate_skill_names_are_refused() {
+        let skills = vec![
+            SkillRef {
+                name: "qa".into(),
+                source_prefix: "/shared/skills/qa-a".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+            SkillRef {
+                name: "qa".into(),
+                source_prefix: "/shared/skills/qa-b".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+        ];
+        let err = AgentModule::validate_skills(&skills).unwrap_err();
+        assert!(matches!(&err, Error::Module(m) if m.contains("duplicate skill name")));
+    }
+
     #[test]
     fn register_rejects_bad_shapes_and_bad_origins() {
         let mut m = module();
@@ -928,6 +985,50 @@ mod tests {
                         source_snapshot: None,
                         load: LoadMode::Always,
                     }]),
+                },
+            ),
+            // a skill name the noded provisioner would refuse as a mount dir.
+            (
+                user(9),
+                AgentMsg::RegisterAgent {
+                    agent_id: "a".into(),
+                    display_name: "A".into(),
+                    capability: "m".into(),
+                    allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: Some(vec![SkillRef {
+                        name: "code review".into(),
+                        source_prefix: "/shared/skills/code-review".into(),
+                        source_snapshot: None,
+                        load: LoadMode::OnDemand,
+                    }]),
+                },
+            ),
+            // two skills curated under the same name.
+            (
+                user(9),
+                AgentMsg::RegisterAgent {
+                    agent_id: "a".into(),
+                    display_name: "A".into(),
+                    capability: "m".into(),
+                    allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: Some(vec![
+                        SkillRef {
+                            name: "qa".into(),
+                            source_prefix: "/shared/skills/qa-a".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                        SkillRef {
+                            name: "qa".into(),
+                            source_prefix: "/shared/skills/qa-b".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                    ]),
                 },
             ),
             // an action outside the known vocabulary.
