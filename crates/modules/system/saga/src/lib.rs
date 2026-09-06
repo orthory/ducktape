@@ -1150,26 +1150,16 @@ impl SagaModule {
         Some(pool[(pick % pool.len() as u64) as usize].clone())
     }
 
-    /// rendezvous-assign one attempt over the sorted assignment pool. every
-    /// input is agreed, so every validator derives the same assignee.
-    async fn compute_assignee(
-        &self,
-        ctx: &dyn Ctx,
-        saga_id: &str,
-        capability: Option<&str>,
-        demands: &BTreeMap<String, u64>,
-        attempt: u32,
-        height: u64,
-    ) -> Option<Vec<u8>> {
-        let pool = self.assignment_pool(ctx, capability, demands).await?;
-        Self::pick_assignee(&pool, saga_id, attempt, height)
-    }
-
+    /// rendezvous-assign one attempt over the sorted assignment pool, minus
+    /// `excluded` when given — every caller passes `None` except the crank's
+    /// lease-expiry retry and `Reassign`, both of which exclude the assignee
+    /// that just failed to deliver. every remaining input is agreed, so every
+    /// validator derives the same assignee.
     #[allow(
         clippy::too_many_arguments,
         reason = "every argument is an independent agreed input to the rendezvous pick \
-                  (saga_id/capability/demands/attempt/height) plus the reassignment-only \
-                  exclusion; bundling them into a struct for one caller is not a savings"
+                  (saga_id/capability/demands/attempt/height) plus the exclusion; bundling \
+                  them into a struct for two callers is not a savings"
     )]
     async fn compute_assignee_excluding(
         &self,
@@ -1186,6 +1176,69 @@ impl SagaModule {
             pool.retain(|candidate| candidate.as_slice() != excluded);
         }
         Self::pick_assignee(&pool, saga_id, attempt, height)
+    }
+
+    /// the standing/capability gate `Accept` enforces: the claiming key must
+    /// be a node [`Self::assignment_pool`] would itself have drawn from.
+    /// valset standing (validator OR resident — the identical union
+    /// `capability::handle_announce` gates announcing on) is always
+    /// required; when the saga names a capability the key must additionally
+    /// be a LISTED provider of that tag. demands are deliberately never
+    /// applied here — an announcement exists because no provider satisfied
+    /// them, so a standing provider of the tag may still claim it by hand.
+    async fn require_accept_standing(
+        &self,
+        ctx: &dyn Ctx,
+        capability: Option<&str>,
+        key: &[u8],
+    ) -> Result<(), Error> {
+        let valset = self
+            .valset
+            .as_deref()
+            .ok_or_else(|| Error::Module("accept_no_standing: no valset is configured".into()))?;
+        let standing = valset::members_and_residents(ctx, valset).await?;
+        if !standing.contains(key) {
+            return Err(Error::Module(
+                "accept_no_standing: submitter holds no current standing (validator or resident)"
+                    .into(),
+            ));
+        }
+        let Some(tag) = capability else {
+            return Ok(());
+        };
+        let registry = self.capability_registry.as_deref().ok_or_else(|| {
+            Error::Module(
+                "accept_not_capability_provider: no capability registry is configured".into(),
+            )
+        })?;
+        let reply = ctx
+            .query(
+                registry,
+                &capability_encode_query(&CapabilityQuery::Providers {
+                    capability: tag.to_string(),
+                }),
+            )
+            .await
+            .map_err(|_| {
+                Error::Module(
+                    "accept_not_capability_provider: capability registry query failed".into(),
+                )
+            })?;
+        let CapabilityReply::Providers(providers) =
+            capability_decode_reply(&reply).map_err(Error::Module)?
+        else {
+            return Err(Error::Module(
+                "accept_not_capability_provider: capability registry answered an unexpected reply"
+                    .into(),
+            ));
+        };
+        if providers.iter().any(|provider| provider.as_slice() == key) {
+            Ok(())
+        } else {
+            Err(Error::Module(format!(
+                "accept_not_capability_provider: submitter is not an announced provider of {tag:?}"
+            )))
+        }
     }
 
     /// the P6 promise: on a terminal transition, hand the requester its
@@ -1261,17 +1314,37 @@ impl SagaModule {
         saga: Saga,
         spec: &[u8],
     ) -> Result<(), Error> {
+        self.lease_and_request_excluding(ctx, saga_id, saga, spec, None)
+            .await
+    }
+
+    /// like [`Self::lease_and_request`], but the rendezvous pick excludes
+    /// `excluded` — the crank's lease-expiry retry uses this so the assignee
+    /// whose lease just expired is never handed the same attempt again
+    /// (`Reassign` gets the identical exclusion through
+    /// [`Self::compute_assignee_excluding`] directly). when exclusion empties
+    /// the pool the attempt falls back to an ANNOUNCEMENT (assignee `None`)
+    /// rather than re-picking the corpse.
+    async fn lease_and_request_excluding(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        saga_id: String,
+        saga: Saga,
+        spec: &[u8],
+        excluded: Option<&[u8]>,
+    ) -> Result<(), Error> {
         let height = ctx.env().height;
         let assignee = match &saga.pinned_assignee {
             Some(key) => Some(key.clone()),
             None => {
-                self.compute_assignee(
+                self.compute_assignee_excluding(
                     ctx,
                     &saga_id,
                     saga.capability.as_deref(),
                     &saga.demands,
                     saga.attempt,
                     height,
+                    excluded,
                 )
                 .await
             }
@@ -1629,6 +1702,8 @@ impl SagaModule {
                 {
                     return Ok(());
                 }
+                self.require_accept_standing(ctx, current.capability.as_deref(), key)
+                    .await?;
                 let height = ctx.env().height;
                 let key = key.clone();
                 let mut saga = current;
@@ -1698,7 +1773,12 @@ impl SagaModule {
                             Self::emit_callback(ctx, &saga_id, &saga, SagaOutcome::TimedOut);
                             self.put(&saga_id, &saga).await?;
                         }
-                        // an expired lease consumes the attempt and re-leases.
+                        // an expired lease consumes the attempt and re-leases
+                        // — EXCLUDING the assignee whose lease just expired,
+                        // the same treatment `Reassign` gives it: a dead node
+                        // must not be a candidate for its own retry. when
+                        // exclusion empties the pool the attempt falls back to
+                        // an announcement rather than re-picking the corpse.
                         (false, true) => {
                             let spec = self.load_spec(&saga_id, saga.spec_len).await?;
                             self.cancel_attempt(
@@ -1708,7 +1788,14 @@ impl SagaModule {
                                 old_assignee.as_deref(),
                             );
                             saga.attempt += 1;
-                            self.lease_and_request(ctx, saga_id, saga, &spec).await?;
+                            self.lease_and_request_excluding(
+                                ctx,
+                                saga_id,
+                                saga,
+                                &spec,
+                                old_assignee.as_deref(),
+                            )
+                            .await?;
                         }
                         (false, false) => {
                             let error = "lease attempts exhausted".to_string();
@@ -1998,8 +2085,21 @@ mod tests {
         }
         async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
             match target {
+                // decode the query variant: `members_and_residents` fires
+                // BOTH `Validators` and `Residents` and expects the matching
+                // reply for each — residents default to empty (no test here
+                // exercises resident-only standing) whenever validators are
+                // configured at all.
                 "valset" => match &self.validators {
-                    Some(v) => Ok(valset::encode_reply(&ValsetReply::Validators(v.clone()))),
+                    Some(v) => match valset::decode_query(req).map_err(Error::Module)? {
+                        ValsetQuery::Validators => {
+                            Ok(valset::encode_reply(&ValsetReply::Validators(v.clone())))
+                        }
+                        ValsetQuery::Residents => {
+                            Ok(valset::encode_reply(&ValsetReply::Residents(Vec::new())))
+                        }
+                        ValsetQuery::MeshWindow => Err(Error::QueryUnsupported),
+                    },
                     None => Err(Error::QueryUnsupported),
                 },
                 // key on the decoded query variant: CapableProviders answers
@@ -2208,9 +2308,13 @@ mod tests {
         // leaves the announcement projection and enters the lease one. The two
         // reads are disjoint by construction, which is what lets a daemon run
         // both lanes without double-executing.
+        // `me` holds valset standing and is a listed provider of "codex" —
+        // both required by Accept's gate.
         let mut ctx = CaptureCtx::new()
             .at(5)
-            .with_origin(Origin::External(me.clone()));
+            .with_origin(Origin::External(me.clone()))
+            .with_validators(vec![me.clone()])
+            .with_providers(vec![me.clone()]);
         exec(
             &mut m,
             &mut ctx,
@@ -2952,7 +3056,11 @@ mod tests {
 
     #[test]
     fn crank_expires_a_lease_into_a_retry_then_a_failure() {
-        let validators = vec![b"node-a".to_vec()];
+        // TWO nodes: the crank's lease-expiry retry excludes the expired
+        // assignee (see `crank_lease_expiry_excludes_the_dead_assignee`), so a
+        // one-node pool here would fall back to an announcement and never
+        // exercise the retry-then-failure path this test is actually for.
+        let validators = vec![b"node-a".to_vec(), b"node-b".to_vec()];
         let mut m = SagaModule::with_valset(
             "saga",
             Box::new(MemStore::new()),
@@ -2985,7 +3093,8 @@ mod tests {
         let assignee = first.assignee.unwrap();
 
         // first expiry: attempts remain, so the crank re-leases and re-asks
-        // the worker under attempt 1.
+        // the worker under attempt 1 — EXCLUDING `assignee`, so with a
+        // two-node pool the other node is the only candidate left.
         let mut ctx = CaptureCtx::new().at(5).with_validators(validators.clone());
         exec(&mut m, &mut ctx, &crank()).unwrap();
         commit(&mut m);
@@ -3000,6 +3109,12 @@ mod tests {
         let requests = ctx.worker_requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].attempt, 1);
+        let retry_assignee = requests[0].assignee.clone().unwrap();
+        assert_ne!(
+            retry_assignee, assignee,
+            "the dead assignee is excluded from its own retry"
+        );
+        assert_eq!(v.assignee, Some(retry_assignee.clone()));
         assert_eq!(
             ctx.worker_controls(),
             vec![WorkerControl::cancel_attempt(
@@ -3013,7 +3128,7 @@ mod tests {
         assert!(decode_worker_request(&ctx.events[1].payload).is_ok());
 
         // second expiry: no attempts remain — terminally Failed.
-        let mut ctx = CaptureCtx::new().at(10);
+        let mut ctx = CaptureCtx::new().at(10).with_validators(validators);
         exec(&mut m, &mut ctx, &crank()).unwrap();
         commit(&mut m);
         let v = get(&m, &sid("s1")).unwrap();
@@ -3021,10 +3136,107 @@ mod tests {
         assert_eq!(v.error, Some("lease attempts exhausted".to_string()));
         assert_eq!(
             ctx.worker_controls(),
-            vec![WorkerControl::cancel_attempt(sid("s1"), 1, assignee)]
+            vec![WorkerControl::cancel_attempt(sid("s1"), 1, retry_assignee)]
         );
         assert_eq!(ctx.events.len(), 1, "exhaustion issues no replacement");
         assert_eq!(ctx.trace, vec!["event", "msg"]);
+    }
+
+    #[test]
+    fn crank_lease_expiry_excludes_the_dead_assignee() {
+        // #1724: the crank's expired-lease arm must never re-pick the
+        // assignee whose lease just expired — the identical exclusion
+        // `Reassign` already applies via `compute_assignee_excluding`.
+        let validators = vec![b"node-a".to_vec(), b"node-b".to_vec()];
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Strict,
+        );
+        let mut ctx = CaptureCtx::new().with_validators(validators.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
+                saga_id: sid("s1"),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 20,
+                lease_views: Some(1),
+                capability: None,
+                demands: Default::default(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let first_assignee = get(&m, &sid("s1")).unwrap().assignee.unwrap();
+
+        // every subsequent expiry must exclude whichever node just held it —
+        // never re-picking the same corpse across several retries in a row.
+        let mut previous = first_assignee;
+        for height in [1u64, 2, 3, 4, 5] {
+            let mut ctx = CaptureCtx::new()
+                .at(height)
+                .with_validators(validators.clone());
+            exec(&mut m, &mut ctx, &crank()).unwrap();
+            commit(&mut m);
+            let current = get(&m, &sid("s1")).unwrap().assignee.unwrap();
+            assert_ne!(
+                current, previous,
+                "the crank re-picked the assignee whose lease just expired"
+            );
+            assert!(validators.contains(&current));
+            previous = current;
+        }
+
+        // a ONE-node pool leaves nothing after exclusion: the retry falls
+        // back to an announcement rather than re-picking the corpse.
+        let solo = vec![b"only-node".to_vec()];
+        let mut m = SagaModule::with_valset(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            LeasePolicy::Strict,
+        );
+        let mut ctx = CaptureCtx::new().with_validators(solo.clone());
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Trigger {
+                pinned_assignee: None,
+                saga_id: sid("solo"),
+                spec: b"w".to_vec(),
+                reply_to: None,
+                reply_payload: Vec::new(),
+                deadline: None,
+                max_attempts: 2,
+                lease_views: Some(1),
+                capability: None,
+                demands: Default::default(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        let v = get(&m, &sid("solo")).unwrap();
+        assert_eq!(v.assignee, Some(solo[0].clone()));
+        assert!(v.lease_expires_at.is_some());
+
+        let mut ctx = CaptureCtx::new()
+            .at(v.lease_expires_at.unwrap())
+            .with_validators(solo);
+        exec(&mut m, &mut ctx, &crank()).unwrap();
+        commit(&mut m);
+        let v = get(&m, &sid("solo")).unwrap();
+        assert_eq!(
+            v.assignee, None,
+            "excluding the sole candidate empties the pool -> an announcement"
+        );
+        assert_eq!(v.lease_expires_at, None, "an announcement holds no lease");
+        assert_eq!(v.attempt, 1, "the expiry still consumed the attempt");
     }
 
     #[test]
@@ -3520,11 +3732,12 @@ mod tests {
         assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
 
         // the FIRST accept claims the attempt: assignee + lease + the actual
-        // work order re-emitted naming the winner.
+        // work order re-emitted naming the winner. "node-a" is a registered
+        // standing provider — Accept's standing gate requires it.
         let mut ctx = CaptureCtx::new()
             .at(7)
             .with_origin(Origin::External(b"node-a".to_vec()))
-            .with_validators(Vec::new());
+            .with_validators(vec![b"node-a".to_vec()]);
         exec(
             &mut m,
             &mut ctx,
@@ -3590,6 +3803,97 @@ mod tests {
         let v = get(&m, &sid("s1")).unwrap();
         assert_eq!(v.status, SagaStatus::Done);
         assert_eq!(v.result, Some(b"legit".to_vec()));
+    }
+
+    #[test]
+    fn accept_gates_on_standing_and_capability_not_on_bare_possession_of_a_key() {
+        // #1722: `Accept` used to admit ANY external key. A foreign key with
+        // no valset standing must be refused even though the attempt is a
+        // live, unassigned announcement; a standing provider of the saga's
+        // capability tag must still succeed.
+        let outsider = b"outsider".to_vec();
+        let standing_non_provider = b"validator-only".to_vec();
+        let standing_provider = b"the-real-provider".to_vec();
+        let mut m = SagaModule::with_assignment(
+            "saga",
+            Box::new(MemStore::new()),
+            "valset",
+            "capability",
+            LeasePolicy::Strict,
+        );
+        // no announced providers -> the trigger is an announcement.
+        let mut ctx = capability_ctx_with(Vec::new(), Vec::new());
+        exec(&mut m, &mut ctx, &capability_trigger(&sid("s1"), "claude")).unwrap();
+        commit(&mut m);
+        assert_eq!(get(&m, &sid("s1")).unwrap().assignee, None);
+
+        // an outsider with NO valset standing at all is refused.
+        let mut ctx = CaptureCtx::new()
+            .with_origin(Origin::External(outsider.clone()))
+            .with_validators(Vec::new())
+            .with_providers(vec![standing_provider.clone()]);
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: sid("s1"),
+                attempt: 0,
+            }),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("accept_no_standing"), "got: {err}");
+        commit(&mut m);
+        assert_eq!(
+            get(&m, &sid("s1")).unwrap().assignee,
+            None,
+            "the refused accept staged nothing"
+        );
+
+        // a validator with standing but NOT announced as a "claude" provider
+        // is also refused — standing alone is not enough for a tagged saga.
+        let mut ctx = CaptureCtx::new()
+            .with_origin(Origin::External(standing_non_provider.clone()))
+            .with_validators(vec![standing_non_provider.clone()])
+            .with_providers(vec![standing_provider.clone()]);
+        let err = exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: sid("s1"),
+                attempt: 0,
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("accept_not_capability_provider"),
+            "got: {err}"
+        );
+        commit(&mut m);
+        assert_eq!(get(&m, &sid("s1")).unwrap().assignee, None);
+
+        // a standing, announced provider of the tag claims it — even though
+        // it never satisfied the ORIGINAL demands (there were none to fail;
+        // the announcement exists precisely because nobody did, and the
+        // demands filter is deliberately not re-applied on Accept).
+        let mut ctx = CaptureCtx::new()
+            .at(9)
+            .with_origin(Origin::External(standing_provider.clone()))
+            .with_validators(vec![standing_provider.clone()])
+            .with_providers(vec![standing_provider.clone()]);
+        exec(
+            &mut m,
+            &mut ctx,
+            &msg(&SagaMsg::Accept {
+                saga_id: sid("s1"),
+                attempt: 0,
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get(&m, &sid("s1")).unwrap().assignee,
+            Some(standing_provider)
+        );
     }
 
     #[test]
@@ -3741,9 +4045,13 @@ mod tests {
         }
 
         // and it is still claimable: the lease starts when someone takes it.
+        // the daemon came back, so it is a standing valset member and a
+        // listed provider again — both required by Accept's gate.
         let mut ctx = CaptureCtx::new()
             .at(30)
-            .with_origin(Origin::External(only.clone()));
+            .with_origin(Origin::External(only.clone()))
+            .with_validators(vec![only.clone()])
+            .with_providers(vec![only.clone()]);
         exec(
             &mut m,
             &mut ctx,
@@ -3855,10 +4163,12 @@ mod tests {
         assert_eq!(get(&m, &sid("s1")).unwrap().status, SagaStatus::Pending);
 
         // a node that CAN run the capability claims it, then its result lands.
+        // "provider" holds valset standing AND is a listed provider of
+        // "alpha" — Accept's gate requires both.
         let mut ctx = CaptureCtx::new()
             .with_origin(Origin::External(b"provider".to_vec()))
-            .with_validators(vec![vec![1u8; 32]])
-            .with_providers(Vec::new());
+            .with_validators(vec![vec![1u8; 32], b"provider".to_vec()])
+            .with_providers(vec![b"provider".to_vec()]);
         exec(
             &mut m,
             &mut ctx,
@@ -4874,10 +5184,14 @@ mod tests {
         let node = b"node-a".to_vec();
         let claimer = b"node-b".to_vec();
 
-        let mut m = SagaModule::with_valset(
+        // `with_assignment` (not `with_valset`): the "claimed" announcement
+        // below names a capability, and Accept's gate must consult the
+        // registry to admit `claimer` as that tag's provider.
+        let mut m = SagaModule::with_assignment(
             "saga",
             Box::new(MemStore::new()),
             "valset",
+            "capability",
             LeasePolicy::Open,
         );
         let ids = [
@@ -4892,7 +5206,9 @@ mod tests {
             CaptureCtx::new()
                 .at(height)
                 .with_origin(origin)
-                .with_validators(vec![node.clone()])
+                // both `node` and `claimer` hold standing throughout — the
+                // claim step below needs `claimer` to pass Accept's gate.
+                .with_validators(vec![node.clone(), claimer.clone()])
         };
         let step = |m: &mut SagaModule, ctx: &mut CaptureCtx, op: &Msg, what: &str| {
             exec(m, ctx, op).unwrap();
@@ -4901,8 +5217,10 @@ mod tests {
             }
         };
 
-        // a capability with no registry configured assigns NOBODY, so that is
-        // how this script gets an announcement into the unassigned lane.
+        // the trigger's ctx never answers the capability query (no
+        // `with_providers`), so the registry lookup fails and assigns
+        // NOBODY — that is how this script gets an announcement into the
+        // unassigned lane.
         let leased =
             |id: &str, deadline: Option<u64>, max_attempts: u32, capability: Option<&str>| {
                 SagaMsg::Trigger {
@@ -4969,8 +5287,11 @@ mod tests {
             "an announcement nobody holds is the unassigned lane"
         );
 
-        // the claim: unassigned -> assigned, plus a lease where there was none.
-        let mut ctx = ctx_at(2, Origin::External(claimer.clone()));
+        // the claim: unassigned -> assigned, plus a lease where there was
+        // none. `claimer` must now announce as a provider of "alpha" for
+        // Accept's gate to admit it.
+        let mut ctx =
+            ctx_at(2, Origin::External(claimer.clone())).with_providers(vec![claimer.clone()]);
         step(
             &mut m,
             &mut ctx,

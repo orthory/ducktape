@@ -607,7 +607,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
         let module = module.to_string();
         async move {
             let root = root?;
-            let bytes = fetch_snapshot(&client, boundary, &module)
+            let bytes = fetch_snapshot(&client, boundary, &module, statesync::MAX_SNAPSHOT_BYTES)
                 .await
                 .map_err(|e| format!("{module} snapshot: {e}"))?;
             Ok::<_, String>((bytes, root))
@@ -767,7 +767,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "ebce7d77c86d70301f4634b8d223f055758f7ca5fc59ea0da4fbfe01e64b7616";
+        "9e277acc00adf9766ebed8713aa050cca34ae2b08b8fd651f93bb1d289c1149e";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
