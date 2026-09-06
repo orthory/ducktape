@@ -526,6 +526,25 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
             .await
             .unwrap();
             host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &BINDINGS)));
+            let initial_root = host.root_hash();
+            for (fixture, reason) in [("hello", "backing"), ("identity", "configuration")] {
+                let bytes =
+                    std::fs::read(fixtures().join(format!("{fixture}.component.wasm"))).unwrap();
+                let deployment = ModuleArtifact::component(bytes).encode();
+                let error = host
+                    .check_module_replacement("valset", &deployment)
+                    .unwrap_err();
+                assert!(error.to_string().contains(reason), "{error}");
+                assert_eq!(
+                    host.root_hash(),
+                    initial_root,
+                    "a preflight changes no running module"
+                );
+            }
+            host.check_module_replacement("valset", &source.0[&codes["valset"].to_vec()])
+                .unwrap();
+            assert_eq!(host.root_hash(), initial_root);
+
             let index =
                 indexer::IndexStore::open_bare(dir.join("index"), &["modules", "valset"]).unwrap();
             noded::converge_host_modules(&index, &host).unwrap();

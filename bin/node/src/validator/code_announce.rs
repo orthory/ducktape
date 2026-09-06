@@ -141,7 +141,7 @@ impl CodeReadinessSignaller {
         &mut self,
         height: u64,
         modules: &[modules::ModuleCode],
-        verdict: impl Fn(&str, &[u8; 32]) -> CodeVerdict,
+        mut verdict: impl FnMut(&str, &[u8; 32]) -> CodeVerdict,
     ) -> CodeActions {
         let mut actions = CodeActions::default();
         for m in modules {

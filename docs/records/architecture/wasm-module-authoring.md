@@ -121,7 +121,9 @@ answer memoized. Design consequences:
 ## State layout is the code-swap contract
 
 A live update swaps code while keeping the store, so it is valid only when the
-replacement reads the exact same keys and value encodings:
+replacement reads the exact same keys and value encodings. Readiness and
+swap preparation reject changes to the declared backing or initialized
+configuration keys; authors must preserve the data layout within that shape:
 
 - Keep the layout byte-stable for a code-only swap.
 - If the layout changes while greenfield, replace it outright and re-genesis.
@@ -179,9 +181,9 @@ remapped to fixed tokens. They are toolchain-dependent, and the toolchain is two
 a rebuild on another rustc, or through another `wasm-tools` (the componentizer
 writes the component's own sections and they move between releases), may
 legitimately differ, so moving either pin rebuilds the whole set and commits it
-as one change. `rust-toolchain.toml` holds the channel and `WASM_TOOLS_VERSION`
-in `bin/guest-builder` holds the componentizer, which refuses to build through
-any other version.
+as one change. `rust-toolchain.toml` holds the channel and `wasm-tools.version`
+holds the componentizer version. `bin/guest-builder` refuses to build through any other
+componentizer version.
 
 The committed copies of one module's component MUST stay byte-identical
 (nothing is embedded: the founder bundles the canonical artifact and the

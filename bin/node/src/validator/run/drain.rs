@@ -1408,7 +1408,11 @@ impl ValidatorRuntime<'_> {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
-            let realizable = noded::compose::validate_deployment(module_id, &bytes, index);
+            let realizable = noded::compose::validate_deployment(module_id, &bytes, index)
+                .and_then(|()| {
+                    node.check_module_replacement(module_id, &bytes)
+                        .map_err(|error| error.to_string())
+                });
             match realizable {
                 Ok(()) => CodeVerdict::Loadable,
                 // the first line only: a wasmtime error carries a multi-line

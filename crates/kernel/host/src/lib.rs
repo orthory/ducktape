@@ -804,6 +804,17 @@ impl Host {
         }
     }
 
+    /// Check that an existing module can retain its state under a replacement.
+    /// Preparing and dropping the action leaves the running deployment intact.
+    /// An admission has no previous state shape to preserve.
+    pub fn check_module_replacement(&mut self, id: &str, bytes: &[u8]) -> Result<(), Error> {
+        let Some(module) = self.registry.get_mut(id) else {
+            return Ok(());
+        };
+        drop(module.prepare_swap(bytes)?);
+        Ok(())
+    }
+
     /// reconcile every hot-swappable module's RUNNING code against the code
     /// registry's committed decision for block `height`, realizing any swap that
     /// has armed. this is the per-node, NON-consensus half of a live code update;

@@ -912,6 +912,7 @@ pub struct WasmModule {
     /// state root. The host binds both identities into its global root.
     code_hash: Vec<u8>,
     index_guest: Option<Vec<u8>>,
+    config_keys: Vec<String>,
     backing: StateBacking,
     /// the [`sdk::genesis_config`]-encoded `__config` bytes an odb-backed
     /// tenant reads through the state lane, beside [`REFS_KEY`] — `None` for
@@ -967,6 +968,7 @@ impl WasmModule {
             component: compiled.component,
             code_hash: compiled.code_hash,
             index_guest: compiled.index_guest,
+            config_keys: compiled.shape.config,
             backing,
             odb_config,
             staged: BTreeMap::new(),
@@ -1805,6 +1807,16 @@ impl Module for WasmModule {
     fn prepare_swap(&mut self, artifact_bytes: &[u8]) -> Result<Box<dyn FnOnce() + '_>, SdkError> {
         let compiled = CompiledModule::compile_artifact(artifact_bytes)?;
         Self::require_declared_backing(&self.id, &compiled.shape, self.backing.kind())?;
+        let current_config: std::collections::BTreeSet<_> = self.config_keys.iter().collect();
+        let replacement_config: std::collections::BTreeSet<_> =
+            compiled.shape.config.iter().collect();
+        let preserves_config = current_config == replacement_config;
+        if !preserves_config {
+            return Err(SdkError::Module(format!(
+                "{} replacement changes initialized configuration keys",
+                self.id
+            )));
+        }
         Ok(Box::new(move || {
             self.engine = compiled.engine;
             self.linker = compiled.linker;
