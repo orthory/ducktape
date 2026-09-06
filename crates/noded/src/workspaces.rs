@@ -232,17 +232,19 @@ pub(crate) async fn commit_workspace(
     if !dir.exists() {
         return error_response(StatusCode::NOT_FOUND, "workspace not found");
     }
-    // `signed` is `None` only when the request presented the OPERATOR
-    // credential instead of a user signature (the Acting lane's gate has no
-    // other way past it) — the same bypass DELETE already gives the operator,
-    // so it may commit any workspace. a signed caller must be the key that
-    // created THIS one: ids are not secret (world-readable managed root), so
-    // possession of some other key must not let it commit or rebase run A's
-    // checkout under run B's identity.
+    // `signed` is `None` when the request presented the OPERATOR credential
+    // (the admin-token header) instead of a user signature — the Acting
+    // lane's gate has no other way past it with no `SignedBy` at all. But the
+    // gate ALSO inserts `SignedBy` for a signature by the operator's OWN key
+    // (`operator_key_matches`, the PoP `ducktape node log-filter` etc. use),
+    // so "is this the operator" is not just "is `signed` absent" — a signed
+    // caller must be either the workspace's creator or the operator, the same
+    // pair DELETE already admits.
     if let Some(crate::SignedBy(acting)) = signed.as_deref() {
-        match read_owner(&dir) {
-            Some(owner) if owner == *acting => {}
-            _ => return error_response(StatusCode::FORBIDDEN, "workspace_not_owner"),
+        let is_owner = read_owner(&dir).is_some_and(|owner| owner == *acting);
+        let is_operator = crate::signed_req::operator_key_matches(&handle.admin, acting);
+        if !is_owner && !is_operator {
+            return error_response(StatusCode::FORBIDDEN, "workspace_not_owner");
         }
     }
     let api = ActorNodeApi::new(handle.clone(), origin);
@@ -444,6 +446,29 @@ mod tests {
         stamp_owned_dir(root.path(), id, b"run-a-key");
 
         let resp = commit_as(handle, id, None).await;
+
+        assert_ne!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// the operator's OWN key, signed rather than the admin-token header,
+    /// also clears the gate on a workspace it did not create: the gate
+    /// inserts `SignedBy` for THAT signature too (`operator_key_matches`), so
+    /// "is `signed` absent" is not the same test as "is this the operator".
+    #[tokio::test]
+    async fn an_operator_signed_key_bypasses_the_ownership_gate_too() {
+        let operator = commonware_cryptography::ed25519::PrivateKey::from_seed(4242);
+        use commonware_cryptography::Signer as _;
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_admin(crate::AdminConfig {
+            owner_key: Some(operator.public_key().as_ref().to_vec()),
+            ..Default::default()
+        });
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let id = "eeee000000000000000000000000000e";
+        stamp_owned_dir(root.path(), id, b"run-a-key");
+
+        let resp = commit_as(handle, id, Some(operator.public_key().as_ref().to_vec())).await;
 
         assert_ne!(resp.status(), StatusCode::FORBIDDEN);
     }
