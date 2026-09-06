@@ -200,6 +200,16 @@ impl MicroVm {
         let blob = crate::guest_manifest::encode(manifest)?;
         std::fs::write(&cfg.manifest, &blob)
             .map_err(|e| format!("write {}: {e}", cfg.manifest.display()))?;
+        // 0600: the manifest's `env` carries this run's secrets (the run-action
+        // and broker bearer tokens). `run_dir` is already 0700 (`ScratchDir`),
+        // but this file is pinned directly too, the same defense in depth the
+        // seeded `.credentials.json` already gets.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&cfg.manifest, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("restrict {} permissions: {e}", cfg.manifest.display()))?;
+        }
         crate::workspace_image::build_assets(assets, &cfg.assets, &run_dir.join("assets"))?;
         let size = crate::workspace_image::sized_for(workdir)?;
         crate::workspace_image::build(workdir, &cfg.workspace, size)?;
@@ -488,9 +498,23 @@ pub struct ScratchDir {
 }
 
 impl ScratchDir {
-    /// create `path` and own it from this moment.
+    /// create `path`, 0700, and own it from this moment.
+    ///
+    /// 0700 keeps it off every other local account on a shared box (#1693): a
+    /// bare `create_dir_all` lands 0755 under a normal umask, and everything
+    /// this directory ever holds — `manifest.bin`'s run env (the run-action and
+    /// broker bearer tokens), `workspace.ext4` (the seeded `.credentials.json`),
+    /// `assets.ext4` — is secret for the run's whole lifetime. Firecracker/vz
+    /// run as this same process's uid (no jailer, no setuid handoff), so 0700
+    /// costs the VMM nothing.
     pub fn create(path: PathBuf) -> Result<Self, String> {
         std::fs::create_dir_all(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("restrict {} permissions: {e}", path.display()))?;
+        }
         Ok(Self { path, owned: true })
     }
 
@@ -743,6 +767,34 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1693: a bare `create_dir_all` lands 0755 under a normal umask, making
+    /// the run directory — and everything staged into it (`manifest.bin`'s run
+    /// env, `workspace.ext4`'s seeded credentials, `assets.ext4`) — readable by
+    /// every other local account for the run's whole lifetime.
+    #[test]
+    fn scratch_dir_is_created_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "dt-scratch-dir-test-{}-{unique}",
+            std::process::id()
+        ));
+        let dir = ScratchDir::create(path.clone()).expect("create scratch dir");
+        let mode = std::fs::metadata(dir.path())
+            .expect("scratch dir metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "{} is readable by group/other: {mode:o}",
+            dir.path().display()
+        );
+    }
 
     /// Firecracker's guest-outbound convention. Getting this wrong means
     /// nothing is listening where the guest dials, and the run produces no
