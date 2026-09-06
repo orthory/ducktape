@@ -17,9 +17,9 @@
 //! `ResourceCaps`, so they are ungated here — inventing a gate the registry
 //! cannot express would be a permission nobody could grant.
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use serde_json::{json, Value};
+use base64::engine::general_purpose::STANDARD;
+use serde_json::{Value, json};
 
 use agent::{AgentQuery, CapRequest};
 use forge::ForgeQuery;
@@ -27,7 +27,7 @@ use pages::PageQuery;
 use runs::RunsQuery;
 use tasks::{TaskQuery, WorkQuery};
 
-use super::{arg_str, opt_u64, schema, Tool};
+use super::{Tool, arg_str, opt_u64, schema};
 use crate::mcp::identity::{Run, TARGET_AGENT, TARGET_RUNS};
 use crate::mcp::node::{NodeError, Result};
 
@@ -45,8 +45,7 @@ pub(super) fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "ducktape_whoami",
-            description:
-                "Who you are in Ducktape: your run id, agent id, display name, owner, the \
+            description: "Who you are in Ducktape: your run id, agent id, display name, owner, the \
                           actions you are allowed to take, your resource caps, your workspace \
                           directory, and where your skills are mounted. Call this first if you \
                           are unsure what you are permitted to do — every write tool is gated on \
@@ -359,38 +358,30 @@ fn files_read(run: &Run, args: &Value) -> Result<Value> {
 /// cap, so each hit's own path is re-checked against the SAME predicate before
 /// it reaches the agent — closing the sibling-path leak without narrowing
 /// grep's textual-prefix search for callers that rely on it (the raw
-/// `/v1/files/grep` route has no cap at all). Two more things: `prefix` itself
-/// is sent to duckfs with a trailing `/` (segment-form) so the walk's raw
-/// string match can't widen past the cap boundary in the first place — a
-/// caller who deliberately points `prefix` at a single file (not a directory)
-/// loses that hit, which is the narrowing side of this same trade. And a
-/// `next` cursor is a resume path, not a hit: `#1663` scrubbed `hits` but left
-/// `next` verbatim, so a page that runs out of budget mid-scan of an
-/// out-of-cap sibling could still hand back that sibling's path.
+/// `/v1/files/grep` route has no cap at all). `prefix` itself is sent to
+/// duckfs UNCHANGED, deliberately: widening it to segment form
+/// (`/shared/team` -> `/shared/team/`) would close the sibling-scan at the
+/// source, but it would also silently empty a legitimate call whose `prefix`
+/// names one exact file rather than a directory (grep only matches a file
+/// candidate with `child == prefix || child.starts_with(prefix)`, and no
+/// file path ends in `/`). `retain_capped_hits` and `scrub_uncapped_cursor`
+/// below already re-check every hit and the resume cursor against the cap
+/// regardless of what duckfs scanned, so nothing outside the cap can reach
+/// the agent either way — a `next` cursor is a resume path, not a hit: #1663
+/// scrubbed `hits` but left `next` verbatim, so a page that runs out of
+/// budget mid-scan of an out-of-cap sibling could still hand back that
+/// sibling's path.
 fn files_grep(run: &Run, args: &Value) -> Result<Value> {
     let prefix = arg_str(args, "prefix")?;
     let pattern = arg_str(args, "pattern")?;
     let record = run.record()?;
     run.permits(&record, &CapRequest::DuckfsRead(&prefix))?;
-    let segment_prefix = as_segment_prefix(&prefix);
     let mut reply = run
         .node
-        .files("grep", &[("pattern", pattern), ("prefix", segment_prefix)])?;
+        .files("grep", &[("pattern", pattern), ("prefix", prefix)])?;
     retain_capped_hits(&record, &mut reply);
     scrub_uncapped_cursor(&record, &mut reply);
     Ok(reply)
-}
-
-/// widen `prefix` to segment form (`/shared/team` -> `/shared/team/`) so
-/// duckfs' raw-string-prefix walk cannot match a sibling that only shares a
-/// textual prefix (`/shared/team-secrets`). left as-is when already segment
-/// form or empty (an empty prefix already matches every absolute path).
-fn as_segment_prefix(prefix: &str) -> String {
-    if prefix.is_empty() || prefix.ends_with('/') {
-        prefix.to_string()
-    } else {
-        format!("{prefix}/")
-    }
 }
 
 /// drop every grep hit whose own path the record's duckfs_read cap does not
@@ -854,13 +845,33 @@ mod tests {
         assert_eq!(reply["next"], json!("/shared/team/b.txt"));
     }
 
-    /// the prefix this tool sends to duckfs is widened to segment form so the
-    /// walk's raw-string match cannot cross into a sibling tree; an already
-    /// segment-form or empty prefix passes through unchanged.
+    /// `prefix` is never widened before it reaches duckfs: a cap (and a call)
+    /// naming one exact FILE, not a directory, must still see its own hit and
+    /// keep a cursor that resumes at that same file — `retain_capped_hits`'s
+    /// `p == pre` exact-match arm (mirroring `AgentRecord::permits`) covers
+    /// this without any prefix rewriting.
     #[test]
-    fn prefix_is_normalized_to_segment_form_before_the_duckfs_request() {
-        assert_eq!(as_segment_prefix("/shared/team"), "/shared/team/");
-        assert_eq!(as_segment_prefix("/shared/team/"), "/shared/team/");
-        assert_eq!(as_segment_prefix(""), "");
+    fn a_cap_naming_one_exact_file_still_sees_its_own_hit_and_cursor() {
+        let record = agent::AgentRecord {
+            caps: agent::ResourceCaps {
+                duckfs_read: vec!["/shared/team/a.txt".into()],
+                ..Default::default()
+            },
+            ..team_capped_record()
+        };
+        let mut reply = json!({
+            "hits": [
+                {"path": "/shared/team/a.txt", "line": 1, "text": "x", "locator": "l1"},
+            ],
+            "next": "/shared/team/a.txt",
+        });
+        retain_capped_hits(&record, &mut reply);
+        scrub_uncapped_cursor(&record, &mut reply);
+        assert_eq!(
+            reply["hits"].as_array().unwrap().len(),
+            1,
+            "the exact-file hit must survive"
+        );
+        assert_eq!(reply["next"], json!("/shared/team/a.txt"));
     }
 }
