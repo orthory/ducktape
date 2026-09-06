@@ -1,6 +1,6 @@
 use super::{
     AuthorRef, BTreeMap, Block, BlockKind, Error, MAX_BLOCK_LEN, MAX_MOVE_SUBTREE_READS,
-    MAX_PAGE_DEPTH, MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT, MAX_PAGE_TITLE_LEN,
+    MAX_PAGE_DEPTH, MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT, MAX_PAGE_TITLE_LEN, MAX_PAGES,
     MAX_TRAVERSAL_WORK, MerkleStore, ModuleId, PAGE_INDEX_KEY, PageBlockPage, PageError, Pages,
     StagedStore, to_page_err,
 };
@@ -218,6 +218,9 @@ impl Pages {
     ) -> Result<(), PageError> {
         let mut index = self.load_index().await.map_err(to_page_err)?;
         if !index.contains_key(page_id) {
+            if index.len() >= MAX_PAGES {
+                return Err(PageError::TooManyPages);
+            }
             index.insert(page_id.to_string(), parent);
             self.stage_index(&index)?;
         }

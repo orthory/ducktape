@@ -942,6 +942,84 @@ fn subtree_removal_preflights_every_read_before_staging() {
 }
 
 #[test]
+fn comment_work_cap_keeps_removal_reachable_against_a_stranger_flooding_threads() {
+    // #1686: without an aggregate per-target cap, an unprivileged account
+    // (mallory) can open enough threads on someone else's block to push
+    // `preflight_subtree_removal`'s shared work budget over the top, and the
+    // block's real author has no author-gated way to shed those threads
+    // (DeleteComment/MoveCommentThread are stored-author/opener-gated). The
+    // fix caps a target's AGGREGATE thread+comment work directly, so the
+    // flood is refused long before it could ever exhaust the removal budget.
+    deterministic::Runner::default().start(|_context| async move {
+        let mut p = Pages::new("agg", Box::new(sdk_testkit::MemStore::new()));
+        seed_wide_branch(&mut p, 1).await;
+        // one thread (well under MAX_THREADS_PER_TARGET), flooded with
+        // replies up to the aggregate cap: opening it costs 2 units (the
+        // thread itself plus its first comment), every reply after costs 1.
+        apply_commit_as(
+            &mut p,
+            &PageMsg::AddComment {
+                thread_id: "mallory-thread".into(),
+                comment_id: "mallory-comment-0".into(),
+                target: "branch".into(),
+                text: "grief".into(),
+                anchor: None,
+                mentions: Vec::new(),
+                as_agent: None,
+            },
+            user("mallory"),
+        )
+        .await;
+        for i in 0..MAX_COMMENT_WORK_PER_TARGET - 2 {
+            apply_commit_as(
+                &mut p,
+                &PageMsg::AddComment {
+                    thread_id: "mallory-thread".into(),
+                    comment_id: format!("mallory-comment-{}", i + 1),
+                    target: "branch".into(),
+                    text: "grief".into(),
+                    anchor: None,
+                    mentions: Vec::new(),
+                    as_agent: None,
+                },
+                user("mallory"),
+            )
+            .await;
+        }
+        // one more reply would push the aggregate past the cap.
+        let error = p
+            .apply(
+                PageMsg::AddComment {
+                    thread_id: "mallory-thread".into(),
+                    comment_id: "mallory-comment-over".into(),
+                    target: "branch".into(),
+                    text: "grief".into(),
+                    anchor: None,
+                    mentions: Vec::new(),
+                    as_agent: None,
+                },
+                &user("mallory"),
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, PageError::TooMuchCommentWork);
+        // the flood never actually threatened the removal budget: the block
+        // (and its one real author-owned leaf) still removes cleanly.
+        p.apply(
+            PageMsg::RemoveBlock {
+                block_id: "branch".into(),
+            },
+            &Origin::System,
+            0,
+        )
+        .await
+        .unwrap();
+        assert!(p.load_block("branch").await.unwrap().is_none());
+    });
+}
+
+#[test]
 fn illegal_moves_are_rejected() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");

@@ -1,7 +1,8 @@
 use super::{
     AuthorRef, Comment, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES,
-    MAX_COMMENT_TEXT_BYTES, MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET,
-    Origin, PageError, PageMsg, Pages, Thread, ThreadView, author_from_origin, id_is_index_safe,
+    MAX_COMMENT_TEXT_BYTES, MAX_COMMENT_WORK_PER_TARGET, MAX_COMMENTS_PER_THREAD,
+    MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError, PageMsg, Pages, Thread,
+    ThreadView, author_from_origin, id_is_index_safe,
 };
 use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
@@ -62,6 +63,22 @@ impl Pages {
             Some(b) => serde_json::from_slice(&b).map_err(|_| PageError::Corrupt),
             None => Ok(Vec::new()),
         }
+    }
+
+    /// the aggregate thread+comment work `preflight_subtree_removal` (store.rs)
+    /// would charge THIS target's owning block: one unit per thread plus one
+    /// per comment across every thread anchored here. `AddComment` caps this
+    /// at [`MAX_COMMENT_WORK_PER_TARGET`] before staging a new thread or reply,
+    /// so the removal budget can never be exhausted by comments alone.
+    async fn comment_work_for_target(&self, target: &str) -> Result<usize, PageError> {
+        let thread_ids = self.load_target_index(target).await?;
+        let mut work = thread_ids.len();
+        for thread_id in &thread_ids {
+            if let Some(thread) = self.load_thread(thread_id).await? {
+                work += thread.comment_ids.len();
+            }
+        }
+        Ok(work)
     }
 
     fn stage_target_index(&mut self, target: &str, ids: &[String]) -> Result<(), PageError> {
@@ -225,6 +242,11 @@ impl Pages {
                         if thread.comment_ids.len() >= MAX_COMMENTS_PER_THREAD {
                             return Err(PageError::TooManyComments);
                         }
+                        if self.comment_work_for_target(&target).await? + 1
+                            > MAX_COMMENT_WORK_PER_TARGET
+                        {
+                            return Err(PageError::TooMuchCommentWork);
+                        }
                         let comment = Comment {
                             id: comment_id.clone(),
                             thread_id: thread_id.clone(),
@@ -239,19 +261,28 @@ impl Pages {
                         self.store_thread(&thread)
                     }
                     None => {
-                        if let Some(anchor) = &anchor {
-                            let block = self
-                                .load_block(&target)
-                                .await
-                                .map_err(|_| PageError::Corrupt)?
-                                .ok_or(PageError::BlockNotFound)?;
-                            if !valid_range(&block.text, anchor.start, anchor.end) {
-                                return Err(PageError::InvalidTextRange);
-                            }
+                        // the new-thread target must be a real block, anchor
+                        // or not — otherwise a thread can be squatted on an
+                        // id that never becomes a block, and no purge can
+                        // ever reach it (RemoveBlock needs the block to load).
+                        let block = self
+                            .load_block(&target)
+                            .await
+                            .map_err(|_| PageError::Corrupt)?
+                            .ok_or(PageError::BlockNotFound)?;
+                        if let Some(anchor) = &anchor
+                            && !valid_range(&block.text, anchor.start, anchor.end)
+                        {
+                            return Err(PageError::InvalidTextRange);
                         }
                         let mut ids = self.load_target_index(&target).await?;
                         if ids.len() >= MAX_THREADS_PER_TARGET {
                             return Err(PageError::TooManyThreads);
+                        }
+                        if self.comment_work_for_target(&target).await? + 2
+                            > MAX_COMMENT_WORK_PER_TARGET
+                        {
+                            return Err(PageError::TooMuchCommentWork);
                         }
                         let comment = Comment {
                             id: comment_id.clone(),
