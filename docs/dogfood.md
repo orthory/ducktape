@@ -207,16 +207,21 @@ the mention, and its program calls runs to start model work. The run then:
    bound issue's title, using the reply's first line as a fallback. The output
    tip, source branch and open item must still match when the action applies.
 
-**The PR is the session.** Re-mention the agent in the PR's own Discussion
-(hidden channel `forge:ducktape:<n>`) to iterate. A PR run uses its existing
-source branch, which may still be `agent/item-<original-issue-number>`, and
-proposes its changes back into that branch for review.
+Repeating the mention in the original issue's Discussion continues
+`agent/item-<issue-number>` and updates its existing PR.
+
+A mention in PR `<n>`'s Discussion (hidden channel `forge:ducktape:<n>`)
+forks that PR's source branch into `agent/item-<n>` and opens a child PR
+targeting the original source branch. Repeated mentions in that same
+Discussion continue `agent/item-<n>` and reuse the child PR. The original
+source branch advances when the proposed changes are merged.
 
 While it works, the agent can `pages.comment` on spec blocks (comments land
 authored by its program account on the page). The human page author ticks
 the spec todos; `pages.set_checked` is available only for pages the program
-account itself authored. Preflight skips record a `runs` breadcrumb. Once an
-action is admitted, its program call has an independent target outcome in
+account itself authored. Preflight skips emit debug breadcrumbs under
+`ducktape::modules`; enable that log target to inspect them. Once an action
+is admitted, its program call has an independent target outcome in
 `ActionRequest`; a refusal cannot undo earlier successful effects. If a comment
 didn't land, inspect that receipt, the model's `pages_write` capability and the
 target block/page id. Replies and other proposed effects also depend on their

@@ -1,6 +1,5 @@
-//! the agent dogfooding loop (M1), end to end on REAL `ducktape`
-//! validators: issue mention → forge-workspace run → PR, then the PR channel as
-//! a SESSION.
+//! the agent dogfooding loop, end to end on REAL `ducktape` validators:
+//! issue mention → forge-workspace run → PR, then a PR-scoped work session.
 //!
 //!   1. a repo is born by its first push; an issue opens (item #1, hidden
 //!      channel `forge:<repo>:1`); the agent is registered with forge caps
@@ -9,26 +8,27 @@
 //!      repo, detached at the pinned dev tip; the host commits + pushes branch
 //!      `agent/item-1` through consensus and the PR sink opens a PR whose
 //!      title is the bound Forge issue title.
-//!   3. re-mentioning in the PR's OWN channel forks the branch TIP: a second
-//!      commit lands on the SAME branch (parent = the first), and the
-//!      duplicate guard opens NO second PR.
+//!   3. mentioning in the PR's channel forks its source tip into the PR item's
+//!      OWN agent branch and opens a child PR targeting the original branch.
+//!      The original branch stays unchanged.
+//!   4. another mention in that same PR channel continues its agent branch;
+//!      the duplicate guard reuses the child PR. Each commit's parent and
+//!      recorded detached HEAD prove the session's exact base.
 //!
 //! ## a run is sandboxed, and that changed what this test can see
 //!
-//! The provider executes INSIDE a container now, so this suite needs a
+//! The provider executes INSIDE a microVM, so this suite needs a
 //! `[sandbox]` table (without one every compute daemon exits at boot — the
 //! reason this file spent weeks passing nothing) and its script cannot touch a
-//! host path: the fixture directory does not exist in the run's mount
-//! namespace. The evidence moved onto the one surface that DOES cross the
-//! boundary — the run workspace itself, which is a bind mount the host then
-//! commits and pushes. Each run writes [`HEAD_FILE`], and the test reads it back
+//! host path: the fixture directory does not exist in the guest. Evidence
+//! crosses the boundary through the workspace image, which the host reads
+//! back, commits, and pushes. Each run writes [`HEAD_FILE`], and the test reads it back
 //! out of committed git history, which is a stronger claim than the old
-//! host-side trace log: it is signed into the branch the run produced.
+//! host-side trace log: the authenticated push records it in the run's branch.
 //!
 //! `.git/HEAD` is read with `cat`, not `git rev-parse`: a detached HEAD holds
 //! the raw oid, so the whole proof (WHICH commit, and that it is DETACHED) is
-//! one file read, and the image stays a 4 MB busybox instead of something
-//! carrying a git client.
+//! one file read, without requiring a guest Git client.
 //!
 //! ## what this file no longer covers, and why
 //!
@@ -343,7 +343,7 @@ fn tracker_item(cluster: &Cluster, idx: usize, number: u64) -> Option<forge::Ite
     }
 }
 
-/// this run's entry in the delivered-runs ring (Task 5's receipt lane).
+/// this run's entry in the terminal-runs ring.
 fn run_record(cluster: &Cluster, idx: usize, run_id: &str) -> Option<RunRecord> {
     let reply = cluster.query(idx, "runs", &runs::encode_query(&RunsQuery::RecentRuns))?;
     match runs::decode_reply(&reply).ok()? {
@@ -426,18 +426,18 @@ fn git_stdout(dir: &Path, args: &[&str]) -> String {
 }
 
 #[test]
-fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
+fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session() {
     if skip_unless_sandboxed(
-        "issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session",
+        "issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session",
     )
     .is_some()
     {
         return;
     }
     // the fixture seeds and inspects the repo with the HOST git; the run inside
-    // the container needs none.
+    // the microVM needs none.
     if nettest::skip_without(
-        "issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session",
+        "issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session",
         nettest::missing_tool("git"),
     )
     .is_some()
@@ -582,8 +582,8 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     let pr_channel = pr.channel_id.clone();
     assert_eq!(pr_channel, format!("forge:{REPO}:{pr_number}"));
 
-    // the delivered-runs ring carries the receipt: branch@commit + PR number.
-    let record = cluster.await_committed(0, "run 1 in the delivered-runs ring", FINALIZE, || {
+    // The terminal-runs ring carries the receipt: branch@commit + PR number.
+    let record = cluster.await_committed(0, "run 1 in the terminal-runs ring", FINALIZE, || {
         run_record(&cluster, 0, &run_1)
     });
     assert_eq!(record.outcome, RunOutcome::ResultAccepted);
@@ -594,8 +594,10 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     );
     assert_eq!(record.pr_number, Some(pr_number));
 
-    // ---- run 2: the PR channel IS the session — re-mention forks the branch
-    //      TIP, lands a second commit on the SAME branch, opens NO second PR.
+    // ---- run 2: the PR item owns a separate work branch. It forks the PR's
+    //      source tip and requests review INTO that branch instead of writing
+    //      directly to the source branch chosen by the PR's author.
+    let pr_work_branch = format!("agent/item-{pr_number}");
     post_mention(&cluster, 0, &pr_channel, "m2");
     let run_2 = common::attributed_run_id(
         &cluster,
@@ -610,40 +612,98 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
         "run 2 replies in the PR channel"
     );
 
-    let run2_oid = cluster.await_committed(0, "the branch tip to advance", FINALIZE, || {
-        branch_tip(&cluster, 0, WORK_BRANCH).filter(|tip| *tip != run1_oid)
+    let run2_oid = cluster.await_committed(0, "the PR work branch to be born", FINALIZE, || {
+        branch_tip(&cluster, 0, &pr_work_branch)
     });
-    // parent chain, proven from a node that executed nothing: run2 → run1 →
-    // seed — the objects fanned out with the refs.
+    assert_ne!(run2_oid, run1_oid, "the PR run pushed a new commit");
+    assert_eq!(
+        branch_tip(&cluster, 0, WORK_BRANCH).as_deref(),
+        Some(run1_oid.as_str()),
+        "the PR's source branch is unchanged"
+    );
+    let child_pr = cluster.await_committed(0, "the child PR to open", FINALIZE, || {
+        tracker_items(&cluster, 0)
+            .into_iter()
+            .filter(|item| item.kind == forge::ItemKind::Pr)
+            .filter_map(|item| tracker_item(&cluster, 0, item.number))
+            .find(|item| item.source_branch.as_deref() == Some(pr_work_branch.as_str()))
+    });
+    let child_pr_number = child_pr.summary.number;
+    assert_ne!(child_pr_number, pr_number);
+    assert_eq!(child_pr.summary.state, forge::ItemState::Open);
+    assert_eq!(child_pr.summary.title, ISSUE_TITLE);
+    assert_eq!(child_pr.target_branch.as_deref(), Some(WORK_BRANCH));
+    let record = cluster.await_committed(0, "run 2 in the terminal-runs ring", FINALIZE, || {
+        run_record(&cluster, 0, &run_2)
+    });
+    assert_eq!(record.outcome, RunOutcome::ResultAccepted);
+    assert!(!record.degraded, "run 2 is clean: {record:?}");
+    assert_eq!(
+        record.output_ref.as_deref(),
+        Some(format!("{pr_work_branch}@{run2_oid}").as_str())
+    );
+    assert_eq!(record.pr_number, Some(child_pr_number));
+
+    // ---- run 3: the SAME PR channel continues its own born work branch,
+    //      preserving the first PR's source and reusing the child PR.
+    post_mention(&cluster, 0, &pr_channel, "m3");
+    let run_3 = common::attributed_run_id(
+        &cluster,
+        0,
+        &pr_channel,
+        seq_of(&cluster, 0, &pr_channel, "m3"),
+        AGENT_ID,
+    );
+    assert_eq!(
+        wait_for_reply(&cluster, 0, &pr_channel, &run_3),
+        REPLY_TITLE,
+        "run 3 replies in the same PR channel"
+    );
+    let run3_oid = cluster.await_committed(0, "the PR work branch to advance", FINALIZE, || {
+        branch_tip(&cluster, 0, &pr_work_branch).filter(|tip| *tip != run2_oid)
+    });
+    assert_eq!(
+        branch_tip(&cluster, 0, WORK_BRANCH).as_deref(),
+        Some(run1_oid.as_str()),
+        "continuing the PR session leaves its source branch unchanged"
+    );
+
+    // Parent chain, proven from a node that executed nothing:
+    // run3 → run2 → run1 → seed. The objects fanned out with the refs.
     let checkout = tempfile::tempdir().expect("git checkout parent");
     let clone_url = format!("http://127.0.0.1:{}/forge/{REPO}", cluster.http_ports[2]);
-    let dest = checkout.path().join("after-run2");
+    let dest = checkout.path().join("after-run3");
     git_ok(
         checkout.path(),
         &[
             "clone",
             "--quiet",
             "--branch",
-            WORK_BRANCH,
+            &pr_work_branch,
             &clone_url,
             dest.to_str().unwrap(),
         ],
     );
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run2_oid);
+    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD"]), run3_oid);
     assert_eq!(
         git_stdout(&dest, &["rev-parse", "HEAD^"]),
+        run2_oid,
+        "run 3 continues the PR session from run 2's commit"
+    );
+    assert_eq!(
+        git_stdout(&dest, &["rev-parse", "HEAD~2"]),
         run1_oid,
         "run 2's parent is run 1's commit"
     );
-    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~2"]), dev_tip);
+    assert_eq!(git_stdout(&dest, &["rev-parse", "HEAD~3"]), dev_tip);
 
     // What each run SAW, read out of the commit it produced: the sandboxed
     // neutral cwd, and a detached `.git/HEAD` naming the commit it forked. Run 1
-    // forks the pinned dev tip; run 2 forks the branch TIP, which is what makes
-    // the PR channel a session rather than a second independent run.
+    // forks dev; run 2 forks the PR source; run 3 forks its OWN branch tip.
     for (commit, pinned_at, which) in [
         (&run1_oid, &dev_tip, "run 1"),
         (&run2_oid, &run1_oid, "run 2"),
+        (&run3_oid, &run2_oid, "run 3"),
     ] {
         let (cwd, head) = run_evidence(&dest, commit);
         assert_eq!(cwd, GUEST_WORKDIR, "{which} ran at the neutral sandbox cwd");
@@ -656,21 +716,21 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
 
     assert_eq!(
         open_pr_count(&cluster, 0),
-        1,
-        "the duplicate guard opened NO second PR"
+        2,
+        "the duplicate guard reuses the child PR for the continued session"
     );
-    let record = cluster.await_committed(0, "run 2 in the delivered-runs ring", FINALIZE, || {
-        run_record(&cluster, 0, &run_2)
+    let record = cluster.await_committed(0, "run 3 in the terminal-runs ring", FINALIZE, || {
+        run_record(&cluster, 0, &run_3)
     });
     assert_eq!(record.outcome, RunOutcome::ResultAccepted);
-    assert!(!record.degraded, "run 2 is clean: {record:?}");
+    assert!(!record.degraded, "run 3 is clean: {record:?}");
     assert_eq!(
         record.output_ref.as_deref(),
-        Some(format!("{WORK_BRANCH}@{run2_oid}").as_str())
+        Some(format!("{pr_work_branch}@{run3_oid}").as_str())
     );
     assert_eq!(
         record.pr_number,
-        Some(pr_number),
+        Some(child_pr_number),
         "the ring names the UPDATED PR"
     );
 }
