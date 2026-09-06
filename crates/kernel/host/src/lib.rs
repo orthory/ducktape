@@ -81,6 +81,15 @@ pub fn global_root_of(pairs: &[(ModuleId, StateRoot)]) -> StateRoot {
 /// loop is guaranteed to terminate regardless of module behavior.
 pub const MAX_DISPATCHES: u32 = 1024;
 
+/// hard cap on rollback+replay cycles per BLOCK — [`MAX_DISPATCHES`] is per
+/// `drain_queue` CALL and so bounds one member, never the batch. Per-op
+/// isolation replays every already-accepted member when a member that STAGED
+/// then fails, which is quadratic in the member count; this bounds the block's
+/// re-execution to `members * (1 + MAX_BLOCK_REPLAYS)`. Past the budget the
+/// remaining members are rejected unexecuted — a function of the block alone,
+/// so every validator produces the identical verdict set.
+pub const MAX_BLOCK_REPLAYS: u32 = 8;
+
 /// the genesis-constant module id the `modules` registry registers under. read
 /// by the boundary code-swap realization ([`Host::realize_module_swaps`]) and by
 /// the drain's [`Host::pending_modules_advance`] injection; absent on a host
@@ -1274,13 +1283,16 @@ impl Host {
             injections.push_back((Origin::System, deliver));
         }
 
-        // 2. per-op isolation: each input op is one unit. `touched` and the
-        // modules' own staging accumulate ACROSS units (never committed
-        // mid-batch); accepted units all replay on a later rejection — one
-        // shared stage.
+        // 2. per-op isolation: each input op is one unit, drained against its OWN
+        // touched set (merged into the block's on the way out). the modules'
+        // staging accumulates ACROSS units (never committed mid-batch), so a unit
+        // that STAGED and then failed is entangled with the accepted units and
+        // costs a rollback + replay; a unit whose own set is EMPTY reached no
+        // module at all and costs nothing. the replay budget bounds the rest.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
         let mut accepted: Vec<AcceptedUnit> = Vec::new();
         let mut results: Vec<Option<MemberOutcome>> = (0..ops.len()).map(|_| None).collect();
+        let mut replays: u32 = 0;
 
         for (i, op) in ops.into_iter().enumerate() {
             let BlockOp {
@@ -1291,18 +1303,23 @@ impl Host {
 
             let mut ev: Vec<Event> = Vec::new();
             let mut di: Vec<DispatchRecord> = Vec::new();
+            let mut unit_touched: BTreeSet<ModuleId> = BTreeSet::new();
             let queue: VecDeque<(Origin, Msg)> = VecDeque::from([(origin.clone(), msg.clone())]);
-            match self
+            let verdict = self
                 .drain_queue(
                     height,
                     consensus_time,
                     queue,
-                    &mut touched,
+                    &mut unit_touched,
                     &mut ev,
                     &mut di,
                 )
-                .await
-            {
+                .await;
+            // whatever this unit reached is part of the block's stage from here
+            // (aborted below on a rejection, committed at the boundary otherwise).
+            let unit_staged = !unit_touched.is_empty();
+            touched.append(&mut unit_touched);
+            match verdict {
                 Ok(()) => {
                     accepted.push(AcceptedUnit {
                         origin,
@@ -1318,6 +1335,16 @@ impl Host {
                     });
                 }
                 Err(reason) => {
+                    results[i] = Some(MemberOutcome::Rejected {
+                        reason: reason.to_string(),
+                    });
+                    // an unknown target or an acl refusal is rejected BEFORE any
+                    // module is reached, so it staged nothing and the accepted
+                    // units' stage already IS the state a rollback would rebuild
+                    // — the whole point of the per-unit set.
+                    if !unit_staged {
+                        continue;
+                    }
                     // ISOLATE: this unit's partial stage is entangled with the
                     // accepted units' stage (one shared per-module stage), so
                     // roll the WHOLE stage back, then replay only the accepted
@@ -1325,11 +1352,22 @@ impl Host {
                     self.abort_all(&mut touched).await?;
                     self.replay_accepted(height, consensus_time, &mut accepted, &mut touched)
                         .await?;
-                    results[i] = Some(MemberOutcome::Rejected {
-                        reason: reason.to_string(),
-                    });
+                    replays += 1;
+                    if replays > MAX_BLOCK_REPLAYS {
+                        break;
+                    }
                 }
             }
+        }
+
+        // the replay budget ran out: every member the loop did not reach is
+        // rejected UNEXECUTED. the budget is a function of the block alone
+        // (member order and their verdicts), so every validator rejects exactly
+        // the same suffix — deterministic, like any other rejection.
+        for slot in results.iter_mut().filter(|s| s.is_none()) {
+            *slot = Some(MemberOutcome::Rejected {
+                reason: format!("block replay budget exhausted ({MAX_BLOCK_REPLAYS})"),
+            });
         }
 
         // 3. write each accepted unit's authoritative trace into its slot and
