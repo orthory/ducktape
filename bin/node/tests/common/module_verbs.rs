@@ -4,24 +4,9 @@ use std::time::Duration;
 
 use super::{Cluster, FIXTURES};
 
-/// blocks a ceremony's activation is placed out. it bounds the MATCHER: run 1
-/// joins run 0's proposal only while run 0's activation still clears run 1's
-/// own floor (`height + MIN_SWAP_LEAD`), so the lead has to outlast the WHOLE
-/// ceremony — and the ceremony is three sequential `ducktape` PROCESSES, each
-/// staging a component, fanning it out and driving governance round trips,
-/// while the chain ticks on regardless: every founder beats one nop per
-/// `TEST_BLOCK_TIME_MS`, so this harness's 3-founder network burns 30 blocks
-/// a second while idle. the lead is therefore spent in wall clock, and a
-/// number sized for a one-second beat is under two seconds of it here — which
-/// is what turned `deciding == 1` into a coin flip on a loaded box.
-///
-/// 900 blocks is 30 s at the harness beat: ten seconds of ceiling per run.
-pub const AFTER: &str = "900";
-
-/// the beat [`AFTER`] is counted in. the lead above is a wall-clock budget
-/// expressed in blocks, so a change to the beat resizes it and it has to be
-/// re-derived rather than silently shrink.
-const _: () = assert!(super::TEST_BLOCK_TIME_MS == 100);
+/// Use the CLI's default activation lead. It starts at governance execution;
+/// matching an open proposal does not consume the lead while voters join.
+pub const AFTER: &str = "50";
 
 /// the checked-in component for `<id>`.
 pub fn fixture(id: &str) -> String {
@@ -143,7 +128,9 @@ pub fn assert_ceremony_scheduled(runs: &[(bool, String)], id: &str) {
         runs[0].1
     );
     assert!(runs[1].1.contains("joining open proposal"), "{}", runs[1].1);
-    assert!(runs[2].1.contains("already scheduled"), "{}", runs[2].1);
+    let already_held =
+        runs[2].1.contains("already scheduled") || runs[2].1.contains("already active");
+    assert!(already_held, "{}", runs[2].1);
 }
 
 /// the ceremony's runs as one readable block, node by node.

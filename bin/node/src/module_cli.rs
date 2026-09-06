@@ -149,7 +149,7 @@ fn matches_module_action<'a>(
 /// `module update|register <id> <component.wasm> [--index <index.wasm>] [--after N]`: stage the bytes
 /// at this node (fan-out to every validator), refuse unless every member holds
 /// them, then drive the governance proposal that schedules the swap at this
-/// node's height + N and read the registry back for its verdict.
+/// execution height + N and read the registry back for its verdict.
 fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     config::validate_module_id(&args.id)?;
     // the static half of the registry's lead rule, checked before anything is
