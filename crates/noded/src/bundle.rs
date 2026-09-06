@@ -32,7 +32,7 @@ pub fn hash_bundle(dir: &Path, ids: &[&str]) -> Result<BTreeMap<String, [u8; 32]
 }
 
 /// A [`host::CodeSource`] packaging directory components and mappers, keyed by
-/// each file's sha256. a hash the directory has no file for is a `None` — the
+/// each deployment's sha256. an unknown hash returns `None` — the
 /// boundary fails closed, and the composer re-hashes whatever bytes come back
 /// regardless (a dir keyed by filename is a lookup, not a guarantee).
 pub struct DirCodeSource {

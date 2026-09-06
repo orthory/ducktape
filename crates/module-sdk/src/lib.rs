@@ -622,7 +622,7 @@ macro_rules! snapshot_guest {
                 // the loaded snapshot was saved post-inner-commit, so the native
                 // query's merged view serves it with an empty pending — the live
                 // staged-overlay projection this round is already folded into
-                // `__state`. these ports' queries are pure self reads.
+                // `__state`. sibling reads use the host query context.
                 let module = loaded_module()?;
                 $crate::block_on(module.query_with(&$crate::WitCtx::new(), &req))
                     .map_err(to_wit_error)
