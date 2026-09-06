@@ -79,6 +79,13 @@ fn spawn_fake_actor(mut cmds: mpsc::Receiver<NodeCommand>, submit_err: Option<&'
     });
 }
 
+/// the fake node's own consensus key — every real serve path carries one
+/// ([`bin/node`'s `operator_wallet_key`] wiring), so a test node modeling one
+/// must too: a keyless node now refuses to verify ANY signature at all
+/// ([`WriteRefusal::NodeUnidentified`]), which would make a signed-request
+/// test here indistinguishable from that refusal instead of exercising it.
+const NODE_KEY: [u8; 32] = [0x11; 32];
+
 /// a fake node that carries an operator credential, the way every real serve
 /// path does ([`AdminConfig::minted`]). The mutating routes admit EITHER a user
 /// signature or that credential, so a test node without one could not model a
@@ -87,6 +94,7 @@ fn local_node() -> (NodeHandle, mpsc::Receiver<NodeCommand>, noded::StreamHub) {
     let (handle, cmd_rx, events) = NodeHandle::channel();
     let handle = handle.with_admin(AdminConfig {
         operator_token: Some(OPERATOR.to_string()),
+        node_key: Some(NODE_KEY.to_vec()),
         ..Default::default()
     });
     (handle, cmd_rx, events)
@@ -115,14 +123,17 @@ fn caller() -> commonware_cryptography::ed25519::PrivateKey {
 
 /// one SIGNED mutating request, built the way every in-tree client builds one:
 /// through `noded::signed_req::request_headers`, never a hand-rolled trio.
-/// `local_node()` carries no node key, so the salt is empty here.
+/// salted against `local_node()`'s [`NODE_KEY`], the node these requests are
+/// always aimed at in this file.
 fn signed(method: &str, uri: &str, body: serde_json::Value) -> Request<Body> {
     let bytes = serde_json::to_vec(&body).unwrap();
     let mut req = Request::builder()
         .method(method)
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json");
-    for (name, value) in noded::signed_req::request_headers(&caller(), method, uri, &[], &bytes) {
+    for (name, value) in
+        noded::signed_req::request_headers(&caller(), method, uri, &NODE_KEY, &bytes)
+    {
         req = req.header(name, value);
     }
     req.body(Body::from(bytes)).unwrap()
@@ -464,6 +475,7 @@ async fn a_node_level_route_refuses_a_self_minted_key_and_admits_the_operator() 
         let handle = handle.with_admin(AdminConfig {
             operator_token: Some(OPERATOR.to_string()),
             owner_key: Some(operator_key.public_key().as_ref().to_vec()),
+            node_key: Some(NODE_KEY.to_vec()),
             ..Default::default()
         });
         (handle, cmd_rx, events)
@@ -476,7 +488,9 @@ async fn a_node_level_route_refuses_a_self_minted_key_and_admits_the_operator() 
             .method(method)
             .uri(uri)
             .header(header::CONTENT_TYPE, "application/json");
-        for (name, value) in noded::signed_req::request_headers(signer, method, uri, &[], &bytes) {
+        for (name, value) in
+            noded::signed_req::request_headers(signer, method, uri, &NODE_KEY, &bytes)
+        {
             req = req.header(name, value);
         }
         req.body(Body::from(bytes)).unwrap()
