@@ -40,13 +40,9 @@ jobs:
       - run: make wasm-modules-check
       - run: make wasm-embed-check
 
-  # `wasm-modules-check` only cmps committed copies against each other, so a
-  # committed index guest can drift from the source beside it and stay green
-  # (it did: a module PR refreshed component.wasm and forgot `--index`). This
-  # rebuilds every index.wasm from source on the pinned toolchain and refuses
-  # a PR whose committed bytes differ. Its own job: the rebuild needs the
-  # wasm32 target and a cargo build, which the cmp-only job above does not.
-  wasm-index-check:
+  # Rebuild every component and index guest from the requested source
+  # revision. Comparing committed copies alone cannot detect stale bytes.
+  wasm-rebuild-check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -55,7 +51,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
-      - run: make wasm-index-check
+      - run: cargo install wasm-tools --locked
+      - run: cargo test --locked -p guest-builder
+      - run: make wasm-rebuild-check
 
   genesis-pin:
     runs-on: ubuntu-latest

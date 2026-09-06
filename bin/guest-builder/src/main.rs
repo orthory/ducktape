@@ -573,8 +573,8 @@ fn pin(scratch: &Path, module: &Module, git: &str, rev: &str) -> Result<serde_js
         .map_err(|e| format!("parsing cargo metadata output: {e}"))?;
     let lock = scratch.join("Cargo.lock");
     let content = fs::read_to_string(&lock).map_err(|e| format!("reading resolved lock: {e}"))?;
-    let selected_source = format!("git+{git}?rev={rev}#");
-    let precise_source = format!("git+{git}#");
+    let selected_source = format!("git+{git}?rev={rev}");
+    let precise_source = format!("git+{git}");
     // Cargo uses this source ID in package entries and disambiguated dependency
     // strings. Normalize every occurrence so they continue to name one source.
     write(&lock, &content.replace(&selected_source, &precise_source))?;
@@ -923,6 +923,33 @@ mod tests {
                 "Base without the new module",
             ],
         );
+        // A second source with the same package name forces Cargo to spell
+        // source IDs in dependency entries as well as package records.
+        let other = root.parent().unwrap().join("other-shared");
+        fs::create_dir_all(&other).unwrap();
+        git(&other, &["init", "--initial-branch=base"]);
+        git(&other, &["config", "user.name", "Guest builder test"]);
+        git(
+            &other,
+            &["config", "user.email", "guest-builder@example.invalid"],
+        );
+        fixture_file(
+            &other,
+            "Cargo.toml",
+            "[package]\nname = \"shared\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+        );
+        fixture_file(&other, "src/lib.rs", "pub fn value() -> u32 { 2 }\n");
+        git(&other, &["add", "."]);
+        git(
+            &other,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "Independent shared package",
+            ],
+        );
         git(root, &["switch", "-c", "module"]);
         fixture_file(
             root,
@@ -934,6 +961,13 @@ mod tests {
             "module/Cargo.toml",
             "[package]\nname = \"new-module\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\nguest = []\n[dependencies]\nshared = { path = \"../shared\" }\n",
         );
+        let manifest = root.join("module/Cargo.toml");
+        let mut content = fs::read_to_string(&manifest).unwrap();
+        content.push_str(&format!(
+            "other-shared = {{ package = \"shared\", git = \"file://{}\" }}\n",
+            other.display()
+        ));
+        fs::write(manifest, content).unwrap();
         fixture_file(
             root,
             "module/src/lib.rs",
