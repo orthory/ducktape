@@ -248,8 +248,8 @@ fn pin_table_full_at_max_pins() {
     }
     // the table is now exactly full: even a FRESH owner (nowhere near its own
     // per-owner share) is refused by the global cap.
-    let err = exec(&mut f, md("owner-fresh"), 2, pin_op(&head, "overflow"))
-        .expect_err("cap reached");
+    let err =
+        exec(&mut f, md("owner-fresh"), 2, pin_op(&head, "overflow")).expect_err("cap reached");
     assert_module_err(&err, "pin table is full");
     abort_block(&mut f);
 }
@@ -294,7 +294,8 @@ fn pin_quota_follows_account_ownership_and_exact_key_admission() {
         key: vec![2],
         account: Some(1),
     };
-    let core = f.core_mut();
+    let store = duckfs_disk::DiskStore::open(d.path().join("objects")).unwrap();
+    let mut core = files::Fs::new(store, decoded_refs(&f));
     core.pin(&old_key, 2, head.clone(), "before-admission".into())
         .unwrap();
     for i in 0..files::MAX_PINS_PER_OWNER - 1 {
@@ -324,13 +325,9 @@ fn pin_quota_follows_account_ownership_and_exact_key_admission() {
         Err("files: pin quota exceeded".into())
     );
     assert_eq!(core.pending_refs(), &before);
-    assert!(
-        core.unpin(&sibling, 2, "before-admission".into())
-            .is_err()
-    );
+    assert!(core.unpin(&sibling, 2, "before-admission".into()).is_err());
     assert_eq!(core.pending_refs(), &before);
-    core.unpin(&admitted, 2, "before-admission".into())
-        .unwrap();
+    core.unpin(&admitted, 2, "before-admission".into()).unwrap();
 
     // A keyless program has its own account share and can release its own pin
     // to regain capacity, with the same revision/rollback discipline.
