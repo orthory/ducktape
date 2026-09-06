@@ -361,6 +361,19 @@ impl Manifest {
             root_hash: self.root_hash,
         }
     }
+
+    /// the first module this boundary cannot transfer at all — the serving
+    /// node could not prepare a sync handle for it (or the module declares no
+    /// sync surface), so the capture holds no payload and pins no resolver
+    /// target. a joiner cannot rebuild such a module from this source at ANY
+    /// height: the fact belongs to the SOURCE, so the caller rotates to
+    /// another one rather than refetching this manifest.
+    pub fn undeliverable_module(&self) -> Option<&ModuleId> {
+        self.entries
+            .iter()
+            .find(|e| e.kind == PayloadKind::Unsupported)
+            .map(|e| &e.module_id)
+    }
 }
 
 /// a state-sync request.
@@ -2543,6 +2556,52 @@ mod tests {
         });
         truncated.truncate(truncated.len() - 1);
         assert!(decode_request(&truncated).is_err(), "short base tail");
+    }
+
+    #[test]
+    fn an_unsupported_entry_names_the_undeliverable_module() {
+        let entry = |id: &str, kind| ManifestEntry {
+            module_id: id.into(),
+            root: StateRoot([1u8; ROOT_LEN]),
+            code_hash: None,
+            kind,
+            resolver_target: None,
+        };
+        let manifest = |entries| Manifest {
+            height: 4,
+            root_hash: StateRoot([2u8; ROOT_LEN]),
+            epoch: 1,
+            view_base: 0,
+            participants: vec![],
+            residents: vec![],
+            floor_cert: None,
+            entries,
+            applied_frames: vec![],
+            pending_cutover_view: None,
+        };
+        // a source whose `kv` could not prepare a handle serves it as
+        // Unsupported: the joiner reads that off the manifest instead of
+        // discovering it as a missing pinned target mid-compose.
+        assert_eq!(
+            manifest(vec![
+                entry("valset", PayloadKind::Snapshot),
+                entry("kv", PayloadKind::Unsupported),
+            ])
+            .undeliverable_module()
+            .map(|m| m.as_str()),
+            Some("kv")
+        );
+        // every other kind is transferable — including Stateless, which
+        // carries no payload on purpose.
+        assert_eq!(
+            manifest(vec![
+                entry("valset", PayloadKind::Snapshot),
+                entry("kv", PayloadKind::Resolver),
+                entry("modules", PayloadKind::Stateless),
+            ])
+            .undeliverable_module(),
+            None
+        );
     }
 
     #[test]

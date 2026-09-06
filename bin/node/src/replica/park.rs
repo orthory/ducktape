@@ -2521,11 +2521,15 @@ pub(super) async fn park(
                                 node = %label,
                                 target_height = m.height,
                                 error = %e,
+                                reason = e.reason(),
                                 "replica bootstrap failed"
                             );
                             // a source that failed the assembly (a lying
                             // total/oversized chunk included) is rotated away
-                            // from rather than re-asked with the same manifest.
+                            // from rather than re-asked with the same manifest
+                            // — and a source that answered with a boundary it
+                            // cannot transfer (`source_degraded_module`) is
+                            // the same call, made before any bytes moved.
                             client.rotate_source();
                         }
                     }
@@ -2739,10 +2743,12 @@ pub(super) async fn park(
                     node = %label,
                     target_height = m.height,
                     error = %e,
+                    reason = e.reason(),
                     "resident boundary sync failed"
                 );
                 // same rationale as the bootstrap arm above: don't re-ask the
-                // source that just failed the assembly.
+                // source that just failed the assembly, or served a boundary
+                // it cannot transfer.
                 client.rotate_source();
             }
         }

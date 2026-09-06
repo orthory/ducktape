@@ -565,6 +565,56 @@ fn intern_label(name: &str) -> &'static str {
     leaked
 }
 
+/// why a boundary sync did not produce a host.
+#[derive(Debug)]
+pub(super) enum SyncModulesError {
+    /// the SOURCE's own manifest says one of its modules cannot be
+    /// transferred at all (`PayloadKind::Unsupported`: the serving node could
+    /// not prepare a sync handle for it). that is a stable fact about the
+    /// source, not about this attempt — no refetch of its manifest turns it
+    /// into a transferable boundary — so the caller rotates instead of
+    /// retrying.
+    SourceDegraded(String),
+    /// everything else: a transfer that may well complete on the next attempt
+    /// (a moved qmdb target, a busy peer, a dropped chunk).
+    Failed(String),
+}
+
+impl SyncModulesError {
+    /// the stable snake_case token the failure logs and metrics carry.
+    pub(super) fn reason(&self) -> &'static str {
+        match self {
+            Self::SourceDegraded(_) => "source_degraded_module",
+            Self::Failed(_) => "sync_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for SyncModulesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SourceDegraded(module) => {
+                write!(f, "source cannot transfer module {module} at this boundary")
+            }
+            Self::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+impl From<String> for SyncModulesError {
+    fn from(e: String) -> Self {
+        Self::Failed(e)
+    }
+}
+
+/// the source-degraded refusal for `manifest`, if it carries one — the whole
+/// decision, so it is testable without a peer.
+fn undeliverable_boundary(manifest: &statesync::Manifest) -> Option<SyncModulesError> {
+    manifest
+        .undeliverable_module()
+        .map(|module| SyncModulesError::SourceDegraded(module.to_string()))
+}
+
 /// rebuild EVERY module of the modules registry's roster from a peer's
 /// statesync service at `manifest`'s boundary and compose them into a
 /// [`Host`], verified against the manifest's root-hash. the disk substrates
@@ -586,7 +636,16 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     substrates: NodeSubstrates<'_>,
     attempt: usize,
     genesis: &GenesisModules,
-) -> Result<Host, String> {
+) -> Result<Host, SyncModulesError> {
+    // BEFORE a byte moves: a module this source cannot transfer makes the
+    // whole boundary unbuildable (the composite root-hash gate below is over
+    // the WHOLE roster), and every lane below would discover it as its own
+    // opaque, retryable-looking failure — a store tenant as "missing pinned
+    // resolver target", a map tenant as a snapshot fetch the source cannot
+    // answer. read it off the manifest and let the caller rotate.
+    if let Some(degraded) = undeliverable_boundary(manifest) {
+        return Err(degraded);
+    }
     let NodeSubstrates {
         forge_repo,
         duckfs_dir,
@@ -752,11 +811,11 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     // runs by construction — a missing module composes a different root-hash
     // and the join fails its final check.
     if host.root_hash() != manifest.root_hash {
-        return Err(format!(
+        return Err(SyncModulesError::Failed(format!(
             "composed {} != manifest {}",
             hex(&host.root_hash()),
             hex(&manifest.root_hash)
-        ));
+        )));
     }
     // the composite gate passed — promote files' scratch into the canonical
     // `duckfs_dir` (verify-then-replace refs + content-addressed object merge,
@@ -792,11 +851,11 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     host.register(Box::new(canonical_files));
     // re-check THE property against the canonical-backed composition.
     if host.root_hash() != manifest.root_hash {
-        return Err(format!(
+        return Err(SyncModulesError::Failed(format!(
             "canonical duckfs reopen composed {} != manifest {}",
             hex(&host.root_hash()),
             hex(&manifest.root_hash)
-        ));
+        )));
     }
     wire(&mut host, context, &canonical_substrates, &net, index)?;
     Ok(host)
@@ -1226,5 +1285,49 @@ mod tests {
                  instead of returning the interned one"
             );
         }
+    }
+
+    /// a source serving a boundary it cannot transfer is refused BEFORE the
+    /// sync spends a genesis fetch, an object possession loop and every store
+    /// rebuild on it — and the refusal names the module and carries the
+    /// rotation's reason token.
+    #[test]
+    fn a_degraded_source_module_refuses_the_boundary() {
+        let entry = |id: &str, kind| statesync::ManifestEntry {
+            module_id: id.into(),
+            root: StateRoot([1u8; 32]),
+            code_hash: None,
+            kind,
+            resolver_target: None,
+        };
+        let manifest = |entries| statesync::Manifest {
+            height: 9,
+            root_hash: StateRoot([2u8; 32]),
+            epoch: 1,
+            view_base: 0,
+            participants: vec![],
+            residents: vec![],
+            floor_cert: None,
+            entries,
+            applied_frames: vec![],
+            pending_cutover_view: None,
+        };
+        let degraded = undeliverable_boundary(&manifest(vec![
+            entry("valset", statesync::PayloadKind::Resolver),
+            entry("kv", statesync::PayloadKind::Unsupported),
+        ]))
+        .expect("an Unsupported entry refuses the boundary");
+        assert_eq!(degraded.reason(), "source_degraded_module");
+        assert!(
+            degraded.to_string().contains("kv"),
+            "the refusal names the module: {degraded}"
+        );
+        assert!(
+            undeliverable_boundary(&manifest(vec![
+                entry("valset", statesync::PayloadKind::Resolver),
+                entry("kv", statesync::PayloadKind::Snapshot),
+            ]))
+            .is_none()
+        );
     }
 }
