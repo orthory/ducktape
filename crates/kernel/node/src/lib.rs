@@ -377,6 +377,15 @@ pub fn decode_member(bytes: &[u8]) -> Result<host::BlockOp, Error> {
 /// message cap gives the envelope headroom over this packing target.
 pub const MAX_BATCH_BYTES: usize = MAX_FRAME_BYTES;
 
+/// hard cap on how many MEMBERS one batch super-frame carries. the byte cap
+/// alone does not bound this: the smallest signed op frame is ~155 bytes, so
+/// `MAX_BATCH_BYTES` (1 MiB + 16 KiB) fits ~6.8k members in one block. Each
+/// member is one isolation unit in `Host::apply_block`, and one that stages
+/// then fails replays every accepted member before it, so the block's
+/// re-execution is bounded by `members * (1 + host::MAX_BLOCK_REPLAYS)` —
+/// 1024 members keep that under ~9.2k module executions.
+pub const MAX_BATCH_MEMBERS: usize = 1024;
+
 /// encoded length of `n` as canonical unsigned LEB128.
 fn varint_len(mut n: u64) -> usize {
     let mut len = 1;
@@ -1443,7 +1452,8 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     }
 
     /// FLUSH — drain `pending_batch` (FIFO), greedily pack the member frames
-    /// into batch super-frames up to [`MAX_BATCH_BYTES`], and for each batch
+    /// into batch super-frames up to [`MAX_BATCH_BYTES`] and
+    /// [`MAX_BATCH_MEMBERS`], and for each batch
     /// PIN its bytes then PROPOSE it to the orderer. returns the number of
     /// batches submitted (`Ok(0)` when nothing was pending).
     ///
@@ -1452,7 +1462,7 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// single node's own op-log-order-dependent (qmdb) root. members stay in
     /// custody (`outstanding`); they leave only when a batch finalizes and the
     /// member resolves in [`drain_delivered`]. a new batch is started when
-    /// adding the next member would push the encoded batch past the cap; a
+    /// adding the next member would push the encoded batch past either cap; a
     /// single member is never split (it is `<= MAX_FRAME_BYTES`, so it always
     /// forms at least its own batch even if that batch edges over the packing
     /// target — the mesh cap has the headroom).
@@ -1470,7 +1480,8 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         for (_id, frame) in pending {
             let contrib = varint_len(frame.len() as u64) + frame.len();
             let projected = varint_len(members.len() as u64 + 1) + members_bytes + contrib;
-            if !members.is_empty() && projected > MAX_BATCH_BYTES {
+            let overflows = projected > MAX_BATCH_BYTES || members.len() == MAX_BATCH_MEMBERS;
+            if !members.is_empty() && overflows {
                 // adding this member would overflow the cap — seal the current
                 // batch and start a fresh one with this member.
                 self.propose_batch(&members).await?;

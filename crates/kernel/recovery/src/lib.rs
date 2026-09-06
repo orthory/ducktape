@@ -629,6 +629,7 @@ impl Manifest {
             pending_cutover_view,
             oplog_pos,
             next_seq,
+            None,
             || std::time::Duration::ZERO,
         )
         .map(|(manifest, _)| manifest)
@@ -638,6 +639,10 @@ impl Manifest {
     /// capture, read off the caller's clock (`now`) — the checkpoint runs on
     /// the node's select loop, and an aggregate `capture_ms` cannot name the
     /// module that spent it (#1018).
+    ///
+    /// `sealed_root` is the root the block at `height` SEALED, when the caller
+    /// knows it: the capture is then verified against it and refuses rather
+    /// than writing a manifest for a root no block committed.
     #[allow(clippy::too_many_arguments)]
     pub fn capture_timed(
         host: &Host,
@@ -649,6 +654,7 @@ impl Manifest {
         pending_cutover_view: Option<u64>,
         oplog_pos: u64,
         next_seq: u64,
+        sealed_root: Option<StateRoot>,
         now: impl FnMut() -> std::time::Duration,
     ) -> Result<(Self, Vec<(sdk::ModuleId, std::time::Duration)>), Error> {
         // ONE pass over the registry: the capture computes every module root
@@ -671,6 +677,31 @@ impl Manifest {
             now,
         );
         let root_hash = snapshot.root_hash;
+        // THE CAPTURE COMPUTES A LIVE ROOT, IT DOES NOT VERIFY ONE. a caller
+        // that knows which root `height` SEALED passes it here, and a manifest
+        // whose live root is anything else is refused: the host can sit ahead of
+        // the sealed boundary (a code-swap realization that stalled before
+        // applying the block seats a module and moves the registry root), and a
+        // manifest labelled `height` carrying a root no block sealed makes
+        // recovery's final compare fatal on every subsequent boot.
+        if let Some(sealed) = sealed_root
+            && sealed != root_hash
+        {
+            tracing::warn!(
+                target: "ducktape::recovery",
+                event = "node_checkpoint_failed",
+                reason = "root_hash_unsealed",
+                height = height.unwrap_or_default(),
+                "checkpoint capture refused: the live root is not the one the block sealed"
+            );
+            return Err(Error::Storage(format!(
+                "checkpoint capture at height {}: live root {:?} is not the sealed root {:?} \
+                 — refusing to write a manifest no block committed",
+                height.unwrap_or_default(),
+                root_hash,
+                sealed,
+            )));
+        }
         // a checkpoint is ALL-OR-NOTHING and that is deliberate: restore reads
         // bytes back per module, so a manifest missing one module's snapshot is
         // a checkpoint that cannot restore — and writing it would prune the
