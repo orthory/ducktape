@@ -211,8 +211,14 @@ pub fn seat_at(entry: &modules::ModuleCode, height: u64) -> Option<([u8; 32], Se
 
 /// the modules registry's roster at `height` ([`seat_at`] per entry). the
 /// registry is optional: without one there are no later admissions to seat.
+/// a registry that IS there and fails to answer is an error, never an empty
+/// roster — seating nothing would silently drop every admitted module.
 async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>, String> {
-    let Some(roster) = host.module_status().await else {
+    let status = host
+        .module_status()
+        .await
+        .map_err(|e| format!("modules registry query failed: {e}"))?;
+    let Some(roster) = status else {
         return Ok(Vec::new());
     };
     Ok(roster
@@ -511,8 +517,13 @@ impl Admissions {
 #[async_trait::async_trait(?Send)]
 impl host::ModuleFactory for Admissions {
     async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<host::Admitted, sdk::Error> {
-        let artifact =
-            module_artifact::ModuleArtifactRef::decode(bytes).map_err(sdk::Error::Module)?;
+        // bytes carrying no artifact frame at all are no module: another
+        // plane's record committed through the same id-generic registry. Skip
+        // and latch — a hard error here is a permanent code stall on every
+        // node, for bytes this boundary never owned.
+        let Ok(artifact) = module_artifact::ModuleArtifactRef::decode(bytes) else {
+            return Ok(host::Admitted::ForeignAbi);
+        };
         let bindings = Bindings {
             invite: &self.invite,
             chain_id: &self.chain_id,
