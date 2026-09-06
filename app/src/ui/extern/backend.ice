@@ -133,12 +133,12 @@ extern crate::backend
   // prepends — an index is stale the moment an older page merges in.
   pure seq_in_copy_range(seq:i64, anchor:i64, head:i64, surface:CopySurface, mine:CopySurface) -> bool
   pure copy_range_count(messages:&[ChatMessage], anchor:i64, head:i64) -> i64
-  pure copy_range_text(messages:[ChatMessage], anchor:i64, head:i64) -> str
-  pure copy_range_toast(messages:[ChatMessage], anchor:i64, head:i64) -> str
+  pure copy_range_text(messages:&[ChatMessage], anchor:i64, head:i64) -> str
+  pure copy_range_toast(messages:&[ChatMessage], anchor:i64, head:i64) -> str
   pure copy_range_label(count:i64) -> str
   pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
   pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface, extending:bool) -> CopyRange
-  pure copy_range_rows(timeline:[ChatMessage], thread:[ChatMessage], surface:CopySurface) -> [ChatMessage]
+  pure copy_range_rows(timeline:&[ChatMessage], thread:&[ChatMessage], surface:CopySurface) -> [ChatMessage]
   pure merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
   pure restore_draft(current:str, pending:str, keep_pending:bool) -> str
   // Chat's message/thread menus still place themselves this way; the name is

@@ -971,11 +971,14 @@ subscribe
   // on purpose: both chords have to work on the launch window too.
   keyboard modifiers -> modifier_state_changed _
   keyboard press status=ignored when cmd_held -> command_chord_pressed _
-  // ⌘C FOR THE CHAT'S COPY RANGE, armed by the range itself. A reader with
-  // nothing selected has no such route at all — which is why this is not an
-  // arm on the quit/close chord, whose route is armed by ⌘ alone and so runs
-  // on every screen. `status=ignored` keeps a focused field's own copy.
-  keyboard press status=ignored when copy_anchor_seq > 0 -> copy_chord_pressed _
+  // ⌘C FOR THE CHAT'S COPY RANGE, armed by the range itself AND by the tab it
+  // belongs to. A reader with nothing selected has no such route at all —
+  // which is why this is not an arm on the quit/close chord, whose route is
+  // armed by ⌘ alone and so runs on every screen. The tab term is the same
+  // rule applied twice: a range left standing in chat must not tax a keystroke
+  // typed in Pages, Forge or the console. `status=ignored` keeps a focused
+  // field's own copy.
+  keyboard press status=ignored when (copy_anchor_seq > 0 && shell_tab == ShellTab.chat) -> copy_chord_pressed _
   // WHICH window ⌘W closes. The OS says which one has focus; guessing (the
   // console, the last opened) would close a window nobody was looking at.
   window focused with-id -> window_focused _
@@ -1076,9 +1079,8 @@ on command_chord_pressed(event)
       task window close target=window_target(focused_win)
     // ⌘ plus any other key is not ours. The route is armed by the modifier
     // alone, so this is the ORDINARY case — every ⌘C, ⌘V and ⌘A lands here —
-    // and
-    // the arm exists because the match is exhaustive on purpose: a chord added
-    // to the enum has to be routed before this file compiles again.
+    // and the arm exists because the match is exhaustive on purpose: a chord
+    // added to the enum has to be routed before this file compiles again.
     CommandChord.ignored
       return if true
 

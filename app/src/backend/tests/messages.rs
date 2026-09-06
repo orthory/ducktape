@@ -979,11 +979,11 @@ fn a_copy_range_covers_its_ends_whichever_way_round_they_are() {
 fn the_copied_text_reads_in_timeline_order() {
     let rows = room();
     assert_eq!(
-        copy_range_text(rows.clone(), 3, 1),
+        copy_range_text(&rows, 3, 1),
         "ana: first\n\nbo: second\n\nana: third",
         "clicked bottom-up, pasted top-down"
     );
-    assert_eq!(copy_range_text(rows, 2, 2), "bo: second");
+    assert_eq!(copy_range_text(&rows, 2, 2), "bo: second");
 }
 
 /// A TOMBSTONE IS NOT A LINE. A deleted row inside the range contributes
@@ -995,8 +995,8 @@ fn a_deleted_row_inside_the_range_contributes_nothing() {
     let mut rows = room();
     rows[1].deleted = true;
     rows[1].body = String::new();
-    assert_eq!(copy_range_text(rows.clone(), 1, 3), "ana: first\n\nana: third");
-    assert_eq!(copy_range_toast(rows, 1, 1), "Message copied");
+    assert_eq!(copy_range_text(&rows, 1, 3), "ana: first\n\nana: third");
+    assert_eq!(copy_range_toast(&rows, 1, 1), "Message copied");
 }
 
 /// SHIFT KEEPS THE ANCHOR, A PLAIN CLICK MOVES IT. This is the whole gesture.
@@ -1055,7 +1055,33 @@ fn the_surface_picks_the_list_the_copy_reads() {
     use crate::CopySurface::{Nowhere, Thread, Timeline};
     let timeline = room();
     let thread = vec![message(7, "cy", "a reply")];
-    assert_eq!(copy_range_rows(timeline.clone(), thread.clone(), Timeline).len(), 4);
-    assert_eq!(copy_range_rows(timeline.clone(), thread.clone(), Thread).len(), 1);
-    assert!(copy_range_rows(timeline, thread, Nowhere).is_empty());
+    assert_eq!(copy_range_rows(&timeline, &thread, Timeline).len(), 4);
+    assert_eq!(copy_range_rows(&timeline, &thread, Thread).len(), 1);
+    assert!(copy_range_rows(&timeline, &thread, Nowhere).is_empty());
+}
+
+/// A PENDING ROW IS NOT AN END OF ANYTHING. A message still in flight carries a
+/// negative seq, and a range with one at either end covers no rows: the bar
+/// holding the only Clear button would vanish while the ⌘C route, armed on the
+/// anchor, stayed armed with nothing able to disarm it. Pressing one ends the
+/// range instead of opening an unclearable one.
+#[test]
+fn a_press_on_a_pending_row_ends_the_range_rather_than_arming_a_dead_one() {
+    use crate::CopySurface::{Nowhere, Timeline};
+    let cleared = copy_range_after_press(0, Nowhere, -1, Timeline, false);
+    assert_eq!((cleared.anchor, cleared.head), (0, 0), "a plain click on one");
+    assert_eq!(cleared.surface, Nowhere);
+
+    let dropped = copy_range_after_press(2, Timeline, -3, Timeline, true);
+    assert_eq!(
+        (dropped.anchor, dropped.head),
+        (0, 0),
+        "and ⇧-clicking one drops the range it would otherwise have widened"
+    );
+    assert_eq!(dropped.surface, Nowhere);
+    assert_eq!(
+        copy_range_count(&room(), dropped.anchor, dropped.head),
+        0,
+        "which is the count the bar was already showing"
+    );
 }

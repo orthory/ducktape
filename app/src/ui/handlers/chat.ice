@@ -100,6 +100,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // The copy range ends with the room — see `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -177,6 +181,15 @@ on choose_channel(id)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // THE COPY RANGE ENDS WITH THE ROOM. Its two ends are seqs in THIS channel's
+  // sequence, so carried next door they would tint rows nobody picked — and
+  // the bar that holds the only Clear button is gated on a count the arriving
+  // list makes zero, which would leave the ⌘C route armed with no way to
+  // disarm it. Every navigation that changes which conversation is on screen
+  // ends the selection; the five other sites that do it point back here.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -265,6 +278,10 @@ on choose_dm(peer_key)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // The copy range ends with the room — see `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -761,6 +778,11 @@ on channel_created(next)
   selected_message_rev = next.selected_message_rev
   message_action = MessageAction.toolbar
   message_edit_draft = next.selected_message_body
+  // A create is a room switch, so the copy range ends here too — see
+  // `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = next.active_thread_seq
   // A create lands on seq 0 — no thread seated, and no composer line owed:
   // each thread's instance keeps its own words (ducktape-ui#697).
@@ -987,6 +1009,14 @@ on open_thread_for(seq)
   thread_selected_rev = 0
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
+  // AND WITH THE RAIL'S LIST, for the same reason as the room — see
+  // `choose_channel`. A reply's seq comes from the CHANNEL's sequence, so a
+  // range left standing tints replies in whichever thread opens next. This
+  // handler already drops the stream's own `selected_message_seq` two lines
+  // up; the selection goes with it.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = true
@@ -1146,6 +1176,11 @@ on close_thread
   thread_selected_rev = 0
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
+  // The rail's list goes with the rail, and so does the copy range — see
+  // `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
 
 on edit_message_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
@@ -1325,14 +1360,13 @@ on clear_copy_range
   copy_head_seq = 0
   copy_surface = CopySurface.nowhere
 
-// Both ways in land here — the bar's button and ⌘C on the chord dispatch — so
-// the clipboard is written in exactly one place. The surface picks the list,
-// which is what makes the chord lift the rows the bar was counting.
 // TWO DOORS, ONE ACT. An app handler cannot call another one and a keyboard
 // subscription cannot hand its event to a no-argument handler, so the bar's
 // button and ⌘C each spell the same four lines. That is thinner than it looks:
 // every decision — which list, whether there is a range, what the toast says,
 // what text comes out — is in the externs, and these bodies only apply them.
+// The surface picks the list, which is what makes the chord lift exactly the
+// rows the bar was counting.
 on copy_chord_pressed(event)
   return if !is_copy_chord(event.key, event.physical_key, event.modifiers)
   let rows = copy_range_rows(messages, thread_messages, copy_surface)

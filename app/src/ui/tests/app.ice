@@ -1688,4 +1688,3 @@ test the_quit_chord_route_is_armed_only_while_command_is_held
   modifiers
   expect !cmd_held
 
-

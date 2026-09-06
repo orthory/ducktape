@@ -961,8 +961,8 @@ pub fn copy_range_count(messages: &[ChatMessage], anchor: i64, head: i64) -> i64
 /// message, blank-line separated so a multi-line body stays readable when it
 /// lands in an editor. A deleted or empty row contributes nothing — its body
 /// is gone, and a placeholder would be a line the reader never wrote.
-pub fn copy_range_text(messages: Vec<ChatMessage>, anchor: i64, head: i64) -> String {
-    range_rows(&messages, anchor, head)
+pub fn copy_range_text(messages: &[ChatMessage], anchor: i64, head: i64) -> String {
+    range_rows(messages, anchor, head)
         .into_iter()
         .filter(|message| !message.deleted && !message.body.trim().is_empty())
         .map(|message| format!("{}: {}", message.author, message.body.trim()))
@@ -971,8 +971,8 @@ pub fn copy_range_text(messages: Vec<ChatMessage>, anchor: i64, head: i64) -> St
 }
 
 /// The toast the copy raises, counting what actually reached the clipboard.
-pub fn copy_range_toast(messages: Vec<ChatMessage>, anchor: i64, head: i64) -> String {
-    match copy_range_count(&messages, anchor, head) {
+pub fn copy_range_toast(messages: &[ChatMessage], anchor: i64, head: i64) -> String {
+    match copy_range_count(messages, anchor, head) {
         1 => "Message copied".to_owned(),
         count => format!("{count} messages copied"),
     }
@@ -981,13 +981,13 @@ pub fn copy_range_toast(messages: Vec<ChatMessage>, anchor: i64, head: i64) -> S
 /// Whichever list the range was drawn in — the surface decides, so the chord
 /// lifts the same rows the bar is counting.
 pub fn copy_range_rows(
-    timeline: Vec<ChatMessage>,
-    thread: Vec<ChatMessage>,
+    timeline: &[ChatMessage],
+    thread: &[ChatMessage],
     surface: crate::CopySurface,
 ) -> Vec<ChatMessage> {
     match surface {
-        crate::CopySurface::Timeline => timeline,
-        crate::CopySurface::Thread => thread,
+        crate::CopySurface::Timeline => timeline.to_vec(),
+        crate::CopySurface::Thread => thread.to_vec(),
         crate::CopySurface::Nowhere => Vec::new(),
     }
 }
@@ -996,6 +996,12 @@ pub fn copy_range_rows(
 /// here; a shift-click keeps the anchor and moves the far end — the gesture
 /// every list in every desktop app already answers. A shift-click in the OTHER
 /// surface starts fresh rather than drawing a range across both.
+///
+/// A PENDING ROW IS NOT AN END. A message still in flight carries a negative
+/// seq (`chat::client` numbers pending rows down from -1), and a range with one
+/// at either end covers no rows at all: the bar — which holds the only Clear
+/// button — would vanish while the ⌘C route, armed on the anchor, stayed armed
+/// with nothing to disarm it. So a press on one clears the range instead.
 pub fn copy_range_after_press(
     anchor: i64,
     surface: crate::CopySurface,
@@ -1003,6 +1009,14 @@ pub fn copy_range_after_press(
     pressed_in: crate::CopySurface,
     extending: bool,
 ) -> CopyRange {
+    let settled = seq > 0;
+    if !settled {
+        return CopyRange {
+            anchor: 0,
+            head: 0,
+            surface: crate::CopySurface::Nowhere,
+        };
+    }
     let anchored = extending && anchor > 0 && surface == pressed_in;
     CopyRange {
         anchor: if anchored { anchor } else { seq },

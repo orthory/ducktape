@@ -718,23 +718,19 @@ component MessageCard(message:ChatMessage, selected:bool, menu_open:bool, in_ran
         r=9.0
         open=menu_open
       stack w=fill
-        // ONE PLATE, ONE TINT. This was three `if` arms over the same box, and
-        // they differed in a single colour — so a third reading (the copy
-        // range) would have been a fourth copy of the same eighteen lines.
-        // The tint is the decision, and it is named once:
+        // ONE PLATE, ONE MATCH. This was three `if` arms over the same box
+        // differing in a single colour, so a third reading (the copy range)
+        // would have been a fourth copy of them. The plate is the decision,
+        // `message_plate` makes it once, and the colours stay in `theme.ice`,
+        // which is the only place that holds a palette.
         //
         // Selection is a tint, not a ring — see the QA note in the stream.
         // `selected_row` is the one plate that means "the row you are on": a
         // menu-open or deep-linked message is that row, exactly as a chosen
         // channel or an open file is. It read `brand_bg` until the reaction
         // chip moved onto the same token and vanished on it. A row in the copy
-        // range wears the lighter `range_row` — it is a run, and a run painted
+        // range wears the lighter `brand_wash` — it is a run, and a run painted
         // in the "you are here" plate would say the reader is on all of them.
-        // ONE PLATE, ONE MATCH. This was three `if` arms over the same box
-        // differing in a single colour, so a third reading (the copy range)
-        // would have been a fourth copy of them. The plate is the decision and
-        // `message_plate` makes it once; the colours stay in `theme.ice`,
-        // which is the only place that holds a palette.
         //
         // THE PRESS THAT PICKS A COPY RANGE sits on the prose and nothing
         // else. Wrapping the whole row would put it under the ♡ and the ⋯, and
@@ -947,9 +943,8 @@ component ThreadMessageCard(message:ChatMessage, selected:bool, menu_open:bool, 
         r=9.0
         open=menu_open
       stack w=fill
-        // One plate, one tint, decided in `message_plate` — the same answer
-        // the stream's card asks for, so a reply reads exactly like a message.
-        // Same plate, same match — a reply reads exactly like a message.
+        // Same plate, same match — `message_plate` gives the same answer the
+        // stream's card asks for, so a reply reads exactly like a message.
         match message_plate(message.deleted, selected, in_range)
           RowPlate.plain
             box
