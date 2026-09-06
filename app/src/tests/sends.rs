@@ -30,6 +30,11 @@ use super::*;
 /// fires only when a modifier moves) arms the press route, so the route does
 /// not exist while anyone is typing. Dropping `when cmd_held` is the regression
 /// — the app would still quit on ⌘Q, and every keystroke would pay for it.
+///
+/// THE FIFTH IS THE CHAT'S ⌘C, armed by its own copy range. It is a separate
+/// route and not an arm on the chord dispatch for exactly the reason above: the
+/// chord's route is armed by ⌘ alone and therefore exists on every screen,
+/// while this one exists only once the reader has actually selected something.
 #[test]
 fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
     let lifecycle = inlined(include_str!("../ui/handlers/lifecycle.ice"));
@@ -48,12 +53,17 @@ fn no_keyboard_subscription_charges_a_captured_key_to_a_bare_composer() {
              fs_delete_target, forge_repo_menu)) -> global_key_pressed _",
             "keyboard press status=ignored -> content_scroll_key _",
             "keyboard press status=ignored when cmd_held -> command_chord_pressed _",
+            "keyboard press status=ignored when copy_anchor_seq > 0 -> copy_chord_pressed _",
         ],
         "a `keyboard press` without `status=` bills every captured key a whole \
          extra view rebuild; the captured half is Escape-only (ducktape-ui#602) \
-         and stays gated on an open layer; and the command chords' route keeps its \
+         and stays gated on an open layer; the command chords' route keeps its \
          `when cmd_held` arming, without which it becomes a fourth STANDING \
-         subscription and every keystroke pays for ⌘Q and ⌘W"
+         subscription and every keystroke pays for ⌘Q and ⌘W; and the chat's \
+         ⌘C route keeps `when copy_anchor_seq > 0`, which is why it is not an \
+         arm on the chord dispatch — a reader with nothing selected has no \
+         copy route at all, while the chord's own route, armed by ⌘ alone, \
+         runs on every screen"
     );
 }
 

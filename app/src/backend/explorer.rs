@@ -202,6 +202,13 @@ pub fn command_held(modifiers: iced::keyboard::Modifiers) -> bool {
     modifiers.command()
 }
 
+/// Is ⇧ down right now? A press carries no modifiers of its own, so the chat's
+/// shift-click reads the arming this fills instead of the app growing a second
+/// key route to learn the same fact.
+pub fn shift_held(modifiers: iced::keyboard::Modifiers) -> bool {
+    modifiers.shift()
+}
+
 /// Which command chord this press is (⌘Q / ⌘W, Ctrl off a Mac), or none. The
 /// ONE answer, so the chords live in a single place rather than re-spelled at
 /// each use site — macOS binds both through an app menu this app does not have,
@@ -465,4 +472,22 @@ pub fn canonical_endpoint(input: String) -> String {
     rpc_client(configured)
         .map(|rpc| rpc.origin().to_string())
         .unwrap_or_else(|_| configured.to_string())
+}
+
+/// Is this press ⌘C? Its own question, not an arm on [`command_chord`]: the
+/// route that asks it exists ONLY while a copy range is open, so ⌘C costs
+/// nothing on a screen with no selection, and the quit/close chord — which is
+/// armed by ⌘ alone, on every screen — keeps a vocabulary of two.
+///
+/// It reaches that route only when no widget captured the press (the
+/// subscription is `status=ignored`), so a caret in a composer or a field with
+/// its own selection keeps its own copy, exactly as it should.
+pub fn is_copy_chord(
+    logical: iced::keyboard::Key,
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+) -> bool {
+    use iced::keyboard::key::{Code, Physical};
+    modifiers.command()
+        && (physical == Physical::Code(Code::KeyC) || types_letter(&logical, "c"))
 }

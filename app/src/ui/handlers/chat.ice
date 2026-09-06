@@ -1269,3 +1269,55 @@ on thread_reply_send_failed(cause)
 on thread_reply_sent(next)
   return if active_channel != next.channel_id
   error = ""
+
+// ============================================================================
+// THE COPY RANGE. Copying what someone said meant retyping it: the message
+// menu offers `Copy message link` and there is no way to lift the TEXT of even
+// one message, let alone a run of them.
+//
+// The unit is the message, not the character. iced has no selection that
+// crosses widgets, and this timeline's hover is draw-time on purpose (see
+// `MessageCard`) — a drag that followed the cursor from row to row would need
+// an enter route and a full rebuild per row crossed, which is the per-hover
+// round trip `DiffRow` refuses by name. So the gesture is the one every
+// desktop list already answers: click an end, shift-click the other.
+// ============================================================================
+
+// A press on a message's prose, in either surface. Plain, it starts a
+// one-message range here; with ⇧ held it keeps the anchor and moves the far
+// end. `shift_held` comes off the modifier stream because a press carries no
+// modifiers of its own, and the surface rides along so a shift-click in the
+// rail cannot draw a range that spans both lists.
+on press_message(seq, surface)
+  let range = copy_range_after_press(copy_anchor_seq, copy_surface, seq, surface, shift_held)
+  copy_anchor_seq = range.anchor
+  copy_head_seq = range.head
+  copy_surface = range.surface
+
+on clear_copy_range
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
+
+// Both ways in land here — the bar's button and ⌘C on the chord dispatch — so
+// the clipboard is written in exactly one place. The surface picks the list,
+// which is what makes the chord lift the rows the bar was counting.
+// TWO DOORS, ONE ACT. An app handler cannot call another one and a keyboard
+// subscription cannot hand its event to a no-argument handler, so the bar's
+// button and ⌘C each spell the same four lines. That is thinner than it looks:
+// every decision — which list, whether there is a range, what the toast says,
+// what text comes out — is in the externs, and these bodies only apply them.
+on copy_chord_pressed(event)
+  return if !is_copy_chord(event.key, event.physical_key, event.modifiers)
+  let rows = copy_range_rows(messages, thread_messages, copy_surface)
+  return if copy_range_count(rows, copy_anchor_seq, copy_head_seq) == 0
+  toast = copy_range_toast(rows, copy_anchor_seq, copy_head_seq)
+  toast_age = 0
+  task clipboard write copy_range_text(rows, copy_anchor_seq, copy_head_seq)
+
+on copy_selected_messages
+  let rows = copy_range_rows(messages, thread_messages, copy_surface)
+  return if copy_range_count(rows, copy_anchor_seq, copy_head_seq) == 0
+  toast = copy_range_toast(rows, copy_anchor_seq, copy_head_seq)
+  toast_age = 0
+  task clipboard write copy_range_text(rows, copy_anchor_seq, copy_head_seq)

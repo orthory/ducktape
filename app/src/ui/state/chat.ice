@@ -17,6 +17,14 @@ state
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // THE COPY RANGE'S TWO ENDS, as seqs. `copy_anchor_seq` is where the reader
+  // clicked and `copy_head_seq` is where they shift-clicked, in either
+  // direction; 0 is no range. Seqs and not indices because history prepends —
+  // an index names a different message the moment an older page merges in.
+  // `copy_surface` says which list they address; see `CopySurface`.
+  copy_anchor_seq:i64 = 0
+  copy_head_seq:i64 = 0
+  copy_surface:CopySurface = CopySurface.nowhere
   selected_message_seq:i64 = 0
   selected_message_rev:i64 = 0
   message_action:MessageAction = MessageAction.toolbar

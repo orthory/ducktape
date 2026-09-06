@@ -1215,6 +1215,9 @@ test message_stream_reset_contract
         thread_has_more
         thread_next_reply_seq
         thread_loading
+        copy_anchor_seq
+        copy_head_seq
+        copy_surface
       events
         search_chat_submit -> search_chat_submit
         clear_chat_search -> clear_chat_search
@@ -1241,6 +1244,9 @@ test message_stream_reset_contract
         begin_message_edit -> begin_message_edit _ _ _
         arm_message_delete -> arm_message_delete _ _ _
         clear_message_selection -> clear_message_selection
+        press_message -> press_message _ _
+        clear_copy_range -> clear_copy_range
+        copy_selected_messages -> copy_selected_messages
         add_reaction_submit -> add_reaction_submit _
         edit_message_submit -> edit_message_submit
         delete_message_submit -> delete_message_submit
@@ -1352,6 +1358,9 @@ test message_body_renders_as_one_rich_paragraph
         thread_has_more
         thread_next_reply_seq
         thread_loading
+        copy_anchor_seq
+        copy_head_seq
+        copy_surface
       events
         search_chat_submit -> search_chat_submit
         clear_chat_search -> clear_chat_search
@@ -1378,6 +1387,9 @@ test message_body_renders_as_one_rich_paragraph
         begin_message_edit -> begin_message_edit _ _ _
         arm_message_delete -> arm_message_delete _ _ _
         clear_message_selection -> clear_message_selection
+        press_message -> press_message _ _
+        clear_copy_range -> clear_copy_range
+        copy_selected_messages -> copy_selected_messages
         add_reaction_submit -> add_reaction_submit _
         edit_message_submit -> edit_message_submit
         delete_message_submit -> delete_message_submit
@@ -1673,4 +1685,5 @@ test the_quit_chord_route_is_armed_only_while_command_is_held
   expect cmd_held
   modifiers
   expect !cmd_held
+
 
