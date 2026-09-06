@@ -466,6 +466,8 @@ pub trait Module {
     /// Initialize a newly installed module from caller-supplied parameters.
     /// The same hook runs for initial membership and later admission; reopen
     /// and code replacement preserve state and do not initialize it again.
+    /// Initialization must be idempotent: a refused admission boundary or an
+    /// interrupted genesis composition can retry against its prepared store.
     async fn initialize(&mut self, _params: &[u8]) -> Result<(), Error> {
         Ok(())
     }

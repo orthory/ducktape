@@ -41,10 +41,8 @@ impl ModuleTopology {
         selection.to_vec()
     }
 
-    /// the ids of `selection` whose crate declares an index guest, in
-    /// selection order — what a founding set MUST carry an `<id>.index.wasm`
-    /// for (`workspace_config::genesis::Genesis::compose` refuses a set that
-    /// omits one, or that carries one for an id not in this list).
+    /// Mapper ids in a build preset. Arbitrary founding directories discover
+    /// their own mappers independently of this catalog.
     pub fn index_guest_ids(&self, selection: &[&'static str]) -> Vec<&'static str> {
         selection
             .iter()

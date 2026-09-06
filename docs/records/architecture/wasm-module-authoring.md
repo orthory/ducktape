@@ -74,7 +74,9 @@ Implement the five exports:
 - `initialize(params) -> result<_, error>` — initialize a fresh module with
   network parameters. The host calls this after seeding declared configuration,
   both for genesis entries and for live admissions. Reopen and code replacement
-  retain state and do not initialize again. At genesis, parameters include the
+  retain state and do not initialize again. Initialization must be idempotent
+  because admission preparation or interrupted composition can retry against
+  the same store. At genesis, parameters include the
   `modules` deployment map and `validators` keys; other modules may ignore them.
 - `finalize-block() -> result<_, error>` — finish the block over its accumulated
   staged writes. The SDK's store wrapper flushes individual operations without
