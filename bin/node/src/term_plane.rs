@@ -364,7 +364,7 @@ async fn receive_chunks<S: AsyncRead + Unpin>(
             continue;
         }
         match event {
-            TermFeedEvent::Chunk(chunk) => ring.append_remote(chunk),
+            TermFeedEvent::Chunk(chunk) => ring.append_remote(chunk, peer.0),
             // the host says the pty is over. Flag it LOCAL-ONLY: this node is
             // mirroring someone else's session, so re-publishing would fan the
             // grain back out. Flagging it is what lets this node's `term:<id>`
@@ -407,7 +407,7 @@ async fn receive_commands<S: AsyncRead + Unpin>(
         }
         // the ring validates the seq against its own cursor — a peer's number is
         // checked, never assigned.
-        ring.append_remote(event);
+        ring.append_remote(event, peer.0);
     }
     Ok(())
 }
@@ -588,7 +588,7 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
             });
             create_watching_the_caller(&mut reader, &control, creating).await
         }
-        SessionControlRequest::Close { session } => serve_close(&control, &session).await,
+        SessionControlRequest::Close { session } => serve_close(&control, peer, &session).await,
     };
     if let Err(error) = write_frame(&mut writer, &reply).await {
         // the same orphan, found the other way: the reply never landed, so the
@@ -839,14 +839,39 @@ async fn serve_create(
     }
 }
 
-/// close on the host: idempotent teardown. The host owns lifecycle; a close from
-/// a non-creator names a random id it would have to already know, and the
-/// wall-clock + kill-on-drop backstops hold — creator-binding close is a named
-/// follow-up.
-async fn serve_close(control: &ControlState, session: &str) -> SessionControlReply {
-    if let Some(sessions) = &control.sessions {
-        sessions.close(session).await;
+/// latch for close refusals — the same per-100 discipline as [`INPUT_WARN`]: a
+/// peer that keeps retrying a refused close can retry as fast as it opens
+/// CONTROL streams.
+static CLOSE_WARN: noded::log::Latch = noded::log::Latch::new(100);
+
+/// close on the host: idempotent teardown, but ONLY for the peer that created
+/// the session. Every forwarded session's chunks fan out to every mesh member
+/// (see [`feed_refusal`]'s doc), so a session id is never secret — the creator
+/// binding, not the id, is what makes a close legitimate. `None` (a local
+/// session, or an unknown id) is refused too: a mesh peer never owns either.
+/// The host's own local principal still closes its own sessions through the
+/// separate loopback HTTP path (`noded::term::close_session`), which never
+/// goes through this CONTROL codec at all.
+async fn serve_close(control: &ControlState, peer: PeerId, session: &str) -> SessionControlReply {
+    let Some(sessions) = &control.sessions else {
+        return SessionControlReply::Closed;
+    };
+    if !input_permitted(sessions.creator_node(session), peer) {
+        if let Some(occurrences) = CLOSE_WARN.hit("close_not_creator") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "close_not_creator",
+                node = %crate::config::hex_bytes(&peer.0[..4]),
+                occurrences,
+                "peer session close refused"
+            );
+        }
+        return refused(
+            "close_not_creator",
+            "only the node that created this session may close it",
+        );
     }
+    sessions.close(session).await;
     SessionControlReply::Closed
 }
 
@@ -1927,6 +1952,93 @@ mod tests {
         assert!(!input_permitted(Some([7u8; 32]), PeerId([9u8; 32])));
         // not an attached session (local, or unknown id) → refused.
         assert!(!input_permitted(None, PeerId([7u8; 32])));
+    }
+
+    /// **The close twin of the input gate (#1743).** A peer-attached session's
+    /// id is never secret — every forwarded chunk fans out to every mesh
+    /// member — so only the creator binding stands between "any admitted peer"
+    /// and "kills any session on any host". A non-creator peer's close is
+    /// refused and the session stays live; the creator's close still works.
+    #[tokio::test]
+    async fn close_is_accepted_only_from_the_creator_node() {
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
+        let (_guard, mut daemon) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
+        let fake_daemon = terminals.clone();
+        tokio::spawn(async move {
+            while let Some(command) = daemon.recv().await {
+                if let wire::Command::TermCreate(create) = command {
+                    fake_daemon.on_event(wire::Event::TermCreated {
+                        session: create.session,
+                    });
+                }
+            }
+        });
+
+        let creator = PeerId([7u8; 32]);
+        let created = terminals
+            .create_for_peer(
+                "claude",
+                PeerAttach {
+                    creator_node: creator.0,
+                    credential: agent_service::wire::Credential {
+                        name: "c".into(),
+                        kind: agent_service::wire::CredentialKind::Claude,
+                        authority: String::new(),
+                        via: String::new(),
+                        seal_pk: [0u8; 32],
+                    },
+                    limits: Default::default(),
+                },
+            )
+            .await
+            .expect("the fake daemon answers every create");
+        let control = test_control([1u8; 32], Some(terminals.clone()));
+
+        // an attacker peer names the id it read off the mesh fanout — refused,
+        // and the session it named is still alive.
+        let (server, mut caller) = tokio::io::duplex(4096);
+        let attacker_control = Arc::clone(&control);
+        let attacker_session = created.session_id.clone();
+        tokio::spawn(async move {
+            let _ = serve_control(server, PeerId([9u8; 32]), attacker_control).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Close {
+                session: attacker_session,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        assert_eq!(
+            reply,
+            SessionControlReply::Refused {
+                reason: "close_not_creator".into(),
+                detail: "only the node that created this session may close it".into(),
+            }
+        );
+        assert!(terminals.mode(&created.session_id).is_some(), "not closed");
+
+        // the actual creator closes it fine.
+        let (server, mut caller) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let _ = serve_control(server, creator, control).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Close {
+                session: created.session_id,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        assert_eq!(reply, SessionControlReply::Closed);
     }
 
     /// **The work-admission call site, behaviourally.**
