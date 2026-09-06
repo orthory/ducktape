@@ -159,6 +159,22 @@ pub fn validate_module_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// a chain id has the shape `mint_chain_id` produces: `<name>#<8 lowercase
+/// hex>`. Checked on a chain id that reaches the program from outside it
+/// (an invite's descriptor) — a shape `node init` never mints (no `#`, more
+/// than one, or a non-hex/non-lowercase/wrong-length suffix) is refused
+/// rather than trusted to sit next to a normally-minted id in the registry.
+pub fn validate_chain_id_shape(id: &str) -> Result<(), String> {
+    let malformed = || format!("chain id {id:?} is not <name>#<8 hex> — refusing to join it");
+    let (name, salt) = id.split_once('#').ok_or_else(malformed)?;
+    let is_hex_salt = salt.len() == 8 && salt.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_lowercase = salt.chars().all(|c| !c.is_ascii_uppercase());
+    if name.is_empty() || !is_hex_salt || !is_lowercase {
+        return Err(malformed());
+    }
+    Ok(())
+}
+
 /// a beat of zero is not a cadence: every consensus timer is a multiple of it,
 /// so the whole simplex clock collapses to a hot spin. checked at every
 /// boundary a descriptor enters through, exactly like [`validate_module_id`].
@@ -1338,6 +1354,31 @@ mod tests {
             NetworkDescriptor::load(&path).unwrap().chain_id,
             original.chain_id
         );
+    }
+
+    #[test]
+    fn chain_id_shape_matches_what_mint_chain_id_produces() {
+        let minted = identity::mint_chain_id(
+            "dognet",
+            &commonware_cryptography::ed25519::PrivateKey::from_seed(1).public_key(),
+        );
+        assert!(validate_chain_id_shape(&minted).is_ok(), "{minted}");
+
+        for bad in [
+            "dognet",           // no salt at all
+            "dognet#",          // empty salt
+            "dognet#abcd123",   // 7 hex chars, not 8
+            "dognet#abcd12345", // 9 hex chars
+            "dognet#ABCD1234",  // uppercase
+            "dognet#zzzzzzzz",  // not hex
+            "#abcd1234",        // empty name
+            "dog#net#abcd1234", // more than one '#' (splits on the first)
+        ] {
+            assert!(
+                validate_chain_id_shape(bad).is_err(),
+                "{bad:?} should not pass as a minted chain id"
+            );
+        }
     }
 
     #[test]
