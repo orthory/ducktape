@@ -67,6 +67,19 @@ impl RunsModule {
                 });
                 Ok(())
             }
+            AgentEvent::Deregistered { agent_id } => {
+                // retire the recipe with the agent: dispatch's own
+                // `RemoveRecipe` already lets an in-flight dispatch finish
+                // against the manifest it captured, so no run-liveness check
+                // belongs here — that seam is deterministic on its own.
+                ctx.emit_msg(Msg {
+                    target: self.dispatch.clone(),
+                    payload: dispatch_encode_msg(&DispatchMsg::RemoveRecipe {
+                        recipe_id: recipe_id_for(&agent_id),
+                    }),
+                });
+                Ok(())
+            }
         }
     }
 }

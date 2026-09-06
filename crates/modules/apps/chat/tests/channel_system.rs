@@ -1599,7 +1599,7 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
 }
 
 #[test]
-fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
+fn sweep_huddle_self_is_a_leave_and_is_idempotent() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
         module
@@ -1618,10 +1618,10 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
             .unwrap();
         module.commit_block().await.unwrap();
 
-        // member B sweeps A's stale entry — A crashed and could not leave.
+        // A names itself — a sweep of yourself is a leave, always allowed.
         module
             .execute(
-                &mut ctx_with_origin(30, user(2)),
+                &mut ctx_with_origin(30, user(1)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
                     user: vec![1u8; 32],
@@ -1640,13 +1640,13 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
         else {
             panic!("channel must exist");
         };
-        assert_eq!(channel.huddle.len(), 0, "sweep evicts the stale member");
+        assert_eq!(channel.huddle.len(), 0, "self-sweep evicts the caller");
 
         // sweeping an absent user is a deterministic no-op.
         let settled = module.root();
         module
             .execute(
-                &mut ctx_with_origin(31, user(2)),
+                &mut ctx_with_origin(31, user(1)),
                 &module_msg(ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
                     user: vec![1u8; 32],
@@ -1660,45 +1660,103 @@ fn sweep_huddle_evicts_a_stale_member_and_is_idempotent() {
 }
 
 #[test]
-fn sweep_huddle_gates_on_members_only_policy_like_posting() {
+fn sweep_huddle_of_another_user_by_a_non_admin_is_refused() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
+        // system-minted, so unowned: no user administers it.
         module
-            .execute(
-                &mut ctx_at(10),
-                &module_msg(ChatMsg::CreateChannel {
-                    channel_id: "core".into(),
-                    name: "CORE".into(),
-                    post_policy: PostPolicy::MembersOnly,
-                }),
-            )
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
             .await
             .unwrap();
         module
             .execute(
-                &mut ctx_at(10),
-                &module_msg(ChatMsg::SetMembership {
-                    channel_id: "core".into(),
-                    user: vec![1u8; 32],
-                    member: true,
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(ChatMsg::JoinHuddle {
+                    channel_id: "general".into(),
+                    node: vec![0xa1; 32],
                 }),
             )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
 
-        // a non-member's sweep is turned away exactly like a non-member post.
+        // any poster on the channel naming a DIFFERENT, still-live user is
+        // refused — this is the eviction #1625 closes.
         let err = module
             .execute(
-                &mut ctx_with_origin(20, user(2)),
+                &mut ctx_with_origin(30, user(2)),
                 &module_msg(ChatMsg::SweepHuddle {
-                    channel_id: "core".into(),
+                    channel_id: "general".into(),
                     user: vec![1u8; 32],
                 }),
             )
             .await
             .unwrap_err();
-        assert!(format!("{err:?}").contains("members-only"));
+        assert!(format!("{err:?}").contains("channel admin"), "{err:?}");
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(channel.huddle.len(), 1, "the refused sweep changes nothing");
+    });
+}
+
+#[test]
+fn sweep_huddle_of_another_user_by_the_channel_admin_succeeds() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        // user(9) creates it, so user(9) is the owner (channel admin).
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(9)),
+                &module_msg(create_channel("general")),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(ChatMsg::JoinHuddle {
+                    channel_id: "general".into(),
+                    node: vec![0xa1; 32],
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        module
+            .execute(
+                &mut ctx_with_origin(30, user(9)),
+                &module_msg(ChatMsg::SweepHuddle {
+                    channel_id: "general".into(),
+                    user: vec![1u8; 32],
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("channel must exist");
+        };
+        assert_eq!(
+            channel.huddle.len(),
+            0,
+            "the admin's sweep evicts the member"
+        );
     });
 }
 

@@ -120,6 +120,37 @@ impl RunsModule {
         }
     }
 
+    // ---- explicit-request admission ---------------------------------------
+
+    /// chat's answer to "may `user` post to `channel_id`" — the standing an
+    /// explicit `RequestRun` submitter must hold before this module pins that
+    /// channel's transcript and posts a reply into it under module authority.
+    /// post standing covers read (chat's [`ChatReply::may_post`] implies
+    /// `may_read`), so this one query is the whole gate. an unexpected or
+    /// failed reply answers `false` — the submission fails closed rather than
+    /// leaking a channel it could not confirm.
+    pub(super) async fn may_post(
+        &self,
+        ctx: &dyn Ctx,
+        user: &[u8],
+        channel_id: &str,
+    ) -> Result<bool, String> {
+        let reply = ctx
+            .query(
+                &self.chat,
+                &chat_encode_query(&ChatQuery::Access {
+                    channel_id: channel_id.to_string(),
+                    user: user.to_vec(),
+                }),
+            )
+            .await
+            .map_err(|e| format!("chat access query failed: {e}"))?;
+        match chat_decode_reply(&reply) {
+            Ok(ChatReply::Access(access)) => Ok(access.may_post),
+            _ => Err("unexpected chat reply for an access query".into()),
+        }
+    }
+
     // ---- context pinning (P4) --------------------------------------------------
 
     /// pin the transcript window ending at `anchor_seq`: query chat for the
@@ -327,14 +358,8 @@ impl RunsModule {
                 None => extra.to_string(),
             });
         }
-        let payload = envelope::render_payload(
-            &self.id,
-            agent,
-            run_id,
-            &transcript,
-            portable,
-        )
-        .into_bytes();
+        let payload =
+            envelope::render_payload(&self.id, agent, run_id, &transcript, portable).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
             return Err(format!(
                 "composed payload is {} bytes; the dispatch cap is {MAX_PAYLOAD_BYTES}",

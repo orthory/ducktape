@@ -10,11 +10,12 @@
 //! the registry itself is self-contained (no sibling queries), so this proof
 //! pins its two FOLLOW-UP lanes across the seam:
 //!
-//! * the REGISTRY HOOK: a registration (and a capability change — and ONLY a
-//!   capability change) emits an [`AgentEvent`] msg to the production hook id
-//!   ("runs" — `bin/node/src/host_state.rs`). both hosts carry a runs-shaped
-//!   recorder under that id whose root folds every hook payload it receives,
-//!   so a missing, spurious, or diverging hook diverges the recorder roots.
+//! * the REGISTRY HOOK: a registration, a capability change, or a
+//!   deregistration (and ONLY those) emits an [`AgentEvent`] msg to the
+//!   production hook id ("runs" — `bin/node/src/host_state.rs`). both hosts
+//!   carry a runs-shaped recorder under that id whose root folds every hook
+//!   payload it receives, so a missing, spurious, or diverging hook diverges
+//!   the recorder roots.
 //! * the SAGA DEAD-LETTER arm: any trigger's `reply_to` may point a saga
 //!   callback at this module, and it must be swallowed (an emitted breadcrumb
 //!   event, never an error) — both hosts carry the REAL native saga and drive
@@ -464,6 +465,22 @@ async fn same_ops_inner(context: &deterministic::Context) {
         }),
         true,
         false,
+    )
+    .await;
+
+    // ---- deregistration frees the roster slot and retires the recipe: the
+    // hook fires (Deregistered) on BOTH runtimes.
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        8,
+        Origin::Module("jobs".into()),
+        agent_op(&AgentMsg::DeregisterAgent {
+            agent_id: "curator".into(),
+        }),
+        true,
+        true,
     )
     .await;
 

@@ -161,11 +161,13 @@ pub enum PageMsg {
         parent: Option<String>,
         after: Option<String>,
     },
-    /// remove a block AND its whole subtree. Removing a `Page` also removes
-    /// every nested page from the enumeration index, and purges the comment
-    /// threads anchored to every block that goes — an implicit mutation on the
-    /// block op's own authority, which like every block op here is any origin
-    /// (see `purge_comments_for_target`).
+    /// remove a block AND its whole subtree. Author-gated like every other
+    /// block op (the page's recorded author, or the containing page's author
+    /// too when the removed block is a nested subpage parented under a
+    /// different page). Removing a `Page` also removes every nested page from
+    /// the enumeration index, and purges the comment threads anchored to
+    /// every block that goes — an implicit mutation that rides the already-
+    /// checked authority of THIS op (see `purge_comments_for_target`).
     RemoveBlock { block_id: String },
 
     // ── comments ──

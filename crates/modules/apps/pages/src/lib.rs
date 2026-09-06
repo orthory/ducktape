@@ -89,6 +89,22 @@ mod text_ranges;
 
 use error::{PageError, to_page_err};
 
+/// derive an author from the dispatch origin — shared by the comment ops and
+/// the page/block ops (mirrors chat). the pre-consensus default
+/// `Origin::External(vec![])` must never pass as a real user.
+pub(crate) fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
+    match origin {
+        Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
+        Origin::External(bytes) if bytes.len() > MAX_COMMENT_AUTHOR_BYTES => {
+            Err(PageError::AuthorTooLarge)
+        }
+        Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
+        Origin::Module(id) if id.len() > MAX_COMMENT_AUTHOR_BYTES => Err(PageError::AuthorTooLarge),
+        Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
+        Origin::System => Ok(AuthorRef::System),
+    }
+}
+
 /// write-time cap on ONE serialized block record (and on the enumeration
 /// index value — both stage through the same guard). the concrete store's
 /// codec bounds a stored value at 1 MiB AT DECODE TIME only (see

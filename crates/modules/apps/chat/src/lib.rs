@@ -998,8 +998,22 @@ impl Chat {
         )
     }
 
+    /// whether `actor` may evict `target` from `channel`'s huddle: the
+    /// channel's admin always may (`check_channel_admin` — the owner, or any
+    /// module/agent/system origin). a self-sweep is legitimate too, but it is
+    /// routed to `stage_leave_huddle` before this predicate ever runs, not
+    /// decided here. there is no third arm: `HuddleMember` carries only
+    /// `joined_at`, set once at join and never refreshed on liveness, so the
+    /// module holds no call-presence signal a staleness rule could read —
+    /// only the admin authority remains.
+    fn may_sweep(channel: &Channel, actor: &AuthorRef) -> bool {
+        Self::check_channel_admin(channel, actor).is_ok()
+    }
+
     /// evict `user` from the channel's huddle (staleness cleanup — see
-    /// `ChatMsg::SweepHuddle`). gated like posting; absent target = no-op.
+    /// `ChatMsg::SweepHuddle`). a poster naming themself is a leave in
+    /// disguise; naming anyone else is an admin-only eviction (`may_sweep`).
+    /// absent target = no-op either way.
     async fn stage_sweep_huddle(
         &mut self,
         author: AuthorRef,
@@ -1007,13 +1021,20 @@ impl Chat {
         user: &[u8],
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
-        let AuthorRef::User(_) = &author else {
+        let AuthorRef::User(actor) = &author else {
             return Err(Error::Module(
                 "only external users may sweep a huddle".into(),
             ));
         };
+        if actor.as_slice() == user {
+            return self.stage_leave_huddle(author, channel_id).await;
+        }
         let mut channel = self.require_channel(channel_id).await?;
-        self.check_post_policy(&channel, &author).await?;
+        if !Self::may_sweep(&channel, &author) {
+            return Err(Error::Module(format!(
+                "only the channel admin may sweep another user's huddle entry in {channel_id}"
+            )));
+        }
         let before = channel.huddle.len();
         channel.huddle.retain(|m| m.user != user);
         if channel.huddle.len() == before {
