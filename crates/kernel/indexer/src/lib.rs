@@ -59,7 +59,9 @@
 //!
 //! failure policy: a host-write error POISONS the store (writes refuse, reads
 //! keep serving) rather than skipping a block — a silent gap would break the
-//! watermark's contiguity promise. a guest-fold error never poisons: the
+//! watermark's contiguity promise. A failed mapper replacement also poisons
+//! writes and refuses reads of that module until it is reconverged; readers
+//! must not see a partially replaced deployment. A guest-fold error never poisons: the
 //! engine retains the events and retries, and the backlog is observable.
 //!
 //! when canonical state advances WITHOUT the op stream — state-sync installs
@@ -73,12 +75,12 @@
 //! the source's own op rows below it ([`IndexStore::write_backfill_rows`] +
 //! [`IndexStore::set_backfill_floor`], the joiner's inline join-seam walk).
 //!
-//! a MAPPER change is the other way derived rows go stale, and it needs no
-//! boundary: the op feed is still there. [`converge_guest`] clears the derived
+//! A mapper changes at its module's deployment activation. The op feed stays
+//! available: [`converge_guest`] clears the derived
 //! keyspace and re-drives the fold over the rows the database already holds,
 //! leaving `op/` and `meta/` alone — a new mapper changes what the rows MEAN,
-//! never what the feed saw. that re-drive completes before [`IndexStore::open`]
-//! returns, so no reader ever sees the cleared keyspace.
+//! never what the feed saw. Readers wait for replacement and refold to finish
+//! under the deployment guard, at boot and at live activation.
 //!
 //! the full contract a per-module index guest must satisfy (fold rules, view
 //! rules, when NOT to index) is `docs/records/specs/indexable-spec.md`; the
@@ -276,17 +278,17 @@ pub struct FoldStatus {
     pub last_error: Option<String>,
 }
 
+enum DeploymentState {
+    Ready { code_hash: Option<Vec<u8>> },
+    Failed,
+}
+
 /// one module's open database plus its guest's declared roles.
 ///
 /// the roles are what the LAST converge established — read back from the
 /// marker at open, so a database keeps serving the guest it holds until
 /// [`IndexStore::converge`] decides otherwise — and updated in place by that
 /// converge, which is why they are atomics on a shared handle.
-enum DeploymentState {
-    Ready,
-    Failed,
-}
-
 struct ModuleIndex {
     db: Arc<Db>,
     /// Readers wait until mapper replacement and its refold finish together.
@@ -304,7 +306,7 @@ impl ModuleIndex {
             .read()
             .unwrap_or_else(PoisonError::into_inner);
         match *guard {
-            DeploymentState::Ready => Ok(guard),
+            DeploymentState::Ready { .. } => Ok(guard),
             DeploymentState::Failed => Err(Error::Poisoned),
         }
     }
@@ -440,7 +442,7 @@ impl IndexStore {
         let (has_fold, has_view) = installed_roles(&db)?;
         let module = ModuleIndex {
             db,
-            deployment: RwLock::new(DeploymentState::Ready),
+            deployment: RwLock::new(DeploymentState::Ready { code_hash: None }),
             has_fold: AtomicBool::new(has_fold),
             has_view: AtomicBool::new(has_view),
         };
@@ -464,19 +466,54 @@ impl IndexStore {
     /// database already holding these bytes (the marker says so).
     pub fn converge(&self, modules: &[IndexModule]) -> Result<()> {
         for spec in modules {
-            let m = self.module(spec.id)?;
-            let mut deployment = m.deployment.write().unwrap_or_else(PoisonError::into_inner);
-            let (has_fold, has_view) = match converge_guest(&m.db, spec) {
-                Ok(roles) => roles,
-                Err(error) => {
-                    *deployment = DeploymentState::Failed;
-                    self.poisoned.store(true, Ordering::Release);
-                    return Err(error);
-                }
-            };
-            m.set_roles(has_fold, has_view);
-            *deployment = DeploymentState::Ready;
+            let module = self.module(spec.id)?;
+            self.converge_module(&module, spec, None)?;
         }
+        Ok(())
+    }
+
+    /// Converge a deployment whose identity the caller has authenticated.
+    /// That hash commits both component and mapper. An unchanged identity
+    /// needs only a shared guard: no Wasm hashing, database read, or wait for
+    /// an active view on the ordinary per-block path.
+    pub fn converge_deployment(&self, spec: &IndexModule, code_hash: &[u8]) -> Result<()> {
+        let module = self.module(spec.id)?;
+        {
+            let deployment = module
+                .deployment
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            let unchanged = matches!(&*deployment,
+                DeploymentState::Ready { code_hash: Some(current) } if current == code_hash);
+            if unchanged {
+                return Ok(());
+            }
+        }
+        self.converge_module(&module, spec, Some(code_hash))
+    }
+
+    fn converge_module(
+        &self,
+        module: &ModuleIndex,
+        spec: &IndexModule,
+        code_hash: Option<&[u8]>,
+    ) -> Result<()> {
+        let mut deployment = module
+            .deployment
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (has_fold, has_view) = match converge_guest(&module.db, spec) {
+            Ok(roles) => roles,
+            Err(error) => {
+                *deployment = DeploymentState::Failed;
+                self.poisoned.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
+        module.set_roles(has_fold, has_view);
+        *deployment = DeploymentState::Ready {
+            code_hash: code_hash.map(<[u8]>::to_vec),
+        };
         Ok(())
     }
 

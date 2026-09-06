@@ -234,6 +234,21 @@ impl CapabilityRegistry {
             .ok_or_else(|| Error::Module("missing node record".into()))
     }
 
+    /// An empty roster has no standing to check. This also lets a network
+    /// without valset read its empty provider list while announcements stay gated.
+    async fn standing_nodes(&self, ctx: &dyn Ctx, valset_id: &str) -> Result<Vec<Vec<u8>>, Error> {
+        let nodes = self.node_roster().await?;
+        let empty_roster = nodes.is_empty();
+        if empty_roster {
+            return Ok(nodes);
+        }
+        let standing = valset::members_and_residents(ctx, valset_id).await?;
+        Ok(nodes
+            .into_iter()
+            .filter(|node| standing.contains(node))
+            .collect())
+    }
+
     /// the node roster — every announced node key, sorted. record and roster
     /// are staged (and commit or abort) together, so membership in one is
     /// membership in both.
@@ -480,12 +495,11 @@ impl Module for CapabilityRegistry {
         };
         Ok(match decode_query(req).map_err(Error::Module)? {
             CapabilityQuery::Providers { capability } => {
-                let standing = valset::members_and_residents(ctx, &valset_id).await?;
                 let mut providers = Vec::new();
-                for node in self.node_roster().await? {
-                    if standing.contains(&node)
-                        && self.rostered_entry(&node).await?.tags.contains(&capability)
-                    {
+                for node in self.standing_nodes(ctx, &valset_id).await? {
+                    let has_capability =
+                        self.rostered_entry(&node).await?.tags.contains(&capability);
+                    if has_capability {
                         providers.push(node);
                     }
                 }
@@ -495,12 +509,8 @@ impl Module for CapabilityRegistry {
                 capability,
                 demands,
             } => {
-                let standing = valset::members_and_residents(ctx, &valset_id).await?;
                 let mut providers = Vec::new();
-                for node in self.node_roster().await? {
-                    if !standing.contains(&node) {
-                        continue;
-                    }
+                for node in self.standing_nodes(ctx, &valset_id).await? {
                     let entry = self.rostered_entry(&node).await?;
                     let covers = demands
                         .iter()
@@ -909,6 +919,21 @@ mod tests {
     /// the READ side — nothing removes its stale roster record, but the
     /// query re-checks standing every time (issue #1723). a node that still
     /// holds standing is unaffected.
+    #[test]
+    fn an_empty_roster_answers_without_valset_but_cannot_announce() {
+        let mut registry = CapabilityRegistry::new(
+            "capability",
+            Box::new(MemStore::new()),
+            Some("valset".into()),
+        );
+        let mut ctx = ctx_external(&[7; 32]);
+        assert!(providers_with(&registry, &ctx, "codex").is_empty());
+        assert!(capable_providers_with(&registry, &ctx, "codex", &[]).is_empty());
+        assert!(
+            futures::executor::block_on(registry.execute(&mut ctx, &announce(&["codex"]))).is_err()
+        );
+    }
+
     #[test]
     fn providers_excludes_a_node_that_lost_standing_after_announcing() {
         let mut c = CapabilityRegistry::new(

@@ -155,7 +155,7 @@ const IDENTITY_MODULE_ID: &str = "identity";
 /// lacks before answering, and only a still-missing digest is a `None`.
 #[async_trait::async_trait(?Send)]
 pub trait CodeSource: Send + Sync {
-    /// component bytes for a content hash, or `None` if absent on this node.
+    /// Encoded deployment bytes for a content hash, or `None` if absent.
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
 
     /// a stable snake_case name for WHERE this source looks — logged with a
@@ -180,7 +180,7 @@ impl CodeSource for NoCodeSource {
     }
 }
 
-/// instantiates a freshly-ADMITTED module from its verified component bytes at
+/// instantiates a freshly-ADMITTED module from its verified deployment bytes at
 /// the activation boundary — the constructor twin of [`CodeSource`]. the node
 /// wires its module composer here (the one path every wasm module enters a
 /// host through); the host itself stays wasm-runtime-agnostic. a host without
@@ -189,7 +189,7 @@ impl CodeSource for NoCodeSource {
 /// store-backed admission opens its store, and stores open asynchronously.
 #[async_trait::async_trait(?Send)]
 pub trait ModuleFactory: Send + Sync {
-    /// a module instance for `id` from component bytes already verified
+    /// a module instance for `id` from encoded deployment bytes already verified
     /// against the committed code hash — or [`Admitted::ForeignAbi`] for bytes
     /// that are no module at all.
     async fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Admitted, Error>;
@@ -212,7 +212,7 @@ pub enum Admitted {
     ForeignAbi,
 }
 
-/// sha256 content hash of component bytes — the verify side of a code swap.
+/// sha256 content hash of deployment bytes — the verify side of a code swap.
 fn sha256(bytes: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).to_vec()

@@ -56,9 +56,14 @@ pub fn converge_host_modules(index: &indexer::IndexStore, host: &host::Host) -> 
         .map(|(id, guest)| indexer::IndexModule { id, guest })
         .collect();
     index_host_modules(index, modules.iter().map(|module| module.id))?;
-    index
-        .converge(&modules)
-        .map_err(|error| format!("converge deployed index guests: {error}"))
+    for module in modules {
+        let result = match host.module_code_hash(module.id) {
+            Some(hash) => index.converge_deployment(&module, &hash),
+            None => index.converge(&[module]),
+        };
+        result.map_err(|error| format!("converge deployed index guests: {error}"))?;
+    }
+    Ok(())
 }
 
 /// the index covers every module the host runs: open a database for each id

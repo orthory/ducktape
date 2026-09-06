@@ -1239,3 +1239,20 @@ fn a_view_reads_its_advisory_tip_before_query_under_one_deployment_guard() {
         "the guard spans both reads"
     );
 }
+
+#[test]
+fn an_unchanged_deployment_converges_while_a_view_holds_its_read_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    let spec = IndexModule {
+        id: "chat",
+        guest: Some(TESTMAP),
+    };
+    let code_hash = sha2::Sha256::digest(TESTMAP);
+    store.converge_deployment(&spec, &code_hash).unwrap();
+    let module = store.module("chat").unwrap();
+    let _view = module.read_deployment().unwrap();
+    // A write lock here would wait for this very reader. The unchanged
+    // deployment must complete without taking one or touching mapper bytes.
+    store.converge_deployment(&spec, &code_hash).unwrap();
+}
