@@ -2008,6 +2008,22 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         self.host.root_hash()
     }
 
+    /// the `consensus_time` a block at `height` carries, under this node's
+    /// [`ConsensusTimePolicy`] — the same derivation
+    /// [`OrderedNode::drain_delivered`] stamps into every applied block's
+    /// `Env`. lets a status projection report the exact clock modules compare
+    /// `expires_at` against, whatever the policy (a block height on the
+    /// validator lane, a millisecond epoch on the sim lane).
+    pub fn stamp_consensus_time(&self, height: u64) -> u64 {
+        self.time_policy.stamp(height)
+    }
+
+    /// the [`ConsensusTimePolicy`] this node stamps blocks under — lets a
+    /// status projection report which UNIT `consensus_time` is expressed in.
+    pub fn consensus_time_policy(&self) -> ConsensusTimePolicy {
+        self.time_policy
+    }
+
     /// take the events accumulated by applied blocks since the last call. the
     /// host-owned reactor drains these, offers each to its workers (try-decode
     /// routing — a `WorkerRequest` is claimed, anything else falls through as

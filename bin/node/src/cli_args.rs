@@ -141,9 +141,11 @@ pub enum WorkCmd {
 /// one account, or the literal `anyone`.
 #[derive(Debug, clap::Args)]
 pub struct WorkTargetArgs {
-    /// an account number, a display name, or the literal `anyone`. `anyone`
-    /// admits every network member — and lets a stranger's workload draw on
-    /// every credential this node has been granted.
+    /// an account NUMBER, or the literal `anyone`. `anyone` admits every
+    /// network member — and lets a stranger's workload draw on every
+    /// credential this node has been granted. A display name is refused: it
+    /// is freely rewritable and not unique, so it cannot name who this node
+    /// trusts (look the number up with `ducktape account show`).
     pub target: String,
     #[command(flatten)]
     pub selector: Selector,

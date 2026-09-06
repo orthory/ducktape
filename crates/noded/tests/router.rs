@@ -806,6 +806,8 @@ async fn status_reports_root_hash_height_and_module_roots() {
         version: "9.9.9".into(),
         root_hash: "cd".repeat(32),
         height: 3,
+        consensus_time: 3,
+        consensus_time_unit: noded::ConsensusTimeUnit::Height,
         modules: vec![ModuleStatus {
             id: "chat".into(),
             root: "ef".repeat(32),
@@ -836,6 +838,8 @@ async fn status_reports_root_hash_height_and_module_roots() {
     assert_eq!(body["version"], "9.9.9");
     assert_eq!(body["root_hash"], "cd".repeat(32));
     assert_eq!(body["height"], 3);
+    assert_eq!(body["consensus_time"], 3);
+    assert_eq!(body["consensus_time_unit"], "height");
     assert_eq!(body["modules"][0]["id"], "chat");
     assert_eq!(body["modules"][0]["root"], "ef".repeat(32));
     // the catalog category rides on the wire as a lowercase string.
