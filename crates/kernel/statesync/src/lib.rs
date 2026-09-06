@@ -338,6 +338,15 @@ pub struct Manifest {
     /// its root — the same failure a lying `view_base` produces, and a
     /// fabricated world still cannot vote.
     pub applied_frames: Vec<(u64, [u8; 32])>,
+    /// the view a valset change already committed but not yet cut over at
+    /// `height` (`None` when no change is armed). the served epoch's
+    /// `participants` may already lag the committed valset by design (see
+    /// above) — this is the serving orchestrator's OWN armed ceiling, so a
+    /// seat resumed from it (`ValsetOrchestrator::resume(.., pending)`) stops
+    /// at the same view every peer stops at instead of observing the
+    /// already-changed valset itself and arming a LATER ceiling that forks
+    /// the root.
+    pub pending_cutover_view: Option<u64>,
 }
 
 impl Manifest {
@@ -801,6 +810,13 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
                 out.extend_from_slice(&height.to_le_bytes());
                 out.extend_from_slice(id);
             }
+            match m.pending_cutover_view {
+                Some(view) => {
+                    out.push(1);
+                    out.extend_from_slice(&view.to_le_bytes());
+                }
+                None => out.push(0),
+            }
         }
         SyncResponse::Chunk { total, bytes } => {
             out.push(1u8);
@@ -1076,6 +1092,11 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 let height = wire::take_u64(&mut buf)?;
                 applied_frames.push((height, wire::take_array::<32>(&mut buf)?));
             }
+            let pending_cutover_view = match wire::take_u8(&mut buf)? {
+                0 => None,
+                1 => Some(wire::take_u64(&mut buf)?),
+                t => return Err(WireError::BadTag("pending_cutover_view", t)),
+            };
             SyncResponse::Manifest(Manifest {
                 height,
                 root_hash,
@@ -1086,6 +1107,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 floor_cert,
                 entries,
                 applied_frames,
+                pending_cutover_view,
             })
         }
         1 => SyncResponse::Chunk {
@@ -1429,6 +1451,9 @@ pub struct BoundaryCoords {
     /// the serving node's replay window at this boundary, filtered to entries
     /// at or below its height — see [`Manifest::applied_frames`].
     pub applied_frames: Vec<(u64, [u8; 32])>,
+    /// the caller's own orchestrator's armed cutover, if any — rides straight
+    /// into [`Manifest::pending_cutover_view`].
+    pub pending_cutover_view: Option<u64>,
 }
 
 /// a consistent boundary capture: every payload from ONE finalized boundary.
@@ -1653,6 +1678,7 @@ impl SyncServer {
             residents: capture.coords.residents.clone(),
             floor_cert: capture.coords.floor_cert.clone(),
             applied_frames: capture.coords.applied_frames.clone(),
+            pending_cutover_view: capture.coords.pending_cutover_view,
             entries: capture
                 .modules
                 .iter()
@@ -2188,38 +2214,18 @@ where
     }
 }
 
-/// fetch a finite, ordered recovery-frame suffix in bounded batches. `None`
-/// means the caller already trusts the range's size (the live-drain backfill
-/// lane, which walks the follower's own certified gap); [`fetch_frames_capped`]
-/// is the untrusted-source entry point.
-pub async fn fetch_frames<C: SyncClient>(
-    client: &C,
-    after_height: u64,
-    up_to_height: u64,
-) -> Result<Vec<FinalizedFrame>, SyncError> {
-    fetch_frames_bounded(client, after_height, up_to_height, None).await
-}
-
-/// [`fetch_frames`], refusing to assemble more than `max_bytes` of frame
-/// payload — see [`MAX_CATCHUP_BYTES`]. mirrors [`fetch_snapshot`]'s cap
-/// shape: the check runs before a frame's bytes are added to the running
-/// total, never after. the joiner catch-up lane's entry point: the served
-/// tip is an UNVERIFIED peer number, so the range it names cannot be trusted
-/// to be small.
+/// fetch a finite, ordered recovery-frame suffix in bounded batches,
+/// refusing to assemble more than `max_bytes` of frame payload — see
+/// [`MAX_CATCHUP_BYTES`]. mirrors [`fetch_snapshot`]'s cap shape: the check
+/// runs before a frame's bytes are added to the running total, never after.
+/// every caller is a served, UNVERIFIED range — a peer's own reported tip
+/// (the joiner catch-up lane) or a peer's own reported frames (a probe, a
+/// live-drain backfill) — so nothing here gets to skip the cap.
 pub async fn fetch_frames_capped<C: SyncClient>(
     client: &C,
     after_height: u64,
     up_to_height: u64,
     max_bytes: u64,
-) -> Result<Vec<FinalizedFrame>, SyncError> {
-    fetch_frames_bounded(client, after_height, up_to_height, Some(max_bytes)).await
-}
-
-async fn fetch_frames_bounded<C: SyncClient>(
-    client: &C,
-    after_height: u64,
-    up_to_height: u64,
-    max_bytes: Option<u64>,
 ) -> Result<Vec<FinalizedFrame>, SyncError> {
     if after_height > up_to_height {
         return Err(SyncError::Server(format!(
@@ -2258,11 +2264,9 @@ async fn fetch_frames_bounded<C: SyncClient>(
                             frame.height
                         )));
                     }
-                    if let Some(cap) = max_bytes {
-                        total_bytes += frame.frame.len() as u64;
-                        if total_bytes > cap {
-                            return Err(too_large(cap));
-                        }
+                    total_bytes += frame.frame.len() as u64;
+                    if total_bytes > max_bytes {
+                        return Err(too_large(max_bytes));
                     }
                     last = frame.height;
                     out.push(frame);
@@ -2576,9 +2580,12 @@ mod tests {
                 ],
                 // non-empty: exercises the replay-window wire tail.
                 applied_frames: vec![(6, [0xE1; 32]), (7, [0xE2; 32])],
+                // exercises the Some(view) pending-cutover wire tail.
+                pending_cutover_view: Some(9),
             }),
             // a fresh-epoch boundary: no finalization past the base yet, so
-            // no floor certificate — the joiner spawns on the genesis floor.
+            // no floor certificate — the joiner spawns on the genesis floor,
+            // and no valset change is armed.
             SyncResponse::Manifest(Manifest {
                 height: 12,
                 root_hash: StateRoot([8u8; ROOT_LEN]),
@@ -2589,6 +2596,7 @@ mod tests {
                 floor_cert: None,
                 entries: vec![],
                 applied_frames: vec![],
+                pending_cutover_view: None,
             }),
             SyncResponse::Chunk {
                 total: 10,
@@ -2822,6 +2830,7 @@ mod tests {
             floor_cert: None,
             entries: vec![],
             applied_frames: vec![(6, [0xE1; 32])],
+            pending_cutover_view: Some(11),
         });
         let bytes = encode_response(&resp);
         // Drop bytes from the trailing entry/resident/replay-window counts.

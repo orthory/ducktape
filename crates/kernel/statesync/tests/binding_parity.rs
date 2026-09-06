@@ -149,6 +149,7 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
                 resolver_target: None,
             }],
             applied_frames: vec![(41, [0x5A; 32]), (42, [0x5B; 32])],
+            pending_cutover_view: Some(45),
         }),
         SyncRequest::Chunk { offset, .. } => SyncResponse::Chunk {
             total: 999,

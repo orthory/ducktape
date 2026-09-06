@@ -42,6 +42,7 @@ fn test_manifest(
         floor_cert,
         entries: vec![],
         applied_frames: vec![],
+        pending_cutover_view: None,
     }
 }
 
@@ -553,6 +554,7 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
             floor_cert: Some(vec![1, 2, 3]),
             entries: vec![],
             applied_frames: vec![],
+            pending_cutover_view: None,
         };
 
         let mut host = mixed_durability_host(durable_store.clone(), 0);
