@@ -207,6 +207,7 @@ async fn an_unsigned_mutation_is_refused_and_never_reaches_the_actor() {
         ("POST", "/v1/files/stage"),
         ("POST", "/v1/files/commit"),
         ("POST", "/v1/files/pin"),
+        ("DELETE", "/v1/files/pin/keep"),
         ("POST", "/v1/files/watch"),
         ("PUT", "/v1/files/object/shared/a.txt"),
         ("DELETE", "/v1/files/object/shared/a.txt"),

@@ -108,4 +108,8 @@ pub trait NodeApi {
 
     /// pin a snapshot by name so gc keeps it reachable.
     fn pin(&self, snapshot: &str, name: &str) -> Result<(), ApiError>;
+
+    /// release a pin so gc can reclaim it once nothing else roots it. the
+    /// module owner-gates this: only the pin's creator or `system` may unpin.
+    fn unpin(&self, name: &str) -> Result<(), ApiError>;
 }

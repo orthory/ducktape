@@ -204,6 +204,9 @@ impl NodeApi for ScriptedNode {
     fn pin(&self, _snapshot: &str, _name: &str) -> Result<(), ApiError> {
         Err(ApiError::Transport("unused".into()))
     }
+    fn unpin(&self, _name: &str) -> Result<(), ApiError> {
+        Err(ApiError::Transport("unused".into()))
+    }
 }
 
 #[test]

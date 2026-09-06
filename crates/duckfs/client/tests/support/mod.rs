@@ -277,4 +277,9 @@ impl NodeApi for ModuleNode {
         }))?;
         Ok(())
     }
+
+    fn unpin(&self, name: &str) -> Result<(), ApiError> {
+        self.exec(encode_msg(&FilesMsg::Unpin { name: name.into() }))?;
+        Ok(())
+    }
 }

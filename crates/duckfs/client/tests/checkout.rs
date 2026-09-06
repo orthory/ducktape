@@ -104,6 +104,10 @@ impl NodeApi for MaliciousNode {
     fn pin(&self, _snapshot: &str, _name: &str) -> Result<(), ApiError> {
         unimplemented!("not exercised by checkout")
     }
+
+    fn unpin(&self, _name: &str) -> Result<(), ApiError> {
+        unimplemented!("not exercised by checkout")
+    }
 }
 
 /// build a `MaliciousNode` serving one File entry at `path` whose `object` is

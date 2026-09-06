@@ -221,8 +221,9 @@ enum Lane {
     /// SEPARATE from [`Lane::Files`] because it is the only lane whose write
     /// verb is PUT, and a `POST`-only arm left it open.
     Object,
-    /// `/v1/files/…` — blob, stage, commit, pin, watch. every duckfs read on
-    /// this prefix is a GET, so POST alone names the writes.
+    /// `/v1/files/…` — blob, stage, commit, pin, watch, and DELETE
+    /// `/v1/files/pin/{name}` to release one. every duckfs read on this prefix
+    /// is a GET, so POST or DELETE alone names the writes.
     Files,
     /// `/v1/term/sessions…` — create and close a node-hosted pty.
     Term,
@@ -309,7 +310,8 @@ impl Lane {
                 .then_some(Authority::Acting)
                 .or(removes.then_some(Authority::Operator)),
             Lane::Object => (replaces || removes).then_some(Authority::Acting),
-            Lane::Files | Lane::Submit => posts.then_some(Authority::Acting),
+            Lane::Files => (posts || removes).then_some(Authority::Acting),
+            Lane::Submit => posts.then_some(Authority::Acting),
             // a pty/microVM on the HOST, and the two fixed node mutations.
             Lane::Term | Lane::NodeLevel => posts.then_some(Authority::Operator),
             Lane::Open => None,
@@ -785,6 +787,7 @@ mod tests {
             (Method::POST, "/v1/files/stage", Authority::Acting),
             (Method::POST, "/v1/files/commit", Authority::Acting),
             (Method::POST, "/v1/files/pin", Authority::Acting),
+            (Method::DELETE, "/v1/files/pin/abc", Authority::Acting),
             (Method::POST, "/v1/files/watch", Authority::Acting),
             (
                 Method::PUT,
