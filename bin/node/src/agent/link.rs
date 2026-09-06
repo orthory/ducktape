@@ -309,6 +309,12 @@ fn classify(text: &str) -> Incoming {
     }
 }
 
+/// how many `input_lane_full` refusals pass between log lines after the
+/// first. One comes in per keystroke the daemon refuses, so an unlatched line
+/// here would evict the ring the same way an unlatched per-frame warning does
+/// anywhere else on this plane.
+static INPUT_LANE_FULL: noded::log::Latch = noded::log::Latch::new(100);
+
 /// Perform one command, on this task or its own.
 ///
 /// The link must never stop reading, so nothing slow may run on it:
@@ -319,9 +325,12 @@ fn classify(text: &str) -> Incoming {
 ///   is answered, and a close is the escape hatch that must not queue behind a
 ///   blocked pty.
 /// - **input and resize** only ENQUEUE onto the target session's own ordered
-///   lane, which is a map lookup and a channel send. That is what keeps
-///   keystrokes in arrival order without making the link the queue — the pty
-///   write itself happens on the session's driver task.
+///   lane, which is a map lookup and a non-blocking `try_send`. That is what
+///   keeps keystrokes in arrival order without making the link the queue — the
+///   pty write itself happens on the session's driver task. The lane is
+///   bounded (frame count and pending bytes both), so a refusal is ordinary
+///   under load, not a bug: it is warned, latched, and the frame is dropped —
+///   never buffered, and never blocks this task.
 async fn execute(sessions: &Arc<Sessions>, command: wire::Command) {
     let touches_a_container = matches!(
         command,
@@ -329,10 +338,27 @@ async fn execute(sessions: &Arc<Sessions>, command: wire::Command) {
     );
     if touches_a_container {
         let sessions = sessions.clone();
-        tokio::spawn(async move { sessions.dispatch(command).await });
+        tokio::spawn(async move {
+            sessions.dispatch(command).await;
+        });
         return;
     }
-    sessions.dispatch(command).await;
+    // `UnknownSession` is already warned inside `agent_service::Sessions`,
+    // where the lookup happened; only `LaneFull` is this link's to report —
+    // there is no wire refusal frame for input, so the drop plus this warning
+    // is the whole fix.
+    let refused_for_lane_full = matches!(
+        sessions.dispatch(command).await,
+        Some(agent_service::EnqueueRefusal::LaneFull)
+    );
+    if refused_for_lane_full && let Some(occurrences) = INPUT_LANE_FULL.hit("input_lane_full") {
+        tracing::warn!(
+            target: "ducktape::agent",
+            reason = "input_lane_full",
+            occurrences,
+            "term input dropped: the session's drive lane is full"
+        );
+    }
 }
 
 #[cfg(test)]
