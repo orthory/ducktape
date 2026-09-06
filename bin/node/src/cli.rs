@@ -527,7 +527,6 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let genesis = config::Genesis::compose(
         &founding_set,
         &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
-        &topology::TOPOLOGY.index_guest_ids(topology::PRODUCTION),
     )
     .map_err(|e| {
         format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")
@@ -578,19 +577,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // descriptor, so the two never silently disagree (see `docs`:
     // coordinator is ambient, node-local).
     let fresh_workspace = !dir.join("node.toml").exists();
-    let mut plumbing = config::merged_plumbing(
-        &dir,
-        net.listen.as_deref(),
-        net.advertised.as_deref(),
-        net.http.as_deref(),
-        net.gateway.as_deref(),
-        net.rpc.as_deref(),
-        net.wireguard_listen.as_deref(),
-        net.invite_listen.as_deref(),
-        net.primary_coordinator.as_deref(),
-        net.wireguard_advertised.as_deref(),
-        net.block_time_ms,
-    )?;
+    let mut plumbing = config::merged_plumbing(&dir, &net.overrides())?;
     // a FRESH workspace detects the platform runtime and writes the table (it
     // describes HOW runs are isolated, and grants nothing); an existing
     // node.toml keeps whatever the operator chose — a deleted table is never
@@ -624,6 +611,9 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         coordination: None,
         modules,
         genesis: hex_bytes(&genesis_hash),
+        // the founding beat: stated once here, carried by the invite, and
+        // inherited by every joiner — it is a genesis fact, not plumbing.
+        block_time_ms: args.block_time_ms,
     };
     if let Some(addr) = config::dialable(Some(&plumbing.advertised), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -1399,7 +1389,7 @@ fn cast_yes_once(
 pub(super) enum CeremonyOutcome {
     /// passed and executed. what that execution CHANGED is the caller's to
     /// confirm: a membership set turns over at the next epoch cutover, a
-    /// module swap lands in the lifecycle registry.
+    /// module swap lands in the modules registry.
     Passed,
     /// this ballot landed but the proposal's frozen threshold is outstanding.
     AwaitingBallots,
@@ -1936,19 +1926,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         false => args.blob.concat(),
         true => read_invite_blob_from_stdin()?,
     };
-    let net = &args.plumbing;
-    let overrides = config::PlumbingOverrides {
-        listen: net.listen.clone(),
-        advertised: net.advertised.clone(),
-        http: net.http.clone(),
-        gateway: net.gateway.clone(),
-        rpc: net.rpc.clone(),
-        primary_coordinator: net.primary_coordinator.clone(),
-        wireguard_listen: net.wireguard_listen.clone(),
-        wireguard_advertised: net.wireguard_advertised.clone(),
-        invite_listen: net.invite_listen.clone(),
-        block_time_ms: net.block_time_ms,
-    };
+    let overrides = args.plumbing.overrides();
     let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
     match (&genesis_bytes, joined.is_member) {
         (Some(bytes), _) => install_joiner_genesis(&joined.dir, bytes)?,

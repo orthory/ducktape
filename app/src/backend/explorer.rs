@@ -193,6 +193,49 @@ pub fn palette_key_action(
     "none".into()
 }
 
+/// Is the command modifier down? The cheap half of the quit chord: it is read
+/// off the modifier stream to ARM the key-press route, so an ordinary keystroke
+/// never publishes one. It asks the same `command()` [`quit_chord`] judges by —
+/// Command on a Mac, Control elsewhere — because arming on one modifier and
+/// judging on another yields a chord that can never fire.
+pub fn command_held(modifiers: iced::keyboard::Modifiers) -> bool {
+    modifiers.command()
+}
+
+/// Which command chord this press is (⌘Q / ⌘W, Ctrl off a Mac), or none. The
+/// ONE answer, so the chords live in a single place rather than re-spelled at
+/// each use site — macOS binds both through an app menu this app does not have,
+/// so it reads them itself.
+///
+/// Both key readings, like the palette's toggle: the physical code is what a
+/// Dvorak or AZERTY layout still calls Q or W, and the logical character is
+/// what a layout that remaps the code actually types.
+pub fn command_chord(
+    logical: iced::keyboard::Key,
+    physical: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+) -> crate::CommandChord {
+    use iced::keyboard::key::{Code, Physical};
+    if !modifiers.command() {
+        return crate::CommandChord::Ignored;
+    }
+    let quit = physical == Physical::Code(Code::KeyQ) || types_letter(&logical, "q");
+    if quit {
+        return crate::CommandChord::Quit;
+    }
+    let close_window = physical == Physical::Code(Code::KeyW) || types_letter(&logical, "w");
+    if close_window {
+        return crate::CommandChord::CloseWindow;
+    }
+    crate::CommandChord::Ignored
+}
+
+/// The letter a press actually types, after the layout has had its say — the
+/// other half of the physical code in every chord above.
+fn types_letter(logical: &iced::keyboard::Key, letter: &str) -> bool {
+    matches!(logical, iced::keyboard::Key::Character(typed) if typed.eq_ignore_ascii_case(letter))
+}
+
 /// The transient layer currently over the console's content — the TOPMOST one
 /// only — or `""` when the content itself is the frontmost thing on screen.
 /// The order IS the z-order.

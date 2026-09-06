@@ -465,8 +465,8 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
     // non-empty by `load_valid_descriptor`, which BOTH paths run.
     let validators = descriptor.validator_keys()?;
     // one dial source of truth: reach_entries() folds bootstrap-synthesised
-    // Direct hints in with the typed `reach` hints (their union). Direct/Fronted
-    // resolve to a mesh Ingress dialed directly; Coordinated routes are handed
+    // Direct hints in with the typed `reach` hints (their union). Direct
+    // resolves to a mesh Ingress dialed directly; Coordinated routes are handed
     // to the nat client, which rendezvouses through the coordinator and
     // hole-punches to the target — but the target is still authenticated
     // end-to-end by its own key, so a coordinated peer is a real mesh member
@@ -553,7 +553,10 @@ fn resolve_network_shape(base: &Path, raw: NodeToml) -> Result<Resolved, String>
         invite_listen,
         dev_demo: false,
         checkpoint_blocks: raw.checkpoint_blocks,
-        cadence: consensus::Cadence::from_millis(raw.block_time_ms),
+        // the beat is a genesis fact, not node plumbing: it rides the
+        // descriptor (and its fingerprint), so every member of a network runs
+        // the same simplex clock by construction.
+        cadence: consensus::Cadence::from_millis(descriptor.block_time_ms),
         invite_token: load_invite_token(base)?,
         invite_wireguard: load_invite_wireguard(base)?,
         invite_fronts: load_invite_fronts(base)?,
@@ -974,6 +977,7 @@ mod tests {
             )],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1015,6 +1019,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1051,6 +1056,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1078,6 +1084,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1140,6 +1147,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         }
@@ -1247,6 +1255,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         }
@@ -1310,6 +1319,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };
@@ -1404,6 +1414,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: Vec::new(),
             genesis: "ab".repeat(32),
         }
@@ -1763,7 +1774,6 @@ mod tests {
             ("primary_coordinator", "\"none\""),
             ("coordinator_relay", "\"none\""),
             ("checkpoint_blocks", "32"),
-            ("block_time_ms", "1000"),
         ];
         defaults
             .iter()
@@ -1799,6 +1809,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         }
@@ -1855,6 +1866,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         }
@@ -1884,6 +1896,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
             modules: fake_modules(),
             genesis: "ab".repeat(32),
         };

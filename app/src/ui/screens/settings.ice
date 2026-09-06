@@ -4,7 +4,7 @@
 // `screens/roster.ice` for the screen contract: no app state is reachable from
 // here, so every reading is a prop and every act leaves as a named event that
 // `view.ice` routes back to the handler of the same name.
-component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:Appearance, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
+component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, account_ceremony_phase:str, account_ceremony_qr:str, account_ceremony_detail:str, account_ceremony_left:str, settings_key_state:str, settings_key_path:str, settings_open_tabs:i64, members_rows:[MemberRow], members_answered:bool, account_number:str, bind account_name_draft:str, account_renaming:bool, account_exists:bool, account_keys:i64, account_key_rows:[AccountKeyRow], account_busy:bool, bind account_create_draft:str, bind account_key_draft:str, bind account_key_label_draft:str, account_ticket:str, bind account_join_draft:str, appearance:Appearance, desktop_notifications:bool, password:str, status:str, loading:bool, connected:bool, mutation_phase:MutationPhase)
   emits
     select_shell_tab(ShellTab)
     reconnect()
@@ -31,6 +31,7 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
     forget_workspace_submit()
     set_appearance_light()
     set_appearance_dark()
+    set_desktop_notifications(bool)
   state
     key_pw = ""
   scroll #settings-body
@@ -208,6 +209,60 @@ component SettingsScreen(account_name:str, network_name:str, connected_rpc:str, 
                     @primary_action
               if appearance != Appearance.dark
                 button "Dark" -> emit(set_appearance_dark)
+                  with
+                    checked=false
+                    h=28.0
+                    p=6.0
+                    @secondary_action
+        col w=fill gap=9.0
+          GroupLabel label="NOTIFICATIONS"
+          box
+            with
+              w=fill
+              p=15.0
+              bg=surface
+              border=card_line
+              border-w=1.0
+              r=11.0
+            row
+              with
+                w=fill
+                gap=9.0
+                align=center
+              col w=fill gap=3.0
+                text "Mentions and direct messages"
+                  with
+                    size=12.5
+                    wrap=none
+                    @text-fg
+                if desktop_notifications
+                  text "A desktop banner when you are named, or written to directly." size=11.0 @text-caption
+                if !desktop_notifications
+                  text "Silent — the bell is the only notice." size=11.0 @text-caption
+              space w=fill
+              if desktop_notifications
+                button "On" -> emit(set_desktop_notifications, true)
+                  with
+                    checked=true
+                    h=28.0
+                    p=6.0
+                    @primary_action
+              if !desktop_notifications
+                button "On" -> emit(set_desktop_notifications, true)
+                  with
+                    checked=false
+                    h=28.0
+                    p=6.0
+                    @secondary_action
+              if !desktop_notifications
+                button "Off" -> emit(set_desktop_notifications, false)
+                  with
+                    checked=true
+                    h=28.0
+                    p=6.0
+                    @primary_action
+              if desktop_notifications
+                button "Off" -> emit(set_desktop_notifications, false)
                   with
                     checked=false
                     h=28.0

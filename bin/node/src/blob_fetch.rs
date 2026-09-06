@@ -23,7 +23,7 @@
 //! pending-map demux.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use commonware_cryptography::ed25519;
@@ -42,19 +42,86 @@ pub const MAX_SERVED_BLOB: usize = 1024 * 1024;
 pub const MAX_BLOB_RANGE: u64 = 256 * 1024;
 
 /// the co-client's rpc-id floor. the serve lane multiplexes id spaces (our
-/// fetch ids beside peers' request ids); starting this client's sequential
-/// ids at a high base keeps the spaces disjoint by construction.
-const COCLIENT_ID_BASE: u64 = 1 << 62;
+/// fetch ids beside peers' request ids); drawing this client's ids at or
+/// above a high base keeps the spaces disjoint by construction.
+pub const COCLIENT_ID_BASE: u64 = 1 << 62;
+
+/// one fresh co-client rpc id: RANDOM in `[COCLIENT_ID_BASE, 1<<63)`, never
+/// sequential. a sequential counter tells any peer that has ever received one
+/// of our requests what the next ids will be, which is half of pre-answering
+/// a request it was never sent (the other half — the peer check in
+/// [`classify_coclient_frame`] — is what actually closes it).
+fn fresh_coclient_id() -> u64 {
+    COCLIENT_ID_BASE | (rand::random::<u64>() >> 2)
+}
 
 /// how long the co-client waits for one response before failing the request
 /// and rotating — mirrors the p2p binding's 1–2 reaper sweeps (3–6s).
 const COCLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
 
+/// one outstanding fetch: the waiter AND the peer we addressed it to. the id
+/// alone is not enough to complete it — see [`classify_coclient_frame`].
+pub struct PendingFetch {
+    /// the one peer whose answer may complete this request.
+    pub peer: ed25519::PublicKey,
+    pub reply: tokio::sync::oneshot::Sender<statesync::SyncResponse>,
+}
+
 /// outstanding fetches keyed by rpc id — the serve loop's demux surface: an
-/// incoming mesh frame whose id is in here is a response to US, everything
-/// else is a peer's request.
-pub type PendingMap =
-    Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<statesync::SyncResponse>>>>;
+/// incoming mesh frame whose id is in here AND whose sender is the peer we
+/// addressed is a response to US, everything else is a peer's request.
+pub type PendingMap = Arc<Mutex<HashMap<u64, PendingFetch>>>;
+
+/// what the serve loop must do with an incoming frame, decided from the frame's
+/// rpc id, its sender, and the peer the matching request (if any) was addressed
+/// to. pure — the map lookup happens outside, so this is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CoClientVerdict {
+    /// no co-client business: hand it to the serve path as a peer's request.
+    PeerRequest,
+    /// the answer we are waiting for, from the peer we asked. complete it.
+    Response,
+    /// a co-client id we DO hold a waiter for, sent by somebody else. every
+    /// other lane this client drives is content-addressed, but `TipCoords`
+    /// answers "what does THIS node see" — its whole value is who said it, and
+    /// it carries no proof. drop, never complete.
+    PeerMismatch,
+    /// a reply with no waiter left: the request timed out at
+    /// [`COCLIENT_TIMEOUT`] and the peer answered afterwards. drop it quietly —
+    /// falling through would run the reply into the proof gate and warn
+    /// `sync_proof_invalid` at a peer that did nothing but answer the question
+    /// we asked, late.
+    LateReply,
+}
+
+/// the demux decision. mirrors the joiner-side client's rule ("only a candidate
+/// source may complete requests", `statesync::p2p`), tightened to the single
+/// peer the request was addressed to.
+/// `unsigned` says the frame's envelope carries ZEROED requester+proof — the
+/// shape a REPLY rides (the transport authenticates a reply, so the server
+/// zero-fills those fields). every genuine request carries a signed standing
+/// proof, so a co-client-range id with no waiter and no signature is our own
+/// answer landing after its timeout. the id space alone cannot say this: both
+/// ends of a link draw their co-client ids from the same range, so a peer's
+/// REQUEST arrives here with a high id too.
+pub fn classify_coclient_frame(
+    rpc_id: u64,
+    peer: &ed25519::PublicKey,
+    addressed_to: Option<&ed25519::PublicKey>,
+    unsigned: bool,
+) -> CoClientVerdict {
+    let Some(addressed_to) = addressed_to else {
+        let we_asked_this = rpc_id >= COCLIENT_ID_BASE && unsigned;
+        return match we_asked_this {
+            true => CoClientVerdict::LateReply,
+            false => CoClientVerdict::PeerRequest,
+        };
+    };
+    if addressed_to != peer {
+        return CoClientVerdict::PeerMismatch;
+    }
+    CoClientVerdict::Response
+}
 
 /// answer a peer's blob request from this node's store — the serve loop's
 /// intercept arm (blobs are host state; `SyncServer` never sees these).
@@ -332,6 +399,10 @@ impl<C: SyncClient + SourceRotate> host::CodeSource for FetchingCodeSource<C> {
         }
         self.local.get_chunk(&digest)
     }
+
+    fn origin(&self) -> &'static str {
+        "blob_mesh"
+    }
 }
 
 // ---- the validator's serve-lane co-client ------------------------------------
@@ -346,7 +417,6 @@ pub struct ServeLaneBlobClient<S: P2pSender<PublicKey = ed25519::PublicKey>> {
     pending: PendingMap,
     peers: Arc<RwLock<Vec<ed25519::PublicKey>>>,
     cursor: Arc<AtomicUsize>,
-    next_id: Arc<AtomicU64>,
     /// this node's real key + standing proof: every request rides
     /// the authed rpc envelope, and a validator's key is in committed
     /// standing, so the serving peer admits its blob lanes.
@@ -361,7 +431,6 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> Clone for ServeLaneBlobClient
             pending: self.pending.clone(),
             peers: Arc::clone(&self.peers),
             cursor: Arc::clone(&self.cursor),
-            next_id: Arc::clone(&self.next_id),
             requester: self.requester,
             proof: self.proof,
         }
@@ -381,7 +450,6 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> ServeLaneBlobClient<S> {
             pending,
             peers,
             cursor: Arc::new(AtomicUsize::new(0)),
-            next_id: Arc::new(AtomicU64::new(COCLIENT_ID_BASE)),
             requester,
             proof,
         }
@@ -402,6 +470,60 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> ServeLaneBlobClient<S> {
             (!is_me).then(|| peer.clone())
         })
     }
+
+    /// the live peer book minus this node's own key — the co-validators and
+    /// residents a caller may address BY NAME (see [`Self::request_from`]).
+    pub fn other_peers(&self) -> Vec<ed25519::PublicKey> {
+        let peers = self.peers.read().expect("blob peers lock");
+        peers
+            .iter()
+            .filter(|peer| peer.as_ref() != self.requester.as_slice())
+            .cloned()
+            .collect()
+    }
+
+    /// one request ADDRESSED to a named peer. [`SyncClient::request`] takes
+    /// its peer off the rotating cursor, which every clone of this client
+    /// shares — the forge pack sweeper rotates it on its own failures — so a
+    /// caller that puts the peer's NAME on the answer must choose the peer
+    /// itself and carry it through the await.
+    pub async fn request_from(
+        &self,
+        peer: ed25519::PublicKey,
+        req: SyncRequest,
+    ) -> Result<SyncResponse, SyncError> {
+        let mut sender = self.sender.clone();
+        let pending = self.pending.clone();
+        let id = fresh_coclient_id();
+        let (requester, proof) = (self.requester, self.proof);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending.lock().expect("pending blob lock").insert(
+            id,
+            PendingFetch {
+                peer: peer.clone(),
+                reply: tx,
+            },
+        );
+        let frame = statesync::encode_rpc(&requester, &proof, id, &statesync::encode_request(&req));
+        let attempted = sender.send(Recipients::One(peer), IoBuf::from(frame), false);
+        if attempted.is_empty() {
+            pending.lock().expect("pending blob lock").remove(&id);
+            return Err(SyncError::Transport(
+                "blob source unreachable (send attempted no recipients)".into(),
+            ));
+        }
+        match tokio::time::timeout(COCLIENT_TIMEOUT, rx).await {
+            Ok(Ok(resp)) => Ok(resp),
+            // timed out, or the demux dropped a malformed body: fail the
+            // request so the caller rotates — and clear our slot either way.
+            _ => {
+                pending.lock().expect("pending blob lock").remove(&id);
+                Err(SyncError::Transport(format!(
+                    "blob request {id} timed out on the serve lane"
+                )))
+            }
+        }
+    }
 }
 
 impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SourceRotate for ServeLaneBlobClient<S> {
@@ -415,37 +537,16 @@ impl<S: P2pSender<PublicKey = ed25519::PublicKey>> SyncClient for ServeLaneBlobC
         &self,
         req: SyncRequest,
     ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
-        let mut sender = self.sender.clone();
-        let pending = self.pending.clone();
+        // the peer is chosen HERE, before the await, so the request and the
+        // answer it is attributed to name the same node even after a clone
+        // rotates the shared cursor underneath us.
         let peer = self.current_peer();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (requester, proof) = (self.requester, self.proof);
+        let client = self.clone();
         async move {
             let Some(peer) = peer else {
                 return Err(SyncError::Transport("no blob peers tracked".into()));
             };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            pending.lock().expect("pending blob lock").insert(id, tx);
-            let frame =
-                statesync::encode_rpc(&requester, &proof, id, &statesync::encode_request(&req));
-            let attempted = sender.send(Recipients::One(peer), IoBuf::from(frame), false);
-            if attempted.is_empty() {
-                pending.lock().expect("pending blob lock").remove(&id);
-                return Err(SyncError::Transport(
-                    "blob source unreachable (send attempted no recipients)".into(),
-                ));
-            }
-            match tokio::time::timeout(COCLIENT_TIMEOUT, rx).await {
-                Ok(Ok(resp)) => Ok(resp),
-                // timed out, or the demux dropped a malformed body: fail the
-                // request so the caller rotates — and clear our slot either way.
-                _ => {
-                    pending.lock().expect("pending blob lock").remove(&id);
-                    Err(SyncError::Transport(format!(
-                        "blob request {id} timed out on the serve lane"
-                    )))
-                }
-            }
+            client.request_from(peer, req).await
         }
     }
 }
@@ -676,6 +777,70 @@ async fn objects_once<C: SyncClient>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(seed: u64) -> ed25519::PublicKey {
+        use commonware_cryptography::Signer;
+        ed25519::PrivateKey::from_seed(seed).public_key()
+    }
+
+    /// the divergence watch puts a peer's NAME on an unproven answer, so the
+    /// id alone must never complete a waiter: only the node we addressed can.
+    #[test]
+    fn only_the_addressed_peer_completes_a_coclient_waiter() {
+        let (asked, other) = (key(1), key(2));
+
+        assert_eq!(
+            classify_coclient_frame(fresh_coclient_id(), &asked, Some(&asked), true),
+            CoClientVerdict::Response,
+            "the peer we asked answers our request"
+        );
+        assert_eq!(
+            classify_coclient_frame(fresh_coclient_id(), &other, Some(&asked), true),
+            CoClientVerdict::PeerMismatch,
+            "a third party may not answer a request addressed elsewhere"
+        );
+        assert_eq!(
+            classify_coclient_frame(7, &other, None, false),
+            CoClientVerdict::PeerRequest,
+            "a signed frame with no waiter is a peer's own request"
+        );
+    }
+
+    /// a peer that answers after our 6 s timeout is honest and late. the demux
+    /// must recognise its own id space and drop the frame, never let it reach
+    /// the proof gate — our replies ride zeroed auth fields, so the gate would
+    /// warn `sync_proof_invalid` at a co-validator that did nothing wrong.
+    #[test]
+    fn a_reply_that_missed_its_timeout_is_dropped_not_refused() {
+        assert_eq!(
+            classify_coclient_frame(fresh_coclient_id(), &key(3), None, true),
+            CoClientVerdict::LateReply,
+            "an unsigned frame on our own id with no waiter left is a late reply"
+        );
+        assert_eq!(
+            classify_coclient_frame(fresh_coclient_id(), &key(3), None, false),
+            CoClientVerdict::PeerRequest,
+            "a peer's own request draws its id from the same range — a SIGNED \
+             frame is always a request, whatever its id"
+        );
+        assert_eq!(
+            classify_coclient_frame(COCLIENT_ID_BASE - 1, &key(3), None, true),
+            CoClientVerdict::PeerRequest,
+            "the id space below the base was never ours to have asked on"
+        );
+    }
+
+    /// a peer that has seen one of our ids must not be able to name the next.
+    #[test]
+    fn coclient_ids_are_random_above_the_base() {
+        let ids: std::collections::HashSet<u64> = (0..64).map(|_| fresh_coclient_id()).collect();
+
+        assert_eq!(ids.len(), 64, "co-client ids must not repeat or step");
+        assert!(
+            ids.iter().all(|id| *id >= COCLIENT_ID_BASE),
+            "every co-client id stays in the id space peers' request ids never reach"
+        );
+    }
 
     /// serving catch-up must not grow this node's store one pack per request:
     /// each answer supersedes the repo's previous one, and re-serving the

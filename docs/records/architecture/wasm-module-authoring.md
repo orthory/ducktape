@@ -3,7 +3,10 @@
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.3`); the authoring contract is
 the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
-the reference modules are `crates/guests/hello-wasm`,
+the reference modules are `crates/guests/noop-wasm` (the smallest compliant
+module: two exports, no state, every op a no-op — the template a new module
+starts from and the admission fixture that touches nothing),
+`crates/guests/hello-wasm` (a counter over host-owned state),
 `crates/guests/hello-wasm-replacement` (its live-update target), and
 `crates/guests/sibling-wasm` (the cross-module-read reference) — kernel test
 fixtures, in no genesis set. The first wasm port of a native module is
@@ -43,8 +46,22 @@ boundary. Consequences you design around:
 
 ## The contract
 
-Implement the two exports:
+Implement the three exports:
 
+- `shape() -> module-shape` — what the host must know to run this component:
+  the `backing` its committed state lives on (`map`: a host-owned key/value
+  map; `store`: a host-constructed authenticated store, every key a 32-byte
+  digest; `odb`: a host-side content-addressed substrate the host provides
+  for this module's id — `files`, `forge`), the `config` keys the host seeds
+  into the reserved `__config` record when the module starts fresh
+  (`chain_id`, `invite`; empty when the module is not network-bound), and
+  `committed-queries` (the query lane answers from committed state alone,
+  regardless of caller). A pure constant of the code: the host reads it once
+  from the bytes on every path a module enters a host — genesis, a registry
+  admission, a reopen, a code swap — before wrapping them over a substrate,
+  and refuses a backing other than the declared one. `guest_adapter` names
+  the three plain shapes (`store_shape()`, `map_shape()`, `odb_shape()`);
+  a network-bound module sets `config` on top.
 - `execute(payload) -> result<_, error>` — apply one op addressed to this
   module. Reject unknown ops with `error::rejected(..)`; a rejection is a clean
   deterministic no-op, never a fork.
@@ -122,7 +139,7 @@ commit it as one change. The check rides the pre-push `make test` gate.
 ## Live update: how new code ships
 
 The consensus commitment to WHICH code a module runs is the code registry
-(`crates/modules/system/lifecycle`): per module, the active 32-byte sha256 of its component
+(`crates/modules/system/modules`): per module, the active 32-byte sha256 of its component
 bytes plus at most one pending height-gated swap. The BYTES travel out-of-band,
 content-addressed on the node blob plane. The flow:
 
@@ -132,10 +149,10 @@ content-addressed on the node blob plane. The flow:
    rather than forks — so distribute first, then schedule).
 3. Drive governance: `GovAction::UpdateModule { name, module_id,
    activation_height, code_hash }` — a member-gated proposal + majority tally;
-   on passing it emits `LifecycleMsg::ScheduleSwap` into the registry. Cancel before
+   on passing it emits `ModulesMsg::ScheduleSwap` into the registry. Cancel before
    the boundary with `GovAction::CancelModuleUpdate`.
 4. At the first applied block at/after `activation_height`, two things happen
-   on every node: the drain's injected lifecycle `Advance` flips the committed
+   on every node: the drain's injected registry `Advance` flips the committed
    active hash (in the root-hash), and the host's out-of-block realization
    (`Host::realize_module_swaps`) verifies `sha256(bytes) == hash` and swaps
    the running component, keeping the host-owned state.

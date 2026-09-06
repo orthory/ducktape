@@ -215,6 +215,7 @@ async fn exec(m: &mut WasmModule, ctx: &mut MockCtx, payload: Vec<u8>) -> Result
 // object-wasm ops (see crates/guests/object-wasm/src/lib.rs)
 fn put_op(kind: u8, body: &[u8]) -> Vec<u8> {
     let mut p = vec![b'p', kind];
+    p.extend_from_slice(&object_id(kind, body));
     p.extend_from_slice(body);
     p
 }

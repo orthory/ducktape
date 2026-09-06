@@ -30,6 +30,8 @@ view
           restore_empty=empty(restore_words)
           join_empty=empty(join_invite)
         events
+          drag_launch_window -> drag_launch_window
+          close_launch_window -> close_launch_window
           pick_wallet -> pick_wallet _
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
@@ -577,6 +579,7 @@ view
               account_busy
               account_ticket
               appearance
+              desktop_notifications
               password
               status
               loading
@@ -608,6 +611,7 @@ view
               forget_workspace_submit -> forget_workspace_submit
               set_appearance_light -> set_appearance_light
               set_appearance_dark -> set_appearance_dark
+              set_desktop_notifications -> set_desktop_notifications _
         explorer:
           ExplorerScreen #explorer(connected_rpc)
             with

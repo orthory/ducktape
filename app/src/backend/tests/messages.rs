@@ -35,15 +35,23 @@ fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
     let rooms = chat_sidebar_rooms(listing.clone(), peers.clone(), Vec::new());
     assert_eq!(rooms.len(), 1);
     assert_eq!(rooms[0].channel.id, "general");
-    // AND THE DIRECTORY IS THE ONLY THING THAT DECIDES IT. A peer row whose
-    // load resolved no account number of ours carries no `channel_id`, so it
-    // claims nothing — the DM falls back into the room list rather than
-    // swallowing every channel whose id happens to be empty.
+    // AND AN EMPTY `channel_id` CLAIMS NOTHING. A peer row whose load resolved
+    // no account number of ours carries none, and it must not swallow every
+    // channel whose id happens to be empty — but the DM does NOT fall back
+    // into the room list either: a derived two-party id is never a CHANNELS
+    // row, whoever's it is (`another_members_dm_is_not_a_channel_of_mine`).
     let unresolved = vec![DmPeer {
         channel_id: String::new(),
         ..peers[0].clone()
     }];
-    assert_eq!(chat_sidebar_rooms(listing, unresolved, Vec::new()).len(), 2);
+    let without_the_directory = chat_sidebar_rooms(listing, unresolved, Vec::new());
+    assert_eq!(
+        without_the_directory
+            .iter()
+            .map(|row| row.channel.id.as_str())
+            .collect::<Vec<_>>(),
+        ["general"]
+    );
 
     // the id the app mints is the id chat will accept from a USER author:
     // ':' is reserved for module origins and '/' is refused outright, so a
@@ -380,7 +388,7 @@ fn history_pagination_prepends_older_and_flags_more() {
 }
 
 /// The composer's grammar loop, closed over a real node: the SAME parser
-/// the rich composer previews (`parse_message_with_members`) builds the
+/// the rich composer previews (`parse_message_with_mentions`) builds the
 /// committed blocks, and the spans read back off the node still carry the
 /// marks. If the preview grammar and the renderer grammar ever drift, one
 /// of the two ends of this test moves.
@@ -420,7 +428,10 @@ async fn composer_markdown_round_trips_rich_spans() {
         chat::encode_msg(&ChatMsg::PostMessage {
             channel_id: "general".into(),
             message_id: "styled-1".into(),
-            blocks: parse_message_with_members("say **hi** to _all_", &[]),
+            blocks: parse_message_with_mentions(
+                "say **hi** to _all_",
+                &MentionCandidates::default(),
+            ),
             thread: None,
             as_agent: None,
         }),

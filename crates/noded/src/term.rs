@@ -750,6 +750,14 @@ impl Drop for AttachGuard {
     }
 }
 
+/// per-session `ducktape::term` warns below that a CLIENT can repeat within
+/// one daemon session: `start`/`send` fire on every create or keystroke while
+/// no agent daemon is attached, `enqueue_command` on every submitted command
+/// against a stale or single-mode session, and `create_local`'s consensus
+/// channel warn on every Shared-mode create while chat is unreachable. First
+/// occurrence, then every 100th, carrying `occurrences`.
+static TERM_WARN: crate::log::Latch = crate::log::Latch::new(100);
+
 impl TerminalSessions {
     /// build the bridge over the StreamHub's shared [`TermRing`] and
     /// [`TermCommandRing`]. No daemon is attached yet — one arrives (or does
@@ -776,12 +784,32 @@ impl TerminalSessions {
         // two reasons, not one: "this node minted no secret" is an operator's
         // node to fix and "you presented the wrong one" is the daemon's, and
         // collapsing them sends whoever reads the log to the wrong machine.
+        //
+        // latched, not once-per-session: `attach` is reached from a plain ws
+        // `ClientMsg::ServiceAttach` that any client can send in a loop, and
+        // the real agent daemon redials a refused link every 2s forever
+        // (`bin/node/src/agent/link.rs`'s `Refused` arm) — unlatched, a node
+        // with no minted token would warn ~1800x/h with no counter.
         if self.0.link_token.is_none() {
-            tracing::warn!(target: "ducktape::service", reason = "no_link_token", "agent service link refused");
+            if let Some(occurrences) = TERM_WARN.hit("no_link_token") {
+                tracing::warn!(
+                    target: "ducktape::service",
+                    reason = "no_link_token",
+                    occurrences,
+                    "agent service link refused"
+                );
+            }
             return None;
         }
         if !self.link_token_matches(token) {
-            tracing::warn!(target: "ducktape::service", reason = "bad_link_token", "agent service link refused");
+            if let Some(occurrences) = TERM_WARN.hit("bad_link_token") {
+                tracing::warn!(
+                    target: "ducktape::service",
+                    reason = "bad_link_token",
+                    occurrences,
+                    "agent service link refused"
+                );
+            }
             return None;
         }
         let mut link = self.0.link.lock().expect("term link lock poisoned");
@@ -809,9 +837,11 @@ impl TerminalSessions {
     /// fails closed.
     ///
     /// A pure predicate: it logs nothing, because its two callers must not log
-    /// alike. An attach is a once-per-daemon-session event worth a `warn`; a
-    /// subscribe is per-request and locally drivable in a loop, so a `warn`
-    /// there would evict the 4096-line ring. Each caller names its own level.
+    /// alike. An attach arrives over a plain ws client message that a client
+    /// (or a redialing agent daemon) can loop, so its `warn` is latched by
+    /// [`TERM_WARN`]; a subscribe is per-request and locally drivable in a
+    /// loop too, and it does not warn at all — a rejected subscription just
+    /// answers with an `unavailable` frame. Each caller names its own level.
     pub(crate) fn link_token_matches(&self, presented: &str) -> bool {
         self.0
             .link_token
@@ -900,12 +930,15 @@ impl TerminalSessions {
         if reply.send(Ok(())).is_ok() {
             return;
         }
-        tracing::warn!(
-            target: "ducktape::term",
-            session = %id,
-            reason = "create_abandoned",
-            "ending a session whose caller went away"
-        );
+        if let Some(occurrences) = TERM_WARN.hit("create_abandoned") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %id,
+                reason = "create_abandoned",
+                occurrences,
+                "ending a session whose caller went away"
+            );
+        }
         // `close` only hands a frame to the link, but that is an await, and this
         // runs on the ws read loop. The teardown proper happens when the
         // daemon's `TermEnded` comes back through `ended`.
@@ -1040,7 +1073,14 @@ impl TerminalSessions {
     /// [`AttachGuard`], which answers every pending create.
     async fn start(&self, mut spawn: Spawn) -> Result<CreatedSession, TermError> {
         let Some(link) = self.link() else {
-            tracing::warn!(target: "ducktape::term", reason = "no_agent_service", "session create refused");
+            if let Some(occurrences) = TERM_WARN.hit("no_agent_service") {
+                tracing::warn!(
+                    target: "ducktape::term",
+                    reason = "no_agent_service",
+                    occurrences,
+                    "session create refused"
+                );
+            }
             return Err(TermError::NoSandbox);
         };
         // A sandbox is BUILT at a size. Under the container backend an absent
@@ -1085,7 +1125,14 @@ impl TerminalSessions {
         if link.send(command).await.is_err() {
             // the daemon detached between the link clone and the send; its guard
             // has already cleaned the entry up.
-            tracing::warn!(target: "ducktape::term", reason = "no_agent_service", "session create refused");
+            if let Some(occurrences) = TERM_WARN.hit("no_agent_service") {
+                tracing::warn!(
+                    target: "ducktape::term",
+                    reason = "no_agent_service",
+                    occurrences,
+                    "session create refused"
+                );
+            }
             return Err(TermError::NoSandbox);
         }
         // `Err` = the sender was dropped without answering, which only the
@@ -1143,11 +1190,25 @@ impl TerminalSessions {
     /// anyway, and [`AttachGuard`] is what tells the client so.
     async fn send(&self, command: wire::Command) {
         let Some(link) = self.link() else {
-            tracing::warn!(target: "ducktape::term", reason = "no_agent_service", "term command dropped");
+            if let Some(occurrences) = TERM_WARN.hit("no_agent_service") {
+                tracing::warn!(
+                    target: "ducktape::term",
+                    reason = "no_agent_service",
+                    occurrences,
+                    "term command dropped"
+                );
+            }
             return;
         };
-        if link.send(command).await.is_err() {
-            tracing::warn!(target: "ducktape::term", reason = "agent_service_gone", "term command dropped");
+        if link.send(command).await.is_err()
+            && let Some(occurrences) = TERM_WARN.hit("agent_service_gone")
+        {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "agent_service_gone",
+                occurrences,
+                "term command dropped"
+            );
         }
     }
 
@@ -1159,12 +1220,28 @@ impl TerminalSessions {
     pub fn enqueue_command(&self, session: &str, origin: String, text: String) {
         let found = self.with_session(session, |live| (live.mode, live.cmd_tx.clone()));
         let Some((mode, tx)) = found else {
-            tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term command dropped");
+            if let Some(occurrences) = TERM_WARN.hit("unknown_session") {
+                tracing::warn!(
+                    target: "ducktape::term",
+                    session = %session,
+                    reason = "unknown_session",
+                    occurrences,
+                    "term command dropped"
+                );
+            }
             return;
         };
         // commands are the SHARED-session path; a Single session has no lane.
         if mode != SessionMode::Shared {
-            tracing::warn!(target: "ducktape::term", session = %session, reason = "command_on_single", "term command dropped");
+            if let Some(occurrences) = TERM_WARN.hit("command_on_single") {
+                tracing::warn!(
+                    target: "ducktape::term",
+                    session = %session,
+                    reason = "command_on_single",
+                    occurrences,
+                    "term command dropped"
+                );
+            }
             return;
         }
         // a send failure means the consumer already exited (a teardown race);
@@ -1408,7 +1485,20 @@ async fn create_local(handle: &NodeHandle, body: CreateSessionBody) -> Response 
                 crate::term_consensus::spawn_projector(handle.clone(), created.session_id.clone());
             }
             Err(reason) => {
-                tracing::warn!(target: "ducktape::term", session = %created.session_id, reason = %reason, "term consensus channel not created");
+                // keyed by a fixed class, not by `reason`: the error text is
+                // free-form (`ensure_channel` returns `String`), and a
+                // per-message key would let a systemic outage — every create
+                // hits the same failure — mint an unbounded run of "first
+                // occurrences".
+                if let Some(occurrences) = TERM_WARN.hit("channel_create_failed") {
+                    tracing::warn!(
+                        target: "ducktape::term",
+                        session = %created.session_id,
+                        reason = %reason,
+                        occurrences,
+                        "term consensus channel not created"
+                    );
+                }
             }
         }
     }

@@ -30,6 +30,40 @@ interface host {
     unsupported,
   }
 
+  /// where a module's COMMITTED state lives: the substrate the host wraps
+  /// the component over and computes `root()` from. a property of the code
+  /// — the same bytes always want the same substrate — so the component
+  /// declares it (`module-shape`) and the host refuses any other.
+  enum backing {
+    /// a host-owned key/value map: root = sha256 over the canonical
+    /// encoding, sync = installable snapshot bytes. any key shape. (`map`
+    /// is a WIT keyword, hence the escape; the name is `map`.)
+    %map,
+    /// a host-constructed authenticated store (qmdb): root = the store's
+    /// merkle root, sync = the store's resolver lane. every state key is a
+    /// 32-byte digest.
+    store,
+    /// a host-side content-addressed substrate (duckfs odb, a repo) the host
+    /// provides for this module's id: root = the substrate's fold of its
+    /// refs image, the object plane is live, queries are served host-side.
+    odb,
+  }
+
+  /// what the host must know to run this component. read once from the
+  /// bytes on every path a module enters a host (genesis, admission, a
+  /// reopen, a code swap), before they are wrapped over a substrate.
+  record module-shape {
+    backing: backing,
+    /// the per-network genesis parameters the host seeds into this module's
+    /// reserved `__config` record when it starts fresh (`chain_id`,
+    /// `invite`); empty = not network-bound.
+    config: list<string>,
+    /// the query lane answers from committed state alone, regardless of
+    /// caller: for a module whose between-block reads must never observe a
+    /// same-block staged write.
+    committed-queries: bool,
+  }
+
   /// deterministic environment for this dispatch.
   get-env: func() -> env;
 
@@ -94,9 +128,13 @@ interface host {
 /// the host surface; it owns no durable memory across dispatches (the host
 /// re-instantiates per call), so state lives entirely behind `host.state-*`.
 world module {
-  use host.{error};
+  use host.{error, module-shape};
   import host;
 
+  /// this component's shape: what the host must know to run it. a pure
+  /// constant of the code — it touches no import (the host reads it outside
+  /// any dispatch, with no env set) and never changes between two calls.
+  export shape: func() -> module-shape;
   /// dispatch entry: apply an incoming op payload addressed to this module.
   export execute: func(payload: list<u8>) -> result<_, error>;
   /// read-only projection of this module's state.

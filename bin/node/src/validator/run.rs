@@ -63,23 +63,11 @@ pub(super) fn publish_boundary_status(
     metrics: &noded::NodeMetrics,
     status_public_key: &str,
 ) {
-    let modules = crate::constants::MODULE_IDS
-        .iter()
-        .map(|m| noded::ModuleStatus {
-            id: (*m).into(),
-            root: node
-                .host()
-                .module_root(m)
-                .map(|r| crate::util::hex(&r))
-                .unwrap_or_default(),
-            category: noded::ModuleCategory::of(m),
-        })
-        .collect();
     status.publish(noded::NodeStatus {
         version: crate::build_version(),
         root_hash: crate::util::hex(&node.root_hash()),
         height: node.finalized().map(|f| f.height).unwrap_or(0),
-        modules,
+        modules: crate::util::module_statuses(node.host()),
         public_key: status_public_key.into(),
         // the cell overlays the boot-wired chain id on every read.
         chain_id: String::new(),

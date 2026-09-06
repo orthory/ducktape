@@ -81,12 +81,12 @@ pub fn global_root_of(pairs: &[(ModuleId, StateRoot)]) -> StateRoot {
 /// loop is guaranteed to terminate regardless of module behavior.
 pub const MAX_DISPATCHES: u32 = 1024;
 
-/// the genesis-constant module id the `lifecycle` module registers under. read
+/// the genesis-constant module id the `modules` registry registers under. read
 /// by the boundary code-swap realization ([`Host::realize_module_swaps`]) and by
-/// the drain's [`Host::pending_lifecycle_advance`] injection; absent on a host
+/// the drain's [`Host::pending_modules_advance`] injection; absent on a host
 /// without the module (e.g. a test registry), in which case no swap is ever
 /// realized or injected.
-pub const LIFECYCLE_MODULE_ID: &str = lifecycle::DEFAULT_LIFECYCLE_ID;
+pub const MODULES_ID: &str = modules::DEFAULT_MODULES_ID;
 
 /// the genesis-constant module id the `dispatch` module registers under. read
 /// by the drain's delivery injection ([`Host::pending_deliveries`]); absent on
@@ -124,6 +124,11 @@ const IDENTITY_MODULE_ID: &str = "identity";
 pub trait CodeSource: Send + Sync {
     /// component bytes for a content hash, or `None` if absent on this node.
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
+
+    /// a stable snake_case name for WHERE this source looks — logged with a
+    /// fail-closed miss so an operator reads "we asked the mesh and no peer
+    /// served it" apart from "this node never asked anyone".
+    fn origin(&self) -> &'static str;
 }
 
 /// the no-source default: a node wired without any code source. every fetch
@@ -136,17 +141,42 @@ impl CodeSource for NoCodeSource {
     async fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
         None
     }
+
+    fn origin(&self) -> &'static str {
+        "none"
+    }
 }
 
 /// instantiates a freshly-ADMITTED module from its verified component bytes at
 /// the activation boundary — the constructor twin of [`CodeSource`]. the node
-/// wires the wasm runtime's `from_bytes` here; the host itself stays
-/// wasm-runtime-agnostic. a host without a factory FAILS CLOSED (loudly) when
-/// an admission arms, and a net that never admits modules never notices.
+/// wires its module composer here (the one path every wasm module enters a
+/// host through); the host itself stays wasm-runtime-agnostic. a host without
+/// a factory FAILS CLOSED (loudly) when an admission arms, and a net that
+/// never admits modules never notices. async like [`CodeSource::fetch`]: a
+/// store-backed admission opens its store, and stores open asynchronously.
+#[async_trait::async_trait(?Send)]
 pub trait ModuleFactory: Send + Sync {
     /// a module instance for `id` from component bytes already verified
-    /// against the committed code hash.
-    fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Box<dyn Module>, Error>;
+    /// against the committed code hash — or [`Admitted::ForeignAbi`] for bytes
+    /// that are no module at all.
+    async fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Admitted, Error>;
+}
+
+/// what a [`ModuleFactory`] made of one admission's verified bytes.
+///
+/// The registry is id-generic bookkeeping: any id may carry a hash-pinned
+/// artifact, and the reachability plane's `ducktape:netstack` guest is
+/// delivered through exactly that record. Only the factory can tell the two
+/// apart, and only it may say so — a refusal that is really "this build cannot
+/// run a genuine module" MUST stay fail-closed, or a node seats a different
+/// registry set than its peers and forks in silence.
+pub enum Admitted {
+    /// a `ducktape:module` component, instantiated and ready to seat.
+    Module(Box<dyn Module>),
+    /// the bytes speak another world entirely: the registry entry is another
+    /// plane's commitment record, not an admission. The module boundary skips
+    /// it — see [`Host::realize_module_swaps`].
+    ForeignAbi,
 }
 
 /// sha256 content hash of component bytes — the verify side of a code swap.
@@ -248,7 +278,7 @@ pub struct BatchOutcome {
     /// input order, then the once-per-block injections.
     pub events: Vec<Event>,
     /// the dispatch trace from the once-per-block System injections
-    /// (`pending_lifecycle_advance` / `pending_deliveries`),
+    /// (`pending_modules_advance` / `pending_deliveries`),
     /// drained once after the members.
     pub system_dispatches: Vec<DispatchRecord>,
 }
@@ -544,6 +574,12 @@ pub struct Host {
     /// instantiates post-genesis ADMISSIONS at the activation boundary.
     /// `None` fails closed the moment an admission arms — never before.
     module_factory: Option<Box<dyn ModuleFactory>>,
+    /// `(module id, code hash)` pairs this boundary has already decided are
+    /// [`Admitted::ForeignAbi`] — THE LATCH. Deciding costs a component
+    /// compile and this boundary runs before EVERY block, so the answer (which
+    /// cannot change for a fixed pair) is paid, reported, and skipped from
+    /// then on. Per-node bookkeeping, never part of `root()`.
+    foreign_admissions: BTreeSet<(ModuleId, Vec<u8>)>,
 }
 
 impl Host {
@@ -551,11 +587,12 @@ impl Host {
         Self {
             registry: BTreeMap::new(),
             module_factory: None,
+            foreign_admissions: BTreeSet::new(),
         }
     }
 
     /// wire the constructor for post-genesis module admissions (the node
-    /// injects the wasm runtime's `from_bytes`; same shape as `CodeSource`).
+    /// injects its module composer; same shape as `CodeSource`).
     pub fn set_module_factory(&mut self, factory: Box<dyn ModuleFactory>) {
         self.module_factory = Some(factory);
     }
@@ -626,7 +663,7 @@ impl Host {
         }
     }
 
-    /// the SYSTEM-ORIGIN lifecycle `Advance` the drain injects in-block at a
+    /// the SYSTEM-ORIGIN modules registry `Advance` the drain injects in-block at a
     /// finalized code-swap boundary, or `None` when there is nothing to
     /// reconcile.
     ///
@@ -636,21 +673,21 @@ impl Host {
     /// state-sync-install also run, the committed active-hash flip +
     /// pending-swap clear reconstruct byte-for-byte on every node (never a
     /// respawn side-effect, invisible to replay). keyed purely on committed
-    /// lifecycle state + `height`: injected iff the committed module holds an
-    /// armed swap ([`lifecycle::ScheduledSwap::armed_at`] — readiness latched
+    /// registry state + `height`: injected iff the committed module holds an
+    /// armed swap ([`modules::ScheduledSwap::armed_at`] — readiness latched
     /// before `height`, floor reached). idempotent — the first block
     /// at/after `H` clears it, so later blocks inject nothing. ABSENT until
     /// the module is registered (the query errors → `None`), so the drain is
     /// byte-identical on a net without the module.
-    async fn pending_lifecycle_advance(&self, height: u64) -> Option<Msg> {
-        let swap_armed = self.lifecycle_module_status().await.is_some_and(|modules| {
+    async fn pending_modules_advance(&self, height: u64) -> Option<Msg> {
+        let swap_armed = self.module_status().await.is_some_and(|modules| {
             modules
                 .iter()
                 .any(|m| m.pending.as_ref().is_some_and(|p| p.armed_at(height)))
         });
         swap_armed.then(|| Msg {
-            target: LIFECYCLE_MODULE_ID.into(),
-            payload: lifecycle::encode_msg(&lifecycle::LifecycleMsg::Advance),
+            target: MODULES_ID.into(),
+            payload: modules::encode_msg(&modules::ModulesMsg::Advance),
         })
     }
 
@@ -689,17 +726,17 @@ impl Host {
         self.pending_deliveries().await.is_some()
     }
 
-    /// the lifecycle module's committed per-module code state, or `None` when the
+    /// the modules registry's committed per-module code state, or `None` when the
     /// module is absent / its reply is unreadable — the shared out-of-block
-    /// committed read behind [`Host::pending_lifecycle_advance`] and
+    /// committed read behind [`Host::pending_modules_advance`] and
     /// [`Host::realize_module_swaps`] (a missing registry is never an error,
     /// just nothing to do). `pub` for the node's restore/sync composers, which
     /// adopt the modules the registry admitted after genesis.
-    pub async fn lifecycle_module_status(&self) -> Option<Vec<lifecycle::ModuleCode>> {
-        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
-        let bytes = self.query(LIFECYCLE_MODULE_ID, &req).await.ok()?;
-        match lifecycle::decode_reply(&bytes).ok()? {
-            lifecycle::LifecycleReply::ModuleStatus { modules } => Some(modules),
+    pub async fn module_status(&self) -> Option<Vec<modules::ModuleCode>> {
+        let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
+        let bytes = self.query(MODULES_ID, &req).await.ok()?;
+        match modules::decode_reply(&bytes).ok()? {
+            modules::ModulesReply::ModuleStatus { modules } => Some(modules),
             _ => None,
         }
     }
@@ -720,13 +757,13 @@ impl Host {
     /// reconcile every hot-swappable module's RUNNING code against the code
     /// registry's committed decision for block `height`, realizing any swap that
     /// has armed. this is the per-node, NON-consensus half of a live code update;
-    /// the consensus half is the in-block [`Host::pending_lifecycle_advance`] tick
+    /// the consensus half is the in-block [`Host::pending_modules_advance`] tick
     /// that flips the committed active hash into the root-hash. code is invisible
     /// to `root()`, so a swap keeps the module's state and the root-hash is
     /// byte-continuous across it.
     ///
     /// keyed PURELY on committed registry state + `height` — the code the
-    /// registry designates FOR `height` ([`lifecycle::code_at`]) — so it
+    /// registry designates FOR `height` ([`modules::code_at`]) — so it
     /// reconstructs identically on every path that advances a node to a
     /// committed state: live drain, recovery replay, state-sync catch-up. it
     /// is idempotent: it compares [`Module::code_hash`] and re-instantiates a
@@ -736,7 +773,7 @@ impl Host {
     ///
     /// the target hash for a module at `height` is a pending hash that has
     /// armed (`ScheduledSwap::armed_at` — the SAME predicate
-    /// lifecycle's `Advance` applies, so this out-of-block realization and the
+    /// the modules registry's `Advance` applies, so this out-of-block realization and the
     /// in-block flip never disagree on the arm set; on the live drain the
     /// registry sits at `height - 1` and this is the read that precedes the
     /// flip), else the latest ACTIVATION at or before `height`. the registry is
@@ -754,16 +791,22 @@ impl Host {
     /// sha256 does not match the committed hash, is a hard error (the node cannot
     /// honestly apply `height` without the agreed code) — it returns `Err` with no
     /// partial swap applied. ABSENT registry → nothing to reconcile, `Ok(())`.
+    ///
+    /// The one thing that is NOT an admission is code that speaks another
+    /// world ([`Admitted::ForeignAbi`]): the registry is id-generic and other
+    /// planes commit their hash-pinned components through it, so such an entry
+    /// is skipped and latched ([`Host::skip_foreign_admission`]) rather than
+    /// halting every block on every node forever.
     pub async fn realize_module_swaps(
         &mut self,
         height: u64,
         src: &dyn CodeSource,
     ) -> Result<(), Error> {
-        let Some(modules) = self.lifecycle_module_status().await else {
+        let Some(modules) = self.module_status().await else {
             return Ok(());
         };
         for m in modules {
-            let Some(target) = lifecycle::code_at(&m, height) else {
+            let Some(target) = modules::code_at(&m, height) else {
                 continue; // registered, never activated — nothing to realize.
             };
             // only reconcile a module this node actually runs AS a hot-swappable
@@ -781,13 +824,31 @@ impl Host {
             if current.as_deref() == Some(target) {
                 continue; // already on the designated code — idempotent no-op.
             }
-            let bytes = src.fetch(target).await.ok_or_else(|| {
-                Error::Module(format!(
+            let decided_foreign = self
+                .foreign_admissions
+                .contains(&(m.module_id.clone(), target.to_vec()));
+            if decided_foreign {
+                continue; // another plane's record, already answered — see the latch.
+            }
+            let Some(bytes) = src.fetch(target).await else {
+                // the ONE line that precedes the fatal: a fail-closed miss is
+                // terminal, so this fires at most once per node lifetime and
+                // names both the hash and the source that could not serve it.
+                tracing::error!(
+                    target: "ducktape::modules",
+                    event = "module_code_unresolved",
+                    reason = "code_bytes_absent",
+                    module = %m.module_id,
+                    code_hash = %hex32(target),
+                    source = src.origin(),
+                    "committed module code is unavailable — the boundary fails closed"
+                );
+                return Err(Error::Module(format!(
                     "code bytes absent for module {} (hash {}) — fail-closed",
                     m.module_id,
                     hex32(target),
-                ))
-            })?;
+                )));
+            };
             if sha256(&bytes) != target {
                 return Err(Error::Module(format!(
                     "code bytes for module {} do not match committed hash {} — fail-closed",
@@ -809,7 +870,11 @@ impl Host {
                             m.module_id,
                         )));
                     };
-                    let module = factory.instantiate(&m.module_id, &bytes)?;
+                    let Admitted::Module(module) = factory.instantiate(&m.module_id, &bytes).await?
+                    else {
+                        self.skip_foreign_admission(&m.module_id, target);
+                        continue;
+                    };
                     if module.id() != m.module_id {
                         return Err(Error::Module(format!(
                             "module factory instantiated `{}` for admission `{}` — fail-closed",
@@ -822,6 +887,30 @@ impl Host {
             }
         }
         Ok(())
+    }
+
+    /// latch one `(id, code hash)` pair as another plane's record and say so
+    /// ONCE. The registry admits any id: the reachability plane's
+    /// `ducktape:netstack` guest is delivered through the very same record,
+    /// and a boundary that treated it as a module admission would fail closed
+    /// on every node, on every block, forever — a halted chain, not a refused
+    /// swap. The code it commits is realized by whatever plane owns that id
+    /// (netstack: its own non-blocking reconciler), never here.
+    fn skip_foreign_admission(&mut self, module_id: &str, code_hash: &[u8]) {
+        let newly_decided = self
+            .foreign_admissions
+            .insert((module_id.to_string(), code_hash.to_vec()));
+        if !newly_decided {
+            return;
+        }
+        tracing::warn!(
+            target: "ducktape::modules",
+            reason = "foreign_module_abi",
+            module = %module_id,
+            code_hash = %hex32(code_hash),
+            "the code this registry entry commits is not a `ducktape:module` — the module \
+             boundary skips it and keeps sealing"
+        );
     }
 
     /// the current root-hash: [`global_root`] over the registered modules.
@@ -1174,11 +1263,11 @@ impl Host {
         // 1. the once-per-block System injections, computed ONCE against PRE-batch
         // committed state — the "results staged by this very block are invisible
         // here" invariant, evaluated BEFORE any member stages. same order as the
-        // single-op drain: the lifecycle `Advance` (one tick reconciling every
+        // single-op drain: the registry `Advance` (one tick reconciling every
         // armed code swap), then `DeliverPending`. drained once, after every
         // member, below (step 4).
         let mut injections: VecDeque<(Origin, Msg)> = VecDeque::new();
-        if let Some(advance) = self.pending_lifecycle_advance(height).await {
+        if let Some(advance) = self.pending_modules_advance(height).await {
             injections.push_back((Origin::System, advance));
         }
         if let Some(deliver) = self.pending_deliveries().await {
@@ -1417,7 +1506,7 @@ impl Host {
         let mut queue: VecDeque<(Origin, Msg)> = VecDeque::from([(ctx.origin, msg)]);
 
         // DETERMINISTIC ACTIVATION INJECTION. at a finalized boundary where the
-        // committed `lifecycle` module holds an armed code swap, append EXACTLY
+        // committed `modules` registry holds an armed code swap, append EXACTLY
         // ONE System-origin `Advance` so the module reconciles its own
         // root-hashed state in-block (flip every armed active hash — the
         // consensus commitment to the new code; the actual component swap is
@@ -1425,8 +1514,8 @@ impl Host {
         // (not the respawn side-path), so live, recovery-replay, and state-sync
         // nodes all reconstruct it byte-for-byte, and it frees the
         // at-most-one-pending slot after activation. INERT until the module is
-        // registered — `pending_lifecycle_advance` returns `None` when absent.
-        if let Some(advance) = self.pending_lifecycle_advance(height).await {
+        // registered — `pending_modules_advance` returns `None` when absent.
+        if let Some(advance) = self.pending_modules_advance(height).await {
             queue.push_back((Origin::System, advance));
         }
         // DETERMINISTIC DELIVERY INJECTION: when the committed dispatch

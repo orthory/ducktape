@@ -352,6 +352,18 @@ pub async fn leave_huddle(
     .await
 }
 
+/// WHO A SEND'S `@handles` MAY REACH: the network's ACCOUNT DIRECTORY unioned
+/// with this room's explicit roster.
+///
+/// The roster alone was the whole answer, and the UI resets it to `[]` for
+/// every open-policy channel (only a members-only room ever loads one) — so
+/// `@orthory` in `#general`, the room everybody actually writes in, parsed as
+/// plain text and minted no `Mark::Mention` for the module to fan out. The
+/// directory is a person's name wherever they can be read.
+async fn mention_candidates(rpc: &RpcClient, members: &[ChatMember]) -> MentionCandidates {
+    MentionCandidates::new(&account_names(rpc).await, members)
+}
+
 pub async fn send_message(
     rpc: String,
     password: String,
@@ -375,7 +387,10 @@ pub async fn send_message(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: required_id(message_id, "message")?,
-                blocks: parse_message_with_members(&body, &members),
+                blocks: parse_message_with_mentions(
+                    &body,
+                    &mention_candidates(&rpc, &members).await,
+                ),
                 thread: None,
                 as_agent: None,
             }),
@@ -522,7 +537,10 @@ pub async fn send_reply(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: message_id.clone(),
-                blocks: parse_message_with_members(&body, &members),
+                blocks: parse_message_with_mentions(
+                    &body,
+                    &mention_candidates(&rpc, &members).await,
+                ),
                 thread: Some(root_seq),
                 as_agent: None,
             }),
@@ -568,7 +586,10 @@ pub async fn edit_message(
             chat::encode_msg(&ChatMsg::EditMessage {
                 channel_id: channel_id.clone(),
                 seq,
-                blocks: parse_message_with_members(&body, &members),
+                blocks: parse_message_with_mentions(
+                    &body,
+                    &mention_candidates(&rpc, &members).await,
+                ),
                 base_rev: Some(base_rev),
             }),
             password,

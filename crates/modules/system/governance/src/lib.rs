@@ -92,7 +92,7 @@ use identity::{
     IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
     encode_query as identity_encode_query,
 };
-use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode_msg};
+use modules::{ModulesMsg, encode_msg as modules_encode_msg};
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
@@ -212,7 +212,7 @@ pub struct Governance {
     /// the id of the valset module this governance instance gates. genesis
     /// wiring — identical on every node.
     valset_id: ModuleId,
-    /// the id of the lifecycle module a passing `UpdateModule`/`CancelModuleUpdate`
+    /// the id of the modules registry a passing `UpdateModule`/`CancelModuleUpdate`
     /// authorizes (the code-registry path — the same module, gated separately).
     /// genesis wiring — identical on every node; `None` (a net without the code
     /// registry wired) rejects those proposals at the door, deterministically.
@@ -263,7 +263,7 @@ impl Governance {
     }
 
     /// enable the code-registry path (`UpdateModule`/`CancelModuleUpdate`) on the
-    /// lifecycle module. genesis wiring — every node of a network must wire the
+    /// modules registry. genesis wiring — every node of a network must wire the
     /// same id (or none), or nodes diverge on whether those proposals are
     /// accepted.
     pub fn with_code_registry(mut self, id: impl Into<ModuleId>) -> Self {
@@ -721,7 +721,7 @@ impl Governance {
         // module-update authorizations: shape-checked at the door (a proposal
         // that can never execute is rejected here, not at tally time); the code
         // registry's min-lead / at-most-one / no-op gates are NOT duplicated —
-        // the lifecycle module is their sole authority at ingest. a net without a
+        // the modules registry is their sole authority at ingest. a net without a
         // wired code registry deterministically rejects these (genesis wiring is
         // identical on every node).
         if let GovAction::UpdateModule {
@@ -747,11 +747,11 @@ impl Governance {
         }
         if let GovAction::UpdateModule { code_hash, .. }
         | GovAction::RegisterModule { code_hash, .. } = &action
-            && code_hash.len() != lifecycle::CODE_HASH_LEN
+            && code_hash.len() != modules::CODE_HASH_LEN
         {
             return Err(Error::Module(format!(
                 "code_hash must be {} bytes (sha256 of the component)",
-                lifecycle::CODE_HASH_LEN
+                modules::CODE_HASH_LEN
             )));
         }
         // acl policy authorizations: shape-checked at the door like the module
@@ -954,9 +954,9 @@ impl Governance {
                     activation_height,
                     code_hash,
                 } => match &self.code_registry_id {
-                    Some(lifecycle) => ctx.emit_msg(Msg {
-                        target: lifecycle.clone(),
-                        payload: lifecycle_encode_msg(&LifecycleMsg::ScheduleSwap {
+                    Some(registry) => ctx.emit_msg(Msg {
+                        target: registry.clone(),
+                        payload: modules_encode_msg(&ModulesMsg::ScheduleSwap {
                             name: name.clone(),
                             module_id: module_id.clone(),
                             activation_height: *activation_height,
@@ -974,9 +974,9 @@ impl Governance {
                     activation_height,
                     code_hash,
                 } => match &self.code_registry_id {
-                    Some(lifecycle) => ctx.emit_msg(Msg {
-                        target: lifecycle.clone(),
-                        payload: lifecycle_encode_msg(&LifecycleMsg::ScheduleRegister {
+                    Some(registry) => ctx.emit_msg(Msg {
+                        target: registry.clone(),
+                        payload: modules_encode_msg(&ModulesMsg::ScheduleRegister {
                             name: name.clone(),
                             module_id: module_id.clone(),
                             activation_height: *activation_height,
@@ -986,9 +986,9 @@ impl Governance {
                     None => proposal.status = ProposalStatus::Rejected,
                 },
                 GovAction::CancelModuleUpdate { name, module_id } => match &self.code_registry_id {
-                    Some(lifecycle) => ctx.emit_msg(Msg {
-                        target: lifecycle.clone(),
-                        payload: lifecycle_encode_msg(&LifecycleMsg::CancelSwap {
+                    Some(registry) => ctx.emit_msg(Msg {
+                        target: registry.clone(),
+                        payload: modules_encode_msg(&ModulesMsg::CancelSwap {
                             name: name.clone(),
                             module_id: module_id.clone(),
                         }),

@@ -1652,8 +1652,11 @@ mod tests {
     #[tokio::test]
     async fn wire_readvertise_supersedes_stale_mapping_over_the_real_udp_path() {
         // The nonce-gated rebind must be reachable over the LIVE protocol, not
-        // only via the in-process `Coordinator::readvertise` API: a rebound node
-        // sends `Msg::Readvertise` over UDP and a peer re-resolves the new mapping.
+        // only via the in-process `Coordinator::readvertise` API: a member
+        // sends `Msg::Readvertise` over UDP and a peer re-resolves against it.
+        // A DIFFERENT socket's Readvertise for the same key — an on-path
+        // replay of a captured keepalive, or a genuine NAT rebind; the wire
+        // cannot tell them apart — must NOT hijack the live mapping.
         let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let coord_addr = coord_sock.local_addr().unwrap();
         tokio::spawn(run_coordinator(
@@ -1676,9 +1679,20 @@ mod tests {
             .expect("lookup a");
         assert_eq!(a_first.port(), a.local_addr().await.unwrap().port());
 
-        // A rebinds: model the fresh reflexive with a NEW socket, and republish it
-        // over the wire under a strictly-higher nonce. The coordinator observes
-        // the new socket's source and must supersede the stale mapping.
+        // A keepalives from its OWN socket under a higher nonce over the wire:
+        // the mapping's nonce advances, and B keeps resolving A's real socket.
+        a.readvertise(1).await.unwrap();
+        let a_second = timeout(Duration::from_secs(2), b.lookup(a_key))
+            .await
+            .expect("no timeout")
+            .expect("lookup a after keepalive");
+        assert_eq!(
+            a_second.port(),
+            a_first.port(),
+            "the wire Readvertise superseded the stale nonce, not the source"
+        );
+
+        // A DIFFERENT socket sends a higher-nonce Readvertise for A's key.
         let a2 = NatClient::bind(a_key, vec![coord_addr], a_signer, None)
             .await
             .unwrap();
@@ -1686,28 +1700,21 @@ mod tests {
         assert_ne!(
             a2_port,
             a_first.port(),
-            "the rebound socket has a fresh port"
+            "a2 is a genuinely different socket"
         );
-        a2.readvertise(1).await.unwrap();
+        a2.readvertise(2).await.unwrap();
 
-        // B re-resolves and now sees A's NEW mapping, not the stale one. Poll to
-        // absorb cross-socket datagram-scheduling jitter (bounded).
-        let mut resolved = None;
-        for _ in 0..50 {
-            if let Ok(Ok(addr)) = timeout(Duration::from_millis(100), b.lookup(a_key)).await
-                && addr.port() == a2_port
-            {
-                resolved = Some(addr);
-                break;
+        // Poll to absorb cross-socket datagram-scheduling jitter (bounded): the
+        // lookup must keep resolving A's ORIGINAL socket, never a2's.
+        for _ in 0..20 {
+            if let Ok(Ok(addr)) = timeout(Duration::from_millis(100), b.lookup(a_key)).await {
+                assert_eq!(
+                    addr.port(),
+                    a_first.port(),
+                    "a different-source Readvertise must never hijack the live mapping"
+                );
             }
         }
-        let new = resolved.expect("B must re-resolve A's superseding mapping over the wire");
-        assert_eq!(new.port(), a2_port);
-        assert_ne!(
-            new.port(),
-            a_first.port(),
-            "the wire Readvertise superseded the stale mapping end-to-end"
-        );
     }
 
     #[tokio::test]

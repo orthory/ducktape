@@ -153,7 +153,7 @@ impl Valset {
     /// publish the staged genesis seed in one batch — idempotent: a store
     /// that already carries a generation counter (a reopened workspace
     /// re-entering the genesis path) is left byte-untouched, exactly like
-    /// lifecycle's `finish_seed`. the gate keys on [`GENERATION_KEY`] rather
+    /// the modules registry's `finish_seed`. the gate keys on [`GENERATION_KEY`] rather
     /// than the validator tier because an EMPTY genesis set still commits
     /// the counter (and no snapshot) — the counter record is the one write
     /// every genesis performs.

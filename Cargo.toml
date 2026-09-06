@@ -28,7 +28,7 @@
 #                      does not belongs somewhere else in this list. (module =
 #                      onchain, service = offchain.)
 #   crates/modules/system/ — system modules: consensus infrastructure (acl,
-#                      kv, valset, governance, identity, lifecycle, saga,
+#                      kv, valset, governance, identity, modules, saga,
 #                      capability, dispatch, tagging, gateway — which absorbed
 #                      the duckdns naming library it now consumes from
 #                      crates/duckdns)
@@ -115,7 +115,7 @@ members = [
     "crates/modules/system/valset",
     "crates/modules/system/governance",
     "crates/modules/system/identity",
-    "crates/modules/system/lifecycle",
+    "crates/modules/system/modules",
     "crates/modules/system/saga",
     "crates/modules/system/capability",
     "crates/modules/system/dispatch",
@@ -340,7 +340,7 @@ acl = { path = "crates/modules/system/acl" }
 valset = { path = "crates/modules/system/valset" }
 governance = { path = "crates/modules/system/governance" }
 identity = { path = "crates/modules/system/identity" }
-lifecycle = { path = "crates/modules/system/lifecycle" }
+modules = { path = "crates/modules/system/modules" }
 saga = { path = "crates/modules/system/saga" }
 capability = { path = "crates/modules/system/capability" }
 dispatch = { path = "crates/modules/system/dispatch" }

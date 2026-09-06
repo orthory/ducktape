@@ -7,7 +7,7 @@
 //! every `always` skill inlined in full (this is where the retired
 //! `prompt_hash` blob's text now lives), then an INDEX of the on-demand ones
 //! (name, description, where to read the body), then the ambient tool-plane
-//! instruction. one document, one delivery — capability-host decides the door
+//! instruction. one document, one delivery — the provider decides the door
 //! (the CLI's auto-load path, or the stdin prompt).
 //!
 //! PURE on purpose: no fs, no duckfs, no `SkillRef`. the provisioner (the only

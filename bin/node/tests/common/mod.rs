@@ -58,11 +58,12 @@ pub fn founding_set() -> &'static str {
     })
 }
 
-/// the beat every harness node runs at (node.toml `block_time_ms`). the suites
-/// wait on block counts — checkpoints, epochs, finalization — so their
-/// wall-clock scales 1:1 with it, and every simplex timer scales with it too:
-/// the number is a policy choice for the whole lane, not a tuning of any one
-/// wait.
+/// the beat every harness network is FOUNDED at (`node init --block-time-ms`,
+/// which lands in the descriptor); a joiner inherits it off the invite and has
+/// no flag of its own. the suites wait on block counts — checkpoints, epochs,
+/// finalization — so their wall-clock scales 1:1 with it, and every simplex
+/// timer scales with it too: the number is a policy choice for the whole lane,
+/// not a tuning of any one wait.
 pub const TEST_BLOCK_TIME_MS: u64 = 100;
 
 /// A cluster's storage root, named so an ABANDONED one can be found and swept.
@@ -86,7 +87,7 @@ pub const TEST_BLOCK_TIME_MS: u64 = 100;
 /// process is gone. A LIVE pid is never touched (sibling test binaries run
 /// concurrently), and pid reuse only makes the sweep skip a directory — it can
 /// never make it delete a live one.
-fn e2e_tempdir(tag: &str) -> tempfile::TempDir {
+pub fn e2e_tempdir(tag: &str) -> tempfile::TempDir {
     sweep_abandoned_e2e_dirs();
     tempfile::Builder::new()
         .prefix(&format!("ducktape-e2e-{}-{tag}-", std::process::id()))
@@ -141,12 +142,14 @@ pub struct NodeProc {
     pub id: u64,
     child: Child,
     pub log: PathBuf,
+    /// what this process is, for a wait's panic message.
+    what: String,
     feed: Arc<OutputFeed>,
 }
 
 impl NodeProc {
     /// spawn `cmd` as process `id`, its output draining into `log` and the feed.
-    fn spawn(id: u64, log: PathBuf, mut cmd: Command, what: &str) -> Self {
+    pub fn spawn(id: u64, log: PathBuf, mut cmd: Command, what: &str) -> Self {
         let (reader, writer) = std::io::pipe().expect("pipe for the process output");
         let stderr = writer.try_clone().expect("clone the pipe's write end");
         let child = cmd
@@ -171,6 +174,7 @@ impl NodeProc {
             id,
             child,
             log,
+            what: what.to_string(),
             feed,
         }
     }
@@ -179,6 +183,42 @@ impl NodeProc {
     fn wait_marker(&self, marker: &str, deadline: Instant) -> Result<String, Unanswered> {
         self.feed
             .wait(deadline, |unseen| find_marker(unseen, marker))
+    }
+
+    /// block until ONE line carries EVERY needle, and answer with that line.
+    ///
+    /// Matches against [`strip_ansi`]ed text: a `key=value` needle can never
+    /// match the raw bytes, because the node's stderr colours every field name
+    /// and its `=` separately.
+    pub fn expect_line(&self, needles: &[&str], timeout: Duration) -> String {
+        self.expect_line_where(&format!("one line carrying all of {needles:?}"), timeout, |line| {
+            needles.iter().all(|needle| line.contains(needle))
+        })
+    }
+
+    /// block until an ANSI-stripped line satisfies `accept`, and answer with
+    /// that line; `wanted` names it in the panic when the process never does.
+    pub fn expect_line_where(
+        &self,
+        wanted: &str,
+        timeout: Duration,
+        accept: impl Fn(&str) -> bool,
+    ) -> String {
+        self.feed
+            .wait(Instant::now() + timeout, |unseen| {
+                strip_ansi(unseen)
+                    .lines()
+                    .find(|line| accept(line))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|why| {
+                panic!(
+                    "{} {} without printing {wanted};\n{}",
+                    self.what,
+                    why.verb(),
+                    self.tail(60)
+                )
+            })
     }
 
     /// which of `markers` a line carried first.
@@ -191,6 +231,25 @@ impl NodeProc {
         })
     }
 
+    /// block until `marker` has appeared at least `count` times in total.
+    ///
+    /// every offered slice is counted exactly once (the feed only ever
+    /// offers a line to a probe once — see `OutputFeed::wait`), so this
+    /// tallies markers across repeated wakes rather than re-scanning from
+    /// the top each time.
+    fn wait_marker_count(
+        &self,
+        marker: &str,
+        count: usize,
+        deadline: Instant,
+    ) -> Result<usize, Unanswered> {
+        let mut seen = 0usize;
+        self.feed.wait(deadline, |unseen| {
+            seen += unseen.lines().filter(|line| line.contains(marker)).count();
+            (seen >= count).then_some(seen)
+        })
+    }
+
     /// block until the process closes its output — it exited — then reap it.
     fn wait_exit(&mut self, deadline: Instant) -> Result<std::process::ExitStatus, Unanswered> {
         self.feed.wait_closed(deadline)?;
@@ -200,6 +259,14 @@ impl NodeProc {
     /// everything the process has written so far.
     fn text(&self) -> String {
         self.feed.text()
+    }
+
+    /// how many lines printed so far contain `marker`.
+    fn marker_count(&self, marker: &str) -> usize {
+        self.text()
+            .lines()
+            .filter(|line| line.contains(marker))
+            .count()
     }
 
     /// the last `lines` lines the process wrote.
@@ -667,8 +734,6 @@ impl NetworkShapeCluster {
                 // LIVE public coordinator from inside the test.
                 "--primary-coordinator",
                 "none",
-                "--block-time-ms",
-                &TEST_BLOCK_TIME_MS.to_string(),
             ])
             .output()
             .expect("run join")
@@ -922,6 +987,31 @@ impl NetworkShapeCluster {
             .unwrap_or_else(|why| {
                 panic!(
                     "network-shape node idx {idx} {} without printing {marker:?};\n{}",
+                    why.verb(),
+                    self.all_log_tails(60),
+                )
+            })
+    }
+
+    /// how many times node `idx` has printed `marker` so far.
+    pub fn marker_count(&self, idx: usize, marker: &str) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.marker_count(marker)
+    }
+
+    /// wait until node `idx` has printed `marker` at least `count` times.
+    pub fn wait_marker_count(
+        &self,
+        idx: usize,
+        marker: &str,
+        count: usize,
+        timeout: Duration,
+    ) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.wait_marker_count(marker, count, Instant::now() + timeout)
+            .unwrap_or_else(|why| {
+                panic!(
+                    "network-shape node idx {idx} {} before printing {marker:?} {count} times;\n{}",
                     why.verb(),
                     self.all_log_tails(60),
                 )
@@ -1511,6 +1601,13 @@ impl Cluster {
             })
     }
 
+    /// how many times node `idx` has printed `marker` so far — the ABSENCE
+    /// assertion `wait_marker` cannot express.
+    pub fn marker_count(&self, idx: usize, marker: &str) -> usize {
+        let node = self.nodes[idx].as_ref().expect("node is running");
+        node.marker_count(marker)
+    }
+
     /// wait until node `idx`'s COMPUTE DAEMON prints a line containing `marker`.
     ///
     /// The compute plane is a SEPARATE PROCESS with its own failure domain, and
@@ -1537,6 +1634,22 @@ impl Cluster {
                     daemon.tail(60),
                 )
             })
+    }
+
+    /// every value that followed `marker` on a line of node `idx`'s COMPUTE
+    /// DAEMON output, in the order the daemon printed them.
+    ///
+    /// unlike `wait_compute_marker` (blocks for the FIRST match) this reads
+    /// what the continuously-drained feed already holds: a fact this quick to
+    /// fire and this transient on disk — a run dir materializes and is
+    /// cleaned up inside one run — can only be witnessed as an event stream,
+    /// never a filesystem sample that might land between the create and the
+    /// cleanup. See `portable_workspace_e2e`'s `materialized_dirs`.
+    pub fn compute_markers(&self, idx: usize, marker: &str) -> Vec<String> {
+        let daemon = self.daemons[idx]
+            .as_ref()
+            .expect("node has a compute daemon (set `compute_grant` before spawn)");
+        extract_markers(&daemon.text(), marker)
     }
 
     /// Wait until `probe` answers, re-evaluating it on node `idx`'s heartbeat.
@@ -2042,11 +2155,53 @@ impl BlockFeed {
     }
 }
 
+/// Drop every ANSI escape sequence from `text`.
+///
+/// The node's stderr layer colours unconditionally — it never consults a tty —
+/// so a captured line reads `phase\x1b[0m\x1b[2m=\x1b[0m"serving"`, and any
+/// assertion on a `field=value` pair has to strip first. Message text is
+/// uncoloured, which is why the marker waits above never needed this.
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI (`ESC [`) runs to a final byte in `@`..=`~`; any other escape is
+        // two characters, and its second one was just consumed.
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn find_marker(text: &str, marker: &str) -> Option<String> {
     text.lines().find_map(|line| {
         line.find(marker)
             .map(|at| line[at + marker.len()..].trim().to_string())
     })
+}
+
+/// every value that followed `marker` on a line of `text`, ANSI-stripped
+/// first: unlike a message-only marker, `compute_markers` reads lines that
+/// can carry a coloured field list after the message (see `compute_markers`
+/// on `Cluster`), so slicing on the raw bytes risks handing back escape
+/// codes instead of the bare value.
+fn extract_markers(text: &str, marker: &str) -> Vec<String> {
+    strip_ansi(text)
+        .lines()
+        .filter_map(|line| {
+            line.find(marker)
+                .map(|at| line[at + marker.len()..].trim().to_string())
+        })
+        .collect()
 }
 
 fn log_tail(text: &str, lines: usize) -> String {
@@ -2222,4 +2377,23 @@ pub fn add_key(
         USER_LANE_FINALIZE,
         || account_of_key(cluster, idx, &joining),
     )
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::extract_markers;
+
+    #[test]
+    fn extract_markers_strips_ansi_before_slicing() {
+        // shaped like a real fmt-layer capture: coloured level/target ANSI
+        // ahead of the message, then a trailing coloured field the message
+        // itself does not carry (e.g. another field on the same event).
+        // The marker sits in the plain-text message, but a naive byte slice
+        // to end-of-line would still hand back the trailing escape codes —
+        // extract_markers must return the bare path only.
+        let line = "\x1b[2m2026-09-05\x1b[0m \x1b[34mDEBUG\x1b[0m run dir materialized \
+                     kind=rw path=/tmp/run-1\x1b[2m note\x1b[0m\x1b[2m=\x1b[0mok";
+        let got = extract_markers(line, "run dir materialized kind=rw path=");
+        assert_eq!(got, vec!["/tmp/run-1 note=ok".to_string()]);
+    }
 }

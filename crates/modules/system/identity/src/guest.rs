@@ -47,6 +47,10 @@ const MODULE_ID: &str = "identity";
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Identity,
+    shape: guest_adapter::host::ModuleShape {
+        config: vec![sdk::genesis_config::CHAIN_ID.into()],
+        ..guest_adapter::store_shape()
+    },
     new: Identity::new(
         MODULE_ID,
         Box::new(WitStore),

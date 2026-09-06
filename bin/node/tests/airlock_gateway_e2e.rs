@@ -16,6 +16,11 @@
 //! The session-key handshake is load-bearing HERE: the quote is fetched and
 //! verified OVER the untrusted overlay before any token is derived, so a relaying
 //! node cannot substitute its key or read the token.
+//!
+//! Real quote verification is the opt-in `verify` feature (off by default);
+//! this whole file compiles out without it. Run with
+//! `cargo test -p node-bin --test airlock_gateway_e2e --features verify`.
+#![cfg(feature = "verify")]
 
 mod common;
 

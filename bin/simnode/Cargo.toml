@@ -46,6 +46,10 @@ duckfs-core = { workspace = true }
 # scenario sees the module breadcrumbs a wasm guest has no other way to emit.
 noded = { path = "../../crates/noded" }
 tracing = { workspace = true }
+# `boot` calls `enable_compilation_cache` when DUCKTAPE_WASM_CACHE_DIR is set:
+# the sim suite's 13-plus test binaries all compile the same genesis, so the
+# cache is shared across them. A real node never calls this hook.
+wasm-host = { workspace = true }
 # the replication layer: the sim actor runs on `OrderedNode<StepOrderer,
 # NullSink>` — the SAME apply/drain/projection engine the validator uses, with
 # a scripted FIFO orderer and a logical-clock time policy. `sim` toggles the

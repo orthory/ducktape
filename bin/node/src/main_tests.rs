@@ -7,18 +7,13 @@ use sdk::{Ctx, Error, Module, StateSyncHandle};
 use std::sync::{Arc, Mutex};
 
 #[test]
-fn gateway_requires_a_loopback_node_api_and_real_overlay() {
+fn gateway_requires_a_running_node_and_a_real_overlay() {
     let wireguard = Some("127.0.0.1:51820".parse().unwrap());
-    assert!(gateway_can_start(
-        false,
-        Some("127.0.0.1:0"),
-        Some("127.0.0.1:8844"),
-        wireguard,
-    ));
+    assert!(gateway_can_start(false, Some("127.0.0.1:0"), wireguard));
     for allowed in [
-        gateway_can_start(false, Some("127.0.0.1:0"), Some("0.0.0.0:8844"), wireguard),
-        gateway_can_start(true, Some("127.0.0.1:0"), Some("127.0.0.1:8844"), wireguard),
-        gateway_can_start(false, Some("127.0.0.1:0"), Some("127.0.0.1:8844"), None),
+        gateway_can_start(true, Some("127.0.0.1:0"), wireguard),
+        gateway_can_start(false, None, wireguard),
+        gateway_can_start(false, Some("127.0.0.1:0"), None),
     ] {
         assert!(!allowed);
     }
@@ -706,6 +701,7 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
             disposition: node::Disposition::Applied,
             root_hash,
             dispatches: &dispatches,
+            roots: &[],
         },
     )
     .expect("an applied non-nop batch rebuilds its row");
@@ -756,6 +752,7 @@ fn boot_fold_skips_nop_and_undecodable_frames() {
                     disposition: node::Disposition::Applied,
                     root_hash: test_root(1),
                     dispatches: &[],
+                    roots: &[],
                 },
             )
             .is_none()
@@ -786,6 +783,7 @@ fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
             disposition: node::Disposition::Rejected,
             root_hash: test_root(2),
             dispatches: &[],
+            roots: &[],
         },
     )
     .expect("a decoded non-nop reject still shows in the explorer");

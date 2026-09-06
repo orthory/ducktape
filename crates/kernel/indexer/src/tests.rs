@@ -220,7 +220,7 @@ fn scan_pages_with_cursor() {
 
 #[test]
 fn an_undeclared_modules_ops_are_skipped_not_poisoned() {
-    // a module admitted after boot (lifecycle register) has no database
+    // a module admitted after boot (modules register) has no database
     // here: its ops write nothing, every declared module's watermark still
     // advances past the block, and the store keeps taking writes.
     let dir = tempfile::tempdir().unwrap();
@@ -972,7 +972,7 @@ fn an_interrupted_refold_is_re_run_whole_by_the_next_open() {
         assert_eq!(store.fold_tip("chat").unwrap(), Some((5, 0)));
 
         // the wreckage of a refold that died after its clear.
-        let db = &store.modules.get("chat").expect("chat is open").db;
+        let db = &store.db("chat").expect("chat is open");
         db.delete(META_GUEST).unwrap();
         clear_derived(db).unwrap();
         assert_eq!(

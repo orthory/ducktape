@@ -24,7 +24,7 @@ use crate::explorer::{
     boundary_block_row, heal_and_backfill_index, heal_index, retry_owed_backfill,
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
-use crate::host_state::{NodeSubstrates, restore_host, sync_all_modules};
+use crate::host_state::{NetworkBindings, NodeSubstrates, restore_host, sync_all_modules};
 use crate::relay;
 use crate::relay_runtime;
 use crate::replica;
@@ -253,25 +253,16 @@ async fn publish_replica_status(
     metrics.update_storage(
         ckpt_height.unwrap_or_default(),
         index.is_poisoned(),
-        MODULE_IDS.iter().map(|module| {
-            (
-                (*module).to_string(),
-                index.applied_height(module).unwrap_or_default(),
-            )
+        index.module_ids().into_iter().map(|module| {
+            let height = index.applied_height(&module).unwrap_or_default();
+            (module, height)
         }),
     );
     let (height, root_hash, modules) = match serving {
         Some((height, host)) => (
             height,
             hex(&host.root_hash()),
-            MODULE_IDS
-                .iter()
-                .map(|m| noded::ModuleStatus {
-                    id: (*m).into(),
-                    root: host.module_root(m).map(|r| hex(&r)).unwrap_or_default(),
-                    category: noded::ModuleCategory::of(m),
-                })
-                .collect(),
+            crate::util::module_statuses(host),
         ),
         None => (0, String::new(), Vec::new()),
     };
@@ -306,6 +297,7 @@ pub(super) async fn park(
     signer: ed25519::PrivateKey,
     label: String,
     namespace: Vec<u8>,
+    identity_chain_id: String,
     peers: Vec<ed25519::PublicKey>,
     validators: Vec<ed25519::PublicKey>,
     wireguard_listen: Option<std::net::SocketAddr>,
@@ -336,7 +328,7 @@ pub(super) async fn park(
     forge_repo: std::path::PathBuf,
     duckfs_dir: std::path::PathBuf,
     manifest: &Option<Manifest>,
-    recovery: Recovery<commonware_runtime::tokio::Context>,
+    mut recovery: Recovery<commonware_runtime::tokio::Context>,
     genesis: &crate::config::GenesisModules,
 ) -> crate::validator::PromotionBaton {
     let ReplicaChannels {
@@ -514,6 +506,11 @@ pub(super) async fn park(
         std::collections::BTreeMap::new();
     let mut warned_builds: std::collections::BTreeSet<(String, String)> =
         std::collections::BTreeSet::new();
+    // peer key hex -> how many times that peer's finalized root disagreed
+    // with ours at the SAME height — the divergence warn's latch memory; see
+    // `sync::divergence::note_peer_root`.
+    let mut peer_root_skew: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
 
     // ---- the RESIDENT's serving lanes ------------------------------
     //
@@ -581,6 +578,15 @@ pub(super) async fn park(
         forge_repo.clone(),
         label.clone(),
     ));
+    // ONE source for every fold path this role runs. the journal arrives from
+    // the boot wiring holding the LOCAL-ONLY blob source, and both ascension
+    // sites below seat the live node's source off this same handle —
+    // so installing the fetching source HERE, before the journal is ever read
+    // or handed on, is what makes the live fold, the recovery replay and the
+    // catch-up apply resolve committed component bytes identically. a resident
+    // is not a module-code PUSH fan-out target (that plane is members-only), so
+    // a local-only live fold is a guaranteed halt at the first code swap.
+    recovery.set_code_source(code_source.clone());
     let mut recovery_slot = Some(recovery);
     let mut recovery_reopens = 0u32;
     // fold-driver state, all epoch-scoped and reset at (re)ascension:
@@ -654,6 +660,10 @@ pub(super) async fn park(
         let restored = restore_host(
             &context,
             ckpt,
+            NetworkBindings {
+                invite: &namespace,
+                identity_chain_id: &identity_chain_id,
+            },
             NodeSubstrates {
                 forge_repo: &forge_repo,
                 duckfs_dir: &duckfs_dir,
@@ -699,9 +709,9 @@ pub(super) async fn park(
         let tip = rec.height.unwrap_or(rec.view_base);
         let root = rec.root_hash;
         let follower = consensus::FollowerOrderer::new(replica_store.clone());
-        // the replica fold realizes code-registry swaps through the SAME source
-        // recovery replay used (wired at Recovery::open).
-        let code_source = recovery.code_source();
+        // the live replica fold realizes code-registry swaps through the SAME
+        // source recovery replay just used — the park loop's one fetching
+        // source, installed on this journal above.
         let mut node_r = node::OrderedNode::resume(
             host,
             follower,
@@ -712,7 +722,7 @@ pub(super) async fn park(
             }),
             rec.view_base,
         );
-        node_r.set_code_source(code_source);
+        node_r.set_code_source(code_source.clone());
         replica_scheme = Some(replica_verifier(&namespace, &rec.participants));
         replica_orchestrator = Some(replica_orchestrator_at(
             rec.epoch,
@@ -969,12 +979,7 @@ pub(super) async fn park(
                             },
                             RpcRequest::Status => match &serving {
                                 Some((height, node_r)) => {
-                                    let mut modules = std::collections::BTreeMap::new();
-                                    for &m in MODULE_IDS {
-                                        if let Some(root) = node_r.host().module_root(m) {
-                                            modules.insert(m.to_string(), hex(&root));
-                                        }
-                                    }
+                                    let modules = crate::util::module_roots_hex(node_r.host());
                                     RpcReply {
                                         status: Some(RpcStatus {
                                             height: Some(*height),
@@ -1447,6 +1452,17 @@ pub(super) async fn park(
                 }
                 *served_height = height;
                 blocks_since_checkpoint += 1;
+                // once per folded block, independent of the checkpoint
+                // cadence: a rig that cuts the underlay mid-run and wants to
+                // prove folding kept going past a height bar has nothing
+                // else to ride (`node_checkpoint_written` fires only when
+                // `checkpoint_due` decides the root moved, see
+                // `bin/node/src/drain_actions.rs`).
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    "resident folded block"
+                );
             }
             if !drained.is_empty()
                 && metrics.operational_status().phase == noded::NodePhase::Syncing
@@ -1490,6 +1506,18 @@ pub(super) async fn park(
                 // channel/orderer concern.
                 let committed_window = read_valset_mesh_window(node_r.host()).await;
                 mesh_window.track_new(oracle, &mesh_book, &committed_window);
+                // one round of the resident's own re-track against
+                // commonware's p2p tracker, clocked by this drain pass
+                // rather than any block content: a re-track that regressed
+                // or duplicated an index would be warn-dropped by
+                // commonware right here, so counting these is the direct
+                // "N quiet rounds passed" signal
+                // (resident_peerset_stability_e2e's SETTLE).
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    "tracker round completed"
+                );
                 let members_raw = read_valset_members(node_r.host()).await;
                 let observed: Vec<ed25519::PublicKey> = members_raw
                     .iter()
@@ -1923,6 +1951,18 @@ pub(super) async fn park(
             &mut peer_builds,
             &mut warned_builds,
         );
+        // and the ROOT rode along with it. the stamp is a proxy that is wrong
+        // in both directions (every rebuild skews it while the state agrees;
+        // identical binaries still diverge on a corrupt store) — this is the
+        // invariant itself, and it was already on the wire.
+        if let Some(mine) = serving.as_ref().and_then(|(_, node_r)| node_r.finalized()) {
+            crate::sync::divergence::note_peer_root(
+                (mine.height, mine.root_hash),
+                &hex_bytes(source.as_ref()),
+                (tip.height, tip.root_hash),
+                &mut peer_root_skew,
+            );
+        }
         // A SOURCE JUST ANSWERED THIS NODE — the one event a refused index
         // backfill is waiting for. The walk is re-issued here and nowhere
         // else, so an unreachable source costs this loop nothing but the
@@ -2100,6 +2140,10 @@ pub(super) async fn park(
                         &context,
                         &client,
                         &m,
+                        NetworkBindings {
+                            invite: &namespace,
+                            identity_chain_id: &identity_chain_id,
+                        },
                         NodeSubstrates {
                             forge_repo: &forge_repo,
                             duckfs_dir: &duckfs_dir,
@@ -2210,7 +2254,6 @@ pub(super) async fn park(
                             // the driver backfills over the Frames
                             // lane.
                             let follower = consensus::FollowerOrderer::new(replica_store.clone());
-                            let code_source = recovery.code_source();
                             let mut node_r = node::OrderedNode::resume(
                                 host,
                                 follower,
@@ -2221,7 +2264,7 @@ pub(super) async fn park(
                                 }),
                                 m.view_base,
                             );
-                            node_r.set_code_source(code_source);
+                            node_r.set_code_source(code_source.clone());
                             replica_scheme = Some(replica_verifier(&namespace, &m.participants));
                             replica_orchestrator = Some(replica_orchestrator_at(
                                 m.epoch,
@@ -2411,6 +2454,10 @@ pub(super) async fn park(
             &context,
             &client,
             &m,
+            NetworkBindings {
+                invite: &namespace,
+                identity_chain_id: &identity_chain_id,
+            },
             NodeSubstrates {
                 forge_repo: &forge_repo,
                 duckfs_dir: &duckfs_dir,
@@ -2644,5 +2691,44 @@ mod tests {
         );
         assert_eq!(builds.get("dd").map(String::as_str), Some("def5678"));
         assert_eq!(warned.len(), 1, "only the real disagreement was named");
+    }
+
+    /// the seam this role BRICKS on when it drifts: a resident is not a
+    /// module-code PUSH fan-out target, so every fold it runs — live fold,
+    /// recovery replay, catch-up apply — must resolve committed component
+    /// bytes through the park loop's ONE fetching source. the journal arrives
+    /// from the boot wiring holding the local-only blob source, so the install
+    /// below is what makes that true; a live node seated from
+    /// the journal's own accessor is how the local-only source reached the
+    /// live fold and halted a serving resident at the first code swap.
+    #[test]
+    fn every_resident_fold_is_seated_from_the_parks_fetching_code_source() {
+        let source = include_str!("park.rs");
+        let install = "recovery.set_code_source(code_source.clone());";
+        let slot = "let mut recovery_slot = Some(recovery);";
+        let installed_at = source
+            .find(install)
+            .expect("park installs the fetching source on the recovery journal");
+        let slot_at = source.find(slot).expect("park fills the journal slot");
+        assert!(
+            installed_at < slot_at,
+            "the fetching source must be installed BEFORE the journal is handed on"
+        );
+        // spelled in parts so this lint does not match itself.
+        let journal_accessor = format!("recovery.code_{}()", "source");
+        assert!(
+            !source.contains(&journal_accessor),
+            "seat a live node from the park loop's `code_source`, never from \
+             whatever source the journal was handed at boot"
+        );
+        let call = format!(".set_code_{}(", "source");
+        for line in source.lines().filter(|l| l.contains(&call)) {
+            let seats_the_parks_source = line.contains("code_source.clone()");
+            let promotion_handback = line.contains("BlobCodeSource");
+            assert!(
+                seats_the_parks_source || promotion_handback,
+                "unexpected code source wired in the replica park: {line}"
+            );
+        }
     }
 }

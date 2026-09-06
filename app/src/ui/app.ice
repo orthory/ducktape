@@ -77,6 +77,14 @@ daemon Ducktape
     size 480 680
     position centered
     resizable false
+    // NO OS HEADER ON THE LAUNCH WINDOW. A titlebar over a centred sign-in
+    // column is chrome around chrome: the column already names the app and the
+    // step, and the traffic lights sat in a strip this window draws nothing in.
+    // Undecorated means the app owes the two things the strip used to give —
+    // a way to MOVE the window (the drag rail at the top of `HubColumn`, which
+    // routes `mouse press` to `task window drag`) and a way to CLOSE it (the ×
+    // beside it). Both live in `components/onboarding.ice`.
+    decorations false
     platform linux
       app-id "dev.ducktape.app"
   // The console. Same window the single-window app declared, now a named

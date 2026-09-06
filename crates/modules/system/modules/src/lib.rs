@@ -1,4 +1,4 @@
-//! the network lifecycle module: the root-hashed commitment to WHICH code every
+//! the network modules registry: the root-hashed commitment to WHICH code every
 //! hot-swappable module runs.
 //!
 //! it holds, folded into a single `root()`: per hot-swappable module, the
@@ -107,7 +107,7 @@ fn activation(height: u64, code_hash: &[u8]) -> Activation {
     }
 }
 
-pub struct Lifecycle {
+pub struct Modules {
     id: ModuleId,
     /// the valset module the readiness denominator (boundary member set) comes
     /// from, via host-routed queries. genesis wiring — identical on every node.
@@ -118,7 +118,7 @@ pub struct Lifecycle {
     staged: StagedStore,
 }
 
-impl Lifecycle {
+impl Modules {
     /// wrap the host-constructed store under module identity `id`.
     pub fn new(
         id: impl Into<ModuleId>,
@@ -133,7 +133,7 @@ impl Lifecycle {
     }
 
     /// GENESIS seeding: stage a module's initial active code hash BEFORE the
-    /// host registers this instance; [`Lifecycle::finish_seed`] publishes the
+    /// host registers this instance; [`Modules::finish_seed`] publishes the
     /// whole seed set in one batch. deterministic and identical on every node
     /// (a different seed set composes a different genesis root-hash and the
     /// network forks at genesis). never valid after genesis: live changes go
@@ -228,7 +228,7 @@ impl Lifecycle {
     {
         self.staged.stage(
             key,
-            borsh::to_vec(value).expect("lifecycle value is serializable"),
+            borsh::to_vec(value).expect("modules value is serializable"),
         );
     }
 
@@ -244,7 +244,7 @@ impl Lifecycle {
     where
         T: BorshSerialize,
     {
-        let bytes = borsh::to_vec(value).expect("lifecycle value is serializable");
+        let bytes = borsh::to_vec(value).expect("modules value is serializable");
         if bytes.len() > cap {
             return Err(Error::Module(format!(
                 "{what} record too large: {} > {cap} bytes",
@@ -310,7 +310,7 @@ impl Lifecycle {
         match &ctx.env().origin {
             Origin::Module(_) | Origin::System => Ok(()),
             Origin::External(_) => Err(Error::Module(
-                "lifecycle schedule/cancel/register only via governance (module) or system origin"
+                "modules schedule/cancel/register only via governance (module) or system origin"
                     .into(),
             )),
         }
@@ -321,7 +321,7 @@ impl Lifecycle {
         match &ctx.env().origin {
             Origin::System => Ok(()),
             other => Err(Error::Module(format!(
-                "lifecycle Advance is a system boundary tick, got {other:?}"
+                "modules Advance is a system boundary tick, got {other:?}"
             ))),
         }
     }
@@ -390,8 +390,14 @@ impl Lifecycle {
                 "scheduled code_hash equals the active code (no-op swap)".into(),
             ));
         }
-        // at most one pending swap per module.
-        if entry.pending.is_some() {
+        // at most one pending swap per module — but a STALE pending (past its
+        // activation height with readiness never latched) never arms, so a new
+        // schedule REPLACES it rather than being refused forever.
+        let in_flight = entry
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !pending.stale_at(ctx.env().height));
+        if in_flight {
             return Err(Error::Module(format!(
                 "module {module_id} already has a pending swap (cancel it first)"
             )));
@@ -474,21 +480,23 @@ impl Lifecycle {
             .entry(&module_id)
             .await?
             .ok_or_else(|| Error::Module(format!("no such module {module_id}")))?;
-        match &entry.pending {
-            // can only cancel BEFORE the boundary — never race an arming swap.
-            Some(swap) if swap.name == name && height < swap.activation_height => {}
-            Some(swap) if swap.name == name => {
-                return Err(Error::Module(
-                    "cannot cancel: activation height already reached".into(),
-                ));
-            }
-            _ => {
-                return Err(Error::Module("no matching pending swap to cancel".into()));
-            }
+        let matching = entry.pending.as_ref().filter(|swap| swap.name == name);
+        let Some(swap) = matching else {
+            return Err(Error::Module("no matching pending swap to cancel".into()));
+        };
+        // never race an ARMING swap: one whose readiness latched and whose
+        // activation height is reached is the boundary's business now. a stale
+        // pending (due, never latched) is still governance's to withdraw.
+        let due = swap.activation_height <= height;
+        let cancellable = !due || swap.stale_at(height);
+        if !cancellable {
+            return Err(Error::Module(
+                "cannot cancel: activation height already reached".into(),
+            ));
         }
         entry.pending = None;
         // cancelling an ADMISSION (no activation yet: the module never ran)
-        // removes the entry entirely — lifecycle must never claim a codeless
+        // removes the entry entirely — the registry must never claim a codeless
         // module. its roster slot is freed with it.
         if entry.active_code_hash().is_empty() {
             let mut roster = self.roster().await?;
@@ -512,6 +520,7 @@ impl Lifecycle {
         ctx: &mut dyn Ctx,
         name: String,
         module_id: String,
+        code_hash: Vec<u8>,
     ) -> Result<(), Error> {
         // validator-origin only: the authenticated frame origin attributes the
         // signal to exactly one member key.
@@ -533,11 +542,15 @@ impl Lifecycle {
             .entry(&module_id)
             .await?
             .ok_or_else(|| Error::Module(format!("no such module {module_id}")))?;
+        // the signal names the BYTES it verified. a name alone cannot tell two
+        // schedules apart — a stale pending is replaceable under the same name
+        // — so a signal for any hash but the pending's own is refused rather
+        // than credited to code this validator never saw.
         let swap = match &mut entry.pending {
-            Some(swap) if swap.name == name => swap,
+            Some(swap) if swap.name == name && swap.code_hash == code_hash => swap,
             _ => {
                 return Err(Error::Module(
-                    "SwapReady does not match the pending swap (name/module)".into(),
+                    "SwapReady does not match the pending swap (name/module/code_hash)".into(),
                 ));
             }
         };
@@ -614,7 +627,7 @@ impl Lifecycle {
 
     // ---- queries ------------------------------------------------------------
 
-    async fn module_status(&self) -> Result<LifecycleReply, Error> {
+    async fn module_status(&self) -> Result<ModulesReply, Error> {
         let mut modules = Vec::new();
         for id in self.roster().await? {
             let e = self.rostered_entry(&id).await?;
@@ -626,10 +639,10 @@ impl Lifecycle {
                 history: e.history,
             });
         }
-        Ok(LifecycleReply::ModuleStatus { modules })
+        Ok(ModulesReply::ModuleStatus { modules })
     }
 
-    async fn armed_at(&self, height: u64) -> Result<LifecycleReply, Error> {
+    async fn armed_at(&self, height: u64) -> Result<ModulesReply, Error> {
         let mut swaps = Vec::new();
         for id in self.roster().await? {
             let e = self.rostered_entry(&id).await?;
@@ -641,12 +654,12 @@ impl Lifecycle {
                 });
             }
         }
-        Ok(LifecycleReply::ArmedAt { swaps })
+        Ok(ModulesReply::ArmedAt { swaps })
     }
 }
 
 #[async_trait::async_trait(?Send)]
-impl Module for Lifecycle {
+impl Module for Modules {
     fn id(&self) -> ModuleId {
         self.id.clone()
     }
@@ -674,11 +687,11 @@ impl Module for Lifecycle {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
-            LifecycleMsg::RegisterModule {
+            ModulesMsg::RegisterModule {
                 module_id,
                 code_hash,
             } => self.handle_register_module(ctx, module_id, code_hash).await,
-            LifecycleMsg::ScheduleSwap {
+            ModulesMsg::ScheduleSwap {
                 name,
                 module_id,
                 activation_height,
@@ -687,7 +700,7 @@ impl Module for Lifecycle {
                 self.handle_schedule_swap(ctx, name, module_id, activation_height, code_hash)
                     .await
             }
-            LifecycleMsg::ScheduleRegister {
+            ModulesMsg::ScheduleRegister {
                 name,
                 module_id,
                 activation_height,
@@ -696,23 +709,26 @@ impl Module for Lifecycle {
                 self.handle_schedule_register(ctx, name, module_id, activation_height, code_hash)
                     .await
             }
-            LifecycleMsg::CancelSwap { name, module_id } => {
+            ModulesMsg::CancelSwap { name, module_id } => {
                 self.handle_cancel_swap(ctx, name, module_id).await
             }
-            LifecycleMsg::SwapReady { name, module_id } => {
-                self.handle_swap_ready(ctx, name, module_id).await
+            ModulesMsg::SwapReady {
+                name,
+                module_id,
+                code_hash,
+            } => {
+                self.handle_swap_ready(ctx, name, module_id, code_hash)
+                    .await
             }
-            LifecycleMsg::Advance => self.handle_advance(ctx).await,
+            ModulesMsg::Advance => self.handle_advance(ctx).await,
         }
     }
 
     /// read projection — the module-code projections need no host routing.
     async fn query_with(&self, _ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
-            LifecycleQuery::ModuleStatus => Ok(encode_reply(&self.module_status().await?)),
-            LifecycleQuery::ArmedAt { height } => {
-                Ok(encode_reply(&self.armed_at(height).await?))
-            }
+            ModulesQuery::ModuleStatus => Ok(encode_reply(&self.module_status().await?)),
+            ModulesQuery::ArmedAt { height } => Ok(encode_reply(&self.armed_at(height).await?)),
         }
     }
 

@@ -344,7 +344,7 @@ pub struct ProviderOutput {
 
 /// optional live-tail callback for provider output. The run context is passed
 /// beside each line so embedders can key their own per-run registry with the
-/// host-local identity available to capability-host.
+/// host-local identity available to the provider.
 pub type OutputSink = Arc<dyn Fn(&RunContext, OutputLine) + Send + Sync>;
 
 /// a machine-local executor for one capability tag. implementations do real
@@ -1855,9 +1855,13 @@ async fn wait_leader_exit_unreaped(pid: u32, label: &str) {
             Err(error) => {
                 failures += 1;
                 if failures == 1 || failures.is_multiple_of(16) {
-                    eprintln!(
-                        "[capability-host] observe unreaped {label} exit \
-                         (attempt {failures}): {error}"
+                    tracing::warn!(
+                        target: "ducktape::provider",
+                        reason = "leader_exit_unobserved",
+                        %label,
+                        attempts = failures,
+                        %error,
+                        "failed to observe whether the process leader exited"
                     );
                 }
             }
@@ -1872,7 +1876,14 @@ async fn wait_process_group_gone(group: u32, label: &str) {
     while process_group_alive(group) {
         observations += 1;
         if observations == 1 || observations.is_multiple_of(160) {
-            eprintln!("[capability-host] waiting for {label} process group {group} to disappear");
+            tracing::warn!(
+                target: "ducktape::provider",
+                reason = "process_group_lingering",
+                %label,
+                group,
+                attempts = observations,
+                "waiting for the process group to disappear"
+            );
         }
         tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
     }
@@ -1884,7 +1895,14 @@ fn wait_process_group_gone_blocking(group: u32, label: &str) {
     while process_group_alive(group) {
         observations += 1;
         if observations == 1 || observations.is_multiple_of(400) {
-            eprintln!("[capability-host] waiting for {label} process group {group} to disappear");
+            tracing::warn!(
+                target: "ducktape::provider",
+                reason = "process_group_lingering",
+                %label,
+                group,
+                attempts = observations,
+                "waiting for the process group to disappear"
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -1901,9 +1919,13 @@ async fn wait_tokio_child_fail_closed(
             Err(error) => {
                 failures += 1;
                 if failures == 1 || failures.is_multiple_of(16) {
-                    eprintln!(
-                        "[capability-host] wait/reap {label} failed \
-                         (attempt {failures}): {error}"
+                    tracing::warn!(
+                        target: "ducktape::provider",
+                        reason = "child_wait_failed",
+                        %label,
+                        attempts = failures,
+                        %error,
+                        "failed to wait on the child process"
                     );
                 }
                 tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
@@ -1971,12 +1993,19 @@ async fn terminate_child(
     if let Some(group) = process_group
         && let Err(error) = signal_process_group(group, libc::SIGTERM)
     {
-        eprintln!("[capability-host] SIGTERM provider process group {group}: {error}");
+        tracing::warn!(
+            target: "ducktape::provider",
+            reason = "sigterm_failed",
+            group,
+            %error,
+            "failed to SIGTERM the provider process group"
+        );
     }
 
     #[cfg(unix)]
     {
         if let Some(group) = process_group {
+            let mut observe_failures = 0u64;
             loop {
                 match leader_exited_unreaped(group) {
                     Ok(true) => {
@@ -1990,8 +2019,12 @@ async fn terminate_child(
                     Ok(false) if tokio::time::Instant::now() < deadline => {}
                     Ok(false) => {
                         if let Err(error) = signal_process_group(group, libc::SIGKILL) {
-                            eprintln!(
-                                "[capability-host] SIGKILL provider process group {group}: {error}"
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "sigkill_failed",
+                                group,
+                                %error,
+                                "failed to SIGKILL the provider process group"
                             );
                         }
                         let _ = child.start_kill();
@@ -2000,9 +2033,17 @@ async fn terminate_child(
                     Err(error) => {
                         // ECHILD or an unreadable wait state makes ownership
                         // unverifiable. Retain the reservation fail-closed.
-                        eprintln!(
-                            "[capability-host] observe cancelled provider leader {group}: {error}"
-                        );
+                        observe_failures += 1;
+                        if observe_failures == 1 || observe_failures.is_multiple_of(16) {
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "leader_observe_failed",
+                                group,
+                                attempts = observe_failures,
+                                %error,
+                                "failed to observe the cancelled provider leader"
+                            );
+                        }
                     }
                 }
                 tokio::time::sleep(PROCESS_POLL_INTERVAL).await;
@@ -2073,9 +2114,13 @@ impl GroupChild {
                     Err(error) => {
                         inspect_failures += 1;
                         if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] inspect setup child before kill \
-                                 (attempt {inspect_failures}): {error}"
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "inspect_setup_child_failed",
+                                group,
+                                attempts = inspect_failures,
+                                %error,
+                                "failed to inspect the setup child before killing it"
                             );
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -2090,9 +2135,13 @@ impl GroupChild {
                     Err(error) => {
                         wait_failures += 1;
                         if wait_failures == 1 || wait_failures.is_multiple_of(16) {
-                            eprintln!(
-                                "[capability-host] reap killed setup child \
-                                 (attempt {wait_failures}): {error}"
+                            tracing::warn!(
+                                target: "ducktape::provider",
+                                reason = "reap_setup_child_failed",
+                                group,
+                                attempts = wait_failures,
+                                %error,
+                                "failed to reap the killed setup child"
                             );
                         }
                         std::thread::sleep(Duration::from_millis(10));
@@ -2132,9 +2181,12 @@ impl GroupChild {
                 Err(error) => {
                     inspect_failures += 1;
                     if inspect_failures == 1 || inspect_failures.is_multiple_of(16) {
-                        eprintln!(
-                            "[capability-host] inspect setup child before kill \
-                             (attempt {inspect_failures}): {error}"
+                        tracing::warn!(
+                            target: "ducktape::provider",
+                            reason = "inspect_setup_child_failed",
+                            attempts = inspect_failures,
+                            %error,
+                            "failed to inspect the setup child before killing it"
                         );
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -2157,9 +2209,12 @@ impl GroupChild {
                 Err(error) => {
                     wait_failures += 1;
                     if wait_failures == 1 || wait_failures.is_multiple_of(16) {
-                        eprintln!(
-                            "[capability-host] reap killed setup child \
-                             (attempt {wait_failures}): {error}"
+                        tracing::warn!(
+                            target: "ducktape::provider",
+                            reason = "reap_setup_child_failed",
+                            attempts = wait_failures,
+                            %error,
+                            "failed to reap the killed setup child"
                         );
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -3272,10 +3327,8 @@ mod tests {
     /// a per-test scratch dir under the system temp root; unique by pid +
     /// test name so parallel tests never collide.
     fn scratch(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "capability-host-test-{}-{test}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("provider-host-test-{}-{test}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir

@@ -26,6 +26,19 @@ die(){ printf '\033[31m[dev-clear] %s\033[0m\n' "$*" >&2; exit 1; }
 # sentence would truncate at an escaped quote, which is fine for a log line.
 json_string(){ sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
 
+# The loopback of a node.toml `http_listen`'s address family, port kept. This
+# script dials its OWN node from this box, and the bind is a wildcard by
+# default (`0.0.0.0`, or `[::]`) that no client can dial as written — the same
+# rewrite every co-located process applies (`workspace_config::http_base_of`).
+# The operator credential presented below is honored only from a loopback peer.
+loopback_base(){
+  local port="${1##*:}" host="${1%:*}"
+  case "$host" in
+    \[*) printf '[::1]:%s' "$port" ;;
+    *) printf '127.0.0.1:%s' "$port" ;;
+  esac
+}
+
 # Candidate discovery is a `pgrep -f` sweep for the workspace path: nothing
 # writes a pidfile, so the sweep is what finds a node left by a seed or an older
 # dev loop. Admission is deliberately narrow: mentioning this workspace in an
@@ -89,7 +102,7 @@ if [ -n "$(node_pids)" ]; then
     # it away is what made a refusal indistinguishable from a stop. The token is
     # printed verbatim — one invented here greps to nothing.
     RESPONSE="$(curl -s -m 2 -w '\n%{http_code}' \
-      -X POST "http://$LISTEN/v1/admin/shutdown" \
+      -X POST "http://$(loopback_base "$LISTEN")/v1/admin/shutdown" \
       -H "x-ducktape-admin-token: $(<"$WSDIR/admin.token")" 2>/dev/null)"
     CODE="${RESPONSE##*$'\n'}"
     BODY="${RESPONSE%$'\n'*}"

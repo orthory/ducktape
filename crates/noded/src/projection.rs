@@ -170,8 +170,11 @@ pub fn project_block(
 
 /// Fold one finalized block into the derived per-module index — the shared
 /// epilogue of every block-apply lane (validator drain, embedded daemon submit,
-/// sim). Merges the lane's explorer `record` onto [`index_block_ops`] and
-/// applies it, logging the ONE STALE-index error they share on failure.
+/// sim). First covers every module the host runs at this block (`roots`,
+/// the host's module set — a module admitted at this block's boundary gets
+/// its database before its first op folds), then merges the lane's explorer
+/// `record` onto [`index_block_ops`] and applies it, logging the ONE
+/// STALE-index error they share on failure.
 ///
 /// The derived index is a READ MODEL: a failure here degrades the app's views
 /// (every module view the app reads is served from it, and it does not
@@ -184,6 +187,7 @@ pub fn apply_block_to_index(
     consensus_time: u64,
     record: Option<Vec<u8>>,
     dispatches: &[host::DispatchRecord],
+    roots: &[(sdk::ModuleId, sdk::StateRoot)],
 ) {
     // a poisoned store refuses every write until an operator rebuilds it, and
     // the ONE error below named that remedy when it happened. re-logging it
@@ -194,6 +198,17 @@ pub fn apply_block_to_index(
             target: "ducktape::consensus",
             height,
             "index apply skipped: store poisoned"
+        );
+        return;
+    }
+    if let Err(err) = crate::index_host_modules(index, roots.iter().map(|(id, _)| id.as_str())) {
+        tracing::error!(
+            target: "ducktape::consensus",
+            event = "node_index_poisoned",
+            height,
+            error = %err,
+            "module index cannot cover an admitted module — the app's views are now \
+             STALE; wipe <storage>/index to rebuild"
         );
         return;
     }
@@ -256,7 +271,7 @@ mod tests {
     fn project_block_row_bytes_are_golden() {
         let blobs = BlobHandle::default();
         let member = dispatch("chat", b"member");
-        let system = dispatch("lifecycle", b"system");
+        let system = dispatch("modules", b"system");
         let frames = vec![
             // multi-member block: applied + rejected members, plus a System
             // dispatch folded into the block's dispatch stream (never a row).

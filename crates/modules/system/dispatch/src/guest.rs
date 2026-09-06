@@ -8,9 +8,9 @@
 //! (`emit_msg` to saga, `emit_event` breadcrumbs) through the wit imports. it
 //! makes no cross-module `query-module` reads inside execute, so — unlike the
 //! `tagging`/`runs` tenants — it needs no memoized sibling replay on the accept
-//! path. its query surface is COMMITTED-ONLY regardless of caller, which the
-//! host wires with `.with_committed_queries()`: that drops the outer staged
-//! overlay for a query round, so `WitStore` answers the native module's
+//! path. its query surface is COMMITTED-ONLY regardless of caller, which this
+//! component declares (`shape().committed_queries`): the host drops the outer
+//! staged overlay for a query round, so `WitStore` answers the native module's
 //! `get_committed` reads from committed state exactly as the native store does.
 //!
 //! ## the STORE-BACKED dispatch model
@@ -57,5 +57,11 @@ use guest_adapter::WitStore;
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: DispatchModule,
+    // the query lane is committed-only regardless of caller: the between-block
+    // delivery injection must never observe a same-block staged write.
+    shape: guest_adapter::host::ModuleShape {
+        committed_queries: true,
+        ..guest_adapter::store_shape()
+    },
     new: DispatchModule::new(MODULE_ID, SAGA_MODULE_ID, Box::new(WitStore)),
 }

@@ -1140,7 +1140,7 @@ pub fn mark_message_groups(messages: &mut [ChatMessage]) {
 /// Flatten wire blocks back into composer text — the seed for an edit draft.
 ///
 /// One `\n` per block boundary, because that is what a block boundary now MEANS
-/// in the composer (`parse_message_with_members` makes every typed line its own
+/// in the composer (`parse_message_with_mentions` makes every typed line its own
 /// block). A `\n\n` here re-parsed to the same blocks, but it handed the editor
 /// a blank line the author never typed, and every edit added another.
 pub fn message_body(blocks: &[Block]) -> String {
@@ -1293,7 +1293,7 @@ pub fn plain_rich_spans(text: &str) -> Vec<ChatSpan> {
     if text.contains('\n') {
         return Vec::new();
     }
-    let spans = inline_spans(text, &[]);
+    let spans = inline_spans(text, &MentionCandidates::default());
     let marked = spans.iter().any(|span| !span.marks.is_empty());
     if !marked {
         return Vec::new();
@@ -1368,6 +1368,52 @@ impl AuthorNames {
 
     pub fn is_empty(&self) -> bool {
         self.by_key.is_empty()
+    }
+
+    /// The account name a raw key is registered under.
+    pub fn name_of(&self, key: &[u8]) -> Option<&str> {
+        self.by_key.get(&hex_encode(key)).map(String::as_str)
+    }
+
+    /// EVERY key of the account `name` names — an account is a set of keys
+    /// (a phone and a laptop sign with different ones), so anything that has
+    /// to REACH a person addresses all of them, not the one it happened to
+    /// see. Case-insensitive on the name; ascending by key hex, so the answer
+    /// is stable across two readings of the same directory.
+    pub fn keys_named(&self, name: &str) -> Vec<Vec<u8>> {
+        let wanted = name.to_ascii_lowercase();
+        self.by_key
+            .iter()
+            .filter(|(_key, registered)| registered.to_ascii_lowercase() == wanted)
+            .filter_map(|(key, _registered)| hex_bytes(key))
+            .collect()
+    }
+
+    /// Every key of the account THIS key belongs to, the key itself included —
+    /// the set a mention of that person must address. An unregistered key
+    /// answers with itself alone: it is still a real identity, just an unnamed
+    /// one.
+    pub fn account_keys_of(&self, key: &[u8]) -> Vec<Vec<u8>> {
+        let Some(name) = self.name_of(key) else {
+            return vec![key.to_vec()];
+        };
+        self.keys_named(name)
+    }
+
+    /// `(account name, its keys)` for every account in the directory,
+    /// ascending by name.
+    fn accounts(&self) -> BTreeMap<String, Vec<Vec<u8>>> {
+        let mut accounts: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+        for (key, name) in &self.by_key {
+            let Some(bytes) = hex_bytes(key) else {
+                continue;
+            };
+            accounts
+                .entry(name.to_ascii_lowercase())
+                .or_default()
+                .push(bytes);
+        }
+        accounts
     }
 
     /// The account name behind a rendered author handle — only a `user:` handle
@@ -1445,6 +1491,20 @@ pub fn short_label(id: &str) -> String {
     label
 }
 
+/// An even-length all-hex string back to its bytes; anything else is not hex.
+fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    let looks_hex = !hex.is_empty()
+        && hex.len().is_multiple_of(2)
+        && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    if !looks_hex {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).ok())
+        .collect()
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1479,15 +1539,14 @@ fn count_i64(value: usize) -> i64 {
 /// a marked-up line renders as a single rich-text paragraph (`run_spans`),
 /// one paragraph widget per typed line.
 pub fn parse_message(input: &str) -> Vec<Block> {
-    parse_message_with_members(input, &[])
+    parse_message_with_mentions(input, &MentionCandidates::default())
 }
 
-/// [`parse_message`] with `@mention` resolution against the channel's member
-/// roster: `@` followed by four or more characters that case-insensitively
-/// prefix-match a member's key becomes a [`Mark::Mention`] span, which the
-/// module fans out to hooks (inbox notifications) on apply. Non-matching
-/// `@word`s stay plain text.
-pub fn parse_message_with_members(input: &str, members: &[ChatMember]) -> Vec<Block> {
+/// [`parse_message`] with `@mention` resolution against [`MentionCandidates`]:
+/// a resolved `@handle` becomes a [`Mark::Mention`] span, which the module
+/// fans out to hooks (inbox notifications) on apply. Non-matching `@word`s
+/// stay plain text.
+pub fn parse_message_with_mentions(input: &str, mentions: &MentionCandidates) -> Vec<Block> {
     let lines: Vec<&str> = input.lines().collect();
     let mut blocks = Vec::new();
     let mut index = 0;
@@ -1504,11 +1563,11 @@ pub fn parse_message_with_members(input: &str, members: &[ChatMember]) -> Vec<Bl
             blocks.push(Block::Divider);
             index += 1;
         } else if is_quote {
-            index = push_quote_block(&lines, index, members, &mut blocks);
+            index = push_quote_block(&lines, index, mentions, &mut blocks);
         } else if is_blank {
             index += 1;
         } else {
-            index = push_paragraph_block(&lines, index, members, &mut blocks);
+            index = push_paragraph_block(&lines, index, mentions, &mut blocks);
         }
     }
     if blocks.is_empty() {
@@ -1536,13 +1595,13 @@ fn push_code_block(lines: &[&str], start: usize, opener: &str, blocks: &mut Vec<
 fn push_quote_block(
     lines: &[&str],
     start: usize,
-    members: &[ChatMember],
+    mentions: &MentionCandidates,
     blocks: &mut Vec<Block>,
 ) -> usize {
     let mut index = start;
     while index < lines.len() && lines[index].trim().starts_with('>') {
         let stripped = lines[index].trim().trim_start_matches('>').trim_start();
-        blocks.push(Block::Quote(inline_spans(stripped, members)));
+        blocks.push(Block::Quote(inline_spans(stripped, mentions)));
         index += 1;
     }
     index
@@ -1551,7 +1610,7 @@ fn push_quote_block(
 fn push_paragraph_block(
     lines: &[&str],
     start: usize,
-    members: &[ChatMember],
+    mentions: &MentionCandidates,
     blocks: &mut Vec<Block>,
 ) -> usize {
     let mut index = start;
@@ -1565,7 +1624,7 @@ fn push_paragraph_block(
         if breaks {
             break;
         }
-        blocks.push(Block::Paragraph(inline_spans(trimmed, members)));
+        blocks.push(Block::Paragraph(inline_spans(trimmed, mentions)));
         index += 1;
     }
     index
@@ -1575,7 +1634,7 @@ fn push_paragraph_block(
 /// not nest; the first matching delimiter wins. Bare `http(s)://` and `duck://`
 /// runs become `Link`s, as does a `[label](url)` reference — one span whose
 /// text is the label and whose mark carries the target.
-fn inline_spans(text: &str, members: &[ChatMember]) -> Vec<Span> {
+fn inline_spans(text: &str, mentions: &MentionCandidates) -> Vec<Span> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<Span> = Vec::new();
     let mut plain = String::new();
@@ -1585,12 +1644,21 @@ fn inline_spans(text: &str, members: &[ChatMember]) -> Vec<Span> {
         let reference = reference_at(&chars, index);
         let bold = fenced(&chars, index, "**").or_else(|| fenced(&chars, index, "__"));
         let italic = fenced(&chars, index, "*").or_else(|| fenced(&chars, index, "_"));
-        if let Some((member, len)) = mention_at(&chars, index, members) {
+        if let Some((target, len)) = mention_at(&chars, index, mentions) {
             flush_plain(&mut plain, &mut spans);
             let handle: String = chars[index..index + len].iter().collect();
             spans.push(Span {
                 text: handle,
-                marks: vec![Mark::Mention(AuthorRef::User(member_key_bytes(&member)))],
+                // ONE VISIBLE HANDLE, ONE MARK PER KEY OF THE ACCOUNT. An
+                // account signs with several keys and a mention has to reach
+                // the person, not the device: `collect_mentions` walks every
+                // mark of a span, so each key becomes its own `AuthorRef`
+                // while the reader still sees one `@name`.
+                marks: target
+                    .keys
+                    .iter()
+                    .map(|key| Mark::Mention(AuthorRef::User(key.clone())))
+                    .collect(),
             });
             index += len;
         } else if let Some((label, target, len)) = reference {
@@ -1746,27 +1814,152 @@ fn reference_at(chars: &[char], at: usize) -> Option<(String, String, usize)> {
     linkable.then(|| (label, target, url_end + 1 - at))
 }
 
-/// If `chars[at..]` opens an `@mention` of a channel member — `@` plus four
-/// or more word characters that case-insensitively prefix-match a member's
-/// key — the matched member and the consumed length (the `@` included).
-fn mention_at(chars: &[char], at: usize, members: &[ChatMember]) -> Option<(ChatMember, usize)> {
+/// WHO A TYPED `@handle` CAN REACH: the network's ACCOUNT DIRECTORY, by name,
+/// unioned with the channel's own member roster, by key.
+///
+/// The roster alone used to be the whole answer, and it is empty in every
+/// open-policy channel — `#general` has no member rows, so `@orthory` in the
+/// room everybody actually writes in resolved to nothing, no `Mark::Mention`
+/// was minted, and the module's `collect_mentions` had nothing to fan out.
+/// A person is nameable in EVERY room they can be read in, so the directory
+/// is the candidate set and the roster only adds keys the directory has not
+/// registered (an unnamed device, an invited key).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MentionCandidates {
+    /// longest handle first, so a greedy scan settles `@orthory-ops` on the
+    /// account of that name instead of on `@orthory`.
+    targets: Vec<MentionTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MentionTarget {
+    /// what the writer types after `@`, lowercased.
+    pub handle: String,
+    /// every key the mention addresses — an account is a SET of keys.
+    pub keys: Vec<Vec<u8>>,
+}
+
+/// The shortest `@key` fragment that may stand for a member key. A name is
+/// matched WHOLE, so this bounds only the hex-prefix form.
+const MIN_KEY_PREFIX: usize = 4;
+
+impl MentionCandidates {
+    /// The directory (by account name) unioned with `members` (by key). A key
+    /// the directory already names is not re-added under its hex.
+    pub fn new(directory: &AuthorNames, members: &[ChatMember]) -> Self {
+        let mut targets: Vec<MentionTarget> = directory
+            .accounts()
+            .into_iter()
+            .map(|(handle, keys)| MentionTarget { handle, keys })
+            .collect();
+        for member in members {
+            let key = member_key_bytes(member);
+            if directory.name_of(&key).is_some() {
+                continue;
+            }
+            targets.push(MentionTarget {
+                handle: member.key.to_ascii_lowercase(),
+                keys: vec![key],
+            });
+        }
+        targets.sort_by(|left, right| {
+            right
+                .handle
+                .len()
+                .cmp(&left.handle.len())
+                .then_with(|| left.handle.cmp(&right.handle))
+        });
+        Self { targets }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    /// Every handle a composer could offer, longest first — the autocomplete's
+    /// source and the parser's.
+    pub fn handles(&self) -> Vec<&str> {
+        self.targets
+            .iter()
+            .map(|target| target.handle.as_str())
+            .collect()
+    }
+
+    /// The target a typed word names: a WHOLE account name, else a key the
+    /// word prefixes. Both case-insensitive.
+    fn resolve(&self, word: &str) -> Option<&MentionTarget> {
+        let needle = word.to_ascii_lowercase();
+        let names_an_account = |target: &&MentionTarget| target.handle == needle;
+        let prefixes_a_key = |target: &&MentionTarget| {
+            needle.len() >= MIN_KEY_PREFIX && target.handle.starts_with(&needle)
+        };
+        self.targets
+            .iter()
+            .find(names_an_account)
+            .or_else(|| self.targets.iter().find(prefixes_a_key))
+    }
+}
+
+/// A character that may sit inside a typed handle. Account names carry `-`,
+/// `_` and `.` (`orthory-ops` is one account), so the scan cannot stop at the
+/// first non-alphanumeric — it takes them all and then backs off.
+fn handle_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+}
+
+/// If `chars[at..]` opens an `@mention` — `@` plus a handle
+/// [`MentionCandidates`] resolves — the matched target and the consumed
+/// length (the `@` included).
+///
+/// LONGEST MATCH FIRST, then shed TRAILING PUNCTUATION one character at a
+/// time: `@orthory-ops.` scans `orthory-ops.`, which names nobody, then
+/// `orthory-ops`, which does. Only `-`, `_` and `.` are shed — backing off
+/// through letters instead would let `@zoe1` mention `zoe` and leave a
+/// stray `1`.
+fn mention_at<'a>(
+    chars: &[char],
+    at: usize,
+    mentions: &'a MentionCandidates,
+) -> Option<(&'a MentionTarget, usize)> {
     let opens = chars[at] == '@' && (at == 0 || chars[at - 1].is_whitespace());
-    if !opens || members.is_empty() {
+    if !opens || mentions.is_empty() {
         return None;
     }
-    let word: String = chars[at + 1..]
+    let mut word: Vec<char> = chars[at + 1..]
         .iter()
-        .take_while(|c| c.is_ascii_alphanumeric())
+        .copied()
+        .take_while(|c| handle_char(*c))
         .collect();
-    if word.chars().count() < 4 {
-        return None;
+    loop {
+        let candidate: String = word.iter().collect();
+        if let Some(target) = mentions.resolve(&candidate) {
+            return Some((target, 1 + word.len()));
+        }
+        let sheds = word
+            .last()
+            .is_some_and(|last| !last.is_ascii_alphanumeric());
+        if !sheds {
+            return None;
+        }
+        word.pop();
     }
-    let needle = word.to_ascii_lowercase();
-    let member = members
-        .iter()
-        .find(|member| member.key.to_ascii_lowercase().starts_with(&needle))?
-        .clone();
-    Some((member, 1 + word.chars().count()))
+}
+
+/// True when any `Mark::Mention` in `blocks` addresses one of `keys` — the
+/// reader's own account keys, so "was I mentioned?" is answered for the
+/// PERSON and not for the one device that happens to be signing here.
+pub fn mentions_reach(blocks: &[Block], keys: &[Vec<u8>]) -> bool {
+    let addressed = |mark: &Mark| match mark {
+        Mark::Mention(AuthorRef::User(key)) => keys.contains(key),
+        Mark::Mention(_) | Mark::Bold | Mark::Italic | Mark::Link(_) => false,
+    };
+    blocks.iter().any(|block| {
+        let spans = match block {
+            Block::Paragraph(spans) | Block::Quote(spans) => spans,
+            Block::Code { .. } | Block::Divider => return false,
+        };
+        spans.iter().any(|span| span.marks.iter().any(addressed))
+    })
 }
 
 /// A member key back to `AuthorRef::User` bytes: keys are rendered by
@@ -1774,21 +1967,7 @@ fn mention_at(chars: &[char], at: usize, members: &[ChatMember]) -> Option<(Chat
 /// bytes arrive hex-encoded — so an even-length all-hex key decodes, and
 /// anything else is the identity's own bytes.
 fn member_key_bytes(member: &ChatMember) -> Vec<u8> {
-    let key = &member.key;
-    let looks_hex = !key.is_empty()
-        && key.len().is_multiple_of(2)
-        && key.bytes().all(|b| b.is_ascii_hexdigit());
-    if looks_hex {
-        let decode = |range: &str| u8::from_str_radix(range, 16).ok();
-        let bytes: Option<Vec<u8>> = (0..key.len())
-            .step_by(2)
-            .map(|i| decode(&key[i..i + 2]))
-            .collect();
-        if let Some(bytes) = bytes {
-            return bytes;
-        }
-    }
-    key.as_bytes().to_vec()
+    hex_bytes(&member.key).unwrap_or_else(|| member.key.as_bytes().to_vec())
 }
 
 /// If `chars[at..]` opens with `marker` and has a later closing `marker`, the
@@ -1835,11 +2014,36 @@ pub fn dm_channel_id(a: &str, b: &str) -> String {
     digest.update(low.as_bytes());
     digest.update([0x1f]);
     digest.update(high.as_bytes());
-    let mut id = String::from("dm-");
+    let mut id = String::from(DM_CHANNEL_PREFIX);
     for byte in digest.finalize() {
         let _ = write!(id, "{byte:02x}");
     }
     id
+}
+
+/// What every derived two-party room id opens with.
+pub const DM_CHANNEL_PREFIX: &str = "dm-";
+
+/// The byte length of the SHA-256 digest [`dm_channel_id`] renders as hex.
+const DM_CHANNEL_DIGEST_HEX: usize = 64;
+
+/// True when `id` has the exact SHAPE [`dm_channel_id`] mints — the prefix and
+/// a full lowercase-hex digest.
+///
+/// A DM record is a NETWORK-VISIBLE channel row: the chat index serves every
+/// member every channel, so a DM between two other people arrives in this
+/// device's channel list like any room. Recognising the shape is what lets the
+/// sidebar drop the ones that are none of this reader's business. It is a
+/// shape test and not a `starts_with("dm-")` test on purpose: a person may
+/// legitimately name a channel `dm-standup`, and that room is a room.
+pub fn is_derived_dm_channel(id: &str) -> bool {
+    let Some(digest) = id.strip_prefix(DM_CHANNEL_PREFIX) else {
+        return false;
+    };
+    digest.len() == DM_CHANNEL_DIGEST_HEX
+        && digest.bytes().all(|byte| {
+            byte.is_ascii_digit() || byte.is_ascii_lowercase() && byte.is_ascii_hexdigit()
+        })
 }
 
 #[cfg(test)]
@@ -2345,8 +2549,127 @@ mod tests {
         assert_eq!(message_body(&blocks), "- apples\n- bananas\n- pears");
     }
 
+    fn directory() -> AuthorNames {
+        AuthorNames::new([
+            ("aa11".into(), "eddy".into()),
+            ("bb22".into(), "orthory".into()),
+            ("cc33".into(), "orthory".into()),
+            ("dd44".into(), "orthory-ops".into()),
+        ])
+    }
+
+    fn mention_keys(blocks: &[Block]) -> Vec<Vec<u8>> {
+        let Block::Paragraph(spans) = &blocks[0] else {
+            panic!("paragraph expected");
+        };
+        spans
+            .iter()
+            .flat_map(|span| span.marks.iter())
+            .filter_map(|mark| match mark {
+                Mark::Mention(AuthorRef::User(key)) => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The bug: `#general` is an open channel with an EMPTY member roster, so
+    /// the roster-only candidate set resolved no name at all in the one room
+    /// everybody writes in. The directory is the candidate set now.
+    #[test]
+    fn an_account_name_mentions_in_a_channel_with_no_roster() {
+        let mentions = MentionCandidates::new(&directory(), &[]);
+        let blocks = parse_message_with_mentions("ping @orthory about it", &mentions);
+        // both of that account's keys, so the mention reaches the PERSON.
+        assert_eq!(
+            mention_keys(&blocks),
+            vec![vec![0xbb, 0x22], vec![0xcc, 0x33]]
+        );
+        let Block::Paragraph(spans) = &blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert!(spans.iter().any(|span| span.text == "@orthory"));
+    }
+
+    /// A hyphenated name is one handle, and the longer one wins: `@orthory-ops`
+    /// must not settle on `orthory` and leave `-ops` as text.
+    #[test]
+    fn a_hyphenated_name_wins_over_its_own_prefix() {
+        let mentions = MentionCandidates::new(&directory(), &[]);
+        let blocks = parse_message_with_mentions("cc @orthory-ops", &mentions);
+        assert_eq!(mention_keys(&blocks), vec![vec![0xdd, 0x44]]);
+        let Block::Paragraph(spans) = &blocks[0] else {
+            panic!("paragraph expected");
+        };
+        assert!(spans.iter().any(|span| span.text == "@orthory-ops"));
+    }
+
+    /// Trailing punctuation is sentence, not handle.
+    #[test]
+    fn a_trailing_dot_is_shed_from_a_handle() {
+        let mentions = MentionCandidates::new(&directory(), &[]);
+        let blocks = parse_message_with_mentions("done @orthory-ops. thanks", &mentions);
+        assert_eq!(mention_keys(&blocks), vec![vec![0xdd, 0x44]]);
+        assert_eq!(message_body(&blocks), "done @orthory-ops. thanks");
+    }
+
+    #[test]
+    fn a_roster_key_still_resolves_beside_the_directory() {
+        let members = vec![ChatMember {
+            key: "f00dbeef".into(),
+            label: "f00dbeef".into(),
+        }];
+        let mentions = MentionCandidates::new(&directory(), &members);
+        let blocks = parse_message_with_mentions("hi @f00d and @eddy", &mentions);
+        assert_eq!(
+            mention_keys(&blocks),
+            vec![vec![0xf0, 0x0d, 0xbe, 0xef], vec![0xaa, 0x11]]
+        );
+    }
+
+    #[test]
+    fn a_mention_reaches_every_key_of_the_account_it_names() {
+        let names = directory();
+        let blocks =
+            parse_message_with_mentions("@orthory ping", &MentionCandidates::new(&names, &[]));
+        // orthory reads this on either device.
+        assert!(mentions_reach(
+            &blocks,
+            &names.account_keys_of(&[0xbb, 0x22])
+        ));
+        assert!(mentions_reach(
+            &blocks,
+            &names.account_keys_of(&[0xcc, 0x33])
+        ));
+        // orthory-ops is a different account and is not addressed.
+        assert!(!mentions_reach(
+            &blocks,
+            &names.account_keys_of(&[0xdd, 0x44])
+        ));
+    }
+
+    #[test]
+    fn an_unregistered_key_is_its_own_account() {
+        assert_eq!(
+            directory().account_keys_of(&[0x99]),
+            vec![vec![0x99]],
+            "a key nobody registered is still one identity"
+        );
+    }
+
+    #[test]
+    fn only_a_derived_id_reads_as_a_dm_room() {
+        let derived = dm_channel_id("1", "2");
+        assert!(is_derived_dm_channel(&derived));
+        assert!(!is_derived_dm_channel("general"));
+        // a person may name a channel this and it stays a channel.
+        assert!(!is_derived_dm_channel("dm-standup"));
+        assert!(!is_derived_dm_channel(&derived.to_ascii_uppercase()));
+    }
+
     #[test]
     fn mentions_resolve_against_the_member_roster() {
+        let roster =
+            |members: &[ChatMember]| MentionCandidates::new(&AuthorNames::default(), members);
         let members = vec![
             ChatMember {
                 key: "a1b2c3d4e5f6".into(),
@@ -2357,7 +2680,7 @@ mod tests {
                 label: "zoe".into(),
             },
         ];
-        let blocks = parse_message_with_members("ping @a1b2 about the deploy", &members);
+        let blocks = parse_message_with_mentions("ping @a1b2 about the deploy", &roster(&members));
         let Block::Paragraph(spans) = &blocks[0] else {
             panic!("paragraph expected");
         };
@@ -2372,7 +2695,7 @@ mod tests {
         assert_eq!(bytes, &vec![0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6]);
 
         // a printable (non-hex) identity keeps its own bytes
-        let blocks = parse_message_with_members("hey @zoe1 no — @zoea", &members);
+        let blocks = parse_message_with_mentions("hey @zoe1 no — @zoea", &roster(&members));
         let Block::Paragraph(spans) = &blocks[0] else {
             panic!("paragraph expected");
         };
@@ -2385,14 +2708,17 @@ mod tests {
         );
 
         // an unknown @word stays plain text
-        let blocks = parse_message_with_members("email @someone", &members);
+        let blocks = parse_message_with_mentions("email @someone", &roster(&members));
         let Block::Paragraph(spans) = &blocks[0] else {
             panic!("paragraph expected");
         };
         assert!(spans.iter().all(|span| span.marks.is_empty()));
 
         // rendered mentions land in the mention arm
-        let view = blocks_view(&parse_message_with_members("cc @a1b2c3", &members));
+        let view = blocks_view(&parse_message_with_mentions(
+            "cc @a1b2c3",
+            &roster(&members),
+        ));
         assert!(view[0].rich);
         assert!(
             view[0]

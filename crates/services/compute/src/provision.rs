@@ -259,7 +259,7 @@ pub type SharedProvisioner = Arc<dyn WorkspaceProvisioner>;
 
 /// the ONE place a materialized workspace is bound onto the run context: the
 /// mount becomes the child's cwd, its env is layered additively, its tool bin
-/// dirs feed `PATH`, and its assembled soul rides into the run — capability-host
+/// dirs feed `PATH`, and its assembled soul rides into the run — the provider
 /// decides the door (the executor's auto-load path, or the stdin prompt).
 pub fn bind_workspace(ws: &dyn ProvisionedWorkspace, ctx: &mut RunContext) {
     ctx.workdir_override = Some(ws.workdir());

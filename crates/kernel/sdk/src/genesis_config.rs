@@ -30,6 +30,16 @@ use crate::codec::{Cursor, push_bytes, push_str};
 /// the reserved host-store key the config travels under.
 pub const CONFIG_KEY: &[u8] = b"__config";
 
+/// genesis-config key: the identity chain id (identity/gateway scope their
+/// certificates and `.duck` routes to it; `runs` stamps the `?net=` half of
+/// every `duck://` link it renders into an agent's context with it). a
+/// component names it in its declared shape; the host binds the network's
+/// value.
+pub const CHAIN_ID: &str = "chain_id";
+/// genesis-config key: the per-network invite namespace (governance verifies
+/// tokens and join proofs against it).
+pub const INVITE: &str = "invite";
+
 /// canonical bytes of a genesis parameter list. keys must be strictly
 /// increasing (one parameter set, one encoding) — the caller is the host's
 /// genesis wiring handing a fixed literal slice, so a violation is a

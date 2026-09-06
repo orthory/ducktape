@@ -8,7 +8,7 @@ use sdk::Msg;
 
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
-use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
+use crate::constants::{GATE_SETTLE_TIMEOUT, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
 use crate::host_reads::{read_redemption_from_host, read_valset_members, read_valset_residents};
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
@@ -31,11 +31,9 @@ impl ValidatorRuntime<'_> {
         self.metrics.update_storage(
             self.prev_ckpt.0.unwrap_or_default(),
             self.index.is_poisoned(),
-            MODULE_IDS.iter().map(|module| {
-                (
-                    (*module).to_string(),
-                    self.index.applied_height(module).unwrap_or_default(),
-                )
+            self.index.module_ids().into_iter().map(|module| {
+                let height = self.index.applied_height(&module).unwrap_or_default();
+                (module, height)
             }),
         );
     }
@@ -124,12 +122,7 @@ impl ValidatorRuntime<'_> {
                 Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
             },
             RpcRequest::Status => {
-                let mut modules = std::collections::BTreeMap::new();
-                for &m in MODULE_IDS {
-                    if let Some(root) = node.host().module_root(m) {
-                        modules.insert(m.to_string(), hex(&root));
-                    }
-                }
+                let modules = crate::util::module_roots_hex(node.host());
                 RpcReply {
                     status: Some(RpcStatus {
                         height: node.finalized().map(|f| f.height),

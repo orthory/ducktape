@@ -184,7 +184,14 @@ impl ValidatorRuntime<'_> {
             // this lane's agreed clock IS the height: the drain stamps
             // BlockContext { consensus_time: height } for every block. the
             // shared index-fold epilogue owns the STALE-index error log.
-            noded::projection::apply_block_to_index(index, height, height, record, &dispatches);
+            noded::projection::apply_block_to_index(
+                index,
+                height,
+                height,
+                record,
+                &dispatches,
+                &node.host().module_roots(),
+            );
         }
         for d in drained {
             // a DISCARD is not this hold's outcome: the cutover
@@ -1196,21 +1203,23 @@ impl ValidatorRuntime<'_> {
         {
             return;
         }
-        let req = lifecycle::encode_query(&lifecycle::LifecycleQuery::ModuleStatus);
-        let Ok(bytes) = node.host().query(host::LIFECYCLE_MODULE_ID, &req).await else {
+        let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
+        let Ok(bytes) = node.host().query(host::MODULES_ID, &req).await else {
             return; // registry absent: byte-identical drain on a baseline net.
         };
-        let Ok(lifecycle::LifecycleReply::ModuleStatus { modules }) =
-            lifecycle::decode_reply(&bytes)
+        let Ok(modules::ModulesReply::ModuleStatus { modules }) = modules::decode_reply(&bytes)
         else {
             return;
         };
         // residency is a VERIFYING read (content re-hashed on the disk path)
         // AND a LOADABILITY read: signing ready must mean sha256(local bytes)
-        // == committed hash AND "this binary can instantiate them". Byte
-        // residency alone let a validator on an older build arm a swap at
-        // R = n and then deterministically reject every op to the module while
-        // its peers applied them — a silent fork on activation (#1297).
+        // == committed hash AND "this binary can instantiate them" AND "this
+        // host can realize the shape they declare" (an odb substrate for the
+        // id, config keys the network binds). Byte residency alone would let
+        // a validator on an older build arm a swap it then deterministically
+        // rejects every op to while its peers apply them — a silent fork on
+        // activation — and a shape the boundary cannot realize would fail
+        // closed on every validator at once.
         //
         // WHAT IT COSTS: the probe COMPILES the component synchronously on
         // this select loop — a few hundred ms for a 1.8 MB module, during
@@ -1219,17 +1228,20 @@ impl ValidatorRuntime<'_> {
         // per pending swap per boot — `decide` latches the verdict, loadable
         // and unloadable alike — and every validator pays it at the same
         // moment, right after the swap commits.
-        let actions = code_signaller.decide(&modules, |digest| {
+        let actions = code_signaller.decide(&modules, |module_id, digest| {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
-            match wasm_host::WasmModule::check_loadable(&bytes) {
+            let realizable = wasm_host::WasmModule::declared_shape(&bytes)
+                .map_err(|e| e.to_string())
+                .and_then(|shape| noded::compose::check_realizable(module_id, &shape));
+            match realizable {
                 Ok(()) => CodeVerdict::Loadable,
-                // the loader's first line only: a wasmtime error carries a
-                // multi-line trace, and the whole thing would evict the ring
-                // it is evidence in.
-                Err(e) => CodeVerdict::Unloadable {
-                    detail: e.to_string().lines().next().unwrap_or_default().to_string(),
+                // the first line only: a wasmtime error carries a multi-line
+                // trace, and the whole thing would evict the ring it is
+                // evidence in.
+                Err(detail) => CodeVerdict::Unloadable {
+                    detail: detail.lines().next().unwrap_or_default().to_string(),
                 },
             }
         });
@@ -1237,8 +1249,8 @@ impl ValidatorRuntime<'_> {
             tracing::warn!(
                 target: "ducktape::modules",
                 node = %label,
-                module = %key.0,
-                swap = key.1,
+                module = %key.module_id,
+                swap = key.name,
                 reason = "code_not_loadable",
                 detail = %detail,
                 "pending-swap code refused: this binary cannot instantiate it, so \
@@ -1278,8 +1290,8 @@ impl ValidatorRuntime<'_> {
                 Ok(_) => tracing::info!(
                     target: "ducktape::modules",
                     node = %label,
-                    module = %key.0,
-                    swap = key.1,
+                    module = %key.module_id,
+                    swap = key.name,
                     "code-ready signaled"
                 ),
                 Err(e) => {

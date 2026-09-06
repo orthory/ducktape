@@ -440,7 +440,9 @@ preset ui_launch
 
 // The launch window's two load-bearing renders: the wallet list's selected
 // row carries the password field, and an empty network list is the welcome
-// plate whose one CTA routes to the join flow.
+// plate whose one CTA routes to the join flow — with the remote-endpoint
+// field still there, because a device with no local network is exactly the
+// one that connects to a remote node.
 test launch_wallets_contract
   preset ui_launch
   viewport 480 680
@@ -469,6 +471,8 @@ test launch_wallets_contract
         restore_empty=true
         join_empty=true
       events
+        drag_launch_window -> drag_launch_window
+        close_launch_window -> close_launch_window
         pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -650,6 +654,8 @@ test launch_networks_empty_contract
         restore_empty=true
         join_empty=true
       events
+        drag_launch_window -> drag_launch_window
+        close_launch_window -> close_launch_window
         pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -677,7 +683,9 @@ test launch_networks_empty_contract
         copy_onboarding_invite -> copy_onboarding_invite
         enter_console -> enter_console
   target cta = #hub/root/networks/root/join-cta
+  target remote_field = #hub/root/networks/root/remote-endpoint
   expect exists cta
+  expect exists remote_field
   click cta
   expect hub_step == HubStep.join
 
@@ -984,6 +992,7 @@ test settings_keyboard_scroll_contract
             account_busy
             account_ticket
             appearance
+            desktop_notifications
             password
             status
             loading
@@ -1015,6 +1024,7 @@ test settings_keyboard_scroll_contract
             forget_workspace_submit -> forget_workspace_submit
             set_appearance_light -> set_appearance_light
             set_appearance_dark -> set_appearance_dark
+            set_desktop_notifications -> set_desktop_notifications _
       explorer:
         space w=1.0 h=1.0
       palette:
@@ -1891,3 +1901,46 @@ test the_huddle_dock_survives_a_channel_and_a_module_switch
   expect exists dock
   expect missing pill
   expect content.width ~= 1205.0
+// CLOSING A WINDOW IS NOT QUITTING. The process used to leave with its last
+// tracked window, which made the red button a quit nobody asked for; now a
+// close only unregisters the slot and the daemon goes on living in the status
+// item. The one thing this cannot assert is the absence of an exit — the
+// harness swallows `Action::Exit` — so it asserts the observable consequence
+// instead: after the close, the menu still answers and can put a window back.
+test closing_the_last_window_only_unregisters_it
+  preset ui_offline
+  tray choose "Open Ducktape"
+  expect onboarding_win != none
+  window closed
+  expect onboarding_win == none
+  expect console_win == none
+  tray choose "Open Ducktape"
+  expect onboarding_win != none
+
+// "OPEN" HAS TO OPEN. With both slots empty there is nothing to raise, and
+// `window_target` on an empty slot names a fresh id whose focus is a no-op —
+// so the raise-only row this replaced did nothing at all once every window was
+// closed, which is exactly the state the change above made reachable.
+test the_status_item_opens_a_window_when_none_is_tracked
+  preset ui_offline
+  expect onboarding_win == none
+  expect console_win == none
+  tray choose "Open Ducktape"
+  expect onboarding_win != none
+
+// ⌘Q IS ARMED BY ⌘, AND BY NOTHING ELSE. The key-press route that carries the
+// chord costs a proxied message and a rebuild for every key it sees, so it
+// exists only while the command modifier is down: the modifier stream is the
+// cheap half and `cmd_held` is the arming. That arming is what this can watch —
+// the exit the chord ends in is swallowed by the harness — and it is the half
+// that decides whether ordinary typing pays anything.
+test the_quit_chord_route_is_armed_only_while_command_is_held
+  preset ui_offline
+  expect !cmd_held
+  key "q"
+  expect !cmd_held
+  modifiers logo
+  expect cmd_held
+  modifiers
+  expect !cmd_held
+

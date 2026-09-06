@@ -36,8 +36,8 @@ use crate::services::ServiceGrant;
 ///
 /// This is `capability`'s own `MAX_CAPABILITIES`, mirrored HOST-SIDE: the
 /// module's constant is private to a crate under `crates/modules/`, and merely
-/// making it `pub` would rebuild its `component.wasm`, move the Lifecycle
-/// digest it is seeded with, and so move the genesis app hash — a flag day for
+/// making it `pub` would rebuild its `component.wasm`, move the code hash
+/// the modules registry seeds it with, and so move the genesis app hash — a flag day for
 /// a visibility keyword. `the_announce_cap_matches_the_modules_own` parses the
 /// module's source to pin the two together; a comment would not have.
 const MAX_ANNOUNCED_TAGS: usize = 64;

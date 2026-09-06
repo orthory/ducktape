@@ -68,7 +68,7 @@ impl StagedStore {
 
     /// read `key` from COMMITTED state only, bypassing the overlay — the
     /// boundary-decider read: a kernel coordinator whose activation decides
-    /// over the frozen end-of-(H-1) state (lifecycle's `Advance`, dispatch's
+    /// over the frozen end-of-(H-1) state (the modules registry's `Advance`, dispatch's
     /// committed-only query lane) must not see writes staged earlier in the
     /// same block. everything else reads [`get`](StagedStore::get).
     pub async fn get_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {

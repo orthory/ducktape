@@ -45,5 +45,6 @@ use guest_adapter::WitStore;
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Tasks,
+    shape: guest_adapter::store_shape(),
     new: Tasks::new(MODULE_ID, Box::new(WitStore)),
 }

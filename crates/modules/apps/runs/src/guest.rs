@@ -32,7 +32,7 @@
 //! (`turn_taken`) short-circuits on the staged pending entry before falling
 //! through to dispatch's PERMANENT committed record; there is no
 //! frozen-committed self-read anywhere in its handle paths (contrast
-//! lifecycle's `Advance` and dispatch's read facade, which stay native for
+//! the modules registry's `Advance` and dispatch's read facade, which stay native for
 //! exactly that reason). the ordering-contract surfaces cross the seam
 //! unchanged: the engagement/result/jobs intakes stay NO-FAIL (a bad event
 //! degrades to a breadcrumb `emit_event`, never a trap), the registry hook
@@ -148,6 +148,15 @@ fn to_wit_error(e: Error) -> host::Error {
 }
 
 impl Guest for Component {
+    /// a whole-state port over host-KV keys (`__state`/`__root`/`__history`),
+    /// bound to the network's chain id through its genesis config.
+    fn shape() -> host::ModuleShape {
+        host::ModuleShape {
+            config: vec![sdk::genesis_config::CHAIN_ID.into()],
+            ..guest_adapter::map_shape()
+        }
+    }
+
     fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
         let mut module = loaded_module()?;
         let mut ctx = WitCtx::new();

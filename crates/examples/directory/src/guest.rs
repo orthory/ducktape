@@ -14,6 +14,11 @@ use guest_adapter::{host, Guest};
 struct Component;
 
 impl Guest for Component {
+    /// plain host-KV keys: the host wraps this component over a map it owns.
+    fn shape() -> host::ModuleShape {
+        guest_adapter::map_shape()
+    }
+
     fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
         match decode_msg(&payload).map_err(host::Error::Rejected)? {
             // a staged write: the host publishes it at the block boundary,

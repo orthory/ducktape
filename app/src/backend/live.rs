@@ -846,6 +846,11 @@ pub(crate) async fn folded_update(
             // long as the node's select loop is busy (issue #1018). It is warm
             // by the connect that opened this stream.
             let names = cached_account_names();
+            // THE ONE ARRIVAL A READER CANNOT AFFORD TO FIND LATER. A mention
+            // and a DM used to reach nothing but the in-app bell, which is
+            // worth nothing behind another window. Pure decision, cached
+            // reads, no query — see `notify`.
+            notify_chat_op(&payload, op.origin.id.as_deref(), &names);
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
@@ -1941,6 +1946,10 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
                 channel_id,
             });
         }
+        // THE DM ROOMS RIDE THIS LOAD TOO, for the reason the directory does:
+        // the live decoder cannot ask which rooms are mine without a query
+        // inside the fold, and this load already derived every one of them.
+        note_dm_rooms(&peers);
         Ok(DmPeersData { generation, peers })
     }
     .await

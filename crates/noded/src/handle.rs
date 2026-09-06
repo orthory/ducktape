@@ -123,9 +123,9 @@ struct StatusCellInner {
     netstack_swapper: std::sync::OnceLock<Arc<NetstackSwapper>>,
 }
 
-/// Which machine the operator wants the reachability plane on. The component
-/// path is read on the NODE, not by the caller: the route takes a path on the
-/// node's own disk, exactly like `module-code` staging.
+/// Which machine the reachability plane is wanted on. The component path is
+/// read on the NODE, not by the caller: the route takes a path on the node's
+/// own disk, exactly like `module-code` staging.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NetstackSwapRequest {
@@ -133,6 +133,13 @@ pub enum NetstackSwapRequest {
     Native,
     /// `{"component": "<path>"}` — a `ducktape:netstack` component on disk.
     Component(PathBuf),
+    /// component bytes already in hand — the governance reconciler's variant:
+    /// the designated component is a verified chunk on the node's blob plane,
+    /// so writing it to disk to read it straight back would be the only I/O
+    /// in the path. NOT on the wire (`serde(skip)`): the admin route is a
+    /// path route by design, and no caller ships bytes through it.
+    #[serde(skip)]
+    Bytes(Vec<u8>),
 }
 
 /// Swap the reachability plane's backend, answering the new backend's name or

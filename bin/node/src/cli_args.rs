@@ -552,6 +552,16 @@ pub struct InitArgs {
     /// else the set the build staged beside this binary)
     #[arg(long, value_name = "DIR")]
     pub modules: Option<PathBuf>,
+    /// milliseconds between idle blocks; every consensus timer scales with it.
+    /// FOUNDING parameter, not plumbing: it lands in the network descriptor and
+    /// every joiner inherits it, so `join` has no such flag.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = config::DEFAULT_BLOCK_TIME_MS,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    pub block_time_ms: u64,
     #[command(flatten)]
     pub plumbing: PlumbingArgs,
 }
@@ -645,9 +655,24 @@ pub struct PlumbingArgs {
     /// invite intro listener address
     #[arg(long, value_name = "ADDR", hide_short_help = true)]
     pub invite_listen: Option<String>,
-    /// milliseconds between idle blocks; every consensus timer scales with it
-    #[arg(long, value_name = "MS", hide_short_help = true)]
-    pub block_time_ms: Option<u64>,
+}
+
+impl PlumbingArgs {
+    /// this flag set, named the way [`config::merged_plumbing`] wants them —
+    /// `init` and `join` build the identical struct from their own flags.
+    pub fn overrides(&self) -> config::PlumbingOverrides {
+        config::PlumbingOverrides {
+            listen: self.listen.clone(),
+            advertised: self.advertised.clone(),
+            http: self.http.clone(),
+            gateway: self.gateway.clone(),
+            rpc: self.rpc.clone(),
+            primary_coordinator: self.primary_coordinator.clone(),
+            wireguard_listen: self.wireguard_listen.clone(),
+            wireguard_advertised: self.wireguard_advertised.clone(),
+            invite_listen: self.invite_listen.clone(),
+        }
+    }
 }
 
 #[cfg(test)]

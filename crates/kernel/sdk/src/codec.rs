@@ -1,7 +1,7 @@
 //! the shared snapshot-codec primitives — ONE length-prefixed LE toolkit for
 //! every module's canonical binary encoding (the `root()` preimage and the
 //! snapshot format), replacing the per-module hand-rolled copies that used to
-//! live in valset/governance/lifecycle/identity/capability/saga/dispatch/….
+//! live in valset/governance/modules/identity/capability/saga/dispatch/….
 //!
 //! this is deliberately dumb: writers append, the [`Cursor`] reads forward
 //! over UNTRUSTED bytes with every accessor length-checked before it reads,
