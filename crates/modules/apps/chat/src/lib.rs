@@ -61,6 +61,10 @@ mod index_guest;
 
 use std::collections::BTreeSet;
 
+use identity::{
+    IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
+    encode_query as identity_encode_query,
+};
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
@@ -133,6 +137,15 @@ fn member_key(channel_id: &str, user: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(6 + 16 + channel_id.len() + user.len());
     key.extend_from_slice(b"member");
     component(&mut key, channel_id.as_bytes());
+    component(&mut key, user);
+    key
+}
+
+/// one creator's channel-creation counter — what [`MAX_CHANNELS_PER_CREATOR`]
+/// is checked against.
+fn creator_count_key(user: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(9 + 8 + user.len());
+    key.extend_from_slice(b"chancount");
     component(&mut key, user);
     key
 }
@@ -222,6 +235,10 @@ pub struct Chat {
     /// registries). the plane owns the loop rule and the subscription check;
     /// chat only translates its shapes at this edge.
     tagging: Option<ModuleId>,
+    /// the identity sibling `CreateDmChannel` resolves a creator's signing
+    /// key through (`OfKey`). `None` = no sibling on this host (tests,
+    /// minimal registries) — such a host refuses every `CreateDmChannel`.
+    identity: Option<ModuleId>,
 }
 
 impl Chat {
@@ -232,12 +249,19 @@ impl Chat {
             id: id.into(),
             staged: StagedStore::new(store),
             tagging: None,
+            identity: None,
         }
     }
 
     /// report every post to `tagging` as a [`tagging::TagEvent`].
     pub fn with_tagging(mut self, tagging: impl Into<ModuleId>) -> Self {
         self.tagging = Some(tagging.into());
+        self
+    }
+
+    /// resolve `CreateDmChannel`'s creator through `identity`'s `OfKey`.
+    pub fn with_identity(mut self, identity: impl Into<ModuleId>) -> Self {
+        self.identity = Some(identity.into());
         self
     }
 
@@ -460,10 +484,22 @@ impl Chat {
         Self::validate_non_empty("channel_id", &channel_id)?;
         Self::validate_non_empty("name", &name)?;
         Self::validate_channel_namespace(author, &channel_id)?;
+        // the `dm-` shape is reserved for `CreateDmChannel`, the only op that
+        // resolves a creator's OWN account and derives the id from it — a
+        // plain `CreateChannel` naming that shape is exactly the squat this
+        // gate closes (see the module doc on `CreateDmChannel`).
+        if client::is_derived_dm_channel(&channel_id) {
+            return Err(Error::Module(
+                "chat: dm- channel ids are reserved; open a DM with CreateDmChannel".into(),
+            ));
+        }
         if self.channel(&channel_id).await?.is_some() {
             return Err(Error::Module(format!(
                 "channel already exists: {channel_id}"
             )));
+        }
+        if let AuthorRef::User(user) = author {
+            self.check_creator_cap(user).await?;
         }
 
         // a user-created channel is owned by its creator (only the owner may
@@ -489,7 +525,109 @@ impl Chat {
             &channel,
             MAX_CHANNEL_RECORD_BYTES,
             "channel",
-        )
+        )?;
+        if let AuthorRef::User(user) = author {
+            self.bump_creator_count(user).await?;
+        }
+        Ok(())
+    }
+
+    /// open the two-party DM room with `counterpart`: derive the id from the
+    /// SIGNING key's own identity account (never trusted from the payload) so
+    /// only one of the pair may ever mint it, always seat `MembersOnly`
+    /// regardless of what a squatter might otherwise request, and own it by
+    /// its creator like any other user-made channel.
+    async fn stage_dm_channel(
+        &mut self,
+        ctx: &dyn Ctx,
+        author: &AuthorRef,
+        counterpart: u64,
+        name: String,
+        created_at: u64,
+    ) -> Result<String, Error> {
+        let AuthorRef::User(user) = author else {
+            return Err(Error::Module(
+                "chat: a DM channel must be opened by a user".into(),
+            ));
+        };
+        Self::validate_non_empty("name", &name)?;
+        let creator = self.resolve_dm_creator(ctx, user).await?;
+        if creator == counterpart {
+            return Err(Error::Module(
+                "chat: a DM's two accounts must differ".into(),
+            ));
+        }
+        let channel_id = client::dm_channel_id(&creator.to_string(), &counterpart.to_string());
+        if self.channel(&channel_id).await?.is_some() {
+            return Err(Error::Module(format!(
+                "channel already exists: {channel_id}"
+            )));
+        }
+        self.check_creator_cap(user).await?;
+        let channel = Channel {
+            id: channel_id.clone(),
+            name,
+            created_at,
+            head_seq: 0,
+            post_policy: PostPolicy::MembersOnly,
+            hooks: Vec::new(),
+            pinned: Vec::new(),
+            huddle: Vec::new(),
+            owner: Some(user.clone()),
+            archived: false,
+        };
+        self.store_bounded(
+            channel_key(&channel_id),
+            &channel,
+            MAX_CHANNEL_RECORD_BYTES,
+            "channel",
+        )?;
+        self.bump_creator_count(user).await?;
+        Ok(channel_id)
+    }
+
+    /// the identity account `key` belongs to, through the ONE resolver
+    /// (`OfKey`) — a key of no account has no standing to open a DM.
+    async fn resolve_dm_creator(&self, ctx: &dyn Ctx, key: &[u8]) -> Result<u64, Error> {
+        let identity_id = self.identity.as_ref().ok_or_else(|| {
+            Error::Module("chat: this host has no identity sibling wired for DM channels".into())
+        })?;
+        let reply = ctx
+            .query(
+                identity_id,
+                &identity_encode_query(&IdentityQuery::OfKey { key: key.to_vec() }),
+            )
+            .await?;
+        match identity_decode_reply(&reply).map_err(Error::Module)? {
+            IdentityReply::Account(Some(account)) => Ok(account.number),
+            IdentityReply::Account(None) => Err(Error::Module(
+                "chat: this key belongs to no identity account".into(),
+            )),
+            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+                Err(Error::Module("chat: unexpected identity reply".into()))
+            }
+        }
+    }
+
+    /// refuse channel creation once `user` is at [`MAX_CHANNELS_PER_CREATOR`]
+    /// — there is no `DeleteChannel` op, so this is the only thing bounding
+    /// one account's share of the (permanent) channel set.
+    async fn check_creator_cap(&self, user: &[u8]) -> Result<(), Error> {
+        let count: u64 = self.load(&creator_count_key(user)).await?.unwrap_or(0);
+        if count as usize >= MAX_CHANNELS_PER_CREATOR {
+            return Err(Error::Module(format!(
+                "chat: you already have {MAX_CHANNELS_PER_CREATOR} channels open"
+            )));
+        }
+        Ok(())
+    }
+
+    /// record that `user` just created a channel — the counter
+    /// [`Self::check_creator_cap`] reads.
+    async fn bump_creator_count(&mut self, user: &[u8]) -> Result<(), Error> {
+        let count: u64 = self.load(&creator_count_key(user)).await?.unwrap_or(0);
+        self.store(creator_count_key(user), &(count + 1));
+        Ok(())
     }
 
     /// rename a channel. reuses `CreateChannel`'s name validation (non-empty +
@@ -1143,6 +1281,13 @@ impl Module for Chat {
             } => {
                 self.stage_channel(&author, channel_id, name, post_policy, now)
                     .await
+            }
+            ChatMsg::CreateDmChannel { counterpart, name } => {
+                let channel_id = self
+                    .stage_dm_channel(ctx, &author, counterpart, name, now)
+                    .await?;
+                ctx.set_assigned(encode_assigned(&ChatAssigned::DmChannel { channel_id }));
+                Ok(())
             }
             ChatMsg::RenameChannel { channel_id, name } => {
                 self.stage_rename(&author, &channel_id, name).await

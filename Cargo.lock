@@ -1508,6 +1508,7 @@ dependencies = [
  "commonware-runtime",
  "guest-adapter",
  "host",
+ "identity",
  "index-guest",
  "sdk",
  "sdk-testkit",
