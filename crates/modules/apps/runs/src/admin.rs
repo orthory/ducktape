@@ -125,6 +125,26 @@ impl RunsModule {
                     }
                     other => canonical_origin(other),
                 };
+                reject_run_separator("channel_id", &channel_id)?;
+                // an external submitter is admitted only where its own key
+                // may post (post standing covers read): this op pins the
+                // channel's transcript and posts the reply under module
+                // authority, which chat admits unconditionally, so the
+                // submitter's own chat standing is the only thing keeping a
+                // non-member from reaching a members-only channel through the
+                // agent. module/system origins are not narrowed further —
+                // chat's own post policy always admits them too.
+                if let Origin::External(key) = &ctx.env().origin {
+                    let may_post = self
+                        .may_post(&*ctx, key, &channel_id)
+                        .await
+                        .map_err(Error::Module)?;
+                    if !may_post {
+                        return Err(Error::Module(format!(
+                            "requester may not post to channel: {channel_id}"
+                        )));
+                    }
+                }
                 // the requester's per-run skills, confined to the library by
                 // construction (names, not paths) — see `library_skills`.
                 let extra = envelope::library_skills(&skills).map_err(Error::Module)?;
@@ -135,7 +155,6 @@ impl RunsModule {
                 else {
                     return Err(Error::Module(format!("unknown agent: {agent_id}")));
                 };
-                reject_run_separator("channel_id", &channel_id)?;
                 let run_id = run_id_for(&channel_id, anchor_seq, &agent_id);
                 if self
                     .turn_taken(&*ctx, &dispatch_id_for(&run_id))

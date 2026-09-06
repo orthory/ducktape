@@ -40,7 +40,7 @@ fn hash(seed: u8) -> Vec<u8> {
 /// a host with valset (members 1,2) + governance wired to the REAL code
 /// registry, and the `hello` module pre-registered (active code = hash(1)).
 async fn gov_host_with_modreg() -> Host {
-    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
     valset.seed(member_key(1)).await.expect("seed valset");
     valset.seed(member_key(2)).await.expect("seed valset");
     valset.finish_seed().await.expect("seed valset");
@@ -59,6 +59,7 @@ async fn gov_host_with_modreg() -> Host {
             "modules",
             Box::new(MemStore::new()),
             "valset",
+            "governance",
         )),
     ])
     .expect("genesis");
@@ -329,7 +330,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         assert_eq!(proposal_status(&host, "mod-short").await, None);
 
         // an UNWIRED registry (Governance::new without with_code_registry).
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
         valset.seed(member_key(1)).await.expect("seed valset");
         valset.finish_seed().await.expect("seed valset");
         let mut unwired = Host::genesis(vec![

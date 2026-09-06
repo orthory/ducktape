@@ -56,11 +56,18 @@ struct CaptureCtx {
     transcripts: BTreeMap<String, Vec<MessageView>>,
     /// channels the chat probe reports as existing.
     channels: BTreeSet<String>,
+    /// channels whose post policy is members-only; every other channel is
+    /// open, which is what chat answers for a channel nobody restricted.
+    members_only: BTreeSet<String>,
+    /// (channel, user) pairs chat reports as members.
+    members: BTreeSet<(String, Vec<u8>)>,
     /// the task list served to the tasks probe.
     tasks: Vec<Task>,
     msgs: Vec<Msg>,
     /// when set, every query returns an error.
     fail_query: bool,
+    /// when set, only the message-text fetch (`MessagesRange`) errors.
+    fail_text_fetch: bool,
 }
 
 impl CaptureCtx {
@@ -77,9 +84,12 @@ impl CaptureCtx {
             },
             transcripts: BTreeMap::new(),
             channels: BTreeSet::new(),
+            members_only: BTreeSet::new(),
+            members: BTreeSet::new(),
             tasks: Vec::new(),
             msgs: Vec::new(),
             fail_query: false,
+            fail_text_fetch: false,
         }
     }
     fn with_origin(mut self, origin: Origin) -> Self {
@@ -103,13 +113,41 @@ impl CaptureCtx {
             id: task_id.into(),
             title: task_id.into(),
             status: TaskStatus::Open,
+            owner: "test".into(),
             created_at: 0,
             updated_at: 0,
         });
         self
     }
+    /// seed a task already owned by `owner`'s actor string — how the
+    /// `OwnerOpenCount` probe (#1740) sees a rule owner already at cap.
+    fn with_task_owned_by(mut self, task_id: &str, owner: &[u8]) -> Self {
+        self.tasks.push(Task {
+            id: task_id.into(),
+            title: task_id.into(),
+            status: TaskStatus::Open,
+            owner: owner_queue(owner),
+            created_at: 0,
+            updated_at: 0,
+        });
+        self
+    }
+    /// make `channel` members-only, admitting exactly `members` — chat's
+    /// answer to the standing probe for everyone else is a refusal.
+    fn with_members_only(mut self, channel: &str, members: &[&[u8]]) -> Self {
+        self.channels.insert(channel.into());
+        self.members_only.insert(channel.into());
+        for member in members {
+            self.members.insert((channel.into(), member.to_vec()));
+        }
+        self
+    }
     fn failing_query(mut self) -> Self {
         self.fail_query = true;
+        self
+    }
+    fn failing_text_fetch(mut self) -> Self {
+        self.fail_text_fetch = true;
         self
     }
     fn chat_msgs(&self) -> Vec<ChatMsg> {
@@ -154,9 +192,13 @@ impl Ctx for CaptureCtx {
                     from_seq,
                     limit,
                 } => {
-                    let transcript = self.transcripts.get(&channel_id).ok_or_else(|| {
-                        Error::Module(format!("unknown channel: {channel_id}"))
-                    })?;
+                    if self.fail_text_fetch {
+                        return Err(Error::Module("text fetch failed".into()));
+                    }
+                    let transcript = self
+                        .transcripts
+                        .get(&channel_id)
+                        .ok_or_else(|| Error::Module(format!("unknown channel: {channel_id}")))?;
                     let head = transcript.len() as u64;
                     let from = from_seq.max(1);
                     let mut window = Vec::new();
@@ -181,15 +223,26 @@ impl Ctx for CaptureCtx {
                     });
                     Ok(chat_encode_reply(&ChatReply::Channel(channel)))
                 }
-                ChatQuery::Message { message_id } => {
-                    Ok(chat_encode_reply(&ChatReply::Message(
-                        self.transcripts
-                            .values()
-                            .flatten()
-                            .find(|view| view.head.message_id == message_id)
-                            .cloned(),
-                    )))
+                // chat's own membership/policy answer. a channel this harness
+                // was not told about is OPEN, mirroring `PostPolicy::Open`:
+                // channel EXISTENCE is probe 1's job, and the real chat's
+                // closed answer for an absent channel has its own test there.
+                ChatQuery::Access { channel_id, user } => {
+                    let is_restricted = self.members_only.contains(&channel_id);
+                    let is_member = self.members.contains(&(channel_id, user));
+                    let admitted = !is_restricted || is_member;
+                    Ok(chat_encode_reply(&ChatReply::Access(ChannelAccess {
+                        may_read: admitted,
+                        may_post: admitted,
+                    })))
                 }
+                ChatQuery::Message { message_id } => Ok(chat_encode_reply(&ChatReply::Message(
+                    self.transcripts
+                        .values()
+                        .flatten()
+                        .find(|view| view.head.message_id == message_id)
+                        .cloned(),
+                ))),
             },
             // the board answers the SAME two reads the real module does; the
             // duplicate probe uses the by-id `Get`.
@@ -206,6 +259,10 @@ impl Ctx for CaptureCtx {
                         .cloned()
                         .collect();
                     Ok(tasks_encode_reply(&TaskReply::Tasks(page)))
+                }
+                TaskQuery::OwnerOpenCount { owner } => {
+                    let count = self.tasks.iter().filter(|t| t.owner == owner).count() as u64;
+                    Ok(tasks_encode_reply(&TaskReply::OwnerOpenCount(count)))
                 }
             },
             other => Err(Error::UnknownModule(other.into())),
@@ -255,6 +312,13 @@ fn inbox_action(member: &str, kind: &str, body: &str) -> Action {
         kind: kind.into(),
         body_template: body.into(),
     }
+}
+
+/// a `DeliverInbox` action whose `member_template` is the ONLY value
+/// `CreateRule` accepts for `owner`: `owner`'s own literal inbox queue (#1739
+/// — a rule may deliver only to its own owner, never a foreign member).
+fn owner_inbox_action(owner: &[u8], kind: &str, body: &str) -> Action {
+    inbox_action(&owner_queue(owner), kind, body)
 }
 
 fn admin(m: &AutomationsMsg) -> Msg {
@@ -403,6 +467,73 @@ fn duplicate_rule_id_is_rejected() {
     )
     .expect_err("duplicate must reject");
     assert!(matches!(err, Error::Module(msg) if msg.contains("already exists")));
+}
+
+/// #1741: `MAX_RULES_PER_OWNER` refuses the (N+1)th rule for THAT owner while
+/// a different owner is unaffected — the tasks board's per-owner cap shape
+/// applied to the rule roster, so one account can no longer permanently own
+/// the whole registry.
+#[test]
+fn per_owner_rule_cap_refuses_the_next_create_for_that_owner_only() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    for n in 0..MAX_RULES_PER_OWNER {
+        exec(
+            &mut m,
+            &mut ctx,
+            &create(
+                &format!("r{n}"),
+                post_trigger(None, None),
+                task_action(&format!("t{n}"), "T"),
+            ),
+        )
+        .expect("under the per-owner cap");
+    }
+    block_on(m.commit_block()).expect("commit");
+
+    let refused = exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "r-over",
+            post_trigger(None, None),
+            task_action("t-over", "T"),
+        ),
+    )
+    .expect_err("this owner is at its per-owner cap");
+    assert!(
+        matches!(&refused, Error::Module(msg) if msg.contains("rule owner at cap")),
+        "unexpected error: {refused}"
+    );
+
+    // a different owner is unaffected.
+    let mut other = CaptureCtx::new().with_origin(Origin::External(STRANGER.to_vec()));
+    exec(
+        &mut m,
+        &mut other,
+        &create("s1", post_trigger(None, None), task_action("s-task", "T")),
+    )
+    .expect("another owner is still admitted");
+
+    // deleting one of the capped owner's rules frees a slot.
+    exec(
+        &mut m,
+        &mut ctx,
+        &admin(&AutomationsMsg::DeleteRule {
+            rule_id: "r0".into(),
+        }),
+    )
+    .expect("delete frees a slot");
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "r-after-delete",
+            post_trigger(None, None),
+            task_action("t-after-delete", "T"),
+        ),
+    )
+    .expect("the freed slot is usable again");
 }
 
 #[test]
@@ -707,8 +838,10 @@ fn creating_a_rule_is_gated_but_firing_one_is_not() {
         vec![TaskMsg::CreateTask {
             task_id: "auto-general-1".into(),
             title: "T".into(),
+            owner: Some(OWNER.to_vec()),
         }],
-        "the owner-gated rule still fires under module authority"
+        "the owner-gated rule still fires under module authority, and the \
+         created task is attributed to the RULE OWNER, never this module"
     );
     assert_eq!(get_rule(&m, "r").expect("r").owner, OWNER);
 }
@@ -771,7 +904,7 @@ fn create_task_action_emits_deterministic_task_id() {
     .expect("fire");
     let tasks = chat_ctx.task_msgs();
     assert_eq!(tasks.len(), 1);
-    let TaskMsg::CreateTask { task_id, title } = &tasks[0] else {
+    let TaskMsg::CreateTask { task_id, title, .. } = &tasks[0] else {
         panic!("expected CreateTask");
     };
     assert_eq!(task_id, "todo-general-5", "deterministic task id");
@@ -802,7 +935,9 @@ fn post_message_action_emits_deterministic_message_id() {
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_channel("announce");
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_channel("announce");
     exec(
         &mut m,
         &mut chat_ctx,
@@ -858,21 +993,31 @@ fn post_message_fire_reads_chat_via_testkit_on_query() {
         origin: Origin::Module(CHAT.into()),
         me: ME.into(),
     })
-    .on_query(CHAT, |req| match chat_decode_query(req).map_err(Error::Module)? {
-        ChatQuery::Channel { channel_id } => Ok(chat_encode_reply(&ChatReply::Channel(Some(Channel {
-            id: channel_id.clone(),
-            name: channel_id,
-            created_at: 0,
-            head_seq: 0,
-            post_policy: PostPolicy::Open,
-            hooks: Vec::new(),
-            pinned: Vec::new(),
-            huddle: Vec::new(),
-            owner: None,
-            archived: false,
-        })))),
-        ChatQuery::Message { .. } => Ok(chat_encode_reply(&ChatReply::Message(None))),
-        _ => Err(Error::QueryUnsupported),
+    .on_query(CHAT, |req| {
+        match chat_decode_query(req).map_err(Error::Module)? {
+            ChatQuery::Channel { channel_id } => {
+                Ok(chat_encode_reply(&ChatReply::Channel(Some(Channel {
+                    id: channel_id.clone(),
+                    name: channel_id,
+                    created_at: 0,
+                    head_seq: 0,
+                    post_policy: PostPolicy::Open,
+                    hooks: Vec::new(),
+                    pinned: Vec::new(),
+                    huddle: Vec::new(),
+                    owner: None,
+                    archived: false,
+                }))))
+            }
+            ChatQuery::Message { .. } => Ok(chat_encode_reply(&ChatReply::Message(None))),
+            // the owner is admitted to both channels — the standing probe the
+            // read gate and the post gate share.
+            ChatQuery::Access { .. } => Ok(chat_encode_reply(&ChatReply::Access(ChannelAccess {
+                may_read: true,
+                may_post: true,
+            }))),
+            _ => Err(Error::QueryUnsupported),
+        }
     });
 
     block_on(m.execute(&mut ctx, &posted("general", 3, user(2), Vec::new()))).expect("fire");
@@ -1031,8 +1176,8 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
         &create(
             "notify-chat",
             post_trigger(Some("general"), None),
-            inbox_action(
-                "{mention}",
+            owner_inbox_action(
+                OWNER,
                 "chat",
                 "channel={channel} seq={seq} author={author} text={text} mention={mention}",
             ),
@@ -1066,7 +1211,11 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
     let InboxMsg::Deliver { member, kind, body } = &delivered[0] else {
         panic!("expected Deliver");
     };
-    assert_eq!(member, "agent/helper", "member uses the first mention");
+    assert_eq!(
+        member,
+        &owner_queue(OWNER),
+        "member is always the rule owner's own queue, regardless of the mention"
+    );
     assert_eq!(kind, "chat");
     assert_eq!(
         body,
@@ -1074,61 +1223,99 @@ fn chat_trigger_can_deliver_inbox_with_chat_placeholders() {
     );
 }
 
-/// the regression #858 introduced and this module has to answer: an inbox
-/// member is a QUEUE NAME in `sdk::Origin::actor_string`'s domain, and inbox
-/// refuses a `MarkRead`/`Clear` naming any queue but the submitter's own — so a
-/// `{author}` member_template has to produce the queue that author owns.
-///
-/// asserted by DERIVATION from the triggering key, never by spelling: rendering
-/// the author as the index tier's `user:{hex}` display handle instead delivers
-/// mail to a queue no origin can ever ack.
+/// #1739: `DeliverInbox` may reach ONLY the rule owner's own inbox queue.
+/// `{author}` used to be treated as "safe" because a firing rule only ever
+/// sees a user-authored post, but the author is whoever TRIGGERED the rule,
+/// never necessarily the rule's OWNER — so a foreign `{author}`/`{mention}`/
+/// literal member is refused at `CreateRule`, before the rule ever burns a
+/// roster slot, and neither ever reaches inbox.
 #[test]
-fn an_author_member_names_the_queue_that_author_owns() {
-    let author_key = vec![0x07; 4];
+fn deliver_inbox_to_a_foreign_member_is_refused_at_create() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    for (rule_id, member) in [
+        ("notify-author", "{author}"),
+        ("notify-mention", "{mention}"),
+        ("notify-literal", "ext:deadbeef"),
+    ] {
+        let refused = exec(
+            &mut m,
+            &mut ctx,
+            &create(
+                rule_id,
+                post_trigger(Some("general"), None),
+                inbox_action(member, "mention", "you were posted at"),
+            ),
+        )
+        .expect_err(&format!("{member} must not resolve to the owner"));
+        assert!(
+            refused
+                .to_string()
+                .contains("must be the rule owner's own queue"),
+            "unexpected error for {member}: {refused}"
+        );
+    }
+    block_on(m.commit_block()).expect("commit");
+    assert!(
+        block_on(m.roster()).expect("roster").is_empty(),
+        "every refused create staged nothing"
+    );
+}
+
+/// the create-time gate is a fast-fail convenience; the SAME confused-deputy
+/// refusal binds again at fire time, deterministically on every validator —
+/// see the module doc and [`Automations::build_and_emit`]'s `DeliverInbox`
+/// arm. `CreateRule` alone can never produce a rule whose member does not
+/// resolve to its owner, so this test crafts one directly through the
+/// in-crate store seam (the [`fire_count_saturates_at_u64_max`] pattern) to
+/// prove the re-check holds even if a future path ever mutated a rule after
+/// creation.
+#[test]
+fn deliver_inbox_to_a_foreign_member_is_refused_at_fire() {
     let mut m = module();
     let mut ctx = CaptureCtx::new();
     exec(
         &mut m,
         &mut ctx,
         &create(
-            "notify-author",
+            "notify-owner",
             post_trigger(Some("general"), None),
-            inbox_action("{author}", "mention", "you were posted at"),
+            owner_inbox_action(OWNER, "mention", "you were posted at"),
         ),
     )
-    .expect("create");
+    .expect("create: the literal owner queue is the one accepted member");
     block_on(m.commit_block()).expect("commit");
+
+    // craft a member_template that no longer resolves to the owner --
+    // unreachable via any admin op, but a fire-time re-check must still hold.
+    let mut rule = block_on(m.rule("notify-owner"))
+        .expect("load")
+        .expect("notify-owner");
+    let Action::DeliverInbox {
+        member_template, ..
+    } = &mut rule.action
+    else {
+        panic!("expected DeliverInbox");
+    };
+    *member_template = "ext:deadbeef".into();
+    m.store(rule_key("notify-owner"), &rule);
+    block_on(m.commit_block()).expect("commit crafted member");
 
     let mut chat_ctx = CaptureCtx::new().with_chat_origin();
     exec(
         &mut m,
         &mut chat_ctx,
-        &posted(
-            "general",
-            1,
-            AuthorRef::User(author_key.clone()),
-            Vec::new(),
-        ),
+        &posted("general", 1, user(1), Vec::new()),
     )
-    .expect("fire");
-
-    let delivered = chat_ctx.inbox_msgs();
-    assert_eq!(delivered.len(), 1);
-    let InboxMsg::Deliver { member, .. } = &delivered[0] else {
-        panic!("expected Deliver");
-    };
-    assert_eq!(
-        member,
-        &Origin::External(author_key).actor_string(),
-        "the delivered queue must be one its author can ack"
-    );
-    // and the run history records the member it actually emitted.
+    .expect("fire records failure, never aborts the block");
+    assert!(chat_ctx.msgs.is_empty(), "no delivery reaches inbox");
     block_on(m.commit_block()).expect("commit fire");
-    let recs = history(&m, "notify-author", 16);
+    assert_eq!(get_rule(&m, "notify-owner").expect("rule").fire_count, 0);
+    let recs = history(&m, "notify-owner", 4);
     assert_eq!(recs.len(), 1);
-    assert!(recs[0].action_ok);
+    assert!(!recs[0].action_ok);
     assert!(
-        recs[0].detail.contains("ext:07070707"),
+        recs[0].detail.contains("may not deliver to"),
         "detail: {}",
         recs[0].detail
     );
@@ -1153,7 +1340,7 @@ fn failed_text_fetch_is_recorded_not_guessed_empty() {
     // the fetch fails -> the text-needing rule cannot be evaluated: a
     // recorded failure (never empty-text guessing), no emit, and crucially
     // the block is NOT aborted.
-    let mut ctx = CaptureCtx::new().failing_query().with_chat_origin();
+    let mut ctx = CaptureCtx::new().failing_text_fetch().with_chat_origin();
     exec(&mut m, &mut ctx, &posted("general", 1, user(1), Vec::new()))
         .expect("no-fail arm survives a failed fetch");
     assert!(ctx.msgs.is_empty());
@@ -1236,30 +1423,33 @@ fn empty_template_records_action_ok_false_without_failing() {
     assert!(recs[0].detail.contains("empty message"));
 }
 
+/// a rule owner's OWN queue can still exceed the inbox member cap if the raw
+/// external key itself is large enough (`member_template` must equal it
+/// exactly, so #1739's gate cannot shrink it) — the length check still runs
+/// BEFORE the owner-equality check, so this stays reachable even though a
+/// foreign or substituted member can no longer reach it.
 #[test]
 fn inbox_member_over_cap_records_action_ok_false_without_emitting() {
+    let big_owner = vec![0x11; MAX_MEMBER_BYTES];
     let mut m = module();
-    let mut ctx = CaptureCtx::new();
+    let mut ctx = CaptureCtx::new().with_origin(Origin::External(big_owner.clone()));
     exec(
         &mut m,
         &mut ctx,
         &create(
             "member-cap",
             post_trigger(None, None),
-            inbox_action("{channel}", "chat", "body"),
+            owner_inbox_action(&big_owner, "chat", "body"),
         ),
     )
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    // chat does not bound channel-id length, so a `{channel}` member can be
-    // substituted past the inbox member cap.
-    let long_channel = "c".repeat(MAX_MEMBER_BYTES + 1);
     let mut chat_ctx = CaptureCtx::new().with_chat_origin();
     exec(
         &mut m,
         &mut chat_ctx,
-        &posted(&long_channel, 1, user(1), Vec::new()),
+        &posted("general", 1, user(1), Vec::new()),
     )
     .expect("fire records failure");
     assert!(chat_ctx.msgs.is_empty());
@@ -1282,7 +1472,7 @@ fn inbox_body_over_cap_records_action_ok_false_without_emitting() {
         &create(
             "body-cap",
             post_trigger(None, None),
-            inbox_action("alice", "chat", "{channel}"),
+            owner_inbox_action(OWNER, "chat", "{channel}"),
         ),
     )
     .expect("create");
@@ -1450,6 +1640,244 @@ fn squatted_message_id_is_caught_by_probe() {
     assert!(recs[0].detail.contains("already taken"));
 }
 
+/// #1617's write half: the rule fires under this module's origin, which chat
+/// admits unconditionally, so the OWNER's own standing in the TARGET channel
+/// is the gate. a refusal is recorded, never emitted, never a block failure.
+#[test]
+fn a_rule_may_not_post_where_its_owner_may_not() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "leak",
+            post_trigger(Some("mallory-pub"), None),
+            post_action("secrets", "{text}"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    // "secrets" admits somebody else; the rule's owner is not a member.
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_members_only("secrets", &[STRANGER])
+        .with_transcript(
+            "mallory-pub",
+            vec![message(
+                "mallory-pub",
+                1,
+                user(1),
+                vec![Block::paragraph("bait")],
+            )],
+        );
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("mallory-pub", 1, user(1), Vec::new()),
+    )
+    .expect("no-fail arm");
+    assert!(chat_ctx.msgs.is_empty(), "no emit into a closed channel");
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "leak").expect("leak").fire_count, 0);
+    let recs = history(&m, "leak", 4);
+    assert_eq!(recs.len(), 1);
+    assert!(!recs[0].action_ok);
+    assert_eq!(recs[0].detail, "rule owner may not post to secrets");
+}
+
+/// the allowed path of the same gate: the owner IS a member, so the post goes
+/// out exactly as before the gate existed.
+#[test]
+fn a_member_owner_still_posts_into_a_members_only_channel() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "brief",
+            post_trigger(Some("general"), None),
+            post_action("secrets", "from {channel}/{seq}"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_members_only("secrets", &[OWNER])
+        .with_channel("general");
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 2, user(1), Vec::new()),
+    )
+    .expect("fire");
+    let posts = chat_ctx.chat_msgs();
+    assert_eq!(posts.len(), 1, "the owner is a member: the post goes out");
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "brief").expect("brief").fire_count, 1);
+}
+
+/// #1618's read half: a wildcard trigger means "every channel the OWNER can
+/// read", so a members-only channel's traffic never reaches a stranger's rule
+/// — and a non-match leaves no run record to disclose that the post happened.
+#[test]
+fn a_wildcard_rule_does_not_observe_a_channel_its_owner_cannot_read() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new().with_origin(Origin::External(STRANGER.to_vec()));
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "spy",
+            post_trigger(None, None),
+            owner_inbox_action(STRANGER, "note", "{channel}#{seq}: {text}"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_members_only("secrets", &[OWNER])
+        .with_transcript(
+            "secrets",
+            vec![message(
+                "secrets",
+                1,
+                user(1),
+                vec![Block::paragraph("private")],
+            )],
+        );
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("secrets", 1, user(1), Vec::new()),
+    )
+    .expect("no-fail arm");
+    assert!(
+        chat_ctx.msgs.is_empty(),
+        "no inbox delivery of private text"
+    );
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "spy").expect("spy").fire_count, 0);
+    assert!(
+        history(&m, "spy", 4).is_empty(),
+        "a non-match records nothing: the record itself would disclose the post"
+    );
+}
+
+/// the same wildcard rule, owned by a member: it observes the channel.
+#[test]
+fn a_wildcard_rule_observes_a_channel_its_owner_is_a_member_of() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create(
+            "digest",
+            post_trigger(None, None),
+            owner_inbox_action(OWNER, "note", "{channel}#{seq}: {text}"),
+        ),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_members_only("secrets", &[OWNER])
+        .with_transcript(
+            "secrets",
+            vec![message(
+                "secrets",
+                1,
+                user(1),
+                vec![Block::paragraph("hello")],
+            )],
+        );
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("secrets", 1, user(1), Vec::new()),
+    )
+    .expect("fire");
+    assert_eq!(chat_ctx.inbox_msgs().len(), 1);
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "digest").expect("digest").fire_count, 1);
+}
+
+/// the standing probes are sibling reads on the consensus path, so one event
+/// spends at most [`MAX_ACCESS_PROBES_PER_EVENT`] DISTINCT (owner, channel)
+/// lookups — rules past that fail closed rather than trapping the dispatch and
+/// aborting the posting user's block. same-owner rules share one lookup.
+#[test]
+fn distinct_owners_past_the_probe_budget_fail_closed() {
+    let mut m = module();
+    let owners = MAX_ACCESS_PROBES_PER_EVENT + 1;
+    for n in 0..owners {
+        let mut ctx = CaptureCtx::new().with_origin(Origin::External(vec![n as u8 + 1]));
+        exec(
+            &mut m,
+            &mut ctx,
+            &create(
+                &format!("r{n:03}"),
+                post_trigger(None, None),
+                task_action(&format!("t{n:03}"), "T"),
+            ),
+        )
+        .expect("create");
+    }
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_channel("general");
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 1, user(1), Vec::new()),
+    )
+    .expect("no-fail arm");
+    block_on(m.commit_block()).expect("commit");
+
+    // the last rule's owner is the one whose lookup had no budget left.
+    let last = format!("r{:03}", owners - 1);
+    assert_eq!(get_rule(&m, &last).expect("last rule").fire_count, 0);
+    assert!(history(&m, &last, 4).is_empty());
+    // and the first MAX_ACTIONS_PER_EVENT of the rules that did get a lookup
+    // fired normally.
+    assert_eq!(get_rule(&m, "r000").expect("first rule").fire_count, 1);
+}
+
+/// an unanswerable standing probe is a refusal, not a pass: the rule does not
+/// observe the event at all.
+#[test]
+fn an_unanswerable_standing_probe_fails_closed() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create("r", post_trigger(None, None), task_action("t", "T")),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new().failing_query().with_chat_origin();
+    exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 1, user(1), Vec::new()),
+    )
+    .expect("no-fail arm survives a failed probe");
+    assert!(chat_ctx.msgs.is_empty());
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "r").expect("r").fire_count, 0);
+    assert!(history(&m, "r", 4).is_empty());
+}
+
 #[test]
 fn task_id_collision_is_caught_by_probe() {
     let mut m = module();
@@ -1462,7 +1890,9 @@ fn task_id_collision_is_caught_by_probe() {
     .expect("create");
     block_on(m.commit_block()).expect("commit");
 
-    let mut chat_ctx = CaptureCtx::new().with_chat_origin().with_task("auto-general-5");
+    let mut chat_ctx = CaptureCtx::new()
+        .with_chat_origin()
+        .with_task("auto-general-5");
     exec(
         &mut m,
         &mut chat_ctx,
@@ -1475,6 +1905,44 @@ fn task_id_collision_is_caught_by_probe() {
     assert_eq!(recs.len(), 1);
     assert!(!recs[0].action_ok);
     assert!(recs[0].detail.contains("already exists"));
+}
+
+/// #1740: the pre-emit probe checks the RULE OWNER's own open-task census,
+/// not just id collision — a full owner refuses the firing rule's action as a
+/// `RunRecord`, never the triggering post's block (P2).
+#[test]
+fn owner_task_cap_probe_refuses_the_action_not_the_block() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new();
+    exec(
+        &mut m,
+        &mut ctx,
+        &create("r", post_trigger(None, None), task_action("auto", "T")),
+    )
+    .expect("create");
+    block_on(m.commit_block()).expect("commit");
+
+    let mut chat_ctx = CaptureCtx::new().with_chat_origin();
+    for n in 0..tasks::MAX_OPEN_TASKS_PER_OWNER {
+        chat_ctx = chat_ctx.with_task_owned_by(&format!("existing-{n}"), OWNER);
+    }
+    let result = exec(
+        &mut m,
+        &mut chat_ctx,
+        &posted("general", 1, user(1), Vec::new()),
+    );
+    assert!(result.is_ok(), "a full owner never aborts the block");
+    assert!(chat_ctx.msgs.is_empty(), "no task is emitted past the cap");
+    block_on(m.commit_block()).expect("commit");
+    assert_eq!(get_rule(&m, "r").expect("r").fire_count, 0);
+    let recs = history(&m, "r", 4);
+    assert_eq!(recs.len(), 1);
+    assert!(!recs[0].action_ok);
+    assert!(
+        recs[0].detail.contains("task cap"),
+        "detail: {}",
+        recs[0].detail
+    );
 }
 
 #[test]
@@ -1565,7 +2033,7 @@ fn an_amplifying_template_truncates_instead_of_failing_the_triggering_post() {
     .expect("the triggering post's op is ACCEPTED");
 
     let tasks = chat_ctx.task_msgs();
-    let [TaskMsg::CreateTask { task_id, title }] = &tasks[..] else {
+    let [TaskMsg::CreateTask { task_id, title, .. }] = &tasks[..] else {
         panic!("expected one CreateTask, got {tasks:?}");
     };
     assert_eq!(task_id, "todo-general-1");
@@ -1817,7 +2285,7 @@ fn two_instances_replaying_the_same_ops_produce_identical_roots() {
                     mention: Some("ops".into()),
                     text_contains: None,
                 },
-                inbox_action("{author}", "notify", "posted {channel}@{seq}"),
+                owner_inbox_action(OWNER, "notify", "posted {channel}@{seq}"),
             ),
         )
         .expect("create r3");
@@ -1924,7 +2392,11 @@ fn run_history_ring_drops_the_oldest_past_the_cap() {
     block_on(m.commit_block()).expect("commit fires");
 
     let records = history(&m, "r", MAX_RUN_HISTORY as u64);
-    assert_eq!(records.len(), MAX_RUN_HISTORY, "the ring holds exactly the cap");
+    assert_eq!(
+        records.len(),
+        MAX_RUN_HISTORY,
+        "the ring holds exactly the cap"
+    );
     assert_eq!(
         records.first().expect("oldest").seq,
         overflow + 1,

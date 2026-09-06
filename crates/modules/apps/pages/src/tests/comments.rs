@@ -77,6 +77,7 @@ fn exact_comment_anchor_rebases_with_target_text() {
 fn add_comment_reports_structured_agent_mentions_to_tagging() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages").with_tagging("tagging");
+        seed_page(&mut p, "page-1").await;
         let mut op = add("t1", "c1", "page-1", "@qa-luna please review");
         let PageMsg::AddComment { mentions, .. } = &mut op else {
             unreachable!()
@@ -110,6 +111,7 @@ fn add_comment_reports_structured_agent_mentions_to_tagging() {
 fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages").with_tagging("tagging");
+        seed_page(&mut p, "page-1").await;
         apply_commit_as(&mut p, &add("t1", "c1", "page-1", "draft"), user("carol")).await;
         let edit = PageMsg::EditComment {
             comment_id: "c1".into(),
@@ -142,6 +144,7 @@ fn edit_comment_reports_only_supplied_new_agent_mentions_to_tagging() {
 fn add_comment_rejects_over_length_ids_before_staging() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         let long_thread = "t".repeat(MAX_THREAD_ID_BYTES + 1);
         apply_err_as(
             &mut p,
@@ -342,6 +345,7 @@ fn a_full_comment_thread_keeps_the_block_removal_escape_path() {
 fn as_agent_refines_a_module_origin_into_an_agent_author() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(
             &mut p,
             &add_as_agent("t1", "m1", "b1", "bot"),
@@ -398,6 +402,7 @@ fn as_agent_requires_a_module_origin_and_a_non_empty_id() {
 fn get_comment_serves_the_record_tombstones_included() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         assert_eq!(query_comment(&p, "m1").await, None, "absent id is None");
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
         assert!(query_comment(&p, "m1").await.is_some());
@@ -421,6 +426,7 @@ fn get_comment_serves_the_record_tombstones_included() {
 fn comment_add_opens_then_appends_and_counts_per_target() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "first"), user("alice")).await;
         apply_commit_as(&mut p, &add("t1", "m2", "b1", "second"), user("bob")).await;
         apply_commit_as(&mut p, &add("t2", "m3", "b1", "other"), user("alice")).await;
@@ -448,6 +454,7 @@ fn comment_add_opens_then_appends_and_counts_per_target() {
 fn comment_append_rejects_target_mismatch_duplicate_and_empty_origin() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "x"), user("alice")).await;
         apply_err_as(
             &mut p,
@@ -477,6 +484,7 @@ fn comment_append_rejects_target_mismatch_duplicate_and_empty_origin() {
 fn comment_edit_and_delete_are_author_only() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "orig"), user("alice")).await;
         apply_err_as(
             &mut p,
@@ -518,6 +526,7 @@ fn comment_edit_and_delete_are_author_only() {
 fn comment_deleting_last_live_removes_the_thread() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
         apply_commit_as(&mut p, &add("t1", "m2", "b1", "b"), user("alice")).await;
         apply_commit_as(
@@ -553,6 +562,7 @@ fn comment_deleting_last_live_removes_the_thread() {
 fn comment_resolve_toggles_and_records_resolver() {
     deterministic::Runner::default().start(|context| async move {
         let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
         apply_commit_as(&mut p, &add("t1", "m1", "b1", "a"), user("alice")).await;
         apply_commit_as(
             &mut p,
@@ -617,6 +627,7 @@ fn comment_caps_and_reserved_ids_reject() {
         // (`index::tests::threads_for_targets_rejects_over_cap_target_lists`).
     });
 }
+
 
 // comments ride the same qmdb as blocks (reserved NUL-prefixed keys), so a
 // block edit and a comment op never collide, and both compose into root.
@@ -751,5 +762,24 @@ fn a_thread_moves_only_by_its_opener() {
         .await;
         assert!(query_thread(&p, "t1").await.is_none());
         assert!(query_comment(&p, "m1").await.is_none());
+    });
+}
+
+#[test]
+fn add_comment_on_a_nonexistent_target_is_refused() {
+    // #1687: a NEW thread's target must be a real block whether or not an
+    // anchor is given — otherwise a thread can be squatted on an id that
+    // never becomes a block, and RemoveBlock (which needs the block to load)
+    // can never purge it.
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        apply_err_as(
+            &mut p,
+            &add("t1", "m1", "ghost", "squat"),
+            user("mallory"),
+            "block not found",
+        )
+        .await;
+        assert!(p.staged.is_empty(), "a rejected comment op stages nothing");
     });
 }

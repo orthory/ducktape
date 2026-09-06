@@ -23,6 +23,19 @@
 //! forever on a reply that will never come. the reaper lives in the dispatch
 //! task because runtime contexts are move-only (not `Clone`): the spawned task
 //! owns the only clock, and the request future itself stays runtime-free.
+//!
+//! BUSY-MESH RETRY: a single missed reaper window does not mean the source is
+//! dead — a founder pushing tens of consensus blocks/s over the same overlay
+//! can starve a statesync request in flight for a few seconds without either
+//! side being wrong. [`send_request`](P2pSyncClient::send_request) therefore
+//! retries the SAME request against the SAME source, stepping the reaper
+//! window across [`RETRY_WINDOWS`] (3s → 6s → 12s) before it surfaces a
+//! timeout and lets [`Sources::advance_past`] rotate the caller onto the next
+//! candidate — a dead source is still abandoned within the bounded total (see
+//! [`RETRY_WINDOWS`]'s doc), it just survives a merely busy mesh first. every
+//! occurrence — each retried attempt and the final surfaced timeout alike —
+//! bumps that source's timeout counter and, latched, a `warn!` (see
+//! [`TIMEOUT_WARN_EVERY`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -32,15 +45,42 @@ use std::time::Duration;
 use commonware_p2p::{Receiver, Recipients, Sender};
 use commonware_runtime::{Clock, IoBuf, Spawner};
 use futures::channel::oneshot;
+use tracing::{debug, warn};
 
 use crate::{
     SyncClient, SyncError, SyncRequest, SyncResponse, TipCoords, decode_response, decode_rpc,
     encode_request, encode_rpc,
 };
 
-/// the reaper's sweep interval. a request survives at most two sweeps, so the
-/// effective request timeout is between one and two intervals (3–6s).
+/// the reaper's sweep interval. a pending request's survival window (see
+/// [`RETRY_WINDOWS`]) is measured in whole sweeps of this.
 pub const REAP_INTERVAL: Duration = Duration::from_secs(3);
+
+/// per-attempt survival windows a request rides against the SAME source
+/// before [`P2pSyncClient::send_request`] gives up and rotates: 3s → 6s →
+/// 12s, each rounded up to whole [`REAP_INTERVAL`] sweeps (so, respectively,
+/// 1/2/4 sweeps — a request filed just after a sweep needs one extra sweep to
+/// clear its window, exactly like the original fixed reaper). Worst case
+/// (filed right after a sweep, every attempt fully spent) sums to
+/// 6s + 9s + 15s = 30s: a dead source is abandoned within ~30s, a busy mesh
+/// gets three chances first.
+pub const RETRY_WINDOWS: [Duration; 3] = [
+    Duration::from_secs(3),
+    Duration::from_secs(6),
+    Duration::from_secs(12),
+];
+
+/// how many reaper-timeout occurrences a source must accumulate before the
+/// latched `warn!` fires again after its first line — never one line per
+/// timeout under a sustained busy mesh (CLAUDE.md: a forever-retry loop logs
+/// attempt 1, then every Nth, carrying an `attempts` field).
+const TIMEOUT_WARN_EVERY: u64 = 20;
+
+/// a retry window's survival in whole reaper sweeps, rounded up so a window
+/// shorter than [`REAP_INTERVAL`] still survives at least one sweep.
+fn window_ticks(window: Duration) -> u64 {
+    window.as_secs().div_ceil(REAP_INTERVAL.as_secs()).max(1)
+}
 
 /// sink for inbound frames whose rpc id matches no pending request: another
 /// owner may multiplex its own id space over the same channel (id spaces are
@@ -49,10 +89,13 @@ pub const REAP_INTERVAL: Duration = Duration::from_secs(3);
 /// `(id, body)`; the kernel stays payload-agnostic.
 pub type UnmatchedFrameHook = Arc<dyn Fn(u64, &[u8]) + Send + Sync>;
 
-/// a pending request: the reply slot plus the reaper tick it was filed under.
+/// a pending request: the reply slot, the reaper tick it was filed under, and
+/// how many whole sweeps THIS attempt survives before the reaper reaps it
+/// (its [`RETRY_WINDOWS`] entry, in [`window_ticks`]).
 struct PendingEntry {
     reply: oneshot::Sender<Vec<u8>>,
     filed_at_tick: u64,
+    survive_ticks: u64,
 }
 
 /// the dispatch task's lane-reclaim seam: fire `stop` and the task hands the
@@ -95,17 +138,27 @@ struct Shared {
 struct Sources<P> {
     candidates: Vec<P>,
     cursor: AtomicUsize,
+    /// per-candidate reaper-timeout occurrence count, indexed the same way
+    /// `current()`/`advance_past` index `candidates` (raw cursor modulo
+    /// len) — see the module doc's BUSY-MESH RETRY.
+    timeout_counts: Vec<AtomicU64>,
 }
 
 impl<P: Clone + PartialEq> Sources<P> {
+    /// the RAW cursor and the candidate it selects. the token is the raw
+    /// counter, never the modular index: [`Sources::advance_past`] compares
+    /// it against the same raw counter, so folding the wrap in here would
+    /// freeze the rotation on index 0 for the process's life the moment the
+    /// cursor passed `len`.
     fn current(&self) -> (usize, P) {
-        let at = self.cursor.load(Ordering::Relaxed) % self.candidates.len();
-        (at, self.candidates[at].clone())
+        let raw = self.cursor.load(Ordering::Relaxed);
+        (raw, self.candidates[raw % self.candidates.len()].clone())
     }
 
-    /// advance past the source at `observed` — exactly once per failure wave:
-    /// a concurrent request that saw the same source fail leaves the cursor
-    /// where the first advance put it.
+    /// advance past the source at `observed` (a RAW cursor token from
+    /// [`Sources::current`]) — exactly once per failure wave: a concurrent
+    /// request that saw the same source fail leaves the cursor where the
+    /// first advance put it.
     fn advance_past(&self, observed: usize) {
         let _ = self.cursor.compare_exchange(
             observed,
@@ -113,6 +166,14 @@ impl<P: Clone + PartialEq> Sources<P> {
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
+    }
+
+    /// record one reaper-timeout occurrence against the source at `observed`
+    /// and return the occurrence count AFTER this one (1 on the first
+    /// occurrence) — the caller latches its `warn!` on this count.
+    fn record_timeout(&self, observed: usize) -> u64 {
+        self.timeout_counts[observed % self.timeout_counts.len()].fetch_add(1, Ordering::Relaxed)
+            + 1
     }
 }
 
@@ -197,9 +258,11 @@ where
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
         assert!(!candidates.is_empty(), "at least one sync source");
+        let timeout_counts = candidates.iter().map(|_| AtomicU64::new(0)).collect();
         let sources = Arc::new(Sources {
             candidates,
             cursor: AtomicUsize::new(0),
+            timeout_counts,
         });
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
@@ -234,15 +297,18 @@ where
             ctx.spawn(move |reap_ctx| async move {
                 loop {
                     reap_ctx.sleep(REAP_INTERVAL).await;
-                    // a request filed two ticks ago never got its reply —
+                    // an entry whose attempt-specific survival window
+                    // (`survive_ticks`, one grace sweep added — a request
+                    // filed just after a sweep still needs a whole extra
+                    // sweep to clear it) has elapsed never got its reply —
                     // dropping its sender fails the caller's await so it can
-                    // retry.
+                    // retry (see the module doc's BUSY-MESH RETRY).
                     let now = reap_shared.tick.fetch_add(1, Ordering::Relaxed) + 1;
                     reap_shared
                         .pending
                         .lock()
                         .expect("pending poisoned")
-                        .retain(|_, e| now.saturating_sub(e.filed_at_tick) < 2);
+                        .retain(|_, e| now.saturating_sub(e.filed_at_tick) < e.survive_ticks + 1);
                 }
             });
             loop {
@@ -353,50 +419,88 @@ where
     /// one request/response round trip, reporting the peer it was ADDRESSED
     /// to beside the answer. the whole transport body lives here;
     /// [`SyncClient::request`] is this with the peer dropped.
+    /// one logical request, riding up to [`RETRY_WINDOWS`] attempts against
+    /// the SAME source (see the module doc's BUSY-MESH RETRY) before
+    /// surfacing a timeout and letting the caller's rotation move on.
     async fn send_request(
         &self,
         req: SyncRequest,
     ) -> Result<(SyncResponse, S::PublicKey), SyncError> {
-        let mut sender = self.sender.clone();
         let sources = &self.sources;
         let shared = &self.shared;
         let (at, server) = sources.current();
-        let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = shared.pending.lock().expect("pending poisoned");
-            pending.insert(
-                id,
-                PendingEntry {
-                    reply: tx,
-                    filed_at_tick: shared.tick.load(Ordering::Relaxed),
-                },
-            );
-        }
-        let frame = encode_rpc(&self.requester, &self.proof, id, &encode_request(&req));
-        let attempted = sender.send(Recipients::One(server.clone()), IoBuf::from(frame), false);
-        if attempted.is_empty() {
-            // the source is offline/unreachable right now — fail fast
-            // instead of waiting out the reaper, and rotate.
-            shared.pending.lock().expect("pending poisoned").remove(&id);
-            sources.advance_past(at);
-            return Err(SyncError::Transport(
-                "sync source unreachable (send attempted no recipients)".into(),
-            ));
-        }
-        // resolves when the response routes back — or errs when the reaper
-        // drops the slot (dropped send / dead server), rotating so the
-        // caller's retry lands on the next candidate.
-        let bytes = match rx.await {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                sources.advance_past(at);
-                return Err(SyncError::Transport(format!(
-                    "request {id} timed out (send dropped by the mesh or source dead)"
-                )));
+        let kind = req.kind_name();
+        let body = encode_request(&req);
+
+        let mut attempt = 0usize;
+        loop {
+            let window = RETRY_WINDOWS[attempt];
+            let mut sender = self.sender.clone();
+            let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = oneshot::channel();
+            {
+                let mut pending = shared.pending.lock().expect("pending poisoned");
+                pending.insert(
+                    id,
+                    PendingEntry {
+                        reply: tx,
+                        filed_at_tick: shared.tick.load(Ordering::Relaxed),
+                        survive_ticks: window_ticks(window),
+                    },
+                );
             }
-        };
-        Ok((decode_response(&bytes)?, server))
+            let frame = encode_rpc(&self.requester, &self.proof, id, &body);
+            let attempted = sender.send(Recipients::One(server.clone()), IoBuf::from(frame), false);
+            if attempted.is_empty() {
+                // the source is offline/unreachable, rate-limited, or its
+                // mailbox refused the send under local backpressure right
+                // now — fail fast instead of waiting out the reaper, and
+                // rotate. this is a distinct, immediately-visible drop (see
+                // the module doc), not the reaper's "sent but unanswered"
+                // case below, so it does not retry against the same source.
+                shared.pending.lock().expect("pending poisoned").remove(&id);
+                debug!(
+                    target: "ducktape::statesync",
+                    reason = "send_rejected",
+                    kind,
+                    attempt = attempt + 1,
+                    "statesync request send accepted no recipients (rate-limited, closed sender, or local backpressure)",
+                );
+                sources.advance_past(at);
+                return Err(SyncError::Transport(
+                    "sync source unreachable (send attempted no recipients)".into(),
+                ));
+            }
+            // resolves when the response routes back — or errs when the
+            // reaper drops the slot (dropped send / dead server), retrying
+            // against the same source before rotating.
+            match rx.await {
+                Ok(bytes) => return Ok((decode_response(&bytes)?, server)),
+                Err(_) => {
+                    let occurrences = sources.record_timeout(at);
+                    let latched =
+                        occurrences == 1 || occurrences.is_multiple_of(TIMEOUT_WARN_EVERY);
+                    if latched {
+                        warn!(
+                            target: "ducktape::statesync",
+                            reason = "request_timeout",
+                            kind,
+                            attempt = attempt + 1,
+                            attempts_total = RETRY_WINDOWS.len(),
+                            occurrences,
+                            "statesync request timed out (send dropped by the mesh or source dead)",
+                        );
+                    }
+                    attempt += 1;
+                    if attempt == RETRY_WINDOWS.len() {
+                        sources.advance_past(at);
+                        return Err(SyncError::Transport(format!(
+                            "request {id} timed out after {attempt} attempts (send dropped by the mesh or source dead)"
+                        )));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -419,11 +523,18 @@ where
 mod tests {
     use super::*;
 
+    /// three zeroed timeout counters — matches every inline `Sources` fixture
+    /// below, which all use a 3-candidate `["a", "b", "c"]` list.
+    fn three_zero_counters() -> Vec<AtomicU64> {
+        (0..3).map(|_| AtomicU64::new(0)).collect()
+    }
+
     #[test]
     fn a_failure_wave_advances_the_cursor_exactly_once() {
         let sources = Sources {
             candidates: vec!["a", "b", "c"],
             cursor: AtomicUsize::new(0),
+            timeout_counts: three_zero_counters(),
         };
         let (at, first) = sources.current();
         assert_eq!((at, first), (0, "a"));
@@ -439,5 +550,242 @@ mod tests {
         assert_eq!(sources.current().1, "c");
         sources.advance_past(2);
         assert_eq!(sources.current().1, "a");
+
+        // and it keeps rotating PAST the wrap: the token stays the raw
+        // counter (3), so the fourth failure lands on "b" rather than
+        // freezing the cursor on the head forever.
+        let (at, wrapped) = sources.current();
+        assert_eq!((at, wrapped), (3, "a"));
+        sources.advance_past(at);
+        assert_eq!(sources.current(), (4, "b"));
+    }
+
+    #[test]
+    fn an_out_of_band_bump_does_not_freeze_the_rotation() {
+        // `advance_source` bumps the same raw cursor from another lane; the
+        // failure path must still rotate from wherever it left it.
+        let sources = Sources {
+            candidates: vec!["a", "b", "c"],
+            cursor: AtomicUsize::new(7),
+            timeout_counts: three_zero_counters(),
+        };
+        let (at, server) = sources.current();
+        assert_eq!((at, server), (7, "b"));
+        sources.advance_past(at);
+        assert_eq!(sources.current().1, "c");
+    }
+
+    #[test]
+    fn record_timeout_latches_first_then_every_nth() {
+        let sources = Sources {
+            candidates: vec!["a", "b"],
+            cursor: AtomicUsize::new(0),
+            timeout_counts: vec![AtomicU64::new(0), AtomicU64::new(0)],
+        };
+        // the first occurrence always latches (the caller's `occurrences ==
+        // 1` check).
+        assert_eq!(sources.record_timeout(0), 1);
+        // 2..TIMEOUT_WARN_EVERY are silent — the caller's `% N == 0` check
+        // is false for all of them — then the Nth relatches.
+        for expected in 2..TIMEOUT_WARN_EVERY {
+            let occurrences = sources.record_timeout(0);
+            assert_eq!(occurrences, expected);
+            assert!(!occurrences.is_multiple_of(TIMEOUT_WARN_EVERY));
+        }
+        let latched_again = sources.record_timeout(0);
+        assert_eq!(latched_again, TIMEOUT_WARN_EVERY);
+        assert!(latched_again.is_multiple_of(TIMEOUT_WARN_EVERY));
+        // a different source's counter is independent.
+        assert_eq!(sources.record_timeout(1), 1);
+    }
+
+    // ========================================================================
+    // reaper integration: a real `P2pSyncClient` over commonware's
+    // deterministic simulated mesh network — the same rig `tests/
+    // binding_parity.rs`'s mesh leg uses, so drops are genuine transport
+    // drops (the server simply never answers), not a fake in-process stand-in.
+    // ========================================================================
+
+    use commonware_cryptography::ed25519;
+
+    const TEST_CHANNEL: u64 = 0;
+
+    fn zero_tip_coords() -> TipCoords {
+        TipCoords {
+            height: 0,
+            root_hash: sdk::StateRoot::ZERO,
+            epoch: 0,
+            view_base: 0,
+            participants: Vec::new(),
+            residents: Vec::new(),
+            has_floor: false,
+            generation: 0,
+            mesh_window: Vec::new(),
+            build: None,
+        }
+    }
+
+    /// stand up a two-peer deterministic mesh (`server`, `joiner`) on one
+    /// registered channel and hand back both sides' sender/receiver halves.
+    async fn mesh_pair(
+        context: &commonware_runtime::deterministic::Context,
+    ) -> (
+        ed25519::PublicKey,
+        (
+            impl Sender<PublicKey = ed25519::PublicKey>,
+            impl Receiver<PublicKey = ed25519::PublicKey>,
+        ),
+        (
+            impl Sender<PublicKey = ed25519::PublicKey>,
+            impl Receiver<PublicKey = ed25519::PublicKey>,
+        ),
+    ) {
+        use commonware_cryptography::Signer as _;
+        use commonware_p2p::simulated::{self, Link};
+        use commonware_runtime::Supervisor as _;
+        use commonware_utils::{NZU32, NZUsize};
+
+        let server = ed25519::PrivateKey::from_seed(101).public_key();
+        let joiner = ed25519::PrivateKey::from_seed(102).public_key();
+
+        let (network, oracle) = simulated::Network::new_with_peers(
+            context.child("network"),
+            simulated::Config {
+                max_size: 1024 * 1024,
+                disconnect_on_block: true,
+                tracked_peer_sets: NZUsize!(1),
+            },
+            vec![server.clone(), joiner.clone()],
+        )
+        .await;
+        network.start();
+
+        let link = Link {
+            latency: Duration::from_millis(2),
+            jitter: Duration::from_millis(0),
+            success_rate: 1.0,
+        };
+        oracle
+            .add_link(server.clone(), joiner.clone(), link.clone())
+            .await
+            .expect("link server -> joiner");
+        oracle
+            .add_link(joiner.clone(), server.clone(), link)
+            .await
+            .expect("link joiner -> server");
+
+        let quota = commonware_runtime::Quota::per_second(NZU32!(128));
+        let server_side = oracle
+            .control(server.clone())
+            .register(TEST_CHANNEL, quota)
+            .await
+            .expect("server channel registration");
+        let joiner_side = oracle
+            .control(joiner.clone())
+            .register(TEST_CHANNEL, quota)
+            .await
+            .expect("joiner channel registration");
+
+        (server, server_side, joiner_side)
+    }
+
+    #[test]
+    fn retry_survives_two_dropped_sends_without_rotation() {
+        use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _, deterministic};
+
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let (server, (mut server_tx, mut server_rx), (joiner_tx, joiner_rx)) =
+                mesh_pair(&context).await;
+
+            // the first two requests the server receives are silently
+            // dropped (never answered) — exactly the busy-mesh shape the
+            // reaper must survive without rotating; the third is answered.
+            context.child("serve").spawn(move |_ctx| async move {
+                let mut seen = 0u32;
+                while let Ok((peer, msg)) = server_rx.recv().await {
+                    seen += 1;
+                    if seen < 3 {
+                        continue;
+                    }
+                    let bytes: Vec<u8> = msg.into();
+                    let Ok((_requester, _proof, id, _body)) = decode_rpc(&bytes) else {
+                        continue;
+                    };
+                    let resp = crate::encode_response(&SyncResponse::TipCoords(zero_tip_coords()));
+                    let _ = server_tx.send(
+                        Recipients::One(peer),
+                        IoBuf::from(encode_rpc(&[0u8; 32], &[0u8; 64], id, &resp)),
+                        false,
+                    );
+                    return;
+                }
+            });
+
+            let client = P2pSyncClient::new(
+                context.child("client"),
+                joiner_tx,
+                joiner_rx,
+                server,
+                [0u8; 32],
+                [0u8; 64],
+            );
+            let before = client.current_source();
+            let result = client.request(SyncRequest::TipCoords).await;
+            assert!(
+                result.is_ok(),
+                "the third attempt against the same source must succeed: {result:?}"
+            );
+            assert_eq!(
+                client.current_source(),
+                before,
+                "two dropped attempts must not rotate the source — only the \
+                 final surfaced timeout may"
+            );
+        });
+    }
+
+    #[test]
+    fn a_dead_source_surfaces_timeout_within_the_bounded_budget() {
+        use commonware_runtime::{
+            Clock as _, Runner as _, Spawner as _, Supervisor as _, deterministic,
+        };
+
+        deterministic::Runner::timed(Duration::from_secs(60)).start(|context| async move {
+            let (server, (_server_tx, mut server_rx), (joiner_tx, joiner_rx)) =
+                mesh_pair(&context).await;
+
+            // a genuinely dead source: every request lands and nothing ever
+            // answers.
+            context
+                .child("serve")
+                .spawn(move |_ctx| async move { while server_rx.recv().await.is_ok() {} });
+
+            let client = P2pSyncClient::new(
+                context.child("client"),
+                joiner_tx,
+                joiner_rx,
+                server,
+                [0u8; 32],
+                [0u8; 64],
+            );
+            let started = context.current();
+            let result = client.request(SyncRequest::TipCoords).await;
+            let elapsed = context
+                .current()
+                .duration_since(started)
+                .unwrap_or_default();
+
+            assert!(result.is_err(), "a dead source must eventually time out");
+            // worst case per attempt is (ticks+1) sweeps; summed across all
+            // three attempts that is exactly 30s (see `RETRY_WINDOWS`'s
+            // doc) — plus a small allowance for the link's own latency.
+            let bound = RETRY_WINDOWS.iter().map(|w| w.as_secs()).sum::<u64>()
+                + RETRY_WINDOWS.len() as u64 * REAP_INTERVAL.as_secs();
+            let budget = Duration::from_secs(bound) + Duration::from_millis(100);
+            assert!(
+                elapsed <= budget,
+                "abandonment must stay bounded: took {elapsed:?}, budget {budget:?}"
+            );
+        });
     }
 }

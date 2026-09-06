@@ -10,11 +10,12 @@
 //! the registry itself is self-contained (no sibling queries), so this proof
 //! pins its two FOLLOW-UP lanes across the seam:
 //!
-//! * the REGISTRY HOOK: a registration (and a capability change — and ONLY a
-//!   capability change) emits an [`AgentEvent`] msg to the production hook id
-//!   ("runs" — `bin/node/src/host_state.rs`). both hosts carry a runs-shaped
-//!   recorder under that id whose root folds every hook payload it receives,
-//!   so a missing, spurious, or diverging hook diverges the recorder roots.
+//! * the REGISTRY HOOK: a registration, a capability change, or a
+//!   deregistration (and ONLY those) emits an [`AgentEvent`] msg to the
+//!   production hook id ("runs" — `bin/node/src/host_state.rs`). both hosts
+//!   carry a runs-shaped recorder under that id whose root folds every hook
+//!   payload it receives, so a missing, spurious, or diverging hook diverges
+//!   the recorder roots.
 //! * the SAGA DEAD-LETTER arm: any trigger's `reply_to` may point a saga
 //!   callback at this module, and it must be swallowed (an emitted breadcrumb
 //!   event, never an error) — both hosts carry the REAL native saga and drive
@@ -317,11 +318,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
         StateRoot::ZERO,
         "agent has no ZERO sentinel"
     );
-    assert_eq!(
-        root_of(&native),
-        root_of(&wasm),
-        "genesis roots diverge"
-    );
+    assert_eq!(root_of(&native), root_of(&wasm), "genesis roots diverge");
     assert!(native.block_durable_ids().contains("agent"));
     assert!(wasm.block_durable_ids().contains("agent"));
 
@@ -344,7 +341,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
                 }),
                 skills: Some(vec![SkillRef {
                     name: "persona".into(),
-                    source_prefix: "skills/persona".into(),
+                    source_prefix: "/shared/skills/persona".into(),
                     source_snapshot: Some("snap-1".into()),
                     load: LoadMode::Always,
                 }]),
@@ -387,13 +384,13 @@ async fn same_ops_inner(context: &deterministic::Context) {
             skills: Some(vec![
                 SkillRef {
                     name: "persona".into(),
-                    source_prefix: "skills/persona".into(),
+                    source_prefix: "/shared/skills/persona".into(),
                     source_snapshot: None,
                     load: LoadMode::Always,
                 },
                 SkillRef {
                     name: "reference".into(),
-                    source_prefix: "skills/reference".into(),
+                    source_prefix: "/shared/skills/reference".into(),
                     source_snapshot: None,
                     load: LoadMode::OnDemand,
                 },
@@ -464,6 +461,22 @@ async fn same_ops_inner(context: &deterministic::Context) {
         }),
         true,
         false,
+    )
+    .await;
+
+    // ---- deregistration frees the roster slot and retires the recipe: the
+    // hook fires (Deregistered) on BOTH runtimes.
+    roundtrip(
+        &mut native,
+        &mut wasm,
+        &ids,
+        8,
+        Origin::Module("jobs".into()),
+        agent_op(&AgentMsg::DeregisterAgent {
+            agent_id: "curator".into(),
+        }),
+        true,
+        true,
     )
     .await;
 
@@ -724,7 +737,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 &Reg {
                     skills: Some(vec![SkillRef {
                         name: String::new(),
-                        source_prefix: "p".into(),
+                        source_prefix: "/shared/skills/p".into(),
                         source_snapshot: None,
                         load: LoadMode::OnDemand,
                     }]),
@@ -732,7 +745,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 }
                 .into(),
             ),
-            "skill name must not be empty",
+            "not a safe mount directory name",
         ),
         (
             owner.clone(),
@@ -748,7 +761,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 }
                 .into(),
             ),
-            "skill source_prefix must not be empty",
+            "not a scoped duckfs subtree",
         ),
         (
             owner.clone(),
@@ -756,7 +769,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 &Reg {
                     skills: Some(vec![SkillRef {
                         name: "s".into(),
-                        source_prefix: "p".into(),
+                        source_prefix: "/shared/skills/s".into(),
                         source_snapshot: Some(String::new()),
                         load: LoadMode::OnDemand,
                     }]),
@@ -765,6 +778,70 @@ async fn rejections_inner(context: &deterministic::Context) {
                 .into(),
             ),
             "source_snapshot must not be empty when set",
+        ),
+        (
+            owner.clone(),
+            agent_op(
+                &Reg {
+                    skills: Some(vec![SkillRef {
+                        name: "not a mount name".into(),
+                        source_prefix: "/shared/skills/r13".into(),
+                        source_snapshot: None,
+                        load: LoadMode::OnDemand,
+                    }]),
+                    ..reg("r13")
+                }
+                .into(),
+            ),
+            "not a safe mount directory name",
+        ),
+        (
+            owner.clone(),
+            agent_op(
+                &Reg {
+                    skills: Some(vec![
+                        SkillRef {
+                            name: "dup".into(),
+                            source_prefix: "/shared/skills/dup-a".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                        SkillRef {
+                            name: "dup".into(),
+                            source_prefix: "/shared/skills/dup-b".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                    ]),
+                    ..reg("r14")
+                }
+                .into(),
+            ),
+            "duplicate skill name",
+        ),
+        (
+            owner.clone(),
+            agent_op(
+                &Reg {
+                    skills: Some(vec![
+                        SkillRef {
+                            name: "a".into(),
+                            source_prefix: "/shared/skills/shared".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                        SkillRef {
+                            name: "b".into(),
+                            source_prefix: "/shared/skills/shared".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                    ]),
+                    ..reg("r15")
+                }
+                .into(),
+            ),
+            "duplicate skill source_prefix",
         ),
         // the record size gate: a display name past MAX_AGENT_RECORD_BYTES.
         (

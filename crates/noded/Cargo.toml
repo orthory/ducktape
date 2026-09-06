@@ -141,6 +141,10 @@ topology = { workspace = true }
 # MemStore: the in-memory MerkleStore double behind store-backed modules in
 # the in-crate provision tests.
 sdk-testkit = { workspace = true }
+# the capability registry: the session-boundary test wires saga with
+# `with_assignment`, so `Accept`'s capability gate needs a real registry to
+# announce a provider into.
+capability = { workspace = true }
 # the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
 nettest = { path = "../testing/nettest" }
 tokio-tungstenite = "0.24"

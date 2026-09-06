@@ -160,6 +160,10 @@ extern crate::backend
   pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
   pure password_problem(password:&str, confirm:&str) -> str
   pure without_window(current:window-id?, closed:window-id) -> window-id?
+  // Whether the close that just unregistered a slot ends the process: true
+  // only off macOS, where no status item exists to live in, once no window
+  // is left.
+  pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool
   // "Open Ducktape" as a discriminant: nothing tracked means there is nothing
   // to raise, so the row must open a window instead of focusing a fresh id.
   pure tray_open_action(console:window-id?, onboarding:window-id?) -> WindowSummon

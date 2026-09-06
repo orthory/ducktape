@@ -49,7 +49,7 @@ use agent::{
     AgentMsg, AgentResponse, ReplyBlock, ResourceCaps, SkillRef, encode_msg as agent_encode_msg,
     encode_response,
 };
-use capability::CapabilityRegistry;
+use capability::{CapabilityMsg, CapabilityRegistry, encode_msg as capability_encode_msg};
 use chat::{
     AuthorRef, Block, Chat, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
@@ -162,7 +162,11 @@ async fn siblings(
         Box::new(Files::open("files", files_dir).expect("files open")),
     ];
     if let Some(members) = assignment_members {
-        let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+        let mut valset = Valset::new(
+            "valset",
+            Box::new(sdk_testkit::MemStore::new()),
+            "governance",
+        );
         for member in members {
             valset.seed(member.clone()).await.expect("seed valset");
         }
@@ -178,14 +182,39 @@ async fn siblings(
 }
 
 async fn native_host(context: &deterministic::Context, files_dir: std::path::PathBuf) -> Host {
+    native_host_with_assignment(context, files_dir, None).await
+}
+
+/// like [`native_host`], but when `assignment_members` is given, saga is
+/// wired with `with_assignment` (a real valset + capability registry,
+/// seeded with those members) instead of the bare `new` — `Accept`'s
+/// standing/capability gate needs a real valset to admit a claim against.
+/// the lease policy stays `Open` regardless: this proof's oracle step
+/// submits under a different origin than the assignee (see the session-lane
+/// test), which only `Open` tolerates.
+async fn native_host_with_assignment(
+    context: &deterministic::Context,
+    files_dir: std::path::PathBuf,
+    assignment_members: Option<&[Vec<u8>]>,
+) -> Host {
+    let saga = match assignment_members {
+        Some(_) => saga::SagaModule::with_assignment(
+            "saga",
+            Box::new(sdk_testkit::MemStore::new()),
+            "valset",
+            "capability",
+            saga::LeasePolicy::Open,
+        ),
+        None => saga::SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())),
+    };
     let mut modules = siblings(
         context,
         "native_chat",
         "native_pages",
         "native_agent",
         files_dir,
-        saga::SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())),
-        None,
+        saga,
+        assignment_members,
     )
     .await;
     modules.push(Box::new(native_runs()));
@@ -193,14 +222,33 @@ async fn native_host(context: &deterministic::Context, files_dir: std::path::Pat
 }
 
 async fn wasm_host_(context: &deterministic::Context, files_dir: std::path::PathBuf) -> Host {
+    wasm_host_with_assignment(context, files_dir, None).await
+}
+
+/// like [`wasm_host_`], but see [`native_host_with_assignment`].
+async fn wasm_host_with_assignment(
+    context: &deterministic::Context,
+    files_dir: std::path::PathBuf,
+    assignment_members: Option<&[Vec<u8>]>,
+) -> Host {
+    let saga = match assignment_members {
+        Some(_) => saga::SagaModule::with_assignment(
+            "saga",
+            Box::new(sdk_testkit::MemStore::new()),
+            "valset",
+            "capability",
+            saga::LeasePolicy::Open,
+        ),
+        None => saga::SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())),
+    };
     let mut modules = siblings(
         context,
         "wasm_chat",
         "wasm_pages",
         "wasm_agent",
         files_dir,
-        saga::SagaModule::new("saga", Box::new(sdk_testkit::MemStore::new())),
-        None,
+        saga,
+        assignment_members,
     )
     .await;
     modules.push(Box::new(wasm_runs()));
@@ -836,6 +884,19 @@ fn rejections_match_and_leave_no_trace() {
         let mut native = native_host(&context, native_files).await;
         let mut wasm = wasm_host_(&context, wasm_files).await;
 
+        // an open "general" channel so alice's own chat standing admits the
+        // RequestRun rejection case below past the #1630 admission gate —
+        // it must fail on the UNKNOWN AGENT it names, not on access.
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            1,
+            alice(),
+            create_channel("general"),
+            false,
+        )
+        .await;
+
         // every distinct refusal family the runs module implements on its
         // root-op surface: admin-origin gates, field validation, the reserved
         // separator, unknown agents/runs, the session lane's key/lease/ACL
@@ -956,7 +1017,7 @@ fn rejections_match_and_leave_no_trace() {
         ];
 
         for (height, (origin, m, needle)) in rejects.into_iter().enumerate() {
-            let height = height as u64 + 1;
+            let height = height as u64 + 2;
             reject_roundtrip(&mut native, &mut wasm, height, origin, m, needle).await;
         }
     });
@@ -1133,15 +1194,18 @@ fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
 /// the ephemeral session keypair's public half (its private half never enters
 /// consensus) and the node that will hold the run's execution lease.
 const SESSION_KEY: [u8; 32] = [0x11; 32];
-const WORKER_NODE: &[u8] = b"worker-node";
+/// 32 bytes: `Accept`'s standing gate requires a real valset-shaped key, and
+/// this is seeded into that valset (see `native_host_with_assignment`).
+const WORKER_NODE: &[u8] = &[0x77; 32];
 
 #[test]
 fn the_session_lane_matches_lease_acl_budget_and_close_out() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (native_files, wasm_files) = (dir.path().join("native"), dir.path().join("wasm"));
     deterministic::Runner::default().start(|context| async move {
-        let mut native = native_host(&context, native_files).await;
-        let mut wasm = wasm_host_(&context, wasm_files).await;
+        let members = [WORKER_NODE.to_vec()];
+        let mut native = native_host_with_assignment(&context, native_files, Some(&members)).await;
+        let mut wasm = wasm_host_with_assignment(&context, wasm_files, Some(&members)).await;
         let run_id = run_id_for("general", 1, "quackbot");
 
         // an in-flight run, driven through both runtimes. the watch precedes
@@ -1188,6 +1252,28 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         )
         .await;
 
+        // WORKER_NODE announces itself as a "mock-llm-1" provider — after the
+        // trigger above, so the attempt's pool was still empty when it fired
+        // (a genuine announcement) and Accept's capability gate is satisfied
+        // by the time it claims. WORKER_NODE already holds valset standing
+        // (seeded into the host above), which the gate also requires.
+        let announce = Msg {
+            target: "capability".into(),
+            payload: capability_encode_msg(&CapabilityMsg::Announce {
+                capabilities: vec!["mock-llm-1".into()],
+                resources: Default::default(),
+            }),
+        };
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            5,
+            Origin::External(WORKER_NODE.to_vec()),
+            announce,
+            false,
+        )
+        .await;
+
         // the REAL lease path: a capable node claims the announced attempt
         // (saga Accept), and the dispatch facade resolves the committed
         // assignee identically on both hosts.
@@ -1202,7 +1288,7 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         roundtrip(
             &mut native,
             &mut wasm,
-            5,
+            6,
             Origin::External(WORKER_NODE.to_vec()),
             accept,
             false,
@@ -1218,7 +1304,7 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         reject_roundtrip(
             &mut native,
             &mut wasm,
-            6,
+            7,
             alice(),
             runs_op(&RunsMsg::OpenAgentSession {
                 run_id: run_id.clone(),
@@ -1233,7 +1319,7 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         roundtrip(
             &mut native,
             &mut wasm,
-            7,
+            8,
             Origin::External(WORKER_NODE.to_vec()),
             runs_op(&RunsMsg::OpenAgentSession {
                 run_id: run_id.clone(),
@@ -1247,7 +1333,7 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         reject_roundtrip(
             &mut native,
             &mut wasm,
-            8,
+            9,
             Origin::External(WORKER_NODE.to_vec()),
             runs_op(&RunsMsg::OpenAgentSession {
                 run_id: run_id.clone(),
@@ -1262,7 +1348,7 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         reject_roundtrip(
             &mut native,
             &mut wasm,
-            9,
+            10,
             Origin::External(WORKER_NODE.to_vec()),
             runs_op(&RunsMsg::AgentAction {
                 run_id: run_id.clone(),
@@ -1280,7 +1366,7 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         reject_roundtrip(
             &mut native,
             &mut wasm,
-            10,
+            11,
             Origin::External(SESSION_KEY.to_vec()),
             runs_op(&RunsMsg::AgentAction {
                 run_id: run_id.clone(),
@@ -1299,7 +1385,7 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         roundtrip(
             &mut native,
             &mut wasm,
-            11,
+            12,
             Origin::External(SESSION_KEY.to_vec()),
             runs_op(&RunsMsg::AgentAction {
                 run_id: run_id.clone(),
@@ -1325,13 +1411,13 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         roundtrip(
             &mut native,
             &mut wasm,
-            12,
+            13,
             Origin::External(b"oracle".to_vec()),
             oracle,
             false,
         )
         .await;
-        roundtrip(&mut native, &mut wasm, 13, alice(), noop_block(13), true).await;
+        roundtrip(&mut native, &mut wasm, 14, alice(), noop_block(14), true).await;
         assert_eq!(
             agent_sessions(&wasm).await,
             Vec::<runs::AgentSession>::new(),
@@ -1340,7 +1426,7 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         reject_roundtrip(
             &mut native,
             &mut wasm,
-            14,
+            15,
             Origin::External(SESSION_KEY.to_vec()),
             runs_op(&RunsMsg::AgentAction {
                 run_id: run_id.clone(),

@@ -54,12 +54,81 @@ pub struct SpeakerStats {
     pub peer: PeerId,
     pub jitter: JitterStats,
     pub decode_errors: u64,
+    /// Packets this peer sent that the codec boundary refused outright
+    /// (off-contract TOC, too short, or an unwind out of the library).
+    pub bad_packets: u64,
 }
+
+/// A refused packet logs on the first and every hundredth occurrence per
+/// lane: a peer can send one per datagram, and a warn per datagram is a log
+/// bomb that evicts the ring the operator is reading.
+const BAD_PACKET_EVERY: u64 = 100;
+
+/// An epoch change is a per-session lifecycle fact, but a peer chooses the
+/// field: latch it the same way, first and every hundredth.
+const EPOCH_CHANGE_EVERY: u64 = 100;
 
 struct Lane {
     jitter: MinimalJitter,
     decoder: VoiceDecoder,
     decode_errors: u64,
+    bad_packets: u64,
+    /// which of the sender's engines this lane is following.
+    epoch: u32,
+    epoch_changes: u64,
+}
+
+impl Lane {
+    fn new(epoch: u32, decoder: VoiceDecoder, config: VoiceConfig) -> Self {
+        Lane {
+            jitter: MinimalJitter::new(config.prefill_frames, config.max_depth_frames),
+            decoder,
+            decode_errors: 0,
+            bad_packets: 0,
+            epoch,
+            epoch_changes: 0,
+        }
+    }
+
+    /// The peer restarted their media without leaving the roster. Their seq
+    /// went back to 0, so a jitter buffer anchored at the old high seq would
+    /// count the whole new stream late: start the lane over.
+    fn follow_new_epoch(
+        &mut self,
+        epoch: u32,
+        decoder: VoiceDecoder,
+        config: VoiceConfig,
+        peer: &PeerId,
+    ) {
+        self.jitter = MinimalJitter::new(config.prefill_frames, config.max_depth_frames);
+        self.decoder = decoder;
+        self.epoch = epoch;
+        self.epoch_changes += 1;
+        let occurrences = self.epoch_changes;
+        if occurrences == 1 || occurrences.is_multiple_of(EPOCH_CHANGE_EVERY) {
+            tracing::info!(
+                target: "ducktape::voice",
+                reason = "media_epoch_changed",
+                peer = %peer_label(peer),
+                occurrences,
+                "peer's media restarted — speaker lane reopened"
+            );
+        }
+    }
+
+    fn note_bad_packet(&mut self, peer: &PeerId, reason: &'static str) {
+        self.bad_packets += 1;
+        let occurrences = self.bad_packets;
+        if occurrences == 1 || occurrences.is_multiple_of(BAD_PACKET_EVERY) {
+            tracing::warn!(
+                target: "ducktape::voice",
+                reason,
+                peer = %peer_label(peer),
+                occurrences,
+                "refused a peer's opus packet"
+            );
+        }
+    }
 }
 
 type Lanes = Arc<Mutex<HashMap<PeerId, Lane>>>;
@@ -68,6 +137,9 @@ type Lanes = Arc<Mutex<HashMap<PeerId, Lane>>>;
 pub struct VoiceEngine<T: DataPlaneTransport> {
     flow: Arc<DatagramFlow<T>>,
     encoder: VoiceEncoder,
+    /// this engine instance, stamped on every media and video frame it sends
+    /// so a receiver can tell a restart from stale traffic.
+    epoch: u32,
     seq: u16,
     timestamp: u32,
     lanes: Lanes,
@@ -93,6 +165,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         Ok(VoiceEngine {
             flow,
             encoder,
+            epoch: rand::random(),
             seq: 0,
             timestamp: 0,
             lanes,
@@ -112,6 +185,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         let payload = self.encoder.encode(pcm)?;
         let frame = media::encode_frame(
             MediaHeader {
+                epoch: self.epoch,
                 seq: self.seq,
                 timestamp: self.timestamp,
             },
@@ -137,7 +211,7 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
     pub fn playout(&self) -> [i16; FRAME_SAMPLES] {
         let mut mix = [0i32; FRAME_SAMPLES];
         let mut lanes = self.lanes.lock().expect("lanes lock");
-        for lane in lanes.values_mut() {
+        for (peer, lane) in lanes.iter_mut() {
             let decoded = match lane.jitter.tick() {
                 // Buffering and Gap both render as silence: nothing to add.
                 PlayoutStep::Buffering | PlayoutStep::Gap => None,
@@ -146,9 +220,14 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
             let pcm = match decoded {
                 None => continue,
                 Some(Ok(pcm)) => pcm,
-                Some(Err(_)) => {
-                    // A peer's undecodable payload must not silence the rest
-                    // of the mix: count it and keep going.
+                // A peer's undecodable payload must not silence the rest of
+                // the mix: count it and keep going. A refused packet is the
+                // hostile-or-broken case and says so by reason.
+                Some(Err(CodecError::BadPacket(reason))) => {
+                    lane.note_bad_packet(peer, reason);
+                    continue;
+                }
+                Some(Err(CodecError::Opus(_))) => {
                     lane.decode_errors += 1;
                     continue;
                 }
@@ -164,6 +243,19 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
         out
     }
 
+    /// Drop a speaker's lane. Call it when the peer leaves the roster: their
+    /// buffered audio and decoder state are dead weight from that moment, and
+    /// a lane per departed peer accumulates for the life of the call. A peer
+    /// who comes back is re-anchored by their media epoch, not by this.
+    /// Returns whether a lane was there to drop.
+    pub fn forget_peer(&self, peer: PeerId) -> bool {
+        self.lanes
+            .lock()
+            .expect("lanes lock")
+            .remove(&peer)
+            .is_some()
+    }
+
     pub fn speaker_stats(&self) -> Vec<SpeakerStats> {
         self.lanes
             .lock()
@@ -173,8 +265,15 @@ impl<T: DataPlaneTransport> VoiceEngine<T> {
                 peer: *peer,
                 jitter: lane.jitter.stats(),
                 decode_errors: lane.decode_errors,
+                bad_packets: lane.bad_packets,
             })
             .collect()
+    }
+
+    /// This engine instance. The video plane stamps the same value, so both
+    /// of a peer's streams restart together.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
     }
 
     /// Datagrams that failed media decoding (bad version/truncated).
@@ -220,13 +319,16 @@ async fn pump<T: DataPlaneTransport>(
                     peer = %peer_label(&peer),
                     "first media frame from peer — speaker lane opened"
                 );
-                vacant.insert(Lane {
-                    jitter: MinimalJitter::new(config.prefill_frames, config.max_depth_frames),
-                    decoder,
-                    decode_errors: 0,
-                })
+                vacant.insert(Lane::new(header.epoch, decoder, config))
             }
         };
+        if lane.epoch != header.epoch {
+            let Ok(decoder) = VoiceDecoder::new() else {
+                malformed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            lane.follow_new_epoch(header.epoch, decoder, config, &peer);
+        }
         lane.jitter.insert(header.seq, payload.to_vec());
     }
 }

@@ -9,6 +9,13 @@
 //! swap is the accepted residual). Path hosts (the publisher node outside the
 //! enclave, any relay) see ciphertext, and a stolen bearer alone cannot
 //! produce a sealable body; the enclave dedupes request nonces per sub.
+//!
+//! The request AEAD also binds the HTTP method and path+query as associated
+//! data (`request_aad`) — a relay holding a live bearer plus a captured sealed
+//! blob cannot redirect it to a different method or path; the tag fails to
+//! open under mismatched AAD. Headers stay UNBOUND: `proxy_inner`'s denylist
+//! (server.rs) is the only header rule, and forwarding the rest verbatim is
+//! by design.
 
 use anyhow::{bail, Context, Result};
 use chacha20poly1305::aead::Aead;
@@ -38,13 +45,21 @@ fn request_key(keys: &SessionKeys) -> [u8; 32] {
     aead::hkdf32(&keys.body, REQ_LABEL)
 }
 
-/// Seal a whole request body as one blob (`aead::seal` envelope).
-pub fn seal_request(keys: &SessionKeys, body: &[u8]) -> Vec<u8> {
-    aead::seal(&request_key(keys), body)
+/// Canonical AAD binding a sealed request to the HTTP request line it is sent
+/// as: `METHOD\n/path?query`. The caller and the gateway must derive this from
+/// the same method and path+query or the AEAD tag refuses to open.
+pub fn request_aad(method: &str, path_and_query: &str) -> Vec<u8> {
+    format!("{method}\n{path_and_query}").into_bytes()
 }
 
-pub fn open_request(keys: &SessionKeys, blob: &[u8]) -> Result<Vec<u8>> {
-    aead::open(&request_key(keys), blob).context("sealed request body")
+/// Seal a whole request body as one blob (`aead::seal` envelope), bound to
+/// `aad` (see `request_aad`).
+pub fn seal_request(keys: &SessionKeys, aad: &[u8], body: &[u8]) -> Vec<u8> {
+    aead::seal(&request_key(keys), aad, body)
+}
+
+pub fn open_request(keys: &SessionKeys, aad: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
+    aead::open(&request_key(keys), aad, blob).context("sealed request body")
 }
 
 /// The request blob's unique nonce — the response-stream binding value (and
@@ -269,12 +284,26 @@ mod tests {
     #[test]
     fn request_blob_round_trips_and_rejects_tamper() {
         let keys = keys();
-        let blob = seal_request(&keys, br#"{"model":"claude"}"#);
-        assert_eq!(open_request(&keys, &blob).unwrap(), br#"{"model":"claude"}"#);
+        let aad = request_aad("POST", "/v1/messages");
+        let blob = seal_request(&keys, &aad, br#"{"model":"claude"}"#);
+        assert_eq!(
+            open_request(&keys, &aad, &blob).unwrap(),
+            br#"{"model":"claude"}"#
+        );
         let mut bad = blob.clone();
         let last = bad.len() - 1;
         bad[last] ^= 1;
-        assert!(open_request(&keys, &bad).is_err());
+        assert!(open_request(&keys, &aad, &bad).is_err());
+    }
+
+    #[test]
+    fn request_blob_refuses_a_different_method_or_path() {
+        let keys = keys();
+        let aad = request_aad("POST", "/v1/messages");
+        let blob = seal_request(&keys, &aad, br#"{"model":"claude"}"#);
+        assert!(open_request(&keys, &request_aad("GET", "/v1/messages"), &blob).is_err());
+        assert!(open_request(&keys, &request_aad("POST", "/v1/other"), &blob).is_err());
+        assert!(open_request(&keys, &aad, &blob).is_ok());
     }
 
     #[test]
@@ -334,8 +363,9 @@ mod tests {
         // The replay the review flagged: an authentic sealed response for
         // request A, returned verbatim for request B, must fail to open.
         let keys = keys();
-        let blob_a = seal_request(&keys, b"request A");
-        let blob_b = seal_request(&keys, b"request B");
+        let aad = request_aad("POST", "/v1/messages");
+        let blob_a = seal_request(&keys, &aad, b"request A");
+        let blob_b = seal_request(&keys, &aad, b"request B");
         let (mut sealer, salt) = StreamSealer::new(&keys, &request_binding(&blob_a));
         let mut wire = salt;
         wire.extend(sealer.seal_head("t"));

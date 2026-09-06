@@ -109,6 +109,12 @@ const GENESIS_GENERATION: u64 = 0;
 
 pub struct Valset {
     id: ModuleId,
+    /// the ONE module id whose follow-ups may stage a membership change.
+    /// every module origin is a host-stamped follow-up from whichever guest
+    /// just executed, so accepting `Module(_)` would let ANY admitted module
+    /// add itself to the validator set. genesis wiring — identical on every
+    /// node.
+    governance_id: ModuleId,
     /// the host-injected authenticated store plus this block's staging overlay
     /// (read-your-writes, folded into `root()` at `commit_block`). store key
     /// is `sha256(logical_key)`, owned by [`StagedStore`].
@@ -117,9 +123,14 @@ pub struct Valset {
 
 impl Valset {
     /// wrap the host-constructed store under module identity `id`.
-    pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
+    pub fn new(
+        id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
+        governance_id: impl Into<ModuleId>,
+    ) -> Self {
         Self {
             id: id.into(),
+            governance_id: governance_id.into(),
             staged: StagedStore::new(store),
         }
     }
@@ -494,18 +505,21 @@ impl Module for Valset {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        // membership changes are GOVERNANCE-GATED: only a module origin (the
-        // governance module's follow-up after a passing proposal) or a system
-        // origin (genesis orchestration) may stage them. an unauthenticated
-        // external Leave was a one-message liveness kill on a private network;
-        // origin is part of the deterministic Env, so every validator enforces
-        // this identically.
+        // membership changes are GOVERNANCE-GATED: only the GOVERNANCE module's
+        // own follow-up (after a passing proposal) or a system origin (genesis
+        // orchestration) may stage them. an unauthenticated external Leave was
+        // a one-message liveness kill on a private network; a bare `Module(_)`
+        // was the same kill from any admitted module, whose follow-ups the host
+        // stamps with its own id. origin is part of the deterministic Env, so
+        // every validator enforces this identically.
         match &ctx.env().origin {
-            sdk::Origin::Module(_) | sdk::Origin::System => {}
-            sdk::Origin::External(_) => {
-                return Err(Error::Module(
-                    "valset membership changes only via governance".into(),
-                ));
+            sdk::Origin::Module(id) if *id == self.governance_id => {}
+            sdk::Origin::System => {}
+            other => {
+                return Err(Error::Module(format!(
+                    "valset membership changes only via governance (the {} module), got {other:?}",
+                    self.governance_id
+                )));
             }
         }
         match decode_msg(&msg.payload).map_err(Error::Module)? {
@@ -576,8 +590,22 @@ mod tests {
         sk.public_key().as_ref().to_vec()
     }
 
+    /// a ctx whose origin is another module's host-stamped follow-up.
+    fn module_ctx(module_id: &str) -> TestCtx {
+        TestCtx::with_env(sdk::Env {
+            height: 0,
+            consensus_time: 0,
+            origin: sdk::Origin::Module(module_id.into()),
+            me: "valset".into(),
+        })
+    }
+
     fn fresh() -> Valset {
-        Valset::new("valset", Box::new(sdk_testkit::MemStore::new()))
+        Valset::new(
+            "valset",
+            Box::new(sdk_testkit::MemStore::new()),
+            "governance",
+        )
     }
 
     /// the root of a store that never committed anything — the store-backed
@@ -639,6 +667,27 @@ mod tests {
             ValsetReply::MeshWindow(window) => window,
             other => panic!("expected MeshWindow, got {other:?}"),
         }
+    }
+
+    /// membership is GOVERNANCE-gated, not module-gated: an admitted app
+    /// module's follow-up carries its own id and must not seat itself.
+    #[test]
+    fn a_non_governance_module_changes_no_membership() {
+        let mut v = fresh();
+        let k = valid_key(1);
+        let mut chat = module_ctx("chat");
+        for m in [join(&k), leave(&k), grant(&k), revoke(&k)] {
+            assert!(
+                matches!(run(&mut v, &mut chat, &m), Err(Error::Module(_))),
+                "a chat-module origin staged a membership change"
+            );
+        }
+        assert_eq!(v.root(), empty_root(), "nothing staged, nothing committed");
+
+        let mut gov = module_ctx("governance");
+        run(&mut v, &mut gov, &join(&k)).unwrap();
+        commit(&mut v);
+        assert_eq!(validators(&v), vec![k]);
     }
 
     #[test]
@@ -1053,7 +1102,11 @@ mod tests {
 
         let window = mesh_window(&v);
         let generations: Vec<u64> = window.iter().map(|s| s.generation).collect();
-        assert_eq!(generations, vec![1, 2, 3], "one generation per block, ascending");
+        assert_eq!(
+            generations,
+            vec![1, 2, 3],
+            "one generation per block, ascending"
+        );
         assert_eq!(window[0].validators, vec![a.clone()]);
         assert!(window[0].residents.is_empty());
         assert_eq!(window[1].validators, vec![a.clone()]);
@@ -1098,7 +1151,10 @@ mod tests {
             v.finish_seed().await.unwrap();
         });
         assert_eq!(
-            mesh_window(&v).iter().map(|s| s.generation).collect::<Vec<_>>(),
+            mesh_window(&v)
+                .iter()
+                .map(|s| s.generation)
+                .collect::<Vec<_>>(),
             vec![0],
             "genesis committed the generation-0 snapshot"
         );
@@ -1109,7 +1165,11 @@ mod tests {
 
         let window = mesh_window(&v);
         let generations: Vec<u64> = window.iter().map(|s| s.generation).collect();
-        assert_eq!(generations, vec![2, 3, 4, 5], "retained depth is 4, ascending");
+        assert_eq!(
+            generations,
+            vec![2, 3, 4, 5],
+            "retained depth is 4, ascending"
+        );
         assert_eq!(
             window.last().unwrap().validators.len(),
             6,
@@ -1137,7 +1197,10 @@ mod tests {
         run(&mut v, &mut ctx, &join(&valid_key(1))).unwrap();
         commit(&mut v);
         assert_eq!(
-            mesh_window(&v).iter().map(|s| s.generation).collect::<Vec<_>>(),
+            mesh_window(&v)
+                .iter()
+                .map(|s| s.generation)
+                .collect::<Vec<_>>(),
             vec![1]
         );
     }

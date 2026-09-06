@@ -100,6 +100,17 @@ impl ValidatorRuntime<'_> {
                         .map(|fc| fc.cert.clone()),
                     generation,
                     mesh_window,
+                    // the replay guard a joiner inherits, cut at the boundary
+                    // it will seat on: an entry above that height names a
+                    // batch the joiner has not reached and must still apply.
+                    applied_frames: match node.finalized() {
+                        Some(f) => node
+                            .replay_window()
+                            .into_iter()
+                            .filter(|(height, _)| *height <= f.height)
+                            .collect(),
+                        None => Vec::new(),
+                    },
                 };
                 let finalized_for_sync = node
                     .finalized()

@@ -36,14 +36,21 @@ fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
 
-/// the founder's consent to admit `new_key` (of `scheme`) at `generation`.
+/// the founder's consent to admit `new_key` (of `scheme`) into account 1 at
+/// `generation`, live past every height this test drives.
 fn ed_consent(member: &Ed, scheme: KeyScheme, new_key: &[u8], generation: u64) -> Authorizer {
-    let preimage = add_key_preimage(CHAIN, scheme, new_key, generation);
+    let preimage = add_key_preimage(CHAIN, scheme, new_key, generation, 1, CONSENT_EXPIRES);
     Authorizer {
         key: ed_pub(member),
+        account: 1,
+        expires_at: CONSENT_EXPIRES,
         proof: keyscheme::testkit::ed25519_proof(member, IDENTITY_ADD_KEY_NS, &preimage),
     }
 }
+
+/// well past the handful of heights this test drives, well inside
+/// `MAX_CONSENT_TTL` of them.
+const CONSENT_EXPIRES: u64 = 1_000;
 
 fn identity_msg(m: &IdentityMsg) -> Msg {
     Msg {

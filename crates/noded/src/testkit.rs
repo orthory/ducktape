@@ -311,6 +311,9 @@ fn publish_status(status: &crate::StatusCell, host: &Host, status_modules: &[Str
         version: env!("CARGO_PKG_VERSION").into(),
         root_hash: hex_root(&host.root_hash()),
         height,
+        // the harness never arms a `ConsensusTimePolicy` — height-is-time.
+        consensus_time: height,
+        consensus_time_unit: crate::ConsensusTimeUnit::Height,
         modules,
         public_key: String::new(),
         chain_id: String::new(),

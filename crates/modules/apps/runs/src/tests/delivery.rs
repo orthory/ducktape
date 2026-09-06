@@ -61,6 +61,7 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
             TaskMsg::CreateTask {
                 task_id: "t1".into(),
                 title: "ship it".into(),
+                owner: None,
             },
             TaskMsg::UpdateStatus {
                 task_id: "t1".into(),
@@ -339,6 +340,7 @@ fn a_task_id_at_the_cap_still_emits() {
         vec![TaskMsg::CreateTask {
             task_id,
             title: "at the cap".into(),
+            owner: None,
         }]
     );
 }

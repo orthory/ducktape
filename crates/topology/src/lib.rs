@@ -6,14 +6,23 @@
 //! SELECTION validated against it — [`PRODUCTION`] for the node, [`SIM_BASE`]
 //! and [`SIM_VALSET`] for simnode.
 //!
-//! A row says WHICH module and WHERE ITS CODE COMES FROM, nothing more. What a
-//! module needs from the host to run — the substrate its state lives on, the
-//! network config it seeds, its query mode, whether it ships an index guest —
-//! is the module's own declaration: a wasm component's `shape` export
-//! (`wasm_host::Shape`) and its crate's `src/index_guest.rs`. A table here
-//! that repeated those would be a second source of truth that cannot be
-//! caught being wrong, and it would hold nothing for a module the registry
+//! A row says WHICH module, WHERE ITS CODE COMES FROM, and whether it ships an
+//! index guest — nothing more. Most host-facing facts (the substrate its
+//! state lives on, the network config it seeds, its query mode) stay the
+//! module's own declaration (a wasm component's `shape` export,
+//! `wasm_host::Shape`) rather than a row here, since a table that repeated
+//! those would be a second source of truth for something with no access
+//! problem — nothing outside the crate needs to know it before the crate
+//! itself is built, and it would hold nothing for a module the registry
 //! admits after genesis.
+//!
+//! `has_index_guest` is the one exception: it MUST be readable by a composer
+//! that only holds a directory of bare wasm files (`workspace_config::genesis`,
+//! composing `node init --modules <dir>` over an arbitrary operator
+//! directory) with no access to any crate's source tree to read
+//! `src/index_guest.rs` from. `crates/noded/build.rs` cross-checks this flag
+//! against that same file at every build, so the two declarations cannot
+//! drift apart unnoticed.
 //!
 //! Inter-module wiring is NOT here either: a module's guest compiles in the
 //! siblings it reads, so the guest is the wiring.
@@ -42,6 +51,11 @@ pub struct ModuleSpec {
     pub id: &'static str,
     /// Where this module's code comes from.
     pub code: Code,
+    /// Whether this module's crate carries an index guest (`src/index_guest.rs`,
+    /// staged by `crates/noded/build.rs` as `<id>.index.wasm`). A `--modules
+    /// <dir>` founding set is checked against this flag — present-but-not-declared
+    /// and declared-but-absent are both refused (`workspace_config::genesis`).
+    pub has_index_guest: bool,
 }
 
 /// The module composition topology: the id universe and the three named
@@ -71,12 +85,33 @@ impl ModuleTopology {
             .filter(|id| self.spec(id).is_some_and(|m| m.code == Code::Wasm))
             .collect()
     }
+
+    /// the ids of `selection` whose crate declares an index guest, in
+    /// selection order — what a founding set MUST carry an `<id>.index.wasm`
+    /// for (`workspace_config::genesis::Genesis::compose` refuses a set that
+    /// omits one, or that carries one for an id not in this list).
+    pub fn index_guest_ids(&self, selection: &[&'static str]) -> Vec<&'static str> {
+        selection
+            .iter()
+            .copied()
+            .filter(|id| self.spec(id).is_some_and(|m| m.has_index_guest))
+            .collect()
+    }
 }
 
 const fn wasm(id: &'static str) -> ModuleSpec {
     ModuleSpec {
         id,
         code: Code::Wasm,
+        has_index_guest: false,
+    }
+}
+
+const fn wasm_indexed(id: &'static str) -> ModuleSpec {
+    ModuleSpec {
+        id,
+        code: Code::Wasm,
+        has_index_guest: true,
     }
 }
 
@@ -84,6 +119,7 @@ const fn native(id: &'static str) -> ModuleSpec {
     ModuleSpec {
         id,
         code: Code::Native,
+        has_index_guest: false,
     }
 }
 
@@ -94,21 +130,21 @@ const MODULES: &[ModuleSpec] = &[
     wasm("agent"),
     wasm("automations"),
     wasm("capability"),
-    wasm("chat"),
+    wasm_indexed("chat"),
     wasm("dispatch"),
     wasm("files"),
     wasm("forge"),
     wasm("gateway"),
     wasm("governance"),
     wasm("identity"),
-    wasm("inbox"),
+    wasm_indexed("inbox"),
     native("kv"),
     native("modules"),
-    wasm("pages"),
+    wasm_indexed("pages"),
     wasm("runs"),
-    wasm("saga"),
+    wasm_indexed("saga"),
     wasm("tagging"),
-    wasm("tasks"),
+    wasm_indexed("tasks"),
     native("valset"),
 ];
 
@@ -292,5 +328,17 @@ mod tests {
     fn wasm_ids_selects_only_wasm_specs_in_selection_order() {
         let ids = TOPOLOGY.wasm_ids(SIM_VALSET);
         assert_eq!(ids, ["acl", "governance"]);
+    }
+
+    /// pins today's index-guest-shipping set — the same 5 crates that carry
+    /// `src/index_guest.rs` and that `crates/noded/build.rs` cross-checks this
+    /// flag against at every build.
+    #[test]
+    fn index_guest_ids_selects_only_the_declared_shippers() {
+        let ids = TOPOLOGY.index_guest_ids(PRODUCTION);
+        assert_eq!(
+            sorted(&ids),
+            sorted(&["chat", "inbox", "pages", "saga", "tasks"])
+        );
     }
 }

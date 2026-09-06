@@ -242,7 +242,9 @@ fn seed_workspace_genesis(
         verify_genesis(&bytes, hash, want).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut seeded = 0usize;
     for (id, digest) in want {
-        if blobs.has_chunk(digest) {
+        // the VERIFYING query: seeding is what heals a corrupt component, and a
+        // stat-shaped "present" would skip exactly the file that needs it.
+        if blobs.has_verified_chunk(digest) {
             continue;
         }
         // verified above: every id in `want` is a component hashing to `digest`.
@@ -252,7 +254,7 @@ fn seed_workspace_genesis(
         blobs.put_chunk(component.to_vec());
         seeded += 1;
     }
-    if !blobs.has_chunk(hash) {
+    if !blobs.has_verified_chunk(hash) {
         blobs.put_chunk(bytes);
     }
     // a lifecycle fact: bytes entered the store (a restart over a seeded store
@@ -282,7 +284,8 @@ fn seed_founding_set(
 ) -> Result<(), String> {
     let mut seeded = 0usize;
     for (id, digest) in want {
-        if blobs.has_chunk(digest) {
+        // verifying, for the same reason as the genesis seed above.
+        if blobs.has_verified_chunk(digest) {
             continue;
         }
         let path = component_path(dir, id);
@@ -604,7 +607,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
         let module = module.to_string();
         async move {
             let root = root?;
-            let bytes = fetch_snapshot(&client, boundary, &module)
+            let bytes = fetch_snapshot(&client, boundary, &module, statesync::MAX_SNAPSHOT_BYTES)
                 .await
                 .map_err(|e| format!("{module} snapshot: {e}"))?;
             Ok::<_, String>((bytes, root))
@@ -764,7 +767,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "e996a7408b4338ffd82fb3a715382deee2f845aca9a28ceffb65b5b700d07442";
+        "a8298d70c450d95a6cbe4cddfac1c4f92c1ed05109acafbd98a3d72d74f7797d";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
@@ -916,8 +919,12 @@ mod tests {
             ),
             (Origin::System, 50, ModulesMsg::Advance),
         ];
-        let mut registry =
-            Modules::new("modules", Box::new(sdk_testkit::MemStore::new()), "valset");
+        let mut registry = Modules::new(
+            "modules",
+            Box::new(sdk_testkit::MemStore::new()),
+            "valset",
+            "governance",
+        );
         futures::executor::block_on(async {
             for (origin, height, m) in steps {
                 let mut ctx = ctx(origin, height);

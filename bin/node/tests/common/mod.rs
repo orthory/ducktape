@@ -191,9 +191,11 @@ impl NodeProc {
     /// match the raw bytes, because the node's stderr colours every field name
     /// and its `=` separately.
     pub fn expect_line(&self, needles: &[&str], timeout: Duration) -> String {
-        self.expect_line_where(&format!("one line carrying all of {needles:?}"), timeout, |line| {
-            needles.iter().all(|needle| line.contains(needle))
-        })
+        self.expect_line_where(
+            &format!("one line carrying all of {needles:?}"),
+            timeout,
+            |line| needles.iter().all(|needle| line.contains(needle)),
+        )
     }
 
     /// block until an ANSI-stripped line satisfies `accept`, and answer with
@@ -2054,7 +2056,10 @@ use nettest::alloc_ports;
 
 /// Wait until `probe` answers, re-evaluating it on each block wake from the
 /// node whose app surface listens on `http_port` — the one body behind both
-/// clusters' `await_committed`. `tails` renders the diagnosis on failure.
+/// clusters' `await_committed`. `tails` renders the diagnosis on failure,
+/// alongside the committed height at entry and at timeout: equal heights name
+/// a halt ("height did not move from H") instead of reading like a merely
+/// slow predicate.
 fn await_committed_on<T>(
     http_port: u16,
     idx: usize,
@@ -2069,11 +2074,21 @@ fn await_committed_on<T>(
         return value;
     }
     let mut blocks = block_feed_on(http_port, idx, timeout);
+    let height_at_entry = blocks.sync_height().ok();
     loop {
         if let Err(why) = blocks.next_block() {
+            let height_at_timeout = blocks.height();
+            let height_note = match (height_at_entry, height_at_timeout) {
+                (Some(entry), Some(timeout)) if entry == timeout => {
+                    format!("height did not move from {entry}")
+                }
+                _ => format!(
+                    "height was {height_at_entry:?} at entry, {height_at_timeout:?} at timeout"
+                ),
+            };
             panic!(
                 "timed out after {timeout:?} waiting for {what} \
-                 (via node idx {idx}): {why};\n{}",
+                 (via node idx {idx}): {why}; {height_note};\n{}",
                 tails()
             );
         }
@@ -2097,7 +2112,19 @@ fn block_feed_on(http_port: u16, idx: usize, timeout: Duration) -> BlockFeed {
     BlockFeed {
         socket,
         deadline: Instant::now() + timeout,
+        last_height: None,
     }
+}
+
+/// The committed height a `heartbeat` frame carries, or `None` for anything
+/// else on the wire (a control frame, or a frame this node never sends on an
+/// unsubscribed connection).
+fn heartbeat_height(text: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if value["type"] != "heartbeat" {
+        return None;
+    }
+    value["height"].as_u64()
 }
 
 /// A live feed of one node's heartbeat frames — the harness's wake seam for
@@ -2105,17 +2132,21 @@ fn block_feed_on(http_port: u16, idx: usize, timeout: Duration) -> BlockFeed {
 ///
 /// The node sends a `heartbeat` frame to every ws client on every block wake,
 /// nop fillers included, so an unsubscribed connection is already the changed
-/// feed (the compute daemon's own intake rides the same frame). Blocking on that
-/// socket means the thread wakes on the chain's own event and re-reads only when
-/// there is something new to read.
+/// feed (the compute daemon's own intake rides the same frame). Blocking on
+/// that socket means the thread wakes on the chain's own event and re-reads
+/// only when there is something new to read.
 ///
-/// **It is not purely event-driven, and the difference matters.**
-/// `crates/noded/src/stream.rs` also emits a byte-identical heartbeat on a 3s
-/// `tokio::time::interval`, and nothing in the frame distinguishes the two — so
-/// this is a ≤3s poll that additionally wakes per block. What it buys over the
-/// 300ms client-side spin it replaces is real but bounded: it cannot fire early
-/// on a slow box, it re-reads only on the node's own schedule, and an idle chain
-/// costs nothing. Calling it "waits on events, never on time" would be false.
+/// **A `heartbeat` frame alone is not proof of that**, and the difference
+/// matters: `crates/noded/src/stream.rs` also emits a byte-identical
+/// `heartbeat` on a 3s `tokio::time::interval` regardless of progress, and
+/// nothing in the frame's shape distinguishes the two — only its `height`
+/// does. Reading every frame as a wake made a HALTED chain (stuck at the same
+/// height, ticking forever) indistinguishable from a merely slow predicate,
+/// since the 3s ticks kept `next_block` returning `Ok` with nothing new to
+/// show for it. This tracks the last height it saw and only reports a wake
+/// when that height MOVED; an unchanged-height tick is consumed as the
+/// liveness fallback it is — proof the connection is alive, not that a block
+/// committed — and looped past.
 ///
 /// The socket read timeout is the FAILURE path only — a node that has stopped
 /// sending anything must fail with a diagnosis rather than hang CI forever. No
@@ -2125,11 +2156,50 @@ pub struct BlockFeed {
         tokio_tungstenite::tungstenite::stream::MaybeTlsStream<TcpStream>,
     >,
     deadline: Instant,
+    /// the last committed height this feed observed, or `None` before its
+    /// first heartbeat. `next_block` reports a wake only on a change from
+    /// this.
+    last_height: Option<u64>,
 }
 
 impl BlockFeed {
-    /// Block until the node reports its next block wake.
+    /// The last committed height this feed observed — `None` before its
+    /// first heartbeat (see [`Self::sync_height`]).
+    pub fn height(&self) -> Option<u64> {
+        self.last_height
+    }
+
+    /// Establish the feed's baseline height, reading frames until the first
+    /// `heartbeat` arrives. A no-op once a height is already known: callers
+    /// that only care about the NEXT wake go straight to [`Self::next_block`],
+    /// which calls this itself.
+    pub fn sync_height(&mut self) -> Result<u64, String> {
+        if let Some(height) = self.last_height {
+            return Ok(height);
+        }
+        use tokio_tungstenite::tungstenite::Message;
+        loop {
+            if Instant::now() >= self.deadline {
+                return Err("no heartbeat received".into());
+            }
+            let frame = self
+                .socket
+                .read()
+                .map_err(|error| format!("block feed read failed: {error}"))?;
+            let Message::Text(text) = frame else { continue };
+            let Some(height) = heartbeat_height(&text) else {
+                continue;
+            };
+            self.last_height = Some(height);
+            return Ok(height);
+        }
+    }
+
+    /// Block until the node reports a committed height past the last one this
+    /// feed saw — a genuine block event, not merely a liveness tick at the
+    /// same height (see the type doc).
     pub fn next_block(&mut self) -> Result<(), String> {
+        let baseline = self.sync_height()?;
         use tokio_tungstenite::tungstenite::Message;
         loop {
             if Instant::now() >= self.deadline {
@@ -2146,9 +2216,11 @@ impl BlockFeed {
             // an unsubscribed connection carries heartbeats and nothing else,
             // but a control frame still has to be stepped over.
             let Message::Text(text) = frame else { continue };
-            let woke = serde_json::from_str::<serde_json::Value>(&text)
-                .is_ok_and(|value| value["type"] == "heartbeat");
-            if woke {
+            let Some(height) = heartbeat_height(&text) else {
+                continue;
+            };
+            self.last_height = Some(height);
+            if height != baseline {
                 return Ok(());
             }
         }
@@ -2341,6 +2413,12 @@ pub fn create_account(
         .number
 }
 
+/// the expiry every consent an e2e mints carries. `consensus_time` is the
+/// block height on a validator network, and a cluster test drives a few
+/// hundred blocks at most — so this is past every one of them and inside
+/// `identity::MAX_CONSENT_TTL` of each.
+pub const CONSENT_EXPIRES: u64 = 100_000;
+
 /// admit `new_key` into `member`'s account through node `idx`: `member`
 /// consents at `new_key`'s CURRENT generation, and the JOINING key signs the
 /// `AddKey` frame (the op's origin is the key being admitted). Waits until
@@ -2369,6 +2447,10 @@ pub fn add_key(
             &joining,
             generation,
             None,
+            account_of_key(cluster, idx, member.public_key().as_ref())
+                .expect("the consenting member belongs to an account")
+                .number,
+            CONSENT_EXPIRES,
         )),
     );
     cluster.await_committed(

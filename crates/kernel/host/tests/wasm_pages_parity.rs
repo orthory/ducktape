@@ -244,7 +244,9 @@ fn same_ops_identical_roots_block_by_block() {
                 },
             ),
             (
-                bob.clone(),
+                // block ops are gated to the page author (#1650) — bob has no
+                // standing on alice's page, so these run as alice.
+                alice.clone(),
                 PageMsg::UpdateText {
                     block_id: "b1".into(),
                     text: "first, edited".into(),
@@ -252,14 +254,14 @@ fn same_ops_identical_roots_block_by_block() {
                 },
             ),
             (
-                bob.clone(),
+                alice.clone(),
                 PageMsg::SetKind {
                     block_id: "b1".into(),
                     kind: BlockKind::Quote,
                 },
             ),
             (
-                bob.clone(),
+                alice.clone(),
                 PageMsg::SetChecked {
                     block_id: "b2".into(),
                     checked: true,

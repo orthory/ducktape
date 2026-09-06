@@ -102,7 +102,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // this daemon runs no network, so its index guests come from the same
     // founding set its components do, not from a genesis.
     let index = noded::open_index_store(&storage, MODULE_IDS)?;
-    noded::converge_index_guests(&index, &noded::IndexGuests::from_dir(&modules_dir, MODULE_IDS)?)?;
+    noded::converge_index_guests(
+        &index,
+        &noded::IndexGuests::from_dir(&modules_dir, MODULE_IDS)?,
+    )?;
 
     let log_ring = noded::LogRing::default();
     noded::log::init(Some(log_ring.clone()), Some(storage.join("daemon.log")));
@@ -563,6 +566,10 @@ fn publish_status(
         version: env!("CARGO_PKG_VERSION").into(),
         root_hash: hex_root(&host.root_hash()),
         height,
+        // the embedded daemon never arms a `ConsensusTimePolicy` either —
+        // height-is-time, same as the validator/replica lanes.
+        consensus_time: height,
+        consensus_time_unit: noded::ConsensusTimeUnit::Height,
         modules,
         // the embedded daemon has no mesh identity — clients treat an empty
         // key as "no peer-routed features here".

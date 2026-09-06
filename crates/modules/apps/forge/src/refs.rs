@@ -114,6 +114,14 @@ pub struct RepoState {
     /// only materialization (the git substrate) reads it.
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     warned: BTreeSet<String>,
+    /// branches whose pending pack has ALREADY been installed into this odb.
+    /// a pack is content-addressed, so re-fetching and re-indexing the same
+    /// bytes on every later block can never add an object — the entry stays
+    /// pending because the closure is short, not because the pack was missed.
+    /// reset exactly where `warned` is: a NEW push to the branch is the only
+    /// thing that can change the answer.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    installed: BTreeSet<String>,
 }
 
 /// one repo's catch-up map: `branch -> (COMMITTED head, pack digest)`.
@@ -192,6 +200,15 @@ impl RepoState {
     /// the branches whose committed head this node cannot serve objects for.
     pub fn pending(&self) -> &PendingMap {
         &self.pending
+    }
+
+    /// the pending branches this node has already spent its pack on: the
+    /// bytes are installed and the ref move was still refused, so nothing
+    /// this node holds can move them. STUCK, not merely late — a new push or
+    /// the object catch-up lane is the only way out.
+    #[cfg(feature = "native")]
+    pub fn stuck_branches(&self) -> &BTreeSet<String> {
+        &self.installed
     }
 
     /// read-your-writes head of one branch: a staged fate shadows the
@@ -288,6 +305,7 @@ impl RepoState {
                     self.refs.insert(branch.clone(), oid);
                     self.pending.insert(branch.clone(), (oid, digest));
                     self.warned.remove(&branch);
+                    self.installed.remove(&branch);
                 }
                 StagedRef::Delete => {
                     let repo = open_or_init_repo(base, name)?;
@@ -296,6 +314,7 @@ impl RepoState {
                     self.refs.remove(&branch);
                     self.pending.remove(&branch);
                     self.warned.remove(&branch);
+                    self.installed.remove(&branch);
                 }
             }
         }
@@ -342,31 +361,43 @@ impl RepoState {
             // hold, then let the CLOSURE decide — a branch whose objects
             // arrived by any route materializes without this digest ever
             // turning up.
-            let held_pack = blobs.get_chunk(digest);
-            if let Some(pack) = &held_pack
-                && let Err(why) = git::install_pack(&repo, pack)
-            {
-                if self.warned.insert(branch.clone()) {
-                    tracing::warn!(
-                        target: "ducktape::forge",
-                        reason = "pack_unreadable",
-                        repo = %name,
-                        branch = %branch,
-                        head = %head,
-                        why = %why,
-                        "materialize: the held pack would not install"
-                    );
+            //
+            // installing it TWICE, on the other hand, is pure waste: a pack is
+            // content-addressed, so the second index of the same bytes (a full
+            // libgit2 re-hash, up to the 95 MiB body cap) cannot add an object
+            // this odb lacks. once installed the entry keeps its place in
+            // `pending` — the closure is short, and only a new push or the
+            // catch-up lane can mend that.
+            let held_pack = match self.installed.contains(branch) {
+                true => None,
+                false => blobs.get_chunk(digest),
+            };
+            if let Some(pack) = &held_pack {
+                self.installed.insert(branch.clone());
+                if let Err(why) = git::install_pack(&repo, pack) {
+                    if self.warned.insert(branch.clone()) {
+                        tracing::warn!(
+                            target: "ducktape::forge",
+                            reason = "pack_unreadable",
+                            repo = %name,
+                            branch = %branch,
+                            head = %head,
+                            why = %why,
+                            "materialize: the held pack would not install"
+                        );
+                    }
+                    continue;
                 }
-                continue;
             }
             if let Err(why) =
                 advance_ref(&repo, &refname, *head, prior, is_protected_branch(branch))
             {
                 // the two reasons stay distinct: nothing to work with at all
                 // versus objects that are present but refused.
-                let reason = match held_pack {
-                    Some(_) => "materialize_refused",
-                    None => "pack_missing",
+                let objects_installed = held_pack.is_some() || self.installed.contains(branch);
+                let reason = match objects_installed {
+                    true => "materialize_refused",
+                    false => "pack_missing",
                 };
                 if self.warned.insert(branch.clone()) {
                     tracing::warn!(
@@ -387,6 +418,7 @@ impl RepoState {
         for (branch, _) in &done {
             self.pending.remove(branch);
             self.warned.remove(branch);
+            self.installed.remove(branch);
         }
         // the pack has done its whole job: the objects are in the odb, which
         // is where every reader — the git fetch lane, a PR diff, a peer's

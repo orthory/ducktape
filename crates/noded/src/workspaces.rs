@@ -190,6 +190,13 @@ pub(crate) async fn commit_workspace(
         return error_response(StatusCode::BAD_REQUEST, "invalid workspace id");
     }
     let dir = root.join(&id);
+    // a lock entry is minted per id below — only mint one for an id that
+    // names a real, currently-materialized checkout, or any signed member
+    // repeatedly posting fresh random ids grows WORKSPACE_LOCKS forever
+    // (delete_workspace, the only pruning path, is Operator-only).
+    if !dir.exists() {
+        return error_response(StatusCode::NOT_FOUND, "workspace not found");
+    }
     let api = ActorNodeApi::new(handle.clone(), origin);
     let lock = workspace_lock(&id);
     let message = body.message;
@@ -220,6 +227,11 @@ pub(crate) async fn commit_workspace(
 
 /// DELETE /v1/fs/workspaces/{id} — remove the managed checkout dir. idempotent:
 /// deleting an already-gone workspace is still `{ok:true}`.
+///
+/// AUTH: node-level (`signed_req`, `Authority::Operator`), unlike the
+/// create and commit above. It takes no acting identity and `remove_dir_all`s
+/// any valid-slug dir under the managed root, so a key that proved only
+/// possession would be able to wipe another run's checkout.
 pub(crate) async fn delete_workspace(
     State(handle): State<NodeHandle>,
     Path(id): Path<String>,
@@ -251,5 +263,44 @@ pub(crate) async fn delete_workspace(
             StatusCode::INTERNAL_SERVER_ERROR,
             "workspace delete task panicked",
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::Json;
+    use axum::extract::{Path as AxPath, State};
+
+    use super::*;
+
+    /// a commit against an id nobody ever created must 404 WITHOUT minting a
+    /// `WORKSPACE_LOCKS` entry — the only pruning path (`delete_workspace`) is
+    /// Operator-only, so a lock entry per unchecked id is unbounded growth any
+    /// signed member can trigger.
+    #[tokio::test]
+    async fn commit_on_a_nonexistent_workspace_404s_and_mints_no_lock() {
+        let (handle, _cmd_rx, _hub) = crate::NodeHandle::channel();
+        let root = tempfile::tempdir().unwrap();
+        let handle = handle.with_duckfs_workspaces(root.path());
+        let id = "deadbeefcafef00d0000000000000001".to_string();
+
+        let resp = commit_workspace(
+            State(handle),
+            None,
+            AxPath(id.clone()),
+            Json(CommitWsBody {
+                message: String::new(),
+            }),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !WORKSPACE_LOCKS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&id),
+            "a nonexistent workspace must never mint a lock entry"
+        );
     }
 }

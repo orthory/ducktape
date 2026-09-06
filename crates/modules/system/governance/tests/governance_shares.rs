@@ -121,7 +121,7 @@ impl Module for IdentityStub {
 async fn share_host() -> (Host, [Vec<u8>; 4], [u64; 3]) {
     let keys = [key(1), key(2), key(3), key(4)];
     let accounts = [1, 2, 3];
-    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
     for node in &keys[..3] {
         valset.seed(node.clone()).await.expect("seed valset");
     }

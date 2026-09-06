@@ -52,7 +52,12 @@ fn hash(seed: u8) -> Vec<u8> {
     vec![seed; CODE_HASH_LEN]
 }
 fn fresh() -> Modules {
-    Modules::new("modules", Box::new(sdk_testkit::MemStore::new()), "valset")
+    Modules::new(
+        "modules",
+        Box::new(sdk_testkit::MemStore::new()),
+        "valset",
+        "governance",
+    )
 }
 
 /// the root of a store that never committed anything — the store-backed twin
@@ -153,6 +158,45 @@ fn armed_at(lc: &Modules, height: u64) -> Vec<ArmedSwap> {
 // ============================================================================
 // module-code path
 // ============================================================================
+
+/// the network-capture gate: a module origin that is NOT governance is refused
+/// on every authoring op. an admitted app module's follow-up carries
+/// `Origin::Module("chat")`, and accepting it would let that one module
+/// schedule a swap of governance itself — no ballot, total capture.
+#[test]
+fn a_non_governance_module_authors_nothing() {
+    let mut lc = fresh();
+    register_module(&mut lc, "governance", 1);
+    let mut chat = ctx(Origin::Module("chat".into()), 0);
+    let refused = [
+        msg(ModulesMsg::RegisterModule {
+            module_id: "kanban".into(),
+            code_hash: hash(1),
+        }),
+        schedule_swap("governance", "capture", 10, 9),
+        schedule_register("kanban", "capture", 10, 9),
+        cancel_swap("governance", "capture"),
+    ];
+    for m in &refused {
+        assert!(
+            matches!(run(&mut lc, &mut chat, m), Err(Error::Module(_))),
+            "a chat-module origin authored {m:?}"
+        );
+    }
+    // the SAME ops from governance's own follow-up pass the gate.
+    let mut gov = ctx(Origin::Module("governance".into()), 0);
+    run(
+        &mut lc,
+        &mut gov,
+        &schedule_swap("governance", "upgrade", 10, 9),
+    )
+    .unwrap();
+    commit(&mut lc);
+    assert_eq!(
+        module_status(&lc)[0].pending.as_ref().unwrap().code_hash,
+        hash(9)
+    );
+}
 
 #[test]
 fn register_and_schedule_origin_gate() {
@@ -503,6 +547,66 @@ fn a_stale_pending_swap_is_replaceable_and_cancellable() {
     let mut past = ctx(Origin::System, 30);
     assert!(run(&mut lc, &mut past, &schedule_swap("hello", "next", 40, 3)).is_err());
     assert!(run(&mut lc, &mut past, &cancel_swap("hello", "armed")).is_err());
+}
+
+/// #1676: a SwapReady arriving AFTER the pending already went stale (past its
+/// activation height, never latched) must not resurrect it. Before the fix,
+/// `handle_swap_ready` latched `ready_at` on any covering signal regardless of
+/// how late it was, which armed the swap at the next height with no fresh
+/// decision behind it and then froze it — `stale_at` becomes permanently
+/// false once latched, so neither CancelSwap nor a replacing ScheduleSwap
+/// could touch it again.
+#[test]
+fn a_late_swap_ready_after_activation_height_never_arms_the_stale_pending() {
+    let mut lc = fresh();
+    register_module(&mut lc, "hello", 1);
+    let mut sys = ctx(Origin::System, 0);
+    run(&mut lc, &mut sys, &schedule_swap("hello", "dead", 10, 2)).unwrap();
+    commit(&mut lc);
+
+    // the pending is stale well past its activation height, never latched.
+    assert!(
+        module_status(&lc)[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .ready_at
+            .is_none()
+    );
+    assert!(module_status(&lc)[0].pending.as_ref().unwrap().stale_at(30));
+
+    // a signal lands at height 100 — long after activation_height 10.
+    let mut late = ctx(Origin::External(member(1)), 100);
+    run(&mut lc, &mut late, &swap_ready("hello", "dead", 2)).unwrap();
+    commit(&mut lc);
+
+    // it must NOT arm: no latch, no activation at the next boundary.
+    let pending = module_status(&lc)[0].pending.clone().unwrap();
+    assert!(
+        pending.ready_at.is_none(),
+        "a late signal must not latch a stale pending"
+    );
+    assert!(armed_at(&lc, 101).is_empty());
+
+    // still evictable: CancelSwap succeeds on the stale pending.
+    let mut past = ctx(Origin::System, 100);
+    run(&mut lc, &mut past, &cancel_swap("hello", "dead")).unwrap();
+    commit(&mut lc);
+    assert!(module_status(&lc)[0].pending.is_none());
+
+    // ...and a fresh ScheduleSwap can (re)designate the module.
+    let mut fresh_sched = ctx(Origin::System, 100);
+    run(
+        &mut lc,
+        &mut fresh_sched,
+        &schedule_swap("hello", "retry", 200, 3),
+    )
+    .unwrap();
+    commit(&mut lc);
+    assert_eq!(
+        module_status(&lc)[0].pending.as_ref().unwrap().code_hash,
+        hash(3)
+    );
 }
 
 /// the netstack shape: an ADMISSION (never activated, so no readiness probe can

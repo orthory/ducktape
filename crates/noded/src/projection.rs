@@ -80,6 +80,25 @@ pub struct BlockProjection {
     pub rejected_ops: usize,
 }
 
+impl BlockProjection {
+    /// DID A BLOCK HAPPEN AT THIS HEIGHT? `sealed_hash` is the discriminant:
+    /// every non-discarded frame stamps it, so a rejected-only height (the
+    /// idle nop) IS sealed and folds, while a batch every frame of which the
+    /// cutover ceiling discarded sealed nothing.
+    ///
+    /// A DISCARDED HEIGHT MUST NEVER FOLD. Discarded views are `view >=
+    /// cutover_view`, at height `old_base + view`, and the new epoch's base IS
+    /// `old_base + cutover_view` — so a discarded height collides EXACTLY with
+    /// one of the new epoch's first heights. Folding it writes that height into
+    /// every module's watermark, and the real block that later lands there is
+    /// then skipped by the fold's own `>= block.height` guard: its ops live in
+    /// canonical state and in `GET /v1/blocks` but are permanently absent from
+    /// every per-module read model, with nothing logged and no self-heal.
+    pub fn sealed(&self) -> bool {
+        self.sealed_hash.is_some()
+    }
+}
+
 /// Group a drain's per-frame outcomes into the per-block projections consumed
 /// by both role loops. Member dispatches precede System dispatches, matching
 /// live indexing and replay; discarded frames retain an empty projection.
@@ -150,7 +169,9 @@ pub fn project_block(
             block_row(&BlockRecord {
                 height,
                 hash: block_hash.map(|hash| hex_bytes(&hash)).unwrap_or_default(),
-                commit_hash: block_root_hash.map(|hash| hex_root(&hash)).unwrap_or_default(),
+                commit_hash: block_root_hash
+                    .map(|hash| hex_root(&hash))
+                    .unwrap_or_default(),
                 ops,
             })
         });
@@ -380,5 +401,52 @@ mod tests {
         assert!(!projections[2].applied);
         assert!(projections[3].dispatches.is_empty());
         assert_eq!(projections[3].sealed_hash, None);
+    }
+
+    /// A CUTOVER-DISCARDED BATCH IS NOT A BLOCK. Its height is, by
+    /// construction, one the NEW epoch is about to use (`old_base + view` for
+    /// `view >= cutover_view`, and the new base IS `old_base + cutover_view`),
+    /// so folding it advances every module's watermark past the new epoch's
+    /// first real blocks and the fold silently skips them. `sealed()` is the
+    /// one predicate every lane's fold is gated on — and it must keep saying
+    /// YES for a rejected-only height, which sealed a block that just did
+    /// nothing.
+    #[test]
+    fn a_discarded_batch_never_seals_a_height_to_fold() {
+        let blobs = BlobHandle::default();
+        let frames = vec![
+            // the whole batch at height 20 was discarded by the ceiling.
+            drained(1, 20, node::Disposition::Discarded, 1, None),
+            drained(2, 20, node::Disposition::Discarded, 1, None),
+            // an idle nop height: rejected, no row, but a block DID seal here.
+            drained(
+                3,
+                21,
+                node::Disposition::Rejected,
+                2,
+                Some(node::DrainedOp {
+                    origin: Origin::External(vec![9]),
+                    target: NOP_TARGET.into(),
+                    payload: Vec::new(),
+                    dispatches: Vec::new(),
+                    latency_us: 0,
+                }),
+            ),
+        ];
+
+        let projections = project_block(&frames, Vec::new(), &blobs);
+
+        let sealed: Vec<(u64, bool)> = projections.iter().map(|p| (p.height, p.sealed())).collect();
+        assert_eq!(
+            sealed,
+            vec![(20, false), (21, true)],
+            "a discarded-only height sealed nothing and must not fold; a \
+             rejected-only height sealed a block and must"
+        );
+        assert!(
+            projections[0].record.is_none() && projections[0].dispatches.is_empty(),
+            "a discarded height carries no row and no dispatches either — \
+             folding it would write the watermark key alone"
+        );
     }
 }

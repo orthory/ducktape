@@ -168,8 +168,8 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:8850";
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
 /// a fixed epoch keeps module timestamps (message sent_at, task created_at)
 /// plausible in the ui while staying identical across runs.
-const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
-const SIM_BLOCK_MS: u64 = 1_000;
+pub const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
+pub const SIM_BLOCK_MS: u64 = 1_000;
 
 /// cap when buffering a /v1/submit response body to strip `op_hash` — receipts
 /// are ~200 bytes; anything past this is not a receipt.
@@ -1154,6 +1154,11 @@ impl Sim {
         // lane, so `project_block` fills it (where the old direct-host path left
         // it empty).
         for projection in noded::projection::project_block(&drained, system, &self.blobs) {
+            // a height that sealed nothing is not a block: never fold one (see
+            // `BlockProjection::sealed`).
+            if !projection.sealed() {
+                continue;
+            }
             let time = ConsensusTimePolicy::Epoch {
                 base_ms: SIM_EPOCH_MS,
                 block_ms: SIM_BLOCK_MS,
@@ -1350,10 +1355,13 @@ impl Sim {
                 id,
             })
             .collect();
+        let height = self.height();
         NodeStatus {
             version: env!("CARGO_PKG_VERSION").into(),
             root_hash: hex_root(&host.root_hash()),
-            height: self.height(),
+            height,
+            consensus_time: self.node.stamp_consensus_time(height),
+            consensus_time_unit: self.node.consensus_time_policy().into(),
             modules,
             // empty unless `--node-key` fabricated one: clients treat an empty
             // key as "no peer-routed features here" (no huddle voice). the
