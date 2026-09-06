@@ -536,6 +536,7 @@ fn minimal_offsets(snapshot: &[u8]) -> MinimalOffsets {
     let requester = cursor;
     cursor += 1;
     skip_lp(snapshot, &mut cursor); // external requester bytes
+    skip_lp(snapshot, &mut cursor); // sink json
     cursor += 8; // created_at
     cursor += 8; // empty sessions
     cursor += 8; // empty delegations

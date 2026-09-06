@@ -5,7 +5,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::paths::canonical as canonical_duckfs_path;
 
-use super::facets::{WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of};
+use super::facets::{WireSink, WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of};
 use super::{
     ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, BTreeSet,
     Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus,
@@ -568,12 +568,30 @@ impl RunsModule {
             .await;
         self.emit_response(ctx, run_id, entry, Lane::Settle, response)
             .await;
+        // the binding is the sink COMMITTED at dispatch (#1835), never the
+        // executing node's echo: an echo that disagrees is a lease-holder
+        // trying to redirect the run's output after the fact, so it is
+        // refused wholesale — delivered as `Chain`, not merely clamped back
+        // to the committed shape.
+        let sink_matches_commitment = result.sink.same_commitment(&entry.sink);
+        let sink_to_apply = match sink_matches_commitment {
+            true => entry.sink.clone(),
+            false => {
+                self.note(
+                    ctx,
+                    format!(
+                        "run {run_id} sink_mismatch: delivered sink does not match the sink committed at dispatch; delivering as chain"
+                    ),
+                );
+                WireSink::Chain
+            }
+        };
         let pr_number = self
             .emit_sink(
                 ctx,
                 run_id,
                 entry,
-                &result.sink,
+                &sink_to_apply,
                 &message,
                 &result.workspace_receipt,
                 &executing_node,
