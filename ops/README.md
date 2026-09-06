@@ -95,8 +95,8 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
   `/home/...`. Needs the wasm32 target, `wasm-tools` and a pushed HEAD.
 - `make wasm-rebuild-check` — the other reproducibility gate, a Makefile target
   with no script here: it rebuilds every committed guest (each `component.wasm`
-  and `index.wasm`) out of the repository at HEAD and cmps it against the bytes
-  in the tree, and refuses a moved `guest.lock`. Same needs.
+  and `index.wasm`) out of the repository at HEAD, seeded from its committed
+  `guest.lock`, and cmps it against the bytes in the tree. Same needs.
 - `make audit` — the third out-of-band gate: `cargo deny check advisories` over
   the committed `Cargo.lock`, under the repo-root `deny.toml` where every
   carried advisory names why it is carried and what clears it. Needs `cargo

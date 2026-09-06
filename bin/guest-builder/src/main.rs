@@ -37,7 +37,8 @@
 //! * the shell lock is the module's `guest.lock`, committed beside its
 //!   artifacts: the record of the revision and the registry versions an
 //!   artifact came from, and the seed of the next build, so a crates.io
-//!   publish between two rebuilds does not move the bytes.
+//!   publish between two rebuilds does not move the bytes. a canonical build
+//!   writes artifact and lock together; `--out` writes the artifact alone.
 //!
 //! the revision defaults to the checkout's HEAD and must be reachable at
 //! [`PLATFORM_GIT`]: push before building. a module whose sources are modified
@@ -170,18 +171,32 @@ fn run() -> Result<(), String> {
         &remap_flags(&scratch, &checkout),
     )?;
 
-    let out = match args.out {
-        Some(path) => path,
-        None => module_dir.join(kind.artifact()),
-    };
     let cdylib = cdylib_path(&scratch, &module.name, kind);
-    match kind {
-        GuestKind::Component => componentize(&cdylib, &out)?,
-        GuestKind::Index => copy_cdylib(&cdylib, &out)?,
-    }
-    record_lock(&scratch, &module_dir)?;
+    // the canonical artifact and its lock are written together: the lock is
+    // the record of THOSE bytes. a one-off `--out` build leaves the module
+    // directory untouched, so a check that rebuilds every guest keeps the
+    // tree clean.
+    let out = match args.out {
+        Some(path) => {
+            write_artifact(kind, &cdylib, &path)?;
+            path
+        }
+        None => {
+            let canonical = module_dir.join(kind.artifact());
+            write_artifact(kind, &cdylib, &canonical)?;
+            record_lock(&scratch, &module_dir)?;
+            canonical
+        }
+    };
     println!("{}", out.display());
     Ok(())
+}
+
+fn write_artifact(kind: GuestKind, cdylib: &Path, out: &Path) -> Result<(), String> {
+    match kind {
+        GuestKind::Component => componentize(cdylib, out),
+        GuestKind::Index => copy_cdylib(cdylib, out),
+    }
 }
 
 // ============================================================================

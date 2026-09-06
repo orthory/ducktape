@@ -418,12 +418,13 @@ wasm-repro-check:
 REBUILD_CHECK_DIR := $(CURDIR)/target/wasm-rebuild-check
 
 ## the drift gate between an artifact and its source: rebuild every guest out
-## of the repository at HEAD and compare it with the committed bytes, and let
-## no guest.lock move — the lock IS the record of the build. `wasm-modules-check`
-## only cmps committed copies against each other, so an artifact could drift
-## arbitrarily far from the source beside it and stay green. Needs the wasm32
-## target, wasm-tools and a pushed HEAD, so like `wasm-repro-check` it stands
-## apart from the pre-push `test` gate.
+## of the repository at HEAD, seeded from its committed guest.lock, and compare
+## it with the committed bytes. `wasm-modules-check` only cmps committed copies
+## against each other, so an artifact could drift arbitrarily far from the
+## source beside it and stay green. A `--out` build leaves the module
+## directory (lock included) untouched, so the tree stays clean under the
+## check. Needs the wasm32 target, wasm-tools and a pushed HEAD, so like
+## `wasm-repro-check` it stands apart from the pre-push `test` gate.
 wasm-rebuild-check:
 	@mkdir -p "$(REBUILD_CHECK_DIR)"
 	@for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
@@ -444,9 +445,6 @@ wasm-rebuild-check:
 	    echo "    $(CARGO) run -p guest-builder -- --index $$m"; \
 	    echo "  and commit the result."; exit 1; }; \
 	done
-	@git diff --quiet -- '*/guest.lock' || { \
-	  echo "a guest.lock moved under the rebuild — the committed lock was not the build's record:"; \
-	  git diff --stat -- '*/guest.lock'; exit 1; }
 	@echo "committed guests match a rebuild of their source at HEAD"
 
 ## the supply-chain tripwire: RustSec advisories and yanked crates against the

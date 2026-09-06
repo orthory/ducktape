@@ -296,10 +296,10 @@ zeroize = "1"
 fluent31 = { git = "https://github.com/orthory/fluent31", rev = "76ba1867bc0ba9c09bb8387149c07844f1d2395c", default-features = false }
 # fluent-guest — fluent31's wasm32 guest SDK. NEVER a host-side dependency:
 # only the index-guest crate's `guest` feature pulls it, and only guest-builder's
-# synthesized wasm32 workspaces ever enable that feature. It is compiled INTO
+# synthesized wasm32 shells ever enable that feature. It is compiled INTO
 # every committed index guest, so moving this rev moves their bytes: rebuild
 # each `index.wasm` (`guest-builder --index`, the Makefile's INDEX_MODULES)
-# and run `make wasm-index-check` in the same change.
+# and run `make wasm-rebuild-check` in the same change.
 fluent-guest = { git = "https://github.com/orthory/fluent31", rev = "76ba1867bc0ba9c09bb8387149c07844f1d2395c", default-features = false }
 # borsh — the deterministic op-row envelope on the derived tier's fold feed
 # (host encodes, index guests decode; one byte layout, no map ordering games).

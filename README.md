@@ -150,7 +150,9 @@ committed artifact to `crates/modules/apps/tasks/component.wasm` (path printed
 on stdout) beside `guest.lock`, the record of the revision and registry
 versions it came from. If kernel tests pin a fixture copy, refresh it too —
 `make wasm-modules` does both. `--rev <sha>` builds another revision,
-`--scratch` overrides the shell directory.
+`--scratch` overrides the shell directory, and `--out <path>` writes the
+artifact there instead, leaving the module directory (lock included)
+untouched.
 
 For the tool to accept a module it must declare the port contract: a
 `guest = ["dep:ducktape-module-sdk"]` feature, the optional

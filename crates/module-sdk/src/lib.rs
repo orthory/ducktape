@@ -1,5 +1,7 @@
-//! `ducktape-module-sdk` — the port harness for running NATIVE module crates as wasm
-//! guests without rewriting their logic.
+//! `ducktape-module-sdk` — the module SDK: the one crate a wasm module is
+//! authored against (pinned by git revision from outside this repository,
+//! reached by path from inside it), and the port harness for running NATIVE
+//! module crates as wasm guests without rewriting their logic.
 //!
 //! a ported module's guest (its `src/guest.rs` behind the `guest` feature —
 //! see `agent`, …) compiles the native module crate to
