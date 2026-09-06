@@ -264,6 +264,39 @@ impl Coordinator {
         }
     }
 
+    /// The one gate shared by every write that could CREATE a live mapping —
+    /// `Register`'s nonce-0 baseline and `Readvertise`'s rebind both call
+    /// this before touching the book, so the return-routability rule lives
+    /// in exactly one place instead of once per arm (and can't quietly drift
+    /// out of sync between the two, which is exactly how `Readvertise` first
+    /// slipped past it: `AdvertBook::readvertise` falls into the same
+    /// `insert_fresh` `observe` does for a key with no live entry, but only
+    /// `observe`'s caller was gated).
+    ///
+    /// A write against an EXISTING live mapping (a same-source refresh, or a
+    /// nonce-superseding readvertise from the same source) needs no cookie:
+    /// `observe`/`readvertise` already re-derive that liveness+source check
+    /// themselves, so requiring a cookie there would add nothing.
+    fn admit_write(&self, key: NodeKey, from: SocketAddr, now: u64, cookie: &[u8; 32]) -> bool {
+        let creates_mapping = self.adverts.current(key, now).is_none();
+        if !creates_mapping || self.cookie_key.verify(from, now, cookie) {
+            return true;
+        }
+        static NO_COOKIE: Latch = Latch::new();
+        if let Some(occurrences) = NO_COOKIE.hit("advert_missing_cookie") {
+            tracing::warn!(
+                target: "ducktape::reachability",
+                event = "advert_refused",
+                reason = "advert_missing_cookie",
+                source = %from,
+                key = short_key(key),
+                occurrences,
+                "a write that would create a live mapping is missing a valid return-routability cookie"
+            );
+        }
+        false
+    }
+
     /// Auth-bypassing seam for this module's own ordered-state tests, which
     /// exercise the pure handler without minting signatures.
     #[cfg(test)]
@@ -318,27 +351,7 @@ impl Coordinator {
                 )])
             }
             Msg::Register { key, cookie } => {
-                // A key with no LIVE mapping (first-seen, or its previous
-                // mapping expired) needs a return-routability proof: without
-                // this, one spoofed-source datagram plants a `ReflexiveAdvert`
-                // for a victim address the sender never touched. A same-source
-                // refresh of an already-live mapping needs no cookie — it
-                // proves nothing `observe` doesn't already re-derive from the
-                // stored mapping itself.
-                let needs_cookie = self.adverts.current(key, now).is_none();
-                if needs_cookie && !self.cookie_key.verify(from, now, &cookie) {
-                    static NO_COOKIE: Latch = Latch::new();
-                    if let Some(occurrences) = NO_COOKIE.hit("register_missing_cookie") {
-                        tracing::warn!(
-                            target: "ducktape::reachability",
-                            event = "advert_refused",
-                            reason = "register_missing_cookie",
-                            source = %from,
-                            key = short_key(key),
-                            occurrences,
-                            "first-seen Register missing a valid return-routability cookie"
-                        );
-                    }
+                if !self.admit_write(key, from, now, &cookie) {
                     return CoordinatorReplies::new();
                 }
                 // The registered reflexive address IS the observed source: the
@@ -367,13 +380,25 @@ impl Coordinator {
                 }
                 CoordinatorReplies::new()
             }
-            Msg::Readvertise { key, nonce } => {
+            Msg::Readvertise {
+                key,
+                nonce,
+                cookie,
+            } => {
                 // The wire-level rebind path AND the keepalive: a node re-runs
                 // STUN and republishes its reflexive (the observed `from`, never
                 // a self-reported address) under a strictly-higher `nonce`. The
                 // `AdvertBook` staleness guard rejects an equal-or-lower nonce, so
                 // a replayed/reordered datagram cannot supersede a fresh mapping
-                // — nor extend its life.
+                // — nor extend its life. A key with no LIVE mapping (first-seen,
+                // or expired) needs the SAME return-routability proof `Register`
+                // does: `AdvertBook::readvertise` falls straight into
+                // `insert_fresh` for one exactly like `observe` would, so a
+                // spoofed `Readvertise{nonce: 1}` for an unknown key is just as
+                // effective a reflector-planting primitive as a bare `Register`.
+                if !self.admit_write(key, from, now, &cookie) {
+                    return CoordinatorReplies::new();
+                }
                 let Admission { outcome, event } =
                     self.adverts.lock().readvertise(key, from, nonce, now);
                 // The book is done with; a log write must not happen under
@@ -636,7 +661,11 @@ mod tests {
 
         // A keepalives from the SAME mapping over the wire under nonce 1.
         assert!(
-            c.handle_verified(a, old, Msg::Readvertise { key: a, nonce: 1 })
+            c.handle_verified(a, old, Msg::Readvertise {
+                    key: a,
+                    nonce: 1,
+                    cookie: [0u8; 32],
+                })
                 .is_empty()
         );
         let out = c.handle_verified(b, b_src, Msg::Lookup { key: a });
@@ -654,7 +683,11 @@ mod tests {
         // A DIFFERENT source replaying a captured, still-fresh higher-nonce
         // Readvertise cannot hijack the live mapping over the wire either.
         assert!(
-            c.handle_verified(a, attacker_src, Msg::Readvertise { key: a, nonce: 2 })
+            c.handle_verified(a, attacker_src, Msg::Readvertise {
+                    key: a,
+                    nonce: 2,
+                    cookie: [0u8; 32],
+                })
                 .is_empty()
         );
         let out_attacker = c.handle_verified(b, b_src, Msg::Lookup { key: a });
@@ -689,7 +722,11 @@ mod tests {
 
         // A wire Readvertise at an equal-or-lower nonce is likewise stale.
         assert!(
-            c.handle_verified(a, old, Msg::Readvertise { key: a, nonce: 1 })
+            c.handle_verified(a, old, Msg::Readvertise {
+                    key: a,
+                    nonce: 1,
+                    cookie: [0u8; 32],
+                })
                 .is_empty()
         );
         let out3 = c.handle_verified(b, b_src, Msg::Lookup { key: a });
@@ -1210,11 +1247,19 @@ mod tests {
                 .is_empty()
         );
         assert!(
-            c.handle_verified_at(a, a_src, Msg::Readvertise { key: a, nonce: 1 }, 1_100)
+            c.handle_verified_at(a, a_src, Msg::Readvertise {
+                    key: a,
+                    nonce: 1,
+                    cookie: [0u8; 32],
+                }, 1_100)
                 .is_empty()
         );
         assert!(
-            c.handle_verified_at(a, a_src, Msg::Readvertise { key: a, nonce: 2 }, 1_200)
+            c.handle_verified_at(a, a_src, Msg::Readvertise {
+                    key: a,
+                    nonce: 2,
+                    cookie: [0u8; 32],
+                }, 1_200)
                 .is_empty()
         );
         // B registers right before its Lookup — a Lookup is only answered to
@@ -1380,6 +1425,57 @@ mod tests {
             src,
             Msg::Register {
                 key,
+                cookie: [0u8; 32],
+            },
+        );
+        assert!(out.is_empty());
+        assert_eq!(c.adverts().current(key, 0), Some(src));
+    }
+
+    #[test]
+    fn spoofed_first_readvertise_for_an_unknown_key_without_cookie_is_refused() {
+        // `AdvertBook::readvertise` falls into the same `insert_fresh` path
+        // `observe` does for a key with no live entry — a spoofed
+        // `Readvertise{nonce: 1}` for a never-registered key must be gated
+        // exactly like a spoofed first-seen `Register` (#1787's fix, applied
+        // to the arm it missed).
+        let mut c = Coordinator::new();
+        let attacker_key = NodeKey([0x55; 32]);
+        let victim_src = addr(9, 9999);
+        let out = c.handle_verified(
+            attacker_key,
+            victim_src,
+            Msg::Readvertise {
+                key: attacker_key,
+                nonce: 1,
+                cookie: [0u8; 32],
+            },
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            c.adverts().current(attacker_key, 0),
+            None,
+            "no cookie -> no mapping, so the relay resolves nothing for this key either"
+        );
+    }
+
+    #[test]
+    fn same_source_readvertise_of_a_live_mapping_needs_no_cookie() {
+        let mut c = Coordinator::new();
+        let key = NodeKey([0x66; 32]);
+        let src = addr(9, 9999);
+        c.handle_verified(key, src, reg(&c, key, src, 0));
+        assert_eq!(c.adverts().current(key, 0), Some(src));
+
+        // A same-source rebind under a higher nonce, with an all-zero
+        // (invalid) cookie, must still supersede the mapping: it is not
+        // creating a live entry, only extending the one that already exists.
+        let out = c.handle_verified(
+            key,
+            src,
+            Msg::Readvertise {
+                key,
+                nonce: 1,
                 cookie: [0u8; 32],
             },
         );

@@ -39,6 +39,11 @@ pub enum Msg {
     Readvertise {
         key: NodeKey,
         nonce: u64,
+        /// Required only when the coordinator holds no LIVE mapping for
+        /// `key` (first-seen or expired) — same rule as `Register::cookie`,
+        /// see `CookieKey::verify`. A same-source rebind of a live mapping
+        /// ignores this field.
+        cookie: [u8; 32],
     },
     Lookup {
         key: NodeKey,
@@ -206,10 +211,10 @@ impl<'a> Reader<'a> {
 }
 
 impl Msg {
-    /// Largest encoded bare message — a `Register` (tag + key + 32-byte
-    /// cookie). This fixed upper bound lets the hot UDP loop encode replies
-    /// on its stack instead of allocating per datagram.
-    pub const MAX_ENCODED_LEN: usize = 1 + 32 + 32;
+    /// Largest encoded bare message — a `Readvertise` (tag + key + 8-byte
+    /// nonce + 32-byte cookie). This fixed upper bound lets the hot UDP loop
+    /// encode replies on its stack instead of allocating per datagram.
+    pub const MAX_ENCODED_LEN: usize = 1 + 32 + 8 + 32;
 
     /// Encode into a stack-backed, fixed-capacity vector.
     pub fn encode_inline(&self) -> ArrayVec<u8, { Self::MAX_ENCODED_LEN }> {
@@ -238,10 +243,15 @@ impl Msg {
                 put_key(out, key);
                 put_cookie(out, cookie);
             }
-            Msg::Readvertise { key, nonce } => {
+            Msg::Readvertise {
+                key,
+                nonce,
+                cookie,
+            } => {
                 out.push(TAG_READVERTISE);
                 put_key(out, key);
                 put_u64(out, *nonce);
+                put_cookie(out, cookie);
             }
             Msg::Lookup { key } => {
                 out.push(TAG_LOOKUP);
@@ -317,6 +327,7 @@ impl Msg {
             TAG_READVERTISE => Msg::Readvertise {
                 key: r.key()?,
                 nonce: r.u64()?,
+                cookie: r.cookie()?,
             },
             TAG_LOOKUP => Msg::Lookup { key: r.key()? },
             TAG_LOOKUP_RESP => {
@@ -459,6 +470,7 @@ mod tests {
             Msg::Readvertise {
                 key: NodeKey([13u8; 32]),
                 nonce: 0x0102_0304_dead_beef,
+                cookie: [0xcdu8; 32],
             },
             Msg::Lookup {
                 key: NodeKey([4u8; 32]),
@@ -532,6 +544,7 @@ mod tests {
         let m = Msg::Readvertise {
             key: NodeKey([0xab; 32]),
             nonce: 0xffff_0000_ffff_0001,
+            cookie: [0xceu8; 32],
         };
         let back = Msg::decode(&m.encode()).expect("decode");
         assert_eq!(m, back);
@@ -561,6 +574,7 @@ mod tests {
             Msg::Readvertise {
                 key: subject,
                 nonce: 42,
+                cookie: [0xcfu8; 32],
             },
             Msg::Lookup {
                 key: NodeKey([7u8; 32]),

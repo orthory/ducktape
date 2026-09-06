@@ -132,6 +132,11 @@ pub struct NatClient {
     coords: Vec<SocketAddr>,
     signer: ed25519::PrivateKey,
     cap: Option<CoordCap>,
+    /// `(minted_at, cookie)` — the last return-routability cookie this
+    /// client learned from a `BindResponse`, and when. `register`/`readvertise`
+    /// refresh it via [`Self::fresh_cookie`] once it ages past
+    /// [`COOKIE_REFRESH_SECS`], so neither pays a bind round trip on every call.
+    cookie: std::sync::Mutex<(u64, [u8; 32])>,
 }
 
 impl NatClient {
@@ -154,6 +159,7 @@ impl NatClient {
             coords,
             signer,
             cap,
+            cookie: std::sync::Mutex::new((0, [0u8; 32])),
         })
     }
 
@@ -176,6 +182,7 @@ impl NatClient {
             coords,
             signer,
             cap,
+            cookie: std::sync::Mutex::new((0, [0u8; 32])),
         })
     }
 
@@ -198,9 +205,12 @@ impl NatClient {
 
     /// `BindRequest`/`BindResponse` round trip against `self.coord`: the
     /// coordinator-observed reflexive AND the return-routability cookie a
-    /// first-seen/expired `Register` must echo (see `auth::CookieKey`).
-    /// `discover_reflexive` and `register` both bottom out here so neither
-    /// duplicates the "only the coordinator's own reply counts" check.
+    /// first-seen/expired `Register`/`Readvertise` must echo (see
+    /// `auth::CookieKey`). `discover_reflexive` and `try_bind_cookie` both
+    /// bottom out here so neither duplicates the "only the coordinator's own
+    /// reply counts" check; both also cache the cookie via
+    /// [`Self::cache_cookie`], so a plain `discover_reflexive` call keeps
+    /// `register`/`readvertise` from re-binding right after.
     async fn bind_cookie(&self) -> std::io::Result<(SocketAddr, [u8; 32])> {
         self.sock
             .send_to(
@@ -218,6 +228,7 @@ impl NatClient {
                 continue;
             }
             if let Ok(Msg::BindResponse { reflexive, cookie }) = Msg::decode(&buf[..n]) {
+                self.cache_cookie(cookie);
                 return Ok((reflexive, cookie));
             }
         }
@@ -227,19 +238,50 @@ impl NatClient {
         self.bind_cookie().await.map(|(reflexive, _)| reflexive)
     }
 
+    /// Remember a cookie this client just learned from a `BindResponse`,
+    /// stamped with the current time so [`Self::fresh_cookie`] knows when to
+    /// mint a new one.
+    fn cache_cookie(&self, cookie: [u8; 32]) {
+        *self.cookie.lock().unwrap() = (now_secs(), cookie);
+    }
+
     /// [`Self::bind_cookie`], but never worth blocking [`Self::register`] over:
     /// a coordinator that never answers `BindRequest` (unreachable, or —
     /// under `AuthPolicy::Private` — refusing an unadmitted caller) must not
     /// hang the caller's `register`, which is otherwise a fire-and-forget
-    /// send. `None` on timeout or any transport error; the caller falls back
-    /// to whatever cookie (possibly none) it already has.
+    /// send. `None` on timeout or any transport error. The bound is generous
+    /// (well past a cross-continent RTT) because it is only paid once every
+    /// [`COOKIE_REFRESH_SECS`], not per call.
     async fn try_bind_cookie(&self) -> Option<[u8; 32]> {
-        const AUTO_BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+        const AUTO_BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
         tokio::time::timeout(AUTO_BIND_TIMEOUT, self.bind_cookie())
             .await
             .ok()?
             .ok()
             .map(|(_, cookie)| cookie)
+    }
+
+    /// The cookie a first-seen `Register`/`Readvertise` echoes, refreshed
+    /// only when stale. A cookie's own validity window is two minutes
+    /// (`CookieKey::verify` accepts the current or previous minute), so
+    /// refreshing well inside that — before every `register`/keepalive
+    /// `readvertise`, but only when the cached one has aged past
+    /// [`COOKIE_REFRESH_SECS`] — means the common case (a cookie already
+    /// cached from `discover_reflexive`/`discover_reflexive_failover` at
+    /// establishment) costs no extra round trip at all.
+    async fn fresh_cookie(&self) -> [u8; 32] {
+        const COOKIE_REFRESH_SECS: u64 = 50;
+        let stale = {
+            let (minted_at, _) = *self.cookie.lock().unwrap();
+            now_secs().saturating_sub(minted_at) >= COOKIE_REFRESH_SECS
+        };
+        if stale {
+            // `try_bind_cookie` already caches on success via `bind_cookie`;
+            // on timeout the stale cached cookie (possibly still [0u8; 32])
+            // is used as-is rather than blocking the caller any further.
+            self.try_bind_cookie().await;
+        }
+        self.cookie.lock().unwrap().1
     }
 
     /// Discover this node's reflexive address, trying each coordinator hint in
@@ -280,7 +322,8 @@ impl NatClient {
                     if from != c {
                         continue;
                     }
-                    if let Ok(Msg::BindResponse { reflexive, .. }) = Msg::decode(&buf[..n]) {
+                    if let Ok(Msg::BindResponse { reflexive, cookie }) = Msg::decode(&buf[..n]) {
+                        self.cache_cookie(cookie);
                         return Ok::<SocketAddr, std::io::Error>(reflexive);
                     }
                 }
@@ -311,7 +354,7 @@ impl NatClient {
     /// same-source refresh of an already-live mapping ignores the cookie
     /// entirely, so a timed-out bind costs that registration nothing.
     pub async fn register(&self) -> std::io::Result<()> {
-        let cookie = self.try_bind_cookie().await.unwrap_or([0u8; 32]);
+        let cookie = self.fresh_cookie().await;
         self.sock
             .send_to(
                 &self.authed(Msg::Register {
@@ -330,13 +373,19 @@ impl NatClient {
     /// re-observes the datagram's NEW source and applies the nonce-staleness
     /// guard, so a replayed/reordered lower-or-equal nonce cannot supersede the
     /// fresh mapping — unlike `register`, whose nonce-0 baseline a stale
-    /// duplicate could otherwise roll back.
+    /// duplicate could otherwise roll back. Also carries a cookie: a
+    /// `Readvertise` for a key with no LIVE mapping needs one exactly like a
+    /// first-seen `Register` does (a keepalive of an already-live mapping
+    /// ignores it), which happens whenever this node's own registration aged
+    /// out before this keepalive caught up.
     pub async fn readvertise(&self, nonce: u64) -> std::io::Result<()> {
+        let cookie = self.fresh_cookie().await;
         self.sock
             .send_to(
                 &self.authed(Msg::Readvertise {
                     key: self.key,
                     nonce,
+                    cookie,
                 }),
                 self.coord,
             )
@@ -1759,6 +1808,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn keepalive_after_cookie_ages_out_rebinds_and_stays_registered() {
+        // `fresh_cookie` only re-binds once the cached cookie is older than
+        // its refresh window; backdating the cached mint time (rather than a
+        // real 50s+ sleep) exercises that refresh path deterministically.
+        let coord_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let coord_addr = coord_sock.local_addr().unwrap();
+        tokio::spawn(run_coordinator(
+            NatSocket::Owned(coord_sock),
+            crate::auth::AuthPolicy::Public,
+        ));
+
+        let (a_key, a) = public_client(15, vec![coord_addr]).await;
+        let (_, b) = public_client(16, vec![coord_addr]).await;
+        b.register().await.unwrap();
+
+        // Simulate an aged-out cookie cache: an ancient mint time, and a
+        // cookie value that would never verify for anything.
+        *a.cookie.lock().unwrap() = (0, [0u8; 32]);
+
+        // A's own registration is first-seen — its keepalive Readvertise
+        // needs a valid cookie exactly like a first-seen Register would. If
+        // the stale cache were reused as-is (never refreshed), the
+        // coordinator would refuse it and B's lookup below would resolve to
+        // nothing.
+        a.readvertise(1).await.unwrap();
+
+        let resolved = timeout(Duration::from_secs(2), b.lookup(a_key))
+            .await
+            .expect("no timeout")
+            .expect("the aged-out cookie was refreshed, so the readvertise registered A");
+        assert_eq!(resolved.port(), a.local_addr().await.unwrap().port());
     }
 
     #[tokio::test]
