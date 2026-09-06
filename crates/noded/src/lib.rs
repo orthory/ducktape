@@ -148,6 +148,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use commonware_cryptography::Signer as _;
 use duckfs_core::CHUNK_SIZE;
 use futures::channel::oneshot;
 use sdk::StateRoot;
@@ -689,6 +690,7 @@ pub fn router(handle: NodeHandle) -> Router {
         // Prometheus scrape convention: root `/metrics`, not under `/v1`.
         .route("/metrics", get(metrics))
         .route("/v1/log-filter", post(log_filter))
+        .route("/v1/huddle/node-proof", post(huddle_node_proof))
         .route("/v1/ws", get(ws))
         .route("/v1/call/ws", get(call_ws))
         .route("/v1/presence/ws", get(presence_ws))
@@ -1059,6 +1061,61 @@ async fn log_filter(body: String) -> Response {
         Ok(()) => (StatusCode::OK, body).into_response(),
         Err(err) => error_response(StatusCode::BAD_REQUEST, &err),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HuddleNodeProofBody {
+    channel_id: String,
+    /// the joining user's origin bytes, hex — the SAME id the `JoinHuddle`
+    /// this proof rides in on will be authored under. Trusted only because
+    /// this route is node-level (below): a caller with no operator standing
+    /// on THIS node cannot reach it at all, so it cannot mint a proof binding
+    /// a user it does not control.
+    user: String,
+}
+
+#[derive(Serialize)]
+struct HuddleNodeProofResponse {
+    node: String,
+    node_proof: String,
+}
+
+/// POST /v1/huddle/node-proof `{"channel_id": "…", "user": "<hex>"}` — mints
+/// the ed25519 signature `chat::ChatMsg::JoinHuddle.node_proof` needs: THIS
+/// node's own identity key, signing `chat::huddle_join_preimage(channel_id,
+/// user)` under `chat::HUDDLE_JOIN_NS`. 503 on a daemon with no mesh identity
+/// (the embedded local daemon, `bin/noded`) — huddle routing has nothing to
+/// name there either.
+///
+/// AUTH: node-level (`signed_req`, `Authority::Operator`) — this node's
+/// operator credential, or a signature by the key it knows as its operator's,
+/// exactly like `/v1/invite`. The handler reads no acting identity, so
+/// possession alone would let ANY caller mint a proof binding an arbitrary
+/// `user` to this node — which is real forgery (`JoinHuddle`'s author still
+/// needs its own signature, but the roster would carry a node this node's
+/// operator never agreed to route media for). The desktop app presents the
+/// operator token it already reads off the same workspace for `/v1/invite`.
+async fn huddle_node_proof(
+    State(handle): State<NodeHandle>,
+    Json(body): Json<HuddleNodeProofBody>,
+) -> Response {
+    let Some(signer) = handle.node_signer.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node has no mesh identity to prove a huddle node key with",
+        );
+    };
+    let Some(user) = crate::signed_req::from_hex(&body.user) else {
+        return error_response(StatusCode::BAD_REQUEST, "user must be hexadecimal");
+    };
+    let preimage = chat::huddle_join_preimage(&body.channel_id, &user);
+    let node_proof = signer.sign(chat::HUDDLE_JOIN_NS, &preimage);
+    Json(HuddleNodeProofResponse {
+        node: hex_bytes(signer.public_key().as_ref()),
+        node_proof: hex_bytes(node_proof.as_ref()),
+    })
+    .into_response()
 }
 
 /// POST /v1/invite `{"ttl_days": N}` — mint one bearer invite and answer

@@ -34,6 +34,11 @@ pub const MAX_QUERY_LIMIT: u64 = 256;
 pub const MAX_HUDDLE_MEMBERS: usize = 32;
 /// a huddle member's node key: raw ed25519 public key bytes.
 pub const HUDDLE_NODE_KEY_BYTES: usize = 32;
+/// the domain separator [`huddle_join_preimage`]'s signature is minted under —
+/// [`crate::HUDDLE_NODE_KEY_BYTES`]'s key proves it holds the join's `node` key
+/// by signing over exactly this namespace plus the channel/user pair, so a
+/// join can never be replayed as a different scheme's proof.
+pub const HUDDLE_JOIN_NS: &[u8] = b"ducktape/huddle-join/v1";
 /// channels one creator (a user, or `CreateDmChannel`'s resolved account) may
 /// have open at once. there is no `DeleteChannel` op — every created channel
 /// is permanent — so this is the only thing bounding one account's share of
@@ -283,8 +288,16 @@ pub enum ChatMsg {
     /// join (or start) the channel's huddle. external users only — huddles are
     /// human affordances; members-only channels gate like posting. idempotent:
     /// re-joining updates `node` (the joiner's node key, [`HUDDLE_NODE_KEY_BYTES`]
-    /// raw ed25519 bytes) and stages nothing when unchanged.
-    JoinHuddle { channel_id: String, node: Vec<u8> },
+    /// raw ed25519 bytes) and stages nothing when unchanged. `node_proof` is
+    /// `node`'s ed25519 signature over [`huddle_join_preimage`]`(channel_id,
+    /// user)` under [`HUDDLE_JOIN_NS`] — proof that the joining client holds
+    /// `node`'s private key, not just its public bytes (see
+    /// [`crate::verify_huddle_join_proof`]).
+    JoinHuddle {
+        channel_id: String,
+        node: Vec<u8>,
+        node_proof: Vec<u8>,
+    },
     /// leave the channel's huddle. leaving a huddle one is not in is a
     /// deterministic no-op; an empty roster means no huddle.
     LeaveHuddle { channel_id: String },
@@ -419,4 +432,14 @@ pub fn encode_assigned(a: &ChatAssigned) -> Vec<u8> {
 
 pub fn decode_assigned(b: &[u8]) -> Result<ChatAssigned, String> {
     sdk::wire::decode(b)
+}
+
+/// the bytes a `JoinHuddle`'s `node_proof` signs: `channel_id ‖ user`, each
+/// length-prefixed so no delimiter collision lets one field's tail bleed into
+/// the next's head. Signed and verified under [`HUDDLE_JOIN_NS`].
+pub fn huddle_join_preimage(channel_id: &str, user: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    sdk::codec::push_str(&mut out, channel_id);
+    sdk::codec::push_bytes(&mut out, user);
+    out
 }

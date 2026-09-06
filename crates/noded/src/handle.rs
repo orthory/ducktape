@@ -359,6 +359,12 @@ pub struct NodeHandle {
     /// same gate; always present, since each route already 503s a handle
     /// with no index store wired.
     pub(crate) index_view_gate: Arc<tokio::sync::Semaphore>,
+    /// this node's own mesh-identity signer — the SAME key `NodeStatus.public_key`
+    /// publishes. wired directly (not through the `cmds` actor lane) so
+    /// `POST /v1/huddle/node-proof` answers synchronously, like `status` does.
+    /// `None` on a daemon with no mesh identity (the embedded local daemon,
+    /// router tests) — that route 503s there.
+    pub(crate) node_signer: Option<commonware_cryptography::ed25519::PrivateKey>,
 }
 
 impl NodeHandle {
@@ -396,6 +402,7 @@ impl NodeHandle {
             index_view_gate: Arc::new(tokio::sync::Semaphore::new(
                 crate::index::MAX_CONCURRENT_INDEX_VIEWS,
             )),
+            node_signer: None,
         };
         (handle, cmd_rx, hub)
     }
@@ -442,6 +449,18 @@ impl NodeHandle {
     /// only the p2p validator wires one — it owns the overlay the plane rides.
     pub fn with_code_stage(mut self, lane: crate::module_code::CodeStageLane) -> Self {
         self.code_stage = Some(lane);
+        self
+    }
+
+    /// wire this node's own mesh-identity signer so `POST /v1/huddle/node-proof`
+    /// can mint a `JoinHuddle.node_proof` for it — the SAME key `node_key` in
+    /// [`Self::with_admin`] names. only a daemon with a real mesh identity
+    /// wires one; a handle without it 503s the route.
+    pub fn with_node_signer(
+        mut self,
+        signer: commonware_cryptography::ed25519::PrivateKey,
+    ) -> Self {
+        self.node_signer = Some(signer);
         self
     }
 

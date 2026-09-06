@@ -28,8 +28,11 @@ mod common;
 
 use std::time::Duration;
 
-use chat::{Channel, ChatMsg, ChatQuery, ChatReply, PostPolicy};
+use chat::{
+    Channel, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS, PostPolicy, huddle_join_preimage,
+};
 use common::{Cluster, hex, unhex};
+use commonware_cryptography::{Signer as _, ed25519};
 use futures::{SinkExt as _, StreamExt as _};
 use media_service::call_wire::{self, CapturedFrame};
 use tokio::net::TcpStream;
@@ -62,6 +65,24 @@ fn status_key(cluster: &Cluster, idx: usize) -> String {
         .as_str()
         .expect("the node publishes its mesh identity")
         .to_string()
+}
+
+/// A `JoinHuddle` op for the node at `seed` naming itself: `cluster.submit`
+/// self-authors (the node re-signs with its own key regardless of origin), so
+/// the author IS `node_hex`'s bytes here — `node_proof` is that same node
+/// signing the join under [`HUDDLE_JOIN_NS`], proof it holds the key it names.
+fn join_huddle_op(channel_id: &str, seed: u64, node_hex: &str) -> ChatMsg {
+    let node = unhex(node_hex);
+    let preimage = huddle_join_preimage(channel_id, &node);
+    let node_proof = ed25519::PrivateKey::from_seed(seed)
+        .sign(HUDDLE_JOIN_NS, &preimage)
+        .as_ref()
+        .to_vec();
+    ChatMsg::JoinHuddle {
+        channel_id: channel_id.into(),
+        node,
+        node_proof,
+    }
 }
 
 /// The channel record as consensus holds it — the same row the app's channel
@@ -262,10 +283,7 @@ fn a_late_joiner_is_heard_and_seen_once_the_roster_re_steers_the_fan_out() {
     cluster.submit(
         0,
         "chat",
-        &chat::encode_msg(&ChatMsg::JoinHuddle {
-            channel_id: CHANNEL.into(),
-            node: unhex(&node_a),
-        }),
+        &chat::encode_msg(&join_huddle_op(CHANNEL, 0, &node_a)),
     );
     cluster.await_committed(0, "A alone in the huddle", FINALIZE, || {
         (roster_nodes(&cluster, 0, CHANNEL) == [node_a.clone()]).then_some(())
@@ -283,10 +301,7 @@ fn a_late_joiner_is_heard_and_seen_once_the_roster_re_steers_the_fan_out() {
     cluster.submit(
         1,
         "chat",
-        &chat::encode_msg(&ChatMsg::JoinHuddle {
-            channel_id: CHANNEL.into(),
-            node: unhex(&node_b),
-        }),
+        &chat::encode_msg(&join_huddle_op(CHANNEL, 1, &node_b)),
     );
     for idx in 0..2 {
         cluster.await_committed(idx, "both nodes read a two-person roster", FINALIZE, || {
