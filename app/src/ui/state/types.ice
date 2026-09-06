@@ -73,7 +73,7 @@ enum PickGate
 // What the status item's "Open" has to do. Since closing a window no longer
 // ends the process, the daemon can be up with nothing tracked — and then there
 // is no window to raise, so the row has to open one.
-enum TrayOpen
+enum WindowSummon
   open
   raise
 

@@ -166,7 +166,10 @@ extern crate::backend
   pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool
   // "Open Ducktape" as a discriminant: nothing tracked means there is nothing
   // to raise, so the row must open a window instead of focusing a fresh id.
-  pure tray_open_action(console:window-id?, onboarding:window-id?) -> TrayOpen
+  pure tray_open_action(console:window-id?, onboarding:window-id?) -> WindowSummon
+  // The same decision for the call's window: the LIVE pill and the tray's
+  // huddle row both mean "put it in front of me", whether or not one is up.
+  pure huddle_summon(huddle:window-id?) -> WindowSummon
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
   // THE RECOVERY-PHRASE CEREMONY, in two calls. `create_device_key` picks a

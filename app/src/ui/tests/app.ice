@@ -224,8 +224,6 @@ test palette_escape_contract
         toggle_bell -> toggle_bell
         switch_network -> switch_network
 
-      huddle:
-        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -381,8 +379,6 @@ test minimum_window_layout_contract
         toggle_bell -> toggle_bell
         switch_network -> switch_network
 
-      huddle:
-        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -950,8 +946,6 @@ test settings_keyboard_scroll_contract
         toggle_bell -> toggle_bell
         switch_network -> switch_network
 
-      huddle:
-        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -1203,7 +1197,6 @@ test message_stream_reset_contract
         huddle_joined_at
         huddle_now
         call_muted
-        huddle_popped=false
         messages
         has_older_history
         history_view
@@ -1232,8 +1225,7 @@ test message_stream_reset_contract
         choose_channel -> choose_channel _
         choose_dm -> choose_dm _
         toggle_channel_settings -> toggle_channel_settings
-        pop_huddle -> pop_huddle
-        focus_huddle -> focus_huddle
+        show_huddle -> show_huddle
         leave_huddle_here -> leave_huddle_here
         huddle_go_channel -> huddle_go_channel
         join_huddle_submit -> join_huddle_submit
@@ -1340,7 +1332,6 @@ test message_body_renders_as_one_rich_paragraph
         huddle_joined_at
         huddle_now
         call_muted
-        huddle_popped=false
         messages
         has_older_history
         history_view
@@ -1369,8 +1360,7 @@ test message_body_renders_as_one_rich_paragraph
         choose_channel -> choose_channel _
         choose_dm -> choose_dm _
         toggle_channel_settings -> toggle_channel_settings
-        pop_huddle -> pop_huddle
-        focus_huddle -> focus_huddle
+        show_huddle -> show_huddle
         leave_huddle_here -> leave_huddle_here
         huddle_go_channel -> huddle_go_channel
         join_huddle_submit -> join_huddle_submit
@@ -1626,15 +1616,14 @@ test the_huddle_controls_survive_the_narrowest_panel
         stage=huddle_stage
         video_live=call_video_live
       events
-        dock_huddle -> dock_huddle
         huddle_go_channel -> huddle_go_channel
         leave_huddle_here -> leave_huddle_here
         toggle_call_mute -> toggle_call_mute
         toggle_call_camera -> toggle_call_camera
         toggle_call_screen -> toggle_call_screen
   target panel = #huddle/root
-  target share = #huddle/root/share-stop
-  target leave = #huddle/root/leave
+  target share = #huddle/root/controls/root/share-stop
+  target leave = #huddle/root/controls/root/leave
   expect call_sharing
   expect leave.x + leave.width <= panel.x + panel.width
   expect share.width ~= 32.0

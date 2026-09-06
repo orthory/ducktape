@@ -1026,9 +1026,9 @@ on window_was_closed(id)
 on tray_open
   let raising = tray_open_action(console_win, onboarding_win)
   match raising
-    TrayOpen.open
+    WindowSummon.open
       task window open onboarding -> onboarding_opened _
-    TrayOpen.raise
+    WindowSummon.raise
       parallel
         task window focus target=window_target(console_win)
         task window focus target=window_target(onboarding_win)
