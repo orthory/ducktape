@@ -167,7 +167,7 @@ fn an_activation_inside_the_min_lead_is_refused_with_the_registry_reason() {
         assert!(!ok, "{}", outputs(&runs));
         assert!(
             out.contains(
-                "--after 2 cannot schedule anything: activation must exceed height+MIN_SWAP_LEAD (3)"
+                "--after 2 cannot schedule anything: activation must exceed execute-height+MIN_SWAP_LEAD (3)"
             ),
             "{out}"
         );
