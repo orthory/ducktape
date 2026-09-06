@@ -514,6 +514,7 @@ pub(crate) async fn run_promoted(
         mesh_window,
         mesh_book,
         replay_window,
+        pending_cutover_view,
     } = baton;
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
     tracing::info!(
@@ -783,8 +784,18 @@ pub(crate) async fn run_promoted(
         resident_keys.clone(),
         epoch,
         view_base,
-        None,
+        pending_cutover_view,
     );
+    if let Some(ceiling) = pending_cutover_view {
+        node.set_view_ceiling(ceiling);
+        tracing::info!(
+            target: "ducktape::consensus",
+            node = %label,
+            cutover_view = ceiling,
+            epoch = epoch + 1,
+            "pending cutover re-armed at promotion"
+        );
+    }
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Validating);
     tracing::info!(
         event = "node_phase_transition",
@@ -994,6 +1005,14 @@ pub(crate) struct PromotionBaton {
     /// suffix a restart would restore from is empty, and a seat that started
     /// with an empty window would apply a replayed batch its peers refuse.
     pub(crate) replay_window: Vec<(u64, node::FrameId)>,
+    /// a valset change already committed but not yet cut over at this
+    /// boundary — the replica's own armed cutover carried through promotion
+    /// (a fresh-epoch seat is a cutover itself, so it arms none), or a synced
+    /// boundary's [`statesync::Manifest::pending_cutover_view`] on a cold
+    /// admission. the seated orchestrator resumes with this exact ceiling
+    /// instead of observing the already-changed valset itself and arming a
+    /// LATER one (#1821).
+    pub(crate) pending_cutover_view: Option<u64>,
 }
 
 /// one epoch's slot in the [`LaneBank`].
