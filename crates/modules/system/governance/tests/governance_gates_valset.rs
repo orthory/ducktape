@@ -960,13 +960,14 @@ fn an_expired_proposal_frees_its_roster_slot_on_the_next_propose() {
             Some(ProposalStatus::Open)
         );
 
-        // past the deadline (proposed at 1, period 5 -> deadline 6); nobody
-        // ever calls Execute on "stale". a fresh Propose at height 100 must
-        // reap it before staging its own entry.
+        // past the deadline (proposed at 1, period 5 -> deadline 6) AND past
+        // its execution grace; nobody ever calls Execute on "stale". a fresh
+        // Propose well past deadline + EXECUTION_GRACE must reap it before
+        // staging its own entry.
         submit_as(
             &mut host,
             &m1,
-            100,
+            200_000,
             "governance",
             gov_encode(&GovMsg::Propose {
                 proposal_id: "fresh".into(),
@@ -1063,6 +1064,243 @@ fn a_submitter_at_its_open_cap_is_refused_while_another_member_is_admitted() {
         assert_eq!(
             open_proposal_count(&host).await,
             governance::MAX_OPEN_PROPOSALS_PER_SUBMITTER + 1
+        );
+    });
+}
+
+#[test]
+fn a_passed_proposal_past_execution_grace_is_refused_and_reaped_rejected() {
+    // a proposal that reached its yes-threshold but was NEVER executed must
+    // not stay enactable forever: past deadline + EXECUTION_GRACE (100_000
+    // consensus-time units) Execute settles it Rejected on the spot instead
+    // of enacting a frozen, possibly long-gone electorate.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2, newcomer) = (member_key(1), member_key(2), member_key(9));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p".into(),
+                action: GovAction::AddValidator {
+                    key: newcomer.clone(),
+                },
+                voting_period: 5,
+            }),
+        )
+        .await
+        .expect("propose");
+
+        // both members vote yes: required_yes = 2/2+1 = 2, met.
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("m1 yes");
+        submit_as(
+            &mut host,
+            &m2,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("m2 yes");
+
+        // deadline is 1 + 5 = 6; nobody ever calls Execute. well past
+        // deadline + EXECUTION_GRACE (100_000), Execute settles it Rejected
+        // in place instead of enacting the frozen electorate's mandate — it
+        // is an ordinary committed write (`Ok`), not an error, so the
+        // settlement is never rolled back by an outer refusal.
+        submit_as(
+            &mut host,
+            &m1,
+            200_000,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "p".into(),
+            }),
+        )
+        .await
+        .expect("execute past the execution grace window settles it in place");
+        assert_eq!(
+            proposal_status(&host, "p").await,
+            Some(ProposalStatus::Rejected),
+            "expiry settles a passed-but-unexecuted proposal Rejected"
+        );
+        assert!(
+            !validators(&host).await.contains(&newcomer),
+            "an expired mandate must never be enacted"
+        );
+    });
+}
+
+#[test]
+fn a_passed_proposal_inside_execution_grace_still_executes() {
+    // symmetric to the above: past the plain deadline but still inside
+    // EXECUTION_GRACE, Execute tallies and enacts normally.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2, newcomer) = (member_key(1), member_key(2), member_key(9));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p".into(),
+                action: GovAction::AddValidator {
+                    key: newcomer.clone(),
+                },
+                voting_period: 5,
+            }),
+        )
+        .await
+        .expect("propose");
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("m1 yes");
+        submit_as(
+            &mut host,
+            &m2,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("m2 yes");
+
+        // deadline is 6; far past it but well inside deadline + 100_000.
+        submit_as(
+            &mut host,
+            &m1,
+            50_000,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "p".into(),
+            }),
+        )
+        .await
+        .expect("still inside the execution grace window");
+        assert_eq!(
+            proposal_status(&host, "p").await,
+            Some(ProposalStatus::Passed)
+        );
+        assert!(validators(&host).await.contains(&newcomer));
+    });
+}
+
+#[test]
+fn an_expired_proposal_is_reaped_by_a_later_vote_or_execute_on_another_proposal() {
+    // expiry must not depend on someone else calling Propose: a later Vote
+    // or Execute targeting a DIFFERENT, still-open proposal reaps the
+    // long-expired one too.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2) = (member_key(1), member_key(2));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "stale".into(),
+                action: GovAction::Signal {
+                    text: "never executed".into(),
+                },
+                voting_period: 5,
+            }),
+        )
+        .await
+        .expect("propose stale");
+
+        // a second, long-lived proposal that is still open at the time we
+        // act on it below.
+        submit_as(
+            &mut host,
+            &m2,
+            200_000,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "fresh".into(),
+                action: GovAction::Signal {
+                    text: "still open".into(),
+                },
+                voting_period: 1_000_000,
+            }),
+        )
+        .await
+        .expect("propose fresh (this ALSO reaps stale via Propose's own reap)");
+
+        // "stale"'s deadline was 6; "fresh" was proposed at 200_000, which
+        // is already past stale's deadline + EXECUTION_GRACE (100_006), so
+        // Propose's own reap already caught it. Cast a Vote on "fresh" at a
+        // LATER time to prove Vote's reap is independently wired too (using
+        // a second stale proposal created after the first reap already ran).
+        submit_as(
+            &mut host,
+            &m1,
+            200_001,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "stale-2".into(),
+                action: GovAction::Signal {
+                    text: "never executed either".into(),
+                },
+                voting_period: 5,
+            }),
+        )
+        .await
+        .expect("propose stale-2");
+        assert_eq!(
+            proposal_status(&host, "stale-2").await,
+            Some(ProposalStatus::Open)
+        );
+
+        submit_as(
+            &mut host,
+            &m2,
+            400_000,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "fresh".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote on fresh reaps stale-2 too");
+
+        assert_eq!(
+            proposal_status(&host, "stale-2").await,
+            Some(ProposalStatus::Rejected),
+            "Vote's own reap_roster call caught the unrelated expired proposal"
         );
     });
 }
