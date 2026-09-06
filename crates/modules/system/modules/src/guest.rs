@@ -7,6 +7,6 @@ const MODULE_ID: &str = "modules";
 ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: Modules,
-    shape: ducktape_module_sdk::host::ModuleShape { committed_queries: true, ..ducktape_module_sdk::store_shape() },
+    shape: ducktape_module_sdk::store_shape(),
     new: Modules::new(MODULE_ID, Box::new(WitStore), "valset", "governance"),
 }
