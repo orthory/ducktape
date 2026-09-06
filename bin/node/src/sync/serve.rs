@@ -122,25 +122,33 @@ pub(crate) fn verify_manifest_participants(
 /// against the local trust anchor, then its finalization floor against that
 /// set.
 ///
-/// The floor is MANDATORY. A boundary at (or below) its own epoch base carries
-/// no finalization in that epoch to certify, which used to skip this whole
-/// check — and `view_base` is served too, so `view_base == height` was a
-/// one-field opt-out of the only cryptographic gate on the lane. A boundary
-/// like that is refused instead; the serving node advances past its base
-/// within a block and the caller's retry picks it up.
+/// A served floor is ALWAYS verified, and a MISSING one is admissible in
+/// exactly the shape the serving node is allowed to produce it
+/// (`validator::run::sync`: a boundary is served bare only when
+/// `height <= view_base`) — a checkpoint captured before a cutover, whose
+/// epoch has finalized nothing yet. That window cannot be closed by demanding
+/// a certificate: the joiner is often IN the new epoch's participant set, so
+/// no finalization can exist until it seats, and requiring one deadlocks the
+/// promotion. What that boundary rests on instead is the participant check
+/// above; certifying it needs the PREVIOUS epoch's floor and its participants
+/// on the wire — the same epoch-chain the anchor rule works around.
 pub(crate) fn verify_manifest_floor(
     namespace: &[u8],
     anchor: TrustAnchor<'_>,
     boundary: &statesync::Manifest,
-) -> Result<Vec<u8>, String> {
+) -> Result<Option<Vec<u8>>, String> {
     verify_manifest_participants(anchor, boundary)?;
-    let cert = boundary.floor_cert.clone().ok_or_else(|| {
-        format!(
-            "manifest_floor_missing: boundary at height {} (epoch {} base {}) carries no \
-             finalization floor",
-            boundary.height, boundary.epoch, boundary.view_base
-        )
-    })?;
+    let Some(cert) = boundary.floor_cert.clone() else {
+        let bare_boundary_is_servable = boundary.height <= boundary.view_base;
+        if !bare_boundary_is_servable {
+            return Err(format!(
+                "manifest_floor_missing: boundary at height {} is past its epoch base \
+                 (epoch {} base {}) and carries no finalization floor",
+                boundary.height, boundary.epoch, boundary.view_base
+            ));
+        }
+        return Ok(None);
+    };
     let mut keys = Vec::with_capacity(boundary.participants.len());
     for k in &boundary.participants {
         let pk = ed25519::PublicKey::decode(k.as_slice())
@@ -167,7 +175,7 @@ pub(crate) fn verify_manifest_floor(
         finalization.proposal.round.view().get(),
     )
     .map_err(|e| format!("served finalization floor is stale: {e}"))?;
-    Ok(cert)
+    Ok(Some(cert))
 }
 
 /// reopen the recovery journal after a replica DESCEND (the node — which
@@ -1071,20 +1079,35 @@ mod tests {
         keys.iter().map(|k| vec![*k; 32]).collect()
     }
 
-    /// `view_base` is SERVED, so `view_base == height` used to be a one-field
-    /// opt-out of the only cryptographic gate on the lane: no cert required,
-    /// no quorum checked, the attacker's root adopted.
+    /// a boundary PAST its epoch base must carry its floor — and it is
+    /// refused for the participant set FIRST, so an unanchored source cannot
+    /// even get its certificate looked at. (a bare boundary at/below the base
+    /// is the post-cutover window a serving node is allowed to answer with;
+    /// `latest_boundary_has_floor` and this function agree on that shape.)
     #[test]
-    fn a_boundary_sitting_on_its_own_base_is_refused_not_waved_through() {
+    fn a_boundary_past_its_base_without_a_floor_is_refused() {
         let anchor_keys = founding(&[1, 2, 3]);
         let anchor = TrustAnchor {
             epoch: 0,
             participants: &anchor_keys,
         };
-        let mut m = served(0, 9_000, 9_000, &[1, 2, 3]);
+        let mut m = served(0, 9_000, 8_000, &[1, 2, 3]);
         m.floor_cert = None;
         let e = verify_manifest_floor(b"ns", anchor, &m).expect_err("no floor, no boundary");
         assert!(e.starts_with("manifest_floor_missing:"), "{e}");
+        // the bare post-cutover shape, with the set still anchored.
+        let mut base = served(0, 9_000, 9_000, &[1, 2, 3]);
+        base.floor_cert = None;
+        assert_eq!(
+            verify_manifest_floor(b"ns", anchor, &base).expect("the post-cutover window"),
+            None
+        );
+        // ...but never with a set nothing local vouches for.
+        let mut unanchored = served(7, 9_000, 9_000, &[20, 21, 22, 23]);
+        unanchored.floor_cert = None;
+        let e = verify_manifest_floor(b"ns", anchor, &unanchored)
+            .expect_err("a bare boundary is still anchored");
+        assert!(e.starts_with("manifest_participants_unanchored:"), "{e}");
     }
 
     /// the whole primitive: an attacker's own keys plus the victim's, served

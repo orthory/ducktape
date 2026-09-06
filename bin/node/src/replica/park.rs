@@ -2175,7 +2175,7 @@ pub(super) async fn park(
                     // verify under that set (real quorum signatures) —
                     // the same gate promotion runs.
                     let floor = match verify_manifest_floor(&namespace, founding_anchor, &m) {
-                        Ok(cert) => Some(recovery::FloorCert {
+                        Ok(cert) => cert.map(|cert| recovery::FloorCert {
                             epoch: m.epoch,
                             height: m.height,
                             cert,
@@ -2600,10 +2600,10 @@ pub(super) async fn park(
                             frames = 0,
                             "suffix install"
                         );
-                        let floor = Some(recovery::FloorCert {
+                        let floor = boundary_floor.map(|cert| recovery::FloorCert {
                             epoch: boundary.epoch,
                             height: boundary.height,
-                            cert: boundary_floor,
+                            cert,
                         });
                         // THE LAST MOMENT A SYNC CLIENT EXISTS: `run_promoted`
                         // seats from the baton and never sees one, so the

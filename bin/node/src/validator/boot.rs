@@ -528,7 +528,7 @@ where
     // keys the floor is verified against, so a set nothing local vouches for
     // makes every check under it — the seat check included — circular.
     let floor = match crate::sync::serve::verify_manifest_floor(namespace, anchor, &boundary) {
-        Ok(cert) => Some(recovery::FloorCert {
+        Ok(cert) => cert.map(|cert| recovery::FloorCert {
             epoch: boundary.epoch,
             height: boundary.height,
             cert,
