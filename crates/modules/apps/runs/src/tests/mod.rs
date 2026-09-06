@@ -70,7 +70,7 @@ struct CaptureCtx {
     /// Get arm as a Done saga (the sink's executing-node attribution).
     saga_assignees: BTreeMap<String, Vec<u8>>,
     /// page_id -> the canonical whole page in preorder, sliced by the "pages"
-    /// GetPage arm (the M2 `[[page:<id>]]` injection lane); GetBlock scans the
+    /// GetPage arm (the `duck://page/<id>` injection lane); GetBlock scans the
     /// same pages by block id (the pages-effects target resolution).
     pages: BTreeMap<String, Vec<pages::Block>>,
     page_query_count: Cell<usize>,

@@ -1317,7 +1317,9 @@ pub async fn load_account(rpc: String, generation: i64) -> Result<AccountData, H
             .await?;
         let account = match reply {
             identity::IdentityReply::Account(account) => account,
-            identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => {
+            identity::IdentityReply::Accounts(_)
+            | identity::IdentityReply::Resolved(_)
+            | identity::IdentityReply::Gen(_) => {
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };
@@ -1497,7 +1499,9 @@ async fn key_generation(client: &RpcClient, key: &[u8]) -> Result<u64, String> {
         .await?;
     match reply {
         identity::IdentityReply::Gen(generation) => Ok(generation),
-        identity::IdentityReply::Account(_) | identity::IdentityReply::Accounts(_) => {
+        identity::IdentityReply::Account(_)
+        | identity::IdentityReply::Accounts(_)
+        | identity::IdentityReply::Resolved(_) => {
             Err("the identity module returned the wrong reply".to_string())
         }
     }
@@ -1560,7 +1564,9 @@ async fn own_account(client: &RpcClient) -> Result<identity::AccountView, String
 fn account_reply(reply: identity::IdentityReply) -> Result<Option<identity::AccountView>, String> {
     match reply {
         identity::IdentityReply::Account(account) => Ok(account),
-        identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => {
+        identity::IdentityReply::Accounts(_)
+        | identity::IdentityReply::Resolved(_)
+        | identity::IdentityReply::Gen(_) => {
             Err("the identity module returned the wrong reply".to_string())
         }
     }

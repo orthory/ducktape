@@ -613,7 +613,11 @@ async fn caller_account(
                 "gateway caller key belongs to no Identity account".into(),
             ));
         }
-        Ok(identity::IdentityReply::Accounts(_)) | Ok(identity::IdentityReply::Gen(_)) => {
+        Ok(
+            identity::IdentityReply::Accounts(_)
+            | identity::IdentityReply::Resolved(_)
+            | identity::IdentityReply::Gen(_),
+        ) => {
             return Err(GatewayFailure::Unavailable(
                 "unexpected Identity caller reply".into(),
             ));
@@ -677,7 +681,11 @@ async fn revalidate_route_authority(
                 "gateway route account no longer exists".into(),
             ));
         }
-        Ok(identity::IdentityReply::Accounts(_)) | Ok(identity::IdentityReply::Gen(_)) => {
+        Ok(
+            identity::IdentityReply::Accounts(_)
+            | identity::IdentityReply::Resolved(_)
+            | identity::IdentityReply::Gen(_),
+        ) => {
             return Err(GatewayFailure::Unavailable(
                 "unexpected Identity route-authority reply".into(),
             ));

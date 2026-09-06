@@ -413,8 +413,8 @@ pub struct RunsModule {
     /// production composer wires it; unwired (dev tools/tests) the envelope
     /// still composes v1, with a null pin.
     files: Option<ModuleId>,
-    /// the pages module id — queried for `[[page:<id>]]` refs so a run's
-    /// context can carry referenced page subtrees (M2). genesis config, NOT
+    /// the pages module id — queried for `duck://page/<id>` refs so a run's
+    /// context can carry referenced page subtrees. genesis config, NOT
     /// committed state (never in `root()`). `None` on nodes not wired for
     /// pages; page refs then compose no page section (a silent skip, never
     /// a failure).
@@ -579,9 +579,9 @@ impl RunsModule {
         self
     }
 
-    /// wire the pages module so `[[page:<id>]]` refs in a run's trigger
+    /// wire the pages module so `duck://page/<id>` refs in a run's trigger
     /// message or injected item body render referenced page subtrees into the
-    /// composed context (M2), after construction — mirrors the injected
+    /// composed context, after construction — mirrors the injected
     /// `Option<ModuleId>` collaborators so `new` and every existing call site
     /// stay untouched. unwired, page refs compose no page section.
     pub fn with_pages_module(mut self, pages: impl Into<ModuleId>) -> Self {

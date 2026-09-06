@@ -43,7 +43,7 @@ tasks = { path = "../tasks", default-features = false }
 files = { path = "../files", default-features = false }
 base64 = { workspace = true }
 # the pages wire types (paged PageQuery::GetPage / PageReply / Block) the
-# injector queries for `[[page:<id>]]` refs (M2). a normal prod-safe dep — pages pulls
+# injector queries for `duck://page/<id>` refs. a normal prod-safe dep — pages pulls
 # only commonware-storage (no libgit2), which chat/tasks already pull.
 # default-features = false for the wasm32 graph, same as chat/tasks above.
 pages = { path = "../pages", default-features = false }

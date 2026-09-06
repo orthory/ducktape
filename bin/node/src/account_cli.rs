@@ -867,7 +867,7 @@ fn query_identity(
 fn account_reply(reply: IdentityReply) -> Result<Option<AccountView>, Box<dyn std::error::Error>> {
     match reply {
         IdentityReply::Account(account) => Ok(account),
-        IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+        IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
             Err(format!("unexpected identity reply: {reply:?}").into())
         }
     }
@@ -876,7 +876,7 @@ fn account_reply(reply: IdentityReply) -> Result<Option<AccountView>, Box<dyn st
 fn accounts_reply(reply: IdentityReply) -> Result<Vec<AccountView>, Box<dyn std::error::Error>> {
     match reply {
         IdentityReply::Accounts(accounts) => Ok(accounts),
-        IdentityReply::Account(_) | IdentityReply::Gen(_) => {
+        IdentityReply::Account(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
             Err(format!("unexpected identity reply: {reply:?}").into())
         }
     }
@@ -885,7 +885,7 @@ fn accounts_reply(reply: IdentityReply) -> Result<Vec<AccountView>, Box<dyn std:
 fn gen_reply(reply: IdentityReply) -> Result<u64, Box<dyn std::error::Error>> {
     match reply {
         IdentityReply::Gen(generation) => Ok(generation),
-        IdentityReply::Account(_) | IdentityReply::Accounts(_) => {
+        IdentityReply::Account(_) | IdentityReply::Accounts(_) | IdentityReply::Resolved(_) => {
             Err(format!("unexpected identity reply: {reply:?}").into())
         }
     }

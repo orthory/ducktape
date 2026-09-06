@@ -112,6 +112,9 @@ impl Module for IdentityStub {
                 IdentityReply::Gen(u64::from(self.by_key.contains_key(&key)))
             }
             IdentityQuery::Controlled { .. } => IdentityReply::Accounts(Vec::new()),
+            IdentityQuery::Resolve { .. } => {
+                return Err(Error::Module("unexpected bulk identity query".into()));
+            }
         };
         Ok(identity_encode_reply(&reply))
     }

@@ -211,7 +211,7 @@ pub(crate) fn render_pages_section(
     )
 }
 
-/// one page: a `[[page:<id>]] — <title>` header line, then every block of the
+/// one page: a Markdown page-link header line, then every block of the
 /// preorder subtree as one markdown line (nesting indents by tree depth; the
 /// parent of any block precedes it in preorder, so depth resolves in one
 /// pass). an unresolvable page is its one-line marker.
@@ -219,8 +219,8 @@ fn render_page(page_id: &str, blocks: Option<&[Block]>, net_query: &str) -> Stri
     let Some((root, rest)) = blocks.and_then(|b| b.split_first()) else {
         return format!("[page {page_id} — not found]");
     };
-    // the header IS the live ref: an agent echoing it produces a working chip
-    // (the retired `[[page:]]` syntax would not).
+    // the header IS the live ref: an agent echoing it produces a working chip.
+    // The reference preserves the page id and network binding.
     //
     // it names its network in `?net=` like every other link the product mints
     // — the module reads the chain id out of its genesis `__config` record
@@ -707,7 +707,7 @@ mod tests {
         assert_eq!(a.as_bytes(), b.as_bytes());
     }
 
-    // ---- `[[page:<id>]]` page-spec injection (M2) -----------------------------
+    // ---- `duck://page/<id>` page-spec injection -----------------------------
 
     /// a page block with derived-by-the-module fields filled in by hand.
     fn block(id: &str, parent: Option<&str>, kind: BlockKind, text: &str) -> Block {

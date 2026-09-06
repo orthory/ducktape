@@ -50,7 +50,7 @@ fn account(cluster: &Cluster, idx: usize, number: u64) -> Option<AccountView> {
     )?;
     match decode_reply(&reply).ok()? {
         IdentityReply::Account(a) => a,
-        IdentityReply::Accounts(_) | IdentityReply::Gen(_) => None,
+        IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => None,
     }
 }
 

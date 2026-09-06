@@ -382,7 +382,7 @@ fn a_pr_whose_source_is_dev_yields_a_work_branch_the_run_owns() {
     );
 }
 
-// ---- `[[page:<id>]]` page-spec injection (M2) ---------------------------------
+// ---- `duck://page/<id>` page-spec injection ---------------------------------
 
 #[test]
 fn page_reads_follow_every_cursor_until_the_page_is_complete() {

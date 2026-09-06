@@ -16,7 +16,7 @@ const MODULE_ID: &str = "runs";
 /// surface, saga the dead-letter origin, attribution the source-report plane,
 /// dispatch the recipe and call ledger, agent the program executor, tasks/jobs the
 /// action and board lanes, files the envelope's source-snapshot pin, forge
-/// the PR/merge sink target, pages the `[[page:]]` context + effects lane.
+/// the PR/merge sink target, pages the `duck://page/` context + effects lane.
 const CHAT_ID: &str = "chat";
 const SAGA_ID: &str = "saga";
 const ATTRIBUTION_ID: &str = "attribution";
@@ -29,7 +29,7 @@ const FILES_ID: &str = "files";
 const FORGE_ID: &str = "forge";
 const PAGES_ID: &str = "pages";
 
-/// reserved host-store key for the delivered-runs ring — the derived
+/// reserved host-store key for the recent-run ring — the derived
 /// observability state the native module keeps OUTSIDE its canonical
 /// snapshot, persisted here so it survives the per-dispatch re-instantiation
 /// (see the crate doc). written on every clean execute, exactly like
@@ -69,7 +69,7 @@ fn loaded_module() -> Result<RunsModule, host::Error> {
             .map_err(|e| host::Error::Rejected(format!("runs state reload: {e}")))?;
     }
     // AFTER install (which clears the in-memory ring): adopt the persisted
-    // delivered-runs ring. absent means the module never persisted — the
+    // recent-run ring. absent means the module never persisted — the
     // genesis-empty ring install left behind.
     if let Some(bytes) = host::state_get(HISTORY_KEY) {
         module
@@ -119,7 +119,7 @@ impl Guest for Component {
         ))
         .map_err(to_wit_error)?;
         // fully apply per dispatch: publish the inner per-op staging, then
-        // persist the canonical snapshot — and the delivered-runs ring, under
+        // persist the canonical snapshot — and the recent-run ring, under
         // its own key — as OUTER staged writes. the host owns the real
         // commit/abort boundary (see the crate doc), so an aborted block
         // discards the ring append exactly like the native `abort_block`.

@@ -333,10 +333,10 @@ impl RunsModule {
                 .await?
             }
         };
-        // M2: `[[page:<id>]]` refs in the trigger message text or the injected
+        // `duck://page/<id>` refs in the trigger message text or the injected
         // item body render referenced page subtrees into the same context
         // section — resolved from COMMITTED pages state at compose height,
-        // appended after the M1 item context (which stays untouched).
+        // appended after the referenced item context.
         let anchor_text = transcript
             .last()
             .map(inject::message_text)

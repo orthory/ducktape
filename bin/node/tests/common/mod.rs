@@ -2389,7 +2389,9 @@ pub fn account_of_key(cluster: &Cluster, idx: usize, key: &[u8]) -> Option<ident
     )?;
     match identity::decode_reply(&bytes).ok()? {
         identity::IdentityReply::Account(account) => account,
-        identity::IdentityReply::Accounts(_) | identity::IdentityReply::Gen(_) => None,
+        identity::IdentityReply::Accounts(_)
+        | identity::IdentityReply::Resolved(_)
+        | identity::IdentityReply::Gen(_) => None,
     }
 }
 
@@ -2403,7 +2405,9 @@ pub fn key_gen(cluster: &Cluster, idx: usize, key: &[u8]) -> Option<u64> {
     )?;
     match identity::decode_reply(&bytes).ok()? {
         identity::IdentityReply::Gen(generation) => Some(generation),
-        identity::IdentityReply::Account(_) | identity::IdentityReply::Accounts(_) => None,
+        identity::IdentityReply::Account(_)
+        | identity::IdentityReply::Accounts(_)
+        | identity::IdentityReply::Resolved(_) => None,
     }
 }
 

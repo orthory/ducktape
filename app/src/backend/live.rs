@@ -1948,7 +1948,7 @@ pub async fn open_dm(
             .await?;
         let mine = match reply {
             IdentityReply::Account(account) => account,
-            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };
@@ -1964,7 +1964,7 @@ pub async fn open_dm(
             .await?;
         let account = match reply {
             IdentityReply::Account(account) => account,
-            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
                 return Err("the identity module returned the wrong reply".to_string());
             }
         };

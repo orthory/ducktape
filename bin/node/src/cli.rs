@@ -1019,7 +1019,7 @@ fn account_of_key(addr: &str, key: &[u8]) -> Result<Option<u64>, String> {
     )?;
     match decode_reply(&raw)? {
         IdentityReply::Account(account) => Ok(account.map(|account| account.number)),
-        IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+        IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
             Err("expected an Account reply from identity".into())
         }
     }
