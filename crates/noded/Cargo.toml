@@ -25,6 +25,7 @@ testkit = ["dep:nettest"]
 verify = ["provider-host/verify"]
 
 [dependencies]
+module-artifact = { workspace = true }
 # the shared raw-http/port/poll test client — only pulled by the `testkit`
 # feature (the in-proc daemon's readiness probe), never in a normal build.
 nettest = { path = "../testing/nettest", optional = true }
@@ -34,10 +35,8 @@ bytes = "1"
 statesync = { workspace = true }
 host = { workspace = true }
 sdk = { workspace = true }
-# the ONE module composer (`src/compose.rs`): the topology names each module's
-# shape, wasm-host wraps the component over its backing, and the three native
-# system modules (valset/modules/kv) plus the two odb substrates (files/forge)
-# are the only constructors it calls by name.
+# The composer loads every deployment through wasm-host. Module crates also
+# supply wire types and host-side services; files/forge provide ODB substrates.
 topology = { workspace = true }
 wasm-host = { workspace = true }
 valset = { workspace = true }

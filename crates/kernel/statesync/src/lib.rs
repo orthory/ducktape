@@ -284,6 +284,7 @@ pub struct FinalizedFrame {
 pub struct ManifestEntry {
     pub module_id: ModuleId,
     pub root: StateRoot,
+    pub code_hash: Option<Vec<u8>>,
     pub kind: PayloadKind,
     pub resolver_target: Option<ResolverTarget>,
 }
@@ -771,6 +772,13 @@ pub fn encode_response(resp: &SyncResponse) -> Vec<u8> {
             for e in &m.entries {
                 wire::put_str(&mut out, &e.module_id);
                 out.extend_from_slice(e.root.as_bytes());
+                match &e.code_hash {
+                    Some(hash) => {
+                        out.push(1);
+                        wire::put_bytes(&mut out, hash);
+                    }
+                    None => out.push(0),
+                }
                 out.push(e.kind.to_u8());
                 match &e.resolver_target {
                     Some(target) => {
@@ -1018,6 +1026,20 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
             for _ in 0..n {
                 let module_id = wire::take_str(&mut buf)?;
                 let root = StateRoot(wire::take_array::<ROOT_LEN>(&mut buf)?);
+                let code_hash = match wire::take_u8(&mut buf)? {
+                    0 => None,
+                    1 => {
+                        let hash = wire::take_bytes(&mut buf)?;
+                        let valid_hash = hash.len() == ROOT_LEN;
+                        if !valid_hash {
+                            return Err(WireError::Codec(
+                                "module code hash must be 32 bytes".into(),
+                            ));
+                        }
+                        Some(hash.to_vec())
+                    }
+                    t => return Err(WireError::BadTag("module code hash", t)),
+                };
                 let kind = PayloadKind::from_u8(wire::take_u8(&mut buf)?)?;
                 let resolver_target = match wire::take_u8(&mut buf)? {
                     0 => None,
@@ -1036,6 +1058,7 @@ pub fn decode_response(bytes: &[u8]) -> Result<SyncResponse, WireError> {
                 entries.push(ManifestEntry {
                     module_id,
                     root,
+                    code_hash,
                     kind,
                     resolver_target,
                 });
@@ -1396,6 +1419,7 @@ impl CapturedPayload {
 #[derive(Debug, Clone)]
 struct CapturedModule {
     root: StateRoot,
+    code_hash: Option<Vec<u8>>,
     payload: CapturedPayload,
 }
 
@@ -1492,6 +1516,7 @@ pub async fn capture_boundary(
             m.id,
             CapturedModule {
                 root: m.root,
+                code_hash: m.code_hash,
                 payload,
             },
         );
@@ -1506,6 +1531,7 @@ pub async fn capture_boundary(
             m.id,
             CapturedModule {
                 root: m.root,
+                code_hash: m.code_hash,
                 payload: CapturedPayload::Unsupported,
             },
         );
@@ -1649,6 +1675,7 @@ impl SyncServer {
                 .map(|(id, m)| ManifestEntry {
                     module_id: id.clone(),
                     root: m.root,
+                    code_hash: m.code_hash.clone(),
                     kind: m.payload.kind(),
                     resolver_target: match &m.payload {
                         CapturedPayload::Resolver(target) => Some(target.clone()),
@@ -2509,6 +2536,7 @@ mod tests {
                 floor_cert: Some(vec![0xCC; 96]),
                 entries: vec![
                     ManifestEntry {
+                        code_hash: None,
                         module_id: "kv".into(),
                         root: StateRoot([1u8; ROOT_LEN]),
                         kind: PayloadKind::Resolver,
@@ -2519,6 +2547,7 @@ mod tests {
                         }),
                     },
                     ManifestEntry {
+                        code_hash: None,
                         module_id: "valset".into(),
                         root: StateRoot([2u8; ROOT_LEN]),
                         kind: PayloadKind::Snapshot,

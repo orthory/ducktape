@@ -5,7 +5,7 @@ How to write, build, and live-update a Ducktape wasm module. The runtime is
 the `ducktape:module` WIT world (`crates/module-sdk/wit/module.wit`, inside the
 module SDK a module pins by git revision, `crates/module-sdk`);
 the reference modules are `crates/guests/noop-wasm` (the smallest compliant
-module: three exports over the raw WIT world, no state, every op a no-op — the
+module: five exports over the raw WIT world, no state, every op a no-op — the
 floor a module must meet and the admission fixture that touches nothing; a new
 module starts from the SDK instead, see "Out-of-tree modules" below),
 `crates/guests/hello-wasm` (a counter over host-owned state),
@@ -20,8 +20,8 @@ no component: `node init` composes every wasm tenant's `<id>.component.wasm`
 and every declared `<id>.index.wasm` out of the founding set (`--modules <dir>`,
 default `$DUCKTAPE_MODULES_DIR`, else the `modules/` dir noded's build script
 stages beside the binary) into the workspace `genesis` file, and pins that file
-and every component in the network descriptor. A node hydrates its blob store
-and index from the file at boot; a joiner takes it at `join --genesis` or
+and every deployment in the network descriptor. A node hydrates its blob store
+from the file and installs the running deployments' mappers at boot; a joiner takes it at `join --genesis` or
 fetches it off the mesh.
 
 ## The model (design-B: host-owned state, guest as pure logic)
@@ -32,9 +32,9 @@ call — so all durable state lives host-side, behind the `host.state-*`
 capability, staged during `execute` and published only at the block-commit
 boundary. Consequences you design around:
 
-- `root()` is host-computed from the host-owned store, never by the guest. A
-  code swap keeps the store, so the module's root — and with it the root-hash —
-  is byte-identical across the swap. **That is the live-update primitive.**
+- `root()` is host-computed from the host-owned store. A code swap preserves
+  that state root. The global root binds each module's state root and deployment
+  hash together, authenticating both its state and the code needed to reopen it.
 - Never cache anything in guest globals/statics expecting it to survive: it
   will not. Read what you need via `state-get`, write via `state-set`.
 - Determinism is by construction: fresh instance per dispatch, fuel-metered
@@ -48,7 +48,7 @@ boundary. Consequences you design around:
 
 ## The contract
 
-Implement the three exports:
+Implement the five exports:
 
 - `shape() -> module-shape` — what the host must know to run this component:
   the `backing` its committed state lives on (`map`: a host-owned key/value
@@ -70,6 +70,21 @@ Implement the three exports:
 - `query(req) -> result<list<u8>, error>` — a read-only projection over LIVE
   state (the staged overlay on committed — the same read-your-writes surface a
   native module's query serves; out of block the overlay is empty).
+
+- `initialize(params) -> result<_, error>` — initialize a fresh module with
+  network parameters. The host calls this after seeding declared configuration,
+  both for genesis entries and for live admissions. Reopen and code replacement
+  retain state and do not initialize again. At genesis, parameters include the
+  `modules` deployment map and `validators` keys; other modules may ignore them.
+- `finalize-block() -> result<_, error>` — finish the block over its accumulated
+  staged writes. The SDK's store wrapper flushes individual operations without
+  publishing the outer block, then invokes `Module::commit_block` here. Valset
+  uses this to advance its generation once for a net membership change.
+
+Lifecycle calls may update own state but cannot emit messages, events, or
+assignments, and cannot read siblings. `state-get-committed` reads before the
+outer block's staged writes; `state-get` includes them. The registry uses the
+committed lane for activation while its status queries expose staged changes.
 
 And use the imports deliberately: `get-env` for the deterministic block env
 (`height`, `consensus-time`, `origin`, `me`); `state-*` for
@@ -128,7 +143,7 @@ default, so push first — and never out of the checkout in place: it synthesize
 a shell workspace under `target/guest-builder/<id>/` whose one dependency is
 the module (its `guest` feature on) as a git source, pins the revision in the
 shell lock, builds for `wasm32-unknown-unknown`, componentizes with
-`wasm-tools`, and writes `component.wasm` and `guest.lock` into the module
+`wasm-tools` at the version pinned in `wasm-tools.version`, and writes `component.wasm` and `guest.lock` into the module
 directory. The lock is the record of the build (the revision, every registry
 version) and the seed of the next one. Uncommitted inputs in the module,
 its resolved SDK and sibling packages, or workspace build configuration are
@@ -164,7 +179,7 @@ commits it as one change.
 
 The committed copies of one module's component MUST stay byte-identical
 (nothing is embedded: the founder bundles the canonical artifact and the
-descriptor commits its sha256 as the genesis-seeded active hash; the kernel
+descriptor commits the component-plus-mapper deployment hash; the kernel
 test fixtures — the node pins' bundle — carry the same bytes).
 `wasm-modules-check` gates that and rides the pre-push `make test` gate;
 `wasm-rebuild-check` gates the artifact against its source and needs the wasm32
@@ -213,30 +228,39 @@ component.wasm`; the network verifies the bytes by hash.
 
 ## Live update: how new code ships
 
-The consensus commitment to WHICH code a module runs is the code registry
-(`crates/modules/system/modules`): per module, the active 32-byte sha256 of its component
-bytes plus at most one pending height-gated swap. The BYTES travel out-of-band,
-content-addressed on the node blob plane. The flow:
+Each deployment is a canonical Borsh `ModuleArtifact`: component bytes followed
+by an optional mapper (`Vec<u8>`, `Option<Vec<u8>>`). Its SHA-256 covers both.
+The CLI packages the raw files, stages this unit on the blob plane, and proposes
+that hash to governance:
 
-1. Build the new component; note `sha256(component.wasm)`.
-2. Stage the bytes on the blob plane so every node holds them before the
-   boundary (a node lacking the bytes at the boundary FAILS CLOSED — it stops
-   rather than forks — so distribute first, then schedule).
-3. Drive governance: `GovAction::UpdateModule { name, module_id,
-   activation_height, code_hash }` — a member-gated proposal + majority tally;
-   on passing it emits `ModulesMsg::ScheduleSwap` into the registry. Cancel before
-   the boundary with `GovAction::CancelModuleUpdate`.
-4. At the first applied block at/after `activation_height`, two things happen
-   on every node: the drain's injected registry `Advance` flips the committed
-   active hash (in the root-hash), and the host's out-of-block realization
-   (`Host::realize_module_swaps`) verifies `sha256(bytes) == hash` and swaps
-   the running component, keeping the host-owned state.
+```
+ducktape module register pages pages.component.wasm --index pages.index.wasm
+ducktape module update pages pages.component.wasm --index pages.index.wasm
+```
 
-The realization is keyed purely on committed registry state + height, so the
-live drain, restart replay, and state-sync catch-up all land the identical swap
-points — and a state-sync joiner that installs post-activation state reconciles
-its genesis component to the committed ACTIVE hash before applying its first
-block.
+Omitting `--index` means the deployment has no mapper, including when updating
+an existing module. Mapper-only changes still require a deployment proposal.
+The `modules` and `valset` registries use these same commands and activation
+rules; their presence at genesis grants no special code-loading path.
+
+Validators verify the deployment hash, compile the component, check its shape,
+and validate its mapper before signaling readiness. At the armed activation
+height, the host prepares every replacement before applying any of them. The
+component retains host-owned state, and the registry's injected `Advance`
+records the activation. An unavailable or invalid deployment stalls that
+boundary without partially replacing the running roster.
+
+The index converges to the running deployment before folding the block. A
+changed mapper clears its derived rows and refolds the retained op feed;
+removing it clears its derived rows and disables its view. Readers wait through
+replacement and refold. A mapper that cannot fold its feed reports a stuck fold
+through index status; the derived tier remains outside consensus.
+
+Checkpoint and state-sync manifests carry each module's deployment hash,
+including the registry's. The global root authenticates those hashes alongside
+state roots. Recovery loads that code directly, then reconciles each replay
+height against the registry's activation history. The genesis file supplies
+initial deployments and remains unchanged by later updates.
 
 ## Testing a module
 

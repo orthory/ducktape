@@ -293,7 +293,7 @@ fn init_writes_module_hashes_and_the_genesis() {
         "the descriptor pins the whole file"
     );
     let genesis = workspace_config::Genesis::decode(&bytes).expect("decodes");
-    let hashes = genesis.component_hashes();
+    let hashes = genesis.module_hashes();
     for m in &d.modules {
         assert_eq!(
             workspace_config::hex_bytes(&hashes[&m.id]),
@@ -305,7 +305,12 @@ fn init_writes_module_hashes_and_the_genesis() {
     // the index guests are exactly the `<id>.index.wasm` files the founding
     // set holds for the genesis set: the build stages one iff the module's
     // crate declares a guest, so presence is the declaration.
-    let guests: Vec<&str> = genesis.index_guests.iter().map(|a| a.id.as_str()).collect();
+    let guests: Vec<&str> = genesis
+        .modules
+        .iter()
+        .filter(|a| genesis.index_guest(&a.id).is_some())
+        .map(|a| a.id.as_str())
+        .collect();
     let founding_set = std::path::Path::new(common::founding_set());
     let mut want: Vec<&str> = topology::TOPOLOGY
         .wasm_ids(topology::PRODUCTION)
@@ -357,13 +362,18 @@ fn init_accepts_a_module_absent_from_the_binary_catalog() {
     let genesis = workspace_config::Genesis::load(&workspace.join("genesis")).unwrap();
     assert_eq!(
         genesis
-            .components
+            .modules
             .iter()
             .map(|a| a.id.as_str())
             .collect::<Vec<_>>(),
         ["directory"]
     );
-    assert!(genesis.index_guests.is_empty());
+    assert!(
+        genesis
+            .modules
+            .iter()
+            .all(|a| genesis.index_guest(&a.id).is_none())
+    );
 }
 
 /// with no `--modules` and no `$DUCKTAPE_MODULES_DIR`, `init` founds from the
@@ -382,7 +392,7 @@ fn init_founds_from_the_set_the_build_staged_beside_the_binary() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let genesis = workspace_config::Genesis::load(&ws.join("genesis")).expect("the genesis file");
-    let ids: Vec<&str> = genesis.components.iter().map(|a| a.id.as_str()).collect();
+    let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
     want.sort_unstable();
     assert_eq!(ids, want);

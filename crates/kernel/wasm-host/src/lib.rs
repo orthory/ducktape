@@ -44,6 +44,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use module_artifact::ModuleArtifact;
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
@@ -768,6 +769,7 @@ pub struct CompiledModule {
     linker: Linker<HostData>,
     component: Component,
     code_hash: Vec<u8>,
+    index_guest: Option<Vec<u8>>,
     shape: Shape,
 }
 
@@ -791,9 +793,22 @@ impl CompiledModule {
             engine,
             linker,
             component,
-            code_hash: sha256(component_bytes),
+            code_hash: ModuleArtifact::component(component_bytes.to_vec())
+                .hash()
+                .to_vec(),
+            index_guest: None,
             shape,
         })
+    }
+
+    /// Compile one deployment. Its code identity commits both the consensus
+    /// component and the mapper; there is no raw-component wire fallback.
+    pub fn compile_artifact(bytes: &[u8]) -> Result<Self, SdkError> {
+        let artifact = ModuleArtifact::decode(bytes).map_err(SdkError::Module)?;
+        let mut compiled = Self::compile(&artifact.component)?;
+        compiled.code_hash = sha256(bytes);
+        compiled.index_guest = artifact.index;
+        Ok(compiled)
     }
 
     /// what the bytes declare about themselves.
@@ -892,10 +907,11 @@ pub struct WasmModule {
     engine: Engine,
     linker: Linker<HostData>,
     component: Component,
-    /// sha256 of the component bytes currently loaded — the CODE identity the
+    /// SHA-256 of the complete deployment currently loaded — the identity the
     /// host reconciles against the registry's committed active hash. NOT part of
-    /// `root()` (code is invisible to the root-hash); per-node realization only.
+    /// state root. The host binds both identities into its global root.
     code_hash: Vec<u8>,
+    index_guest: Option<Vec<u8>>,
     backing: StateBacking,
     /// the [`sdk::genesis_config`]-encoded `__config` bytes an odb-backed
     /// tenant reads through the state lane, beside [`REFS_KEY`] — `None` for
@@ -927,7 +943,7 @@ pub struct WasmModule {
     /// durable-height into its refs envelope (the recovery bookkeeping the native
     /// module records atomically with the refs). `None` between blocks / when no
     /// dispatch has run this block.
-    block_height: Option<u64>,
+    block_env: Option<WitEnv>,
 }
 
 impl WasmModule {
@@ -950,13 +966,14 @@ impl WasmModule {
             linker: compiled.linker,
             component: compiled.component,
             code_hash: compiled.code_hash,
+            index_guest: compiled.index_guest,
             backing,
             odb_config,
             staged: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
             committed_queries: compiled.shape.committed_queries,
-            block_height: None,
+            block_env: None,
         })
     }
 
@@ -992,7 +1009,7 @@ impl WasmModule {
     /// sync is the store's resolver lane. this is the STORE-BACKED port shape:
     /// a native module written over `Box<dyn MerkleStore>` compiles into the
     /// guest and drives the very same store through the wit `state-*` imports,
-    /// so the cutover is root-continuous. for a component declaring
+    /// so the cutover preserves the module state root. for a component declaring
     /// [`Backing::Store`].
     pub fn with_store(
         id: impl Into<ModuleId>,
@@ -1151,12 +1168,14 @@ impl WasmModule {
     }
 
     fn lifecycle_env(&self) -> WitEnv {
-        WitEnv {
-            height: self.block_height.unwrap_or(0),
+        let mut env = self.block_env.clone().unwrap_or_else(|| WitEnv {
+            height: 0,
             consensus_time: 0,
             me: self.id.clone(),
             origin: WitOrigin::System,
-        }
+        });
+        env.origin = WitOrigin::System;
+        env
     }
 
     async fn run_mutation(
@@ -1168,7 +1187,7 @@ impl WasmModule {
         // capture the block height for the boundary: an Odb backing stamps it into
         // its durable-height envelope at commit. every dispatch this block carries
         // the same height, so re-setting it per dispatch is idempotent.
-        self.block_height = Some(env.height);
+        self.block_env = Some(env.clone());
         // every replay round re-runs the pure guest over the SAME pre-dispatch
         // stage: an aborted round's writes must not leak into the next, or a
         // replay could observe (e.g. double-apply) its own discarded effects.
@@ -1325,7 +1344,7 @@ impl WasmModule {
         // `0` only if no dispatch ran this block — impossible for a touched (=
         // committing) module, and inert regardless (nothing staged → the Odb arm
         // never reaches `adopt_refs`, so the height is never persisted).
-        let height = self.block_height.take().unwrap_or(0);
+        let height = self.block_env.take().map_or(0, |env| env.height);
         match &mut self.backing {
             StateBacking::Map { committed } => {
                 // Map/Store guests never stage objects; drop any (there are none)
@@ -1685,7 +1704,7 @@ impl Module for WasmModule {
 
     /// map mode: sha256 over the canonical host-KV encoding. store mode: the
     /// injected store's REAL merkle root, verbatim — the same value the native
-    /// module computed pre-cutover, so the root-hash is continuous.
+    /// module computed pre-cutover, so its state root is preserved.
     fn root(&self) -> StateRoot {
         match &self.backing {
             StateBacking::Map { committed } => Self::root_of(committed),
@@ -1699,6 +1718,10 @@ impl Module for WasmModule {
 
     fn code_hash(&self) -> Option<Vec<u8>> {
         Some(self.code_hash.clone())
+    }
+
+    fn index_guest(&self) -> Option<&[u8]> {
+        self.index_guest.as_deref()
     }
 
     /// the disk cohort by BACKING KIND, which is the only honest source for it:
@@ -1779,25 +1802,20 @@ impl Module for WasmModule {
         }
     }
 
-    /// Replace the component code IN PLACE, keeping the host-owned state store.
-    /// This is the live-update primitive: same store, new logic, and the root is
-    /// computed from the (untouched) store — so root-hash is continuous across the
-    /// swap. Staged (yet uncommitted) writes are discarded: a swap is only ever
-    /// driven at a clean block boundary, never mid-block. the replacement must
-    /// declare the backing the store IS — the state layout is the code-swap
-    /// contract, and a component wanting another substrate cannot keep this
-    /// state — while its committed-query mode is taken as it declares.
-    fn swap_code(&mut self, component_bytes: &[u8]) -> Result<(), SdkError> {
-        let compiled = CompiledModule::compile(component_bytes)?;
+    fn prepare_swap(&mut self, artifact_bytes: &[u8]) -> Result<Box<dyn FnOnce() + '_>, SdkError> {
+        let compiled = CompiledModule::compile_artifact(artifact_bytes)?;
         Self::require_declared_backing(&self.id, &compiled.shape, self.backing.kind())?;
-        self.engine = compiled.engine;
-        self.linker = compiled.linker;
-        self.component = compiled.component;
-        self.code_hash = compiled.code_hash;
-        self.committed_queries = compiled.shape.committed_queries;
-        self.staged.clear();
-        self.staged_objects.clear();
-        Ok(())
+        Ok(Box::new(move || {
+            self.engine = compiled.engine;
+            self.linker = compiled.linker;
+            self.component = compiled.component;
+            self.code_hash = compiled.code_hash;
+            self.index_guest = compiled.index_guest;
+            self.committed_queries = compiled.shape.committed_queries;
+            self.staged.clear();
+            self.staged_objects.clear();
+            self.block_env = None;
+        }))
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), SdkError> {
@@ -1898,7 +1916,7 @@ impl Module for WasmModule {
         // discard this block's staged object puts alongside the state stage.
         self.staged_objects.clear();
         // the aborted block's captured height is void — the next block recaptures.
-        self.block_height = None;
+        self.block_env = None;
         // tell an odb backing to drop any block-local pending too (native
         // `Fs::abort_block`; a disk backing may sweep orphan object files). in
         // the fatal-or-complete commit model the backing has no pending here

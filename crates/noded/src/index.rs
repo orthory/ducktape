@@ -3,7 +3,6 @@
 //! daemon that runs no network), boundary stamping, and the `/v1/index/*` +
 //! `/v1/blocks` snapshot read lane.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::Json;
@@ -25,64 +24,9 @@ const BLOCKS_DEFAULT_LIMIT: usize = 256;
 // passing its own genesis module list.
 // ---------------------------------------------------------------------------
 
-/// the index guests a node installs: id → mapper bytes for every module that
-/// ships one. Each module's fluentabi mapper is built by `guest-builder
-/// --index` and committed beside its crate (`make wasm-modules` refreshes the
-/// set); the build stages it into the founding set as `<id>.index.wasm` iff
-/// the crate declares the guest (`src/index_guest.rs`), and a network's
-/// genesis carries the set its founder built, so every node on that network
-/// folds with the same mapper. the artifact's presence IS the declaration:
-/// a module with no `<id>.index.wasm` ships no guest, and a database with
-/// no guest serves a bare feed.
-pub struct IndexGuests(BTreeMap<String, Vec<u8>>);
-
-impl IndexGuests {
-    /// the guests a founding set holds for `module_ids` — the daemons that
-    /// run no network (noded, simnode, the dev shape) install from here. an
-    /// absent file is a module that ships no guest; any other read failure
-    /// names its path.
-    pub fn from_dir<S: AsRef<str>>(dir: &std::path::Path, module_ids: &[S]) -> Result<Self, String> {
-        let mut guests = BTreeMap::new();
-        for id in module_ids {
-            let id = id.as_ref();
-            let path = workspace_config::index_guest_path(dir, id);
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    guests.insert(id.to_string(), bytes);
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(format!(
-                        "module {id}: {} is unreadable: {err} \
-                         (run `make wasm-modules`, or `cargo build` to stage the founding set)",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        Ok(Self(guests))
-    }
-
-    /// the guests a genesis carries — a node on a network installs from its
-    /// workspace genesis, never from a directory.
-    pub fn from_genesis(genesis: &workspace_config::Genesis) -> Self {
-        Self(
-            genesis
-                .index_guests
-                .iter()
-                .map(|a| (a.id.clone(), a.bytes.clone()))
-                .collect(),
-        )
-    }
-
-    fn get(&self, id: &str) -> Option<&[u8]> {
-        self.0.get(id).map(Vec::as_slice)
-    }
-}
-
 /// open the per-module index store under `<storage>/index`, deciding nothing
 /// about guests yet: each database keeps serving the guest its last converge
-/// installed until [`converge_index_guests`] runs. The split is what lets a
+/// installed until [`converge_host_modules`] runs. The split is what lets a
 /// node bring its index routes up before it holds a genesis (a joiner
 /// fetches its genesis off the mesh after the surfaces start). an open
 /// failure is fatal-with-remedy for the caller: the tier is rebuildable, so
@@ -103,27 +47,18 @@ pub fn open_index_store<S: AsRef<str>>(
         })
 }
 
-/// converge every module's database onto its guest in `guests` (or onto no
-/// guest, for a module that ships none): the install half of
-/// [`open_index_store`], run once the guests are known.
-pub fn converge_index_guests(
-    index: &indexer::IndexStore,
-    guests: &IndexGuests,
-) -> Result<(), String> {
-    let ids = index.module_ids();
-    let modules: Vec<indexer::IndexModule> = ids
-        .iter()
-        .map(|id| indexer::IndexModule {
-            id,
-            guest: guests.get(id),
-        })
+/// Install the mapper belonging to each running deployment. Called after
+/// composition and before a sealed block reaches the derived tier, so genesis,
+/// live admission, code replacement and recovery all use the same path.
+pub fn converge_host_modules(index: &indexer::IndexStore, host: &host::Host) -> Result<(), String> {
+    let modules: Vec<indexer::IndexModule<'_>> = host
+        .module_index_guests()
+        .map(|(id, guest)| indexer::IndexModule { id, guest })
         .collect();
-    index.converge(&modules).map_err(|err| {
-        format!(
-            "install index guests at {}: {err} (derived tier — delete the directory to rebuild)",
-            index.base().display()
-        )
-    })
+    index_host_modules(index, modules.iter().map(|module| module.id))?;
+    index
+        .converge(&modules)
+        .map_err(|error| format!("converge deployed index guests: {error}"))
 }
 
 /// the index covers every module the host runs: open a database for each id
@@ -131,8 +66,8 @@ pub fn converge_index_guests(
 /// after the store opened — leaving the ones it holds untouched. idempotent,
 /// and free when nothing was admitted. called after every compose and before
 /// every block fold, so an admitted module's feed begins at the block that
-/// seated it. a database opened here holds no guest (an admission ships
-/// none through the genesis) and serves a bare feed.
+/// seated it. The database opens bare; `converge_host_modules` installs the
+/// optional mapper from the running deployment before feeding that block.
 pub fn index_host_modules<'a>(
     index: &indexer::IndexStore,
     modules: impl IntoIterator<Item = &'a str>,
@@ -514,41 +449,23 @@ pub(crate) async fn index_view(
     };
     let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
     let query_module = module.clone();
-    // BEFORE the view, deliberately: the two reads take two MVCC snapshots, and
-    // the order decides which way the mismatch falls. read first and the tip
-    // can only be OLDER than the rows served — the caller waits one more round
-    // trip. read after and it can be NEWER, claiming a row this reply does not
-    // contain, which is the exact bug the tip exists to close.
-    //
-    // and ADVISORY, never a precondition: a read error here degrades to "no
-    // header", the same answer an unstamped module gives. everything about
-    // this key is best-effort (absent = unknown, a malformed value = unknown),
-    // and `IndexStore::view` promises a poisoned store still serves views —
-    // stale but consistent. failing the whole read because one bookkeeping key
-    // would not load empties the caller's sidebar over nothing. an unknown
-    // module still 404s: `store.view` below answers that.
-    //
-    // both reads run off the axum worker on `spawn_blocking`'s pool: fluent31's
-    // `query` is synchronous wasm with no `.await` inside it, so awaiting it
-    // directly here would hold this task's worker thread for the whole call.
-    let outcome = tokio::task::spawn_blocking(move || {
-        let folded = store.fold_tip(&query_module).ok().flatten();
-        let view = store.view(&query_module, &req_bytes);
-        (folded, view)
-    })
-    .await;
-    let (folded, view) = match outcome {
-        Ok(pair) => pair,
+    // The index holds a single deployment guard across watermark and view.
+    // Both synchronous engine reads run off the HTTP worker.
+    let outcome =
+        tokio::task::spawn_blocking(move || store.view_with_tip(&query_module, &req_bytes)).await;
+    let indexer::IndexedView { bytes, folded } = match outcome {
+        Ok(Ok(view)) => view,
+        Ok(Err(error)) => return index_error(error),
         Err(_) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "index view task panicked");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "index view task panicked",
+            );
         }
     };
-    let mut response = match view {
-        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(value) => Json(value).into_response(),
-            Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
-        },
-        Err(err) => index_error(err),
+    let mut response = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => Json(value).into_response(),
+        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
     };
     if let Some((height, seq)) = folded {
         // infallible on purpose: ABSENT is the one honest way to say "no tip"
@@ -657,46 +574,6 @@ pub(crate) async fn blocks(
 
 #[cfg(test)]
 mod tests {
-    /// THE WATERMARK MUST BE READ BEFORE THE VIEW. The two reads take two MVCC
-    /// snapshots, and the ORDER is the whole correctness argument: read the tip
-    /// first and it can only be older than the rows served (the caller waits
-    /// one more round trip — safe); read it after and it can be newer, vouching
-    /// for a row this very reply does not contain — which is exactly the
-    /// acceptance-vs-application bug the header exists to close.
-    ///
-    /// Pinned as a source shape because no behavioural test can see it: both
-    /// orders answer identically except in the interleaving that makes the
-    /// wrong one wrong.
-    #[test]
-    fn the_view_reads_its_fold_watermark_before_the_snapshot() {
-        const SRC: &str = include_str!("index.rs");
-        let body = SRC
-            .split("pub(crate) async fn index_view(")
-            .nth(1)
-            .expect("index_view is declared")
-            .split("\n/// ")
-            .next()
-            .expect("index_view body");
-        let tip = body
-            .find("store.fold_tip(")
-            .expect("the view reads the tip");
-        let view = body.find("store.view(").expect("the view serves the view");
-        assert!(
-            tip < view,
-            "the fold watermark must be read BEFORE the view snapshot"
-        );
-        // AND IT MUST NOT BE ABLE TO REFUSE THE READ. The tip is advisory —
-        // absent is unknown, malformed is unknown — so an engine error on it
-        // has to degrade to "no header" too. Turning it into a precondition
-        // would answer 500 to a request that could have served the rows fine,
-        // against `IndexStore::view`'s own promise that a poisoned store still
-        // serves views. Nothing between the two reads may leave the function.
-        assert!(
-            !body[tip..view].contains("return"),
-            "an unreadable fold watermark must not refuse the view"
-        );
-    }
-
     /// #1717: once `MAX_CONCURRENT_INDEX_VIEWS` callers are already "running"
     /// (holding a permit, as the wasm query would while it runs), the NEXT
     /// `index_view` call refuses with 429 rather than queuing behind them —

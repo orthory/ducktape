@@ -4612,6 +4612,7 @@ dependencies = [
  "inbox",
  "keyscheme",
  "kv",
+ "module-artifact",
  "modules",
  "p256",
  "pages",
@@ -5967,6 +5968,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "module-artifact"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "modules"
 version = "0.1.0"
 dependencies = [
@@ -6311,6 +6320,7 @@ dependencies = [
  "kv",
  "libc",
  "media-service",
+ "module-artifact",
  "modules",
  "nat-traversal",
  "nettest",
@@ -6385,6 +6395,7 @@ dependencies = [
  "keyscheme",
  "kv",
  "media-service",
+ "module-artifact",
  "modules",
  "nettest",
  "node",
@@ -10846,6 +10857,7 @@ name = "wasm-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "module-artifact",
  "sdk",
  "sdk-testkit",
  "sha2 0.10.9",
@@ -12127,6 +12139,7 @@ dependencies = [
  "ducktape-home",
  "governance",
  "identity",
+ "module-artifact",
  "nat-traversal",
  "rand 0.8.6",
  "reachability",

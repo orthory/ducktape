@@ -14,26 +14,24 @@ use crate::compose::BoxFut;
 /// beside the genesis it composes.
 pub use workspace_config::component_path;
 
-/// sha256 every `<id>.component.wasm` in `dir` for `ids`; a missing file names
+/// Hash each component plus its optional mapper in `dir`; a missing file names
 /// its path, because the operator's next move is to look at that directory.
 ///
 /// The walk is BY ID, not in the caller's selection order, so a bundle missing
 /// several components always names the same one first — the operator fixes a
 /// stable list instead of chasing a topology-order lottery one file at a time.
 pub fn hash_bundle(dir: &Path, ids: &[&str]) -> Result<BTreeMap<String, [u8; 32]>, String> {
-    use sha2::Digest as _;
     let mut ids = ids.to_vec();
     ids.sort_unstable();
     let mut out = BTreeMap::new();
     for id in &ids {
-        let path = component_path(dir, id);
-        let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        out.insert((*id).to_string(), sha2::Sha256::digest(&bytes).into());
+        let artifact = workspace_config::read_module_artifact(dir, id)?;
+        out.insert((*id).to_string(), artifact.hash());
     }
     Ok(out)
 }
 
-/// a [`host::CodeSource`] over a directory of `<id>.component.wasm`, keyed by
+/// A [`host::CodeSource`] packaging directory components and mappers, keyed by
 /// each file's sha256. a hash the directory has no file for is a `None` — the
 /// boundary fails closed, and the composer re-hashes whatever bytes come back
 /// regardless (a dir keyed by filename is a lookup, not a guarantee).
@@ -66,7 +64,9 @@ impl host::CodeSource for DirCodeSource {
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
         let digest: [u8; 32] = code_hash.try_into().ok()?;
         let id = self.by_hash.get(&digest)?;
-        std::fs::read(component_path(&self.dir, id)).ok()
+        workspace_config::read_module_artifact(&self.dir, id)
+            .ok()
+            .map(|artifact| artifact.encode())
     }
 
     fn origin(&self) -> &'static str {

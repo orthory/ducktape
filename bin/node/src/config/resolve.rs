@@ -156,7 +156,7 @@ pub struct Resolved {
 /// signed for.
 #[derive(Debug)]
 pub struct GenesisModules {
-    /// id -> sha256 of the genesis component, for every wasm tenant.
+    /// id -> sha256 of the genesis deployment, for every wasm tenant.
     pub hashes: BTreeMap<String, [u8; 32]>,
     /// where the bytes come from.
     pub source: GenesisSource,
@@ -877,7 +877,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // a typo'd `listen` must be told about the typo, not about the bundle.
     let founding_set = PathBuf::from(&raw.modules);
     let genesis = GenesisModules {
-        hashes: workspace_config::Genesis::compose(&founding_set)?.component_hashes(),
+        hashes: workspace_config::Genesis::compose(&founding_set)?.module_hashes(),
         source: GenesisSource::FoundingSet(founding_set),
     };
     Ok(Resolved {
@@ -1370,7 +1370,6 @@ mod tests {
 
     #[test]
     fn dev_shape_hashes_its_modules_dir() {
-        use sha2::Digest as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let modules = dir.path().join("modules");
         std::fs::create_dir_all(&modules).expect("modules dir");
@@ -1396,8 +1395,8 @@ mod tests {
         );
         assert_eq!(
             r.genesis.hashes["pages"],
-            <[u8; 32]>::from(sha2::Sha256::digest(b"pages")),
-            "each hash is the sha256 of the component file on disk"
+            module_artifact::ModuleArtifact::component(b"pages".to_vec()).hash(),
+            "each hash commits the whole deployment from disk"
         );
     }
 

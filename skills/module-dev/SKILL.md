@@ -20,13 +20,14 @@ opens its index over, and reports) joins the genesis set: every existing
 workspace fails closed, dev networks re-genesis, and `GENESIS_ROOT_HASH`
 moves. A genesis module ⇒ a new genesis — get that agreed before wiring.
 
-A POST-genesis module does NOT move the root and needs no genesis edit, no
+A post-genesis module leaves the genesis unchanged, changes the live root at
+activation, and needs no genesis edit, no
 topology row, and no bin change — it is one operator command against a LIVE
 network:
 
 ```
-ducktape module register <id> <component.wasm> [--after N]  # admit a new id
-ducktape module update   <id> <component.wasm> [--after N]  # swap live code
+ducktape module register <id> <component.wasm> [--index <index.wasm>] [--after N]  # admit a new id
+ducktape module update   <id> <component.wasm> [--index <index.wasm>] [--after N]  # swap live code
 ducktape module status                                      # the registry
 ```
 
@@ -141,27 +142,28 @@ the sha256 digests it can't invert. A key-layout or value-shape change is a
 new module id — a fresh `register`, decided at genesis if it must replace an
 existing one — never a `module update`.
 
-The table is the GENESIS path: the flag day that moves the root hash. There
-is ONE source: `crates/topology/src/lib.rs`. Every binary composes from it
-through `crates/noded/src/compose.rs` — `bin/node` from `PRODUCTION`, `bin/noded`
-and `bin/simnode` from `SIM_BASE` (+ `SIM_VALSET` under simnode's
-`--with-valset`) — so a wasm store-backed module touches no bin at all.
+Genesis is a file of ordinary deployments. `node init --modules <dir>`
+discovers components and optional mappers by filename, without consulting a
+compiled roster. Each module, including `modules` and `valset`, initializes
+through the same Wasm lifecycle. The default founding sets are build presets:
+`PRODUCTION` stages into `modules/`; `SIM_BASE` and `SIM_VALSET` are available
+in `sim-modules/` beside the binaries.
 
 | Where | What to touch |
 |---|---|
-| `crates/topology/src/lib.rs` | a `ModuleSpec` row in `MODULES` (the id and its `code`) and the id in the selection(s) it joins. Everything else the host needs — backing, config keys, query mode — is the component's own `shape` export (see §2), so the row carries nothing a registry admission would lack. The siblings a module reads are compiled into its guest, not declared here; `host_state` composes genesis/restore/sync from the selection — nothing to mirror there. The component is NOT embedded: noded's build script stages `<id>.component.wasm` (and `<id>.index.wasm` for a crate carrying `src/index_guest.rs`) into the founding set beside the binary (`target/<profile>/modules`), and `node init` composes that set (`--modules <dir>`, default `$DUCKTAPE_MODULES_DIR`, else the staged set) into `<workspace>/genesis`, pinned by the descriptor. The kernel fixtures dir pins the same component bytes. |
-| `crates/noded/src/compose.rs` | ONLY for a `Code::Native` tenant (an arm in `native`, plus the `Cargo.toml` dep) or an odb-declared tenant (an arm in `open_odb` opening its disk substrate, and its id in `ODB_SUBSTRATES`). A wasm store-backed module needs neither. |
-| the indexer | `open_index_store` opens a database for EVERY id in the selection (and the host's composition opens one for every module the registry admitted since), so joining or leaving a selection gains or loses one — nothing to touch for a module with no mapper. A module that ships one carries `src/index_guest.rs` and joins `INDEX_MODULES` in the `Makefile`; the genesis carries the guest and the node converges it into the module's database at hydration (`converge_index_guests`, `crates/noded/src/index.rs`). |
+| `crates/topology/src/lib.rs` | Add a catalog row and selection only when the module belongs in a shipped default. The component declares its own backing and configuration. Arbitrary founding directories and live admissions need no catalog entry. |
+| `crates/noded/src/compose.rs` | Only a new ODB substrate needs an `open_odb` implementation and an entry in `ODB_SUBSTRATES`. Store and map modules use the generic Wasm path. |
+| the indexer | Ship `src/index_guest.rs`, add the crate to `INDEX_MODULES` in the Makefile, and pass `--index` on live registration or update. `converge_host_modules` installs the running deployment's mapper at boot and activation. Omitting `--index` removes an old mapper; its derived rows clear while the feed survives. |
 
-`SIM_BASE` is 15 of production's 19; the four it leaves out — `acl`,
-`governance`, `modules`, `valset` — are exactly what simnode's
-`--with-valset` appends (with native `kv`). Decide which selection a new
-module joins: `SIM_BASE` if it should boot by default (testable in sim-lane,
-visible in the app), `SIM_VALSET` if it is governance-shaped.
+The deployment hash covers component and mapper together. A mapper-only
+change uses the same proposal, readiness, and activation boundary as a code
+change. The global root binds deployment hashes as well as state; checkpoints
+and state-sync manifests authenticate the code needed to reopen the registries.
 
-A new module joins `topology::PRODUCTION`; update the topology's count and
-membership pins and `host_state.rs`'s `GENESIS_ROOT_HASH` in the SAME commit
-(the failing pin prints the new hex) and name the flag day in the message.
+`SIM_BASE` contains 15 modules; `--with-valset` adds `acl`, `governance`,
+`modules`, `valset`, and `kv`, all Wasm. When changing a shipped default set,
+update its membership tests and `host_state.rs`'s `GENESIS_ROOT_HASH` after
+rebuilding the artifacts; the failing pin prints the expected root.
 
 ## 4. Gates — ordering is load-bearing
 

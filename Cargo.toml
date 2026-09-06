@@ -102,6 +102,7 @@ members = [
     # two lines up, and the reason it left crates/modules/system/.
     "crates/kernel/blobstore",
     "crates/kernel/wasm-host",
+    "crates/kernel/module-artifact",
     # networking — the netstack (host-side infra + the modules that govern it)
     "crates/networking/wireguard",
     "crates/networking/nat-traversal",
@@ -342,6 +343,7 @@ blobstore = { path = "crates/kernel/blobstore" }
 # feature sharing its name with a non-optional dependency key.
 index_guest = { path = "crates/kernel/index-guest", package = "index-guest" }
 wasm-host = { path = "crates/kernel/wasm-host" }
+module-artifact = { path = "crates/kernel/module-artifact" }
 # per-module materialized views on the derived tier (indexer + the module's
 # types-only interface crate — never the module impl).
 # internal — module impl crates

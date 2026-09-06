@@ -102,6 +102,16 @@ pub fn modules_dir() -> Result<PathBuf, String> {
     })
 }
 
+/// The simulator's packaged preset also includes its small KV test module.
+/// An explicit modules directory remains the caller's complete artifact set.
+pub fn sim_modules_dir() -> Result<PathBuf, String> {
+    let configured = std::env::var_os("DUCKTAPE_MODULES_DIR");
+    if let Some(dir) = configured {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(modules_dir()?.with_file_name("sim-modules"))
+}
+
 /// the founding set the build staged beside `exe`: `<exe dir>/modules` (a
 /// `cargo build` binary in `target/<profile>/`, or an installed one), else
 /// `<exe dir>/../modules` (a test executable cargo runs from
@@ -140,7 +150,7 @@ pub use duckfs_core::{to_hex as hex_bytes, unhex};
 pub struct ModuleCode {
     /// the consensus-visible module id, the host registry key.
     pub id: String,
-    /// sha256 of the component bytes, 64 hex chars; IN the genesis fingerprint.
+    /// sha256 of the complete deployment, 64 hex chars; IN the genesis fingerprint.
     pub code_hash: String,
 }
 

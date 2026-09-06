@@ -36,7 +36,7 @@ _ducktape() {
     local agent_verbs=(pty sched install cancel reassign help)
     local agent_flags=(-n --network --node --key --host-node --cred --cpu --mem --attempt)
     local module_verbs=(update register status help)
-    local module_flags=(--after --config -n --network --json)
+    local module_flags=(--index --after --config -n --network --json)
 
     if (( CURRENT == 2 )); then
         compadd -- $families

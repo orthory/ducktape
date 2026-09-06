@@ -159,8 +159,10 @@ pub(crate) async fn reconcile(
             );
             continue;
         };
-        let request = noded::NetstackSwapRequest::Bytes(component);
-        let answer = crate::reachability_plane::swap_netstack(request).await;
+        let answer = match module_artifact::ModuleArtifact::decode(&component) {
+            Ok(artifact) => apply_netstack_artifact(artifact).await,
+            Err(error) => SwapAnswer::Refused(error),
+        };
         crate::reachability_plane::record_swap(&metrics, &answer);
         let decided = spends_the_designation(&answer);
         retries = match decided {
@@ -172,6 +174,14 @@ pub(crate) async fn reconcile(
         }
         report_answer(&label, &designated, answer, retries);
     }
+}
+
+async fn apply_netstack_artifact(artifact: module_artifact::ModuleArtifact) -> SwapAnswer {
+    if artifact.index.is_some() {
+        return SwapAnswer::Refused("the reachability component has no module index".into());
+    }
+    let request = noded::NetstackSwapRequest::Bytes(artifact.component);
+    crate::reachability_plane::swap_netstack(request).await
 }
 
 /// the committed modules registry roster, off the drain's own command lane —

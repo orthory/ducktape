@@ -1,19 +1,12 @@
 //! The genesis file — `<workspace>/genesis` — and the founding set it is
 //! composed from.
 //!
-//! A network's wasm is the network's: the genesis carries every consensus
-//! component and every index guest a node on that network runs, and the
-//! workspace's first boot installs them from here (components into the blob
-//! store, index guests into the index databases) and unpacks them as bare
-//! files into `<workspace>/modules` (founding-set layout — the readable copy
-//! of what the network runs). Nothing outside the workspace decides what its
-//! network runs, so two networks carry two sets.
-//!
-//! The descriptor pins it twice: `network.toml`'s `genesis` is the sha256 of
-//! this whole file (in the genesis fingerprint — the network IS its genesis)
-//! and its `modules` table names each component's own hash (what the code
-//! registry seeds at block zero). A joiner verifies both before a byte of it
-//! is installed.
+//! Each entry is one deployment: a consensus component and its optional
+//! index mapper, encoded by `module-artifact`. A network's descriptor pins the
+//! whole genesis file and every deployment hash. The blob plane stores those
+//! encoded deployments; materialization writes their bare Wasm files beneath
+//! `<workspace>/modules` for inspection. Live updates arrive through the code
+//! registry and can replace either part without rewriting genesis.
 //!
 //! The FOUNDING SET is the one place bare wasm files are read: a directory of
 //! `<id>.component.wasm`, `<id>.index.wasm` and `netstack.component.wasm` the
@@ -27,6 +20,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use borsh::{BorshDeserialize, BorshSerialize};
+use module_artifact::{ModuleArtifact, ModuleArtifactRef};
 
 use crate::hex_bytes;
 
@@ -61,6 +55,21 @@ pub fn index_guest_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.index.wasm"))
 }
 
+/// Package one module's component and optional mapper from a directory.
+pub fn read_module_artifact(dir: &Path, id: &str) -> Result<ModuleArtifact, String> {
+    crate::validate_module_id(id)?;
+    let component_path = component_path(dir, id);
+    let component = std::fs::read(&component_path)
+        .map_err(|error| format!("read {}: {error}", component_path.display()))?;
+    let index_path = index_guest_path(dir, id);
+    let index = match std::fs::read(&index_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("read {}: {error}", index_path.display())),
+    };
+    Ok(ModuleArtifact { component, index })
+}
+
 /// `<dir>/netstack.component.wasm` — the netstack guest in a founding set.
 pub fn netstack_component_path(dir: &Path) -> PathBuf {
     dir.join(NETSTACK_COMPONENT_FILE)
@@ -78,10 +87,8 @@ pub struct Artifact {
 /// file has one hash.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub struct Genesis {
-    /// the consensus components, one per wasm tenant of the genesis set.
-    pub components: Vec<Artifact>,
-    /// the index guests, one per module of the set that ships a mapper.
-    pub index_guests: Vec<Artifact>,
+    /// Each entry is the same encoded deployment accepted by the code plane.
+    pub modules: Vec<Artifact>,
 }
 
 impl Genesis {
@@ -96,11 +103,31 @@ impl Genesis {
                 source.display()
             ));
         }
-        let index_guests = discover_artifacts(source, ".index.wasm")?;
-        let genesis = Self {
-            components,
-            index_guests,
-        };
+        let mut index_guests: BTreeMap<String, Vec<u8>> =
+            discover_artifacts(source, ".index.wasm")?
+                .into_iter()
+                .map(|artifact| (artifact.id, artifact.bytes))
+                .collect();
+        let modules = components
+            .into_iter()
+            .map(|artifact| {
+                let index = index_guests.remove(&artifact.id);
+                Artifact {
+                    id: artifact.id,
+                    bytes: ModuleArtifact {
+                        component: artifact.bytes,
+                        index,
+                    }
+                    .encode(),
+                }
+            })
+            .collect();
+        if let Some(id) = index_guests.keys().next() {
+            return Err(format!(
+                "index guest {id} has no module component in the genesis"
+            ));
+        }
+        let genesis = Self { modules };
         genesis.validate()?;
         Ok(genesis)
     }
@@ -113,11 +140,12 @@ impl Genesis {
     pub fn materialize(&self, dir: &Path) -> Result<(), String> {
         self.validate()?;
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        for a in &self.components {
-            write_atomic(&component_path(dir, &a.id), &a.bytes)?;
-        }
-        for a in &self.index_guests {
-            write_atomic(&index_guest_path(dir, &a.id), &a.bytes)?;
+        for module in &self.modules {
+            let artifact = ModuleArtifactRef::decode(&module.bytes)?;
+            write_atomic(&component_path(dir, &module.id), artifact.component)?;
+            if let Some(index) = artifact.index {
+                write_atomic(&index_guest_path(dir, &module.id), index)?;
+            }
         }
         let entries = std::fs::read_dir(dir)
             .map_err(|e| format!("read modules directory {}: {e}", dir.display()))?;
@@ -159,26 +187,13 @@ impl Genesis {
     }
 
     fn validate(&self) -> Result<(), String> {
-        let components_sorted = self.components.windows(2).all(|w| w[0].id < w[1].id);
-        let index_guests_sorted = self.index_guests.windows(2).all(|w| w[0].id < w[1].id);
-        let canonical = components_sorted && index_guests_sorted;
+        let canonical = self.modules.windows(2).all(|w| w[0].id < w[1].id);
         if !canonical {
             return Err("genesis file is not canonical (ids unsorted or duplicated)".into());
         }
-        for artifact in self.components.iter().chain(&self.index_guests) {
+        for artifact in &self.modules {
             crate::validate_module_id(&artifact.id)?;
-        }
-        for guest in &self.index_guests {
-            let has_component = self
-                .components
-                .binary_search_by(|component| component.id.cmp(&guest.id))
-                .is_ok();
-            if !has_component {
-                return Err(format!(
-                    "index guest {} has no module component in the genesis",
-                    guest.id
-                ));
-            }
+            ModuleArtifactRef::decode(&artifact.bytes)?;
         }
         Ok(())
     }
@@ -188,34 +203,39 @@ impl Genesis {
         Self::decode(&bytes).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    /// id → sha256 of each component: the descriptor's `modules` table.
-    pub fn component_hashes(&self) -> BTreeMap<String, [u8; 32]> {
-        self.components
+    /// id → sha256 of each deployment: the descriptor's `modules` table.
+    pub fn module_hashes(&self) -> BTreeMap<String, [u8; 32]> {
+        self.modules
             .iter()
             .map(|a| (a.id.clone(), sha256(&a.bytes)))
             .collect()
     }
 
-    pub fn component(&self, id: &str) -> Option<&[u8]> {
-        self.components
+    pub fn artifact(&self, id: &str) -> Option<&[u8]> {
+        self.modules
             .iter()
-            .find(|a| a.id == id)
-            .map(|a| a.bytes.as_slice())
+            .find(|module| module.id == id)
+            .map(|module| module.bytes.as_slice())
+    }
+
+    pub fn component(&self, id: &str) -> Option<&[u8]> {
+        Some(
+            ModuleArtifactRef::decode(self.artifact(id)?)
+                .ok()?
+                .component,
+        )
     }
 
     pub fn index_guest(&self, id: &str) -> Option<&[u8]> {
-        self.index_guests
-            .iter()
-            .find(|a| a.id == id)
-            .map(|a| a.bytes.as_slice())
+        ModuleArtifactRef::decode(self.artifact(id)?).ok()?.index
     }
 
-    /// the components are exactly the descriptor's module set (`want`: id →
+    /// the deployments are exactly the descriptor's module set (`want`: id →
     /// `code_hash`), byte for byte: the same ids, each hashing to its entry.
     /// A mismatch names the module, because the operator's next move is to
     /// look at it.
-    pub fn verify_components(&self, want: &BTreeMap<String, [u8; 32]>) -> Result<(), String> {
-        let have = self.component_hashes();
+    pub fn verify_modules(&self, want: &BTreeMap<String, [u8; 32]>) -> Result<(), String> {
+        let have = self.module_hashes();
         for (id, hash) in want {
             match have.get(id) {
                 None => {
@@ -249,7 +269,7 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 /// decode `bytes` as the genesis the descriptor pins: the whole file must
-/// hash to `hash` (the descriptor's `genesis`) and its components must be
+/// hash to `hash` (the descriptor's `genesis`) and its deployments must be
 /// `modules` (the descriptor's table, id → `code_hash`). Every reader of a
 /// genesis that did not compose it goes through here — a joiner installing
 /// a handed-out or fetched file, a member reopening its own.
@@ -268,7 +288,7 @@ pub fn verify_genesis(
         ));
     }
     let genesis = Genesis::decode(bytes)?;
-    genesis.verify_components(modules)?;
+    genesis.verify_modules(modules)?;
     Ok(genesis)
 }
 
@@ -352,7 +372,7 @@ mod tests {
             block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: hex_bytes(&sha256(&bytes)),
             modules: genesis
-                .component_hashes()
+                .module_hashes()
                 .iter()
                 .map(|(id, h)| ModuleCode {
                     id: id.clone(),
@@ -371,7 +391,7 @@ mod tests {
             &[("chat", b"c-map")],
         );
         let genesis = Genesis::compose(dir.path()).unwrap();
-        let ids: Vec<&str> = genesis.components.iter().map(|a| a.id.as_str()).collect();
+        let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(
             ids,
             ["chat", "pages"],
@@ -426,10 +446,14 @@ mod tests {
         std::fs::write(netstack_component_path(dir.path()), b"network").unwrap();
         let genesis = Genesis::compose(dir.path()).unwrap();
         assert_eq!(
-            genesis.components,
+            genesis.modules,
             vec![Artifact {
                 id: "weather".into(),
-                bytes: b"W".to_vec()
+                bytes: ModuleArtifact {
+                    component: b"W".to_vec(),
+                    index: Some(b"mapper".to_vec())
+                }
+                .encode()
             }]
         );
         assert_eq!(genesis.index_guest("weather"), Some(&b"mapper"[..]));
@@ -445,8 +469,7 @@ mod tests {
             "{err}"
         );
         let invalid = Genesis {
-            components: vec![],
-            index_guests: vec![Artifact {
+            modules: vec![Artifact {
                 id: "weather".into(),
                 bytes: b"mapper".to_vec(),
             }],
@@ -467,11 +490,10 @@ mod tests {
             "..",
         ] {
             let invalid = Genesis {
-                components: vec![Artifact {
+                modules: vec![Artifact {
                     id: id.into(),
                     bytes: vec![],
                 }],
-                index_guests: vec![],
             };
             assert!(Genesis::decode(&invalid.encode()).is_err(), "{id:?}");
             assert!(
@@ -485,7 +507,7 @@ mod tests {
     #[test]
     fn decode_refuses_a_non_canonical_file() {
         let unsorted = Genesis {
-            components: vec![
+            modules: vec![
                 Artifact {
                     id: "pages".into(),
                     bytes: vec![1],
@@ -495,7 +517,6 @@ mod tests {
                     bytes: vec![2],
                 },
             ],
-            index_guests: vec![],
         };
         let err = Genesis::decode(&unsorted.encode()).unwrap_err();
         assert!(err.contains("canonical"), "{err}");
@@ -505,13 +526,13 @@ mod tests {
     fn install_verifies_the_whole_file_then_every_component() {
         let dir = tempfile::tempdir().unwrap();
         let genesis = Genesis {
-            components: vec![Artifact {
+            modules: vec![Artifact {
                 id: "pages".into(),
-                bytes: vec![1, 2, 3],
-            }],
-            index_guests: vec![Artifact {
-                id: "pages".into(),
-                bytes: vec![9],
+                bytes: ModuleArtifact {
+                    component: vec![1, 2, 3],
+                    index: Some(vec![9]),
+                }
+                .encode(),
             }],
         };
         let descriptor = descriptor_for(&genesis);
@@ -535,11 +556,11 @@ mod tests {
         // refused by module name.
         let mut wrong_modules = modules.clone();
         wrong_modules.insert("pages".into(), [0u8; 32]);
-        let err = genesis.verify_components(&wrong_modules).unwrap_err();
+        let err = genesis.verify_modules(&wrong_modules).unwrap_err();
         assert!(err.starts_with("module pages:"), "{err}");
         let mut extra = modules.clone();
         extra.insert("chat".into(), [0u8; 32]);
-        let err = genesis.verify_components(&extra).unwrap_err();
+        let err = genesis.verify_modules(&extra).unwrap_err();
         assert!(err.contains("no component"), "{err}");
     }
 }

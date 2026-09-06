@@ -26,7 +26,7 @@ pub enum ModuleCmd {
     Status(StatusArgs),
 }
 
-/// `<id> <component.wasm> [--after N]` — shared by update and register.
+/// `<id> <component.wasm> [--index <index.wasm>] [--after N]` — shared by update and register.
 #[derive(Debug, clap::Args)]
 pub struct StageArgs {
     /// the module id the code belongs to
@@ -35,6 +35,9 @@ pub struct StageArgs {
     /// the component bytes to stage
     #[arg(value_name = "COMPONENT.WASM")]
     pub component: PathBuf,
+    /// Optional mapper deployed and activated with this component; omission removes it.
+    #[arg(long, value_name = "INDEX.WASM")]
+    pub index: Option<PathBuf>,
     /// blocks after the current height at which the swap activates
     #[arg(long, default_value_t = 50)]
     pub after: u64,
@@ -147,7 +150,7 @@ fn matches_module_action<'a>(
     }
 }
 
-/// `module update|register <id> <component.wasm> [--after N]`: stage the bytes
+/// `module update|register <id> <component.wasm> [--index <index.wasm>] [--after N]`: stage the bytes
 /// at this node (fan-out to every validator), refuse unless every member holds
 /// them, then drive the governance proposal that schedules the swap at this
 /// node's height + N and read the registry back for its verdict.
@@ -166,8 +169,14 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         )
         .into());
     }
-    let bytes = std::fs::read(&args.component)
+    let component = std::fs::read(&args.component)
         .map_err(|e| format!("read {}: {e}", args.component.display()))?;
+    let index = args
+        .index
+        .as_ref()
+        .map(|path| std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display())))
+        .transpose()?;
+    let bytes = module_artifact::ModuleArtifact { component, index }.encode();
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, verb.name())?;
@@ -633,7 +642,7 @@ fn digest_matches(reply: &StageReply, bytes: &[u8]) -> Result<[u8; 32], String> 
     let agree = theirs[..] == ours[..];
     if !agree {
         return Err(format!(
-            "stage digest {} is not the sha256 of the file we read ({})",
+            "stage digest {} is not the sha256 of the deployment we packaged ({})",
             reply.digest,
             hex_bytes(&ours)
         ));

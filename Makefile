@@ -197,6 +197,8 @@ install-node:
 	$(CARGO) install --path bin/node --locked --target-dir target
 	rm -rf "$(CARGO_BIN)/modules"
 	cp -r target/release/modules "$(CARGO_BIN)/modules"
+	rm -rf "$(CARGO_BIN)/sim-modules"
+	cp -r target/release/sim-modules "$(CARGO_BIN)/sim-modules"
 	@echo "installed the founding set into $(CARGO_BIN)/modules"
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
@@ -256,7 +258,7 @@ test: wasm-modules-check wasm-embed-check
 ## in one sweep (the canonical artifact in the module's own directory, which
 ## the build stages into the founding set, + the kernel test fixtures), so the
 ## copies can never drift apart. requires wasm-tools (cargo install
-## wasm-tools); the wasm32-unknown-unknown target comes from the pinned
+## wasm-tools --version "$$(cat wasm-tools.version)"); the wasm32 target uses
 ## rust-toolchain.toml. every guest is built ALONE, out of the platform
 ## repository at this checkout's HEAD (bin/guest-builder), so HEAD must be
 ## pushed first; each module's guest.lock records the revision and the

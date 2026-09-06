@@ -127,6 +127,9 @@ pub(crate) async fn stage_module_code(
     if body.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "empty artifact body");
     }
+    if let Err(error) = module_artifact::ModuleArtifactRef::decode(&body) {
+        return error_response(StatusCode::BAD_REQUEST, &error);
+    }
     let len = body.len() as u64;
     // ingest-by-value: the operator upload buffers once here, then lives on
     // disk (the store's large-blob path never parks it in memory). the WIRE

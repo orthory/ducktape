@@ -403,6 +403,8 @@ pub struct Manifest {
     pub root_hash: StateRoot,
     /// every module's root at `height` — the replay baseline.
     pub roots: Vec<(ModuleId, StateRoot)>,
+    /// Executable commitments at this checkpoint, including the module registry.
+    pub codes: Vec<(ModuleId, Vec<u8>)>,
     /// canonical snapshot bytes for the modules that do NOT persist
     /// themselves (the in-memory cohort), keyed by module id. a disk-cohort
     /// module (`sdk::Module::block_durable`) is deliberately absent: it
@@ -452,6 +454,7 @@ impl Manifest {
     fn check_field_caps(&self) -> Result<(), Error> {
         let counts = [
             ("module roots", self.roots.len()),
+            ("module codes", self.codes.len()),
             ("participant keys", self.participants.len()),
             ("resident keys", self.residents.len()),
             ("snapshots", self.snapshots.len()),
@@ -471,6 +474,29 @@ impl Manifest {
             )));
         }
         let over_cap = |len: usize| len > MAX_CHECKPOINT_FIELD_LEN;
+        for (id, hash) in &self.codes {
+            let invalid_hash = hash.len() != 32;
+            if invalid_hash {
+                return Err(Error::FieldOverCap(format!(
+                    "module {id}'s code hash must be 32 bytes"
+                )));
+            }
+        }
+        let ids = self
+            .roots
+            .iter()
+            .map(|(id, _)| id)
+            .chain(self.codes.iter().map(|(id, _)| id))
+            .chain(self.snapshots.iter().map(|(id, _)| id));
+        for id in ids {
+            let oversized_id = over_cap(id.len());
+            if oversized_id {
+                return Err(Error::FieldOverCap(
+                    "module id exceeds checkpoint field cap".into(),
+                ));
+            }
+        }
+
         if let Some((id, bytes)) = self.snapshots.iter().find(|(_, b)| over_cap(b.len())) {
             return Err(Error::FieldOverCap(format!(
                 "module {id}'s snapshot is {} bytes, over the {MAX_CHECKPOINT_FIELD_LEN}-byte \
@@ -514,6 +540,11 @@ impl Manifest {
         }
         put_root(&mut out, &self.root_hash);
         put_roots(&mut out, &self.roots);
+        put_u64(&mut out, self.codes.len() as u64);
+        for (id, hash) in &self.codes {
+            put_bytes(&mut out, id.as_bytes());
+            put_bytes(&mut out, hash);
+        }
         put_u64(&mut out, self.snapshots.len() as u64);
         for (id, bytes) in &self.snapshots {
             put_bytes(&mut out, id.as_bytes());
@@ -547,6 +578,22 @@ impl Manifest {
         };
         let root_hash = read_root(&mut c, "root hash")?;
         let roots = get_roots(&mut c)?;
+        let count = c.u64("module code count")? as usize;
+        if count > MAX_LIST_LEN {
+            return Err(Error::Corrupt(
+                "module code count exceeds sanity cap".into(),
+            ));
+        }
+        let mut codes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let id = c.string("module code id")?;
+            let hash = c.bytes("module code hash")?;
+            let valid_hash = hash.len() == 32;
+            if !valid_hash {
+                return Err(Error::Corrupt("module code hash must be 32 bytes".into()));
+            }
+            codes.push((id, hash.to_vec()));
+        }
         let n = c.u64("snapshots count")? as usize;
         if n > MAX_LIST_LEN {
             return Err(Error::Corrupt(format!("{n} snapshots exceeds sanity cap")));
@@ -581,6 +628,7 @@ impl Manifest {
             pending_cutover_view,
             root_hash,
             roots,
+            codes,
             snapshots,
             oplog_pos,
             next_seq,
@@ -725,6 +773,16 @@ impl Manifest {
             .iter()
             .map(|m| (m.id.clone(), m.root))
             .collect();
+        let codes = snapshot
+            .modules
+            .iter()
+            .filter_map(|module| {
+                module
+                    .code_hash
+                    .clone()
+                    .map(|hash| (module.id.clone(), hash))
+            })
+            .collect();
         let snapshots = snapshot
             .modules
             .into_iter()
@@ -743,6 +801,7 @@ impl Manifest {
                 pending_cutover_view,
                 root_hash,
                 roots,
+                codes,
                 snapshots,
                 oplog_pos,
                 next_seq,
@@ -1227,6 +1286,8 @@ where
 /// derives its row from the frame's content, not the dispatch trace — the
 /// trace alone cannot reproduce it.
 pub struct FoldedBlock<'a> {
+    /// The deployments realized for this replayed block.
+    pub host: &'a Host,
     pub height: u64,
     pub frame: &'a [u8],
     pub disposition: Disposition,
@@ -1489,6 +1550,7 @@ where
                             match disposition {
                                 // a rejected block never had content anywhere.
                                 Disposition::Rejected => sink.folded_block(&FoldedBlock {
+                                    host,
                                     height,
                                     frame: &frame,
                                     disposition,
@@ -1553,6 +1615,7 @@ where
                             .await?;
                             if let Some(sink) = sink.as_mut() {
                                 sink.folded_block(&FoldedBlock {
+                                    host,
                                     height,
                                     frame: &frame,
                                     disposition,
@@ -1632,6 +1695,7 @@ where
                                 // re-execution; only the COMMIT scope was
                                 // selective.
                                 sink.folded_block(&FoldedBlock {
+                                    host,
                                     height,
                                     frame: &frame,
                                     disposition,
@@ -1689,6 +1753,7 @@ where
                     apply_block(host, height, &frame, None, code_source.as_ref()).await?;
                 if let Some(sink) = sink.as_mut() {
                     sink.folded_block(&FoldedBlock {
+                        host,
                         height,
                         frame: &frame,
                         disposition,
@@ -1760,6 +1825,7 @@ where
                     }
                     if let Some(sink) = sink.as_mut() {
                         sink.folded_block(&FoldedBlock {
+                            host,
                             height,
                             frame: &frame,
                             disposition,
@@ -2283,6 +2349,7 @@ mod tests {
 
     fn sample_manifest() -> Manifest {
         Manifest {
+            codes: vec![("registry".into(), vec![7; 32])],
             height: Some(42),
             epoch: 1,
             view_base: 30,
@@ -2299,6 +2366,14 @@ mod tests {
             next_seq: 5,
             applied_frames: vec![(40, [0xA1; 32]), (41, [0xA2; 32]), (42, [0xA3; 32])],
         }
+    }
+
+    #[test]
+    fn checkpoint_writer_refuses_invalid_deployment_hash_width() {
+        let mut manifest = sample_manifest();
+        manifest.codes[0].1.pop();
+        assert!(manifest.check_field_caps().is_err());
+        assert!(Manifest::decode(&manifest.encode()).is_err());
     }
 
     #[test]
