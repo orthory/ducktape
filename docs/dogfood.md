@@ -2,8 +2,8 @@
 
 The operator's runbook for the agent dogfooding loop: host this repo in its
 own forge, provision a model user over it, open an issue that references a Pages
-spec, mention the agent, and review the resulting PR, block-anchored spec
-commentary, and usage — all in the app.
+spec, mention the agent, and review the resulting PR and block-anchored spec
+commentary in the app, with run outcomes available through the query API.
 
 ## 0. Prereqs
 
@@ -21,14 +21,20 @@ commentary, and usage — all in the app.
   lane permanently unavailable, loudly. Forge repos are git-default **sha1**
   — do NOT set `init.defaultObjectFormat = sha256` host-wide; a sha256 clone
   cannot interop with the node's repos.
-- **A capability provider** announced by the executing node: a built-in spec
-  whose binary is on the node's `PATH`, or an operator spec in
-  `<ducktape home>/capabilities/` (`docs/records/specs/capability-spec.md`).
-  The register form's *Runs on* picker lists announced tags.
+- **An enabled compute service with a working microVM sandbox.** Install
+  guest-architecture executors with `ducktape agent install claude` or
+  `ducktape agent install codex`, including the spec's declared companions.
+  Discovery checks the sandbox's executor directory. Custom specs live under
+  `DUCKTAPE_CAPABILITY_DIR` or `<ducktape home>/capabilities/`
+  (`docs/records/specs/capability-spec.md`).
+- **Provider authentication on the executing service.** Codex uses
+  `OPENAI_API_KEY` or `CODEX_HOME/auth.json`; Claude uses `ANTHROPIC_API_KEY`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, or `~/.claude/.credentials.json`. Installing an
+  executable does not configure its credentials.
 - **Raise the provider timeout for cold Rust builds.**
-  `DUCKTAPE_PROVIDER_TIMEOUT_SECS=<secs>` on the node process overrides every
-  spec's *idle* timeout at once. The hard wall-clock cap is always
-  **idle × `HARD_TIMEOUT_FACTOR`** (36, `crates/services/provider/src/lib.rs`)
+  `DUCKTAPE_PROVIDER_TIMEOUT_SECS=<secs>` on the executing compute service
+  overrides the spec's *idle* timeout. The hard wall-clock cap is
+  **idle × `[invoke].hard_timeout_factor`** (default 36)
   and the child is killed at the cap even while producing output, so budget
   for a first `cargo build` in a fresh worktree.
 
@@ -39,13 +45,14 @@ make dogfood-forge
 ```
 
 `ops/dogfood-forge.sh` resolves the node's HTTP base
-(`DUCKTAPE_DEV_FORGE_URL` → the active workspace's `http_listen` from
-`<ducktape home>/registry.json` + `node.toml` → `http://127.0.0.1:8844`;
-the home is `$DUCKTAPE_HOME` when set, else `~/.ducktape`),
+from `DUCKTAPE_DEV_FORGE_URL` or the active workspace's `http_listen` in
+`<ducktape home>/registry.json` and `node.toml`, failing if neither resolves
+(the home is `$DUCKTAPE_HOME` when set, else `~/.ducktape`),
 registers a normal git remote `ducktape-dev` at `<base>/forge/ducktape`,
-fetches `origin/dev`, pushes that exact commit to the forge's `refs/heads/dev`
-(release-only `main` is never moved), then reads the Forge ref back and
-requires exact OID equality. Repo creation *is* the first push — no separate
+fetches `origin/dev`, and reconciles it with the forge's `refs/heads/dev`.
+It fast-forwards when possible, retains a Forge descendant, or joins equal-tree
+divergence with a two-parent bridge; differing-tree divergence fails. It reads
+the Forge ref back and verifies the selected tip. Repo creation is the first push — no separate
 create step. The whole packfile travels over git smart-HTTP and is stored
 node-locally; only a tiny `forge Push` (digest + oids) crosses consensus. Run
 this before creating or invoking agent work so a clean but stale local
@@ -57,7 +64,7 @@ Knobs: `FORGE_REPO` (default `ducktape`), `FORGE_REMOTE` (default
 
 Verify: the `ducktape` repo appears in the desktop **Forge** view with `dev`
 browsable. Re-run `make dogfood-forge` before later agent work; a raw
-`git push ducktape-dev dev` bypasses the fetch and equality gate. Caveat: the
+`git push ducktape-dev dev` bypasses the fetch and reconciliation checks. Caveat: the
 remote lives in the shared `.git/config`, visible to every worktree of this
 repo — set `FORGE_REMOTE` per worktree if you run several nodes at once.
 
@@ -171,15 +178,15 @@ curl -s <base>/v1/index/pages/view -X POST -H 'content-type: application/json' \
 # → ids + titles, cursor-paged; pick your spec's id.
 ```
 
-## 4. Open the issue with a `[[page:<id>]]` ref
+## 4. Open the issue with a page link
 
 Forge view → the `ducktape` repo → **Issues** → *New issue*. Put
-`[[page:<your-page-id>]]` in the body.
+`[spec](duck://page/<your-page-id>)` in the body.
 
 At run compose, every ref found in the trigger message or the injected issue
 body resolves against committed pages state and the page's whole subtree is
 rendered into the run's context: headings, `- [ ]`/`- [x]` todos with an
-inline `[blk:<id>]` per block (the ids the agent targets with its pages
+inline `[blk:<id>]` on todo blocks (the ids the agent targets with its pages
 actions), fenced code, a 64 KiB budget with a truncation marker
 (`PAGE_CONTEXT_BYTES`, `crates/modules/apps/runs/src/inject.rs`). Page and
 attachment resolution share the dispatch's bounded reference-read budget. An
@@ -193,25 +200,27 @@ In the issue's **Discussion** tab, `@`-mention the agent (the composer's
 typeahead resolves its account). The message commits, attribution delivers
 the mention, and its program calls runs to start model work. The run then:
 
-1. provisions a **detached** worktree at the pinned base commit (never
-   holding the branch), with its skills mounted read-only beside it,
-2. works, commits, and pushes `agent/item-<n>`,
-3. opens a PR titled from its reply, and replies in the issue thread.
+1. provisions an isolated clone with detached HEAD at the pinned base commit,
+   with its skills mounted read-only beside it,
+2. works, commits, and pushes `agent/item-<issue-number>`,
+3. proposes a PR and a reply through program calls. The PR title prefers the
+   bound issue's title, using the reply's first line as a fallback. The output
+   tip, source branch and open item must still match when the action applies.
 
 **The PR is the session.** Re-mention the agent in the PR's own Discussion
-(hidden channel `forge:ducktape:<n>`) to iterate. Each item uses its own
-`agent/item-<n>` branch. A PR run forks from the PR's source branch and
+(hidden channel `forge:ducktape:<n>`) to iterate. A PR run uses its existing
+source branch, which may still be `agent/item-<original-issue-number>`, and
 proposes its changes back into that branch for review.
 
 While it works, the agent can `pages.comment` on spec blocks (comments land
 authored by its program account on the page). The human page author ticks
 the spec todos; `pages.set_checked` is available only for pages the program
-account itself authored. A pages action that fails its gate (cap
-deny, bad target, squatted id) degrades **individually** — that one action is
-dropped and the run still delivers its reply and other effects, with the
-drop reason recorded as a `runs` breadcrumb on the run. If a comment didn't
-land, check the agent's caps (`pages_write` on the page) and that the target
-block/page id is correct.
+account itself authored. Preflight skips record a `runs` breadcrumb. Once an
+action is admitted, its program call has an independent target outcome in
+`ActionRequest`; a refusal cannot undo earlier successful effects. If a comment
+didn't land, inspect that receipt, the model's `pages_write` capability and the
+target block/page id. Replies and other proposed effects also depend on their
+own call outcomes.
 
 ## 6. Review in-app
 
@@ -219,17 +228,25 @@ block/page id is correct.
   branch, and the discussion trail.
 - **The spec page**: agent-authored comment threads anchored to the blocks
   they discuss; todos checked by their page author.
-- **Agents → Activity**: the delivered-runs history (last-100 ring) with
-  per-run duration **in blocks** and a `PR #<n>` chip linking run to
-  artifact; above it the **UsageCard** — whose subscription carried how much,
-  grouped per account (executor nodes resolved to their bound accounts), with
-  per-capability breakdown. Header says *all time · durations in blocks*: the
-  ledger counts consensus heights, not seconds, and there is deliberately no
-  wall-clock week.
+
+Inspect the last 100 terminal runs with the query helper from provisioning:
+
+```sh
+query runs '"recent_runs"'
+```
+
+History records include the executing node, output reference and verified PR
+number. Their creation/delivery counters measure blocks, not wall-clock time.
+
+`result_accepted` means the model result passed validation; the program decides
+which proposed actions to execute. A reported program or target refusal marks
+the run `action_rejected`, and its `ActionRequest` query retains the reason.
+`failed` records worker failure, cancellation, or invalid output. PR links name
+only an existing verified PR or a successfully committed allocation.
 
 ## Known limits
 
-- **No page read-authorization:** `[[page:<id>]]` injection renders any
+- **No page read-authorization:** `[spec](duck://page/<id>)` injection renders any
   referenced page's subtree into the run context with no read-cap gate
   (pages are workspace-visible to members). A member can surface any page
   they can already see.
@@ -238,8 +255,8 @@ block/page id is correct.
   document and starts a separate 64-edge document.
 - **Concurrent branch advance is absorbed, not lost**: on a push reject the
   provisioner fetches, rebases and re-pushes a bounded number of times
-  (`rebased: true` in the receipt). Only a genuine rebase **conflict**
-  degrades the run.
+  (`rebased: true` in the receipt). Rebase conflicts, exhausted push retries
+  and other commit failures can degrade the run.
 - A losing re-leased attempt's push can leave branch residue in a narrow
   race — harmless, but you may see an unexpected commit on the work branch.
 - **Usage starts at the indexer's deploy boundary**: the ledger doesn't

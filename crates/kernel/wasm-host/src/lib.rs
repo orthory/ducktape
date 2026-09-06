@@ -2693,10 +2693,16 @@ mod bounds {
     #[test]
     fn the_assigned_stamp_keeps_its_own_cap() {
         let mut data = HostData::default();
+        let at_cap = vec![0u8; sdk::MAX_ASSIGNED_BYTES];
         assert!(
-            host::Host::set_assigned(&mut data, vec![0u8; sdk::MAX_ASSIGNED_BYTES]).is_ok(),
+            host::Host::set_assigned(&mut data, at_cap.clone()).is_ok(),
             "at the cap"
         );
+        assert_eq!(
+            data.out_assigned.into_value("op assigned stamp").unwrap(),
+            Some(at_cap)
+        );
+        let mut data = HostData::default();
         assert!(
             host::Host::set_assigned(&mut data, vec![0u8; sdk::MAX_ASSIGNED_BYTES + 1]).is_ok(),
             "declaration is checked after guest execution"

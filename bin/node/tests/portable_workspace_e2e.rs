@@ -285,7 +285,7 @@ fn mention(cluster: &Cluster, idx: usize, message_id: &str) {
 }
 
 fn wait_for_reply(cluster: &Cluster, idx: usize, run_id: &str) -> String {
-    cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
+    let body = cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
         let reply = cluster.query(
             idx,
             "chat",
@@ -299,7 +299,7 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, run_id: &str) -> String {
             return None;
         };
         views.into_iter().find_map(|v| {
-            (v.head.message_id == format!("agent/{run_id}")).then(|| {
+            (v.head.message_id == runs::reply_message_id(run_id)).then(|| {
                 v.head
                     .blocks
                     .iter()
@@ -313,7 +313,19 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, run_id: &str) -> String {
                     .collect::<String>()
             })
         })
-    })
+    });
+    let reply = cluster
+        .query(idx, "runs", &runs::encode_query(&RunsQuery::RecentRuns))
+        .expect("the accepted run's history");
+    let RunsReply::RecentRuns(records) = runs::decode_reply(&reply).unwrap() else {
+        panic!("expected recent runs");
+    };
+    let record = records
+        .iter()
+        .find(|record| record.run_id == run_id)
+        .unwrap();
+    assert_eq!(record.outcome, runs::RunOutcome::ResultAccepted);
+    body
 }
 
 /// the committed files-module view of `path` on `idx` — `Some(size)` when the

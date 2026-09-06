@@ -674,6 +674,57 @@ impl Identity {
         self.load(&key_owner_key(key)).await
     }
 
+    /// Resolve only account numbers, with bounded read frontiers and the
+    /// same staged ownership and dangling-index checks as `Get`/`OfKey`.
+    async fn resolve_references(
+        &self,
+        references: &[AccountRef],
+    ) -> Result<Vec<Option<AccountNumber>>, Error> {
+        let exceeds_query_limit = references.len() as u64 > MAX_QUERY_LIMIT;
+        if exceeds_query_limit {
+            return Err(Error::Module(format!(
+                "identity: reference count exceeds query limit ({MAX_QUERY_LIMIT})"
+            )));
+        }
+        let key_reads: Vec<_> = references
+            .iter()
+            .filter_map(|reference| match reference {
+                AccountRef::Key(key) => Some(key_owner_key(key)),
+                AccountRef::Account(_) => None,
+            })
+            .collect();
+        self.staged.prefetch(&key_reads).await?;
+        let mut numbers = Vec::with_capacity(references.len());
+        for reference in references {
+            numbers.push(match reference {
+                AccountRef::Account(number) => Some(*number),
+                AccountRef::Key(key) => self.owner_of_key(key).await?,
+            });
+        }
+        let account_reads: Vec<_> = numbers
+            .iter()
+            .flatten()
+            .map(|number| acct_key(*number))
+            .collect();
+        self.staged.prefetch(&account_reads).await?;
+        let mut resolved = Vec::with_capacity(references.len());
+        for (reference, number) in references.iter().zip(numbers) {
+            let Some(number) = number else {
+                resolved.push(None);
+                continue;
+            };
+            let account = match reference {
+                AccountRef::Account(_) => self.account(number).await?.map(|_| number),
+                AccountRef::Key(_) => {
+                    self.stored_account(number).await?;
+                    Some(number)
+                }
+            };
+            resolved.push(account);
+        }
+        Ok(resolved)
+    }
+
     /// how many times `key` has been admitted anywhere (absent = 0).
     async fn key_gen(&self, key: &[u8]) -> Result<u64, Error> {
         Ok(self.load(&key_gen_key(key)).await?.unwrap_or(0))
@@ -929,6 +980,9 @@ impl Module for Identity {
                     self.view_of(number).await?,
                 )))
             }
+            IdentityQuery::Resolve { references } => Ok(encode_reply(&IdentityReply::Resolved(
+                self.resolve_references(&references).await?,
+            ))),
             IdentityQuery::KeyGen { key } => {
                 Ok(encode_reply(&IdentityReply::Gen(self.key_gen(&key).await?)))
             }

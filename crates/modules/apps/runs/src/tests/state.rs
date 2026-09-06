@@ -1,6 +1,33 @@
 use super::*;
 
 #[test]
+fn public_message_ids_are_bounded_and_disjoint_for_internal_run_keys() {
+    let run_ids = [
+        run_id_for("general", 1, "builder"),
+        page_run_id_for("thread", 1, "builder"),
+        job_run_id_for("job", "builder", 1),
+        "attributed/1/builder".into(),
+        "attributed/1/builder/post/s0".into(),
+        "nested\u{1f}key/post/0".into(),
+    ];
+    let mut ids = BTreeSet::new();
+    for run in run_ids {
+        for id in [
+            reply_message_id(&run),
+            post_message_id(&run, "0"),
+            post_message_id(&run, "s0"),
+        ] {
+            assert!(!id.contains(RUN_KEY_SEPARATOR));
+            assert!(
+                ids.insert(id),
+                "distinct runs and action slots must not alias"
+            );
+        }
+        assert_eq!(reply_message_id(&run).len(), "agent/".len() + 64);
+    }
+}
+
+#[test]
 fn model_run_session_and_request_state_round_trip() {
     let (mut module, registry, run_id) = awaiting_run(&[ACTION_TASKS_CREATE]);
     let mut open = CaptureCtx::new()

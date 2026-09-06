@@ -332,6 +332,20 @@ impl Module for RunsModule {
                 record.pr_number = Some(number);
             }
         }
+        for run_id in std::mem::take(&mut self.pending_action_rejections) {
+            let Some(record) = self
+                .history
+                .iter_mut()
+                .find(|record| record.run_id == run_id)
+            else {
+                continue;
+            };
+            // A successful later action cannot erase a refusal, and a worker
+            // failure stays a failure even if its explanatory post is refused.
+            if record.outcome == super::RunOutcome::ResultAccepted {
+                record.outcome = super::RunOutcome::ActionRejected;
+            }
+        }
         Ok(())
     }
 
@@ -344,6 +358,7 @@ impl Module for RunsModule {
         self.pending_delegations.clear();
         self.pending_history.clear();
         self.pending_pr_links.clear();
+        self.pending_action_rejections.clear();
         Ok(())
     }
 }

@@ -30,6 +30,21 @@ use statesync::qmdb::QmdbStore;
 fn identity_stub(accounts: Vec<(Vec<u8>, u64)>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
     move |req| {
         let query = identity_decode_query(req).map_err(Error::Module)?;
+        if let IdentityQuery::Resolve { references } = query {
+            let numbers = references
+                .iter()
+                .map(|reference| {
+                    accounts.iter().find_map(|(key, number)| {
+                        let matches = match reference {
+                            identity::AccountRef::Key(requested) => key == requested,
+                            identity::AccountRef::Account(requested) => number == requested,
+                        };
+                        matches.then_some(*number)
+                    })
+                })
+                .collect();
+            return Ok(identity_encode_reply(&IdentityReply::Resolved(numbers)));
+        }
         let account = accounts
             .iter()
             .find(|(key, number)| match &query {

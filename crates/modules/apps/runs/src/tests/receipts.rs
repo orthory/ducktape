@@ -94,6 +94,50 @@ fn acknowledge(module: &mut RunsModule, item: u64, outcome: sdk::DeliveryOutcome
 }
 
 #[test]
+fn result_action_rejection_is_committed_sticky_and_does_not_replace_worker_failure() {
+    let (mut module, _, entry) = hosted();
+    let id = stage(&mut module, &entry, 0);
+    let request = block_on(module.action_request(&id)).unwrap().unwrap();
+    module.pending_history.push(RunRecord {
+        run_id: entry.run_id.clone(),
+        agent_id: entry.agent_id.clone(),
+        channel_id: entry.channel_id.clone(),
+        anchor_seq: entry.anchor_seq,
+        outcome: RunOutcome::ResultAccepted,
+        degraded: false,
+        created_at: 1,
+        delivered_at: 2,
+        executing_node: "node".into(),
+        output_ref: None,
+        pr_number: None,
+    });
+    commit(&mut module);
+    let rejection = dispatch::CallOutcomeSummary::Rejected {
+        reason: "target refused".into(),
+    };
+    let applied = dispatch::CallOutcomeSummary::Applied {
+        output_digest: [0; 32],
+        assigned: Vec::new(),
+    };
+    module.stage_completed_action_outcome(&request, &rejection);
+    assert_eq!(recent_runs(&module)[0].outcome, RunOutcome::ResultAccepted);
+    abort(&mut module);
+    commit(&mut module);
+    assert_eq!(recent_runs(&module)[0].outcome, RunOutcome::ResultAccepted);
+    module.stage_completed_action_outcome(&request, &rejection);
+    module.stage_completed_action_outcome(&request, &applied);
+    commit(&mut module);
+    assert_eq!(recent_runs(&module)[0].outcome, RunOutcome::ActionRejected);
+    module.stage_completed_action_outcome(&request, &applied);
+    commit(&mut module);
+    assert_eq!(recent_runs(&module)[0].outcome, RunOutcome::ActionRejected);
+    module.history.front_mut().unwrap().outcome = RunOutcome::Failed;
+    module.stage_completed_action_outcome(&request, &rejection);
+    commit(&mut module);
+    assert_eq!(recent_runs(&module)[0].outcome, RunOutcome::Failed);
+}
+
+#[test]
 fn a_verified_pr_link_is_staged_and_abort_discards_it() {
     let (mut module, _, entry) = hosted();
     module = module.with_sink_forge("forge");
@@ -114,7 +158,7 @@ fn a_verified_pr_link_is_staged_and_abort_discards_it() {
         agent_id: entry.agent_id.clone(),
         channel_id: entry.channel_id.clone(),
         anchor_seq: entry.anchor_seq,
-        outcome: RunOutcome::Delivered,
+        outcome: RunOutcome::ResultAccepted,
         degraded: false,
         created_at: 1,
         delivered_at: 2,

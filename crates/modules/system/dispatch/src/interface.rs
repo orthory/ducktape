@@ -281,7 +281,8 @@ pub enum CallOutcome {
 /// a call outcome minus its bulk: what a finalized call's record keeps once
 /// the outcome bytes were handed to the requester, and what a query exposes.
 /// an `Applied` output (up to `sdk::MAX_OUTPUT_BYTES`) is kept as its sha256
-/// digest; the assigned stamp, a handful of scalars, is kept verbatim.
+/// digest; the assigned metadata, bounded by `sdk::MAX_ASSIGNED_BYTES`, is
+/// kept verbatim.
 #[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CallOutcomeSummary {

@@ -185,7 +185,11 @@ fn assert_delivered(m: &mut RunsModule, run_id: &str) {
         .into_iter()
         .find(|r| r.run_id == run_id)
         .expect("a terminal record");
-    assert_eq!(record.outcome, RunOutcome::Delivered, "the run delivers");
+    assert_eq!(
+        record.outcome,
+        RunOutcome::ResultAccepted,
+        "the run delivers"
+    );
 }
 
 #[test]

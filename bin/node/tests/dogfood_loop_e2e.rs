@@ -294,7 +294,7 @@ fn seq_of(cluster: &Cluster, idx: usize, channel: &str, message_id: &str) -> u64
 
 fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) -> String {
     cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
-        find_message(cluster, idx, channel, &format!("agent/{run_id}")).map(|(_, text)| text)
+        find_message(cluster, idx, channel, &runs::reply_message_id(run_id)).map(|(_, text)| text)
     })
 }
 
@@ -586,7 +586,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     let record = cluster.await_committed(0, "run 1 in the delivered-runs ring", FINALIZE, || {
         run_record(&cluster, 0, &run_1)
     });
-    assert_eq!(record.outcome, RunOutcome::Delivered);
+    assert_eq!(record.outcome, RunOutcome::ResultAccepted);
     assert!(!record.degraded, "run 1 is clean: {record:?}");
     assert_eq!(
         record.output_ref.as_deref(),
@@ -662,7 +662,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
     let record = cluster.await_committed(0, "run 2 in the delivered-runs ring", FINALIZE, || {
         run_record(&cluster, 0, &run_2)
     });
-    assert_eq!(record.outcome, RunOutcome::Delivered);
+    assert_eq!(record.outcome, RunOutcome::ResultAccepted);
     assert!(!record.degraded, "run 2 is clean: {record:?}");
     assert_eq!(
         record.output_ref.as_deref(),

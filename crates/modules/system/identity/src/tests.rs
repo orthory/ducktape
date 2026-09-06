@@ -375,6 +375,83 @@ fn create_founds_account_one_then_two() {
 }
 
 #[test]
+fn reference_resolution_is_positional_and_reads_staged_accounts() {
+    let mut id = new_identity();
+    let alice = ed_pub(&ed(1));
+    let bob = ed_pub(&ed(2));
+    create(&mut id, &alice, "alice", KeyScheme::Ed25519).unwrap();
+    let mut ctx = ctx_external(&bob);
+    block_on(id.execute(
+        &mut ctx,
+        &identity_msg(&IdentityMsg::Create {
+            name: "bob".into(),
+            scheme: KeyScheme::Ed25519,
+        }),
+    ))
+    .unwrap();
+    let references = vec![
+        AccountRef::Key(bob.clone()),
+        AccountRef::Account(1),
+        AccountRef::Key(alice.clone()),
+        AccountRef::Account(2),
+        AccountRef::Account(0),
+        AccountRef::Key(vec![99]),
+        AccountRef::Account(3),
+        AccountRef::Key(bob.clone()),
+    ];
+    assert_eq!(
+        block_on(id.resolve_references(&references)).unwrap(),
+        vec![
+            Some(2),
+            Some(1),
+            Some(1),
+            Some(2),
+            None,
+            None,
+            None,
+            Some(2)
+        ]
+    );
+    block_on(id.abort_block()).unwrap();
+    assert_eq!(
+        block_on(id.resolve_references(&references)).unwrap(),
+        vec![None, Some(1), Some(1), None, None, None, None, None]
+    );
+}
+
+#[test]
+fn reference_resolution_rejects_oversized_batches_and_dangling_key_indexes() {
+    let mut id = new_identity();
+    let alice = ed_pub(&ed(1));
+    create(&mut id, &alice, "alice", KeyScheme::Ed25519).unwrap();
+    let batch = vec![AccountRef::Account(1); MAX_QUERY_LIMIT as usize];
+    assert_eq!(
+        block_on(id.resolve_references(&batch)).unwrap(),
+        vec![Some(1); batch.len()]
+    );
+    let oversized = vec![AccountRef::Account(1); MAX_QUERY_LIMIT as usize + 1];
+    assert!(
+        block_on(id.query(&encode_query(&IdentityQuery::Resolve {
+            references: oversized
+        })))
+        .is_err()
+    );
+    assert!(block_on(id.resolve_references(&[])).unwrap().is_empty());
+    let missing = vec![8; 32];
+    id.store(key_owner_key(&missing), &99u64);
+    assert!(
+        block_on(id.resolve_references(&[AccountRef::Key(missing)]))
+            .unwrap_err()
+            .to_string()
+            .contains("missing account record")
+    );
+    assert_eq!(
+        block_on(id.resolve_references(&[AccountRef::Account(99)])).unwrap(),
+        vec![None]
+    );
+}
+
+#[test]
 fn a_key_founds_at_most_one_account_and_names_are_not_unique() {
     let mut id = new_identity();
     let a = ed(1);

@@ -776,7 +776,7 @@ fn post_message_needs_its_own_grant_and_chat_post_does_not_widen_into_it() {
     assert_eq!(blocks, &vec![Block::paragraph("still working on it")]);
     assert_eq!(
         *message_id,
-        format!("agent/{run_id}/post/s0"),
+        post_message_id(&run_id, "s0"),
         "deterministic, and never the run's ONE reply id"
     );
     assert_ne!(*message_id, reply_message_id(&run_id));

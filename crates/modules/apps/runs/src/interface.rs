@@ -39,20 +39,24 @@ pub struct PendingRun {
     pub created_at: u64,
 }
 
-// ---- delivered-run history --------------------------------------------------
+// ---- terminal-run history ---------------------------------------------------
 
-/// how a run ended: the result delivered, or it failed (worker error,
-/// timeout, cancellation, failed validation). a degraded-but-delivered run is
-/// `Delivered` with [`RunRecord::degraded`] set.
+/// Model-result admission and result-action execution are separate facts. An
+/// accepted result proposes effects that its program may execute or omit.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RunOutcome {
-    Delivered,
+    /// The model result passed admission; this does not claim its effects ran.
+    ResultAccepted,
+    /// At least one proposed result action was refused by its program or target.
+    /// The corresponding ActionRequest carries the authenticated reason.
+    ActionRejected,
+    /// Worker error, timeout, cancellation, or failed result validation.
     Failed,
 }
 
-/// one terminal run in the delivered-runs ring — DERIVED observability state,
-/// recorded at delivery (the moment the pending entry prunes). never part of
+/// One terminal run in the history ring, recorded when its pending entry
+/// prunes and updated by authenticated result-action completions. Never part of
 /// `root()`/snapshot: replay rebuilds it deterministically, and a
 /// snapshot-joined node starts with an empty ring.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -66,7 +70,7 @@ pub struct RunRecord {
     /// thread key is `"{channel_id}#{seq}"`.
     pub anchor_seq: u64,
     pub outcome: RunOutcome,
-    /// the host observed the run as degraded but still delivered it.
+    /// The accepted model result was degraded during validation or composition.
     pub degraded: bool,
     /// consensus counters (creation block / delivery block) — counter DIFFS
     /// are meaningful, the raw values are whatever the lane stamps.
@@ -367,7 +371,7 @@ pub enum RunsQuery {
     /// every in-flight correlation entry, ascending by dispatch id. bounded:
     /// entries prune on delivery, and every dispatch has a deadline.
     PendingRuns,
-    /// the delivered-runs ring, newest first (last 100). derived state — see
+    /// The terminal-runs ring, newest first (last 100). Derived state — see
     /// [`RunRecord`].
     RecentRuns,
     /// every LIVE agent session, ascending by run id — the audit surface: which

@@ -129,10 +129,12 @@ pub struct Msg {
 pub const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// hard cap on a dispatch's assigned stamp ([`Ctx::set_assigned`]) — the
-/// module-assigned values of one applied op (a sequence, a revision), carried
-/// into the derived-tier op feed. a stamp is a handful of scalars, never a
-/// data lane; an oversized stamp is a deterministic rejection of the op.
-pub const MAX_ASSIGNED_BYTES: usize = 4 * 1024;
+/// module-assigned values of one applied op, carried into the derived-tier
+/// op feed. Besides counters, this can include the canonical identities of
+/// every reference in a 64 KiB source record. The original payload carries
+/// the body; an oversized stamp is a deterministic rejection, never a
+/// truncation. Call admission reserves this budget inside its record limit.
+pub const MAX_ASSIGNED_BYTES: usize = 64 * 1024;
 
 /// A dispatch declaration shared by native and Wasm execution. Oversized
 /// values are discarded and cannot be replaced by a later valid declaration.

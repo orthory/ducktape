@@ -290,6 +290,7 @@ impl RunsModule {
             let exact_retry = previous == &call && completing.invocation == call.invocation;
             if exact_retry {
                 self.stage_completed_pr_link(&request, outcome, result)?;
+                self.stage_completed_action_outcome(&request, outcome);
                 ctx.set_output(sdk::wire::encode(&request.view.status));
                 return Ok(());
             }
@@ -330,10 +331,30 @@ impl RunsModule {
             | dispatch::CallStatus::Delivered { outcome, .. } => outcome,
         };
         self.stage_completed_pr_link(&request, &outcome, result)?;
+        self.stage_completed_action_outcome(&request, &outcome);
         request.view.status = ActionStatus::Completed { call, outcome };
         ctx.set_output(sdk::wire::encode(&request.view.status));
         self.stage_action_marker(&request).await?;
         Ok(())
+    }
+
+    pub(super) fn stage_completed_action_outcome(
+        &mut self,
+        request: &ActionRequest,
+        outcome: &dispatch::CallOutcomeSummary,
+    ) {
+        let target_rejected = match outcome {
+            dispatch::CallOutcomeSummary::Applied { .. } => false,
+            dispatch::CallOutcomeSummary::Rejected { .. }
+            | dispatch::CallOutcomeSummary::Refused(_)
+            | dispatch::CallOutcomeSummary::Unrepresentable { .. } => true,
+        };
+        let result_action_rejected =
+            matches!(request.scope, RequestScope::Result) && target_rejected;
+        if result_action_rejected {
+            self.pending_action_rejections
+                .insert(request.view.run_id.clone());
+        }
     }
 
     /// The program supplies decoded output, but only dispatch's authenticated
@@ -405,6 +426,10 @@ impl RunsModule {
         }
         request.view.status = ActionStatus::Rejected { reason };
         self.stage_action_marker(&request).await?;
+        if matches!(request.scope, RequestScope::Result) {
+            self.pending_action_rejections
+                .insert(request.view.run_id.clone());
+        }
         Ok(())
     }
 

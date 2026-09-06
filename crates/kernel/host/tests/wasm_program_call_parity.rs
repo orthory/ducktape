@@ -208,7 +208,7 @@ fn compiled_guest_and_native_finalize_identical_call_results_and_roots() {
         (b"output-cap-then-error", Some("Module(explicit refusal)")),
         (
             b"assigned-cap",
-            Some("Module(op assigned stamp exceeds cap (4097 > 4096))"),
+            Some("Module(op assigned stamp exceeds cap (65537 > 65536))"),
         ),
         (b"module-error", Some("Module(explicit refusal)")),
         (b"self-query", Some("SelfQuery")),

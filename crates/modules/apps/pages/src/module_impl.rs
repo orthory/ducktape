@@ -166,16 +166,44 @@ impl Pages {
             } => BTreeSet::from([*account]),
             _ => BTreeSet::new(),
         };
-        for number in accounts {
-            let exists = number != 0
-                && self
-                    .identity_account(ctx, identity::IdentityQuery::Get { number })
-                    .await?
-                    .is_some();
-            if !exists {
-                return Err(Error::Module(format!(
-                    "pages: mention names no account: {number}"
-                )));
+        let accounts: Vec<_> = accounts.into_iter().collect();
+        for chunk in accounts.chunks(identity::MAX_QUERY_LIMIT as usize) {
+            let numbers = match &self.identity {
+                Some(identity) => {
+                    let references = chunk
+                        .iter()
+                        .copied()
+                        .map(identity::AccountRef::Account)
+                        .collect();
+                    let bytes = ctx
+                        .query(
+                            identity,
+                            &identity::encode_query(&identity::IdentityQuery::Resolve {
+                                references,
+                            }),
+                        )
+                        .await?;
+                    let identity::IdentityReply::Resolved(numbers) =
+                        identity::decode_reply(&bytes).map_err(Error::Module)?
+                    else {
+                        return Err(Error::Module("pages: unexpected identity reply".into()));
+                    };
+                    numbers
+                }
+                None => vec![None; chunk.len()],
+            };
+            if numbers.len() != chunk.len() {
+                return Err(Error::Module(
+                    "pages: identity resolution count mismatch".into(),
+                ));
+            }
+            for (number, resolved) in chunk.iter().zip(numbers) {
+                let exists = *number != 0 && resolved == Some(*number);
+                if !exists {
+                    return Err(Error::Module(format!(
+                        "pages: mention names no account: {number}"
+                    )));
+                }
             }
         }
         Ok(())

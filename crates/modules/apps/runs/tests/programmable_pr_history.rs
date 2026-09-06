@@ -97,7 +97,11 @@ async fn awaiting_pr(
                         agent_id: "builder".into(),
                         display_name: None,
                         capability: None,
-                        allowed_actions: None,
+                        allowed_actions: Some(vec![
+                            runs::ACTION_TASKS_CREATE.into(),
+                            runs::ACTION_CHAT_POST.into(),
+                            runs::ACTION_CHAT_POST_MESSAGE.into(),
+                        ]),
                         recipe_hash: None,
                         skills: None,
                         caps: Some(runs::ResourceCaps {
@@ -202,6 +206,47 @@ async fn awaiting_pr(
             ),
         )
         .await;
+    assert_eq!(run.run_id, runs::run_id_for("forge:demo:1", 1, "builder"));
+    assert!(run.run_id.contains('\u{1f}'));
+    network
+        .submit(
+            provider(),
+            msg(
+                "runs",
+                &runs::RunsMsg::OpenAgentSession {
+                    run_id: run.run_id.clone(),
+                    session_key: vec![9; 32],
+                },
+            ),
+        )
+        .await;
+    network
+        .submit(
+            session(),
+            msg(
+                "runs",
+                &runs::RunsMsg::AgentAction {
+                    run_id: run.run_id.clone(),
+                    action: runs::AgentAction::PostMessage {
+                        channel_id: "forge:demo:1".into(),
+                        text: "Working on this issue".into(),
+                        thread: None,
+                    },
+                },
+            ),
+        )
+        .await;
+    network.drain().await;
+    assert!(matches!(
+        network
+            .action(&runs::action_request_id(&run.run_id, 0))
+            .await
+            .status,
+        runs::ActionStatus::Completed {
+            outcome: dispatch::CallOutcomeSummary::Applied { .. },
+            ..
+        }
+    ));
     let result = sdk::wire::encode(&serde_json::json!({
         "ducktape_runner_result": 1,
         "response_text": "Implemented the requested change.",
@@ -248,6 +293,25 @@ fn history_links_the_actual_program_allocation_after_another_item_wins_the_next_
         issue(&mut network, "Another transaction allocates item two").await;
         network.drain().await;
         assert_eq!(
+            history(&network, &run.run_id).await.unwrap().outcome,
+            runs::RunOutcome::ResultAccepted
+        );
+        let bytes = network
+            .host
+            .query(
+                "chat",
+                &chat::encode_query(&chat::ChatQuery::Message {
+                    message_id: runs::reply_message_id(&run.run_id),
+                }),
+            )
+            .await
+            .unwrap();
+        let chat::ChatReply::Message(Some(reply)) = chat::decode_reply(&bytes).unwrap() else {
+            panic!("explicit RequestRun reply must actually commit");
+        };
+        assert_eq!(reply.head.author, chat::Party::Account(2));
+        assert_eq!(reply.head.origin, sdk::Origin::Program(2));
+        assert_eq!(
             history(&network, &run.run_id).await.unwrap().pr_number,
             Some(3)
         );
@@ -275,6 +339,10 @@ fn a_rejected_program_target_never_links_a_predicted_pr() {
             None
         );
         assert!(item(&network, 2).await.is_none());
+        assert_eq!(
+            history(&network, &run.run_id).await.unwrap().outcome,
+            runs::RunOutcome::ActionRejected
+        );
         let receipt = network
             .action(&format!("result/{}/1", run.dispatch_id))
             .await;

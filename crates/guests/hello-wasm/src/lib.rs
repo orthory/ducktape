@@ -81,7 +81,7 @@ impl Guest for Component {
                         host::set_output(&vec![0; 256 * 1024 + 1]);
                         return Err(host::Error::Rejected("explicit refusal".into()));
                     }
-                    b"assigned-cap" => host::set_assigned(&vec![0; 4 * 1024 + 1]),
+                    b"assigned-cap" => host::set_assigned(&vec![0; 64 * 1024 + 1]),
                     b"declarations-valid" => {
                         host::set_output(b"result");
                         host::set_assigned(b"stamp");

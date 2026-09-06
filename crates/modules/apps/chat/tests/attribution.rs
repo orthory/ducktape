@@ -1039,7 +1039,22 @@ fn key_mentions_are_frozen_as_accounts_in_canonical_heads_and_stamps() {
             .with_attribution("attribution");
         let context = |key_owner| {
             TestCtx::at_height(1).on_query("identity", move |query| {
-                let number = match identity::decode_query(query).unwrap() {
+                let query = identity::decode_query(query).unwrap();
+                if let identity::IdentityQuery::Resolve { references } = query {
+                    let numbers = references
+                        .into_iter()
+                        .map(|reference| {
+                            Some(match reference {
+                                identity::AccountRef::Key(_) => key_owner,
+                                identity::AccountRef::Account(number) => number,
+                            })
+                        })
+                        .collect();
+                    return Ok(identity::encode_reply(&identity::IdentityReply::Resolved(
+                        numbers,
+                    )));
+                }
+                let number = match query {
                     identity::IdentityQuery::OfKey { .. } => key_owner,
                     identity::IdentityQuery::Get { number } => number,
                     _ => panic!("identity point read"),

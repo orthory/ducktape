@@ -375,7 +375,7 @@ fn wait_for_reply(
             return None;
         };
         views.into_iter().find_map(|v| {
-            (v.head.message_id == format!("agent/{run_id}")).then(|| {
+            (v.head.message_id == runs::reply_message_id(run_id)).then(|| {
                 assert_eq!(
                     v.head.author,
                     Party::Account(account),
@@ -418,6 +418,17 @@ fn wait_for_delivered(cluster: &Cluster, idx: usize, run_id: &str) {
             _ => None,
         }
     });
+    let reply = cluster
+        .query(idx, "runs", &runs::encode_query(&RunsQuery::RecentRuns))
+        .expect("the accepted run's history");
+    let RunsReply::RecentRuns(records) = runs::decode_reply(&reply).unwrap() else {
+        panic!("expected recent runs");
+    };
+    let record = records
+        .iter()
+        .find(|record| record.run_id == run_id)
+        .unwrap();
+    assert_eq!(record.outcome, runs::RunOutcome::ResultAccepted);
 }
 
 /// every op row of `module`'s derived op index on `idx`, oldest-first.
@@ -571,7 +582,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
         (status == 200).then_some(())?;
         let rows = body["roots"]["roots"].as_array()?;
         rows.iter()
-            .find(|r| r["message_id"] == format!("agent/{run_text}"))
+            .find(|r| r["message_id"] == runs::reply_message_id(&run_text))
             .map(|_| ())
     });
 
@@ -592,7 +603,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
             op_height(&index_ops(&cluster, 0, "chat"), |p| {
                 p.get("post_message")
                     .and_then(|m| m["message_id"].as_str())
-                    .is_some_and(|id| id == format!("agent/{run_text}"))
+                    .is_some_and(|id| id == runs::reply_message_id(&run_text))
             })
         });
     assert!(

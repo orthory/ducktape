@@ -223,6 +223,14 @@ pub enum IdentityMsg {
     RevokeProgram { account: AccountNumber },
 }
 
+/// An account number or an associated key whose current account is needed.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum AccountRef {
+    Account(AccountNumber),
+    Key(Vec<u8>),
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum IdentityQuery {
@@ -241,6 +249,11 @@ pub enum IdentityQuery {
     /// answer here.
     OfKey {
         key: Vec<u8>,
+    },
+    /// Resolve at most [`MAX_QUERY_LIMIT`] references in their input order.
+    /// Missing accounts/keys return `None`; an oversized batch rejects whole.
+    Resolve {
+        references: Vec<AccountRef>,
     },
     /// how many times `key` has been admitted anywhere (absent = 0) -- the
     /// generation an add-key consent must sign.
@@ -262,6 +275,7 @@ pub enum IdentityQuery {
 pub enum IdentityReply {
     Accounts(Vec<AccountView>),
     Account(Option<AccountView>),
+    Resolved(Vec<Option<AccountNumber>>),
     Gen(u64),
 }
 

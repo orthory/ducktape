@@ -603,5 +603,5 @@ fn a_post_into_a_channel_the_requester_cannot_post_to_fails_the_run() {
     .unwrap();
     assert_eq!(ctx.chat_msgs().len(), 2, "the reply and the post");
     commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Delivered);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::ResultAccepted);
 }

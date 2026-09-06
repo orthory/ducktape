@@ -493,7 +493,7 @@ impl Chat {
         let reply = ctx.query(identity, &identity_encode_query(query)).await?;
         match identity_decode_reply(&reply).map_err(Error::Module)? {
             IdentityReply::Account(account) => Ok(account.map(|view| view.number)),
-            IdentityReply::Accounts(_) | IdentityReply::Gen(_) => {
+            IdentityReply::Accounts(_) | IdentityReply::Resolved(_) | IdentityReply::Gen(_) => {
                 Err(Error::Module("chat: unexpected identity reply".into()))
             }
         }
@@ -550,28 +550,61 @@ impl Chat {
 
     /// the account a mention names, or the rejection: an account must exist,
     /// a key must hold an account, and a module or the system is no account.
-    async fn resolve_mention(
+    async fn resolve_mention_batch(
         &self,
         ctx: &dyn Ctx,
-        mention: &Party,
-    ) -> Result<AccountNumber, Error> {
-        match mention {
-            Party::Account(account) => {
-                if !self.account_exists(ctx, *account).await? {
-                    return Err(Error::Module(format!(
-                        "chat: a mention names no account: {account}"
-                    )));
-                }
-                Ok(*account)
-            }
-            Party::Key(key) => self
-                .account_of_key(ctx, key)
-                .await?
-                .ok_or_else(|| Error::Module("chat: a mentioned key belongs to no account".into())),
-            Party::Module(_) | Party::System => Err(Error::Module(
-                "chat: a mention names an account, never a module or the system".into(),
-            )),
+        mentions: &[Party],
+    ) -> Result<Vec<AccountNumber>, Error> {
+        if mentions.is_empty() {
+            return Ok(Vec::new());
         }
+        let references: Vec<_> = mentions
+            .iter()
+            .filter_map(|mention| match mention {
+                Party::Account(number) => Some(identity::AccountRef::Account(*number)),
+                Party::Key(key) => Some(identity::AccountRef::Key(key.clone())),
+                Party::Module(_) | Party::System => None,
+            })
+            .collect();
+        let numbers = match &self.identity {
+            Some(identity) => {
+                let bytes = ctx
+                    .query(
+                        identity,
+                        &identity_encode_query(&IdentityQuery::Resolve { references }),
+                    )
+                    .await?;
+                let IdentityReply::Resolved(numbers) =
+                    identity_decode_reply(&bytes).map_err(Error::Module)?
+                else {
+                    return Err(Error::Module("chat: unexpected identity reply".into()));
+                };
+                numbers
+            }
+            None => vec![None; mentions.len()],
+        };
+        if numbers.len() != mentions.len() {
+            return Err(Error::Module(
+                "chat: identity resolution count mismatch".into(),
+            ));
+        }
+        mentions
+            .iter()
+            .zip(numbers)
+            .map(|(mention, number)| {
+                number.ok_or_else(|| {
+                    Error::Module(match mention {
+                        Party::Account(account) => {
+                            format!("chat: a mention names no account: {account}")
+                        }
+                        Party::Key(_) => "chat: a mentioned key belongs to no account".into(),
+                        Party::Module(_) | Party::System => {
+                            "chat: a mention names an account, never a module or the system".into()
+                        }
+                    })
+                })
+            })
+            .collect()
     }
 
     /// the accounts `blocks` mention, resolved and deduplicated in first
@@ -585,14 +618,26 @@ impl Chat {
         let mut accounts = Vec::new();
         let mut key_mentions = Vec::new();
         let mut resolved = BTreeMap::new();
-        for mention in collect_mentions(blocks) {
-            let account = self.resolve_mention(ctx, &mention).await?;
-            if matches!(mention, Party::Key(_)) {
-                key_mentions.push(account);
+        let mentions = collect_mentions(blocks);
+        for chunk in mentions.chunks(identity::MAX_QUERY_LIMIT as usize) {
+            let end = chunk
+                .iter()
+                .position(|party| !party.is_person())
+                .unwrap_or(chunk.len());
+            let numbers = self.resolve_mention_batch(ctx, &chunk[..end]).await?;
+            for (mention, account) in chunk[..end].iter().zip(numbers) {
+                if matches!(mention, Party::Key(_)) {
+                    key_mentions.push(account);
+                }
+                resolved.insert(mention.clone(), account);
+                if !accounts.contains(&account) {
+                    accounts.push(account);
+                }
             }
-            resolved.insert(mention, account);
-            if !accounts.contains(&account) {
-                accounts.push(account);
+            if end != chunk.len() {
+                return Err(Error::Module(
+                    "chat: a mention names an account, never a module or the system".into(),
+                ));
             }
         }
         for block in blocks {

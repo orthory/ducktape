@@ -173,9 +173,10 @@ pub fn job_spec_hash(spec: &[u8]) -> Vec<u8> {
     Sha256::digest(spec).to_vec()
 }
 
-/// the chat message id of a run's reply — one run posts at most one reply.
+/// The chat message id of a run's reply. Hash the internal run key so its
+/// reserved separators and arbitrary suffixes cannot enter the public id space.
 pub fn reply_message_id(run_id: &str) -> String {
-    format!("agent/{run_id}")
+    format!("agent/{}", dispatch_id_for(run_id))
 }
 
 /// which lane an agent action is being applied from — and therefore how its
@@ -217,7 +218,7 @@ impl Lane {
 /// catches). the slot is the action's [`Lane`] slot: its index in the delivered
 /// response, or `s{n}` for the nth action of the run's session.
 pub fn post_message_id(run_id: &str, slot: &str) -> String {
-    format!("agent/{run_id}/post/{slot}")
+    format!("agent/{}/post/{slot}", dispatch_id_for(run_id))
 }
 
 /// the dispatch-plane recipe an agent's runs execute under — registered
@@ -462,6 +463,8 @@ pub struct RunsModule {
     pending_history: Vec<RunRecord>,
     /// Verified PR allocations update existing history only at commit.
     pending_pr_links: BTreeMap<String, u64>,
+    /// Authenticated result-action refusals become visible only at commit.
+    pending_action_rejections: BTreeSet<String>,
 }
 
 impl RunsModule {
@@ -535,6 +538,7 @@ impl RunsModule {
             history: VecDeque::new(),
             pending_history: Vec::new(),
             pending_pr_links: BTreeMap::new(),
+            pending_action_rejections: BTreeSet::new(),
         }
     }
 
@@ -756,6 +760,7 @@ impl RunsModule {
         self.history.clear();
         self.pending_history.clear();
         self.pending_pr_links.clear();
+        self.pending_action_rejections.clear();
         Ok(())
     }
 
@@ -795,6 +800,7 @@ impl RunsModule {
         self.history = history;
         self.pending_history.clear();
         self.pending_pr_links.clear();
+        self.pending_action_rejections.clear();
         Ok(())
     }
 }

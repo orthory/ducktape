@@ -979,6 +979,67 @@ fn the_collaboration_loop_lands_identically_on_both_runtimes() {
         let settled = root_of(&pair.wasm);
         replies(&pair.wasm).await;
         assert_eq!(root_of(&pair.wasm), settled, "queries do not write");
+
+        // The model result can be accepted before its separately authorized
+        // reply executes. A competing committed post then makes that call fail.
+        pair.submit(alice(), plain_post("general", "manual-after-mention"))
+            .await;
+        pair.submit(alice(), request("quackbot", "general", 3))
+            .await;
+        pair.drain().await;
+        let manual = pending_run_ids(&pair.wasm).await.pop().unwrap();
+        assert_eq!(manual, runs::run_id_for("general", 3, "quackbot"));
+        pair.accept(&manual).await;
+        let response = encode_response(&AgentResponse {
+            reply_blocks: vec![ReplyBlock {
+                kind: "paragraph".into(),
+                text: "answer".into(),
+                lang: None,
+            }],
+            actions: Vec::new(),
+            commit_message: None,
+        });
+        let oracle = oracle_op(&pair.native, &manual, wrap_runner(response)).await;
+        pair.submit(Origin::External(WORKER_NODE.to_vec()), oracle)
+            .await;
+        while !recent_runs(&pair.wasm)
+            .await
+            .iter()
+            .any(|record| record.run_id == manual)
+        {
+            assert!(pair.wasm.has_pending_work().await.unwrap());
+            pair.batch(Vec::new()).await;
+        }
+        assert_eq!(
+            recent_runs(&pair.wasm).await[0].outcome,
+            runs::RunOutcome::ResultAccepted
+        );
+        pair.submit(alice(), plain_post("general", &reply_message_id(&manual)))
+            .await;
+        pair.drain().await;
+        let receipt = pair
+            .action(&format!("result/{}/0", dispatch_id_for(&manual)))
+            .await;
+        let runs::ActionStatus::Completed {
+            outcome: dispatch::CallOutcomeSummary::Rejected { reason },
+            ..
+        } = receipt.status
+        else {
+            panic!("the actual target must reject the occupied reply id: {receipt:?}");
+        };
+        assert!(!reason.is_empty());
+        assert_eq!(
+            recent_runs(&pair.wasm).await[0].outcome,
+            runs::RunOutcome::ActionRejected
+        );
+        assert_eq!(
+            chat_message(&pair.wasm, &reply_message_id(&manual))
+                .await
+                .unwrap()
+                .head
+                .author,
+            Party::Account(1)
+        );
     });
 }
 
@@ -1227,7 +1288,14 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             ],
         )
         .await;
-        let run = pair.mention_run().await;
+        pair.submit(alice(), plain_post("general", "manual-anchor"))
+            .await;
+        pair.submit(alice(), request("quackbot", "general", 1))
+            .await;
+        pair.drain().await;
+        let run = pending_run_ids(&pair.wasm).await.pop().unwrap();
+        assert_eq!(run, runs::run_id_for("general", 1, "quackbot"));
+        assert!(run.contains('\u{1f}'));
         pair.accept(&run).await;
         assert_eq!(
             dispatch_assignee(&pair.wasm, &run).await,
@@ -1295,6 +1363,15 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
         assert_eq!(message.head.origin, Origin::Program(2));
         verify_receipt_snapshots(&pair, &runs::action_request_id(&run, 0)).await;
         pair.settle(&run, canned_response(&run)).await;
+        let reply = chat_message(&pair.wasm, &reply_message_id(&run))
+            .await
+            .unwrap();
+        assert_eq!(reply.head.author, Party::Account(2));
+        assert_eq!(reply.head.origin, Origin::Program(2));
+        assert_eq!(
+            recent_runs(&pair.wasm).await[0].outcome,
+            runs::RunOutcome::ResultAccepted
+        );
         assert!(agent_sessions(&pair.wasm).await.is_empty());
         pair.rejected(
             Origin::External(SESSION_KEY.to_vec()),
