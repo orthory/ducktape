@@ -288,41 +288,42 @@ pub(crate) async fn ensure_channel(handle: &NodeHandle, channel: &str) -> Ensure
     }
 }
 
-/// prove this node's own account owns `channel` after losing the create race
-/// for it. No new plumbing is needed to learn "this node's own account
-/// bytes" — `RenameChannel` to the SAME name is an idempotent no-op that
-/// still runs `check_channel_admin` (chat's `stage_rename`) before the
-/// idempotency short-circuit, so submitting one under the exact origin
-/// [`ensure_channel`] would have created the channel with is a
-/// self-authenticating probe: it commits only when that origin already IS
-/// `Channel.owner`.
-async fn confirm_ownership(handle: &NodeHandle, channel: &str) -> EnsureChannelOutcome {
-    let (reply, rx) = futures::channel::oneshot::channel();
-    let payload = chat::encode_msg(&chat::ChatMsg::RenameChannel {
-        channel_id: channel.to_string(),
-        name: channel.to_string(),
-    });
-    let sent = handle
-        .send(NodeCommand::Submit {
-            target: chat::DEFAULT_CHAT_TARGET.to_string(),
-            payload,
-            origin: crate::DEFAULT_ORIGIN.as_bytes().to_vec(),
-            reply,
-        })
-        .await;
-    if sent.is_err() {
-        return EnsureChannelOutcome::Failed("actor gone".to_string());
+/// this node's own account, in the same shape `Channel.owner` compares
+/// against — a pure LOCAL read, no query and no write.
+///
+/// Mirrors the origin resolution [`ensure_channel`]'s doc describes: `bin/node`
+/// signs a `Submit` with its own node key regardless of the `origin` field, and
+/// that key is exactly `NodeStatus.public_key` (`bin/node/src/boot/mesh.rs`
+/// derives both from the same signer) — published once at boot, so reading it
+/// back here costs nothing that reaching consensus would. A daemon with no mesh
+/// identity (the embedded local daemon, `bin/noded`) publishes an empty
+/// `public_key`, and on that path the origin field IS the author: the literal
+/// [`crate::DEFAULT_ORIGIN`] bytes `ensure_channel` submits.
+fn self_account(handle: &NodeHandle) -> Vec<u8> {
+    let public_key = handle.status_cell().current().public_key;
+    match crate::term::decode_node_key(&public_key) {
+        Some(bytes) => bytes.to_vec(),
+        None => crate::DEFAULT_ORIGIN.as_bytes().to_vec(),
     }
-    match rx.await {
-        Err(_) => EnsureChannelOutcome::Failed("reply dropped".to_string()),
-        Ok(Ok(_)) => EnsureChannelOutcome::Ready,
-        // `check_channel_admin`'s two refusal texts (not the owner; unowned) —
-        // either way this node's own account did not mint the channel that
-        // already exists at this id.
-        Ok(Err(reason)) if reason.contains("may administer") => {
-            EnsureChannelOutcome::Squatted("channel_owned_by_another_account")
-        }
-        Ok(Err(reason)) => EnsureChannelOutcome::Failed(reason),
+}
+
+/// prove this node's own account owns `channel` after losing the create race
+/// for it — a READ, not a write: `query_channel` is the same `ChatQuery::Channel`
+/// point read [`projector_loop`] already trusts, so this asks it the one
+/// question that matters BEFORE the projector ever spawns, instead of after.
+/// No new chat op and no new query shape — `Channel.owner` was always the
+/// right anchor, the missing piece was comparing it against something.
+async fn confirm_ownership(handle: &NodeHandle, channel: &str) -> EnsureChannelOutcome {
+    let record = match query_channel(handle, channel).await {
+        Ok(record) => record,
+        Err(reason) => return EnsureChannelOutcome::Failed(reason),
+    };
+    match channel_owner(record) {
+        Ok(owner) if owner == self_account(handle) => EnsureChannelOutcome::Ready,
+        // either a different account's `User` origin owns it, or (impossible
+        // by construction for a `term-<id>` channel, but fail closed anyway)
+        // it has no owner at all — neither is this node's own account.
+        Ok(_) | Err(_) => EnsureChannelOutcome::Squatted("channel_owned_by_another_account"),
     }
 }
 
@@ -488,31 +489,53 @@ mod tests {
 
     /// a stand-in chat actor for [`ensure_channel`]/[`confirm_ownership`]:
     /// answers `CreateChannel` with `create_reply` (the first-create outcome)
-    /// and `RenameChannel` with `rename_reply` (the ownership-probe outcome).
-    /// Every other op panics — these two are the only ones `ensure_channel`'s
-    /// path ever submits.
+    /// and `ChatQuery::Channel` with a record owned by `existing_owner` —
+    /// [`confirm_ownership`]'s READ, reached only after a create loss. Every
+    /// other op panics — these are the only two `ensure_channel`'s path ever
+    /// issues.
     fn spawn_chat_actor(
         mut rx: futures::channel::mpsc::Receiver<NodeCommand>,
         create_reply: Result<(), &'static str>,
-        rename_reply: Result<(), &'static str>,
+        existing_owner: Option<Vec<u8>>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             while let Some(cmd) = rx.next().await {
                 match cmd {
                     NodeCommand::Submit { payload, reply, .. } => {
-                        let reply_with = match chat::decode_msg(&payload).expect("a chat op") {
-                            chat::ChatMsg::CreateChannel { .. } => create_reply,
-                            chat::ChatMsg::RenameChannel { .. } => rename_reply,
+                        match chat::decode_msg(&payload).expect("a chat op") {
+                            chat::ChatMsg::CreateChannel { .. } => {
+                                let _ = reply.send(
+                                    create_reply
+                                        .map(|()| committed_block())
+                                        .map_err(|reason| reason.to_string()),
+                                );
+                            }
                             other => panic!("ensure_channel submitted an unexpected op: {other:?}"),
-                        };
-                        let _ = reply.send(
-                            reply_with
-                                .map(|()| committed_block())
-                                .map_err(|reason| reason.to_string()),
-                        );
+                        }
                     }
-                    NodeCommand::Query { .. } | NodeCommand::SubmitFrame { .. } => {
-                        panic!("ensure_channel queried the actor unexpectedly")
+                    NodeCommand::Query { req, reply, .. } => {
+                        let chat::ChatQuery::Channel { channel_id } =
+                            chat::decode_query(&req).expect("a chat query")
+                        else {
+                            panic!("confirm_ownership queried something other than Channel");
+                        };
+                        let record = existing_owner.clone().map(|owner| chat::Channel {
+                            id: channel_id.clone(),
+                            name: channel_id,
+                            created_at: 0,
+                            head_seq: 0,
+                            post_policy: chat::PostPolicy::Open,
+                            hooks: Vec::new(),
+                            pinned: Vec::new(),
+                            huddle: Vec::new(),
+                            owner: Some(owner),
+                            archived: false,
+                        });
+                        let _ =
+                            reply.send(Ok(chat::encode_reply(&chat::ChatReply::Channel(record))));
+                    }
+                    NodeCommand::SubmitFrame { .. } => {
+                        panic!("ensure_channel used SubmitFrame unexpectedly")
                     }
                 }
             }
@@ -667,7 +690,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_channel_is_ready_on_a_fresh_create() {
         let (handle, rx, _hub) = NodeHandle::channel();
-        let actor = spawn_chat_actor(rx, Ok(()), Err("unused"));
+        let actor = spawn_chat_actor(rx, Ok(()), None);
         assert!(matches!(
             ensure_channel(&handle, "term-0000000000000001").await,
             EnsureChannelOutcome::Ready
@@ -678,15 +701,16 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_channel_confirms_ownership_after_losing_the_create_race() {
-        // the create lost the race ("already exists"), but the rename probe —
-        // gated by chat's own `check_channel_admin` — commits, meaning this
-        // node's own account already IS the channel's owner. Ready, same as a
-        // fresh create.
+        // the create lost the race ("already exists"), but the READ back says
+        // the existing channel's owner is `DEFAULT_ORIGIN` — the same account
+        // `NodeHandle::channel()`'s bare test handle (no mesh identity)
+        // resolves to. This node's own account already IS the channel's
+        // owner. Ready, same as a fresh create — and no write was made.
         let (handle, rx, _hub) = NodeHandle::channel();
         let actor = spawn_chat_actor(
             rx,
             Err("channel already exists: term-0000000000000001"),
-            Ok(()),
+            Some(crate::DEFAULT_ORIGIN.as_bytes().to_vec()),
         );
         assert!(matches!(
             ensure_channel(&handle, "term-0000000000000001").await,
@@ -699,17 +723,17 @@ mod tests {
     /// **#1746, the regression.** A create loss ("already exists") used to be
     /// treated as success outright, with no check of who actually won it — so
     /// a member who pre-squatted `term-<id>` became the session's command
-    /// author. Now the ownership probe's refusal (chat's `check_channel_admin`
-    /// text) is surfaced as `Squatted`, which `create_local` closes the
-    /// session on rather than spawning a projector that would trust the
-    /// squatter as `Channel.owner`.
+    /// author. Now the READ-back owner is compared against this node's own
+    /// account, and a mismatch surfaces as `Squatted`, which `create_local`
+    /// closes the session on rather than spawning a projector that would
+    /// trust the squatter as `Channel.owner`.
     #[tokio::test]
     async fn ensure_channel_refuses_a_channel_squatted_by_another_account() {
         let (handle, rx, _hub) = NodeHandle::channel();
         let actor = spawn_chat_actor(
             rx,
             Err("channel already exists: term-0000000000000001"),
-            Err("only the owner may administer channel term-0000000000000001"),
+            Some(vec![0x99, 0x99]),
         );
         assert!(matches!(
             ensure_channel(&handle, "term-0000000000000001").await,
@@ -724,13 +748,31 @@ mod tests {
         // NOT an authorization outcome — an actor/transport failure never
         // reaches `confirm_ownership` and must not be mistaken for a squat.
         let (handle, rx, _hub) = NodeHandle::channel();
-        let actor = spawn_chat_actor(rx, Err("host busy"), Err("unused"));
+        let actor = spawn_chat_actor(rx, Err("host busy"), None);
         assert!(matches!(
             ensure_channel(&handle, "term-0000000000000001").await,
             EnsureChannelOutcome::Failed(reason) if reason == "host busy"
         ));
         drop(handle);
         actor.await.expect("actor task");
+    }
+
+    #[test]
+    fn self_account_falls_back_to_default_origin_with_no_mesh_identity() {
+        // the bare test handle publishes no `NodeStatus` (empty `public_key`)
+        // — the embedded-local-daemon shape `ensure_channel`'s doc describes.
+        let (handle, _rx, _hub) = NodeHandle::channel();
+        assert_eq!(self_account(&handle), crate::DEFAULT_ORIGIN.as_bytes());
+    }
+
+    #[test]
+    fn self_account_reads_the_published_mesh_identity_when_present() {
+        let (handle, _rx, _hub) = NodeHandle::channel();
+        handle.status_cell().publish(crate::NodeStatus {
+            public_key: "ab".repeat(32),
+            ..Default::default()
+        });
+        assert_eq!(self_account(&handle), vec![0xab; 32]);
     }
 
     #[test]

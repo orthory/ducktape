@@ -1602,7 +1602,7 @@ pub enum CreateRoute {
 }
 
 /// decode a 64-hex node key to its 32 bytes.
-fn decode_node_key(hex: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_node_key(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 {
         return None;
     }
