@@ -96,13 +96,18 @@
 //! never trigger rules, so an automation posting into a hooked channel cannot
 //! cascade. this mirrors the agent module's user-author-only decision.
 //!
-//! that guard is also what makes `{author}` safe as a member: the ONLY author a
-//! firing rule ever sees is an external user, so `{author}` always renders an
-//! ownable queue. `{mention}` carries no such guarantee (a mentioned agent or
-//! module is nobody's queue), and neither does a literal member string — both
-//! are the rule author's own choice, in the same class as any other direct
-//! `InboxMsg::Deliver`, which inbox takes from any origin to any member by
-//! design.
+//! a `DeliverInbox` action may reach ONLY the rule owner's OWN inbox queue —
+//! `member_template` must be the exact literal `sdk::Origin::External(owner)
+//! .actor_string()`, checked at `CreateRule` (so a rule that could never
+//! legally fire never burns a roster slot) and re-checked at fire time. this
+//! module fires under `Origin::Module("automations")`, which inbox admits
+//! UNCONDITIONALLY (module origins may deliver to any member) — so without
+//! this gate a rule owner could deliver to a stranger's queue under the
+//! module's authority, exactly the write inbox's own `deliver_is_permitted`
+//! refuses on the direct path. `{author}`/`{mention}`/a literal foreign
+//! member all fail this check the same way: none of them can ever equal the
+//! FIXED owner queue, so the only member_template a `CreateRule` accepts is
+//! the owner's own `ext:{hex}`.
 //!
 //! ## No-fail hook arm, probes, and atomicity (P2)
 //!
@@ -118,9 +123,13 @@
 //! the target module's staged-or-committed state — deterministic on every
 //! validator — verify that a `PostMessage` target channel exists and its
 //! deterministic message id is unused (a user could pre-post the composed id to
-//! wedge the rule — id squatting), and that a `CreateTask` id is unused. a probe
-//! rejection downgrades to a `RunRecord`, protecting the posting user's block
-//! from every structurally-KNOWABLE follow-up failure.
+//! wedge the rule — id squatting), and that a `CreateTask` id is unused and its
+//! owner (the rule owner, not this module — see below) is under
+//! [`tasks::MAX_OPEN_TASKS_PER_OWNER`]. a probe rejection downgrades to a
+//! `RunRecord`, protecting the posting user's block from every
+//! structurally-KNOWABLE follow-up failure — including the RULE's own owner
+//! being at cap, which must refuse the rule's action, never the triggering
+//! post.
 //!
 //! `DeliverInbox` is different: member/body caps are checked before emit, and
 //! inbox delivery is otherwise no-op tolerant. the one accepted residual abort
@@ -197,8 +206,16 @@ use tasks::{
     encode_task_msg as tasks_encode_msg, encode_task_query as tasks_encode_query,
 };
 
-/// max rules retained. registering beyond this is rejected at execute.
+/// max rules retained NETWORK-WIDE. registering beyond this is rejected at
+/// execute. [`MAX_RULES_PER_OWNER`] is the per-account bound that keeps any
+/// ONE account from being the reason this global roster ever fills.
 pub const MAX_RULES: usize = 1024;
+/// max rules one owner may hold at once, the tasks board's
+/// [`tasks::MAX_OPEN_TASKS_PER_OWNER`] shape applied to the rule roster: no
+/// single account can fill [`MAX_RULES`] and permanently deny the feature to
+/// everyone else. [`AutomationsMsg::DeleteRule`] is how an owner recedes from
+/// it.
+pub const MAX_RULES_PER_OWNER: usize = 32;
 /// `rule_id` byte bound (also the `channel_id`/`task_id_prefix` bound).
 pub const MAX_ID_BYTES: usize = 256;
 /// trigger filter (`mention`, `text_contains`) byte bound.
@@ -286,7 +303,19 @@ fn run_key(seq: u64) -> Vec<u8> {
     key
 }
 
-/// the roster record's whole key. collides with no `rule\0...`/`run\0...` key.
+/// per-owner rule census key: prefix + 0 + the owner's raw key bytes — the
+/// tasks board's `t@{owner}` shape ([`tasks::MAX_OPEN_TASKS_PER_OWNER`]),
+/// what [`MAX_RULES_PER_OWNER`] is checked against.
+fn owner_rule_count_key(owner: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(7 + 1 + owner.len());
+    key.extend_from_slice(b"rulecnt");
+    key.push(0);
+    key.extend_from_slice(owner);
+    key
+}
+
+/// the roster record's whole key. collides with no `rule\0...`/`run\0...`/
+/// `rulecnt\0...` key.
 const ROSTER_KEY: &[u8] = b"roster";
 
 /// the run-history cursor record's whole key.
@@ -412,6 +441,32 @@ impl Automations {
         Ok(self.load(ROSTER_KEY).await?.unwrap_or_default())
     }
 
+    /// one owner's live rule count, read through the staged overlay — what
+    /// [`MAX_RULES_PER_OWNER`] is checked against. absent reads as zero, the
+    /// tasks board's `owner_count` shape.
+    async fn owner_rule_count(&self, owner: &[u8]) -> Result<u64, Error> {
+        let Some(bytes) = self.staged.get(&owner_rule_count_key(owner)).await? else {
+            return Ok(0);
+        };
+        let raw: [u8; 8] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Module("owner rule census record is not a u64".into()))?;
+        Ok(u64::from_le_bytes(raw))
+    }
+
+    /// stage an owner's rule census. a zero count DELETES the key, so an
+    /// owner with no rules left hashes the same as one who never created any
+    /// (the tasks board's `stage_owner_count` rule).
+    fn stage_owner_rule_count(&mut self, owner: &[u8], count: u64) {
+        let key = owner_rule_count_key(owner);
+        if count == 0 {
+            self.staged.delete(key);
+            return;
+        }
+        self.staged.stage(key, count.to_le_bytes().to_vec());
+    }
+
     /// every rule, in roster (rule-id) order — the ONE enumeration read:
     /// consensus itself consumes it (each hook event evaluates each rule), so
     /// it stays canonical, bounded by [`MAX_RULES`]. a rostered id without a
@@ -489,6 +544,27 @@ impl Automations {
         Ok(())
     }
 
+    /// a `DeliverInbox` action's `member_template` must be the exact literal
+    /// inbox queue the rule owner itself would own — see the module doc's
+    /// confused-deputy note. checked here at `CreateRule` (a rule that could
+    /// never legally fire never burns a roster slot) and again at fire time
+    /// in [`Self::build_and_emit`] (defense in depth against a future path
+    /// that mutates a rule's owner). every other action is unconstrained.
+    fn validate_deliver_inbox_owner(owner: &[u8], action: &Action) -> Result<(), Error> {
+        let Action::DeliverInbox { member_template, .. } = action else {
+            return Ok(());
+        };
+        let owner_queue = owner_queue(owner);
+        let resolves_to_owner = member_template == &owner_queue;
+        if !resolves_to_owner {
+            return Err(Error::Module(format!(
+                "inbox member_template must be the rule owner's own queue ({owner_queue}); \
+                 no {{seq}}/{{author}}/other substitution can ever resolve to it"
+            )));
+        }
+        Ok(())
+    }
+
     // ---- admin ops ----------------------------------------------------------
 
     /// authorize an op on an EXISTING rule. owner-only, and that is the whole
@@ -519,6 +595,7 @@ impl Automations {
         Self::validate_len("rule_id", &rule_id, MAX_ID_BYTES)?;
         Self::validate_trigger(&trigger)?;
         Self::validate_action(&action)?;
+        Self::validate_deliver_inbox_owner(&owner, &action)?;
         let mut roster = self.roster().await?;
         let position = match roster.binary_search(&rule_id) {
             Ok(_) => {
@@ -528,6 +605,12 @@ impl Automations {
         };
         if roster.len() >= MAX_RULES {
             return Err(Error::Module(format!("rule cap reached ({MAX_RULES})")));
+        }
+        let owner_rules = self.owner_rule_count(&owner).await?;
+        if owner_rules >= MAX_RULES_PER_OWNER as u64 {
+            return Err(Error::Module(format!(
+                "rule owner at cap: {MAX_RULES_PER_OWNER} rules"
+            )));
         }
         roster.insert(position, rule_id.clone());
         // the roster's byte gate first: a refusal must stage NOTHING.
@@ -541,7 +624,7 @@ impl Automations {
             rule_key(&rule_id),
             &Rule {
                 rule_id: rule_id.clone(),
-                owner,
+                owner: owner.clone(),
                 enabled: true,
                 trigger,
                 action,
@@ -549,6 +632,7 @@ impl Automations {
                 fire_count: 0,
             },
         );
+        self.stage_owner_rule_count(&owner, owner_rules + 1);
         Ok(())
     }
 
@@ -592,6 +676,8 @@ impl Automations {
         self.staged.delete(rule_key(&rule_id));
         // shrinking keeps the roster under its create-time byte gate.
         self.store(ROSTER_KEY.to_vec(), &roster);
+        let owner_rules = self.owner_rule_count(&rule.owner).await?;
+        self.stage_owner_rule_count(&rule.owner, owner_rules.saturating_sub(1));
         Ok(())
     }
 
@@ -872,10 +958,33 @@ impl Automations {
                             return Err(format!("task id already exists: {task_id}"));
                         }
                         Ok(TaskReply::Task(None)) => {}
-                        Ok(TaskReply::Tasks(_)) => {
+                        Ok(TaskReply::Tasks(_) | TaskReply::OwnerOpenCount(_)) => {
                             return Err("tasks answered a page, not a task".into());
                         }
                         Err(_) => return Err("tasks probe returned an unexpected reply".into()),
+                    },
+                }
+                // probe: the RULE OWNER's own open-task census must be under
+                // cap — the task is created under the owner, not this
+                // module's identity (see the created task's `owner` below),
+                // so a full owner refuses the RULE's action here, never the
+                // triggering post's block.
+                let owner_actor = owner_queue(&rule.owner);
+                let req = tasks_encode_query(&TaskQuery::OwnerOpenCount {
+                    owner: owner_actor.clone(),
+                });
+                match ctx.query(&self.tasks, &req).await {
+                    Err(e) => return Err(format!("tasks probe failed: {e}")),
+                    Ok(bytes) => match tasks_decode_reply(&bytes) {
+                        Ok(TaskReply::OwnerOpenCount(count)) => {
+                            if count >= tasks::MAX_OPEN_TASKS_PER_OWNER as u64 {
+                                return Err(format!(
+                                    "rule owner at task cap: {} open tasks",
+                                    tasks::MAX_OPEN_TASKS_PER_OWNER
+                                ));
+                            }
+                        }
+                        _ => return Err("tasks probe returned an unexpected reply".into()),
                     },
                 }
                 ctx.emit_msg(Msg {
@@ -883,6 +992,14 @@ impl Automations {
                     payload: tasks_encode_msg(&TaskMsg::CreateTask {
                         task_id: task_id.clone(),
                         title,
+                        // the created task's owner is the RULE OWNER, never
+                        // this module's own id — see #1740: a task owned by
+                        // the literal module id "automations" shares one
+                        // 128-task budget across every rule on the network
+                        // and can never be deleted (nothing submits as that
+                        // actor). tasks honors this override only because the
+                        // dispatch origin here is `Origin::Module`.
+                        owner: Some(rule.owner.clone()),
                     }),
                 });
                 Ok(format!("created task {task_id}"))
@@ -898,6 +1015,15 @@ impl Automations {
                 }
                 if member.len() > MAX_MEMBER_BYTES {
                     return Err("inbox member exceeds cap".into());
+                }
+                // re-check the confused-deputy gate at fire time (mirrors the
+                // owner_access probe above): `CreateRule` already refuses any
+                // member_template that cannot equal this, but a firing rule
+                // never gets to deliver past it either, deterministically on
+                // every validator.
+                let owner_queue = owner_queue(&rule.owner);
+                if member != owner_queue {
+                    return Err(format!("rule owner may not deliver to {member}"));
                 }
                 let body = substitute_vars(body_template, vars);
                 if body.len() > INBOX_MAX_BODY_BYTES {
@@ -1050,6 +1176,14 @@ fn actor_of(author: &AuthorRef) -> String {
         AuthorRef::Module(module) => Origin::Module(module.clone()).actor_string(),
         AuthorRef::System => Origin::System.actor_string(),
     }
+}
+
+/// the inbox queue a rule OWNER owns — `sdk::Origin::External(owner)
+/// .actor_string()`, the exact string [`inbox::deliver_is_permitted`] admits
+/// for that owner on the direct path. every rule owner is an authenticated
+/// external submitter ([`rule_owner`]), so this is total.
+fn owner_queue(owner: &[u8]) -> String {
+    Origin::External(owner.to_vec()).actor_string()
 }
 
 /// concatenate a message's text blocks: spans within paragraph/quote blocks are

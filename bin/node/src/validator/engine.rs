@@ -288,6 +288,7 @@ pub(super) async fn resume(
             payload: encode_task_msg(&TaskMsg::CreateTask {
                 task_id: format!("k{n}"),
                 title: format!("node-{n}"),
+                owner: None,
             }),
         };
         node.submit(signer, 0, op).await.expect("submit op");

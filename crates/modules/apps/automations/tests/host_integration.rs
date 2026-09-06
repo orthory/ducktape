@@ -254,6 +254,7 @@ fn squatted_task_id_is_caught_by_probe_and_block_commits() {
                 payload: tasks::encode_task_msg(&tasks::TaskMsg::CreateTask {
                     task_id: "auto-general-5".into(),
                     title: "squatted".into(),
+                    owner: None,
                 }),
             },
         )

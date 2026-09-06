@@ -141,7 +141,9 @@ fn synced_store_reconstructs_source_root_rules_and_history() {
                 "alpha",
                 None,
                 Action::DeliverInbox {
-                    member_template: "ops".into(),
+                    // #1739: `DeliverInbox` may reach only the rule owner's
+                    // own inbox queue -- `operator()`'s literal `ext:{hex}`.
+                    member_template: format!("ext:{}", "09".repeat(32)),
                     kind: "note".into(),
                     body_template: "a post landed".into(),
                 },

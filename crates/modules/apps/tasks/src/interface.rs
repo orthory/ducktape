@@ -47,16 +47,32 @@ pub struct Task {
     pub updated_at: u64,
 }
 
-/// write intents against the task board. `owner` is never carried here -- it
-/// is derived from the dispatch origin at create time, the job board's
-/// `submitter` convention.
+/// write intents against the task board. `owner` is normally derived from the
+/// dispatch origin at create time, the job board's `submitter` convention --
+/// [`TaskMsg::CreateTask::owner`] is the one deliberate exception.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskMsg {
-    /// create a task owned by the caller. refused once the caller already
-    /// owns [`crate::MAX_OPEN_TASKS_PER_OWNER`] tasks, or the board is at
+    /// create a task. refused once the owner already owns
+    /// [`crate::MAX_OPEN_TASKS_PER_OWNER`] tasks, or the board is at
     /// [`crate::MAX_TASKS`].
-    CreateTask { task_id: String, title: String },
+    CreateTask {
+        task_id: String,
+        title: String,
+        /// override the created task's owner with this raw external-key
+        /// actor, instead of the dispatch origin's own. `None` keeps the
+        /// original behavior (owner = the origin's own actor string).
+        ///
+        /// honored ONLY when the dispatch origin is `Origin::Module` -- a
+        /// module vouching for a DIFFERENT principal's task on its own
+        /// authority (e.g. automations attributing a rule's created task to
+        /// the rule's OWNER, never to the literal module id "automations" --
+        /// see #1740). an `Origin::External` submitter naming anyone but
+        /// itself is refused: an external caller may only ever own its own
+        /// tasks.
+        #[serde(default)]
+        owner: Option<Vec<u8>>,
+    },
     /// move a task's status. gated to [`Task::owner`] -- anyone else's op
     /// fails the block.
     UpdateStatus { task_id: String, status: TaskStatus },
@@ -87,6 +103,13 @@ pub enum TaskQuery {
         #[serde(default)]
         after: Option<String>,
     },
+    /// one owner's live open-task count -- what
+    /// [`crate::MAX_OPEN_TASKS_PER_OWNER`] is checked against. automations
+    /// spends this as a pre-emit probe (see #1740) so a full owner refuses
+    /// the firing rule's action instead of aborting the triggering post's
+    /// block. `owner` is the actor string ([`sdk::Origin::actor_string`]),
+    /// the same domain [`Task::owner`] records.
+    OwnerOpenCount { owner: String },
 }
 
 /// replies to [`TaskQuery`].
@@ -95,6 +118,7 @@ pub enum TaskQuery {
 pub enum TaskReply {
     Task(Option<Task>),
     Tasks(Vec<Task>),
+    OwnerOpenCount(u64),
 }
 
 // ---- job board wire (first-claim kind) ------------------------------------
