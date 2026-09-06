@@ -57,11 +57,17 @@ pub(super) enum PageError {
     Corrupt,
     /// an op named the reserved [`PAGE_INDEX_KEY`] sentinel.
     ReservedId,
-    // ── comments ──
-    /// a comment op arrived with an empty (pre-consensus) origin.
+    /// a create/insert/update/move/remove was attempted by an origin other
+    /// than the page's recorded author (see [`Pages::may_edit`]).
+    NotPageAuthor,
+    /// a block/page or comment op arrived with an empty (pre-consensus)
+    /// origin — [`crate::author_from_origin`] rejects it before any op can
+    /// derive an author from it.
     EmptyOrigin,
-    /// an external or module origin was too large for bounded comment replies.
+    /// an external or module origin was too large for a bounded stored
+    /// author (a page's recorded author or a comment's).
     AuthorTooLarge,
+    // ── comments ──
     /// an AddComment carried an empty `as_agent` id.
     EmptyAgent,
     /// an AddComment carried an `as_agent` id too large for bounded comment
@@ -117,6 +123,7 @@ impl core::fmt::Display for PageError {
             PageError::TitleTooLarge => "page title too large",
             PageError::Corrupt => "stored page state is corrupt",
             PageError::ReservedId => "reserved block id",
+            PageError::NotPageAuthor => "not the page author",
             PageError::EmptyOrigin => "empty origin",
             PageError::AuthorTooLarge => "comment author is too large",
             PageError::EmptyAgent => "empty as_agent",

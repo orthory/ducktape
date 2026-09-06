@@ -1,8 +1,7 @@
 use super::{
-    AuthorRef, Comment, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_AUTHOR_BYTES,
-    MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
-    MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError,
-    PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
+    AuthorRef, Comment, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES,
+    MAX_COMMENT_TEXT_BYTES, MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET,
+    Origin, PageError, PageMsg, Pages, Thread, ThreadView, author_from_origin, id_is_index_safe,
 };
 use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
@@ -21,22 +20,6 @@ fn comment_key(id: &str) -> String {
 }
 fn target_index_key(target: &str) -> String {
     format!("{TARGET_INDEX_PREFIX}{target}")
-}
-
-/// derive the comment author from the dispatch origin (mirrors chat). the
-/// pre-consensus default `Origin::External(vec![])` must never pass as a real
-/// user.
-fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
-    match origin {
-        Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
-        Origin::External(bytes) if bytes.len() > MAX_COMMENT_AUTHOR_BYTES => {
-            Err(PageError::AuthorTooLarge)
-        }
-        Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
-        Origin::Module(id) if id.len() > MAX_COMMENT_AUTHOR_BYTES => Err(PageError::AuthorTooLarge),
-        Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
-        Origin::System => Ok(AuthorRef::System),
-    }
 }
 
 impl Pages {
@@ -118,13 +101,14 @@ impl Pages {
     /// to `target` — called when the target block/page is deleted so comment
     /// records never dangle in the reserved keyspace with no reachable target.
     ///
-    /// deliberately NOT author-gated, and that is the module's rule rather
-    /// than an omission: this is an IMPLICIT mutation, a consequence of
-    /// removing the block, and it rides that block op's own authority. A page
-    /// tree here has no owning principal — every block op admits any origin —
-    /// so a per-comment check would only make a block undeletable once anyone
-    /// else commented on it, while adding no authority the module has
-    /// anywhere. What bounds the purge is aim, not permission: it reaches
+    /// deliberately NOT author-gated on its own, and that is the module's
+    /// rule rather than an omission: this is an IMPLICIT mutation, a
+    /// consequence of removing the block, and it rides that `RemoveBlock`
+    /// op's OWN [`Pages::may_edit`] check, already passed by the time this
+    /// runs — a per-comment check on top would only make a block undeletable
+    /// once anyone else commented on it, while adding no authority the module
+    /// does not already have. What bounds the purge is aim, not permission: it
+    /// reaches
     /// exactly the threads anchored to the subtree being removed, which is why
     /// [`Pages::apply_comment_op`]'s `MoveCommentThread` must stay
     /// opener-gated — that op is the only way to aim it at a thread that was
