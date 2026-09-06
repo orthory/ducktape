@@ -72,7 +72,7 @@ dependencies = [
 [[package]]
 name = "directory"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#f26de8ad3cfbdc47d6cf7a13e97ea4b29b69ce93"
+source = "git+https://github.com/orthory/ducktape#c2362725c2448d463b6802d6878c5102c126e168"
 dependencies = [
  "ducktape-module-sdk",
  "serde",
@@ -89,7 +89,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/orthory/ducktape#f26de8ad3cfbdc47d6cf7a13e97ea4b29b69ce93"
+source = "git+https://github.com/orthory/ducktape#c2362725c2448d463b6802d6878c5102c126e168"
 dependencies = [
  "async-trait",
  "sdk",
@@ -223,7 +223,7 @@ dependencies = [
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#f26de8ad3cfbdc47d6cf7a13e97ea4b29b69ce93"
+source = "git+https://github.com/orthory/ducktape#c2362725c2448d463b6802d6878c5102c126e168"
 dependencies = [
  "async-trait",
  "serde",
@@ -471,19 +471,19 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[patch.unused]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#f26de8ad3cfbdc47d6cf7a13e97ea4b29b69ce93"
+source = "git+https://github.com/orthory/ducktape#c2362725c2448d463b6802d6878c5102c126e168"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#f26de8ad3cfbdc47d6cf7a13e97ea4b29b69ce93"
+source = "git+https://github.com/orthory/ducktape#c2362725c2448d463b6802d6878c5102c126e168"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#f26de8ad3cfbdc47d6cf7a13e97ea4b29b69ce93"
+source = "git+https://github.com/orthory/ducktape#c2362725c2448d463b6802d6878c5102c126e168"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#f26de8ad3cfbdc47d6cf7a13e97ea4b29b69ce93"
+source = "git+https://github.com/orthory/ducktape#c2362725c2448d463b6802d6878c5102c126e168"

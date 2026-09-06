@@ -34,6 +34,7 @@ use statesync::{
     fetch_snapshot,
     qmdb::{QmdbStore, RemoteQmdbResolver},
 };
+#[cfg(test)]
 use topology::PRODUCTION;
 use wasm_host::Backing;
 
@@ -792,7 +793,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "6f9111bacc5c799a6b4263fc69951b4e8c4ba0e03439d1464e20e5e75e40c115";
+        "0e977c049bf7fc30ce43648a454319374333ca214f8558607ea10fd2978ec112";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
