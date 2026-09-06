@@ -237,12 +237,22 @@ fn signed_lookup(
     (key, request)
 }
 
-/// A signed `Register` for `caller`. The coordinator answers a `Lookup` only
-/// to a caller it has already bound to that datagram's source (#1595), so a
-/// valid client must register itself before its lookup loop starts — exactly
-/// the same order every legitimate rendezvous caller already follows.
-fn signed_register(signer: &ed25519::PrivateKey, caller: NodeKey, timestamp: u64) -> Vec<u8> {
-    let inner = Msg::Register { key: caller };
+/// A signed `Register` for `caller`, carrying `cookie` (a return-routability
+/// proof from a prior `BindResponse` — required only for a first-seen or
+/// expired mapping; `#1800`). The coordinator answers a `Lookup` only to a
+/// caller it has already bound to that datagram's source (#1595), so a valid
+/// client must register itself before its lookup loop starts — exactly the
+/// same order every legitimate rendezvous caller already follows.
+fn signed_register(
+    signer: &ed25519::PrivateKey,
+    caller: NodeKey,
+    cookie: [u8; 32],
+    timestamp: u64,
+) -> Vec<u8> {
+    let inner = Msg::Register {
+        key: caller,
+        cookie,
+    };
     let encoded_inner = inner.encode_inline();
     AuthRequest {
         caller,
@@ -250,6 +260,52 @@ fn signed_register(signer: &ed25519::PrivateKey, caller: NodeKey, timestamp: u64
         inner,
     }
     .encode()
+}
+
+fn signed_bind_request(signer: &ed25519::PrivateKey, caller: NodeKey, timestamp: u64) -> Vec<u8> {
+    let inner = Msg::BindRequest { from: caller };
+    let encoded_inner = inner.encode_inline();
+    AuthRequest {
+        caller,
+        auth: sign_authenticator(signer, &encoded_inner, timestamp, None),
+        inner,
+    }
+    .encode()
+}
+
+/// Oldest a cached cookie may be before a fresh `BindRequest` replaces it. A
+/// cookie verifies for the coordinator's current-or-previous 60s bucket
+/// (`CookieKey::verify`), so 50s always leaves margin before it falls out of
+/// that window. Same cadence as `valid_client`'s own re-signing.
+const COOKIE_REFRESH_SECS: u64 = 50;
+
+/// One `BindRequest`/`BindResponse` round trip on `socket`, bounded by
+/// `timeout`. Never worth failing the caller over — on timeout this returns
+/// the zero cookie, exactly like `NatClient::try_bind_cookie`: a `Register`
+/// sent with it either targets an already-live mapping (which ignores the
+/// cookie) or is refused and retried next cycle.
+async fn bind_cookie(
+    socket: &UdpSocket,
+    signer: &ed25519::PrivateKey,
+    caller: NodeKey,
+    timeout: Duration,
+) -> io::Result<[u8; 32]> {
+    socket
+        .send(&signed_bind_request(signer, caller, now_secs()))
+        .await?;
+    let mut response = [0u8; 128];
+    let wait = async {
+        loop {
+            let size = socket.recv(&mut response).await?;
+            if let Ok(Msg::BindResponse { cookie, .. }) = Msg::decode(&response[..size]) {
+                return Ok::<[u8; 32], io::Error>(cookie);
+            }
+        }
+    };
+    match tokio::time::timeout(timeout, wait).await {
+        Ok(result) => result,
+        Err(_elapsed) => Ok([0u8; 32]),
+    }
 }
 
 async fn valid_client(
@@ -283,6 +339,20 @@ async fn valid_client(
     let mut sequence = 0;
     let (mut key, mut request) = signed_lookup(&signer, caller, seed, sequence, signed_at);
     let mut response = [0; 128];
+    // A first-seen (or expired) Register needs a valid return-routability
+    // cookie (#1800) — mint one up front so the very first cycle's Register
+    // can land. Retried (bounded by `deadline`, not just one `timeout`
+    // window): a single lost attempt under the coordinator's own post-flood
+    // backlog would otherwise leave every Register — and so every Lookup —
+    // unbound for the whole run, since the 50s refresh cadence below never
+    // revisits it again within a short probe.
+    let mut cookie = loop {
+        let attempt = bind_cookie(&socket, &signer, caller, timeout).await?;
+        if attempt != [0u8; 32] || Instant::now() >= deadline {
+            break attempt;
+        }
+    };
+    let mut cookie_at = now_secs();
 
     while Instant::now() < deadline {
         let cycle_started = Instant::now();
@@ -291,13 +361,17 @@ async fn valid_client(
             (_, request) = signed_lookup(&signer, caller, seed, sequence, now);
             signed_at = now;
         }
+        if now.saturating_sub(cookie_at) >= COOKIE_REFRESH_SECS {
+            cookie = bind_cookie(&socket, &signer, caller, timeout).await?;
+            cookie_at = now;
+        }
         let started = Instant::now();
         // Re-sent every cycle, not just once at start: a lost Register (UDP,
         // no retry — dropped under the coordinator's own receive backlog
         // during a flood) would otherwise leave every later Lookup from this
         // socket unbound and unanswered (#1595) for the rest of the run.
         socket
-            .send(&signed_register(&signer, caller, signed_at))
+            .send(&signed_register(&signer, caller, cookie, signed_at))
             .await?;
         socket.send(&request).await?;
         stats.valid_sent += 1;
