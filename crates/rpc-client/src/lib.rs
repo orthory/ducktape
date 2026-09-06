@@ -762,6 +762,34 @@ impl Client {
         Ok(minted.invite)
     }
 
+    /// Mint this node's `node_proof` for a `JoinHuddle`: its own mesh-identity
+    /// key signing `channel_id` ‖ `user` (hex origin bytes). The NODE mints
+    /// it, not the caller — proof of possession needs the private key this
+    /// node holds, never sent over the wire. Answers `(node, node_proof)`,
+    /// both hex. 503 on a daemon with no mesh identity.
+    pub async fn huddle_node_proof(
+        &self,
+        channel_id: &str,
+        user_hex: &str,
+    ) -> Result<(String, String)> {
+        let response = self
+            .credentialed(self.http.post(self.url("v1/huddle/node-proof")?))
+            .json(&serde_json::json!({ "channel_id": channel_id, "user": user_hex }))
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("minting a huddle node proof failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
+        }
+        #[derive(Deserialize)]
+        struct Minted {
+            node: String,
+            node_proof: String,
+        }
+        let minted: Minted = decode_json(response).await?;
+        Ok((minted.node, minted.node_proof))
+    }
+
     /// Connect to the node stream and subscribe to committed module changes.
     pub async fn module_events(
         &self,

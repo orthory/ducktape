@@ -254,8 +254,14 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         ed25519::PrivateKey::from_seed(12),
     );
     // Two people, two nodes — the huddle's roster is (user, node) pairs, and
-    // it is the NODE half the media plane speaks.
-    let (my_node, peer_node) = ([0xa1u8; 32], [0xb2u8; 32]);
+    // it is the NODE half the media plane speaks. Each node signs its own
+    // `node_proof` over the join (proof of possession).
+    let (my_node, peer_node) = (
+        ed25519::PrivateKey::from_seed(21),
+        ed25519::PrivateKey::from_seed(22),
+    );
+    let my_node_pub = my_node.public_key().as_ref().to_vec();
+    let peer_node_pub = peer_node.public_key().as_ref().to_vec();
 
     submit_test(
         &rpc,
@@ -276,7 +282,14 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "chat",
         chat::encode_msg(&ChatMsg::JoinHuddle {
             channel_id: "eng".into(),
-            node: my_node.to_vec(),
+            node: my_node_pub.clone(),
+            node_proof: my_node
+                .sign(
+                    chat::HUDDLE_JOIN_NS,
+                    &chat::huddle_join_preimage("eng", me.public_key().as_ref()),
+                )
+                .as_ref()
+                .to_vec(),
         }),
     )
     .await;
@@ -287,7 +300,14 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "chat",
         chat::encode_msg(&ChatMsg::JoinHuddle {
             channel_id: "eng".into(),
-            node: peer_node.to_vec(),
+            node: peer_node_pub.clone(),
+            node_proof: peer_node
+                .sign(
+                    chat::HUDDLE_JOIN_NS,
+                    &chat::huddle_join_preimage("eng", peer.public_key().as_ref()),
+                )
+                .as_ref()
+                .to_vec(),
         }),
     )
     .await;
@@ -304,10 +324,10 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
         "exactly one row is this device's — the id vocabulary has to match"
     );
 
-    let nodes = huddle_recipient_nodes(roster);
+    let nodes = huddle_recipient_nodes(roster, None);
     assert_eq!(
         nodes,
-        vec![hex_encode(&peer_node)],
+        vec![hex_encode(&peer_node_pub)],
         "the fan-out is the OTHER node's key: ours in it would aim this \
          device's media at itself, and the peer's missing from it is the \
          silence this whole poll exists to end"

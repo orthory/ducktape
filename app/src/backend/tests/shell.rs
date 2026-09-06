@@ -290,7 +290,41 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
     // The fan-out the live session polls for is this roster's NODE keys with
     // our own row removed — the hub admits and fans out by node identity, and
     // a set that carried our own key would aim this device's media at itself.
-    assert_eq!(huddle_recipient_nodes(roster), vec!["0b0b".to_string()]);
+    assert_eq!(
+        huddle_recipient_nodes(roster, None),
+        vec!["0b0b".to_string()]
+    );
+}
+
+#[test]
+fn huddle_recipient_nodes_drops_any_row_naming_this_devices_own_node() {
+    // A `node_proof` only proves ITS OWN user holds that node's key — nothing
+    // stops a stale or replayed roster row from naming a DIFFERENT user
+    // alongside THIS node's key. `is_you` alone would miss it (that row is
+    // not "mine"), and fanning media to your own node is a loopback echo.
+    let me = [0xaau8; 32];
+    let peer = [0xbbu8; 32];
+    let roster = huddle_roster(
+        &[
+            chat::index::HuddleEntry {
+                user: hex_encode(&me),
+                node: "0a0a".into(),
+                joined_at: 10,
+            },
+            chat::index::HuddleEntry {
+                user: hex_encode(&peer),
+                node: "0a0a".into(),
+                joined_at: 20,
+            },
+        ],
+        Some(&me),
+        &AuthorNames::default(),
+    );
+    assert_eq!(
+        huddle_recipient_nodes(roster, Some("0a0a")),
+        Vec::<String>::new(),
+        "the peer row names this device's own node — never fan media there"
+    );
 }
 
 #[test]

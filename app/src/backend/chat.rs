@@ -266,10 +266,22 @@ pub fn huddle_self(roster: Vec<HuddleParticipant>) -> bool {
 
 /// The call fan-out set: every roster peer's node key, self excluded — the
 /// shape `CallClientControl::Recipients` wants.
-pub fn huddle_recipient_nodes(roster: Vec<HuddleParticipant>) -> Vec<String> {
+///
+/// Excludes by BOTH `is_you` (this device's own roster row) AND `self_node`
+/// (this device's node key, whichever roster row carries it): a member's
+/// `node_proof` only proves that member's user holds the node key it names,
+/// never that the name is unique — a stale or replayed roster row can still
+/// carry another user's `user` field alongside THIS node's key, and fanning
+/// media to your own node is a loopback echo regardless of whose row it rides
+/// in on.
+pub fn huddle_recipient_nodes(
+    roster: Vec<HuddleParticipant>,
+    self_node: Option<&str>,
+) -> Vec<String> {
     roster
         .into_iter()
         .filter(|participant| !participant.is_you)
+        .filter(|participant| Some(participant.node.as_str()) != self_node)
         .map(|participant| participant.node)
         .collect()
 }
@@ -294,12 +306,14 @@ pub(crate) async fn huddle_fanout_nodes(
 ) -> Result<Vec<String>, String> {
     let client = rpc_client(rpc)?;
     let me = local_user_key().await;
+    let status = client.status().await.map_err(|error| error.to_string())?;
+    let self_node = (!status.public_key.is_empty()).then_some(status.public_key);
     // A huddle in a room this node cannot see has no fan-out set — an empty
     // one, not a failure: the poll re-reads on its own cadence and picks the
     // roster up as soon as the index answers for the room.
     let facts = load_channel_facts(&client, channel_id, me.as_deref()).await?;
     let roster = facts.map_or_else(Vec::new, |(_channel, roster)| roster);
-    Ok(huddle_recipient_nodes(roster))
+    Ok(huddle_recipient_nodes(roster, self_node.as_deref()))
 }
 
 // The huddle's elapsed clock is a LOCAL session fact on a NATIVE `every 1s`
@@ -315,12 +329,25 @@ pub async fn join_huddle(
         let rpc = rpc_client(&rpc)?;
         let status = rpc.status().await.map_err(|error| error.to_string())?;
         let node = public_key(&status.public_key, "node public key")?;
+        // Proof of possession: THIS node signs the join under its own key —
+        // never asserted by the joiner — so the roster can only ever name a
+        // node that agreed to route this user's media (issue #1792).
+        let user = local_user_key()
+            .await
+            .ok_or_else(|| "no local user key to join a huddle as".to_string())?;
+        let (_, node_proof_hex) = rpc
+            .huddle_node_proof(&channel_id, &hex_encode(&user))
+            .await
+            .map_err(|error| error.to_string())?;
+        let node_proof = hex_decode(&node_proof_hex)
+            .map_err(|_| "huddle node proof must be hexadecimal".to_string())?;
         signed_write(
             &rpc,
             "chat",
             chat::encode_msg(&ChatMsg::JoinHuddle {
                 channel_id: channel_id.clone(),
                 node,
+                node_proof,
             }),
             password,
         )
