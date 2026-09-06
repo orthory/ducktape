@@ -662,6 +662,11 @@ impl RunsModule {
         // counted in EMISSION order: the run's own reply first, then the
         // actions by index, exactly as `emit_response` emits them.
         let mut staged_replies: BTreeMap<(String, u64), u64> = BTreeMap::new();
+        // the requester's post standing per channel a `chat.post_message`
+        // action names — see `requester_may_post`. one response may carry many
+        // posts into the same channel and the answer cannot change mid-pass,
+        // so each channel is asked exactly once.
+        let mut post_standing: BTreeMap<String, bool> = BTreeMap::new();
 
         if !response.reply_blocks.is_empty() {
             if matches!(lane, Lane::DelegatedSettle) {
@@ -751,6 +756,14 @@ impl RunsModule {
                     // message record, so no number of posts can push one head
                     // past chat's MAX_MESSAGE_HEAD_BYTES.
                     self.probe_channel_exists(ctx, channel_id).await?;
+                    if !self
+                        .requester_may_post(ctx, entry, channel_id, &mut post_standing)
+                        .await?
+                    {
+                        return Err(format!(
+                            "the run's requester may not post to channel: {channel_id}"
+                        ));
+                    }
                     // the thread cap is the one check a sibling post can move
                     // out from under: fold in what this response already staged
                     // into the same thread, then count this post as staged.
@@ -1008,10 +1021,45 @@ impl RunsModule {
         })
     }
 
+    /// the run REQUESTER's own chat standing in the channel a
+    /// `chat.post_message` action NAMES.
+    ///
+    /// `RunsMsg::RequestRun` admits a submitter only where its own key may post
+    /// (see [`RunsModule::may_post`]), but that gate covers the run's channel —
+    /// and this action carries its OWN `channel_id`. chat admits a module/agent
+    /// author into every channel, so without this the whole gate is bypassed by
+    /// one sibling field: an agent holding `chat.post_message` would write into
+    /// any members-only channel on the network, and a prompt-injected agent
+    /// would do it on a stranger's behalf. the requester's standing is the
+    /// authority the run is speaking under, so it is the one that must cover the
+    /// target channel too.
+    ///
+    /// a module/system requester is not narrowed, exactly as at request time —
+    /// chat's own post policy always admits those origins. an empty external key
+    /// is nobody, and fails closed. memoized per channel by `known`.
+    async fn requester_may_post(
+        &self,
+        ctx: &dyn Ctx,
+        entry: &PendingState,
+        channel_id: &str,
+        known: &mut BTreeMap<String, bool>,
+    ) -> Result<bool, String> {
+        let SagaOrigin::External(key) = &entry.requester else {
+            return Ok(true);
+        };
+        if let Some(answer) = known.get(channel_id) {
+            return Ok(*answer);
+        }
+        let may_post = !key.is_empty() && self.may_post(ctx, key, channel_id).await?;
+        known.insert(channel_id.to_string(), may_post);
+        Ok(may_post)
+    }
+
     /// prove a channel EXISTS before an agent speaks into it — chat rejects a
     /// post to an unknown channel, and on the settle path that rejection would
-    /// abort the delivery block. (its post policy needs no probe: chat always
-    /// admits a module/agent author.)
+    /// abort the delivery block. existence ONLY: chat admits a module/agent
+    /// author into any channel it holds, which is exactly why the standing gate
+    /// ([`RunsModule::requester_may_post`]) has to run beside this probe.
     async fn probe_channel_exists(&self, ctx: &dyn Ctx, channel_id: &str) -> Result<(), String> {
         let reply = ctx
             .query(

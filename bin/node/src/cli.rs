@@ -527,6 +527,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let genesis = config::Genesis::compose(
         &founding_set,
         &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
+        &topology::TOPOLOGY.index_guest_ids(topology::PRODUCTION),
     )
     .map_err(|e| {
         format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")
@@ -775,10 +776,13 @@ pub(crate) fn mint_invite_blob(
     let key = config::load_identity(&base.join(&raw.key_file))?;
     let dial_hint = config::dialable(Some(&raw.advertised), &raw.listen)?;
     let has_coordinated_reach = descriptor.has_coordinated_reach()?;
-    if let Some(addr) = &dial_hint {
-        descriptor.add_bootstrap(&key.public_key(), addr);
+    let descriptor_changed = match &dial_hint {
+        Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
+        None => false,
+    };
+    if descriptor_changed {
+        descriptor.save(&descriptor_path)?;
     }
-    descriptor.save(&descriptor_path)?;
 
     // the WireGuard bootstrap: endpoints are minted from the advertised host
     // (the listen IP is usually unspecified) + the plane's UDP ports; the

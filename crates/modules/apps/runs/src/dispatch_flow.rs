@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
 use super::{
-    AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChatQuery, ChatReply, Ctx,
-    DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES,
-    MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule, SagaOrigin,
-    SiblingReadBudget, SkillRef, agent_decode_reply, agent_encode_query, chat_decode_reply,
-    chat_encode_query, dispatch_decode_reply, dispatch_encode_msg, dispatch_encode_query,
-    dispatch_id_for, envelope, files_decode_reply, files_encode_query, inject, recipe_id_for,
+    AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChannelAccess, ChatQuery,
+    ChatReply, Ctx, DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply,
+    MAX_PAYLOAD_BYTES, MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule,
+    SagaOrigin, SiblingReadBudget, SkillRef, agent_decode_reply, agent_encode_query,
+    chat_decode_reply, chat_encode_query, dispatch_decode_reply, dispatch_encode_msg,
+    dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply, files_encode_query,
+    inject, recipe_id_for,
 };
 use crate::facets::WireSink;
 
@@ -135,6 +136,27 @@ impl RunsModule {
         user: &[u8],
         channel_id: &str,
     ) -> Result<bool, String> {
+        Ok(self.channel_access(ctx, user, channel_id).await?.may_post)
+    }
+
+    /// chat's answer to "may `user` SEE `channel_id`" — the standing an
+    /// account must hold before this module pins that channel's transcript
+    /// into a dispatch payload its owner's provider will read.
+    pub(super) async fn may_read(
+        &self,
+        ctx: &dyn Ctx,
+        user: &[u8],
+        channel_id: &str,
+    ) -> Result<bool, String> {
+        Ok(self.channel_access(ctx, user, channel_id).await?.may_read)
+    }
+
+    async fn channel_access(
+        &self,
+        ctx: &dyn Ctx,
+        user: &[u8],
+        channel_id: &str,
+    ) -> Result<ChannelAccess, String> {
         let reply = ctx
             .query(
                 &self.chat,
@@ -146,7 +168,7 @@ impl RunsModule {
             .await
             .map_err(|e| format!("chat access query failed: {e}"))?;
         match chat_decode_reply(&reply) {
-            Ok(ChatReply::Access(access)) => Ok(access.may_post),
+            Ok(ChatReply::Access(access)) => Ok(access),
             _ => Err("unexpected chat reply for an access query".into()),
         }
     }

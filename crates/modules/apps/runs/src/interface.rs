@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 
-use agent::{AgentAction, DelegationRequest, ReplyBlock};
+use agent::{AgentAction, AgentRecord, DelegationRequest, ReplyBlock, ResourceCaps};
 use saga::SagaOrigin;
 use serde::{Deserialize, Serialize};
 
@@ -304,9 +304,61 @@ pub struct AgentSession {
     /// the ed25519 public key that must sign every [`RunsMsg::AgentAction`] for
     /// this run.
     pub session_key: Vec<u8>,
+    /// the node key that held the run's execution lease when the session was
+    /// opened. the lease can MOVE mid-run (a reassignment, or an expiry that
+    /// re-leases the saga), and the session's authority is the lease — so every
+    /// acting op re-reads the live holder and refuses once it stops matching
+    /// this, and the new holder may open a session of its own.
+    pub holder: Vec<u8>,
     pub opened_at: u64,
     /// how many actions this session has applied — the audit counter.
     pub actions: u32,
+}
+
+/// the ADMISSION CEILING a delegated run carries: the CALLER's own grant,
+/// frozen at the moment of the call. it is never authority of its own — every
+/// read intersects it with the callee's LIVE record ([`Self::apply`]), so a
+/// later owner revocation narrows the run immediately while a later widening
+/// cannot escape what the caller originally granted.
+///
+/// consensus applies it on every write (`agent_for_run`); the read plane must
+/// apply the SAME ceiling, which is what [`RunsQuery::RunAuthority`] is for —
+/// a peer's MCP server re-fetching the callee's standing record would gate its
+/// reads on the callee's full caps, i.e. on a grant this run never had.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunAuthority {
+    pub allowed_actions: Vec<String>,
+    pub caps: ResourceCaps,
+}
+
+impl RunAuthority {
+    pub(crate) fn from_record(record: &AgentRecord) -> Self {
+        Self {
+            allowed_actions: record.allowed_actions.clone(),
+            caps: record.caps.clone(),
+        }
+    }
+
+    /// `record` narrowed to this ceiling — the ONE definition, shared by the
+    /// consensus write path and the host-side read plane.
+    pub fn apply(&self, record: &AgentRecord) -> AgentRecord {
+        let mut ceiling = record.clone();
+        ceiling.allowed_actions = self.allowed_actions.clone();
+        ceiling.caps = self.caps.clone();
+        ceiling.scoped_for_call(record)
+    }
+}
+
+/// one in-flight run's ceiling, as [`RunsQuery::RunAuthority`] answers it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RunAuthorityView {
+    pub run_id: String,
+    pub agent_id: String,
+    /// `None` for an ordinary run — nothing narrows it but the agent's own
+    /// committed record.
+    pub authority: Option<RunAuthority>,
 }
 
 // ---- queries ------------------------------------------------------------------
@@ -331,6 +383,12 @@ pub enum RunsQuery {
     Delegations {
         caller_run_id: String,
     },
+    /// one IN-FLIGHT run's admission ceiling — the read plane's half of
+    /// [`RunAuthority`]. `None` when the run is not in flight, which a caller
+    /// must treat as a refusal: an unknown run proves no ceiling.
+    RunAuthority {
+        run_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -341,6 +399,9 @@ pub enum RunsReply {
     RecentRuns(Vec<RunRecord>),
     AgentSessions(Vec<AgentSession>),
     Delegations(Vec<DelegationView>),
+    /// boxed only to keep the reply enum small — serde is transparent over
+    /// `Box`, so the wire shape is the bare view or `null`.
+    RunAuthority(Option<Box<RunAuthorityView>>),
 }
 
 // ---- codecs -------------------------------------------------------------------

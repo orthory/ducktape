@@ -515,8 +515,10 @@ async fn a_run_with_no_agent_opens_no_session_and_submits_no_bind() {
         .expect("provision");
 
     let env = ws.env();
+    // the WRITE half is what a session buys; the consensus run id is identity
+    // and rides every provisioned run.
     assert!(!env.contains_key("DUCKTAPE_RUN_SESSION_KEY"));
-    assert!(!env.contains_key("DUCKTAPE_RUN_ID"));
+    assert!(!env.contains_key(session::ENV_ACTION_URL));
     assert!(
         binds.lock().unwrap().is_empty(),
         "a workspace nobody acts for asks consensus for nothing"
@@ -545,6 +547,7 @@ async fn an_envelope_with_no_consensus_run_id_opens_no_session_and_submits_no_bi
 
     let env = ws.env();
     assert!(!env.contains_key("DUCKTAPE_RUN_SESSION_KEY"));
+    // no consensus run id on the envelope ⇒ none to export either.
     assert!(!env.contains_key("DUCKTAPE_RUN_ID"));
     assert!(
         binds.lock().unwrap().is_empty(),
@@ -576,7 +579,8 @@ async fn a_refused_bind_degrades_to_a_read_only_plane_and_never_fails_the_run() 
     let env = ws.env();
     assert_eq!(binds.lock().unwrap().len(), 1, "the bind was attempted");
     assert!(
-        !env.contains_key("DUCKTAPE_RUN_SESSION_KEY") && !env.contains_key("DUCKTAPE_RUN_ID"),
+        !env.contains_key("DUCKTAPE_RUN_SESSION_KEY")
+            && !env.contains_key(session::ENV_ACTION_TOKEN),
         "no session, no key — the agent must not hold a key consensus refused"
     );
     // the READ half of the tool plane is untouched: this is exactly the

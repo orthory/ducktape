@@ -966,3 +966,154 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
         "{err:?}"
     );
 }
+
+/// the node the lease MOVED to (a `ReassignRun`, or a saga expiry re-leasing
+/// the run on its own).
+const NEW_ASSIGNEE: [u8; 32] = [0x11; 32];
+
+#[test]
+fn a_moved_lease_strands_the_old_session_and_lets_the_new_holder_open_one() {
+    const NEW_SESSION_KEY: [u8; 32] = [0x22; 32];
+    let (mut m, registry, run_id) = with_open_session(&[ACTION_CHAT_POST_MESSAGE], &[]);
+    let reassigned = |origin: Origin| {
+        CaptureCtx::new()
+            .at(6)
+            .with_origin(origin)
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2))
+            .with_lease_holder(&run_id, &NEW_ASSIGNEE)
+    };
+    let post = AgentAction::PostMessage {
+        channel_id: "general".into(),
+        text: "still here".into(),
+        thread: None,
+    };
+
+    // the ex-holder's key is still bound, and still refused: its authority was
+    // the lease, and the lease left.
+    let mut ctx = reassigned(Origin::External(SESSION_KEY.to_vec()));
+    let err = exec(&mut m, &mut ctx, &act(&run_id, post.clone())).unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("lease has moved")),
+        "{err:?}"
+    );
+    assert!(ctx.chat_msgs().is_empty(), "{:?}", ctx.chat_msgs());
+    assert_eq!(sessions(&m)[0].session_key, SESSION_KEY.to_vec());
+
+    // the node actually executing the run now opens its own session,
+    // REPLACING the stranded one.
+    let mut ctx = reassigned(Origin::External(NEW_ASSIGNEE.to_vec()));
+    exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap();
+    commit(&mut m);
+    let live = sessions(&m);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].session_key, NEW_SESSION_KEY.to_vec());
+    assert_eq!(live[0].holder, NEW_ASSIGNEE.to_vec());
+
+    // and the new holder cannot re-open on top of its own live session.
+    let mut ctx = reassigned(Origin::External(NEW_ASSIGNEE.to_vec()));
+    let err = exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("already has an open agent session")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_moved_lease_stops_the_old_session_from_delegating() {
+    let (mut m, registry, run_id) = with_open_delegating_session(2);
+    let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()))
+        .with_lease_holder(&run_id, &NEW_ASSIGNEE);
+    let err = exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&run_id, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("lease has moved")),
+        "{err:?}"
+    );
+    assert!(ctx.dispatch_msgs().is_empty());
+    assert!(delegations(&m, &run_id).is_empty());
+}
+
+#[test]
+fn a_callee_whose_owner_cannot_read_the_channel_is_refused() {
+    // the callee's dispatch carries the CALLER's transcript to a provider the
+    // callee's owner runs, so that owner's read standing is the gate.
+    let (mut m, mut registry, run_id) = with_open_delegating_session(2);
+    let private = |registry: &Registry| {
+        session_ctx(registry, &run_id, Origin::External(SESSION_KEY.to_vec()))
+            .with_members_only("general", vec![9; 32])
+    };
+
+    registry.get_mut("worker").unwrap().owner = SagaOrigin::External(vec![8; 32]);
+    let mut ctx = private(&registry);
+    let err = exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&run_id, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("may not read the caller's channel")),
+        "{err:?}"
+    );
+    assert!(ctx.dispatch_msgs().is_empty(), "no transcript leaves");
+    assert!(delegations(&m, &run_id).is_empty());
+
+    // an owner who can read the channel dispatches as before.
+    registry.get_mut("worker").unwrap().owner = SagaOrigin::External(vec![9; 32]);
+    let mut ctx = private(&registry);
+    exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&run_id, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap();
+    assert_eq!(ctx.dispatch_msgs().len(), 1);
+}
+
+#[test]
+fn the_run_authority_query_answers_the_ceiling_the_read_plane_must_apply() {
+    let authority_of = |m: &RunsModule, run_id: &str| {
+        let reply = block_on(m.query(&encode_query(&RunsQuery::RunAuthority {
+            run_id: run_id.into(),
+        })))
+        .unwrap();
+        match runs_decode_reply(&reply).unwrap() {
+            RunsReply::RunAuthority(view) => view,
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    };
+
+    let (mut m, registry, caller_run) = with_open_delegating_session(2);
+    // an ordinary run is ceilinged by nothing but its agent's own record.
+    let plain = authority_of(&m, &caller_run).expect("the caller is in flight");
+    assert_eq!(plain.agent_id, "bot");
+    assert_eq!(plain.authority, None);
+
+    let mut ctx = session_ctx(
+        &registry,
+        &caller_run,
+        Origin::External(SESSION_KEY.to_vec()),
+    );
+    exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&caller_run, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap();
+    commit(&mut m);
+
+    // the delegated run carries the caller's frozen grant.
+    let callee_run = delegations(&m, &caller_run)[0].callee_run_id.clone();
+    let scoped = authority_of(&m, &callee_run).expect("the callee is in flight");
+    assert_eq!(scoped.agent_id, "worker");
+    let ceiling = scoped.authority.expect("a delegated run carries a ceiling");
+    assert_eq!(ceiling.allowed_actions, vec![ACTION_CHAT_POST.to_string()]);
+
+    // a run nobody is executing proves no ceiling — the read plane must refuse.
+    assert_eq!(authority_of(&m, "chat\u{1f}general\u{1f}9\u{1f}bot"), None);
+}

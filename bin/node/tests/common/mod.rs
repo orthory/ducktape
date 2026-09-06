@@ -2341,6 +2341,12 @@ pub fn create_account(
         .number
 }
 
+/// the expiry every consent an e2e mints carries. `consensus_time` is the
+/// block height on a validator network, and a cluster test drives a few
+/// hundred blocks at most — so this is past every one of them and inside
+/// `identity::MAX_CONSENT_TTL` of each.
+pub const CONSENT_EXPIRES: u64 = 100_000;
+
 /// admit `new_key` into `member`'s account through node `idx`: `member`
 /// consents at `new_key`'s CURRENT generation, and the JOINING key signs the
 /// `AddKey` frame (the op's origin is the key being admitted). Waits until
@@ -2369,6 +2375,10 @@ pub fn add_key(
             &joining,
             generation,
             None,
+            account_of_key(cluster, idx, member.public_key().as_ref())
+                .expect("the consenting member belongs to an account")
+                .number,
+            CONSENT_EXPIRES,
         )),
     );
     cluster.await_committed(
