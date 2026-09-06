@@ -105,6 +105,9 @@ pub(super) struct ValidatorLoopState<'a> {
     pub(super) media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     pub(super) blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
+    /// the digests the modules registry currently names — shared with the
+    /// code plane's push admission gate, so both sides of #1833 read one set.
+    pub(super) code_registry: crate::code_plane::CodeRegistry,
     pub(super) reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     pub(super) relay_tx: super::MeshSender,
     pub(super) sync_state_rx: futures::channel::mpsc::Receiver<SyncStateRequest>,
@@ -168,6 +171,9 @@ struct ValidatorRuntime<'a> {
     media_peers: Option<std::sync::Arc<overlay_book::OverlayPeers>>,
     blob_peers: std::sync::Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     blob_client: crate::blob_fetch::ServeLaneBlobClient<super::MeshSender>,
+    /// the digests the modules registry currently names — shared with the
+    /// code plane's push admission gate, so both sides of #1833 read one set.
+    code_registry: crate::code_plane::CodeRegistry,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     relay_tx: super::MeshSender,
     gate_outcomes: GateOutcomes,
@@ -297,6 +303,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         media_peers,
         blob_peers,
         blob_client,
+        code_registry,
         reach_cmd,
         relay_tx,
         mut sync_state_rx,
@@ -523,6 +530,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         media_peers,
         blob_peers,
         blob_client,
+        code_registry,
         reach_cmd,
         relay_tx,
         gate_outcomes,
