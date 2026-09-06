@@ -308,6 +308,7 @@ async fn submit_refuses_a_self_minted_key_and_the_operators_signature_wins_over_
         let handle = handle.with_admin(AdminConfig {
             operator_token: Some(OPERATOR.to_string()),
             owner_key: Some(operator_key.public_key().as_ref().to_vec()),
+            node_key: Some(NODE_KEY.to_vec()),
             ..Default::default()
         });
         (handle, cmd_rx, events)
@@ -325,7 +326,7 @@ async fn submit_refuses_a_self_minted_key_and_the_operators_signature_wins_over_
             .uri("/v1/submit")
             .header(header::CONTENT_TYPE, "application/json");
         for (name, value) in
-            noded::signed_req::request_headers(signer, "POST", "/v1/submit", &[], &bytes)
+            noded::signed_req::request_headers(signer, "POST", "/v1/submit", &NODE_KEY, &bytes)
         {
             req = req.header(name, value);
         }
