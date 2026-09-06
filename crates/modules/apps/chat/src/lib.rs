@@ -1063,13 +1063,17 @@ impl Chat {
 
     /// join (or start) the channel's huddle. only external users may — the
     /// roster is a room of people, so module/system origins are rejected —
-    /// and members-only channels gate exactly like posting. re-joining with
-    /// the same node key stages nothing (idempotent, byte-identical op log).
+    /// and members-only channels gate exactly like posting. `node_proof` must
+    /// verify as `node`'s own signature over this join (proof of possession —
+    /// see [`interface::huddle_join_preimage`]), refused with
+    /// `huddle_node_proof_invalid` otherwise. re-joining with the same node
+    /// key stages nothing (idempotent, byte-identical op log).
     async fn stage_join_huddle(
         &mut self,
         author: AuthorRef,
         channel_id: &str,
         node: Vec<u8>,
+        node_proof: Vec<u8>,
         now: u64,
     ) -> Result<(), Error> {
         Self::validate_non_empty("channel_id", channel_id)?;
@@ -1083,6 +1087,10 @@ impl Chat {
                 "huddle node key must be {HUDDLE_NODE_KEY_BYTES} bytes, got {}",
                 node.len()
             )));
+        }
+        let preimage = huddle_join_preimage(channel_id, user);
+        if !keyscheme::KeyScheme::Ed25519.verify(&node, HUDDLE_JOIN_NS, &preimage, &node_proof) {
+            return Err(Error::Module("huddle_node_proof_invalid".into()));
         }
         let mut channel = self.require_channel(channel_id).await?;
         self.check_post_policy(&channel, &author).await?;
@@ -1425,8 +1433,13 @@ impl Module for Chat {
                 self.stage_membership(&author, &channel_id, user, member)
                     .await
             }
-            ChatMsg::JoinHuddle { channel_id, node } => {
-                self.stage_join_huddle(author, &channel_id, node, now).await
+            ChatMsg::JoinHuddle {
+                channel_id,
+                node,
+                node_proof,
+            } => {
+                self.stage_join_huddle(author, &channel_id, node, node_proof, now)
+                    .await
             }
             ChatMsg::LeaveHuddle { channel_id } => {
                 self.stage_leave_huddle(author, &channel_id).await

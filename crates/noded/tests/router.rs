@@ -456,6 +456,11 @@ async fn a_node_level_route_refuses_a_self_minted_key_and_admits_the_operator() 
         ),
         ("POST", "/v1/term/sessions/abc/close", ""),
         ("DELETE", "/v1/fs/workspaces/abc", ""),
+        (
+            "POST",
+            "/v1/huddle/node-proof",
+            r#"{"channel_id":"general","user":"aa"}"#,
+        ),
     ] {
         // a key nobody knows, signed correctly. the whole vector.
         let (handle, _cmds, _events) = node();

@@ -1558,11 +1558,13 @@ name = "chat"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "commonware-cryptography",
  "commonware-runtime",
  "guest-adapter",
  "host",
  "identity",
  "index-guest",
+ "keyscheme",
  "sdk",
  "sdk-testkit",
  "serde",

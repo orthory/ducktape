@@ -785,7 +785,9 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 index_guest::delete(&mut out, key);
             }
         }
-        ChatMsg::JoinHuddle { channel_id, node } => {
+        ChatMsg::JoinHuddle {
+            channel_id, node, ..
+        } => {
             let Some(mut row) = read_channel(read, &channel_id)? else {
                 return Ok(out);
             };
@@ -1736,6 +1738,7 @@ mod tests {
             &ChatMsg::JoinHuddle {
                 channel_id: "g".into(),
                 node: vec![0xab; 32],
+                node_proof: vec![0; 64],
             },
         );
         let ChatViewReply::Channel(Some(info)) =
