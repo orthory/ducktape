@@ -385,6 +385,11 @@ pub enum WriteRefusal {
     NotOperator,
     /// the body is larger than any gated route accepts (or its stream broke).
     BodyOverCap,
+    /// this node carries no consensus key to salt the signature with — an
+    /// embedded daemon binding the empty salt would verify a signature minted
+    /// for ANY such daemon, so it refuses instead of falling back to a
+    /// wildcard.
+    NodeUnidentified,
 }
 
 impl WriteRefusal {
@@ -397,6 +402,7 @@ impl WriteRefusal {
             Self::SignatureInvalid => "signature_invalid",
             Self::NotOperator => "not_operator",
             Self::BodyOverCap => "body_over_cap",
+            Self::NodeUnidentified => "node_unidentified",
         }
     }
 
@@ -412,6 +418,9 @@ impl WriteRefusal {
             | Self::SignatureInvalid => StatusCode::UNAUTHORIZED,
             Self::NotOperator => StatusCode::FORBIDDEN,
             Self::BodyOverCap => StatusCode::PAYLOAD_TOO_LARGE,
+            // this node's own condition, not a defect in what the caller
+            // presented — retrying with any signature cannot fix it.
+            Self::NodeUnidentified => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -431,6 +440,10 @@ impl WriteRefusal {
                  credential or a signature by its operator key"
             }
             Self::BodyOverCap => "the request body is larger than this node accepts",
+            Self::NodeUnidentified => {
+                "this node has no consensus key to bind the signature to, so it cannot \
+                 verify any mutating request"
+            }
         }
     }
 }
@@ -514,9 +527,13 @@ pub(crate) async fn signed_write_guard(
         Err(_) => return refuse(&path, WriteRefusal::BodyOverCap),
     };
     // the node key SALTS the signature: a mutation signed for this node cannot
-    // be replayed against another node the same key acts on. absent on the
-    // embedded daemon (no consensus identity), which binds the empty salt.
-    let node_key = handle.admin.node_key.clone().unwrap_or_default();
+    // be replayed against another node the same key acts on. an embedded
+    // daemon with no consensus identity has nothing to salt with — refuse
+    // rather than bind the empty salt, which would verify a signature minted
+    // for ANY such keyless daemon.
+    let Some(node_key) = handle.admin.node_key.clone().filter(|k| !k.is_empty()) else {
+        return refuse(&path, WriteRefusal::NodeUnidentified);
+    };
     let verified = verify_pop(&headers, DATA_HEADERS, DATA_REQ_NS, now_secs(), |ts| {
         request_message(method.as_str(), &path_and_query, &node_key, ts, &body)
     });
@@ -879,6 +896,41 @@ mod tests {
         assert!(cap("/v1/files/stage") < cap("/v1/files/object/shared/a.bin"));
     }
 
+    /// the embedded-daemon shape this refusal exists for: no consensus key
+    /// means no salt to bind a signature to, so the guard must refuse rather
+    /// than fall back to verifying against the empty salt — which would
+    /// admit a signature minted for ANY other keyless daemon.
+    #[tokio::test]
+    async fn a_keyless_daemon_refuses_rather_than_binding_an_empty_salt() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::post;
+        use tower::ServiceExt as _;
+
+        // `NodeHandle::channel()` carries `AdminConfig::default()`, whose
+        // `node_key` is `None` — exactly the embedded-daemon condition.
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let app = axum::Router::new()
+            .route("/v1/invite", post(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                handle,
+                signed_write_guard,
+            ));
+
+        let caller = key(9);
+        let now = 9_000_000;
+        let sig = sign_request(&caller, "POST", "/v1/invite", &[], now, b"{}");
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/invite")
+            .body(Body::from("{}"))
+            .unwrap();
+        *req.headers_mut() = headers_for(&caller, &sig, now);
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[test]
     fn a_refusal_names_one_stable_reason_per_variant() {
         let all = [
@@ -888,6 +940,7 @@ mod tests {
             WriteRefusal::SignatureInvalid,
             WriteRefusal::NotOperator,
             WriteRefusal::BodyOverCap,
+            WriteRefusal::NodeUnidentified,
         ];
         let mut reasons: Vec<&str> = all.iter().map(|r| r.reason()).collect();
         reasons.sort_unstable();
