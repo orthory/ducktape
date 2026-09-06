@@ -33,8 +33,8 @@ use crate::oid::{OID_RAW_LEN, Oid};
 use crate::refs::{INTEGRATION_BRANCH, RepoState, StagedRef, is_protected_branch, norm_branch};
 use crate::tracker::{self, Tracker, author_from_origin, parse_hex_oid};
 use crate::{
-    ForgeMsg, ItemKind, MAX_REFS_PER_PUSH, PushCert, RefUpdate, ReviewVerdict, decode_msg,
-    norm_repo,
+    ForgeMsg, ItemKind, MAX_BRANCHES_PER_REPO, MAX_REFS_PER_PUSH, MAX_REPOS_PER_OWNER, PushCert,
+    RefUpdate, ReviewVerdict, decode_msg, norm_repo,
 };
 
 /// the Identity module's genesis-constant id — the account registry every
@@ -181,6 +181,15 @@ fn stage_updates(
             new,
             new.is_some().then(|| digest.unwrap()),
         )?;
+    }
+    // the branch ceiling reads the map this push would PUBLISH, so a delete
+    // always passes and a push that both deletes and creates is judged on its
+    // net effect. the branch map IS the count — no counter to persist.
+    let live_branches = state.published_refs().len();
+    if live_branches > MAX_BRANCHES_PER_REPO {
+        return Err(Error::Module(format!(
+            "forge: repo is at its branch cap ({MAX_BRANCHES_PER_REPO}); delete a branch first"
+        )));
     }
     Ok(())
 }
@@ -574,7 +583,16 @@ impl ForgeState {
         // the CAS runs AFTER, so a stale prev_oid from the rightful owner still
         // reports the non-fast-forward, not an authorization refusal.
         match self.tracker_view().owner(name).map(<[u8]>::to_vec) {
-            None => self.staged_tracker_mut().claim_owner(name, principal),
+            None => {
+                let owned = self.tracker_view().repos_owned_by(&principal);
+                if owned >= MAX_REPOS_PER_OWNER {
+                    return Err(Error::Module(format!(
+                        "forge: you already own {MAX_REPOS_PER_OWNER} repos; a repo cannot be \
+                         released, so no more may be birthed"
+                    )));
+                }
+                self.staged_tracker_mut().claim_owner(name, principal)
+            }
             Some(owner) => require_owner_for_protected(name, &owner, &principal, &updates)?,
         }
 
@@ -1266,5 +1284,93 @@ mod tests {
         let mut extra = encode_ref_target(&target);
         extra.push(0);
         assert!(decode_ref_target(&extra).is_err());
+    }
+
+    /// a single-branch create/delete push, the shape both cap tests drive.
+    fn update(branch: &str, prev: Option<Oid>, new: Option<Oid>) -> Vec<RefUpdate> {
+        vec![RefUpdate {
+            ref_name: branch.into(),
+            prev_oid: prev.map(|o| o.as_bytes().to_vec()),
+            new_oid: new.map(|o| o.as_bytes().to_vec()),
+        }]
+    }
+
+    #[test]
+    fn one_principal_may_not_birth_repos_without_bound() {
+        // nothing releases an owner, so an uncapped birth path grows every
+        // validator's tracker, root preimage and on-disk repo count forever.
+        let mut state = ForgeState::default();
+        let digest = Some(vec![7u8; 32]);
+        for i in 0..MAX_REPOS_PER_OWNER {
+            state
+                .stage_push_refs(
+                    &format!("r{i}"),
+                    vec![1],
+                    update("main", None, Some(oid('a'))),
+                    digest.clone(),
+                )
+                .unwrap();
+        }
+        let refused = state
+            .stage_push_refs(
+                "one-too-many",
+                vec![1],
+                update("main", None, Some(oid('a'))),
+                digest.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("you already own"),
+            "the cap+1-th birth is refused: {refused}"
+        );
+        // the ceiling is per OWNER, not per network.
+        state
+            .stage_push_refs(
+                "someone-else",
+                vec![2],
+                update("main", None, Some(oid('a'))),
+                digest,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_push_may_not_grow_a_repo_past_its_branch_cap() {
+        let full: BTreeMap<String, Oid> = (0..MAX_BRANCHES_PER_REPO)
+            .map(|i| (format!("b{i}"), oid('a')))
+            .collect();
+        let mut state = ForgeState::default();
+        state
+            .repos
+            .insert("alpha".into(), RepoState::with_refs(full));
+        state.tracker.claim_owner("alpha", vec![1]);
+        let digest = Some(vec![7u8; 32]);
+
+        let refused = state
+            .stage_push_refs(
+                "alpha",
+                vec![1],
+                update("new", None, Some(oid('c'))),
+                digest.clone(),
+            )
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("branch cap"),
+            "the cap+1-th branch is refused: {refused}"
+        );
+        // the host drops every staged fate of a rejected block (`abort_block`).
+        state.repos.get_mut("alpha").unwrap().abort();
+        // a delete is always allowed — it is the only way back under the cap.
+        state
+            .stage_push_refs("alpha", vec![1], update("b0", Some(oid('a')), None), None)
+            .unwrap();
+        state
+            .stage_push_refs(
+                "alpha",
+                vec![1],
+                update("new", None, Some(oid('c'))),
+                digest,
+            )
+            .unwrap();
     }
 }

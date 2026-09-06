@@ -243,6 +243,15 @@ impl Tracker {
         self.repos.get(repo).and_then(|r| r.owner.as_deref())
     }
 
+    /// how many repos `principal` already owns — derived from the tracker the
+    /// owner entries already live in, so the cap needs no counter of its own.
+    pub fn repos_owned_by(&self, principal: &[u8]) -> usize {
+        self.repos
+            .values()
+            .filter(|r| r.owner.as_deref() == Some(principal))
+            .count()
+    }
+
     /// pin the owner of the repo this block's push is BIRTHING. the caller has
     /// already established that the repo has none.
     pub fn claim_owner(&mut self, repo: &str, principal: Vec<u8>) {
