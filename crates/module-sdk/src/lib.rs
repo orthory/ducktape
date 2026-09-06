@@ -585,6 +585,14 @@ macro_rules! snapshot_guest {
             }
 
             fn finalize_block() -> ::core::result::Result<(), $crate::host::Error> {
+                use $crate::sdk::Module as _;
+                let mut module = loaded_module()?;
+                let before = module.root();
+                $crate::block_on(module.commit_block()).map_err(to_wit_error)?;
+                let changed = module.root() != before;
+                if changed {
+                    $crate::save_state(&module.snapshot(), module.root().as_bytes());
+                }
                 ::core::result::Result::Ok(())
             }
 

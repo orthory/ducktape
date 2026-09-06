@@ -59,7 +59,8 @@ pub fn active_hash(cluster: &Cluster, idx: usize, id: &str) -> Option<String> {
 /// the code hash the registry will hold for a fixture once its swap executes.
 pub fn sha256_hex(path: &str) -> String {
     use sha2::Digest as _;
-    let bytes = std::fs::read(path).expect("fixture");
+    let component = std::fs::read(path).expect("fixture");
+    let bytes = module_artifact::ModuleArtifact::component(component).encode();
     format!("{:x}", sha2::Sha256::digest(&bytes))
 }
 
