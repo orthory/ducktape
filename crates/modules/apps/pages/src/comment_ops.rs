@@ -261,15 +261,19 @@ impl Pages {
                         self.store_thread(&thread)
                     }
                     None => {
-                        if let Some(anchor) = &anchor {
-                            let block = self
-                                .load_block(&target)
-                                .await
-                                .map_err(|_| PageError::Corrupt)?
-                                .ok_or(PageError::BlockNotFound)?;
-                            if !valid_range(&block.text, anchor.start, anchor.end) {
-                                return Err(PageError::InvalidTextRange);
-                            }
+                        // the new-thread target must be a real block, anchor
+                        // or not — otherwise a thread can be squatted on an
+                        // id that never becomes a block, and no purge can
+                        // ever reach it (RemoveBlock needs the block to load).
+                        let block = self
+                            .load_block(&target)
+                            .await
+                            .map_err(|_| PageError::Corrupt)?
+                            .ok_or(PageError::BlockNotFound)?;
+                        if let Some(anchor) = &anchor
+                            && !valid_range(&block.text, anchor.start, anchor.end)
+                        {
+                            return Err(PageError::InvalidTextRange);
                         }
                         let mut ids = self.load_target_index(&target).await?;
                         if ids.len() >= MAX_THREADS_PER_TARGET {
