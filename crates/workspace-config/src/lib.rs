@@ -31,6 +31,7 @@ use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::Ingress;
 use commonware_utils::Hostname;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 // The submodules are public as well as flat-re-exported: `config/resolve.rs`
 // back in bin/node reaches several of them by path (`node_toml::RawNodeToml`),
@@ -158,6 +159,22 @@ pub fn validate_module_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// a chain id has the shape `mint_chain_id` produces: `<name>#<8 lowercase
+/// hex>`. Checked on a chain id that reaches the program from outside it
+/// (an invite's descriptor) — a shape `node init` never mints (no `#`, more
+/// than one, or a non-hex/non-lowercase/wrong-length suffix) is refused
+/// rather than trusted to sit next to a normally-minted id in the registry.
+pub fn validate_chain_id_shape(id: &str) -> Result<(), String> {
+    let malformed = || format!("chain id {id:?} is not <name>#<8 hex> — refusing to join it");
+    let (name, salt) = id.split_once('#').ok_or_else(malformed)?;
+    let is_hex_salt = salt.len() == 8 && salt.bytes().all(|b| b.is_ascii_hexdigit());
+    let is_lowercase = salt.chars().all(|c| !c.is_ascii_uppercase());
+    if name.is_empty() || !is_hex_salt || !is_lowercase {
+        return Err(malformed());
+    }
+    Ok(())
+}
+
 /// a beat of zero is not a cadence: every consensus timer is a multiple of it,
 /// so the whole simplex clock collapses to a hot spin. checked at every
 /// boundary a descriptor enters through, exactly like [`validate_module_id`].
@@ -250,8 +267,12 @@ impl NetworkDescriptor {
         Self::from_toml(&text)
     }
 
+    /// write the descriptor via tmp-file + rename: this is the workspace's
+    /// identity file, rewritten on every invite mint and admit — a crash
+    /// mid-write must never leave a torn `network.toml` (see genesis.rs's
+    /// own `write_atomic`, which this shares).
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        std::fs::write(path, self.to_toml()).map_err(|e| format!("write {path:?}: {e}"))
+        genesis::write_atomic(path, self.to_toml().as_bytes())
     }
 
     pub fn validator_keys(&self) -> Result<Vec<ed25519::PublicKey>, String> {
@@ -394,12 +415,21 @@ impl NetworkDescriptor {
 
     /// record a dial hint (`host:port`, an IP or a hostname) for `key`, replacing
     /// any previous hint for the same key (a member's advertised addr can move).
-    pub fn add_bootstrap(&mut self, key: &ed25519::PublicKey, addr: &str) {
+    ///
+    /// Returns whether the entry set actually changed, so a caller that only
+    /// rewrites the descriptor to record a bootstrap hint (every invite mint)
+    /// can skip the write when this key already carries this address.
+    pub fn add_bootstrap(&mut self, key: &ed25519::PublicKey, addr: &str) -> bool {
         let hex = hex_bytes(key.as_ref());
+        let entry = format!("{hex}@{addr}");
+        if self.bootstrap.contains(&entry) {
+            return false;
+        }
         self.bootstrap
             .retain(|e| !e.starts_with(&format!("{hex}@")));
-        self.bootstrap.push(format!("{hex}@{addr}"));
+        self.bootstrap.push(entry);
         self.bootstrap.sort();
+        true
     }
 
     /// the reach hints, typed. if the descriptor carries explicit `reach`
@@ -1063,9 +1093,20 @@ fn find_workspace_config_in(root: &Path, needle: &str) -> Result<PathBuf, String
             continue;
         }
         // an unreadable descriptor in one workspace must not break addressing
-        // the others — skip it.
-        let Ok(d) = NetworkDescriptor::load(&descriptor_path) else {
-            continue;
+        // the others — skip it, but say so: silence here reads as "no such
+        // workspace" when the real story is a torn network.toml.
+        let d = match NetworkDescriptor::load(&descriptor_path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    target: "ducktape::workspace",
+                    reason = "descriptor_unreadable",
+                    dir = %dir.display(),
+                    error = %e,
+                    "skipping workspace with an unreadable network.toml"
+                );
+                continue;
+            }
         };
         if d.chain_id == needle {
             return Ok(dir.join("node.toml"));
@@ -1165,8 +1206,18 @@ pub fn list_workspaces_in(root: &Path) -> Result<Vec<(String, PathBuf)>, String>
         if !descriptor_path.is_file() {
             continue;
         }
-        let Ok(d) = NetworkDescriptor::load(&descriptor_path) else {
-            continue;
+        let d = match NetworkDescriptor::load(&descriptor_path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    target: "ducktape::workspace",
+                    reason = "descriptor_unreadable",
+                    dir = %dir.display(),
+                    error = %e,
+                    "skipping workspace with an unreadable network.toml"
+                );
+                continue;
+            }
         };
         out.push((d.chain_id, dir.join("node.toml")));
     }
@@ -1236,6 +1287,98 @@ mod tests {
         let ids: Vec<&str> = got.iter().map(|(c, _)| c.as_str()).collect();
         assert_eq!(ids, ["alpha#00000001", "zebra#00000002"]);
         assert!(got[0].1.ends_with("alpha#00000001/node.toml"));
+    }
+
+    #[test]
+    fn list_and_find_skip_a_torn_descriptor_instead_of_erroring() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good#00000001");
+        std::fs::create_dir_all(&good).unwrap();
+        NetworkDescriptor {
+            chain_id: "good#00000001".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        }
+        .save(&good.join("network.toml"))
+        .unwrap();
+        // a torn (truncated mid-write) network.toml: present, but not
+        // parseable toml.
+        let torn = root.path().join("torn#00000002");
+        std::fs::create_dir_all(&torn).unwrap();
+        std::fs::write(torn.join("network.toml"), b"chain_id = \"torn#0000").unwrap();
+
+        let listed = list_workspaces_in(root.path()).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|(c, _)| c.as_str()).collect();
+        assert_eq!(ids, ["good#00000001"]);
+
+        // `find` still resolves the healthy workspace and does not surface
+        // the damaged one as a match or a hard error.
+        let found = find_workspace_config_in(root.path(), "good#00000001").unwrap();
+        assert!(found.ends_with("good#00000001/node.toml"));
+        assert!(find_workspace_config_in(root.path(), "torn").is_err());
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_partial_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("network.toml");
+        let original = NetworkDescriptor {
+            chain_id: "atomic#00000001".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        };
+        original.save(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // save goes through a tmp file that is renamed into place: after a
+        // successful save, no `.tmp.<pid>` sibling is left behind, and the
+        // reader never sees anything but a complete descriptor.
+        let leftover_tmp = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.path().extension().is_some_and(|ext| ext != "toml"));
+        assert!(!leftover_tmp, "save left a tmp file behind");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        // reloading yields the exact descriptor that was saved.
+        assert_eq!(
+            NetworkDescriptor::load(&path).unwrap().chain_id,
+            original.chain_id
+        );
+    }
+
+    #[test]
+    fn chain_id_shape_matches_what_mint_chain_id_produces() {
+        let minted = identity::mint_chain_id(
+            "dognet",
+            &commonware_cryptography::ed25519::PrivateKey::from_seed(1).public_key(),
+        );
+        assert!(validate_chain_id_shape(&minted).is_ok(), "{minted}");
+
+        for bad in [
+            "dognet",           // no salt at all
+            "dognet#",          // empty salt
+            "dognet#abcd123",   // 7 hex chars, not 8
+            "dognet#abcd12345", // 9 hex chars
+            "dognet#ABCD1234",  // uppercase
+            "dognet#zzzzzzzz",  // not hex
+            "#abcd1234",        // empty name
+            "dog#net#abcd1234", // more than one '#' (splits on the first)
+        ] {
+            assert!(
+                validate_chain_id_shape(bad).is_err(),
+                "{bad:?} should not pass as a minted chain id"
+            );
+        }
     }
 
     #[test]

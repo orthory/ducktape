@@ -13,9 +13,15 @@
 //!   CURRENT generation; acceptance advances that generation, so the consent
 //!   is single-use -- including after a compromised key is removed. a removed
 //!   key is never burned (a wallet or an SSH key cannot be re-minted): it can
-//!   be re-admitted anywhere by a consent signed at its next generation.
-//! - [`IdentityMsg::RemoveKey`] drops a key (any member may drop any, except
-//!   the last -- an account always keeps at least one live key).
+//!   be re-admitted anywhere by a consent signed at its next generation. the
+//!   consent also NAMES the account it admits into and the consensus time it
+//!   dies at: an unspent one neither follows its author onto another account
+//!   nor outlives [`MAX_CONSENT_TTL`]. there is no revoke op -- the clock is
+//!   the revocation, and it is why the ceiling is days rather than months.
+//! - [`IdentityMsg::RemoveKey`] drops a key: a member removes ITSELF or a key
+//!   admitted no earlier than it was, never the last one. seniority is what
+//!   stops a key admitted by a mis-issued consent from evicting the founders
+//!   who predate it -- an account cannot be taken over from the bottom.
 //! - [`IdentityMsg::SetName`] / [`IdentityMsg::SetProfile`] are member-gated
 //!   by the origin alone.
 //!
@@ -81,6 +87,13 @@ pub const MAX_ACCOUNTS: u64 = 65_536;
 /// record past the cap is refused loudly and deterministically instead of
 /// poisoning the sync wire.
 pub const MAX_ACCOUNT_RECORD_BYTES: usize = 512 * 1024;
+/// keys one account may associate. the byte cap alone would allow ~11k of
+/// them (a key entry is the pubkey plus its meta, well under 128 bytes), and
+/// EVERY `OfKey`/`All` reader decodes the whole set -- so the association is
+/// bounded by count too: 32 keys x ~128 bytes is ~4 KiB, three orders of
+/// magnitude under [`MAX_ACCOUNT_RECORD_BYTES`]. a person's devices, wallets
+/// and passkeys fit; a scripted key farm does not.
+pub const MAX_KEYS_PER_ACCOUNT: usize = 32;
 
 /// per-account record key: prefix + 0 + the number, little-endian.
 fn acct_key(number: AccountNumber) -> Vec<u8> {
@@ -447,16 +460,51 @@ impl Identity {
             .owner_of_key(&authorizer.key)
             .await?
             .ok_or_else(|| Error::Module("authorizer belongs to no account".into()))?;
+        // the account is under the authorizer's signature AND is its account
+        // right now: a consent minted on one account never admits into another
+        // its author later joins.
+        if number != authorizer.account {
+            return Err(Error::Module(format!(
+                "consent names account {}, its authorizer is on account {number}",
+                authorizer.account
+            )));
+        }
+        let now = ctx.env().consensus_time;
+        if now > authorizer.expires_at {
+            return Err(Error::Module(format!(
+                "consent expired at {} (now {now})",
+                authorizer.expires_at
+            )));
+        }
+        if authorizer.expires_at - now > MAX_CONSENT_TTL {
+            return Err(Error::Module(format!(
+                "consent outlives the {MAX_CONSENT_TTL}-block ceiling"
+            )));
+        }
         let mut record = self.stored_account(number).await?;
+        let full = record.keys.len() >= MAX_KEYS_PER_ACCOUNT;
+        if full {
+            return Err(Error::Module(format!(
+                "account key cap reached ({MAX_KEYS_PER_ACCOUNT})"
+            )));
+        }
         let authorizer_scheme = record
             .keys
             .get(&authorizer.key)
             .map(|meta| meta.scheme)
             .ok_or_else(|| Error::Module("key index disagrees with its account record".into()))?;
 
-        // the consent names THIS key at ITS current generation -- nothing else.
+        // the consent names THIS key at ITS current generation, that account,
+        // and that expiry -- nothing else.
         let generation = self.key_gen(&origin).await?;
-        let preimage = add_key_preimage(&self.chain_id, scheme, &origin, generation);
+        let preimage = add_key_preimage(
+            &self.chain_id,
+            scheme,
+            &origin,
+            generation,
+            authorizer.account,
+            authorizer.expires_at,
+        );
         if !authorizer_scheme.verify(
             &authorizer.key,
             IDENTITY_ADD_KEY_NS,
@@ -469,7 +517,6 @@ impl Identity {
         }
         let label = clean_label(label)?;
 
-        let now = ctx.env().consensus_time;
         record.keys.insert(
             origin.clone(),
             KeyMeta {
@@ -486,19 +533,38 @@ impl Identity {
         Ok(())
     }
 
-    /// drop `key` from the origin's account. any member may drop any member
-    /// (including itself), except the last remaining one.
+    /// drop `key` from the origin's account: itself, or a key admitted no
+    /// earlier than the origin was. never the last remaining one.
     async fn remove_key(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
+        let origin = Self::origin_key(ctx)?;
         let (number, mut record) = self.account_of_origin(ctx).await?;
-        if !record.keys.contains_key(&key) {
+        let Some(target) = record.keys.get(&key) else {
             return Err(Error::Module(
                 "target key is not a member of this account".into(),
             ));
-        }
+        };
         let last_key = record.keys.len() == 1;
         if last_key {
             return Err(Error::Module(
                 "cannot remove the last key of an account".into(),
+            ));
+        }
+        // SENIORITY. the origin is a member, so the record holds its meta.
+        // keys admitted in the same block are peers; a key admitted later is
+        // junior and may be dropped. this is what an outstanding consent
+        // cannot buy: the key it admits can never evict the members that
+        // predate it, so a mis-issued ticket costs a squatter, not the
+        // account.
+        let removing_self = key == origin;
+        let senior_target = target.added_at
+            < record
+                .keys
+                .get(&origin)
+                .expect("the origin is a member of its own account")
+                .added_at;
+        if !removing_self && senior_target {
+            return Err(Error::Module(
+                "cannot remove a key admitted before your own".into(),
             ));
         }
         record.keys.remove(&key);

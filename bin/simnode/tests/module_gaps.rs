@@ -65,7 +65,7 @@ fn an_add_key_consent_is_single_use_and_a_removed_key_relinks_at_its_next_gen() 
     assert!(of_key(&sim, &pub_c).is_null(), "a fresh key has no account");
 
     // key_a consents at gen 0; key_c submits the AddKey as ITS OWN origin.
-    let consent_at_0 = add_ed25519_key(&key_a, &pub_c, 0);
+    let consent_at_0 = add_ed25519_key(&key_a, &pub_c, 0, 1);
     sim.submit_ok("identity", consent_at_0.clone(), Some(&origin_c));
     let acct = of_key(&sim, &pub_c);
     assert_eq!(acct["number"], 1, "key_c joined account 1: {acct}");
@@ -106,7 +106,7 @@ fn an_add_key_consent_is_single_use_and_a_removed_key_relinks_at_its_next_gen() 
     sim.submit_ok("identity", create("b"), Some(&key_origin(&key_b)));
     let stale = sim.submit_rejected(
         "identity",
-        add_ed25519_key(&key_b, &pub_c, 0),
+        add_ed25519_key(&key_b, &pub_c, 0, 2),
         Some(&origin_c),
     );
     assert!(
@@ -115,7 +115,7 @@ fn an_add_key_consent_is_single_use_and_a_removed_key_relinks_at_its_next_gen() 
     );
     sim.submit_ok(
         "identity",
-        add_ed25519_key(&key_b, &pub_c, 1),
+        add_ed25519_key(&key_b, &pub_c, 1, 2),
         Some(&origin_c),
     );
     let acct = of_key(&sim, &pub_c);

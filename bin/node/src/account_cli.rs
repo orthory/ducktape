@@ -18,7 +18,11 @@
 //!   member key by signing its own `AddKey` frame AS ORIGIN (registration is
 //!   two touches: the page yields the key, then the key proves possession);
 //!   `login` is the reverse — a passkey's assertion over THIS key's `AddKey`
-//!   preimage is the consent that admits this device.
+//!   preimage is the consent that admits this device, and it takes two touches
+//!   because the consent names the account (touch 1 asks the passkey which).
+//!
+//! A minted consent is account-bound and short-lived ([`CONSENT_TTL`]): there
+//! is no revoke verb, so the expiry is how a mis-issued ticket dies.
 //!
 //! Program output stays `println!` (a CLI's stdout is not logging); the
 //! password crosses on stdin, never a flag.
@@ -512,9 +516,11 @@ fn cmd_create_eth(ctx: &VerbCtx, auth: &AuthCtx, name: String) -> AccountResult 
     Ok(())
 }
 
-/// `login`: this device asks a passkey to admit it. The assertion over THIS
-/// key's `AddKey` preimage is the consent; its `userHandle` names the account;
-/// the frame is signed by this device — the key being admitted, as `key join`.
+/// `login`: this device asks a passkey to admit it. TWO touches, because a
+/// consent names the account it admits into and only the passkey knows which
+/// that is: touch 1 asks (`userHandle`), touch 2 is the assertion over THIS
+/// key's `AddKey` preimage for that account — the consent. The frame is signed
+/// by this device, the key being admitted, as `key join`.
 fn cmd_login(
     ctx: &VerbCtx,
     auth: &AuthCtx,
@@ -531,14 +537,25 @@ fn cmd_login(
             key: device_key.clone(),
         },
     )?)?;
-    let consent = ceremony(
-        auth,
-        &authpage::login_request(&chain_id, &device_key, generation),
-    )?;
-    let (number, proof) = authpage::login_consent(&consent)?;
+    let number = authpage::assertion_account(&ceremony(auth, &authpage::account_request())?)?;
     let account = account_reply(query_identity(&base, &IdentityQuery::Get { number })?)?
         .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
-    let msg = authpage::login_add_key(&chain_id, &device_key, generation, &account, label, proof)?;
+    let expires_at = consent_expiry(&base)?;
+    eprintln!("account {number} — confirm once more to admit this device");
+    let consent = ceremony(
+        auth,
+        &authpage::login_request(&chain_id, &device_key, generation, number, expires_at),
+    )?;
+    let (_, proof) = authpage::login_consent(&consent)?;
+    let msg = authpage::login_add_key(
+        &chain_id,
+        &device_key,
+        generation,
+        &account,
+        label,
+        proof,
+        expires_at,
+    )?;
     let height = submit_identity(&base, &user, &msg)?;
     println!("joined account {number} at height {height}");
     print_keys(&own_account(&base, &device_key)?);
@@ -632,9 +649,39 @@ fn consented_add_key(
             key: new_key.to_vec(),
         },
     )?)?;
+    let account = own_account(base, user.public_key().as_ref())?.number;
     Ok(add_key_msg(
-        user, chain_id, scheme, new_key, label, generation,
+        user,
+        chain_id,
+        scheme,
+        new_key,
+        label,
+        generation,
+        account,
+        consent_expiry(base)?,
     ))
+}
+
+/// How long a minted consent stays spendable, in blocks — `consensus_time` is
+/// a block height and a validator network heartbeats about once a second, so
+/// this is roughly a day. A device pairing is minutes of work; the day is the
+/// slack for a phone in another timezone. There is no revoke op, so this
+/// number IS the revocation window: it stays short enough that a mis-issued
+/// ticket ages out before anyone remembers it exists.
+const CONSENT_TTL: u64 = 86_400;
+
+/// the `expires_at` a consent minted right now carries: the node's committed
+/// height plus [`CONSENT_TTL`].
+fn consent_expiry(base: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    Ok(head_height(base)? + CONSENT_TTL)
+}
+
+/// this node's committed height, from `/v1/status`.
+fn head_height(base: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let status = node_http::get_json(base, "/v1/status").map_err(|failure| failure.to_string())?;
+    status["height"]
+        .as_u64()
+        .ok_or_else(|| "node status carries no height".into())
 }
 
 fn identity_msg(msg: &IdentityMsg) -> sdk::Msg {
@@ -697,9 +744,11 @@ fn create_msg(name: String) -> IdentityMsg {
     }
 }
 
-/// the `AddKey` an existing member consents to for `new_key` (of `scheme`) at
-/// its current `generation` on `chain_id`. Encoded, it is the ticket `key add
-/// --pubkey` prints — ONE json line, exactly the payload the new device submits.
+/// the `AddKey` an existing member consents to for `new_key` (of `scheme`)
+/// into `account` at its current `generation` on `chain_id`, spendable until
+/// `expires_at`. Encoded, it is the ticket `key add --pubkey` prints — ONE
+/// json line, exactly the payload the new device submits.
+#[allow(clippy::too_many_arguments)]
 fn add_key_msg(
     user: &ed25519::PrivateKey,
     chain_id: &str,
@@ -707,11 +756,15 @@ fn add_key_msg(
     new_key: &[u8],
     label: Option<String>,
     generation: u64,
+    account: u64,
+    expires_at: u64,
 ) -> IdentityMsg {
     IdentityMsg::AddKey {
         scheme,
         label,
-        authorizer: config::ed25519_authorizer(user, chain_id, scheme, new_key, generation),
+        authorizer: config::ed25519_authorizer(
+            user, chain_id, scheme, new_key, generation, account, expires_at,
+        ),
     }
 }
 
@@ -930,9 +983,22 @@ mod tests {
         label: Option<String>,
         generation: u64,
     ) -> String {
-        let msg = add_key_msg(user, chain_id, scheme, new_key, label, generation);
+        let msg = add_key_msg(
+            user,
+            chain_id,
+            scheme,
+            new_key,
+            label,
+            generation,
+            TEST_ACCOUNT,
+            TEST_EXPIRES,
+        );
         String::from_utf8(identity::encode_msg(&msg)).unwrap()
     }
+
+    /// what a ticket in these tests is minted for.
+    const TEST_ACCOUNT: u64 = 11;
+    const TEST_EXPIRES: u64 = 900;
 
     #[test]
     fn the_verb_tree_is_create_show_key_login_set_name_set_profile() {
@@ -1016,7 +1082,16 @@ mod tests {
         let member = signer(5);
         let sk = ssh_key(3);
         let pubkey = ssh_pubkey(&sk);
-        let msg = add_key_msg(&member, "chain-a", KeyScheme::Ed25519, &pubkey, None, 0);
+        let msg = add_key_msg(
+            &member,
+            "chain-a",
+            KeyScheme::Ed25519,
+            &pubkey,
+            None,
+            0,
+            TEST_ACCOUNT,
+            TEST_EXPIRES,
+        );
         let preimage = node::frame_preimage(KeyScheme::Ed25519, &pubkey, 9, &identity_msg(&msg));
         // what ssh-keygen prints for the bytes the CLI pipes into it.
         let armored = armor(&ssh_proof(&sk, node::FRAME_NS, &preimage));
@@ -1053,7 +1128,14 @@ mod tests {
             bio: None,
             updated_at: 0,
         };
-        let preimage = identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 4);
+        let preimage = identity::add_key_preimage(
+            "chain-a",
+            KeyScheme::Ed25519,
+            &device_key,
+            4,
+            TEST_ACCOUNT,
+            TEST_EXPIRES,
+        );
         let (authenticator_data, client_data_json, signature) = passkey_assertion_parts(
             &mine,
             "auth.ducktape.industries",
@@ -1068,8 +1150,16 @@ mod tests {
         };
         let (number, proof) = authpage::login_consent(&outcome).unwrap();
         assert_eq!(number, 11);
-        let msg =
-            authpage::login_add_key("chain-a", &device_key, 4, &account, None, proof).unwrap();
+        let msg = authpage::login_add_key(
+            "chain-a",
+            &device_key,
+            4,
+            &account,
+            None,
+            proof,
+            TEST_EXPIRES,
+        )
+        .unwrap();
         let frame = user_frame(&device, "identity", identity::encode_msg(&msg));
         let (origin, submitted) = node::decode_frame(&frame).unwrap();
         assert_eq!(origin, sdk::Origin::External(device_key));
@@ -1114,21 +1204,36 @@ mod tests {
         assert_eq!(authorizer.key, member.public_key().as_ref());
         // the module's own check, verbatim: at the generation the ticket was
         // minted for — and at no other.
-        let preimage = |generation| {
-            identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &new_key, generation)
+        assert_eq!(authorizer.account, TEST_ACCOUNT);
+        assert_eq!(authorizer.expires_at, TEST_EXPIRES);
+        let preimage = |generation, account, expires_at| {
+            identity::add_key_preimage(
+                "chain-a",
+                KeyScheme::Ed25519,
+                &new_key,
+                generation,
+                account,
+                expires_at,
+            )
         };
-        assert!(KeyScheme::Ed25519.verify(
-            &authorizer.key,
-            identity::IDENTITY_ADD_KEY_NS,
-            &preimage(2),
-            &authorizer.proof,
-        ));
-        assert!(!KeyScheme::Ed25519.verify(
-            &authorizer.key,
-            identity::IDENTITY_ADD_KEY_NS,
-            &preimage(3),
-            &authorizer.proof,
-        ));
+        let verifies = |generation, account, expires_at| {
+            KeyScheme::Ed25519.verify(
+                &authorizer.key,
+                identity::IDENTITY_ADD_KEY_NS,
+                &preimage(generation, account, expires_at),
+                &authorizer.proof,
+            )
+        };
+        assert!(verifies(2, TEST_ACCOUNT, TEST_EXPIRES));
+        assert!(!verifies(3, TEST_ACCOUNT, TEST_EXPIRES), "single-use");
+        assert!(
+            !verifies(2, TEST_ACCOUNT + 1, TEST_EXPIRES),
+            "the ticket admits into ONE account"
+        );
+        assert!(
+            !verifies(2, TEST_ACCOUNT, TEST_EXPIRES + 1),
+            "and dies at ONE time"
+        );
     }
 
     #[test]
