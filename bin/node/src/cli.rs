@@ -527,6 +527,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let genesis = config::Genesis::compose(
         &founding_set,
         &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
+        &topology::TOPOLOGY.index_guest_ids(topology::PRODUCTION),
     )
     .map_err(|e| {
         format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")
