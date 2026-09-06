@@ -1001,18 +1001,23 @@ subscribe
   // buffer has drifted from the last text known written.
   every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick
 
-// CLOSING A WINDOW IS NOT QUITTING. This only unregisters the slot the closed
-// window held; the daemon goes on living in the status item with no window at
-// all, the way a menu-bar app does. Leaving is an explicit act — the tray's
-// "Quit Ducktape" or ⌘Q (`quit_chord_pressed`) — never the side effect of a
-// red button. The handoff paths (`console_opened`, `onboarding_reopened`) still
-// close their predecessor after the successor is registered; that is window
-// bookkeeping now, not a life-or-death guard, and the huddle window needs no
-// special case because no window's absence ends anything.
+// CLOSING A WINDOW IS NOT QUITTING — where there is somewhere else to live.
+// This unregisters the slot the closed window held; on a Mac the daemon goes
+// on in the status item with no window at all, the way a menu-bar app does,
+// and leaving is an explicit act — the tray's "Quit Ducktape" or ⌘Q
+// (`command_chord_pressed`) — never the side effect of a red button. Off macOS
+// there is no status item, so a window is the only handle on the process and
+// the last close leaves; `last_window_closed_exits` is the one place that
+// decides. The handoff paths (`console_opened`, `onboarding_reopened`) close
+// their predecessor after the successor is registered, so a handoff never
+// counts as the last close.
 on window_was_closed(id)
   onboarding_win = without_window(onboarding_win, id)
   console_win = without_window(console_win, id)
   huddle_win = without_window(huddle_win, id)
+  let leaving = last_window_closed_exits(console_win, onboarding_win)
+  return if !leaving
+  exit
 
 // THE STATUS ITEM'S MENU. Since a close no longer ends the process, "Open" has
 // to be able to OPEN: with both slots empty there is nothing to raise, and

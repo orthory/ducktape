@@ -304,6 +304,22 @@ pub fn tray_open_action(
     }
 }
 
+/// Does this close end the process? Only where the daemon has nowhere else to
+/// live: on a Mac it goes on in the status item with no window at all, but off
+/// macOS there is no status item (`ui-lang-runtime`'s tray is a no-op there),
+/// so a window is the only handle on the process and closing the last one
+/// must leave — a daemon nobody can reach is a leak, not a menu-bar app. The
+/// huddle window is deliberately not a survivor: a lone call window never
+/// keeps the daemon alive after its console is gone.
+pub fn last_window_closed_exits(
+    console: Option<iced::window::Id>,
+    onboarding: Option<iced::window::Id>,
+) -> bool {
+    let has_status_item = cfg!(target_os = "macos");
+    let a_window_remains = console.is_some() || onboarding.is_some();
+    !has_status_item && !a_window_remains
+}
+
 /// Clear a tracked window id when it is the one that closed.
 pub fn without_window(
     current: Option<iced::window::Id>,

@@ -1631,12 +1631,14 @@ test the_huddle_controls_survive_the_narrowest_panel
   expect share.width ~= 32.0
   capture huddle_sharing_light
 
-// CLOSING A WINDOW IS NOT QUITTING. The process used to leave with its last
-// tracked window, which made the red button a quit nobody asked for; now a
-// close only unregisters the slot and the daemon goes on living in the status
-// item. The one thing this cannot assert is the absence of an exit — the
-// harness swallows `Action::Exit` — so it asserts the observable consequence
-// instead: after the close, the menu still answers and can put a window back.
+// CLOSING A WINDOW IS NOT QUITTING on a Mac. The process used to leave with
+// its last tracked window, which made the red button a quit nobody asked for;
+// now a close only unregisters the slot and the daemon goes on living in the
+// status item. The one thing this cannot assert is an exit or its absence —
+// the harness swallows `Action::Exit`, which is also why it runs the same off
+// macOS, where the last close does leave — so it asserts the observable
+// consequence: after the close, the menu still answers and can put a window
+// back.
 test closing_the_last_window_only_unregisters_it
   preset ui_offline
   tray choose "Open Ducktape"
@@ -1669,7 +1671,9 @@ test the_quit_chord_route_is_armed_only_while_command_is_held
   expect !cmd_held
   key "q"
   expect !cmd_held
-  modifiers logo
+  // Both modifiers at once, because the command key is ⌘ on a Mac and Ctrl
+  // everywhere else and this scenario runs on both.
+  modifiers control logo
   expect cmd_held
   modifiers
   expect !cmd_held
