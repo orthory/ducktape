@@ -56,6 +56,24 @@ const MAX_CONTROL_CUMULATIVE_SECS: u64 = 2 * 60 * 60;
 /// client that opens a second request before the first's body drains.
 /// ponytail: fixed 8, revisit only if a real session starves it.
 const MAX_CONCURRENT: usize = 8;
+/// TCP+TLS connect deadline for every broker/gateway client (#1668). Neither
+/// reqwest client had ANY timeout, so a half-open path (a dead NAT/WireGuard
+/// hop is the realistic case on the airlock overlay arm) parked its
+/// concurrency permit — and, for `refresh_if_needed`/`airlock_reauth`, the
+/// auth mutex — forever. A live connect completes in well under a second; 10s
+/// covers a slow network without masking a genuinely dead one.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle-between-reads deadline for the two provider brokers' streamed/buffered
+/// upstream calls. A real model answer can legitimately idle for tens of
+/// seconds between chunks (thinking, a slow tool round trip upstream), so this
+/// must be generous — but a connection that never sends anything at all (the
+/// #1668 repro: a listener that accepts and never writes) must not wedge a
+/// permit past a bounded wait. Shrunk under `cfg(test)` so the timeout test
+/// does not need to sleep tens of seconds to observe it.
+#[cfg(not(test))]
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 struct UpstreamCredential {
@@ -380,6 +398,8 @@ impl RunBroker {
             responses_url,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(UPSTREAM_IDLE_TIMEOUT)
                 .build()
                 .map_err(|e| format!("build provider broker client: {e}"))?,
             requests: AtomicU32::new(0),
@@ -536,12 +556,7 @@ async fn forward_responses(
     let (mut upstream, mut binding, mut seal_keys) = match send_codex(&state, &headers, &body).await
     {
         Ok(sent) => sent,
-        Err(e) => {
-            return response(
-                StatusCode::BAD_GATEWAY,
-                &format!("provider upstream failed: {e}"),
-            );
-        }
+        Err(e) => return upstream_send_error(&e, "provider"),
     };
     // Airlock only: a gateway 401 means the scoped session token's TTL lapsed.
     // Re-handshake once and retry. Host runs pass straight through (reauth is a
@@ -550,12 +565,7 @@ async fn forward_responses(
     if token_expired && codex_airlock_reauth(&state).await {
         (upstream, binding, seal_keys) = match send_codex(&state, &headers, &body).await {
             Ok(sent) => sent,
-            Err(e) => {
-                return response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("provider upstream failed: {e}"),
-                );
-            }
+            Err(e) => return upstream_send_error(&e, "provider"),
         };
     }
     let status =
@@ -579,12 +589,7 @@ async fn forward_responses(
                 output.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(e) => {
-                return response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("provider upstream stream failed: {e}"),
-                );
-            }
+            Err(e) => return upstream_send_error(&e, "provider"),
         }
     }
     if state
@@ -1063,6 +1068,21 @@ fn response(status: StatusCode, message: &str) -> Response<Body> {
     let mut response = Response::new(Body::from(message.to_string()));
     *response.status_mut() = status;
     response
+}
+
+/// Turn a failed upstream `send()` into the response the sandbox sees. A
+/// timeout (connect or idle-read, see the broker client builders) gets its own
+/// stable reason token and 504 rather than a generic 502 — the permit that
+/// held it is a local var, already dropped by the time the caller returns
+/// this, so the run's concurrency budget is freed rather than parked forever.
+fn upstream_send_error(e: &reqwest::Error, provider: &str) -> Response<Body> {
+    if e.is_timeout() {
+        return response(StatusCode::GATEWAY_TIMEOUT, "upstream_idle_timeout");
+    }
+    response(
+        StatusCode::BAD_GATEWAY,
+        &format!("{provider} upstream failed: {e}"),
+    )
 }
 
 // ===== Anthropic Messages broker (Claude Code) ===============================
@@ -1809,6 +1829,8 @@ impl RunBroker {
             auth: tokio::sync::Mutex::new(auth),
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(UPSTREAM_IDLE_TIMEOUT)
                 .build()
                 .map_err(|e| format!("build anthropic broker client: {e}"))?,
             messages_url,
@@ -1972,12 +1994,7 @@ async fn forward_messages(
     let (mut upstream, mut binding, mut seal_keys) =
         match send_upstream(&state, &headers, &body).await {
             Ok(sent) => sent,
-            Err(e) => {
-                return response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("anthropic upstream failed: {e}"),
-                );
-            }
+            Err(e) => return upstream_send_error(&e, "anthropic"),
         };
     // Airlock only: a gateway 401 means the scoped session token's TTL lapsed.
     // Re-handshake once and retry. Every other credential arm — and every other
@@ -1986,12 +2003,7 @@ async fn forward_messages(
     if token_expired && state.airlock_reauth().await {
         (upstream, binding, seal_keys) = match send_upstream(&state, &headers, &body).await {
             Ok(sent) => sent,
-            Err(e) => {
-                return response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("anthropic upstream failed: {e}"),
-                );
-            }
+            Err(e) => return upstream_send_error(&e, "anthropic"),
         };
     }
     // Airlock sealed session: the enclave's proxied response is an opaque
@@ -2615,6 +2627,66 @@ mod tests {
             "unexpected error: {err}"
         );
         upstream.abort();
+    }
+
+    /// #1668 regression: an upstream that accepts the TCP connection and never
+    /// writes a byte (the issue's `nc -l -p PORT >/dev/null` repro) must not
+    /// park the concurrency permit forever. With the client's idle-read
+    /// timeout (shrunk under `cfg(test)`) it 504s with the stable reason token
+    /// instead — and, with capacity 1, a SECOND request proves the permit was
+    /// actually freed: it gets far enough to hit the same hung upstream and
+    /// time out again, rather than being rejected 429 "concurrency exhausted".
+    #[tokio::test]
+    async fn upstream_idle_timeout_returns_504_and_frees_the_permit() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        // accept and hold every connection open, writing nothing — the
+        // half-open-path repro from the issue.
+        let held: Arc<Mutex<Vec<tokio::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let held_accept = held.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                held_accept.lock().unwrap().push(socket);
+            }
+        });
+
+        let state = Arc::new(AnthropicBrokerState {
+            run_bearer: "bearer".into(),
+            auth: tokio::sync::Mutex::new(AnthropicAuth::ApiKey("host-secret".into())),
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(UPSTREAM_IDLE_TIMEOUT)
+                .build()
+                .unwrap(),
+            messages_url: format!("http://{addr}/v1/messages"),
+            requests: AtomicU32::new(0),
+            bytes: AtomicU64::new(0),
+            concurrent: Arc::new(Semaphore::new(1)),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str("Bearer bearer").unwrap(),
+        );
+
+        let resp1 =
+            forward_messages(State(state.clone()), headers.clone(), Bytes::from_static(b"{}"))
+                .await;
+        assert_eq!(resp1.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body1 = to_bytes(resp1.into_body(), 1024).await.unwrap();
+        assert_eq!(&body1[..], b"upstream_idle_timeout".as_slice());
+
+        let resp2 =
+            forward_messages(State(state), headers, Bytes::from_static(b"{}")).await;
+        assert_eq!(
+            resp2.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "permit must be freed — a 429 here means the first request's permit was never released"
+        );
+
+        accept_task.abort();
     }
 
     #[tokio::test]
