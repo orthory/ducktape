@@ -89,13 +89,12 @@ const ISSUE_TITLE: &str = "prove the dogfood loop";
 ///
 /// The behaviour rides the spec's ARGV, not a staged `provider.sh`: a microVM
 /// mounts nothing from the host, so an executor a node lends has to already be
-/// in the guest rootfs. A host script arrives as
+/// in the executor image. A host script arrives as
 /// `execve /opt/duck/bin/provider.sh` and exit 126.
 struct DogfoodProvider {
     tag: String,
     spec_dir: PathBuf,
-    env_var: String,
-    bin: PathBuf,
+    executors: PathBuf,
 }
 
 impl DogfoodProvider {
@@ -104,7 +103,7 @@ impl DogfoodProvider {
         let spec_dir = dir.join("specs");
         std::fs::create_dir_all(&spec_dir).expect("provider spec dir");
         let tag = "quack-dogfood";
-        let env_var = "DUCKTAPE_TEST_QUACK_DOGFOOD_BIN".to_string();
+        let executors = common::script_executor_dir(&dir);
         std::fs::write(
             spec_dir.join(format!("{tag}.toml")),
             format!(
@@ -113,8 +112,7 @@ impl DogfoodProvider {
                  tag = \"{tag}\"\n\
                  description = \"dogfood e2e script executor\"\n\
                  [detect]\n\
-                 bin = \"{tag}-nonexistent-cli\"\n\
-                 env = \"{env_var}\"\n\
+                 bin = \"sh\"\n\
                  [invoke]\n\
                  args = {}\n\
                  prompt = \"stdin\"\n\
@@ -128,9 +126,7 @@ impl DogfoodProvider {
         Self {
             tag: tag.into(),
             spec_dir,
-            env_var,
-            // resolved by basename to /opt/duck/bin/sh inside the guest
-            bin: PathBuf::from("/bin/sh"),
+            executors,
         }
     }
 
@@ -154,7 +150,10 @@ impl DogfoodProvider {
                 "DUCKTAPE_CAPABILITY_DIR".into(),
                 self.spec_dir.display().to_string(),
             ),
-            (self.env_var.clone(), self.bin.display().to_string()),
+            (
+                "DUCKTAPE_EXECUTOR_DIR".into(),
+                self.executors.display().to_string(),
+            ),
         ]
     }
 }
@@ -173,22 +172,17 @@ fn run_evidence(checkout: &Path, commit: &str) -> (String, String) {
 fn hermetic_env(root: &Path, name: &str) -> Vec<(String, String)> {
     let empty = root.join(name).join("specs");
     std::fs::create_dir_all(&empty).expect("empty spec dir");
-    let missing = root.join(name).join("missing-executor");
+    let executors = root.join(name).join("executors");
+    std::fs::create_dir_all(&executors).expect("empty executor dir");
     vec![
         (
             "DUCKTAPE_CAPABILITY_DIR".into(),
             empty.display().to_string(),
         ),
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
-    ]
-}
-
-fn hide_builtins(root: &Path, name: &str) -> Vec<(String, String)> {
-    let missing = root.join(name).join("missing-executor");
-    vec![
-        ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
-        ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
+        (
+            "DUCKTAPE_EXECUTOR_DIR".into(),
+            executors.display().to_string(),
+        ),
     ]
 }
 
@@ -472,12 +466,7 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
         vec![runs_root_env.clone()],
     ]
     .concat();
-    cluster.env[1] = [
-        provider.env(),
-        hide_builtins(fixtures.path(), "node1"),
-        vec![runs_root_env.clone()],
-    ]
-    .concat();
+    cluster.env[1] = [provider.env(), vec![runs_root_env.clone()]].concat();
     cluster.env[2] = [hermetic_env(fixtures.path(), "node2"), vec![runs_root_env]].concat();
     boot(&mut cluster);
 

@@ -572,15 +572,20 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
         ChatMsg::PostMessage {
             channel_id,
             message_id,
-            blocks: _,
+            blocks,
             thread,
         } => {
-            let ChatAssigned::Posted { seq, blocks, .. } = decode_stamp(op)? else {
+            let ChatAssigned::Posted {
+                seq, key_mentions, ..
+            } = decode_stamp(op)?
+            else {
                 return Err(Fail::new(
                     FAIL_ASSIGNED_DECODE,
                     "applied PostMessage carried a non-Posted stamp",
                 ));
             };
+            let blocks = crate::resolve_assigned_mentions(blocks, &key_mentions)
+                .map_err(|reason| Fail::new(FAIL_ASSIGNED_DECODE, reason))?;
             index_guest::put(&mut out, seq_key(&channel_id), seq.to_be_bytes().to_vec());
             index_guest::put(
                 &mut out,
@@ -637,15 +642,20 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
         ChatMsg::EditMessage {
             channel_id,
             seq,
-            blocks: _,
+            blocks,
             base_rev,
         } => {
-            let ChatAssigned::Edited { rev, blocks, .. } = decode_stamp(op)? else {
+            let ChatAssigned::Edited {
+                rev, key_mentions, ..
+            } = decode_stamp(op)?
+            else {
                 return Err(Fail::new(
                     FAIL_ASSIGNED_DECODE,
                     "applied EditMessage carried a non-Edited stamp",
                 ));
             };
+            let blocks = crate::resolve_assigned_mentions(blocks, &key_mentions)
+                .map_err(|reason| Fail::new(FAIL_ASSIGNED_DECODE, reason))?;
             // absent row == the message predates this index; nothing to
             // retokenize (see the module doc's pre-index caveat).
             let Some(mut row) = read_row(read, &msg_key(&channel_id, seq))? else {
@@ -1147,18 +1157,13 @@ mod tests {
     /// explicit stamp through [`op_with`] instead.
     fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
         match msg {
-            ChatMsg::PostMessage {
-                channel_id, blocks, ..
-            } => encode_assigned(&ChatAssigned::Posted {
+            ChatMsg::PostMessage { channel_id, .. } => encode_assigned(&ChatAssigned::Posted {
                 seq: read_u64(map, &seq_key(channel_id)) + 1,
                 actor: Party::Key(b"jess".to_vec()),
-                blocks: blocks.clone(),
+                key_mentions: Vec::new(),
             }),
             ChatMsg::EditMessage {
-                channel_id,
-                seq,
-                blocks,
-                ..
+                channel_id, seq, ..
             } => {
                 let row = read_row(map, &msg_key(channel_id, *seq))
                     .expect("row reads")
@@ -1166,7 +1171,7 @@ mod tests {
                 encode_assigned(&ChatAssigned::Edited {
                     rev: row.rev + 1,
                     actor: Party::Key(b"jess".to_vec()),
-                    blocks: blocks.clone(),
+                    key_mentions: Vec::new(),
                 })
             }
             ChatMsg::SweepHuddle { .. }
@@ -1286,7 +1291,7 @@ mod tests {
             ChatAssigned::Posted {
                 seq: 1,
                 actor: Party::Account(7),
-                blocks: vec![Block::paragraph("text")],
+                key_mentions: Vec::new(),
             },
         );
         let participant = || ChatAssigned::Participant {
@@ -1391,7 +1396,7 @@ mod tests {
                 encode_assigned(&ChatAssigned::Posted {
                     seq: 42,
                     actor: Party::Key(b"jess".to_vec()),
-                    blocks: vec![Block::paragraph("first post after the boundary")],
+                    key_mentions: Vec::new(),
                 }),
             ),
             &map,
@@ -1534,7 +1539,7 @@ mod tests {
                     assigned: encode_assigned(&ChatAssigned::Posted {
                         seq,
                         actor: party,
-                        blocks: vec![Block::paragraph(format!("hello {seq}"))],
+                        key_mentions: Vec::new(),
                     }),
                 },
                 &map,

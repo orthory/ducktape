@@ -94,6 +94,41 @@ fn acknowledge(module: &mut RunsModule, item: u64, outcome: sdk::DeliveryOutcome
 }
 
 #[test]
+fn reordered_json_has_the_same_durable_proposal_bytes() {
+    let original =
+        br#"{"task":{"create_task":{"task_id":"same","title":"Same task","owner":null}}}"#;
+    let reordered =
+        br#"{"task":{"create_task":{"owner":null,"title":"Same task","task_id":"same"}}}"#;
+    let mut snapshots = Vec::new();
+    for payload in [original.as_slice(), reordered.as_slice()] {
+        let (mut module, backing, entry) = hosted();
+        block_on(module.stage_action_request(
+            &entry,
+            "reordered".into(),
+            crate::action_requests::RequestScope::Result,
+            Msg {
+                target: "tasks".into(),
+                payload: payload.to_vec(),
+            },
+        ))
+        .unwrap();
+        commit(&mut module);
+        let request = block_on(module.action_request("reordered"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sdk::wire::encode(&request.view.payload),
+            br#"{"task":{"create_task":{"owner":null,"task_id":"same","title":"Same task"}}}"#
+        );
+        snapshots.push(backing.0.borrow().records.clone());
+    }
+    assert_eq!(
+        snapshots[0], snapshots[1],
+        "field order cannot alter the persisted proposal or its call digest"
+    );
+}
+
+#[test]
 fn receipt_history_does_not_increase_one_actions_reads_or_writes() {
     let (mut module, backing, entry) = hosted();
     let history = sdk::MAX_DELIVERIES_PER_BLOCK * 4;

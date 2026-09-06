@@ -18,18 +18,13 @@ type Map = BTreeMap<Vec<u8>, Vec<u8>>;
 /// `assigned_for` (the harness duplication is deliberate, per the module doc).
 fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
     match msg {
-        ChatMsg::PostMessage {
-            channel_id, blocks, ..
-        } => encode_assigned(&ChatAssigned::Posted {
+        ChatMsg::PostMessage { channel_id, .. } => encode_assigned(&ChatAssigned::Posted {
             seq: read_u64(map, &seq_key(channel_id)) + 1,
             actor: crate::Party::Key(b"jess".to_vec()),
-            blocks: blocks.clone(),
+            key_mentions: Vec::new(),
         }),
         ChatMsg::EditMessage {
-            channel_id,
-            seq,
-            blocks,
-            ..
+            channel_id, seq, ..
         } => {
             let row = read_row(map, &msg_key(channel_id, *seq))
                 .expect("row reads")
@@ -37,7 +32,7 @@ fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
             encode_assigned(&ChatAssigned::Edited {
                 rev: row.rev + 1,
                 actor: crate::Party::Key(b"jess".to_vec()),
-                blocks: blocks.clone(),
+                key_mentions: Vec::new(),
             })
         }
         ChatMsg::AddReaction { .. }

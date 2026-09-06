@@ -430,7 +430,14 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
     // daemon's upstream + oauth at the mock.
     let owner_storage = cluster.workspace(0);
     seed_claude_store(&owner_storage, "owner-claude-1", "rt-e2e");
+    let owner_key_file = owner_storage.join("owner.key");
+    let (_, owner) = keystore::userkey::mint_user_key(&owner_key_file, "lender-fixture-password")
+        .expect("mint the lender operator's encrypted wallet");
     cluster.env[0] = vec![
+        (
+            "DUCKTAPE_USER_KEY".into(),
+            owner_key_file.display().to_string(),
+        ),
         ("DUCKTAPE_AIRLOCK_ANTHROPIC_BASE".into(), upstream.clone()),
         ("DUCKTAPE_AIRLOCK_OAUTH_TOKEN_URL".into(), oauth_url.clone()),
     ];
@@ -444,22 +451,20 @@ fn granted_credential_resolves_and_round_trips_across_nodes() {
         cluster.wait_marker(index, "peer handshake COMPLETE", READY);
         cluster.wait_marker(index, "gateway plane: overlay stream bound", READY);
     }
+    // Admit the lender's actual operator wallet before the service resolves
+    // its route account. Node identities remain separate, accountless keys.
+    let compute = ed25519::PrivateKey::from_seed(43);
+    let owner_node = Cluster::identity(0);
+    let compute_node = Cluster::identity(1);
+    let owner_account = create_account(&cluster, 0, &owner, "owner");
+    let compute_account = create_account(&cluster, 1, &compute, "compute");
+
     // Only NOW start the lender: the daemon's first hello must land, so its
     // node's http surface has to be listening before it starts. It opens the
     // store (minting seal.key), binds loopback and registers its port as the
     // `airlock` gateway route the node reverse-proxies to.
     cluster.spawn_service(0, "airlock");
     cluster.wait_service_marker(0, "airlock", "airlock daemon serving", READY);
-
-    // two USERS, one per node: the owner founds account 1 through node 0, the
-    // compute user account 2 through node 1. The nodes themselves stay
-    // accountless — a node is never an account.
-    let owner = ed25519::PrivateKey::from_seed(42);
-    let compute = ed25519::PrivateKey::from_seed(43);
-    let owner_node = Cluster::identity(0);
-    let compute_node = Cluster::identity(1);
-    let owner_account = create_account(&cluster, 0, &owner, "owner");
-    let compute_account = create_account(&cluster, 1, &compute, "compute");
 
     // Owner maps `owner.duck`, so `airlock.owner.duck` resolves to her account.
     submit_frame(

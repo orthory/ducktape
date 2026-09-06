@@ -140,6 +140,65 @@ async fn propose_task(network: &mut Network, run_id: &str, task_id: &str) -> Str
 }
 
 #[test]
+fn a_programs_changed_payload_cannot_complete_the_original_proposal() {
+    block_on(async {
+        use agent::{Step, Value};
+        use std::collections::BTreeMap;
+        let mut program = runs::model_program("builder");
+        for step in &mut program.steps {
+            let Step::Call { module, msg, .. } = step else {
+                continue;
+            };
+            if module != "tasks" {
+                continue;
+            }
+            *msg = Value::Map(BTreeMap::from([(
+                "task".into(),
+                Value::Map(BTreeMap::from([(
+                    "create_task".into(),
+                    Value::Map(BTreeMap::from([
+                        ("owner".into(), Value::Null),
+                        ("task_id".into(), Value::Text("substituted".into())),
+                        ("title".into(), Value::Text("A tool write".into())),
+                    ])),
+                )])),
+            )]));
+        }
+        let mut network = Network::new().await;
+        let run = network.provision_program(program).await;
+        let request = propose_task(&mut network, &run, "requested").await;
+        network.drain().await;
+        let receipt = network.action(&request).await;
+        assert!(
+            matches!(receipt.status, runs::ActionStatus::Rejected { ref reason } if reason.contains("different action")),
+            "{receipt:?}"
+        );
+        assert!(network.task("requested").await.is_none());
+        assert_eq!(
+            network.task("substituted").await.unwrap().owner,
+            tasks::Party::Account(2)
+        );
+        let bytes = network
+            .host
+            .query(
+                "agent",
+                &agent::encode_query(&agent::AgentQuery::Invocations {
+                    account: 2,
+                    after: 0,
+                    limit: 100,
+                }),
+            )
+            .await
+            .unwrap();
+        let invocations = String::from_utf8(bytes).unwrap();
+        assert!(
+            invocations.contains("call does not execute this action request"),
+            "completion must reject the substituted action: {invocations}"
+        );
+    });
+}
+
+#[test]
 fn an_actual_target_rejection_reaches_the_tool_receipt() {
     block_on(async {
         let mut network = Network::new().await;

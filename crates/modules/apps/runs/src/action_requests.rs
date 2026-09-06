@@ -29,6 +29,24 @@ pub(super) struct ActionRequest {
     pub grant: RunAuthority,
 }
 
+/// Program calls encode every JSON object's keys in sorted order. The
+/// proposal must use those same bytes even when another workspace dependency
+/// enables serde_json's insertion-order maps. Arrays and scalar values keep
+/// their exact meaning; no field is omitted from the authenticated digest.
+pub(super) fn canonical_action_payload(mut payload: serde_json::Value) -> serde_json::Value {
+    payload.sort_all_objects();
+    payload
+}
+
+fn call_matches_action(view: &dispatch::CallView, request: &ActionRequestView) -> bool {
+    let payload = canonical_action_payload(request.payload.clone());
+    let digest: [u8; 32] = Sha256::digest(sdk::wire::encode(&payload)).into();
+    view.account == request.account
+        && view.generation == request.generation
+        && view.target == request.target
+        && view.payload_digest == digest
+}
+
 /// Capture target intents while retaining the original deterministic query surface.
 pub(super) struct EffectsCtx<'a> {
     pub inner: &'a mut dyn Ctx,
@@ -284,11 +302,7 @@ impl RunsModule {
         else {
             return Err(Error::Module("action call does not exist".into()));
         };
-        let digest: [u8; 32] = Sha256::digest(sdk::wire::encode(&request.view.payload)).into();
-        let matches_request = view.account == request.view.account
-            && view.generation == request.view.generation
-            && view.target == request.view.target
-            && view.payload_digest == digest;
+        let matches_request = call_matches_action(&view, &request.view);
         if !matches_request {
             return Err(Error::Module(
                 "call does not execute this action request".into(),
@@ -356,12 +370,7 @@ impl RunsModule {
                 return Err(Error::Module("unexpected action call reply".into()));
             };
             if let Some(queued) = queued {
-                let digest: [u8; 32] =
-                    Sha256::digest(sdk::wire::encode(&request.view.payload)).into();
-                let exact = queued.account == view.account
-                    && queued.generation == view.generation
-                    && queued.target == view.target
-                    && queued.payload_digest == digest;
+                let exact = call_matches_action(&queued, &view);
                 if !exact {
                     view.status = ActionStatus::Rejected {
                         reason: "program called a different action than it claimed".into(),

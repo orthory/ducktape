@@ -1206,7 +1206,7 @@ fn describe_target(module: &str, origin: &Origin, input: &Input) -> String {
 /// what one unit attempt came to.
 enum UnitVerdict {
     Accepted(AcceptedUnit),
-    Rejected(String),
+    Rejected(Error),
     /// the replay budget was exhausted before this unit ran.
     Unattempted,
 }
@@ -2491,9 +2491,11 @@ impl Host {
                         // the single-op contract: Rejected means NOTHING
                         // committed and nothing consumed.
                         self.abort_all(&mut block.touched).await?;
-                        return Err(SubmitError::Rejected(Error::Module(reason)));
+                        return Err(SubmitError::Rejected(reason));
                     }
-                    members[i] = Some(MemberOutcome::Rejected { reason });
+                    members[i] = Some(MemberOutcome::Rejected {
+                        reason: reason.to_string(),
+                    });
                 }
                 UnitVerdict::Unattempted => {
                     members[i] = Some(MemberOutcome::Rejected {
@@ -2713,7 +2715,7 @@ impl Host {
                 if unit_staged {
                     self.isolate(block).await?;
                 }
-                Ok(UnitVerdict::Rejected(reason.to_string()))
+                Ok(UnitVerdict::Rejected(reason))
             }
         }
     }
@@ -2872,7 +2874,9 @@ impl Host {
                             "{REPLAY_BUDGET_REASON} ({MAX_BLOCK_REPLAYS})"
                         ))));
                     }
-                    UnitVerdict::Rejected(reason) => dispatch::CallOutcome::Rejected { reason },
+                    UnitVerdict::Rejected(reason) => dispatch::CallOutcome::Rejected {
+                        reason: reason.to_string(),
+                    },
                     UnitVerdict::Accepted(mut unit) => {
                         // the root dispatch of the unit is the target op; its
                         // declared output and stamp ride the completion.
@@ -2978,7 +2982,9 @@ impl Host {
                     Ok(Some(CallRecord {
                         enqueued: call.enqueued,
                         id: call.id.clone(),
-                        disposition: CallDisposition::NotFinalized { reason },
+                        disposition: CallDisposition::NotFinalized {
+                            reason: reason.to_string(),
+                        },
                         dispatches: Vec::new(),
                     }))
                 }
@@ -3021,7 +3027,9 @@ impl Host {
                     dispatches: Vec::new(),
                 }));
             }
-            UnitVerdict::Rejected(reason) => DeliveryOutcome::Failed { reason },
+            UnitVerdict::Rejected(reason) => DeliveryOutcome::Failed {
+                reason: reason.to_string(),
+            },
             UnitVerdict::Accepted(mut unit) => {
                 let ack = ack_step(delivery, DeliveryOutcome::Applied);
                 match self.extend_unit(block, &mut unit, vec![ack]).await? {
@@ -3112,7 +3120,9 @@ impl Host {
                 Ok(Some(DeliveryRecord {
                     item: delivery.item.clone(),
                     target: delivery.target.clone(),
-                    disposition: DeliveryDisposition::NotFinalized { reason },
+                    disposition: DeliveryDisposition::NotFinalized {
+                        reason: reason.to_string(),
+                    },
                     dispatches: Vec::new(),
                 }))
             }

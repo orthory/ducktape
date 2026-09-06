@@ -7,6 +7,8 @@
 //! a membership, a huddle sweep), and replies and events carry the party the
 //! module resolved.
 
+use std::collections::BTreeMap;
+
 use borsh::{BorshDeserialize, BorshSerialize};
 use sdk::AccountNumber;
 use serde::{Deserialize, Serialize};
@@ -461,17 +463,19 @@ pub enum ChatEvent {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ChatAssigned {
-    /// `PostMessage`: assigned sequence and body with mentions resolved to accounts.
+    /// `PostMessage`: assigned sequence and resolution of the payload's keys.
     Posted {
         seq: u64,
         actor: Party,
-        blocks: Vec<Block>,
+        /// Accounts for distinct raw-key mentions, in first-occurrence order.
+        /// The payload retains the body and already-canonical account mentions.
+        key_mentions: Vec<AccountNumber>,
     },
-    /// `EditMessage`: assigned revision and body with mentions resolved to accounts.
+    /// `EditMessage`: assigned revision and resolution of the payload's keys.
     Edited {
         rev: u32,
         actor: Party,
-        blocks: Vec<Block>,
+        key_mentions: Vec<AccountNumber>,
     },
     /// `CreateDmChannel`: the derived id the module minted from (creator,
     /// counterpart) — the payload never carries it.
@@ -480,6 +484,47 @@ pub enum ChatAssigned {
     Actor { actor: Party },
     /// Exact existing/new party whose reaction or huddle entry was affected.
     Participant { actor: Party, participant: Party },
+}
+
+/// Reconstruct a committed body from the original payload and its assigned
+/// key resolutions. Every distinct key consumes one account, in appearance
+/// order; repeated keys reuse that resolution. This never consults identity,
+/// whose current key ownership may differ from the committed operation's.
+pub fn resolve_assigned_mentions(
+    mut blocks: Vec<Block>,
+    key_mentions: &[AccountNumber],
+) -> Result<Vec<Block>, String> {
+    let mut accounts = key_mentions.iter();
+    let mut resolved = BTreeMap::new();
+    for block in &mut blocks {
+        let spans = match block {
+            Block::Paragraph(spans) | Block::Quote(spans) => spans,
+            Block::Code { .. } | Block::Divider => continue,
+        };
+        for span in spans {
+            for mark in &mut span.marks {
+                let Mark::Mention(Party::Key(key)) = mark else {
+                    continue;
+                };
+                let account = match resolved.get(key) {
+                    Some(account) => *account,
+                    None => {
+                        let account = *accounts.next().ok_or("missing assigned mention account")?;
+                        if account == 0 {
+                            return Err("assigned mention account is zero".into());
+                        }
+                        resolved.insert(key.clone(), account);
+                        account
+                    }
+                };
+                *mark = Mark::Mention(Party::Account(account));
+            }
+        }
+    }
+    if accounts.next().is_some() {
+        return Err("unused assigned mention accounts".into());
+    }
+    Ok(blocks)
 }
 
 impl ChatAssigned {

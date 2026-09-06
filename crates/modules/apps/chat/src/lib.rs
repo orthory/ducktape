@@ -328,6 +328,11 @@ struct MessageContent {
     mentions: Vec<AccountNumber>,
 }
 
+struct ResolvedMentions {
+    accounts: Vec<AccountNumber>,
+    key_mentions: Vec<AccountNumber>,
+}
+
 struct Posted {
     seq: u64,
     thread_root: Option<u64>,
@@ -576,11 +581,15 @@ impl Chat {
         &self,
         ctx: &dyn Ctx,
         blocks: &mut [Block],
-    ) -> Result<Vec<AccountNumber>, Error> {
+    ) -> Result<ResolvedMentions, Error> {
         let mut accounts = Vec::new();
+        let mut key_mentions = Vec::new();
         let mut resolved = BTreeMap::new();
         for mention in collect_mentions(blocks) {
             let account = self.resolve_mention(ctx, &mention).await?;
+            if matches!(mention, Party::Key(_)) {
+                key_mentions.push(account);
+            }
             resolved.insert(mention, account);
             if !accounts.contains(&account) {
                 accounts.push(account);
@@ -599,7 +608,10 @@ impl Chat {
                 }
             }
         }
-        Ok(accounts)
+        Ok(ResolvedMentions {
+            accounts,
+            key_mentions,
+        })
     }
 
     /// a party a roster may name: a person, in the resolved vocabulary every
@@ -1635,8 +1647,8 @@ impl Chat {
                         &channel_id,
                         message_id.clone(),
                         MessageContent {
-                            blocks: blocks.clone(),
-                            mentions: mentions.clone(),
+                            blocks,
+                            mentions: mentions.accounts.clone(),
                         },
                         thread,
                         now,
@@ -1645,7 +1657,7 @@ impl Chat {
                 ctx.set_assigned(encode_assigned(&ChatAssigned::Posted {
                     seq: posted.seq,
                     actor: party.clone(),
-                    blocks,
+                    key_mentions: mentions.key_mentions,
                 }));
                 ctx.set_output(sdk::wire::encode(&serde_json::json!({ "channel_id": channel_id, "message_id": message_id, "seq": posted.seq })));
                 // one follow-up per registered hook, drained in this block —
@@ -1660,7 +1672,7 @@ impl Chat {
                             seq: posted.seq,
                             thread_root: posted.thread_root,
                             author: party.clone(),
-                            mentions: mentions.clone(),
+                            mentions: mentions.accounts.clone(),
                         }),
                     });
                 }
@@ -1680,8 +1692,8 @@ impl Chat {
                         &channel_id,
                         seq,
                         MessageContent {
-                            blocks: blocks.clone(),
-                            mentions,
+                            blocks,
+                            mentions: mentions.accounts,
                         },
                         base_rev,
                         now,
@@ -1690,7 +1702,7 @@ impl Chat {
                 ctx.set_assigned(encode_assigned(&ChatAssigned::Edited {
                     rev,
                     actor: party.clone(),
-                    blocks,
+                    key_mentions: mentions.key_mentions,
                 }));
                 self.report(ctx, &party, report);
                 Ok(())

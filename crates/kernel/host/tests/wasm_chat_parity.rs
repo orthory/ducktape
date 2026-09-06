@@ -13,8 +13,8 @@
 
 use attribution::AttributionModule;
 use chat::{
-    Block, Chat, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS, PostPolicy, decode_reply,
-    encode_msg, encode_query, huddle_join_preimage,
+    Block, Chat, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS, Mark, MessageHead, Party,
+    PostPolicy, Span, decode_reply, encode_msg, encode_query, huddle_join_preimage,
 };
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -27,6 +27,264 @@ use wasm_host::WasmModule;
 /// GENERATED artifact — built from the module crate's guest port by
 /// guest-builder (`make wasm-modules`); committed so this proof is self-contained.
 const CHAT_WASM: &[u8] = include_bytes!("fixtures/chat.component.wasm");
+
+fn mixed_mentions(first: Party, second: Party, direct: u64, text: &str) -> Vec<Block> {
+    vec![
+        Block::Paragraph(vec![
+            Span::plain(text),
+            Span {
+                text: " first #topic".into(),
+                marks: vec![
+                    Mark::Bold,
+                    Mark::Mention(first.clone()),
+                    Mark::Mention(Party::Account(direct)),
+                ],
+            },
+        ]),
+        Block::Quote(vec![Span {
+            text: " repeated and second".into(),
+            marks: vec![Mark::Mention(first), Mark::Italic, Mark::Mention(second)],
+        }]),
+        Block::Code {
+            lang: Some("text".into()),
+            text: "unchanged code".into(),
+        },
+    ]
+}
+
+/// Fill the canonical serialized head exactly to its existing consensus cap.
+fn fill_message_head(head: &mut MessageHead) -> String {
+    let available = chat::MAX_MESSAGE_HEAD_BYTES - sdk::wire::encode(head).len();
+    let text = "x".repeat(available);
+    let Block::Paragraph(spans) = &mut head.blocks[0] else {
+        panic!("paragraph")
+    };
+    spans[0].text = text.clone();
+    assert_eq!(sdk::wire::encode(head).len(), chat::MAX_MESSAGE_HEAD_BYTES);
+    text
+}
+
+async fn exercise_message_capacity(host: &mut Host) -> Vec<host::DispatchRecord> {
+    let keys: Vec<_> = (1..=3)
+        .map(|seed| {
+            ed25519::PrivateKey::from_seed(seed)
+                .public_key()
+                .as_ref()
+                .to_vec()
+        })
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        host.submit_at(
+            block(index as u64 + 1, key),
+            Msg {
+                target: "identity".into(),
+                payload: identity::encode_msg(&identity::IdentityMsg::Create {
+                    name: format!("account-{index}"),
+                    scheme: identity::KeyScheme::Ed25519,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let channel = host
+        .submit_at(
+            block(4, &keys[0]),
+            op(&ChatMsg::CreateChannel {
+                channel_id: "capacity".into(),
+                name: "Capacity".into(),
+                post_policy: PostPolicy::Open,
+            }),
+        )
+        .await
+        .unwrap();
+    let mut indexed = std::collections::BTreeMap::new();
+    let mut trace = channel.dispatches;
+    for dispatch in trace.iter().filter(|dispatch| dispatch.module == "chat") {
+        let row = index_guest::OpRow {
+            height: 4,
+            seq: 0,
+            time: 1_004,
+            origin: index_guest::OriginTag::system(),
+            payload: dispatch.payload.clone(),
+            assigned: dispatch.assigned.clone(),
+        };
+        let writes = chat::index::fold_op(&row, &indexed).unwrap();
+        index_guest::apply_to_map(&mut indexed, writes);
+    }
+    let mut posted = MessageHead {
+        message_id: "long".into(),
+        author: Party::Account(1),
+        origin: Origin::External(keys[0].clone()),
+        content_origin: Origin::External(keys[0].clone()),
+        blocks: mixed_mentions(Party::Account(2), Party::Account(3), 2, ""),
+        created_at: 1_005,
+        rev: 0,
+        revision: 1,
+        edited_at: None,
+        base_rev: None,
+        deleted: false,
+        thread: None,
+        reply_count: 0,
+        last_reply_seq: None,
+    };
+    let post_text = fill_message_head(&mut posted);
+    let post = ChatMsg::PostMessage {
+        channel_id: "capacity".into(),
+        message_id: "long".into(),
+        thread: None,
+        blocks: mixed_mentions(
+            Party::Key(keys[1].clone()),
+            Party::Key(keys[2].clone()),
+            2,
+            &post_text,
+        ),
+    };
+    let mut edited = MessageHead {
+        blocks: mixed_mentions(Party::Account(3), Party::Account(2), 1, ""),
+        rev: 1,
+        revision: 2,
+        edited_at: Some(1_006),
+        base_rev: Some(0),
+        ..posted.clone()
+    };
+    let edit_text = fill_message_head(&mut edited);
+    let edit = ChatMsg::EditMessage {
+        channel_id: "capacity".into(),
+        seq: 1,
+        base_rev: Some(0),
+        blocks: mixed_mentions(
+            Party::Key(keys[2].clone()),
+            Party::Key(keys[1].clone()),
+            1,
+            &edit_text,
+        ),
+    };
+    for (height, input, expected, accounts) in [
+        (5, post, posted, vec![2, 3]),
+        (6, edit, edited.clone(), vec![3, 2]),
+    ] {
+        let outcome = host
+            .submit_at(block(height, &keys[0]), op(&input))
+            .await
+            .unwrap();
+        let dispatch = outcome
+            .dispatches
+            .iter()
+            .find(|dispatch| dispatch.module == "chat")
+            .unwrap();
+        assert!(dispatch.assigned.len() < sdk::MAX_ASSIGNED_BYTES);
+        let assigned = chat::decode_assigned(&dispatch.assigned).unwrap();
+        let key_mentions = match &assigned {
+            chat::ChatAssigned::Posted { key_mentions, .. }
+            | chat::ChatAssigned::Edited { key_mentions, .. } => key_mentions,
+            other => panic!("unexpected stamp {other:?}"),
+        };
+        assert_eq!(
+            key_mentions, &accounts,
+            "repeated keys consume one assignment"
+        );
+        assert_eq!(assigned.actor(), &Party::Account(1));
+        let row = index_guest::OpRow {
+            height,
+            seq: 0,
+            time: 1_000 + height,
+            origin: index_guest::OriginTag::system(),
+            payload: dispatch.payload.clone(),
+            assigned: dispatch.assigned.clone(),
+        };
+        let writes = chat::index::fold_op(&row, &indexed).unwrap();
+        index_guest::apply_to_map(&mut indexed, writes);
+        let request = serde_json::to_vec(&chat::index::ChatViewQuery::Message {
+            message_id: "long".into(),
+        })
+        .unwrap();
+        let indexed_bytes = chat::index::serve_view(&indexed, &request).unwrap();
+        let chat::index::ChatViewReply::Message(Some(projected)) =
+            serde_json::from_slice(&indexed_bytes).unwrap()
+        else {
+            panic!("indexed message")
+        };
+        let bytes = host
+            .query(
+                "chat",
+                &encode_query(&ChatQuery::Message {
+                    message_id: "long".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        let ChatReply::Message(Some(canonical)) = decode_reply(&bytes).unwrap() else {
+            panic!("canonical message")
+        };
+        assert_eq!(canonical.head, expected);
+        assert_eq!(projected.blocks, canonical.head.blocks);
+        assert_eq!(projected.author, "acct:1");
+        let stamp = serde_json::to_value(&assigned).unwrap();
+        let delta = chat::client::delta_from_op(
+            &dispatch.payload,
+            Some(&stamp),
+            "system",
+            None,
+            chat::client::ChatReader::nobody(),
+            height,
+        )
+        .unwrap()
+        .unwrap();
+        let message = match delta {
+            chat::client::ChatDelta::Posted { message, .. }
+            | chat::client::ChatDelta::Edited { message, .. } => message,
+            other => panic!("unexpected delta {other:?}"),
+        };
+        let hydrated = chat::client::chat_message(projected, chat::client::ChatReader::nobody());
+        assert_eq!(message.blocks, hydrated.blocks);
+        assert_eq!(message.body, hydrated.body);
+        trace.extend(outcome.dispatches);
+    }
+    let before = host.root_hash();
+    let mut oversized = edited.blocks;
+    let Block::Paragraph(spans) = &mut oversized[0] else {
+        panic!("paragraph")
+    };
+    spans[0].text.push('x');
+    let rejected = host
+        .submit_at(
+            block(7, &keys[0]),
+            op(&ChatMsg::EditMessage {
+                channel_id: "capacity".into(),
+                seq: 1,
+                blocks: oversized,
+                base_rev: Some(1),
+            }),
+        )
+        .await;
+    assert!(matches!(rejected, Err(SubmitError::Rejected(_))));
+    assert_eq!(
+        host.root_hash(),
+        before,
+        "the existing 64 KiB bound still rejects atomically"
+    );
+    trace
+}
+
+#[test]
+fn native_full_message_capacity_keeps_compact_stamps_and_canonical_mentions() {
+    deterministic::Runner::default().start(|context| async move {
+        exercise_message_capacity(&mut native_host(&context).await).await;
+    });
+}
+
+#[test]
+fn wasm_full_message_capacity_and_mixed_mention_index_match_native() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut native = native_host(&context).await;
+        let mut wasm = wasm_host_(&context).await;
+        let native_trace = exercise_message_capacity(&mut native).await;
+        let wasm_trace = exercise_message_capacity(&mut wasm).await;
+        assert_eq!(native_trace, wasm_trace);
+        assert_eq!(native.module_roots(), wasm.module_roots());
+    });
+}
 
 /// a 32-byte submitter key (the ordered lane hands modules verified ed25519
 /// ids; the parity claim only needs them distinct and non-empty).

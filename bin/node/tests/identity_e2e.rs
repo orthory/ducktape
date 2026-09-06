@@ -1,8 +1,8 @@
 //! live 2-validator e2e for the `identity` module: one USER founds an account
 //! through node A, a second device key JOINS it through node B on the founder's
 //! consent, and the association converges identically on both validators; then
-//! the joiner evicts the founder (any member removes any key but the last) and
-//! the registry converges again.
+//! the junior key cannot evict the founder, while the founder can revoke the
+//! junior key, and the registry converges again.
 //!
 //! every op is a USER-signed frame over `/v1/submit/frame`: the module
 //! attributes each op to its frame origin, and no node key is involved — a
@@ -12,7 +12,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Cluster, account_of_key, add_key, create_account, key_gen, submit_frame};
+use common::{
+    Cluster, account_of_key, add_key, create_account, key_gen, submit_frame, try_submit_frame,
+};
 use commonware_cryptography::{Signer as _, ed25519};
 use identity::{
     AccountView, IdentityMsg, IdentityQuery, IdentityReply, decode_reply, encode_query,
@@ -123,9 +125,9 @@ fn identity_two_nodes_one_account() {
     }
     assert_roots_converge(&cluster, "identity module root to converge after the join");
 
-    // the joiner removes the founder — the recovery path: a surviving device
-    // evicts a lost one, with nothing but its own membership.
-    submit_frame(
+    // A newly admitted key cannot use its membership to evict an older one.
+    let before = identity_roots(&cluster);
+    let (status, rejection) = try_submit_frame(
         &cluster,
         1,
         &joiner,
@@ -134,34 +136,57 @@ fn identity_two_nodes_one_account() {
             key: founder_pub.clone(),
         }),
     );
+    assert_eq!(status, 400, "junior key removal must reject: {rejection}");
+    assert!(
+        rejection["error"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("cannot remove a key admitted before your own")),
+        "{rejection}"
+    );
+    assert_eq!(identity_roots(&cluster), before);
+    for reader in [0usize, 1] {
+        assert!(sees_both(
+            &account(&cluster, reader, 1).expect("the account remains")
+        ));
+    }
+
+    // The founder may revoke the junior device, leaving its own account intact.
+    submit_frame(
+        &cluster,
+        0,
+        &founder,
+        "identity",
+        &identity::encode_msg(&IdentityMsg::RemoveKey {
+            key: joiner_pub.clone(),
+        }),
+    );
     for reader in [0usize, 1] {
         cluster.await_committed(
             reader,
-            &format!("OfKey(founder) to clear on node {reader}"),
+            &format!("OfKey(joiner) to clear on node {reader}"),
             FINALIZE,
             || {
-                account_of_key(&cluster, reader, &founder_pub)
+                account_of_key(&cluster, reader, &joiner_pub)
                     .is_none()
                     .then_some(())
             },
         );
         let view = cluster.await_committed(
             reader,
-            &format!("OfKey(joiner) on node {reader}"),
+            &format!("OfKey(founder) on node {reader}"),
             FINALIZE,
-            || account_of_key(&cluster, reader, &joiner_pub),
+            || account_of_key(&cluster, reader, &founder_pub),
         );
-        assert_eq!(view.number, 1, "node {reader}: the joiner keeps account 1");
+        assert_eq!(view.number, 1, "node {reader}: the founder keeps account 1");
         assert_eq!(
             pubkeys(&view),
-            vec![joiner_pub.clone()],
-            "node {reader}: only the joiner remains"
+            vec![founder_pub.clone()],
+            "node {reader}: only the founder remains"
         );
     }
 
-    // generations: the joiner was admitted by consent once (its next consent
-    // signs at 1); the founder never was — Create counts no generation and
-    // removal touches none — so a re-admission of the founder signs at 0.
+    // Revocation preserves the joiner's consumed consent generation: a new
+    // admission must sign at 1. The founder's Create leaves its generation 0.
     for reader in [0usize, 1] {
         assert_eq!(
             key_gen(&cluster, reader, &joiner_pub),

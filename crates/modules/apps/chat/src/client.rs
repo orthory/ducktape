@@ -555,12 +555,16 @@ pub fn delta_from_op(
         ChatMsg::PostMessage {
             channel_id,
             message_id,
-            blocks: _,
+            blocks,
             thread,
         } => {
-            let ChatAssigned::Posted { seq, blocks, .. } = decode_stamp(assigned)? else {
+            let ChatAssigned::Posted {
+                seq, key_mentions, ..
+            } = decode_stamp(assigned)?
+            else {
                 return Err("applied PostMessage carried a non-Posted stamp".into());
             };
+            let blocks = crate::resolve_assigned_mentions(blocks, &key_mentions)?;
             let row = MsgRow {
                 channel_id: channel_id.clone(),
                 seq,
@@ -599,12 +603,16 @@ pub fn delta_from_op(
         ChatMsg::EditMessage {
             channel_id,
             seq,
-            blocks: _,
+            blocks,
             base_rev,
         } => {
-            let ChatAssigned::Edited { rev, blocks, .. } = decode_stamp(assigned)? else {
+            let ChatAssigned::Edited {
+                rev, key_mentions, ..
+            } = decode_stamp(assigned)?
+            else {
                 return Err("applied EditMessage carried a non-Edited stamp".into());
             };
+            let blocks = crate::resolve_assigned_mentions(blocks, &key_mentions)?;
             let carrier = MsgRow {
                 channel_id: channel_id.clone(),
                 seq,
@@ -2546,7 +2554,7 @@ mod tests {
             thread: None,
         })
         .expect("a PostMessage encodes");
-        let assigned = serde_json::json!({ "posted": { "seq": 7, "actor": { "key": [171, 171] }, "blocks": [] } });
+        let assigned = serde_json::json!({ "posted": { "seq": 7, "actor": { "key": [171, 171] }, "key_mentions": [] } });
         let delta = delta_from_op(
             &payload,
             Some(&assigned),

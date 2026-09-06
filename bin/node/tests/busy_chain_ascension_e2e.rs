@@ -24,8 +24,6 @@
 
 mod common;
 
-use std::io::{BufRead as _, BufReader, Write as _};
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -99,8 +97,10 @@ fn resident_rebootstraps_while_the_chain_stays_busy() {
     // engine-starvation regime that serves nothing at all), which is a
     // different failure than the floor-tracking seam this test pins.
     let stop = Arc::new(AtomicBool::new(false));
+    let token = noded::admin::read_operator_token(&cluster.workspace(0))
+        .expect("founder minted an operator credential");
     let pumps: Vec<_> = (0..1)
-        .map(|lane| spawn_pump(lane, cluster.rpc_ports[0], Arc::clone(&stop)))
+        .map(|lane| spawn_pump(lane, cluster.http_ports[0], token.clone(), Arc::clone(&stop)))
         .collect();
 
     // ---- THE POINT: a granted resident restarting with empty storage must
@@ -122,39 +122,40 @@ fn resident_rebootstraps_while_the_chain_stays_busy() {
     cluster.kill(0);
 }
 
-/// posts to `general` on the founder's rpc until stopped. each submit's reply
+/// posts to `general` on the founder's HTTP surface until stopped. each submit's reply
 /// is held to its block boundary, so a lane naturally emits ~one op per block
 /// window — the chain is never idle but never floods either. fire-and-forget
 /// on errors: the pump's job is load, not assertions.
-fn spawn_pump(lane: u64, rpc_port: u16, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+fn spawn_pump(
+    lane: u64,
+    http_port: u16,
+    token: String,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let filler = "keep the chain busy ".repeat(10); // ~200 B of block weight
         let mut i = 0u64;
         while !stop.load(Ordering::Relaxed) {
             i += 1;
-            let payload = encode_msg(&ChatMsg::PostMessage {
+            let payload = ChatMsg::PostMessage {
                 channel_id: "general".into(),
                 message_id: format!("pump-{lane}-{i}"),
                 blocks: vec![Block::paragraph(&filler)],
                 thread: None,
-            });
+            };
             let req = serde_json::json!({
-                "cmd": "submit",
                 "target": "chat",
-                "payload_hex": payload.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "payload": payload,
             });
-            let _ = submit_once(rpc_port, &req);
+            let bytes = serde_json::to_vec(&req).expect("pump request serializes");
+            let _ = nettest::try_http_bytes_with(
+                http_port,
+                "POST",
+                "/v1/submit",
+                "application/json",
+                &[(noded::admin::ADMIN_TOKEN_HEADER, &token)],
+                &bytes,
+            );
         }
     })
-}
-
-fn submit_once(rpc_port: u16, req: &serde_json::Value) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect(("127.0.0.1", rpc_port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    let mut line = serde_json::to_string(req).expect("pump request serializes");
-    line.push('\n');
-    stream.write_all(line.as_bytes())?;
-    let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply)?;
-    Ok(())
 }

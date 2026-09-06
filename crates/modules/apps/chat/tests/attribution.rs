@@ -1085,12 +1085,12 @@ fn key_mentions_are_frozen_as_accounts_in_canonical_heads_and_stamps() {
             text: "tag".into(),
             marks: vec![Mark::Mention(Party::Account(2))],
         }])];
-        let chat::ChatAssigned::Posted { blocks, .. } =
+        let chat::ChatAssigned::Posted { key_mentions, .. } =
             chat::decode_assigned(ctx.assigned().unwrap()).unwrap()
         else {
             panic!("post stamp")
         };
-        assert_eq!(blocks, canonical);
+        assert_eq!(key_mentions, vec![2]);
         let bytes = chat
             .query(&chat::encode_query(&ChatQuery::Message {
                 message_id: "key".into(),

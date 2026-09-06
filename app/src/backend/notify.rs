@@ -257,14 +257,21 @@ pub(crate) fn chat_arrival(
     names: &NameDirectory,
     me: Option<&[u8]>,
 ) -> Option<Arrival> {
-    let ::chat::ChatMsg::PostMessage { channel_id, .. } = ::chat::decode_msg(payload).ok()? else {
-        return None;
-    };
-    let ::chat::ChatAssigned::Posted { actor, blocks, .. } =
-        serde_json::from_value(assigned?.clone()).ok()?
+    let ::chat::ChatMsg::PostMessage {
+        channel_id, blocks, ..
+    } = ::chat::decode_msg(payload).ok()?
     else {
         return None;
     };
+    let ::chat::ChatAssigned::Posted {
+        actor,
+        key_mentions,
+        ..
+    } = serde_json::from_value(assigned?.clone()).ok()?
+    else {
+        return None;
+    };
+    let blocks = ::chat::resolve_assigned_mentions(blocks, &key_mentions).ok()?;
     let handle = ::chat::index::party_handle(&actor);
     let parties = me.map(|key| names.parties_of(key)).unwrap_or_default();
     Some(Arrival {
@@ -429,17 +436,16 @@ mod tests {
         let payload = ::chat::encode_msg(&::chat::ChatMsg::PostMessage {
             channel_id: "notifications-test".into(),
             message_id: "m".into(),
-            blocks: vec![::chat::Block::paragraph("unresolved input")],
+            blocks: vec![::chat::Block::Paragraph(vec![::chat::Span {
+                text: "Hello Reader".into(),
+                marks: vec![::chat::Mark::Mention(::chat::Party::Key(key.to_vec()))],
+            }])],
             thread: None,
         });
-        let blocks = vec![::chat::Block::Paragraph(vec![::chat::Span {
-            text: "Hello Reader".into(),
-            marks: vec![::chat::Mark::Mention(::chat::Party::Account(1))],
-        }])];
         let assigned = serde_json::to_value(::chat::ChatAssigned::Posted {
             seq: 1,
             actor: ::chat::Party::Account(2),
-            blocks: blocks.clone(),
+            key_mentions: vec![1],
         })
         .unwrap();
         let arrival = chat_arrival(&payload, Some(&assigned), &names, Some(&key)).unwrap();
@@ -451,7 +457,7 @@ mod tests {
         let mine = serde_json::to_value(::chat::ChatAssigned::Posted {
             seq: 2,
             actor: ::chat::Party::Account(1),
-            blocks,
+            key_mentions: vec![1],
         })
         .unwrap();
         let own = chat_arrival(&payload, Some(&mine), &names, Some(&key)).unwrap();

@@ -4714,6 +4714,7 @@ dependencies = [
  "greeter",
  "identity",
  "inbox",
+ "index-guest",
  "keyscheme",
  "kv",
  "module-artifact",

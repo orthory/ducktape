@@ -57,6 +57,7 @@ directory = { workspace = true }
 # (root-continuous cutover — revision stays 1).
 pages = { workspace = true }
 chat = { workspace = true }
+index_guest = { workspace = true }
 inbox = { workspace = true }
 tasks = { workspace = true }
 capability = { workspace = true }

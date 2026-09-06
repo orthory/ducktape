@@ -1,5 +1,5 @@
 //! Immutable proposals, reserved completion markers and an indexed outbox.
-use super::action_requests::{ActionRequest, Publication, RequestScope};
+use super::action_requests::{ActionRequest, Publication, RequestScope, canonical_action_payload};
 use super::receipts::View;
 use super::*;
 use sdk::{Ack, CallId, Cause, DeliveryOutcome, Hop, PendingItem};
@@ -174,7 +174,8 @@ impl RunsModule {
         scope: RequestScope,
         msg: Msg,
     ) -> Result<(), Error> {
-        let payload = sdk::wire::decode(&msg.payload).map_err(Error::Module)?;
+        let payload =
+            canonical_action_payload(sdk::wire::decode(&msg.payload).map_err(Error::Module)?);
         let view = ActionRequestView {
             request_id: id.clone(),
             account: entry.account,
