@@ -160,7 +160,7 @@ fn genesis_module_membership_comes_from_the_bundle() {
             assert!(genesis.module_root("acl").is_none());
             assert!(genesis.module_root("runs").is_none());
             assert!(
-                genesis.module_status().await.is_none(),
+                genesis.module_status().await.unwrap().is_none(),
                 "an omitted registry is not inserted by the binary"
             );
             assert_eq!(genesis.module_roots().len(), 1);
@@ -342,6 +342,16 @@ fn admissions_build_through_the_one_wasm_path() {
             assert!(
                 matches!(admitted, host::Admitted::ForeignAbi),
                 "the netstack guest is no module admission"
+            );
+            // and the same answer one step earlier: bytes carrying no artifact
+            // frame at all. Erroring here stalls the code plane on every node
+            // forever, for a record this boundary never owned.
+            let admitted = host::ModuleFactory::instantiate(&admissions, "raw", b"\0asm\x01\0\0\0")
+                .await
+                .expect("unframed bytes are answered, not errored");
+            assert!(
+                matches!(admitted, host::Admitted::ForeignAbi),
+                "no artifact frame is no module admission"
             );
         })
     });
@@ -655,7 +665,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
                 host.module_code_hash("modules").unwrap(),
                 registry_replacement
             );
-            let status = host.module_status().await.unwrap();
+            let status = host.module_status().await.unwrap().unwrap();
             assert_eq!(
                 status
                     .iter()
