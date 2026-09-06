@@ -56,6 +56,24 @@ const MAX_CONTROL_CUMULATIVE_SECS: u64 = 2 * 60 * 60;
 /// client that opens a second request before the first's body drains.
 /// ponytail: fixed 8, revisit only if a real session starves it.
 const MAX_CONCURRENT: usize = 8;
+/// TCP+TLS connect deadline for every broker/gateway client (#1668). Neither
+/// reqwest client had ANY timeout, so a half-open path (a dead NAT/WireGuard
+/// hop is the realistic case on the airlock overlay arm) parked its
+/// concurrency permit — and, for `refresh_if_needed`/`airlock_reauth`, the
+/// auth mutex — forever. A live connect completes in well under a second; 10s
+/// covers a slow network without masking a genuinely dead one.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Idle-between-reads deadline for the two provider brokers' streamed/buffered
+/// upstream calls. A real model answer can legitimately idle for tens of
+/// seconds between chunks (thinking, a slow tool round trip upstream), so this
+/// must be generous — but a connection that never sends anything at all (the
+/// #1668 repro: a listener that accepts and never writes) must not wedge a
+/// permit past a bounded wait. Shrunk under `cfg(test)` so the timeout test
+/// does not need to sleep tens of seconds to observe it.
+#[cfg(not(test))]
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone)]
 struct UpstreamCredential {
@@ -380,6 +398,8 @@ impl RunBroker {
             responses_url,
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(UPSTREAM_IDLE_TIMEOUT)
                 .build()
                 .map_err(|e| format!("build provider broker client: {e}"))?,
             requests: AtomicU32::new(0),
@@ -533,28 +553,19 @@ async fn forward_responses(
         );
     };
 
-    let (mut upstream, mut binding) = match send_codex(&state, &headers, &body).await {
+    let (mut upstream, mut binding, mut seal_keys) = match send_codex(&state, &headers, &body).await
+    {
         Ok(sent) => sent,
-        Err(e) => {
-            return response(
-                StatusCode::BAD_GATEWAY,
-                &format!("provider upstream failed: {e}"),
-            );
-        }
+        Err(e) => return upstream_send_error(&e, "provider"),
     };
     // Airlock only: a gateway 401 means the scoped session token's TTL lapsed.
     // Re-handshake once and retry. Host runs pass straight through (reauth is a
     // no-op and returns false).
     let token_expired = upstream.status() == StatusCode::UNAUTHORIZED;
     if token_expired && codex_airlock_reauth(&state).await {
-        (upstream, binding) = match send_codex(&state, &headers, &body).await {
+        (upstream, binding, seal_keys) = match send_codex(&state, &headers, &body).await {
             Ok(sent) => sent,
-            Err(e) => {
-                return response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("provider upstream failed: {e}"),
-                );
-            }
+            Err(e) => return upstream_send_error(&e, "provider"),
         };
     }
     let status =
@@ -578,12 +589,7 @@ async fn forward_responses(
                 output.extend_from_slice(&chunk);
             }
             Ok(None) => break,
-            Err(e) => {
-                return response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("provider upstream stream failed: {e}"),
-                );
-            }
+            Err(e) => return upstream_send_error(&e, "provider"),
         }
     }
     if state
@@ -599,13 +605,11 @@ async fn forward_responses(
     // A gateway ERROR body (minted before the proxy path) is plaintext and
     // relays as-is; a plaintext SUCCESS on a sealed session can only be a path
     // host forging one, so it is refused.
-    let seal_keys = {
-        let auth = state.auth.lock().await;
-        match &*auth {
-            CodexAuth::Airlock(session) => Some(session.keys.clone()),
-            CodexAuth::Host(_) => None,
-        }
-    };
+    //
+    // `seal_keys` is exactly what THIS request's `send_codex` sealed under, not
+    // a re-read of `state.auth` after the round trip (see `send_upstream`'s doc
+    // — the anthropic broker's actual race; codex's semaphore of 1 keeps this
+    // one unreachable today, same shape regardless).
     if let Some(keys) = seal_keys {
         let sealed_outer = content_type_str
             .as_deref()
@@ -679,14 +683,20 @@ fn upstream_content_type(headers: &reqwest::header::HeaderMap) -> Option<HeaderV
 
 /// Build the codex upstream request (target URL + forwarded headers + the
 /// current credential) and send it, WITHOUT consuming the body — so a gateway
-/// 401 can be retried after an airlock re-handshake. Returns the response plus
-/// the sealed request's BINDING (empty when unsealed) — the response is opened
-/// under it.
+/// 401 can be retried after an airlock re-handshake. Returns the response, the
+/// sealed request's BINDING (empty when unsealed), and — on the airlock arm —
+/// the exact keys sealed under (see `send_upstream`'s doc for why: codex's
+/// semaphore is 1 so this race is not currently reachable, but the two
+/// brokers share the shape rather than diverging).
 async fn send_codex(
     state: &BrokerState,
     headers: &HeaderMap,
     body: &Bytes,
-) -> reqwest::Result<(reqwest::Response, Vec<u8>)> {
+) -> reqwest::Result<(
+    reqwest::Response,
+    Vec<u8>,
+    Option<airlock::handshake::SessionKeys>,
+)> {
     let mut request = state.client.post(&state.responses_url);
     // Match the official Codex responses-api-proxy posture: preserve Codex's
     // protocol/version/session headers, but replace auth and hop-by-hop framing.
@@ -703,7 +713,7 @@ async fn send_codex(
             request = request.header(name, value);
         }
     }
-    let (request, binding) = {
+    let (request, binding, keys) = {
         let auth = state.auth.lock().await;
         match &*auth {
             CodexAuth::Host(host) => {
@@ -711,7 +721,7 @@ async fn send_codex(
                 if let Some(account_id) = &host.account_id {
                     request = request.header("ChatGPT-Account-ID", account_id);
                 }
-                (request, Vec::new())
+                (request, Vec::new(), None)
             }
             // Sealed-body airlock session: encrypt under the handshake body key
             // (fresh nonce per attempt, so the 401-retry re-seals safely) and
@@ -723,11 +733,15 @@ async fn send_codex(
                 let request = request
                     .body(sealed)
                     .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1);
-                (session.gateway.route(request.bearer_auth(&session.token)), binding)
+                (
+                    session.gateway.route(request.bearer_auth(&session.token)),
+                    binding,
+                    Some(session.keys.clone()),
+                )
             }
         }
     };
-    Ok((request.send().await?, binding))
+    Ok((request.send().await?, binding, keys))
 }
 
 /// Airlock only: re-mint the scoped session against the already-trusted seal key
@@ -1054,6 +1068,21 @@ fn response(status: StatusCode, message: &str) -> Response<Body> {
     let mut response = Response::new(Body::from(message.to_string()));
     *response.status_mut() = status;
     response
+}
+
+/// Turn a failed upstream `send()` into the response the sandbox sees. A
+/// timeout (connect or idle-read, see the broker client builders) gets its own
+/// stable reason token and 504 rather than a generic 502 — the permit that
+/// held it is a local var, already dropped by the time the caller returns
+/// this, so the run's concurrency budget is freed rather than parked forever.
+fn upstream_send_error(e: &reqwest::Error, provider: &str) -> Response<Body> {
+    if e.is_timeout() {
+        return response(StatusCode::GATEWAY_TIMEOUT, "upstream_idle_timeout");
+    }
+    response(
+        StatusCode::BAD_GATEWAY,
+        &format!("{provider} upstream failed: {e}"),
+    )
 }
 
 // ===== Anthropic Messages broker (Claude Code) ===============================
@@ -1800,6 +1829,8 @@ impl RunBroker {
             auth: tokio::sync::Mutex::new(auth),
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(UPSTREAM_IDLE_TIMEOUT)
                 .build()
                 .map_err(|e| format!("build anthropic broker client: {e}"))?,
             messages_url,
@@ -1866,13 +1897,20 @@ async fn probe_ok() -> StatusCode {
 /// credential) and send it, WITHOUT consuming the body — factored out of
 /// [`forward_messages`] so a gateway 401 can be retried after an airlock
 /// re-handshake. The caller streams the returned response body.
-/// Returns the response plus the sealed request's BINDING (its blob nonce,
-/// empty when unsealed) — the response stream key is derived under it.
+/// Returns the response, the sealed request's BINDING (its blob nonce, empty
+/// when unsealed), and — on the airlock arm — the EXACT keys sealed under, so
+/// the caller opens the response under those keys rather than re-reading
+/// `session.keys` after the round trip, which a sibling request's concurrent
+/// re-handshake (`airlock_reauth`) may have swapped out from under it.
 async fn send_upstream(
     state: &AnthropicBrokerState,
     headers: &HeaderMap,
     body: &Bytes,
-) -> reqwest::Result<(reqwest::Response, Vec<u8>)> {
+) -> reqwest::Result<(
+    reqwest::Response,
+    Vec<u8>,
+    Option<airlock::handshake::SessionKeys>,
+)> {
     let mut request = state.client.post(&state.messages_url).body(body.clone());
     // Forward request headers VERBATIM — including `anthropic-version` and
     // `anthropic-beta` (the subscription OAuth capability rides beta; stripping
@@ -1890,13 +1928,13 @@ async fn send_upstream(
             request = request.header(name, value);
         }
     }
-    let (request, binding) = {
+    let (request, binding, keys) = {
         let auth = state.auth.lock().await;
         // Airlock sessions are sealed-body: encrypt the child's plaintext under
         // the handshake body key (fresh nonce per attempt, so the 401-retry
         // path re-seals safely) and mark the request. The enclave refuses
         // plaintext on this token, so the bearer alone grants nothing.
-        let (request, binding) = if let AnthropicAuth::Airlock(session) = &*auth {
+        let (request, binding, keys) = if let AnthropicAuth::Airlock(session) = &*auth {
             let aad = airlock::bodyseal::request_aad("POST", "/v1/messages");
             let sealed = airlock::bodyseal::seal_request(&session.keys, &aad, body);
             let binding = airlock::bodyseal::request_binding(&sealed);
@@ -1905,13 +1943,14 @@ async fn send_upstream(
                     .body(sealed)
                     .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1),
                 binding,
+                Some(session.keys.clone()),
             )
         } else {
-            (request, Vec::new())
+            (request, Vec::new(), None)
         };
-        (auth.authorize(request), binding)
+        (auth.authorize(request), binding, keys)
     };
-    Ok((request.send().await?, binding))
+    Ok((request.send().await?, binding, keys))
 }
 
 async fn forward_messages(
@@ -1952,28 +1991,19 @@ async fn forward_messages(
     // never 502s the session.
     state.refresh_if_needed().await;
 
-    let (mut upstream, mut binding) = match send_upstream(&state, &headers, &body).await {
-        Ok(sent) => sent,
-        Err(e) => {
-            return response(
-                StatusCode::BAD_GATEWAY,
-                &format!("anthropic upstream failed: {e}"),
-            );
-        }
-    };
+    let (mut upstream, mut binding, mut seal_keys) =
+        match send_upstream(&state, &headers, &body).await {
+            Ok(sent) => sent,
+            Err(e) => return upstream_send_error(&e, "anthropic"),
+        };
     // Airlock only: a gateway 401 means the scoped session token's TTL lapsed.
     // Re-handshake once and retry. Every other credential arm — and every other
     // status — passes straight through (`airlock_reauth` returns false).
     let token_expired = upstream.status() == StatusCode::UNAUTHORIZED;
     if token_expired && state.airlock_reauth().await {
-        (upstream, binding) = match send_upstream(&state, &headers, &body).await {
+        (upstream, binding, seal_keys) = match send_upstream(&state, &headers, &body).await {
             Ok(sent) => sent,
-            Err(e) => {
-                return response(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("anthropic upstream failed: {e}"),
-                );
-            }
+            Err(e) => return upstream_send_error(&e, "anthropic"),
         };
     }
     // Airlock sealed session: the enclave's proxied response is an opaque
@@ -1981,13 +2011,11 @@ async fn forward_messages(
     // error bodies (minted before the proxy path) are plaintext and relay as
     // errors below; a plaintext SUCCESS on a sealed session can only be a
     // forgery by a path host, so it is refused.
-    let seal_keys = {
-        let auth = state.auth.lock().await;
-        match &*auth {
-            AnthropicAuth::Airlock(session) => Some(session.keys.clone()),
-            _ => None,
-        }
-    };
+    //
+    // `seal_keys` is exactly what THIS request's `send_upstream` sealed under
+    // (the last attempt's, if it retried) — never a fresh re-read of
+    // `state.auth`, which a sibling request's concurrent `airlock_reauth` may
+    // have swapped in the meantime (see the fn doc on `send_upstream`).
     if let Some(keys) = seal_keys {
         let sealed_outer = upstream
             .headers()
@@ -1995,7 +2023,7 @@ async fn forward_messages(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|ct| ct.starts_with("application/octet-stream"));
         if sealed_outer {
-            return relay_sealed(upstream, keys, binding, permit).await;
+            return relay_sealed(upstream, keys, binding, permit, state).await;
         }
         if upstream.status().is_success() {
             return response(
@@ -2025,6 +2053,10 @@ async fn forward_messages(
                         "run broker response byte budget exhausted",
                     ))
                 } else {
+                    // charge the lifetime budget too (#1669): the codex path
+                    // charges its output.len(), this path never did — a long
+                    // streamed answer never counted against MAX_TOTAL_BYTES.
+                    state.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     Ok(bytes)
                 }
             }
@@ -2050,6 +2082,7 @@ async fn relay_sealed(
     keys: airlock::handshake::SessionKeys,
     binding: Vec<u8>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    state: Arc<AnthropicBrokerState>,
 ) -> Response<Body> {
     use airlock::bodyseal::OpenedItem;
     let status =
@@ -2089,6 +2122,8 @@ async fn relay_sealed(
         let mut seen = 0usize;
         for data in pending {
             seen = seen.saturating_add(data.len());
+            // #1669: charge the lifetime budget same as the plain stream path.
+            state.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
             if tx.send(Ok(data)).await.is_err() {
                 return;
             }
@@ -2117,6 +2152,7 @@ async fn relay_sealed(
                                     .await;
                                 return;
                             }
+                            state.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
                             if tx.send(Ok(Bytes::from(data))).await.is_err() {
                                 return;
                             }
@@ -2529,6 +2565,181 @@ mod tests {
         assert!(
             headers.get("accept-encoding").is_none(),
             "accept-encoding must not reach the anthropic upstream: {headers:?}"
+        );
+        upstream.abort();
+    }
+
+    /// #1667 regression: `send_upstream` seals under `session.keys` at call
+    /// time and MUST return exactly those keys, not whatever `state.auth`
+    /// holds later. Proven directly rather than via a live two-request race
+    /// (flaky under "tests wait on events, never on time"): seal under keys A,
+    /// have a "sibling's re-handshake" swap the session to keys B in place,
+    /// then show the keys `send_upstream` returned still open a stream sealed
+    /// under A — while the (buggy, old) behavior of re-reading `state.auth`
+    /// after the round trip would hand back B and fail chunk 0, exactly the
+    /// symptom in the issue.
+    #[tokio::test]
+    async fn send_upstream_returns_the_keys_it_actually_sealed_under() {
+        let (url, _seen, upstream) = mock_upstream(StatusCode::OK, "application/json", "{}").await;
+        let keys_a = airlock::handshake::SessionKeys { session: [1u8; 32], body: [2u8; 32] };
+        let keys_b = airlock::handshake::SessionKeys { session: [3u8; 32], body: [4u8; 32] };
+        let session = AirlockSession {
+            gateway: Gateway::local("http://127.0.0.1:1".into()),
+            seal_pk: [0u8; 32],
+            sub: "sub".into(),
+            work: WorkRef::Direct,
+            token: "tok".into(),
+            keys: keys_a.clone(),
+        };
+        let state = AnthropicBrokerState {
+            run_bearer: "bearer".into(),
+            auth: tokio::sync::Mutex::new(AnthropicAuth::Airlock(session)),
+            client: reqwest::Client::new(),
+            messages_url: url,
+            requests: AtomicU32::new(0),
+            bytes: AtomicU64::new(0),
+            concurrent: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+        };
+        let (_resp, binding, keys) = send_upstream(&state, &HeaderMap::new(), &Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+        let keys = keys.expect("airlock session seals every request");
+        assert_eq!(keys.body, keys_a.body, "must return what it sealed under, not a re-read");
+
+        // A sibling request's concurrent `airlock_reauth` swaps the session's
+        // keys in place — the exact race in the issue.
+        {
+            let mut auth = state.auth.lock().await;
+            let AnthropicAuth::Airlock(session) = &mut *auth else { unreachable!() };
+            session.keys = keys_b.clone();
+        }
+
+        // The enclave would have sealed its response under keys_a (what this
+        // request actually sealed its request under). Opening with the
+        // RETURNED keys succeeds; opening with whatever `state.auth` holds NOW
+        // (the old, buggy re-read) reproduces "chunk 0 failed to open".
+        let (mut sealer, salt) = airlock::bodyseal::StreamSealer::new(&keys_a, &binding);
+        let mut sealed = salt;
+        sealed.extend(sealer.seal_head("application/json"));
+        sealed.extend(sealer.seal_final());
+
+        let mut opener_correct = airlock::bodyseal::StreamOpener::new(&keys, &binding);
+        assert!(opener_correct.feed(&sealed).is_ok(), "the returned keys must open it");
+
+        let mut opener_stale_reread = airlock::bodyseal::StreamOpener::new(&keys_b, &binding);
+        let err = opener_stale_reread
+            .feed(&sealed)
+            .expect_err("re-reading state.auth's swapped keys must fail to open, per the issue");
+        assert!(
+            err.to_string().contains("chunk 0 failed to open"),
+            "unexpected error: {err}"
+        );
+        upstream.abort();
+    }
+
+    /// #1668 regression: an upstream that accepts the TCP connection and never
+    /// writes a byte (the issue's `nc -l -p PORT >/dev/null` repro) must not
+    /// park the concurrency permit forever. With the client's idle-read
+    /// timeout (shrunk under `cfg(test)`) it 504s with the stable reason token
+    /// instead — and, with capacity 1, a SECOND request proves the permit was
+    /// actually freed: it gets far enough to hit the same hung upstream and
+    /// time out again, rather than being rejected 429 "concurrency exhausted".
+    #[tokio::test]
+    async fn upstream_idle_timeout_returns_504_and_frees_the_permit() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        // accept and hold every connection open, writing nothing — the
+        // half-open-path repro from the issue.
+        let held: Arc<Mutex<Vec<tokio::net::TcpStream>>> = Arc::new(Mutex::new(Vec::new()));
+        let held_accept = held.clone();
+        let accept_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                held_accept.lock().unwrap().push(socket);
+            }
+        });
+
+        let state = Arc::new(AnthropicBrokerState {
+            run_bearer: "bearer".into(),
+            auth: tokio::sync::Mutex::new(AnthropicAuth::ApiKey("host-secret".into())),
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(UPSTREAM_IDLE_TIMEOUT)
+                .build()
+                .unwrap(),
+            messages_url: format!("http://{addr}/v1/messages"),
+            requests: AtomicU32::new(0),
+            bytes: AtomicU64::new(0),
+            concurrent: Arc::new(Semaphore::new(1)),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str("Bearer bearer").unwrap(),
+        );
+
+        let resp1 =
+            forward_messages(State(state.clone()), headers.clone(), Bytes::from_static(b"{}"))
+                .await;
+        assert_eq!(resp1.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body1 = to_bytes(resp1.into_body(), 1024).await.unwrap();
+        assert_eq!(&body1[..], b"upstream_idle_timeout".as_slice());
+
+        let resp2 =
+            forward_messages(State(state), headers, Bytes::from_static(b"{}")).await;
+        assert_eq!(
+            resp2.status(),
+            StatusCode::GATEWAY_TIMEOUT,
+            "permit must be freed — a 429 here means the first request's permit was never released"
+        );
+
+        accept_task.abort();
+    }
+
+    /// #1669 regression: the plain (non-sealed) streamed response's bytes must
+    /// count against `state.bytes` — the codex path already charges its
+    /// `output.len()`, this path never did. Proven by seeding the lifetime
+    /// counter just under `MAX_TOTAL_BYTES`, draining a small streamed
+    /// response, and showing the NEXT request's existing pre-request check
+    /// now refuses it — that check is unchanged; only the charge is new.
+    #[tokio::test]
+    async fn anthropic_streamed_response_bytes_count_against_the_lifetime_budget() {
+        let (url, _seen, upstream) =
+            mock_upstream(StatusCode::OK, "text/event-stream", "0123456789").await;
+        let state = Arc::new(AnthropicBrokerState {
+            run_bearer: "bearer".into(),
+            auth: tokio::sync::Mutex::new(AnthropicAuth::ApiKey("host-secret".into())),
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(UPSTREAM_IDLE_TIMEOUT)
+                .build()
+                .unwrap(),
+            messages_url: url,
+            requests: AtomicU32::new(0),
+            // seeded just under the cap — the mock's 10-byte body tips it over.
+            bytes: AtomicU64::new(MAX_TOTAL_BYTES - 5),
+            concurrent: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str("Bearer bearer").unwrap(),
+        );
+
+        let resp1 =
+            forward_messages(State(state.clone()), headers.clone(), Bytes::from_static(b"{}"))
+                .await;
+        assert_eq!(resp1.status(), StatusCode::OK);
+        // drain the body — the byte charge happens as the stream is polled.
+        let body1 = to_bytes(resp1.into_body(), 1024).await.unwrap();
+        assert_eq!(&body1[..], b"0123456789".as_slice());
+
+        let resp2 = forward_messages(State(state), headers, Bytes::from_static(b"{}")).await;
+        assert_eq!(
+            resp2.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the streamed response's bytes must have counted against the lifetime budget"
         );
         upstream.abort();
     }
