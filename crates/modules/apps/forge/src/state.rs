@@ -267,6 +267,7 @@ impl ForgeState {
                 let principal = self
                     .push_principal(ctx, chain_id, &name, cert.as_ref(), &updates)
                     .await?;
+                self.settle_owner(ctx, &name).await?;
                 self.stage_push_refs(&name, principal, updates, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
@@ -385,6 +386,7 @@ impl ForgeState {
                 // the PR must be an open PR; pull its branches.
                 let (source, target) = self.tracker_view().pr_branches(&name, number)?;
                 let actor = author_from_origin(&ctx.env().origin)?;
+                self.settle_owner(ctx, &name).await?;
                 self.require_merge_authorized(&name, &target, number, &actor, &principal)?;
 
                 // double CAS on COMMITTED refs: the target must not have moved
@@ -535,6 +537,37 @@ impl ForgeState {
         Ok(account.map_or(signer, identity::account_principal))
     }
 
+    /// settle a repo's stored owner onto the ACCOUNT that owns it, the moment
+    /// Identity knows the owning key.
+    ///
+    /// a repo birthed by a key Identity knew nothing about stores that RAW
+    /// key. the principal every op derives is not stored, it is re-derived per
+    /// op — so admitting that key to an account later makes every push speak
+    /// for the account principal while the stored owner still names the key,
+    /// and the owner is locked out of their own repo. the stored bytes have to
+    /// follow the derivation.
+    ///
+    /// the settle is ONE-WAY and PERSISTED: once a repo is owned by an
+    /// account, removing the key from that account does not hand ownership
+    /// back to the key. it runs before every owner check, on the same
+    /// block-scratch tracker as the op itself, so a refused block drops it
+    /// with everything else.
+    async fn settle_owner(&mut self, ctx: &dyn Ctx, repo: &str) -> Result<(), Error> {
+        let Some(owner) = self.tracker_view().owner(repo).map(<[u8]>::to_vec) else {
+            return Ok(());
+        };
+        let already_an_account = identity::principal_account(&owner).is_some();
+        if already_an_account {
+            return Ok(());
+        }
+        let Some(number) = Self::identity_account(ctx, &owner).await? else {
+            return Ok(());
+        };
+        self.staged_tracker_mut()
+            .claim_owner(repo, identity::account_principal(number));
+        Ok(())
+    }
+
     /// stage an atomic multi-branch push: validate the update list, settle
     /// ownership, then CAS every branch. PURE and deterministic — no repo
     /// opened, nothing installed, no ref moves (see
@@ -551,7 +584,9 @@ impl ForgeState {
     /// the push that BIRTHS a repo pins its owner; afterwards only that owner
     /// may move `main`/`dev`. FEATURE branches stay force-pushable by any
     /// member — the GitHub flow this module documents, and what the dogfood
-    /// loop's second node pushes under its own key.
+    /// loop's second node pushes under its own key. a raw-key owner follows
+    /// its key onto an account the first time Identity knows it
+    /// ([`Self::settle_owner`], run by the caller before this).
     fn stage_push_refs(
         &mut self,
         name: &str,

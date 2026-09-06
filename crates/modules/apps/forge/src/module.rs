@@ -2729,6 +2729,124 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// an `identity` handler that knows exactly `members`, each on `number`;
+    /// every other key is on no account. `members` empty is the identity-less
+    /// / unregistered-key world.
+    fn identity_knowing(
+        number: u64,
+        members: Vec<Vec<u8>>,
+    ) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
+        move |req| {
+            let identity::IdentityQuery::OfKey { key } = identity::decode_query(req).unwrap()
+            else {
+                panic!("forge asks identity only for a key's account");
+            };
+            let account = members.contains(&key).then(|| identity::AccountView {
+                number,
+                name: "acct".into(),
+                keys: Vec::new(),
+                avatar: None,
+                bio: None,
+                updated_at: 0,
+            });
+            Ok(identity::encode_reply(&IdentityReply::Account(account)))
+        }
+    }
+
+    // #1866: a repo birthed by a key identity knows nothing about stores that
+    // RAW key, but the principal a push speaks for is re-derived per op — so
+    // registering that same key on an account used to lock its owner out, and
+    // revoking it used to hand ownership back. the stored owner FOLLOWS the
+    // key onto its account, one-way.
+    #[test]
+    fn ownership_follows_the_owning_key_onto_its_account() {
+        let base = tmp_base("owner-settles");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let account = 3u64;
+        let alice = vec![0xA1u8; 32];
+        let stranger = vec![0xEEu8; 32];
+
+        // 1. an account-less key births the repo: owner = the raw key.
+        let unregistered = |t: u64, key: &Vec<u8>| {
+            ctx_with_origin(t, sdk::Origin::External(key.clone()))
+                .on_query("identity", identity_knowing(account, Vec::new()))
+        };
+        push(
+            &mut forge,
+            &mut unregistered(1, &alice),
+            "demo",
+            "main",
+            None,
+            oid('a'),
+        )
+        .expect("an account-less key births a repo (the dogfood/operator path)");
+
+        // 2. `account key add --ssh` admits alice's key. her next push derives
+        //    the ACCOUNT principal, and it is still her repo.
+        let registered = |t: u64, key: &Vec<u8>| {
+            ctx_with_origin(t, sdk::Origin::External(key.clone()))
+                .on_query("identity", identity_knowing(account, vec![alice.clone()]))
+        };
+        push(
+            &mut forge,
+            &mut registered(2, &alice),
+            "demo",
+            "main",
+            Some(oid('a')),
+            oid('b'),
+        )
+        .expect("registering the owning key does not lock its owner out");
+        assert_eq!(
+            forge.state.tracker.owner("demo"),
+            Some(identity::account_principal(account).as_slice()),
+            "the stored owner settled onto the account"
+        );
+
+        // 3. `account key remove` revokes alice's key: it derives its raw self
+        //    again, and the settle is one-way, so it does NOT regain the repo.
+        let err = push(
+            &mut forge,
+            &mut unregistered(3, &alice),
+            "demo",
+            "main",
+            Some(oid('b')),
+            oid('c'),
+        )
+        .expect_err("a key removed from the owning account is not the owner");
+        assert!(err.to_string().contains("only the owner"), "{err}");
+        assert_eq!(
+            forge.read_head("demo"),
+            Some(oid('b').to_string()),
+            "the refused push moved nothing"
+        );
+
+        // 4. and a never-registered stranger is still nobody.
+        let err = push(
+            &mut forge,
+            &mut unregistered(4, &stranger),
+            "demo",
+            "main",
+            Some(oid('b')),
+            oid('c'),
+        )
+        .expect_err("a stranger may not move main");
+        assert!(err.to_string().contains("only the owner"), "{err}");
+
+        // 5. any key of the owning account moves main.
+        push(
+            &mut forge,
+            &mut registered(5, &alice),
+            "demo",
+            "main",
+            Some(oid('b')),
+            oid('c'),
+        )
+        .expect("the owning account still moves main");
+        assert_eq!(forge.read_head("demo"), Some(oid('c').to_string()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // MergePr is the SECOND ref-move door: gating the push alone closes nothing.
     #[test]
     fn merging_onto_a_protected_target_is_owner_only() {
