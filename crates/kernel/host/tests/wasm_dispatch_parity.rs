@@ -31,10 +31,10 @@
 //!
 //! dispatch answers `Module::query` from COMMITTED state alone regardless of
 //! caller, so a same-block staged write never leaks into the host's delivery
-//! injection or runs' `turn_taken` read. on the wasm side that is
-//! `.with_committed_queries()`, which drops the outer staged overlay for a query
-//! round so `WitStore` serves the native module's `get_committed` reads exactly
-//! as the native store does.
+//! injection or runs' `turn_taken` read. on the wasm side the component
+//! declares it (`shape().committed_queries`), and the host drops the outer
+//! staged overlay for a query round so `WitStore` serves the native module's
+//! `get_committed` reads exactly as the native store does.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use dispatch::{
@@ -69,11 +69,11 @@ async fn wasm_dispatch(context: &deterministic::Context, label: &'static str) ->
         DISPATCH_WASM,
         Box::new(QmdbStore::init(context.child(label), "dispatch").await),
     )
-    .expect("load component")
     // dispatch's query surface is committed-only regardless of caller (the
     // native contract): a same-block staged write must never leak into a
-    // mid-block sibling read. this is the genesis wiring, pinned here.
-    .with_committed_queries()
+    // mid-block sibling read. the component declares it (`shape`), so the
+    // load applies it — nothing to wire here.
+    .expect("load component")
 }
 
 /// a stand-in sibling that records every follow-up `Msg` delivered to it — under
@@ -950,9 +950,10 @@ fn sync_handle_matches_native() {
 /// port. dispatch answers its query surface from COMMITTED state ALONE
 /// regardless of caller, so a recipe registered earlier in the SAME block is
 /// invisible to a mid-block sibling read. runs' consensus-visible sibling reads
-/// (turn-taken, lease-holder) rely on this; without `.with_committed_queries()`
-/// the guest's `WitStore` would serve the host's staged overlay and leak the
-/// same-block write. this matrix pins the contract: op 1 registers a recipe
+/// (turn-taken, lease-holder) rely on this; without the component's
+/// `committed_queries` declaration the guest's `WitStore` would serve the
+/// host's staged overlay and leak the same-block write. this matrix pins the
+/// contract: op 1 registers a recipe
 /// (staged, uncommitted) and op 2 — a sibling in the SAME block — reads it back
 /// through dispatch's query surface, and BOTH runtimes must answer
 /// `Recipe(None)`.

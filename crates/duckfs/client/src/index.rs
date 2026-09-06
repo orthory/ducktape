@@ -25,7 +25,7 @@ pub const INDEX_FILE: &str = "index.json";
 /// but an empty dir has nothing to imply it, so status tracks it explicitly to
 /// tell a fresh empty dir (needs a `Mkdir`) from one already in the base snapshot
 /// (`mkdir` on an existing dir rejects, so re-emitting it would break the commit).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     File,

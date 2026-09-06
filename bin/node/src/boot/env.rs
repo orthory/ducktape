@@ -177,7 +177,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
             node = %label,
             reason = "coord_cap_missing",
             "private coordinator rendezvous will be denied; provide coord.cap or use a \
-             fronted/direct reach hint"
+             direct reach hint"
         );
     }
     // the mesh ADDRESS BOOK: config dial hints as the operator tier, then
@@ -289,7 +289,7 @@ pub(crate) fn derive(resolved: Resolved, sync_only: bool) -> BootEnv {
                 node = %label,
                 targets = coordinated.len(),
                 reason = "no_bootstrap_link",
-                "coordinated targets UNREACHABLE — add a direct/fronted bootstrap hint for the \
+                "coordinated targets UNREACHABLE — add a direct bootstrap hint for the \
                  first join"
             );
         } else {

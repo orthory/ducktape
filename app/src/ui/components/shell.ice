@@ -932,8 +932,3 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
 
       slot palette
       slot bell
-      // The huddle rides every screen, so it is a window-level layer like the
-      // palette and the bell — not a prop on TitleBar. A titlebar seat would
-      // widen TitleBar's signature, which a source guard in main.rs pins, and
-      // it would land the pill on top of the status/bell cluster already there.
-      slot huddle

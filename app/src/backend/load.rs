@@ -74,7 +74,17 @@ pub(crate) async fn load_chat_data(
     // The directory before any row: every author, member and huddle tile below
     // is named through it, and this is the load that runs on boot and on every
     // resync — including the one an identity op triggers.
-    refresh_names(rpc).await?;
+    //
+    // A directory that cannot be read yet — a resident whose identity index is
+    // still folding — is a room named by key hex, never a room that failed to
+    // open: this must not be the `?` that takes the whole chat load down.
+    if let Err(error) = refresh_names(rpc).await {
+        tracing::debug!(
+            target: "ducktape::chat",
+            %error,
+            "the name directory was not read; keys render as hex"
+        );
+    }
     let mut wire_channels = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -125,6 +135,12 @@ pub(crate) async fn load_chat_data(
         .find(|channel| channel.id == active_channel)
         .map(|channel| channel.name.clone())
         .unwrap_or_default();
+    // WHAT THE READER IS LOOKING AT, recorded where it is decided. This load
+    // runs on every room open and every chat resync, and it is the only place
+    // that knows both the room names and which one won — the live decoder,
+    // which needs both to word and to suppress a desktop notification, may not
+    // query for either inside the fold. See `notify`.
+    note_rooms(&channels, &active_channel);
     let active_wire_channel = wire_channels
         .iter()
         .find(|info| info.channel.id == active_channel);

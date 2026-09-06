@@ -362,7 +362,6 @@ async fn files_head(rpc: &RpcClient) -> Result<Option<String>, String> {
     Ok(refs["head"].as_str().map(str::to_string))
 }
 
-/// One files commit through the node's commit lane.
 /// One commit, SIGNED BY THE PERSON. The files module records a frame's
 /// verified signer as the commit's author and charges `/home/<owner>/**`
 /// authority to it, so a person's commit rides the same signed-frame lane as

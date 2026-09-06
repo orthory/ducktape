@@ -58,6 +58,12 @@ const POLICY_KEY: &[u8] = b"policy";
 
 pub struct Acl {
     id: ModuleId,
+    /// the ONE module id whose follow-ups may stage a policy change. every
+    /// module origin is a host-stamped follow-up from whichever guest just
+    /// executed, so accepting `Module(_)` would let ANY admitted module
+    /// rewrite the acl table for itself. genesis wiring — identical on every
+    /// node.
+    governance_id: ModuleId,
     /// the host-injected authenticated store plus this block's staging overlay
     /// (read-your-writes, folded into `root()` at `commit_block`). store key
     /// is `sha256(logical_key)`, owned by [`StagedStore`].
@@ -66,9 +72,14 @@ pub struct Acl {
 
 impl Acl {
     /// wrap the host-constructed store under module identity `id`.
-    pub fn new(id: impl Into<ModuleId>, store: Box<dyn MerkleStore>) -> Self {
+    pub fn new(
+        id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
+        governance_id: impl Into<ModuleId>,
+    ) -> Self {
         Self {
             id: id.into(),
+            governance_id: governance_id.into(),
             staged: StagedStore::new(store),
         }
     }
@@ -178,14 +189,21 @@ impl Module for Acl {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
-        // policy changes are GOVERNANCE-GATED: only a module origin (the
-        // governance module's follow-up after a passing proposal) or a system
-        // origin (genesis orchestration) may stage them. origin is part of the
-        // deterministic Env, so every validator enforces this identically.
+        // policy changes are GOVERNANCE-GATED: only the GOVERNANCE module's
+        // own follow-up (after a passing proposal) or a system origin (genesis
+        // orchestration) may stage them. a bare `Module(_)` would let any
+        // admitted module rewrite the acl table for itself — the host stamps
+        // every module origin with the id of whichever guest just ran. origin
+        // is part of the deterministic Env, so every validator enforces this
+        // identically.
         match &ctx.env().origin {
-            Origin::Module(_) | Origin::System => {}
-            Origin::External(_) => {
-                return Err(Error::Module("acl policy changes only via governance".into()));
+            Origin::Module(id) if *id == self.governance_id => {}
+            Origin::System => {}
+            other => {
+                return Err(Error::Module(format!(
+                    "acl policy changes only via governance (the {} module), got {other:?}",
+                    self.governance_id
+                )));
             }
         }
         match decode_msg(&msg.payload).map_err(Error::Module)? {
@@ -245,7 +263,21 @@ mod tests {
     }
 
     fn fresh() -> Acl {
-        Acl::new(DEFAULT_ACL_ID, Box::new(sdk_testkit::MemStore::new()))
+        Acl::new(
+            DEFAULT_ACL_ID,
+            Box::new(sdk_testkit::MemStore::new()),
+            "governance",
+        )
+    }
+
+    /// a ctx whose origin is another module's host-stamped follow-up.
+    fn module_ctx(module_id: &str) -> TestCtx {
+        TestCtx::with_env(sdk::Env {
+            height: 1,
+            consensus_time: 1,
+            origin: Origin::Module(module_id.into()),
+            me: DEFAULT_ACL_ID.into(),
+        })
     }
 
     /// the root of a store that never committed anything — the allow-all
@@ -284,12 +316,42 @@ mod tests {
     }
 
     fn table(a: &Acl) -> Vec<(String, Standing)> {
-        let reply =
-            futures::executor::block_on(a.query(&encode_query(&AclQuery::Policy))).unwrap();
+        let reply = futures::executor::block_on(a.query(&encode_query(&AclQuery::Policy))).unwrap();
         match decode_reply(&reply).unwrap() {
             AclReply::Policy(t) => t,
             other => panic!("expected Policy, got {other:?}"),
         }
+    }
+
+    /// policy is GOVERNANCE-gated, not module-gated: an admitted app module's
+    /// follow-up must not rewrite the acl table for itself. system origin
+    /// (genesis orchestration) still passes.
+    #[test]
+    fn a_non_governance_module_sets_no_policy() {
+        let mut a = fresh();
+        let mut chat = module_ctx("chat");
+        assert!(
+            matches!(
+                run(&mut a, &mut chat, &set("valset", Some(Standing::Validator))),
+                Err(Error::Module(_))
+            ),
+            "a chat-module origin set acl policy"
+        );
+        assert_eq!(a.root(), empty_root(), "nothing staged, nothing committed");
+
+        let mut sys = TestCtx::with_env(sdk::Env {
+            height: 1,
+            consensus_time: 1,
+            origin: Origin::System,
+            me: DEFAULT_ACL_ID.into(),
+        });
+        run(&mut a, &mut sys, &set("valset", Some(Standing::Validator))).unwrap();
+
+        let mut gov = gov_ctx();
+        run(&mut a, &mut gov, &set("chat", Some(Standing::User))).unwrap();
+        commit(&mut a);
+        assert_eq!(policy_for(&a, "valset"), Some(Standing::Validator));
+        assert_eq!(policy_for(&a, "chat"), Some(Standing::User));
     }
 
     #[test]
@@ -313,7 +375,12 @@ mod tests {
     fn the_wildcard_entry_is_the_fallback_and_an_exact_entry_beats_it() {
         let mut a = fresh();
         let mut ctx = gov_ctx();
-        run(&mut a, &mut ctx, &set(WILDCARD_TARGET, Some(Standing::User))).unwrap();
+        run(
+            &mut a,
+            &mut ctx,
+            &set(WILDCARD_TARGET, Some(Standing::User)),
+        )
+        .unwrap();
         run(&mut a, &mut ctx, &set("chat", Some(Standing::Open))).unwrap();
         commit(&mut a);
 
@@ -389,7 +456,12 @@ mod tests {
         );
 
         for n in 0..MAX_POLICY_ENTRIES {
-            run(&mut a, &mut ctx, &set(&format!("m{n}"), Some(Standing::Open))).unwrap();
+            run(
+                &mut a,
+                &mut ctx,
+                &set(&format!("m{n}"), Some(Standing::Open)),
+            )
+            .unwrap();
         }
         let err = run(&mut a, &mut ctx, &set("one-more", Some(Standing::Open))).unwrap_err();
         assert!(
@@ -405,7 +477,11 @@ mod tests {
         run(&mut a, &mut ctx, &set("chat", Some(Standing::Validator))).unwrap();
         assert_eq!(policy_for(&a, "chat"), Some(Standing::Validator), "staged");
         futures::executor::block_on(a.abort_block()).unwrap();
-        assert_eq!(policy_for(&a, "chat"), None, "aborted block leaves no trace");
+        assert_eq!(
+            policy_for(&a, "chat"),
+            None,
+            "aborted block leaves no trace"
+        );
         assert_eq!(a.root(), empty_root());
     }
 }

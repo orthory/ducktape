@@ -4,11 +4,11 @@
 //! discriminating property the rest of the store-backed family proves, over
 //! the meta + item + member-count layout.
 //!
-//! the source delivers to two members, marks one item read (record
-//! overwrite), and clears a prefix (the op log carries item DELETES with the
-//! meta keeping its never-rewinding counter), so the joiner must reconstruct
-//! every record family — and a post-sync delivery must resume at the
-//! preserved next_seq, never a reused one.
+//! the source delivers to two members, marks one item read (a meta
+//! read-watermark bump), and fully clears the other (the op log carries item
+//! DELETES plus a META delete and a member-count decrement), so the joiner must
+//! reconstruct every record family — and a post-sync delivery to the cleared
+//! member must re-mint from seq 1, since its meta record no longer exists.
 
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use inbox::{Inbox, InboxMsg, encode_msg};
@@ -105,7 +105,10 @@ fn synced_store_reconstructs_source_root_queues_and_counters() {
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, genesis_root, "the ops moved the root");
         let src_alice = src.queue_view(&alice).await.unwrap();
+        // bob's ONLY item (seq 1) was cleared, so his queue is now fully
+        // empty and its meta record is deleted — see `stage_clear`.
         let src_bob = src.queue_view(&bob).await.unwrap();
+        assert!(src_bob.is_none(), "bob's emptied queue has no meta record");
 
         // the module consumed its store, so REOPEN the committed partitions
         // as a bare store for the handoff (drop first — one owner at a time).
@@ -141,19 +144,20 @@ fn synced_store_reconstructs_source_root_queues_and_counters() {
         assert_eq!(synced.queue_view(&alice).await.unwrap(), src_alice);
         assert_eq!(synced.queue_view(&bob).await.unwrap(), src_bob);
 
-        // the cleared member's counter survived the trip: the next delivery
-        // resumes at the preserved next_seq (2), never a reused seq 1.
+        // the cleared member's meta record did not survive the trip (it was
+        // deleted along with the last item): the next delivery re-mints a
+        // fresh MemberMeta, starting back at seq 1.
         apply_commit(&mut synced, chat(), 6, deliver(&bob, "k", "after clear")).await;
         let (next, items) = synced
             .queue_view(&bob)
             .await
             .unwrap()
-            .expect("bob exists");
-        assert_eq!(next, 3);
+            .expect("bob exists again");
+        assert_eq!(next, 2);
         assert_eq!(
             items.iter().map(|n| n.seq).collect::<Vec<_>>(),
-            vec![2],
-            "the post-sync delivery took seq 2 — next_seq did not rewind"
+            vec![1],
+            "the post-sync delivery re-minted at seq 1"
         );
     });
 }

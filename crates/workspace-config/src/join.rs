@@ -20,8 +20,9 @@ use commonware_cryptography::{Signer as _, ed25519};
 
 use crate::{
     Invite, Plumbing, Reach, ReachHint, SandboxToml, decode_invite, default_workspace_dir,
-    guard_join_descriptor, hex_bytes, load_or_generate_identity, merged_plumbing,
-    save_invite_fronts, save_invite_token, save_invite_wireguard, write_node_toml,
+    guard_join_descriptor, hex_bytes, list_workspaces_in, load_or_generate_identity,
+    merged_plumbing, save_invite_fronts, save_invite_token, save_invite_wireguard,
+    validate_chain_id_shape, workspaces_root, write_node_toml,
 };
 
 /// Plumbing the joiner wants instead of the defaults. Every field is an
@@ -42,7 +43,6 @@ pub struct PlumbingOverrides {
     pub wireguard_listen: Option<String>,
     pub wireguard_advertised: Option<String>,
     pub invite_listen: Option<String>,
-    pub block_time_ms: Option<u64>,
 }
 
 /// What a join produced. Enough for either caller to say what happened without
@@ -81,9 +81,16 @@ pub fn join_workspace(
 ) -> Result<JoinedWorkspace, String> {
     let invite = decode_invite(blob)?;
     let mut descriptor = invite.descriptor.clone();
+    // the chain id came straight out of an untrusted invite: constrain its
+    // shape to what `node init` actually mints before it is trusted to
+    // address a registry directory or a `-n <chain-id>` selector.
+    validate_chain_id_shape(&descriptor.chain_id)?;
     let dir = match dir {
         Some(dir) => dir,
-        None => default_workspace_dir(&descriptor.chain_id)?,
+        None => {
+            guard_no_chain_id_collision(&workspaces_root()?, &descriptor.chain_id)?;
+            default_workspace_dir(&descriptor.chain_id)?
+        }
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
@@ -93,24 +100,16 @@ pub fn join_workspace(
     // a paste simply admits whoever runs it.
     let (key, generated) = load_or_generate_identity(&dir.join("identity.key"))?;
     let identity = hex_bytes(key.public_key().as_ref());
-    guard_join_descriptor(&dir, &descriptor)?;
+    // the issuer `decode_invite` already verified the envelope against — the
+    // one field of a pasted blob an attacker cannot choose freely, and what
+    // separates a real admit refresh from a descriptor that merely copied our
+    // validator list.
+    guard_join_descriptor(&dir, &descriptor, &invite.token.issuer)?;
 
     // Computed BEFORE anything lands on disk, so a corrupt existing node.toml
     // aborts the join instead of leaving a half-written directory.
     let fresh_workspace = !dir.join("node.toml").exists();
-    let mut plumbing = merged_plumbing(
-        &dir,
-        overrides.listen.as_deref(),
-        overrides.advertised.as_deref(),
-        overrides.http.as_deref(),
-        overrides.gateway.as_deref(),
-        overrides.rpc.as_deref(),
-        overrides.wireguard_listen.as_deref(),
-        overrides.invite_listen.as_deref(),
-        overrides.primary_coordinator.as_deref(),
-        overrides.wireguard_advertised.as_deref(),
-        overrides.block_time_ms,
-    )?;
+    let mut plumbing = merged_plumbing(&dir, overrides)?;
     // A FRESH joining workspace gets the same compute detection as `init`: the
     // platform runtime on PATH ⇒ a live `[sandbox]` table (announce stays off),
     // so agent runs and the terminal plane work without a config edit. A
@@ -149,6 +148,31 @@ pub fn join_workspace(
         generated,
         compute_runtime,
     })
+}
+
+/// refuse a chain id that would make `-n <chain-id>` prefix lookup ambiguous
+/// against an ALREADY-registered network: `find_workspace_config_in` answers
+/// an exact match before it ever looks at prefixes, so a chain id that equals
+/// a habitual short selector (or is a prefix/extension of an existing id)
+/// would silently steal that selector out from under an operator's existing
+/// network. The exact-same-id case is not a collision — it is the same
+/// network's own directory, and a re-join over it is legitimate.
+fn guard_no_chain_id_collision(root: &Path, chain_id: &str) -> Result<(), String> {
+    for (existing, _) in list_workspaces_in(root)? {
+        if existing == chain_id {
+            continue;
+        }
+        let shadows = existing.starts_with(chain_id) || chain_id.starts_with(&existing);
+        if shadows {
+            return Err(format!(
+                "chain id {chain_id:?} collides with the already-registered network \
+                 {existing:?} under `-n <chain-id>` prefix matching — refusing to create a \
+                 workspace whose id would shadow it (or be shadowed by it); pass --dir to join \
+                 outside the registry"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A WireGuard or Coordinated invite makes the reachability plane the dial
@@ -243,9 +267,7 @@ pub fn detect_platform_sandbox() -> Option<(SandboxToml, PathBuf)> {
 /// The plumbing a caller with no overrides gets — exposed because both callers
 /// want to show it before writing it.
 pub fn default_plumbing(dir: &Path) -> Result<Plumbing, String> {
-    merged_plumbing(
-        dir, None, None, None, None, None, None, None, None, None, None,
-    )
+    merged_plumbing(dir, &PlumbingOverrides::default())
 }
 
 #[cfg(test)]
@@ -284,6 +306,46 @@ mod tests {
         assert_eq!((table.cores, table.mem_gb), (0, 0));
     }
 
+    /// a chain id that is a strict prefix of an already-registered network's
+    /// id (or has one as its own prefix) is refused: `find_workspace_config_in`
+    /// answers an EXACT match before it ever considers a prefix, so letting
+    /// this land would silently steal an operator's habitual short `-n`
+    /// selector for the existing network out from under them.
+    #[test]
+    fn a_chain_id_that_would_shadow_an_existing_workspace_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("dognet#a1b2c3d4");
+        std::fs::create_dir_all(&existing).unwrap();
+        crate::NetworkDescriptor {
+            chain_id: "dognet#a1b2c3d4".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        }
+        .save(&existing.join("network.toml"))
+        .unwrap();
+
+        // a strict prefix of the existing id.
+        let err = guard_no_chain_id_collision(root.path(), "dognet").unwrap_err();
+        assert!(err.contains("dognet#a1b2c3d4"), "{err}");
+
+        // the existing id is itself a strict prefix of the incoming one.
+        let err = guard_no_chain_id_collision(root.path(), "dognet#a1b2c3d4ff").unwrap_err();
+        assert!(err.contains("dognet#a1b2c3d4"), "{err}");
+
+        // the SAME id is not a collision — it is a re-join of the same network.
+        guard_no_chain_id_collision(root.path(), "dognet#a1b2c3d4")
+            .expect("re-joining the same network is not a collision");
+
+        // an unrelated id is fine.
+        guard_no_chain_id_collision(root.path(), "cathouse#deadbeef")
+            .expect("an unrelated chain id is not a collision");
+    }
+
     /// A blob that is not an invite must fail BEFORE anything is written: the
     /// destination directory is derived from the invite's own chain id, so a
     /// join that got that far would have created a directory named after
@@ -295,5 +357,57 @@ mod tests {
         let overrides = PlumbingOverrides::default();
         assert!(join_workspace("not-an-invite", Some(target.clone()), &overrides).is_err());
         assert!(!target.exists(), "a refused join left a directory behind");
+    }
+
+    /// THE beat test: a joiner with NO flags at all — the desktop app's only
+    /// shape (`join_workspace(&blob, None, &Default::default())`) — comes up on
+    /// the founder's cadence, not the compiled default. The beat is a genesis
+    /// fact carried by the invite, so there is nothing left in `node.toml` for
+    /// a member to disagree about.
+    #[test]
+    fn a_joiner_inherits_the_founders_beat_with_no_flag() {
+        const FOUNDING_BEAT: u64 = 250;
+        assert_ne!(FOUNDING_BEAT, crate::DEFAULT_BLOCK_TIME_MS);
+
+        let issuer = ed25519::PrivateKey::from_seed(31);
+        let founder = issuer.public_key();
+        let mut descriptor = crate::NetworkDescriptor {
+            chain_id: "beat#a1b2c3d4".into(),
+            validators: vec![hex_bytes(founder.as_ref())],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: FOUNDING_BEAT,
+            genesis: "ab".repeat(32),
+            modules: Vec::new(),
+        };
+        descriptor.add_bootstrap(&founder, "127.0.0.1:52200");
+        let token =
+            crate::mint_invite_token(&issuer, descriptor.genesis_namespace().as_bytes(), u64::MAX);
+        let wireguard = crate::InviteWireGuard {
+            public_key: [0u8; 32],
+            endpoint: None,
+            intro: None,
+            mesh_port: 52200,
+        };
+        let blob = crate::encode_invite(&descriptor, &token, &wireguard, &[], &issuer)
+            .expect("encode the invite");
+
+        let root = tempfile::tempdir().unwrap();
+        let joined = join_workspace(
+            &blob,
+            Some(root.path().join("joined")),
+            &PlumbingOverrides::default(),
+        )
+        .expect("join");
+
+        let landed = crate::NetworkDescriptor::load(&joined.dir.join("network.toml"))
+            .expect("the joined descriptor");
+        assert_eq!(landed.block_time_ms, FOUNDING_BEAT);
+        let node_toml = std::fs::read_to_string(joined.dir.join("node.toml")).expect("node.toml");
+        assert!(
+            !node_toml.contains("block_time_ms"),
+            "the beat is descriptor-only; node.toml must not restate it:\n{node_toml}"
+        );
     }
 }

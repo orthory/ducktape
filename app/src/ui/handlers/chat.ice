@@ -100,6 +100,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // The copy range ends with the room — see `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -177,6 +181,15 @@ on choose_channel(id)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // THE COPY RANGE ENDS WITH THE ROOM. Its two ends are seqs in THIS channel's
+  // sequence, so carried next door they would tint rows nobody picked — and
+  // the bar that holds the only Clear button is gated on a count the arriving
+  // list makes zero, which would leave the ⌘C route armed with no way to
+  // disarm it. Every navigation that changes which conversation is on screen
+  // ends the selection; the five other sites that do it point back here.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -265,6 +278,10 @@ on choose_dm(peer_key)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // The copy range ends with the room — see `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -390,8 +407,8 @@ on remove_channel_member_submit(key)
 //
 // It answers for the channel ON SCREEN only: `ChatData` carries the roster of
 // the active channel, and nothing on the wire says whether she is in a huddle
-// in some OTHER channel. So the docked titlebar pill and the "live elsewhere"
-// affordance stay dark rather than guess (see the report).
+// in some OTHER channel. So no "live elsewhere" affordance is drawn: the
+// pill stays dark rather than guess (see the report).
 on join_huddle_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || active_channel_archived
   hydration_generation = hydration_generation + 1
@@ -400,17 +417,43 @@ on join_huddle_submit
   error = ""
   run every join_huddle(connected_rpc, password, active_channel) -> huddle_joined_ack _ | mutation_failed _
 
-// THE JOIN OPENS THE HUDDLE, because the huddle window is where the huddle IS:
-// every face, every shared screen, the mic and camera controls and Leave live
-// in it, and the header pill it docks into can show none of them. Joining and
-// then being shown a pill is how someone sits in a call watching nothing
-// happen, which is exactly what "I joined and there was no video" is. The
-// guard is `pop_huddle`'s own: a window already up is not opened twice.
+// THE JOIN OPENS THE CALL'S WINDOW. That window is the only surface a huddle
+// has, so a join that opened none would be a call with nowhere to be seen.
+// It goes through `show_huddle` rather than opening outright: if a window is
+// somehow already up (the reconciler took the seat away and the reader joined
+// again before closing it), a second open would leak the first as an
+// untracked window, so the summon raises that one instead.
+//
+// AND THE ACK IS WHAT LANDS THE JOINED STATE, because nothing else was doing
+// it. `huddle_joined` has no local writer on the way IN — it is answered by
+// `huddle_after_load` off a chat load's roster — and the load that used to
+// answer it was the popped window's own read of the huddle channel. Take the
+// window away and the write committed, the chain roster listed you, and the
+// app sat there with the "Huddle" start button still up and no media session,
+// until some unrelated refresh of that room happened by. So: stamp the huddle
+// here, then ask that channel for its roster. `huddle_after_load` stays the
+// RECONCILER — it is what takes the huddle away again if the roster does not
+// have you on it — and it keeps the stamp below, because it reads the
+// `huddle_joined` this handler has already set.
 on huddle_joined_ack(_result)
   mutation_phase = MutationPhase.idle
   error = ""
-  return if huddle_win != none
-  task window open huddle -> huddle_opened _
+  huddle_joined = true
+  huddle_channel = active_channel
+  huddle_channel_name = active_channel_name
+  // The clock starts where THIS process saw the join land — see the header of
+  // handlers/huddle.ice for why it is never the roster row's `joined_at`.
+  huddle_joined_at = huddle_now
+  // The roster the tiles are drawn from, and the reconciler's own input. Same
+  // one-root-window read `choose_channel` issues, on the same lane.
+  chat_generation = chat_generation + 1
+  // A window task is terminal, so the summon runs beside the load rather than
+  // after it.
+  parallel
+    flow
+      from done true
+      done -> show_huddle()
+    run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
 // HUDDLE'S channel rather than the one on screen — the same button serves the
@@ -465,11 +508,7 @@ on composer_submitted(kind, pending_body, pending_id)
           // Sending is a jump to now: the minted row lands at the tail, and a
           // reader who had scrolled up would otherwise get her own send below the
           // fold — an optimistic insert she cannot see is no confirmation at all.
-          //
-          // `snap … 0.0`, NOT `snap-end`: the stream is `anchor-y=end`, where the
-          // offset counts FROM the tail — relative 0.0 IS the tail. `snap-end` is
-          // relative 1.0, which an end anchor translates to the TOP of history; it
-          // shipped once and every send hurled the reader to the oldest loaded row.
+          // The stream is `anchor-y=end`, where relative 0.0 is the tail.
           parallel
             run every send_message(connected_rpc, password, active_channel, pending_id, pending_body, channel_members) -> message_sent _ | message_send_failed _
             task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0 window=window_target(console_win)
@@ -739,6 +778,11 @@ on channel_created(next)
   selected_message_rev = next.selected_message_rev
   message_action = MessageAction.toolbar
   message_edit_draft = next.selected_message_body
+  // A create is a room switch, so the copy range ends here too — see
+  // `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = next.active_thread_seq
   // A create lands on seq 0 — no thread seated, and no composer line owed:
   // each thread's instance keeps its own words (ducktape-ui#697).
@@ -965,6 +1009,14 @@ on open_thread_for(seq)
   thread_selected_rev = 0
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
+  // AND WITH THE RAIL'S LIST, for the same reason as the room — see
+  // `choose_channel`. A reply's seq comes from the CHANNEL's sequence, so a
+  // range left standing tints replies in whichever thread opens next. This
+  // handler already drops the stream's own `selected_message_seq` two lines
+  // up; the selection goes with it.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = true
@@ -1124,6 +1176,11 @@ on close_thread
   thread_selected_rev = 0
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
+  // The rail's list goes with the rail, and so does the copy range — see
+  // `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
 
 on edit_message_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
@@ -1273,3 +1330,54 @@ on thread_reply_send_failed(cause)
 on thread_reply_sent(next)
   return if active_channel != next.channel_id
   error = ""
+
+// ============================================================================
+// THE COPY RANGE. Copying what someone said meant retyping it: the message
+// menu offers `Copy message link` and there is no way to lift the TEXT of even
+// one message, let alone a run of them.
+//
+// The unit is the message, not the character. iced has no selection that
+// crosses widgets, and this timeline's hover is draw-time on purpose (see
+// `MessageCard`) — a drag that followed the cursor from row to row would need
+// an enter route and a full rebuild per row crossed, which is the per-hover
+// round trip `DiffRow` refuses by name. So the gesture is the one every
+// desktop list already answers: click an end, shift-click the other.
+// ============================================================================
+
+// A press on a message's prose, in either surface. Plain, it starts a
+// one-message range here; with ⇧ held it keeps the anchor and moves the far
+// end. `shift_held` comes off the modifier stream because a press carries no
+// modifiers of its own, and the surface rides along so a shift-click in the
+// rail cannot draw a range that spans both lists.
+on press_message(seq, surface)
+  let range = copy_range_after_press(copy_anchor_seq, copy_surface, seq, surface, shift_held)
+  copy_anchor_seq = range.anchor
+  copy_head_seq = range.head
+  copy_surface = range.surface
+
+on clear_copy_range
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
+
+// TWO DOORS, ONE ACT. An app handler cannot call another one and a keyboard
+// subscription cannot hand its event to a no-argument handler, so the bar's
+// button and ⌘C each spell the same four lines. That is thinner than it looks:
+// every decision — which list, whether there is a range, what the toast says,
+// what text comes out — is in the externs, and these bodies only apply them.
+// The surface picks the list, which is what makes the chord lift exactly the
+// rows the bar was counting.
+on copy_chord_pressed(event)
+  return if !is_copy_chord(event.key, event.physical_key, event.modifiers)
+  let rows = copy_range_rows(messages, thread_messages, copy_surface)
+  return if copy_range_count(rows, copy_anchor_seq, copy_head_seq) == 0
+  toast = copy_range_toast(rows, copy_anchor_seq, copy_head_seq)
+  toast_age = 0
+  task clipboard write copy_range_text(rows, copy_anchor_seq, copy_head_seq)
+
+on copy_selected_messages
+  let rows = copy_range_rows(messages, thread_messages, copy_surface)
+  return if copy_range_count(rows, copy_anchor_seq, copy_head_seq) == 0
+  toast = copy_range_toast(rows, copy_anchor_seq, copy_head_seq)
+  toast_age = 0
+  task clipboard write copy_range_text(rows, copy_anchor_seq, copy_head_seq)

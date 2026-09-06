@@ -4,7 +4,9 @@
 # things the dev loop already treats as load-bearing: the committed wasm
 # component bytes (`make wasm-modules-check`) and that no binary embeds any
 # of them (`make wasm-embed-check`), the genesis root-hash pin
-# (`host_state`), and clippy across the workspace.
+# (`host_state`), the simnode suites (`cargo test -p simnode` — the sim's own
+# genesis pin in `topology_set.rs` lives here, alongside every other simnode
+# scenario; #1433), and clippy across the workspace.
 name: pr
 
 on:
@@ -38,6 +40,23 @@ jobs:
       - run: make wasm-modules-check
       - run: make wasm-embed-check
 
+  # `wasm-modules-check` only cmps committed copies against each other, so a
+  # committed index guest can drift from the source beside it and stay green
+  # (it did: a module PR refreshed component.wasm and forgot `--index`). This
+  # rebuilds every index.wasm from source on the pinned toolchain and refuses
+  # a PR whose committed bytes differ. Its own job: the rebuild needs the
+  # wasm32 target and a cargo build, which the cmp-only job above does not.
+  wasm-index-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup show
+      - run: make wasm-index-check
+
   genesis-pin:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -49,6 +68,57 @@ jobs:
       - run: rustup show
       - run: cargo test --locked -p node-bin host_state
 
+  # the wasm/native cutover-continuity proofs (crates/kernel/host/tests/wasm_*_parity.rs):
+  # each op sequence must commit the identical root, replies and rejection
+  # reasons on both a native module and its wasm guest, block by block. Had
+  # no PR gate (#1695) — a fixture written before a module's own admission
+  # rule shifted (#1650, #1046) slipped a stale-fixture failure onto dev
+  # unnoticed. Measured ~1 min for `--tests` warm-cache locally, plus the
+  # ~2-3 min host-crate compile; 30 min matches the other host-crate jobs.
+  host-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup show
+      - run: cargo test --locked -p host --tests
+
+  # A separate job (not folded into genesis-pin) so it runs in parallel
+  # rather than lengthening one job's critical path. `cargo test -p simnode`
+  # cranelift-compiles the sim's module set per boot (25–29 min on the
+  # 2-core runner, so the timeout sits well above that) with no sandbox,
+  # microVM, or outbound network — every simnode test binds loopback only —
+  # so the whole crate runs here, not a scoped subset. This is the job that
+  # was missing (#1433): `topology_set.rs`'s `DEFAULT_GENESIS_ROOT_HASH`
+  # pins the sim's own genesis composition and drifted unnoticed with no PR
+  # gate exercising it.
+  #
+  # DUCKTAPE_WASM_CACHE_DIR turns on wasmtime's own compilation cache
+  # (`simnode::boot` calls `wasm_host::enable_compilation_cache`) for this job
+  # ONLY: the 13 test binaries all
+  # boot the SAME 15-module `topology::SIM_BASE` genesis, so after the first
+  # binary compiles it, every later one loads the cranelift artifacts from
+  # disk instead of recompiling them. A node never sets this env var, so
+  # production boot behavior is unchanged. The dir lives under `target/` so
+  # Swatinem/rust-cache's `cache-directories` persists it across runs.
+  simnode-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DUCKTAPE_WASM_CACHE_DIR: ${{ github.workspace }}/target/sim-wasm-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: target/sim-wasm-cache
+      - run: rustup show
+      - run: cargo test --locked -p simnode
+
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -59,3 +129,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
       - run: cargo clippy --locked --workspace --tests --no-deps -- -D warnings
+      # the default workspace build never enables airlock's `verify` feature
+      # (#1302 — dcap-qvl/sev/a second reqwest-0.13 stack are opt-in), so the
+      # attested-path code (crates/services/broker/src/attested.rs,
+      # bin/node/src/cred_seal.rs) needs its own compile check or it rots
+      # unnoticed between the rare `--features verify` runs.
+      - run: cargo clippy --locked -p node-bin -p broker-host -p provider-host --tests --no-deps --features node-bin/verify,broker-host/verify,provider-host/verify -- -D warnings

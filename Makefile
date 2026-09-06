@@ -16,7 +16,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-index-check labs-gate audit
+.PHONY: all app app-release dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-index-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -109,9 +109,40 @@ $(ICE_BIN):
 	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build" $(CARGO) install cargo-ice \
 		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
 
-## build the signed-ad-hoc Ducktape.app and DMG under target/ice-bundle
+## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed
+## unless the environment says otherwise — `cargo-ice bundle` reads these
+## itself, and this recipe inherits the environment, so nothing is forwarded
+## by hand:
+##   ICE_CODESIGN_IDENTITY  a "Developer ID Application: … (TEAMID)" identity
+##                          (`security find-identity -v -p codesigning`).
+##                          Signs the .app and the .dmg with --timestamp
+##                          --options runtime; without it both are signed
+##                          ad-hoc, which Gatekeeper refuses off this machine.
+##   ICE_NOTARY_KEY         path to the App Store Connect API key .p8
+##   ICE_NOTARY_KEY_ID      that key's id
+##   ICE_NOTARY_ISSUER      the issuer UUID
+##                          All three together add `xcrun notarytool submit
+##                          --wait` + `xcrun stapler staple` on the DMG. Set
+##                          without ICE_CODESIGN_IDENTITY, cargo-ice refuses
+##                          before the upload — Apple rejects an ad-hoc
+##                          signature.
+## The release recipe is app/README.md § "Release build".
 app: $(ICE_BIN)
 	"$(ICE_BIN)" bundle -p ducktape-app
+
+## `make app-release` for a build that leaves this machine: refuses unless a
+## real Developer ID identity is set, so an ad-hoc bundle cannot be shipped by
+## forgetting one variable. Notarization needs the three ICE_NOTARY_* vars on
+## top; without them the bundle is signed and stapleable but not stapled.
+app-release:
+	@if [ -z "$$ICE_CODESIGN_IDENTITY" ]; then \
+		echo "app-release needs ICE_CODESIGN_IDENTITY set to a Developer ID Application identity;" >&2; \
+		echo "list them with: security find-identity -v -p codesigning" >&2; \
+		echo "(and ICE_NOTARY_KEY, ICE_NOTARY_KEY_ID, ICE_NOTARY_ISSUER to notarize)" >&2; \
+		echo "see app/README.md § \"Release build\"; 'make app' builds the ad-hoc bundle" >&2; \
+		exit 1; \
+	fi
+	@$(MAKE) app
 
 ## install the operator CLI and desktop app without requiring root
 install: install-node install-app
@@ -239,8 +270,8 @@ test: wasm-modules-check wasm-embed-check
 # Every product/example module carries its own guest port (src/guest.rs behind
 # the `guest` feature); guest-builder synthesizes the packaging workspace and
 # writes the canonical component.wasm into the module directory itself. The
-# four kernel-fixture test guests (hello, hello-replacement, sibling, object) keep
-# their standalone crates/guests workspaces below.
+# five kernel-fixture test guests (hello, hello-replacement, sibling, object,
+# noop) keep their standalone crates/guests workspaces below.
 BUILDER_MODULES := \
   crates/examples/directory \
   crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
@@ -256,9 +287,10 @@ BUILDER_MODULES := \
 # `index-guest` feature): guest-builder --index writes the canonical
 # index.wasm (core wasm, no componentize) into the module directory; the
 # build stages it into the founding set as `<id>.index.wasm` and a genesis
-# carries it (the topology's `index_guest` flag declares which modules have
-# one). The reference testmap mapper is the indexer crate's test fixture and
-# rides the same sweep.
+# carries it. The shell file IS the declaration: noded's build script stages
+# an index guest for exactly the module crates that carry src/index_guest.rs,
+# so this list must name exactly those. The reference testmap mapper is the
+# indexer crate's test fixture and rides the same sweep.
 INDEX_MODULES := \
   crates/modules/apps/chat crates/modules/apps/tasks crates/modules/apps/pages \
   crates/modules/apps/inbox crates/modules/system/saga \
@@ -286,11 +318,10 @@ wasm-modules:
 	# hello mirrors its component into BOTH fixture homes; sibling/object write
 	# straight to the wasm-host fixture with no guest copy; hello-replacement
 	# builds the replacement crate directly into the host fixture. Each shape is
-	# unique — kept explicit. No $(LOCKED) below: these four are STANDALONE
-	# workspaces with no committed lock, and their components are kernel test
-	# fixtures — nothing the genesis hash pins. Committing their locks is what
-	# would earn them the flag.
-	cd crates/guests/hello-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	# unique — kept explicit. These five ARE STANDALONE workspaces (each owns a
+	# committed lock, so $(LOCKED) applies same as everywhere else) — their
+	# components are kernel test fixtures, nothing the genesis hash pins.
+	cd crates/guests/hello-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/hello-wasm/target/wasm32-unknown-unknown/release/hello_wasm.wasm \
 	  -o crates/guests/hello-wasm/component.wasm
@@ -298,15 +329,24 @@ wasm-modules:
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
 	cp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
-	cd crates/guests/hello-wasm-replacement && $(CARGO) build --target wasm32-unknown-unknown --release
+	# noop: the smallest compliant module, the admission fixture that touches
+	# nothing. Its component is committed beside the crate and pinned in the
+	# host fixtures, the hello shape.
+	cd crates/guests/noop-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
+	wasm-tools component new \
+	  crates/guests/noop-wasm/target/wasm32-unknown-unknown/release/noop_wasm.wasm \
+	  -o crates/guests/noop-wasm/component.wasm
+	cp crates/guests/noop-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/noop.component.wasm
+	cd crates/guests/hello-wasm-replacement && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/hello-wasm-replacement/target/wasm32-unknown-unknown/release/hello_wasm_replacement.wasm \
 	  -o crates/kernel/host/tests/fixtures/hello-replacement.component.wasm
-	cd crates/guests/sibling-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/sibling-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/sibling-wasm/target/wasm32-unknown-unknown/release/sibling_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/sibling.component.wasm
-	cd crates/guests/object-wasm && $(CARGO) build --target wasm32-unknown-unknown --release
+	cd crates/guests/object-wasm && $(CARGO) build $(LOCKED) --target wasm32-unknown-unknown --release
 	wasm-tools component new \
 	  crates/guests/object-wasm/target/wasm32-unknown-unknown/release/object_wasm.wasm \
 	  -o crates/kernel/wasm-host/tests/fixtures/object.component.wasm
@@ -321,6 +361,8 @@ wasm-modules-check:
 	  crates/kernel/wasm-host/tests/fixtures/hello.component.wasm
 	cmp crates/guests/hello-wasm/component.wasm \
 	  crates/kernel/host/tests/fixtures/hello.component.wasm
+	cmp crates/guests/noop-wasm/component.wasm \
+	  crates/kernel/host/tests/fixtures/noop.component.wasm
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
 	  cmp $$m/component.wasm \

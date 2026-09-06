@@ -61,7 +61,11 @@ fn native_capability(store: Box<dyn sdk::MerkleStore>) -> CapabilityRegistry {
 /// a REAL valset sibling, genesis-seeded with `validators` — the module whose
 /// live Validators/Residents projections every announce is gated on.
 async fn seeded_valset(validators: &[Vec<u8>]) -> Valset {
-    let mut valset = Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut valset = Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     for v in validators {
         valset.seed(v.clone()).await.expect("seed valset");
     }

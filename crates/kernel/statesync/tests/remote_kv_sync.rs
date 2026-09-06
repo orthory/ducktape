@@ -203,9 +203,14 @@ fn joiner_rebuilds_kv_over_the_wire_protocol() {
             );
 
             // multi-chunk snapshot lane: bytes reassemble exactly.
-            let snap = fetch_snapshot(&client_for_join, manifest.boundary_id(), "bigsnap")
-                .await
-                .expect("big snapshot");
+            let snap = fetch_snapshot(
+                &client_for_join,
+                manifest.boundary_id(),
+                "bigsnap",
+                statesync::MAX_SNAPSHOT_BYTES,
+            )
+            .await
+            .expect("big snapshot");
             assert_eq!(
                 snap,
                 BigSnapshot::new().bytes,
@@ -852,7 +857,7 @@ fn an_empty_page_re_offering_its_cursor_is_refused_not_re_asked() {
 /// A KEY THAT PARSES IS NOT A KEY THAT SORTS. `op/2/0` decodes to `(2, 0)` —
 /// `from_str_radix` neither demands the canonical width nor rejects a leading
 /// `+` — so a source can pass every ascent check while handing the joiner a
-/// key that lands AFTER `op/0000000000000009/0000` in the store. Key order is
+/// key that lands AFTER `op/0000000000000009/00000000` in the store. Key order is
 /// the one invariant this whole lane rests on: the next `converge_guest`
 /// refold replays `op/` in KEY order, so a mis-sorted row means every derived
 /// view is rebuilt from history running backwards, silently. The boundary

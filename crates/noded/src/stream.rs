@@ -36,6 +36,12 @@ pub const STREAM_CATCHUP_BUDGET: usize = 256;
 /// few run-output panes; far below this. beyond it, subscribes refuse
 /// per-topic.
 pub const MAX_TOPICS_PER_CONNECTION: usize = 64;
+/// the ws frame/message ceiling for `/v1/ws` — this surface is unauthenticated
+/// like the rest of the file, so tungstenite's 64 MiB default is 1000x more
+/// than any legitimate client message: a `Subscribe` at the topic cap above
+/// (64 names + a same-sized `resume` map) or one run-output publish
+/// ([`MAX_RUN_OUTPUT_LINE`], 16 KiB) both fit many times over inside this.
+pub const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
 /// rows a files:watch catch-up may SCAN (not just emit) per wakeup — a
 /// stage-heavy history is mostly non-commit rows, and an unbounded back-scan
 /// would stall the session task; past this the topic lags to live instead.
@@ -419,7 +425,7 @@ pub enum RunStream {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockWake {
     /// the tip moved and nothing else. An idle chain nop-fills once per
-    /// block time (node.toml `block_time_ms`) and that filler appends no
+    /// block time (network.toml `block_time_ms`) and that filler appends no
     /// per-module op row, so every scan it used to trigger returned empty.
     TipOnly,
     /// op rows were appended under the subscribers.
@@ -569,7 +575,10 @@ impl StreamHub {
         self.term_commands.clone()
     }
 
-    pub(crate) fn subscribe_blocks(&self) -> broadcast::Receiver<BlockWake> {
+    /// one subscription to the block wake. The ws sessions ride it, and so
+    /// does any node-local task that must re-read committed state once per
+    /// block WITHOUT sitting on the drain's select loop.
+    pub fn subscribe_blocks(&self) -> broadcast::Receiver<BlockWake> {
         self.blocks.subscribe()
     }
 
@@ -697,6 +706,112 @@ impl Drop for LogRingWriter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// the numbering that outlives a ring entry
+// ---------------------------------------------------------------------------
+
+/// how many evicted ids keep their numbering.
+///
+/// Basis: a record is one `u64`, a `Copy` mark and the id string — under a
+/// hundred bytes — while the ONE ring entry it stands in for holds up to
+/// [`RUN_OUTPUT_MAX_LINES`] lines or a quarter megabyte of scrollback. So the
+/// bound sits orders of magnitude above the entry caps it backs (32 runs, 16
+/// terminal sessions): every id a node plausibly touches keeps its numbering,
+/// and the cap is here only so a peer minting fresh ids cannot grow the map
+/// without end.
+const SEQ_MEMORY_MAX_IDS: usize = 2_048;
+
+/// the per-id numbering that survives a whole-entry eviction.
+///
+/// Every ring in this crate is bounded twice: by rows within an id, and by id
+/// count across the map. Shedding ROWS is the point — the bytes are
+/// observational. Shedding the id's COUNTERS with them is not: the next append
+/// to that still-live id would restart at seq 1, which every mirror peer
+/// refuses as out-of-order and every subscribed cursor sits above forever. So
+/// eviction hands the id's head here on the way out, a re-created entry
+/// continues numbering from it, and while no entry exists this is what the id
+/// reports as BOTH head and floor — with no rows left, everything up to the
+/// head really is gone, which is what turns a stale cursor into a `Lagged`
+/// frame instead of silence.
+pub(crate) struct SeqMemory<M> {
+    records: BTreeMap<String, SeqRecord<M>>,
+    touch: u64,
+}
+
+struct SeqRecord<M> {
+    /// the last seq the evicted entry stamped: its head, and — no rows having
+    /// survived — its floor.
+    head: u64,
+    mark: M,
+    remembered: u64,
+}
+
+impl<M> Default for SeqMemory<M> {
+    fn default() -> Self {
+        Self {
+            records: BTreeMap::new(),
+            touch: 0,
+        }
+    }
+}
+
+impl<M: Copy> SeqMemory<M> {
+    /// stash an id's numbering as its entry is dropped. Oldest-first eviction
+    /// past [`SEQ_MEMORY_MAX_IDS`], by the order records were remembered.
+    pub(crate) fn remember(&mut self, id: &str, head: u64, mark: M) {
+        self.touch += 1;
+        let remembered = self.touch;
+        self.records.insert(
+            id.to_string(),
+            SeqRecord {
+                head,
+                mark,
+                remembered,
+            },
+        );
+        while self.records.len() > SEQ_MEMORY_MAX_IDS {
+            let Some(oldest) = self
+                .records
+                .iter()
+                .min_by_key(|(_, record)| record.remembered)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.records.remove(&oldest);
+        }
+    }
+
+    /// the head a re-created entry continues from, and the mark the evicted one
+    /// carried.
+    pub(crate) fn recall(&self, id: &str) -> Option<(u64, M)> {
+        self.records
+            .get(id)
+            .map(|record| (record.head, record.mark))
+    }
+
+    /// what an id with no entry reports as its head and floor. `0` — a cursor
+    /// of 0 is not behind — for an id this ring has never held.
+    pub(crate) fn head_of(&self, id: &str) -> u64 {
+        self.records.get(id).map_or(0, |record| record.head)
+    }
+
+    /// the entry owns the numbering again.
+    pub(crate) fn forget(&mut self, id: &str) {
+        self.records.remove(id);
+    }
+}
+
+/// where a subscriber's cursor actually lands on a ring: up to `floor`
+/// (everything at or below it was evicted) and down to `head` (a cursor above
+/// the last stamped seq belongs to numbering this ring no longer has — a
+/// restart, or an entry evicted and re-created). The catch-up path emits
+/// `Lagged` whenever this moves the cursor, which is what keeps an impossible
+/// cursor from waiting on rows that will never come.
+pub(crate) fn resume_within(after: u64, floor: u64, head: u64) -> u64 {
+    after.max(floor).min(head)
+}
+
 #[derive(Clone)]
 pub struct RunOutputRegistry {
     inner: Arc<Mutex<RunOutputInner>>,
@@ -719,14 +834,51 @@ struct RunOutputInner {
     version: u64,
     touch: u64,
     runs: BTreeMap<String, RunRing>,
+    /// the numbering (and origin) of runs whose whole ring the cap evicted —
+    /// see [`SeqMemory`]. A run that keeps printing after its ring was shed
+    /// continues its seq from here instead of restarting at 1.
+    memory: SeqMemory<RunOrigin>,
 }
 
-#[derive(Default)]
+impl RunOutputInner {
+    /// shed a ring's ROWS, never its numbering: the id's head and origin move
+    /// to [`Self::memory`], so a run that keeps printing after the cap dropped
+    /// its ring resumes its seq instead of restarting at 1.
+    fn evict(&mut self, id: &str) {
+        let Some(ring) = self.runs.remove(id) else {
+            return;
+        };
+        self.memory.remember(id, ring.next_seq, ring.origin);
+    }
+}
+
+/// who fed this ring its lines. A run this node hosts is never writable by a
+/// peer, and the cap's eviction never sacrifices one to make room for a peer's
+/// — see [`RunOutputRegistry::push`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunOrigin {
+    Local,
+    Remote,
+}
+
 struct RunRing {
+    origin: RunOrigin,
     next_seq: u64,
     floor_seq: u64,
     touched: u64,
     lines: VecDeque<(u64, RunStream, String)>,
+}
+
+impl RunRing {
+    fn new(origin: RunOrigin) -> Self {
+        Self {
+            origin,
+            next_seq: 0,
+            floor_seq: 0,
+            touched: 0,
+            lines: VecDeque::new(),
+        }
+    }
 }
 
 impl Default for RunOutputRegistry {
@@ -757,21 +909,89 @@ impl RunOutputRegistry {
     }
 
     pub fn append(&self, id: impl Into<String>, stream: RunStream, line: impl Into<String>) {
-        self.push(id.into(), stream, line.into(), true);
+        self.push(id.into(), stream, line.into(), RunOrigin::Local);
     }
 
     /// Add a line received from another node without broadcasting it again.
-    pub fn append_remote(&self, event: RunOutputEvent) {
-        self.push(event.id, event.stream, event.line, false);
+    /// Refused (`false`) when `event.id` names a run this node hosts locally,
+    /// or when admitting a never-seen remote id would have to evict a local
+    /// ring to fit under [`RUN_OUTPUT_MAX_RUNS`] — see [`Self::push`].
+    #[must_use]
+    pub fn append_remote(&self, event: RunOutputEvent) -> bool {
+        self.push(event.id, event.stream, event.line, RunOrigin::Remote)
     }
 
-    fn push(&self, id: String, stream: RunStream, line: String, publish: bool) {
+    /// whether `id` names a run this node hosts locally. Checked by the agent
+    /// data plane before it even spends a peer's remote-binding budget on the
+    /// id: unlike a term session's 16-hex random id, a run id is consensus
+    /// state — every member can learn every hosted run's id — so "unseen id"
+    /// is not a signal a peer could not have forged for a run it does not own.
+    pub fn is_local(&self, id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("run output lock poisoned")
+            .runs
+            .get(id)
+            .is_some_and(|ring| ring.origin == RunOrigin::Local)
+    }
+
+    /// `origin` decides who this line may come from and how the run-count cap
+    /// is enforced:
+    /// - `Local` (this node's own provider output): always admitted, and
+    ///   growing past [`RUN_OUTPUT_MAX_RUNS`] evicts the globally
+    ///   least-recently-touched OTHER ring, local or remote — this node's own
+    ///   work always wins a slot.
+    /// - `Remote` (a peer's line): refused outright against an existing
+    ///   `Local` ring — a peer never appends to, or evicts, a run this node
+    ///   hosts. A brand-new remote id at the cap evicts only the
+    ///   least-recently-touched REMOTE ring; with none to evict (every held
+    ///   ring is local), the line is refused rather than growing past the cap.
+    ///
+    /// Returns whether the line was admitted.
+    fn push(&self, id: String, stream: RunStream, line: String, origin: RunOrigin) -> bool {
         let mut inner = self.inner.lock().expect("run output lock poisoned");
+        let held = inner.runs.get(&id).map(|ring| ring.origin);
+        // the Local/Remote mark outlives the rows: a local run whose ring the
+        // cap shed is still a run this node hosts, and a peer may no more claim
+        // it after the eviction than before.
+        let known = held.or_else(|| inner.memory.recall(&id).map(|(_, mark)| mark));
+        // the cap counts RINGS, so only an id holding none can grow the map.
+        let needs_slot = held.is_none() && inner.runs.len() >= RUN_OUTPUT_MAX_RUNS;
+        match (origin, known) {
+            (RunOrigin::Remote, Some(RunOrigin::Local)) => return false,
+            (RunOrigin::Remote, _) if needs_slot => {
+                let victim = inner
+                    .runs
+                    .iter()
+                    .filter(|(_, ring)| ring.origin == RunOrigin::Remote)
+                    .min_by_key(|(_, ring)| ring.touched)
+                    .map(|(run_id, _)| run_id.clone());
+                match victim {
+                    Some(victim) => inner.evict(&victim),
+                    None => return false,
+                }
+            }
+            _ => {}
+        }
+        // a re-created ring continues the evicted one's numbering; with every
+        // row gone, that head is also its floor.
+        let restored = held
+            .is_none()
+            .then(|| inner.memory.recall(&id))
+            .flatten()
+            .map(|(head, _)| head);
         inner.version += 1;
         inner.touch += 1;
         let version = inner.version;
         let touch = inner.touch;
-        let ring = inner.runs.entry(id.clone()).or_default();
+        let ring = inner
+            .runs
+            .entry(id.clone())
+            .or_insert_with(|| RunRing::new(origin));
+        if let Some(head) = restored {
+            ring.next_seq = head;
+            ring.floor_seq = head;
+        }
         ring.touched = touch;
         ring.next_seq += 1;
         let seq = ring.next_seq;
@@ -781,23 +1001,29 @@ impl RunOutputRegistry {
                 ring.floor_seq = evicted;
             }
         }
-        while inner.runs.len() > RUN_OUTPUT_MAX_RUNS {
-            let Some(victim) = inner
-                .runs
-                .iter()
-                .filter(|(run_id, _)| *run_id != &id)
-                .min_by_key(|(_, ring)| ring.touched)
-                .map(|(run_id, _)| run_id.clone())
-            else {
-                break;
-            };
-            inner.runs.remove(&victim);
+        if origin == RunOrigin::Local {
+            while inner.runs.len() > RUN_OUTPUT_MAX_RUNS {
+                let Some(victim) = inner
+                    .runs
+                    .iter()
+                    .filter(|(run_id, _)| *run_id != &id)
+                    .min_by_key(|(_, ring)| ring.touched)
+                    .map(|(run_id, _)| run_id.clone())
+                else {
+                    break;
+                };
+                inner.evict(&victim);
+            }
+        }
+        if restored.is_some() {
+            inner.memory.forget(&id);
         }
         drop(inner);
         let _ = self.watch.send(version);
-        if publish {
+        if origin == RunOrigin::Local {
             let _ = self.appends.send(RunOutputEvent { id, stream, line });
         }
+        true
     }
 
     pub fn read_after(
@@ -810,7 +1036,9 @@ impl RunOutputRegistry {
         inner.touch += 1;
         let touch = inner.touch;
         let Some(ring) = inner.runs.get_mut(id) else {
-            return (Vec::new(), 0);
+            // no ring, but the numbering may have outlived it: report the
+            // evicted head as the floor, since every row up to it is gone.
+            return (Vec::new(), inner.memory.head_of(id));
         };
         ring.touched = touch;
         let rows = ring
@@ -821,6 +1049,16 @@ impl RunOutputRegistry {
             .cloned()
             .collect();
         (rows, ring.floor_seq)
+    }
+
+    /// where a subscriber's cursor lands on this run's ring — see
+    /// [`resume_within`]. The catch-up path `Lagged`s whenever it moves.
+    pub fn resume_cursor(&self, id: &str, after: u64) -> u64 {
+        let inner = self.inner.lock().expect("run output lock poisoned");
+        let Some(ring) = inner.runs.get(id) else {
+            return inner.memory.head_of(id);
+        };
+        resume_within(after, ring.floor_seq, ring.next_seq)
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -1213,6 +1451,14 @@ fn take_service_link(
         .ok_or("refused: present this node's service-link token, and only one agent service may attach")
 }
 
+/// every `ducktape::term` refusal below that a CLIENT drives per frame (a held
+/// key, a resize, a command, a publisher hammering an unattached connection),
+/// latched by reason. Unlatched, any one of them repeats at whatever rate the
+/// client sends frames — ~30/s for a held key — and evicts the whole
+/// 4096-line ring in about two minutes. First occurrence, then every 100th,
+/// carrying `occurrences`; the counter is the diagnosis.
+static TERM_WARN: crate::log::Latch = crate::log::Latch::new(100);
+
 /// Apply one daemon-published event to the terminal plane, or drop it.
 ///
 /// The `attached` gate is a trust boundary, not tidiness: these events append to
@@ -1220,19 +1466,25 @@ fn take_service_link(
 /// publishing one would be injecting into another member's terminal.
 fn handle_agent_event(handle: &NodeHandle, attached: bool, event: agent_service::wire::Event) {
     if !attached {
-        tracing::warn!(
-            target: "ducktape::term",
-            reason = "unattached_publisher",
-            "agent event dropped"
-        );
+        if let Some(occurrences) = TERM_WARN.hit("unattached_publisher") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "unattached_publisher",
+                occurrences,
+                "agent event dropped"
+            );
+        }
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(
-            target: "ducktape::term",
-            reason = "no_terminal_plane",
-            "agent event dropped"
-        );
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "agent event dropped"
+            );
+        }
         return;
     };
     terminals.on_event(event);
@@ -1267,6 +1519,12 @@ fn handle_client_msg(
     }
 }
 
+/// every `ducktape::agent` refusal below, latched by reason: a compute daemon
+/// publishes one `RunOutput` frame per line of its run, so a malformed id or
+/// an oversized line repeats at the daemon's own output rate. First
+/// occurrence, then every 100th, carrying `occurrences`.
+static AGENT_WARN: crate::log::Latch = crate::log::Latch::new(100);
+
 /// Admit one published run-output line, or drop it with a named reason.
 ///
 /// The two checks are a trust boundary, not tidiness: see [`ClientMsg::RunOutput`].
@@ -1276,20 +1534,26 @@ fn handle_run_output(hub: &StreamHub, id: String, stream: RunStream, line: Strin
     let id_well_formed =
         id.len() == RUN_OUTPUT_ID_LEN && id.bytes().all(|byte| byte.is_ascii_hexdigit());
     if !id_well_formed {
-        tracing::warn!(
-            target: "ducktape::agent",
-            reason = "malformed_run_id",
-            "run output dropped"
-        );
+        if let Some(occurrences) = AGENT_WARN.hit("malformed_run_id") {
+            tracing::warn!(
+                target: "ducktape::agent",
+                reason = "malformed_run_id",
+                occurrences,
+                "run output dropped"
+            );
+        }
         return;
     }
     if line.len() > MAX_RUN_OUTPUT_LINE {
-        tracing::warn!(
-            target: "ducktape::agent",
-            bytes = line.len(),
-            reason = "run_output_line_too_long",
-            "run output dropped"
-        );
+        if let Some(occurrences) = AGENT_WARN.hit("run_output_line_too_long") {
+            tracing::warn!(
+                target: "ducktape::agent",
+                bytes = line.len(),
+                reason = "run_output_line_too_long",
+                occurrences,
+                "run output dropped"
+            );
+        }
         return;
     }
     hub.run_output().append(id, stream, line);
@@ -1327,15 +1591,28 @@ fn forward_target(handle: &NodeHandle, session: &str) -> Option<[u8; 32]> {
 /// lane or a full channel drops the frame (never a panic); never logs the bytes.
 async fn forward_input(handle: &NodeHandle, host: [u8; 32], event: crate::SessionInputWire) {
     let Some(lane) = handle.session_lane() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_session_lane", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_session_lane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_session_lane",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     };
     if lane
         .send(crate::SessionJob::Input { host, event })
         .await
         .is_err()
+        && let Some(occurrences) = TERM_WARN.hit("input_forward_failed")
     {
-        tracing::warn!(target: "ducktape::term", reason = "input_forward_failed", "term input dropped");
+        tracing::warn!(
+            target: "ducktape::term",
+            reason = "input_forward_failed",
+            occurrences,
+            "term input dropped"
+        );
     }
 }
 
@@ -1351,7 +1628,9 @@ async fn forward_input(handle: &NodeHandle, host: [u8; 32], event: crate::Sessio
 /// held-down key would otherwise mint one `warn` per repeat into the 4096-line
 /// ring — evicting the very context an operator opened the Logs tab to read,
 /// and doing it through the `logs` topic any ws caller may hold. The other three
-/// reasons here stay `warn`: each is once per frame class, not once per byte.
+/// reasons here stay `warn`, each once per frame class rather than once per
+/// byte — but a stuck client can still hold ANY of those frame classes down,
+/// so they go through [`TERM_WARN`] too.
 async fn handle_term_input(
     handle: &NodeHandle,
     topics: &BTreeMap<String, TopicState>,
@@ -1377,27 +1656,58 @@ async fn handle_term_input(
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     };
     // a live session has a mode; an unknown or already-ended one has none. Two
     // causes, two countable reasons — collapsing them would hide "the id is
     // stale" behind "you used the wrong lane".
     let Some(mode) = terminals.mode(session) else {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("unknown_session") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "unknown_session",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     };
     // raw keystrokes are the SINGLE-session path only. A shared session refuses
     // them so nothing bypasses its ordered command lane (drive it with
     // TermCommand).
     if mode != crate::term::SessionMode::Single {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "raw_input_on_shared", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("raw_input_on_shared") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "raw_input_on_shared",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     }
     // decoded here purely to refuse a malformed frame at this boundary; the
     // daemon takes the base64 as-is, so the bytes never round-trip.
     if STANDARD.decode(data_b64).is_err() {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "bad_base64", "term input dropped");
+        if let Some(occurrences) = TERM_WARN.hit("bad_base64") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "bad_base64",
+                occurrences,
+                "term input dropped"
+            );
+        }
         return;
     }
     terminals.input(session, data_b64).await;
@@ -1431,13 +1741,28 @@ async fn handle_term_resize(
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term resize dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "term resize dropped"
+            );
+        }
         return;
     };
     // the same no-op-on-unknown discipline as input: refuse here rather than
     // spending a link frame on a session that is already gone.
     if terminals.mode(session).is_none() {
-        tracing::warn!(target: "ducktape::term", session = %session, reason = "unknown_session", "term resize dropped");
+        if let Some(occurrences) = TERM_WARN.hit("unknown_session") {
+            tracing::warn!(
+                target: "ducktape::term",
+                session = %session,
+                reason = "unknown_session",
+                occurrences,
+                "term resize dropped"
+            );
+        }
         return;
     }
     terminals.resize(session, cols, rows).await;
@@ -1462,7 +1787,14 @@ fn handle_term_command(
         return;
     }
     let Some(terminals) = handle.terminals() else {
-        tracing::warn!(target: "ducktape::term", reason = "no_terminal_plane", "term command dropped");
+        if let Some(occurrences) = TERM_WARN.hit("no_terminal_plane") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "no_terminal_plane",
+                occurrences,
+                "term command dropped"
+            );
+        }
         return;
     };
     terminals.enqueue_command(session, origin, text);
@@ -1475,6 +1807,23 @@ fn subscribe_topics(
     resume: &BTreeMap<String, String>,
     token: Option<&str>,
 ) -> Vec<ServerFrame> {
+    // No caller ever legitimately needs more names in ONE message than the
+    // connection may ever hold: at most `MAX_TOPICS_PER_CONNECTION` states
+    // exist, so a request past it is either a mistake or a fan-out attempt
+    // (a 64 MiB frame naming millions of names, each turned into its own
+    // refusal `ServerFrame` before this used to look at the cap at all). Stop
+    // BEFORE the per-topic loop runs — one frame, sized by the request, not
+    // by `requested.len()`.
+    if requested.len() > MAX_TOPICS_PER_CONNECTION {
+        let requested_count = requested.len();
+        return vec![unavailable(
+            "",
+            format!(
+                "subscribe named {requested_count} topics, over the \
+                 {MAX_TOPICS_PER_CONNECTION}-topic connection cap; split the request"
+            ),
+        )];
+    }
     let store = handle.stream_index();
     // ONE constant-time compare per frame, not per topic: the secret is
     // connection-wide, so this is both the cheapest place to spend it and the
@@ -1775,7 +2124,7 @@ fn prepare_module(
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
     let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
-    if !store.module_ids().any(|id| id == module) {
+    if !store.module_ids().iter().any(|id| id == module) {
         return Err(refuse_topic(topic, TopicRefusal::UnknownModule));
     }
     let (cursor, lagged) = module_start_cursor(topic, module, resume, store)?;
@@ -1795,7 +2144,7 @@ fn prepare_files_watch(
     store: Option<&Arc<indexer::IndexStore>>,
 ) -> Result<(TopicState, Option<ServerFrame>), ServerFrame> {
     let store = store.ok_or_else(|| unavailable(topic, "no index store configured"))?;
-    if !store.module_ids().any(|id| id == "files") {
+    if !store.module_ids().iter().any(|id| id == "files") {
         return Err(refuse_topic(topic, TopicRefusal::UnknownModule));
     }
     let (cursor, lagged) = module_start_cursor(topic, "files", resume, store)?;
@@ -2213,12 +2562,17 @@ fn catch_up_run_output(
     runs: &RunOutputRegistry,
 ) -> CatchUpResult {
     let mut frames = Vec::new();
-    let (_, floor) = runs.read_after(id, *seq, STREAM_CATCHUP_BUDGET);
-    if *seq < floor {
-        *seq = floor;
+    // BOTH directions: below the floor the rows were evicted, above the head
+    // the cursor names numbering this ring no longer has (a restart, or an
+    // entry evicted and re-created). Either way the reader must be told, or it
+    // waits on rows that will never come.
+    let resume = runs.resume_cursor(id, *seq);
+    let rewound = resume != *seq;
+    if rewound {
+        *seq = resume;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
-            cursor: floor.to_string(),
+            cursor: resume.to_string(),
         });
     }
     loop {
@@ -2253,12 +2607,17 @@ fn catch_up_term(
     ring: &crate::term::TermRing,
 ) -> CatchUpResult {
     let mut frames = Vec::new();
-    let (_, floor) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
-    if *seq < floor {
-        *seq = floor;
+    // BOTH directions: below the floor the rows were evicted, above the head
+    // the cursor names numbering this ring no longer has (a restart, or an
+    // entry evicted and re-created). Either way the reader must be told, or it
+    // waits on rows that will never come.
+    let resume = ring.resume_cursor(session, *seq);
+    let rewound = resume != *seq;
+    if rewound {
+        *seq = resume;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
-            cursor: floor.to_string(),
+            cursor: resume.to_string(),
         });
     }
     loop {
@@ -2304,12 +2663,17 @@ fn catch_up_term_command(
     ring: &crate::term::TermCommandRing,
 ) -> CatchUpResult {
     let mut frames = Vec::new();
-    let (_, floor) = ring.read_after(session, *seq, STREAM_CATCHUP_BUDGET);
-    if *seq < floor {
-        *seq = floor;
+    // BOTH directions: below the floor the rows were evicted, above the head
+    // the cursor names numbering this ring no longer has (a restart, or an
+    // entry evicted and re-created). Either way the reader must be told, or it
+    // waits on rows that will never come.
+    let resume = ring.resume_cursor(session, *seq);
+    let rewound = resume != *seq;
+    if rewound {
+        *seq = resume;
         frames.push(ServerFrame::Lagged {
             topic: topic.to_string(),
-            cursor: floor.to_string(),
+            cursor: resume.to_string(),
         });
     }
     loop {
@@ -2551,7 +2915,10 @@ pub(crate) fn unix_millis() -> u64 {
 
 fn live_cursor(store: &indexer::IndexStore, module: &str) -> Result<String, indexer::Error> {
     let applied = store.applied_height(module)?;
-    Ok(format!("{}{:016x}/ffff", indexer::OP_PREFIX, applied))
+    // the end of that height: every real row at it is at or below the widest
+    // seq, so the next scan starts at the height above. built through
+    // `op_key` so the field width can never drift from the rows it pages.
+    Ok(indexer::op_key(applied, u32::MAX))
 }
 
 fn cursor_height(cursor: &str) -> Option<u64> {
@@ -2682,7 +3049,7 @@ mod tests {
             })
             .expect("apply block");
 
-        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let mut cursor = "op/0000000000000000/ffffffff".to_string();
         let result = catch_up_files("files:watch", &mut cursor, &store);
         assert!(
             !result.drop_topic,
@@ -2707,18 +3074,18 @@ mod tests {
     fn module_catch_up_emits_rows_and_cursors() {
         let (_dir, store) = temp_store(&["chat"]);
         apply_chat(&store, 1, vec![json!({"one": 1}), json!({"two": 2})]);
-        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let mut cursor = "op/0000000000000000/ffffffff".to_string();
         let result = catch_up_module("module:chat", "chat", &mut cursor, &store);
         assert!(!result.drop_topic);
         assert_eq!(result.frames.len(), 2);
         match &result.frames[0] {
             ServerFrame::Event { cursor, op, .. } => {
-                assert_eq!(cursor, "op/0000000000000001/0000");
+                assert_eq!(cursor, "op/0000000000000001/00000000");
                 assert_eq!(op.payload, Some(json!({"one": 1})));
             }
             other => panic!("expected event, got {other:?}"),
         }
-        assert_eq!(cursor, "op/0000000000000001/0001");
+        assert_eq!(cursor, "op/0000000000000001/00000001");
     }
 
     /// A BLOCK THAT APPENDED NOTHING MUST NOT SEND ANYONE BACK TO THE STORE.
@@ -2763,13 +3130,13 @@ mod tests {
             .map(|i| json!({ "n": i }))
             .collect();
         apply_chat(&store, 1, payloads);
-        let mut cursor = "op/0000000000000000/ffff".to_string();
+        let mut cursor = "op/0000000000000000/ffffffff".to_string();
         let result = catch_up_module("module:chat", "chat", &mut cursor, &store);
         assert_eq!(result.frames.len(), STREAM_CATCHUP_BUDGET + 1);
         assert!(
-            matches!(result.frames.last(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/0000000000000001/ffff")
+            matches!(result.frames.last(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/0000000000000001/ffffffff")
         );
-        assert_eq!(cursor, "op/0000000000000001/ffff");
+        assert_eq!(cursor, "op/0000000000000001/ffffffff");
     }
 
     #[test]
@@ -2779,7 +3146,7 @@ mod tests {
         let (state, lagged) =
             prepare_topic("module:chat", NO_SECRET, None, Some(&store)).expect("topic");
         assert!(lagged.is_none());
-        assert_eq!(state.cursor(), "op/0000000000000001/ffff");
+        assert_eq!(state.cursor(), "op/0000000000000001/ffffffff");
         let mut state = state;
         let result = catch_up_topic(
             "module:chat",
@@ -2797,13 +3164,13 @@ mod tests {
         let (state, lagged) = prepare_topic(
             "module:chat",
             NO_SECRET,
-            Some(&"op/0000000000000005/0000".to_string()),
+            Some(&"op/0000000000000005/00000000".to_string()),
             Some(&store),
         )
         .expect("topic");
-        assert_eq!(state.cursor(), "op/000000000000000a/ffff");
+        assert_eq!(state.cursor(), "op/000000000000000a/ffffffff");
         assert!(
-            matches!(lagged, Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/000000000000000a/ffff")
+            matches!(lagged, Some(ServerFrame::Lagged { cursor, .. }) if cursor == "op/000000000000000a/ffffffff")
         );
     }
 
@@ -2874,8 +3241,64 @@ mod tests {
             runs.append(format!("run-{i}"), RunStream::Stderr, "x");
         }
         let (rows, floor) = runs.read_after("active", 0, 1);
-        assert!(rows.is_empty());
-        assert_eq!(floor, 0);
+        assert!(rows.is_empty(), "the rows went with the ring");
+        assert_eq!(
+            floor,
+            (RUN_OUTPUT_MAX_LINES + 1) as u64,
+            "but the numbering did not: the floor still names what was dropped"
+        );
+    }
+
+    /// a run whose ring the cap shed while a pane was subscribed to it. The
+    /// pane's cursor sits at the old high-water; the run keeps printing. Before
+    /// the numbering survived eviction the ring restarted at 1, every new line
+    /// failed the `> cursor` filter, the floor read 0 so no `Lagged` fired, and
+    /// the pane sat frozen for the life of the connection.
+    #[test]
+    fn a_re_created_run_ring_lags_the_subscriber_instead_of_going_silent() {
+        let runs = RunOutputRegistry::default();
+        for i in 0..600 {
+            runs.append("active", RunStream::Stdout, format!("line-{i}"));
+        }
+        // the pane has consumed the first 500 lines.
+        let mut seq = 500;
+        for i in 0..RUN_OUTPUT_MAX_RUNS {
+            runs.append(format!("run-{i}"), RunStream::Stderr, "x");
+        }
+        runs.append("active", RunStream::Stdout, "after the eviction");
+
+        let result = catch_up_run_output("run-output:active", "active", &mut seq, &runs);
+        assert!(
+            matches!(result.frames.first(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "600"),
+            "the 100 lines evicted under the cursor are announced, not swallowed"
+        );
+        assert!(matches!(
+            result.frames.last(),
+            Some(ServerFrame::Tail { cursor, .. }) if cursor == "601"
+        ));
+        assert_eq!(seq, 601, "and the pane is live again on the new numbering");
+    }
+
+    /// the same blind spot with no eviction at all: a client resumes with a seq
+    /// it saved before a restart, so the cursor is above a fresh ring's head.
+    /// It must be rewound and told, never left waiting for seq 901.
+    #[test]
+    fn a_resume_cursor_above_the_head_lags_rather_than_waits() {
+        let runs = RunOutputRegistry::default();
+        let mut seq = 900;
+        let result = catch_up_run_output("run-output:fresh", "fresh", &mut seq, &runs);
+        assert!(
+            matches!(result.frames.first(), Some(ServerFrame::Lagged { cursor, .. }) if cursor == "0")
+        );
+        assert_eq!(seq, 0);
+
+        runs.append("fresh", RunStream::Stdout, "first");
+        let result = catch_up_run_output("run-output:fresh", "fresh", &mut seq, &runs);
+        assert!(matches!(
+            result.frames.first(),
+            Some(ServerFrame::Tail { cursor, .. }) if cursor == "1"
+        ));
+        assert_eq!(seq, 1);
     }
 
     #[test]
@@ -2885,18 +3308,61 @@ mod tests {
         runs.append("aa".repeat(32), RunStream::Stdout, "local");
         assert_eq!(appends.try_recv().unwrap().line, "local");
 
-        runs.append_remote(RunOutputEvent {
-            id: "aa".repeat(32),
+        // "bb"*32 is a run only a peer has ever named — a mirrored remote run,
+        // never one this node hosts.
+        assert!(runs.append_remote(RunOutputEvent {
+            id: "bb".repeat(32),
             stream: RunStream::Stderr,
             line: "remote".into(),
-        });
+        }));
         assert!(matches!(
             appends.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
         ));
+        let (rows, _) = runs.read_after(&"bb".repeat(32), 0, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, "remote");
+    }
+
+    #[test]
+    fn a_locally_hosted_run_is_never_writable_by_a_peer() {
+        let runs = RunOutputRegistry::default();
+        runs.append("aa".repeat(32), RunStream::Stdout, "local");
+        assert!(runs.is_local(&"aa".repeat(32)));
+
+        assert!(!runs.append_remote(RunOutputEvent {
+            id: "aa".repeat(32),
+            stream: RunStream::Stderr,
+            line: "forged".into(),
+        }));
         let (rows, _) = runs.read_after(&"aa".repeat(32), 0, 10);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].2, "remote");
+        assert_eq!(rows.len(), 1, "the peer's line never entered the local ring");
+        assert_eq!(rows[0].2, "local");
+    }
+
+    #[test]
+    fn thirty_two_fabricated_remote_ids_never_evict_a_local_ring() {
+        let runs = RunOutputRegistry::default();
+        runs.append("aa".repeat(32), RunStream::Stdout, "local");
+        // fill every other slot with local runs too, so the registry sits at
+        // the cap holding nothing but locally hosted rings.
+        for i in 0..RUN_OUTPUT_MAX_RUNS - 1 {
+            runs.append(format!("{i:064x}"), RunStream::Stdout, "x");
+        }
+        for i in 0..RUN_OUTPUT_MAX_RUNS {
+            let forged = format!("{:064x}", i + 1_000);
+            assert!(
+                !runs.append_remote(RunOutputEvent {
+                    id: forged,
+                    stream: RunStream::Stdout,
+                    line: "flood".into(),
+                }),
+                "no remote ring exists to evict, so the flood is refused outright"
+            );
+        }
+        assert!(runs.is_local(&"aa".repeat(32)), "the local ring survives the flood");
+        let (rows, _) = runs.read_after(&"aa".repeat(32), 0, 10);
+        assert_eq!(rows.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2975,8 +3441,8 @@ mod tests {
         assert!(matches!(state, TopicState::TermCommand { .. }));
 
         let ring = crate::term::TermCommandRing::default();
-        ring.append("s", "alice", "list files");
-        ring.append("s", "", "run tests"); // empty origin = "local" (attribution kept verbatim)
+        let _ = ring.append("s", "alice", "list files");
+        let _ = ring.append("s", "", "run tests"); // empty origin = "local" (attribution kept verbatim)
         let mut seq = 0u64;
         let result = catch_up_term_command("term-cmd:s", "s", &mut seq, &ring);
         assert!(!result.drop_topic);
@@ -3408,38 +3874,53 @@ mod tests {
     }
 
     #[test]
-    fn subscription_cap_refuses_new_topics_but_allows_recursoring() {
+    fn a_subscribe_at_the_cap_admits_all_and_still_allows_recursoring() {
         let handle = handle_with_secret();
         let mut states = BTreeMap::new();
-        let requested: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION + 1)
+        let at_cap: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION)
             .map(|i| format!("run-output:r{i}"))
             .collect();
         let frames = subscribe_topics(
             &handle,
             &mut states,
-            requested,
+            at_cap.clone(),
             &BTreeMap::new(),
             Some(TEST_SECRET),
         );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
-        let refused = frames
-            .iter()
-            .filter(|f| {
-                matches!(
-                    f,
-                    ServerFrame::Error {
-                        code: StreamErrorCode::Unavailable,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(refused, 1, "exactly the over-cap topic refuses");
-        // re-subscribing an EXISTING topic at the cap re-cursors, never refuses.
+        assert!(
+            frames.iter().all(|f| !matches!(f, ServerFrame::Error { .. })),
+            "every topic at exactly the cap must admit: {frames:?}"
+        );
+
+        // one more NEW topic on top of an already-full connection refuses the
+        // WHOLE message as one frame — never a per-topic fan-out — and leaves
+        // the held state untouched.
+        let mut over = at_cap.clone();
+        over.push("run-output:extra".into());
+        let refused = subscribe_topics(
+            &handle,
+            &mut states,
+            over,
+            &BTreeMap::new(),
+            Some(TEST_SECRET),
+        );
+        assert_eq!(refused.len(), 1, "one summary refusal, not one per topic");
+        assert!(matches!(
+            refused[0],
+            ServerFrame::Error {
+                code: StreamErrorCode::Unavailable,
+                ..
+            }
+        ));
+        assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
+
+        // re-subscribing exactly the EXISTING topics (at, not over, the cap)
+        // re-cursors, never refuses.
         let again = subscribe_topics(
             &handle,
             &mut states,
-            vec!["run-output:r0".into()],
+            at_cap,
             &BTreeMap::new(),
             Some(TEST_SECRET),
         );
@@ -3450,6 +3931,32 @@ mod tests {
             "re-subscribe at the cap must stay allowed: {again:?}"
         );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
+    }
+
+    /// The amplification this fixes: a `Subscribe` naming far more topics than
+    /// the connection could ever hold used to walk the ENTIRE vector, pushing
+    /// one heap-allocating refusal frame per name (`stream.rs`, pre-fix). It
+    /// must now cost one frame regardless of how many names were sent.
+    #[test]
+    fn a_subscribe_far_over_the_topic_cap_never_fans_out_one_frame_per_topic() {
+        let handle = handle_with_secret();
+        let mut states = BTreeMap::new();
+        let huge: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION + 10_000)
+            .map(|i| format!("bogus:{i}"))
+            .collect();
+        let frames = subscribe_topics(
+            &handle,
+            &mut states,
+            huge,
+            &BTreeMap::new(),
+            Some(TEST_SECRET),
+        );
+        assert_eq!(
+            frames.len(),
+            1,
+            "one refusal for the whole message, not one per requested topic"
+        );
+        assert!(states.is_empty());
     }
 
     #[test]

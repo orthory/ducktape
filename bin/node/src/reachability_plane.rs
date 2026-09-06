@@ -30,11 +30,102 @@ pub(crate) enum IntroPath {
 /// its own socket, the coordinated receiver via `SendResolverDatagram`).
 /// Returns `false` once the plane's command channel is gone, telling the
 /// caller to exit its receive loop.
+/// one settled gate outcome plus the wall-clock instant it was written: what
+/// [`sweep_gate_outcomes`] ages out and [`insert_gate_outcome`] evicts by,
+/// oldest first, at the cap.
+pub(crate) struct GateOutcomeEntry {
+    pub(crate) reply: join_gate::IntroReply,
+    pub(crate) settled_at: std::time::SystemTime,
+}
+
+/// how often a still-unreachable peer re-warns, once latched — CLAUDE's rule
+/// for a forever-retry loop (attempt 1, then every Nth, carrying the count),
+/// same cadence as `noded::log::Latch`.
+const PEER_UNREACHABLE_WARN_EVERY: u64 = 100;
+
+/// per-peer latch for the "peer unreachable" warn in the `reachability_out`
+/// pump: `PeerFailed` re-fires on every retry of a hole-punch, so an
+/// unconditional `warn!` is the same log-bomb `noded::log::Latch` exists to
+/// stop — but that helper is keyed by a fixed `&'static str` reason, not a
+/// dynamic peer identity, and has no reset, so this mirrors its `hit` cadence
+/// with a per-peer key and a `clear` for when the peer is heard from again.
+#[derive(Default)]
+pub(crate) struct UnreachableLatch {
+    attempts: HashMap<Vec<u8>, u64>,
+}
+
+impl UnreachableLatch {
+    /// bump this peer's attempt count; `Some(occurrences)` on the first hit
+    /// and every Nth after, `None` otherwise (still counted, just silent).
+    pub(crate) fn hit(&mut self, peer: &[u8]) -> Option<u64> {
+        let count = self.attempts.entry(peer.to_vec()).or_insert(0);
+        *count += 1;
+        let n = *count;
+        (n == 1 || n.is_multiple_of(PEER_UNREACHABLE_WARN_EVERY)).then_some(n)
+    }
+
+    /// forget this peer: it is reachable again, so its next failure is a
+    /// fresh first-warn rather than a buried Nth.
+    pub(crate) fn clear(&mut self, peer: &[u8]) {
+        self.attempts.remove(peer);
+    }
+}
+
+/// cap on live gate outcomes. An invite is bearer (`join_gate.rs`: no target
+/// lock, the join proof binds only the announced key), so one unexpired
+/// token mints unlimited joiner keys and each verified intro settles an
+/// entry — sized generously above the invite-peer table's own concurrency
+/// limit (`reachability::MAX_INVITE_PEERS`, 64 uncovered tunnels per join
+/// window) so ordinary churn never evicts a live outcome.
+pub(crate) const MAX_GATE_OUTCOMES: usize = 4096;
+
+pub(crate) type GateOutcomeMap = HashMap<Vec<u8>, GateOutcomeEntry>;
+
 /// the shared gate-outcome map (joiner key → its resolved [`join_gate::IntroReply`]):
 /// the run loop's drain WRITES the settled outcome, the intro doorbell READS it
 /// on the joiner's next retransmit and seals it back down the tunnel.
-pub(crate) type GateOutcomes =
-    std::sync::Arc<std::sync::Mutex<HashMap<Vec<u8>, join_gate::IntroReply>>>;
+pub(crate) type GateOutcomes = std::sync::Arc<std::sync::Mutex<GateOutcomeMap>>;
+
+/// Insert a freshly-settled outcome, capped at [`MAX_GATE_OUTCOMES`] live
+/// entries: past the cap the OLDEST entry is evicted to make room. A
+/// re-settle of a joiner already tracked (a held gate resolving after an
+/// earlier `Installed`/`Busy` write) never grows the map, so it never evicts.
+pub(crate) fn insert_gate_outcome(
+    map: &mut GateOutcomeMap,
+    joiner: Vec<u8>,
+    reply: join_gate::IntroReply,
+    now: std::time::SystemTime,
+) {
+    if map.len() >= MAX_GATE_OUTCOMES
+        && !map.contains_key(&joiner)
+        && let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, entry)| entry.settled_at)
+            .map(|(key, _)| key.clone())
+    {
+        map.remove(&oldest);
+    }
+    map.insert(
+        joiner,
+        GateOutcomeEntry {
+            reply,
+            settled_at: now,
+        },
+    );
+}
+
+/// Sweep every entry settled more than `window` ago — `Admitted` included. A
+/// joiner that never retransmits within the invite join window and shows up
+/// again later just re-runs the gate: `on_gate_forward`'s V9 arm ("already
+/// holding standing") answers it Admitted again for free, no consensus round
+/// — so letting a stale `Admitted` age out costs nothing but a re-read.
+pub(crate) fn sweep_gate_outcomes(
+    map: &mut GateOutcomeMap,
+    now: std::time::SystemTime,
+    window: std::time::Duration,
+) {
+    map.retain(|_, entry| now.duration_since(entry.settled_at).unwrap_or_default() <= window);
+}
 
 /// The handshake sampler's knowledge, published for the event pump: peer
 /// ULAs whose WireGuard tunnel is carrying traffic at the last sample. The
@@ -208,8 +299,11 @@ async fn gate_reply(
     let settled = {
         let mut outcomes = hook.outcomes.lock().expect("gate outcomes lock");
         match outcomes.get(&joiner_key) {
-            Some(admitted @ join_gate::IntroReply::Admitted { .. }) => Some(admitted.clone()),
-            Some(_) => outcomes.remove(&joiner_key),
+            Some(GateOutcomeEntry {
+                reply: admitted @ join_gate::IntroReply::Admitted { .. },
+                ..
+            }) => Some(admitted.clone()),
+            Some(_) => outcomes.remove(&joiner_key).map(|entry| entry.reply),
             None => None,
         }
     };
@@ -395,6 +489,7 @@ where
                 // distinct endpoint: the refusal is a standing state, not an
                 // event, and a `warn!` per gossip round would evict the ring.
                 let mut pinned: HashMap<Vec<u8>, std::net::SocketAddr> = HashMap::new();
+                let mut unreachable = UnreachableLatch::default();
                 while let Some(event) = ev_rx.recv().await {
                     match event {
                         reachability::ReachabilityEvent::Send { to, bytes } => {
@@ -475,6 +570,9 @@ where
                             peer,
                             endpoint,
                         } => {
+                            // this peer is reachable again: its next failure
+                            // (if any) is a fresh first-warn, not a buried Nth.
+                            unreachable.clear(peer.as_ref());
                             tracing::info!(
                                 target: "ducktape::reachability",
                                 node = %pump_label,
@@ -511,22 +609,35 @@ where
                                 .lock()
                                 .is_ok_and(|carrying| carrying.contains(&ula));
                             match carrying {
-                                true => tracing::debug!(
-                                    target: "ducktape::reachability",
-                                    node = %pump_label,
-                                    peer = %hex_bytes(&peer.as_ref()[..4]),
-                                    %reason,
-                                    "peer endpoint resolution failed while its tunnel is \
-                                     carrying traffic — the live path stands"
-                                ),
-                                // the peer is DARK. media to it will silently go nowhere.
-                                false => tracing::warn!(
-                                    target: "ducktape::reachability",
-                                    node = %pump_label,
-                                    peer = %hex_bytes(&peer.as_ref()[..4]),
-                                    %reason,
-                                    "peer unreachable — traffic to it will go nowhere"
-                                ),
+                                true => {
+                                    // the tunnel is carrying: reachable, so
+                                    // forget any latched unreachable streak.
+                                    unreachable.clear(peer.as_ref());
+                                    tracing::debug!(
+                                        target: "ducktape::reachability",
+                                        node = %pump_label,
+                                        peer = %hex_bytes(&peer.as_ref()[..4]),
+                                        %reason,
+                                        "peer endpoint resolution failed while its tunnel is \
+                                         carrying traffic — the live path stands"
+                                    )
+                                }
+                                // the peer is DARK. media to it will silently go
+                                // nowhere — but this event re-fires on every
+                                // retry, so latch it: first occurrence, then
+                                // every Nth, carrying the attempt count.
+                                false => {
+                                    if let Some(attempts) = unreachable.hit(peer.as_ref()) {
+                                        tracing::warn!(
+                                            target: "ducktape::reachability",
+                                            node = %pump_label,
+                                            peer = %hex_bytes(&peer.as_ref()[..4]),
+                                            %reason,
+                                            attempts,
+                                            "peer unreachable — traffic to it will go nowhere"
+                                        );
+                                    }
+                                }
                             }
                         }
                         reachability::ReachabilityEvent::EpochFailed { epoch, reason } => {
@@ -649,18 +760,48 @@ fn publish_live_plane(cmds: &tokio::sync::mpsc::Sender<reachability::Reachabilit
     *LIVE_PLANE.write().expect("live plane lock poisoned") = Some(cmds.downgrade());
 }
 
-/// Swap the live plane's netstack backend and answer the new backend's name,
-/// or the reason the plane refused. A refusal leaves the running machine
-/// untouched — the executor's contract — so this never retries.
+/// What one swap attempt came to. THE distinction a retrying caller needs: a
+/// machine that answered has decided (the same bytes decide the same way
+/// forever), while a swap no machine ever saw has decided nothing.
+pub(crate) enum SwapAnswer {
+    /// The plane took the swap and now runs this backend.
+    Swapped(String),
+    /// The plane REFUSED — a foreign contract, not a component, a restore
+    /// fault — and keeps running the machine it has, untouched. Deterministic:
+    /// re-offering the same bytes buys the same refusal.
+    Refused(String),
+    /// No machine was ever asked: no plane is running yet, the lane died
+    /// mid-flight (a promotion tears the old plane down before wiring the
+    /// next), or the request never resolved to a backend at all. Nothing was
+    /// attempted, so this is the ONE answer a caller may retry.
+    Unattempted(String),
+}
+
+/// Swap the live plane's netstack backend. A refusal leaves the running
+/// machine untouched — the executor's contract — so nothing retries a
+/// [`SwapAnswer::Refused`].
 ///
 /// The component path is read HERE, on the node: the route takes a path on the
-/// node's own disk and no caller ships bytes through it.
-pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> Result<String, String> {
+/// node's own disk and no caller ships bytes through it. The governance
+/// reconciler takes the [`noded::NetstackSwapRequest::Bytes`] road instead —
+/// its component is already a verified chunk on the blob plane.
+pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> SwapAnswer {
     let backend = match request {
         noded::NetstackSwapRequest::Native => reachability::NetstackBackend::Native,
-        noded::NetstackSwapRequest::Component(path) => reachability::NetstackBackend::Guest {
-            component: std::fs::read(&path)
-                .map_err(|error| format!("{}: {error}", path.display()))?,
+        noded::NetstackSwapRequest::Component(path) => {
+            let component = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return SwapAnswer::Unattempted(format!("{}: {error}", path.display()));
+                }
+            };
+            reachability::NetstackBackend::Guest {
+                component,
+                step_fuel: reachability::NETSTACK_STEP_FUEL,
+            }
+        }
+        noded::NetstackSwapRequest::Bytes(component) => reachability::NetstackBackend::Guest {
+            component,
             step_fuel: reachability::NETSTACK_STEP_FUEL,
         },
     };
@@ -669,19 +810,43 @@ pub(crate) async fn swap_netstack(request: noded::NetstackSwapRequest) -> Result
         .read()
         .expect("live plane lock poisoned")
         .clone()
-        .and_then(|weak| weak.upgrade())
-        .ok_or_else(|| "the reachability plane is not running".to_string())?;
+        .and_then(|weak| weak.upgrade());
+    let Some(lane) = lane else {
+        return SwapAnswer::Unattempted("the reachability plane is not running".to_string());
+    };
     let (reply, outcome) = tokio::sync::oneshot::channel();
-    lane.send(reachability::ReachabilityCommand::SwapBackend {
-        backend,
-        reply: reachability::SwapReply(reply),
-    })
-    .await
-    .map_err(|_| "the reachability plane stopped".to_string())?;
-    outcome
-        .await
-        .map_err(|_| "the reachability plane dropped the swap reply".to_string())?
-        .map(|()| name.to_string())
+    let sent = lane
+        .send(reachability::ReachabilityCommand::SwapBackend {
+            backend,
+            reply: reachability::SwapReply(reply),
+        })
+        .await;
+    if sent.is_err() {
+        return SwapAnswer::Unattempted("the reachability plane stopped".to_string());
+    }
+    match outcome.await {
+        Ok(Ok(())) => SwapAnswer::Swapped(name.to_string()),
+        Ok(Err(reason)) => SwapAnswer::Refused(reason),
+        Err(_) => {
+            SwapAnswer::Unattempted("the reachability plane dropped the swap reply".to_string())
+        }
+    }
+}
+
+/// Record one swap attempt in the `operations.netstack` projection — the ONE
+/// place it is written, for the operator's admin route and the governance
+/// reconciler alike. A refusal is recorded WITHOUT moving `backend`: the
+/// machine that was running still is.
+pub(crate) fn record_swap(metrics: &noded::NodeMetrics, answer: &SwapAnswer) {
+    match answer {
+        SwapAnswer::Swapped(backend) => {
+            metrics.set_netstack_backend(backend.clone());
+            metrics.record_netstack_swap(noded::NetstackSwapOutcome::Swapped, None);
+        }
+        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => {
+            metrics.record_netstack_swap(noded::NetstackSwapOutcome::Refused, Some(reason.clone()))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

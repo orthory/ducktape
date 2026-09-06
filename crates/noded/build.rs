@@ -24,9 +24,11 @@
 //! that set where a freshly built binary looks — `target/<profile>/modules`,
 //! beside the binary (`workspace_config::modules_dir`) — so a built node is
 //! complete without an install step. The set is the checkout's committed
-//! artifacts (`make wasm-modules` refreshes them), one file per artifact the
-//! topology declares: a declared component or index guest the checkout lacks
-//! fails the build here, naming the path, instead of `node init` later.
+//! artifacts (`make wasm-modules` refreshes them): one component per wasm
+//! module the topology names, plus one index guest per module whose crate
+//! declares one by carrying `src/index_guest.rs`. A declared artifact the
+//! checkout lacks fails the build here, naming the path, instead of `node
+//! init` later.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -75,7 +77,20 @@ fn stage_founding_set() {
             &module_dir.join("component.wasm"),
             &dest.join(format!("{}.component.wasm", spec.id)),
         );
-        if spec.index_guest {
+        let ships_guest = declares_index_guest(&module_dir);
+        // topology::TOPOLOGY.has_index_guest is `workspace_config::genesis`'s
+        // OWN declaration of this same fact (it has no access to the source
+        // checkout, so it cannot read `src/index_guest.rs` itself) — a drift
+        // here would silently pass a founding set here while `node init`
+        // refuses it, or vice versa. Caught at build time, naming the module.
+        assert_eq!(
+            ships_guest, spec.has_index_guest,
+            "module {}: crates/noded/build.rs sees src/index_guest.rs = {ships_guest} but \
+             topology::TOPOLOGY says has_index_guest = {} — update crates/topology/src/lib.rs \
+             to match",
+            spec.id, spec.has_index_guest
+        );
+        if ships_guest {
             stage(
                 &module_dir.join("index.wasm"),
                 &dest.join(format!("{}.index.wasm", spec.id)),
@@ -86,6 +101,17 @@ fn stage_founding_set() {
         &checkout.join("crates/networking/netstack-machine/component.wasm"),
         &dest.join("netstack.component.wasm"),
     );
+}
+
+/// a module declares its index guest by carrying the guest's engine shell:
+/// `src/index_guest.rs` (built by `guest-builder --index` into the crate's
+/// committed `index.wasm`). the file is the declaration, so a module cannot
+/// ship a mapper the founding set omits or be declared to ship one it lacks.
+/// the file is a rerun trigger too: adding or removing the shell re-stages.
+fn declares_index_guest(module_dir: &Path) -> bool {
+    let shell = module_dir.join("src/index_guest.rs");
+    println!("cargo:rerun-if-changed={}", shell.display());
+    shell.is_file()
 }
 
 /// the checkout directory a module's committed artifacts live in: the

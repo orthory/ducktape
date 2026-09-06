@@ -18,6 +18,11 @@ version.workspace = true
 # loopback threads, for e2e harnesses. dev-only — consumers enable it as a
 # dev-dependency feature, so it never compiles into the shipping node.
 testkit = ["dep:nettest"]
+# forwards to `provider-host/verify` (real TEE quote verification for the
+# airlock `Attested` trust arm, off by default) — `ducktape-noded` reaches
+# that arm through `provider-host`'s dispatch worker the same as `ducktape`
+# does, so it needs the same opt-in flag.
+verify = ["provider-host/verify"]
 
 [dependencies]
 # the shared raw-http/port/poll test client — only pulled by the `testkit`
@@ -31,12 +36,12 @@ host = { workspace = true }
 sdk = { workspace = true }
 # the ONE module composer (`src/compose.rs`): the topology names each module's
 # shape, wasm-host wraps the component over its backing, and the three native
-# system modules (valset/lifecycle/kv) plus the two odb substrates (files/forge)
+# system modules (valset/modules/kv) plus the two odb substrates (files/forge)
 # are the only constructors it calls by name.
 topology = { workspace = true }
 wasm-host = { workspace = true }
 valset = { workspace = true }
-lifecycle = { workspace = true }
+modules = { workspace = true }
 kv = { workspace = true }
 files = { workspace = true }
 chat = { workspace = true }
@@ -136,6 +141,10 @@ topology = { workspace = true }
 # MemStore: the in-memory MerkleStore double behind store-backed modules in
 # the in-crate provision tests.
 sdk-testkit = { workspace = true }
+# the capability registry: the session-boundary test wires saga with
+# `with_assignment`, so `Accept`'s capability gate needs a real registry to
+# announce a provider into.
+capability = { workspace = true }
 # the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
 nettest = { path = "../testing/nettest" }
 tokio-tungstenite = "0.24"

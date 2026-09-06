@@ -58,5 +58,6 @@ use guest_adapter::WitStore;
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: Automations,
+    shape: guest_adapter::store_shape(),
     new: Automations::new(MODULE_ID, Box::new(WitStore), CHAT_ID, TASKS_ID, INBOX_ID),
 }

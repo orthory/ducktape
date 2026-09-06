@@ -19,9 +19,14 @@
 //! `<id>.component.wasm`, `<id>.index.wasm` and `netstack.component.wasm` the
 //! build stages beside its binaries (`crates/noded/build.rs`), read by `node
 //! init` to compose a genesis and by the daemons that run no network (noded,
-//! simnode, the dev shape) to compose directly. Which files it must hold is
-//! the topology's declaration — a declared artifact with no file is a
-//! refusal naming the path.
+//! simnode, the dev shape) to compose directly. It must hold a component for
+//! every wasm id of the selection — one with no file is a refusal naming the
+//! path — and an index guest for exactly the modules
+//! `topology::ModuleTopology::index_guest_ids` declares (the same
+//! declaration `crates/noded/build.rs`'s `declares_index_guest` stages from):
+//! a declared module with no file, or a file for a module that declares
+//! none, is refused the same way a missing component is — an arbitrary
+//! `--modules <dir>` cannot silently found a network with a dead index plane.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -80,18 +85,43 @@ pub struct Artifact {
 pub struct Genesis {
     /// the consensus components, one per wasm tenant of the genesis set.
     pub components: Vec<Artifact>,
-    /// the index guests, one per module the topology declares a mapper for.
+    /// the index guests, one per module of the set that ships a mapper.
     pub index_guests: Vec<Artifact>,
 }
 
 impl Genesis {
     /// compose a genesis from the founding set at `source`: every id in
-    /// `wasm_ids` must have its component there and every id in `index_ids`
-    /// its index guest. The walk is by sorted id, so an incomplete set always
-    /// names the same missing file first.
-    pub fn compose(source: &Path, wasm_ids: &[&str], index_ids: &[&str]) -> Result<Self, String> {
+    /// `wasm_ids` must have its component there, and every id in
+    /// `index_guest_ids` (the modules the topology says ship a mapper — see
+    /// `topology::ModuleTopology::index_guest_ids`) must have its
+    /// `<id>.index.wasm` there too — a missing one is a refusal naming the
+    /// path, same as a missing component, never a silent "ships none". A
+    /// `<id>.index.wasm` for an id NOT in `index_guest_ids` is refused too: a
+    /// stray file is the same class of drift as a missing declared one. The
+    /// walk is by sorted id, so an incomplete set always names the same
+    /// missing file first.
+    pub fn compose(
+        source: &Path,
+        wasm_ids: &[&str],
+        index_guest_ids: &[&str],
+    ) -> Result<Self, String> {
         let components = read_artifacts(wasm_ids, |id| component_path(source, id))?;
-        let index_guests = read_artifacts(index_ids, |id| index_guest_path(source, id))?;
+        let index_guests = read_artifacts(index_guest_ids, |id| index_guest_path(source, id))
+            .map_err(|e| format!("{e} — this module ships an index guest per the topology"))?;
+        let declared: std::collections::BTreeSet<&str> = index_guest_ids.iter().copied().collect();
+        for id in sorted_ids(wasm_ids) {
+            if declared.contains(id.as_str()) {
+                continue;
+            }
+            let path = index_guest_path(source, &id);
+            if path.is_file() {
+                return Err(format!(
+                    "{}: module {id} ships no index guest per the topology, but the founding \
+                     set carries one",
+                    path.display()
+                ));
+            }
+        }
         Ok(Self {
             components,
             index_guests,
@@ -235,36 +265,38 @@ pub fn install_genesis(
     Ok(genesis)
 }
 
+fn sorted_ids(ids: &[&str]) -> Vec<String> {
+    let mut ids: Vec<String> = ids.iter().map(|id| (*id).to_string()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// one artifact per id; a missing file is a refusal naming its path.
 fn read_artifacts(
     ids: &[&str],
     path_of: impl Fn(&str) -> PathBuf,
 ) -> Result<Vec<Artifact>, String> {
-    let mut ids = ids.to_vec();
-    ids.sort_unstable();
-    ids.dedup();
-    ids.iter()
+    sorted_ids(ids)
+        .into_iter()
         .map(|id| {
-            let path = path_of(id);
+            let path = path_of(&id);
             let bytes =
                 std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-            Ok(Artifact {
-                id: (*id).to_string(),
-                bytes,
-            })
+            Ok(Artifact { id, bytes })
         })
         .collect()
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// write `bytes` to `path` via tmp-file + rename: a reader never observes a
+/// truncated or partial file, only the old contents or the new ones. Shared
+/// with [`crate::NetworkDescriptor::save`] — the descriptor is as much a
+/// workspace identity file as the genesis is.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        format!(
-            "rename {} -> {}: {e}",
-            tmp.display(),
-            path.display()
-        )
-    })
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
 }
 
 #[cfg(test)]
@@ -289,6 +321,7 @@ mod tests {
             bootstrap: vec![],
             reach: vec![],
             coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
             genesis: hex_bytes(&sha256(&bytes)),
             modules: genesis
                 .component_hashes()
@@ -311,7 +344,11 @@ mod tests {
         );
         let genesis = Genesis::compose(dir.path(), &["pages", "chat"], &["chat"]).unwrap();
         let ids: Vec<&str> = genesis.components.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, ["chat", "pages"], "id-sorted regardless of selection order");
+        assert_eq!(
+            ids,
+            ["chat", "pages"],
+            "id-sorted regardless of selection order"
+        );
         assert_eq!(genesis.component("pages"), Some(&b"P"[..]));
         assert_eq!(genesis.index_guest("chat"), Some(&b"c-map"[..]));
         assert_eq!(genesis.index_guest("pages"), None);
@@ -348,14 +385,37 @@ mod tests {
         assert_eq!(again, genesis, "the directory is the genesis, unpacked");
     }
 
+    /// a component is owed for every id; an index guest is owed for every id
+    /// the caller declares (a stand-in for `topology::index_guest_ids`), and
+    /// a module that declares none must not carry a stray file either.
     #[test]
-    fn compose_refuses_a_missing_artifact_by_path() {
+    fn compose_refuses_a_missing_component_and_a_missing_declared_index_guest() {
         let dir = tempfile::tempdir().unwrap();
         founding_set(dir.path(), &[("pages", b"P")], &[]);
         let err = Genesis::compose(dir.path(), &["pages", "chat"], &[]).unwrap_err();
         assert!(err.contains("chat.component.wasm"), "{err}");
+
+        // pages has its component now, but nothing declares chat and nothing
+        // ships its index guest — composing over just pages is fine, and
+        // carries no guest.
+        let genesis = Genesis::compose(dir.path(), &["pages"], &[]).unwrap();
+        assert!(genesis.index_guests.is_empty());
+
+        // pages IS declared to ship a guest but the file is absent: refused,
+        // not silently dropped.
         let err = Genesis::compose(dir.path(), &["pages"], &["pages"]).unwrap_err();
         assert!(err.contains("pages.index.wasm"), "{err}");
+    }
+
+    #[test]
+    fn compose_refuses_a_stray_index_guest_for_an_undeclared_module() {
+        let dir = tempfile::tempdir().unwrap();
+        // "pages" ships a component and (mistakenly, or from a stale copy) an
+        // index guest, but the caller's declared set says pages ships none.
+        founding_set(dir.path(), &[("pages", b"P")], &[("pages", b"map")]);
+        let err = Genesis::compose(dir.path(), &["pages"], &[]).unwrap_err();
+        assert!(err.contains("pages.index.wasm"), "{err}");
+        assert!(err.contains("ships no index guest"), "{err}");
     }
 
     #[test]

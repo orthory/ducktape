@@ -420,6 +420,17 @@ pub struct Manifest {
     /// framed (the exactly-once digest gate does not survive the process, so
     /// a reused (origin, seq, payload) triple would re-apply).
     pub next_seq: u64,
+    /// the node's REPLAY WINDOW at `height`: the `(height, batch id)` pairs it
+    /// had journaled, oldest first, capped at [`node::REPLAY_WINDOW_HEIGHTS`].
+    ///
+    /// the journal suffix a checkpoint leaves behind is SHORTER than the
+    /// protocol window — that is the point of checkpointing — so a restart
+    /// that rebuilt the window from the suffix alone would refuse fewer
+    /// replayed batches than a peer that never restarted, and the two fork on
+    /// the difference. carrying it here makes the window a property of the
+    /// node's persisted state instead of its uptime: restore seeds from this
+    /// and the suffix extends it.
+    pub applied_frames: Vec<(u64, node::FrameId)>,
 }
 
 impl Manifest {
@@ -449,6 +460,14 @@ impl Manifest {
             return Err(Error::FieldOverCap(format!(
                 "{n} {what} is over the {MAX_LIST_LEN}-entry list cap this crate's own reader \
                  enforces"
+            )));
+        }
+        if self.applied_frames.len() > node::REPLAY_WINDOW_HEIGHTS {
+            return Err(Error::FieldOverCap(format!(
+                "{} replay window entries is over the {}-entry protocol depth this crate's own \
+                 reader enforces",
+                self.applied_frames.len(),
+                node::REPLAY_WINDOW_HEIGHTS
             )));
         }
         let over_cap = |len: usize| len > MAX_CHECKPOINT_FIELD_LEN;
@@ -503,6 +522,11 @@ impl Manifest {
         put_u64(&mut out, self.oplog_pos);
         put_u64(&mut out, self.next_seq);
         put_keys(&mut out, &self.residents);
+        put_u64(&mut out, self.applied_frames.len() as u64);
+        for (height, id) in &self.applied_frames {
+            put_u64(&mut out, *height);
+            out.extend_from_slice(id);
+        }
         out
     }
 
@@ -535,6 +559,18 @@ impl Manifest {
         let oplog_pos = c.u64("oplog pos")?;
         let next_seq = c.u64("next seq")?;
         let residents = get_keys(&mut c)?;
+        let w = c.u64("replay window count")? as usize;
+        if w > node::REPLAY_WINDOW_HEIGHTS {
+            return Err(Error::Corrupt(format!(
+                "{w} replay window entries exceeds the {}-entry protocol depth",
+                node::REPLAY_WINDOW_HEIGHTS
+            )));
+        }
+        let mut applied_frames = Vec::with_capacity(w);
+        for _ in 0..w {
+            let height = c.u64("replay window height")?;
+            applied_frames.push((height, c.array::<32>("replay window batch id")?));
+        }
         c.finish("manifest")?;
         Ok(Self {
             height,
@@ -548,6 +584,7 @@ impl Manifest {
             snapshots,
             oplog_pos,
             next_seq,
+            applied_frames,
         })
     }
 
@@ -592,6 +629,7 @@ impl Manifest {
             pending_cutover_view,
             oplog_pos,
             next_seq,
+            None,
             || std::time::Duration::ZERO,
         )
         .map(|(manifest, _)| manifest)
@@ -601,6 +639,10 @@ impl Manifest {
     /// capture, read off the caller's clock (`now`) — the checkpoint runs on
     /// the node's select loop, and an aggregate `capture_ms` cannot name the
     /// module that spent it (#1018).
+    ///
+    /// `sealed_root` is the root the block at `height` SEALED, when the caller
+    /// knows it: the capture is then verified against it and refuses rather
+    /// than writing a manifest for a root no block committed.
     #[allow(clippy::too_many_arguments)]
     pub fn capture_timed(
         host: &Host,
@@ -612,6 +654,7 @@ impl Manifest {
         pending_cutover_view: Option<u64>,
         oplog_pos: u64,
         next_seq: u64,
+        sealed_root: Option<StateRoot>,
         now: impl FnMut() -> std::time::Duration,
     ) -> Result<(Self, Vec<(sdk::ModuleId, std::time::Duration)>), Error> {
         // ONE pass over the registry: the capture computes every module root
@@ -634,6 +677,31 @@ impl Manifest {
             now,
         );
         let root_hash = snapshot.root_hash;
+        // THE CAPTURE COMPUTES A LIVE ROOT, IT DOES NOT VERIFY ONE. a caller
+        // that knows which root `height` SEALED passes it here, and a manifest
+        // whose live root is anything else is refused: the host can sit ahead of
+        // the sealed boundary (a code-swap realization that stalled before
+        // applying the block seats a module and moves the registry root), and a
+        // manifest labelled `height` carrying a root no block sealed makes
+        // recovery's final compare fatal on every subsequent boot.
+        if let Some(sealed) = sealed_root
+            && sealed != root_hash
+        {
+            tracing::warn!(
+                target: "ducktape::recovery",
+                event = "node_checkpoint_failed",
+                reason = "root_hash_unsealed",
+                height = height.unwrap_or_default(),
+                "checkpoint capture refused: the live root is not the one the block sealed"
+            );
+            return Err(Error::Storage(format!(
+                "checkpoint capture at height {}: live root {:?} is not the sealed root {:?} \
+                 — refusing to write a manifest no block committed",
+                height.unwrap_or_default(),
+                root_hash,
+                sealed,
+            )));
+        }
         // a checkpoint is ALL-OR-NOTHING and that is deliberate: restore reads
         // bytes back per module, so a manifest missing one module's snapshot is
         // a checkpoint that cannot restore — and writing it would prune the
@@ -678,9 +746,24 @@ impl Manifest {
                 snapshots,
                 oplog_pos,
                 next_seq,
+                // the window is the ORDERED LANE's, not the host's: capture
+                // reads state, and the node hands its window in with
+                // [`Manifest::with_replay_window`].
+                applied_frames: Vec::new(),
             },
             capture_cost,
         ))
+    }
+
+    /// stamp the capturing node's replay window onto a captured manifest —
+    /// the one seam between the ordered lane's guard and the checkpoint that
+    /// has to restore it. truncated to the newest [`node::REPLAY_WINDOW_HEIGHTS`]
+    /// entries, exactly as the live window bounds itself.
+    #[must_use]
+    pub fn with_replay_window(mut self, window: Vec<(u64, node::FrameId)>) -> Self {
+        let over = window.len().saturating_sub(node::REPLAY_WINDOW_HEIGHTS);
+        self.applied_frames = window[over..].to_vec();
+        self
     }
 }
 
@@ -1149,6 +1232,10 @@ pub struct FoldedBlock<'a> {
     pub disposition: Disposition,
     pub root_hash: StateRoot,
     pub dispatches: &'a [DispatchRecord],
+    /// the host's module set after this block — what the seal records. a
+    /// module the block's boundary admitted appears here for the first
+    /// time, so a derived tier can cover it before its first op folds.
+    pub roots: &'a [(ModuleId, StateRoot)],
 }
 
 /// observer of every sealed block the journal replay walks, in height order —
@@ -1195,6 +1282,14 @@ pub struct Recovered {
     /// armed by a block ABOVE the checkpoint (the checkpoint itself records
     /// one armed at or below it via `pending_cutover_view`).
     pub blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)>,
+    /// the restored REPLAY WINDOW — the checkpoint's own
+    /// [`Manifest::applied_frames`] extended by every sealed block the journal
+    /// suffix walked, one entry per height in ascending order, bounded to
+    /// [`node::REPLAY_WINDOW_HEIGHTS`]. the boot path hands these to
+    /// `OrderedNode::seed_replay_window`, so a restarted node's window is as
+    /// deep as a peer that never restarted rather than as deep as whatever
+    /// journal the last checkpoint happened to leave behind.
+    pub applied_frames: Vec<(u64, node::FrameId)>,
     /// replay accounting, for the boot log line.
     pub applied: usize,
     pub skipped: usize,
@@ -1248,6 +1343,10 @@ where
         let mut residents = manifest.residents.clone();
         let mut frames: Vec<Vec<u8>> = Vec::new();
         let mut blocks: Vec<(u64, Vec<(ModuleId, StateRoot)>)> = Vec::new();
+        // the replay window starts at the CHECKPOINT's, not empty: the journal
+        // suffix below only reaches back to the checkpoint, and a window
+        // shorter than a peer's is a fork waiting on a replayed batch.
+        let mut applied_frames: Vec<(u64, node::FrameId)> = manifest.applied_frames.clone();
         let mut pending: Option<(u64, Vec<u8>)> = None;
         let mut applied = 0usize;
         let mut skipped = 0usize;
@@ -1395,6 +1494,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &[],
+                                    roots: &roots,
                                 }),
                                 // an applied block whose ops moved no root:
                                 // its trace existed at runtime but is not
@@ -1458,6 +1558,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
+                                    roots: &host.module_roots(),
                                 });
                             }
                             for (id, root) in &changed {
@@ -1536,6 +1637,7 @@ where
                                     disposition,
                                     root_hash,
                                     dispatches: &dispatches,
+                                    roots: &host.module_roots(),
                                 });
                             }
                             // every re-committed and exact-post module must now
@@ -1561,6 +1663,7 @@ where
                         }
                     }
                     blocks.push((height, roots.clone()));
+                    applied_frames.push((height, node::frame_id(&frame)));
                     for (id, root) in roots {
                         expected.insert(id, root);
                     }
@@ -1593,6 +1696,7 @@ where
                         // below; this is that same post-block boundary.
                         root_hash: host.root_hash(),
                         dispatches: &dispatches,
+                        roots: &host.module_roots(),
                     });
                 }
                 disposition
@@ -1661,6 +1765,7 @@ where
                             disposition,
                             root_hash: host.root_hash(),
                             dispatches: &dispatches,
+                            roots: &host.module_roots(),
                         });
                     }
                     disposition
@@ -1677,6 +1782,7 @@ where
                 .map_err(|e| Error::Storage(e.to_string()))?;
             self.journal.sync().await.map_err(storage_err)?;
             blocks.push((height, seal.roots.clone()));
+            applied_frames.push((height, node::frame_id(&frame)));
             tip_height = Some(height);
             tip_hash = host.root_hash();
             rolled_forward = true;
@@ -1704,6 +1810,19 @@ where
             )));
         }
 
+        // the checkpoint's window and the journal suffix overlap wherever the
+        // retained journal reaches back below the checkpoint height (a
+        // root-idempotent block is walked and skipped, but still remembered).
+        // one entry per height, newest last, bounded to the protocol depth —
+        // a duplicate would cost a window slot and shorten this node's reach
+        // against a peer's.
+        applied_frames.sort_by_key(|(height, _)| *height);
+        applied_frames.dedup_by_key(|(height, _)| *height);
+        let over = applied_frames
+            .len()
+            .saturating_sub(node::REPLAY_WINDOW_HEIGHTS);
+        applied_frames.drain(..over);
+
         Ok(Recovered {
             height: tip_height,
             root_hash: tip_hash,
@@ -1713,6 +1832,7 @@ where
             residents,
             frames,
             blocks,
+            applied_frames,
             applied,
             skipped,
             rolled_forward,
@@ -1812,7 +1932,7 @@ async fn replay_batch(
     // before re-applying or the sealed roots cannot reproduce. the registry
     // is disk-durable and reopens AHEAD of this window — its tip says nothing
     // about which code sealed `height` — so realization keys on the registry's
-    // activation HISTORY at `height` (`lifecycle::code_at`): the identical
+    // activation HISTORY at `height` (`modules::code_at`): the identical
     // swap points the live node realized, walked in either direction.
     // fail-closed on missing/tampered bytes.
     host.realize_module_swaps(height, code_source)
@@ -2177,6 +2297,7 @@ mod tests {
             ],
             oplog_pos: 17,
             next_seq: 5,
+            applied_frames: vec![(40, [0xA1; 32]), (41, [0xA2; 32]), (42, [0xA3; 32])],
         }
     }
 

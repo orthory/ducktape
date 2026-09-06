@@ -698,3 +698,140 @@ fn pending_branches_is_the_node_side_pull_handle() {
     let _ = std::fs::remove_dir_all(&src_dir);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// the packfiles a repo's object dir holds.
+fn pack_count(base: &Path) -> usize {
+    let dir = repo_dir(base).join(".git").join("objects").join("pack");
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "pack"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// stage a push whose head NO pack closes: the CAS is pure, so consensus takes
+/// it, and the branch is left pending on a verdict that can never change.
+fn push_poison(forge: &mut Forge, branch: &str, digest: &[u8]) {
+    let head = [7u8; OID_LEN];
+    futures::executor::block_on(
+        forge.execute(&mut at(0), &push_branch_msg(branch, None, &head, digest)),
+    )
+    .unwrap();
+    futures::executor::block_on(forge.commit_block()).unwrap();
+}
+
+#[test]
+fn a_head_no_pack_closes_is_installed_once_and_then_left_alone() {
+    // consensus cannot open a pack, so a push may name a head its pack does not
+    // contain. the node-local catch-up must not re-index that pack on every
+    // block for the rest of the repo's life.
+    let (src_dir, _src, cap) = source_one("poison-src");
+    let dir = tmp_repo("poison");
+    let blobs = blobstore::BlobHandle::default();
+    let digest = cap.stash(&blobs);
+
+    let mut node = Forge::with_blobs("forge", dir.clone(), blobs.clone()).unwrap();
+    push_poison(&mut node, "poison", &digest);
+
+    assert_eq!(pack_count(&dir), 1, "the pack installed once");
+    assert_eq!(
+        forge::pending_branches(&dir).unwrap().len(),
+        1,
+        "the closure is short, so the branch stays pending"
+    );
+
+    // wipe the evidence: a second install would put it straight back.
+    let pack_dir = repo_dir(&dir).join(".git").join("objects").join("pack");
+    std::fs::remove_dir_all(&pack_dir).unwrap();
+    std::fs::create_dir_all(&pack_dir).unwrap();
+    node.materialize().unwrap();
+    node.materialize().unwrap();
+    assert_eq!(pack_count(&dir), 0, "the futile pack is never re-installed");
+
+    // a NEW push to the branch is the one thing that can change the verdict, so
+    // it clears the mark — and this one names a head the same pack DOES close.
+    let poison_head = vec![7u8; OID_LEN];
+    futures::executor::block_on(node.execute(
+        &mut at(0),
+        &push_branch_msg("poison", Some(&poison_head), &cap.head, &digest),
+    ))
+    .unwrap();
+    futures::executor::block_on(node.commit_block()).unwrap();
+    assert_eq!(pack_count(&dir), 1, "the fresh push installs again");
+    assert!(
+        forge::pending_branches(&dir).unwrap().is_empty(),
+        "and this head's closure verifies, so nothing is left waiting"
+    );
+
+    let _ = std::fs::remove_dir_all(&src_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_stuck_branch_does_not_disable_the_repos_compaction() {
+    // one unresolvable head used to skip the WHOLE repo forever, and packs cost
+    // 212 MB at 1001 where the same history costs 6 MB in one.
+    // two unrelated histories on two branches, so one pack per branch and a
+    // collapse that really has something to collapse.
+    let (dir_a, _a, mut cap_a) = source_history("compact-a", &[(1, "a.txt", "one", "c1")]);
+    let (dir_b, _b, mut cap_b) = source_history("compact-b", &[(2, "b.txt", "two", "c2")]);
+    let main = cap_a.remove(0);
+    let feat = cap_b.remove(0);
+
+    // a node with both packs materializes both branches, and the pair is worth
+    // collapsing — the baseline both halves below measure against.
+    let two_branch_node = |tag: &str| {
+        let dir = tmp_repo(tag);
+        let blobs = blobstore::BlobHandle::default();
+        let blobs_for_later = blobs.clone();
+        let dm = main.stash(&blobs);
+        let df = feat.stash(&blobs);
+        let mut node = Forge::with_blobs("forge", dir.clone(), blobs).unwrap();
+        push(&mut node, None, &main.head, &dm);
+        futures::executor::block_on(
+            node.execute(&mut at(0), &push_branch_msg("feat", None, &feat.head, &df)),
+        )
+        .unwrap();
+        futures::executor::block_on(node.commit_block()).unwrap();
+        assert_eq!(pack_count(&dir), 2, "one pack per materialized branch");
+        (dir, node, blobs_for_later)
+    };
+
+    // a branch still WAITING on its objects keeps holding compaction back: its
+    // closure is the one the repo is about to need.
+    let (waiting_dir, mut lagging, _) = two_branch_node("compact-waiting");
+    let unheld = [9u8; 32];
+    futures::executor::block_on(lagging.execute(
+        &mut at(0),
+        &push_branch_msg("later", None, &[7u8; OID_LEN], &unheld),
+    ))
+    .unwrap();
+    futures::executor::block_on(lagging.commit_block()).unwrap();
+    assert_eq!(
+        forge::compact_repos(&waiting_dir, 0).unwrap(),
+        0,
+        "a repo whose branches are still in flight is left alone"
+    );
+
+    // a STUCK one does not: its pack is installed and refused, so nothing is
+    // coming for it and the whole repo must not wait on it. (a materialized
+    // push RELEASES its pack, so the poison push needs one of its own.)
+    let (dir_c, _c, mut cap_c) = source_history("compact-c", &[(3, "c.txt", "three", "c3")]);
+    let (dir, mut node, blobs) = two_branch_node("compact-stuck");
+    let dc = cap_c.remove(0).stash(&blobs);
+    push_poison(&mut node, "poison", &dc);
+    assert!(
+        forge::compact_repos(&dir, 0).unwrap() > 0,
+        "the repo still compacts"
+    );
+    assert_eq!(pack_count(&dir), 1, "collapsed into one pack");
+
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+    let _ = std::fs::remove_dir_all(&dir_c);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&waiting_dir);
+}

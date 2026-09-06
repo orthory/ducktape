@@ -10,6 +10,7 @@ extern crate::backend
   ChatBlock(kind:str, text:str, lang:str, rich:bool, spans:[ChatSpan])
   ChatMessage(id:str, view_key:i64, seq:i64, author:str, meta:str, body:str, blocks:[ChatBlock], pending:bool, rev:i64, edited:bool, deleted:bool, reply_count:i64, thread_seq:i64, show_author:bool, initial:str, avatar_kind:str, height:i64, time:i64, reactions:[ChatReaction], render_rev:i64)
   MessageSelection(seq:i64, rev:i64, action:MessageAction, draft:str)
+  CopyRange(anchor:i64, head:i64, surface:CopySurface)
   HuddleParticipant(key:str, label:str, initials:str, is_agent:bool, is_you:bool, joined_at:i64, node:str)
   ChatData(generation:i64, channels:[ChatChannel], messages:[ChatMessage], has_older_history:bool, active_channel:str, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, huddle_roster:[HuddleParticipant], channel_members:[ChatMember], selected_message_seq:i64, selected_message_rev:i64, selected_message_body:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_has_more:bool)
   SendReceipt(operation_id:str, channel_id:str)
@@ -128,6 +129,16 @@ extern crate::backend
   pure oldest_message_seq(messages:[ChatMessage]) -> i64
   pure prepend_history(messages:[ChatMessage], older:[ChatMessage]) -> [ChatMessage]
   pure message_selection_after_window(messages:[ChatMessage], seq:i64, rev:i64, action:MessageAction, draft:str) -> MessageSelection
+  // THE COPY RANGE. Addressed by the seqs at its two ends because history
+  // prepends — an index is stale the moment an older page merges in.
+  pure seq_in_copy_range(seq:i64, anchor:i64, head:i64, surface:CopySurface, mine:CopySurface) -> bool
+  pure copy_range_count(messages:&[ChatMessage], anchor:i64, head:i64) -> i64
+  pure copy_range_text(messages:&[ChatMessage], anchor:i64, head:i64) -> str
+  pure copy_range_toast(messages:&[ChatMessage], anchor:i64, head:i64) -> str
+  pure copy_range_label(count:i64) -> str
+  pure message_plate(deleted:bool, selected:bool, in_range:bool) -> RowPlate
+  pure copy_range_after_press(anchor:i64, surface:CopySurface, seq:i64, pressed_in:CopySurface, extending:bool) -> CopyRange
+  pure copy_range_rows(timeline:&[ChatMessage], thread:&[ChatMessage], surface:CopySurface) -> [ChatMessage]
   pure merge_pending_blocks(canonical:[PageBlock], current:[PageBlock], current_page:str, next_page:str, settled_id:str) -> [PageBlock]
   pure restore_draft(current:str, pending:str, keep_pending:bool) -> str
   // Chat's message/thread menus still place themselves this way; the name is
@@ -160,6 +171,16 @@ extern crate::backend
   pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
   pure password_problem(password:&str, confirm:&str) -> str
   pure without_window(current:window-id?, closed:window-id) -> window-id?
+  // Whether the close that just unregistered a slot ends the process: true
+  // only off macOS, where no status item exists to live in, once no window
+  // is left.
+  pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool
+  // "Open Ducktape" as a discriminant: nothing tracked means there is nothing
+  // to raise, so the row must open a window instead of focusing a fresh id.
+  pure tray_open_action(console:window-id?, onboarding:window-id?) -> WindowSummon
+  // The same decision for the call's window: the LIVE pill and the tray's
+  // huddle row both mean "put it in front of me", whether or not one is up.
+  pure huddle_summon(huddle:window-id?) -> WindowSummon
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
   // THE RECOVERY-PHRASE CEREMONY, in two calls. `create_device_key` picks a
@@ -195,6 +216,18 @@ extern crate::backend
   pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str, forge_repo_menu:bool) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   pure content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
+  // The command modifier held, off the modifier stream: the cheap half that
+  // arms the quit route. It asks `command()` — the SAME modifier the chord
+  // below asks for — because a route armed on one modifier and a chord judged
+  // on another is a chord that never fires off a Mac.
+  pure command_held(modifiers:key-modifiers) -> bool
+  pure shift_held(modifiers:key-modifiers) -> bool
+  pure is_copy_chord(logical:key, physical:physical-key, modifiers:key-modifiers) -> bool
+  // WHICH command chord this press is, if any — the one answer, so ⌘Q and ⌘W
+  // are defined in one place instead of re-spelled per handler. Both key
+  // readings, like every other chord here: the logical key follows the layout,
+  // the physical one is what a non-QWERTY layout still calls Q and W.
+  pure command_chord(logical:key, physical:physical-key, modifiers:key-modifiers) -> CommandChord
   NavItem(id:ShellTab, title:str, icon:str, badge:i64, active:bool, live:bool)
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)
@@ -408,6 +441,8 @@ extern crate::backend
   load_doc_tabs(rpc:str) -> [str]
   load_appearance() -> Appearance
   save_appearance(mode:Appearance) -> bool
+  load_desktop_notifications() -> bool
+  save_desktop_notifications(enabled:bool) -> bool
   save_doc_tabs(rpc:str, tabs:[str]) -> bool
   pure retain_for_endpoint(value:str, current:str, next:str) -> str
   pure mutation_failure_phase(committed:bool) -> MutationPhase

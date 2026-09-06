@@ -18,10 +18,40 @@
 //! [`PushCert`]; every validator then checks, in this order: the SSHSIG
 //! verifies for the key it embeds; the certificate's update list IS the op's
 //! (a cert cannot be borrowed to authorize different moves); the nonce names
-//! this repo. The nonce is `<chain id>/<repo>`; the chain half is checked by
-//! the bridge (which knows its chain — `Env` carries none), the repo half
-//! here. Freshness is not a concern: a certificate names exact old→new
-//! moves, so a replay is a no-op CAS.
+//! this repo. The nonce is `<chain id>/<repo>`; the repo half is checked
+//! here (`nonce_names_repo`). Freshness is not a concern: a certificate names
+//! exact old→new moves, so a replay is a no-op CAS.
+//!
+//! ## the chain half — #1761
+//!
+//! the bridge ALSO checks the chain half, by exact string equality
+//! (`git_http.rs`'s `parse_push_commands`) — but the bridge is not on the
+//! trust path: `PushRefs` is an ordinary op, so any account with
+//! `/v1/submit/frame` standing can carry a certificate lifted from a
+//! DIFFERENT ducktape network straight past the bridge, and every validator
+//! re-verifies the SAME `Ok` from the repo-half check alone. closing that
+//! fully needs consensus to know ITS OWN chain id — the same genesis-config
+//! seam `identity`/`gateway`/`runs` bind their chain id through
+//! (`sdk::genesis_config`, `guest_adapter::genesis_chain_id`) — but that seam
+//! only seeds a wasm tenant's `__config` for `Backing::Store` and
+//! `Backing::Map` (`crates/noded/src/compose.rs`'s `wasm_module`); forge
+//! declares `Backing::Odb`, whose committed-read facade
+//! (`wasm-host`'s `committed_for_round`) carries only the git-refs image
+//! under `REFS_KEY` — there is no config side-channel for it, and `Env`
+//! carries no chain id either. reaching it would mean extending the KERNEL
+//! (`wasm-host`'s `Odb` backing + `noded::compose`'s fresh-start seeding) to
+//! carry a generic config side-channel for EVERY `Odb`-backed module, not
+//! just forge — a structural, cross-cutting change outside a forge-module
+//! fix.
+//!
+//! the strictest check reachable from inside forge alone, until that lands:
+//! [`crate::tracker::Tracker::accepted_chain`] pins the chain half of the
+//! FIRST cert-verified push this forge instance ever accepts, forever; every
+//! later cert-verified push (any repo) must carry the identical chain half.
+//! that closes the replay against an ALREADY-ACTIVE network (the harvested
+//! cert's chain half no longer matches the one already pinned), but not a
+//! race against a network's very first certified push, where nothing is
+//! pinned yet to compare against.
 
 use crate::PushCert;
 use crate::oid::Oid;
@@ -42,11 +72,21 @@ pub fn nonce(chain_id: &str, repo: &str) -> String {
     format!("{chain_id}/{repo}")
 }
 
-/// does `nonce` end in `/<repo>` — the half consensus can check.
+/// does `nonce` end in `/<repo>` — the half consensus can check unaided.
 pub fn nonce_names_repo(nonce: &str, repo: &str) -> bool {
     nonce
         .strip_suffix(repo)
         .is_some_and(|head| head.ends_with('/'))
+}
+
+/// the chain half of a nonce already proven (by [`nonce_names_repo`]) to end
+/// in `/<repo>` — everything before that trailing slash. `debug_assert`s the
+/// precondition rather than re-deriving it; the one caller ([`signer`]) has
+/// already checked.
+fn chain_half(nonce: &str, repo: &str) -> String {
+    debug_assert!(nonce_names_repo(nonce, repo));
+    let head = nonce.strip_suffix(repo).unwrap_or(nonce);
+    head.strip_suffix('/').unwrap_or(head).to_string()
 }
 
 /// the certificate text git would write for `updates` under `nonce` — the
@@ -133,10 +173,18 @@ fn oid_field(hex: &str) -> Result<Option<Vec<u8>>, String> {
     Ok((!oid.is_zero()).then(|| oid.as_bytes().to_vec()))
 }
 
-/// the SSH key that signed `cert` for THIS push: the SSHSIG verifies for the
-/// key it embeds, the certificate's updates equal `updates` as a set, and its
-/// nonce names `repo`. The 32 raw ed25519 key bytes — a member key's form.
-pub fn signer(cert: &PushCert, repo: &str, updates: &[RefUpdate]) -> Result<Vec<u8>, String> {
+/// the SSH key that signed `cert` for THIS push, plus the nonce's chain half
+/// — the SSHSIG verifies for the key it embeds, the certificate's updates
+/// equal `updates` as a set, and its nonce names `repo`. The 32 raw ed25519
+/// key bytes are a member key's form. the caller (`ForgeState::push_principal`)
+/// checks the returned chain half against [`crate::tracker::Tracker::accepted_chain`]
+/// — see the module doc for why that, not a nonce equality check here, is
+/// the strictest cross-chain-replay gate forge can enforce today.
+pub fn signer(
+    cert: &PushCert,
+    repo: &str,
+    updates: &[RefUpdate],
+) -> Result<(Vec<u8>, String), String> {
     let sig = keyscheme::sshsig::parse(&cert.sshsig)?;
     let verified = keyscheme::sshsig::verify_ed25519(
         &sig.pubkey,
@@ -158,7 +206,7 @@ pub fn signer(cert: &PushCert, repo: &str, updates: &[RefUpdate]) -> Result<Vec<
     if !same_moves {
         return Err("push certificate does not list this push's ref updates".into());
     }
-    Ok(sig.pubkey.to_vec())
+    Ok((sig.pubkey.to_vec(), chain_half(&certificate.nonce, repo)))
 }
 
 fn sorted(updates: &[RefUpdate]) -> Vec<&RefUpdate> {
@@ -209,7 +257,7 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
             cert: CERT.as_bytes().to_vec(),
             sshsig: dearmor(ARMORED).unwrap(),
         };
-        let key = signer(&cert, "lab", &[main_birth()]).unwrap();
+        let (key, chain) = signer(&cert, "lab", &[main_birth()]).unwrap();
         assert_eq!(
             key,
             keyscheme::sshsig::authorized_key(
@@ -217,6 +265,7 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
             )
             .unwrap()
         );
+        assert_eq!(chain, "chain-a");
         assert!(
             signer(&cert, "other", &[main_birth()])
                 .unwrap_err()
@@ -265,11 +314,9 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
             cert: text.clone(),
         };
         let reordered: Vec<RefUpdate> = updates.iter().rev().cloned().collect();
-        assert_eq!(
-            signer(&cert, "lab", &reordered).unwrap(),
-            ssh_pubkey(&sk),
-            "order-free"
-        );
+        let (key, chain) = signer(&cert, "lab", &reordered).unwrap();
+        assert_eq!(key, ssh_pubkey(&sk), "order-free");
+        assert_eq!(chain, "chain-b");
         let under_ducktape = PushCert {
             sshsig: sshsig(&sk, keyscheme::sshsig::DUCKTAPE_SSH_NS, &text),
             cert: text,

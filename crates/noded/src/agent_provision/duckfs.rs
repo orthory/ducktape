@@ -66,6 +66,17 @@ pub(super) async fn provision(
     .await
     .map_err(|_| "workspace checkout task panicked".to_string())?
     .map_err(|e| e.to_string())?;
+    // the rw checkout is materialized on disk NOW — the one host-observable
+    // fact an e2e otherwise has to poll for (the dir lives only seconds and
+    // is cleaned up before a filesystem sample could reliably catch it).
+    // the message text is the only carrier the harness reads (see
+    // `compute_markers`/`materialized_dirs`): a structured `kind`/`path` field
+    // here would duplicate the same pair after the fmt layer's coloured field
+    // list, corrupting the marker extraction.
+    tracing::debug!(
+        target: "ducktape::agent",
+        "run dir materialized kind=rw path={}", dir.display()
+    );
     // W6 skill ro mounts land at a SUFFIXED SIBLING of the rw checkout
     // root (`<slug>-ro/<name>`): `commit` scans only under `dir`, so a
     // skill tree beside it can never leak into the output snapshot. the same
@@ -101,6 +112,13 @@ pub(super) async fn provision(
         })
         .await
         .map_err(|_| "skill mount checkout task panicked".to_string())??;
+        // the ro skill root is the sibling half of the same host-observable
+        // fact (see the rw marker above).
+        // same reasoning as the rw marker above: message text only.
+        tracing::debug!(
+            target: "ducktape::agent",
+            "run dir materialized kind=ro path={}", ro_root.display()
+        );
         (Some(ro_root), Some(context_doc))
     };
     // the workspace EXISTS now, so ask consensus to bind the run's agent session
@@ -136,7 +154,7 @@ struct NodedWorkspace {
     source: WorkspaceSource,
     env: BTreeMap<String, String>,
     /// the run's assembled soul — its `always` skills inlined, the rest indexed.
-    /// `None` when the agent curated no skills. capability-host delivers it.
+    /// `None` when the agent curated no skills. the provider delivers it.
     context_doc: Option<String>,
     /// Owns the scoped signer endpoint for exactly as long as the workspace.
     _session: Option<super::session::RunSession>,

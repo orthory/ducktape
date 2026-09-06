@@ -13,6 +13,13 @@ version.workspace = true
 name = "ducktape-noded"
 path = "src/main.rs"
 
+[features]
+# forwards to `noded/verify` — real TEE quote verification for the airlock
+# `Attested` trust arm, off by default. `cargo build -p noded-bin --features
+# verify` is the working flag for `ducktape-noded`, the same as `node-bin`'s
+# own `verify` is for `ducktape`.
+verify = ["noded/verify"]
+
 [dependencies]
 noded = { path = "../../crates/noded" }
 host = { workspace = true }

@@ -5,8 +5,9 @@
 //! members vote before a consensus-time deadline, and anyone may trigger
 //! `Execute` once the outcome is decidable. a passing membership action emits
 //! the valset op as a host-drained follow-up in the SAME block — and the
-//! valset module only accepts membership ops from module origins, so
-//! governance is the sole authorized author of membership change.
+//! valset module only accepts membership ops from THIS module's origin (its
+//! wired `governance_id`, never a bare module origin), so governance is the
+//! sole authorized author of membership change.
 //!
 //! ## why authorship is trustworthy
 //!
@@ -33,16 +34,25 @@
 //! logical record per proposal (`prop\0{id}`) and per settled invite
 //! redemption (`red\0{nonce}`), plus three aggregate records:
 //!
-//! - the proposal ROSTER (the sorted proposal-id list, bounded by
-//!   [`MAX_PROPOSALS`]) — the ONE enumeration read. it stays canonical
-//!   because governance's read model CANNOT move to the derived index tier:
-//!   a proposal's frozen electorate, every ballot's principal resolution,
-//!   and the settlement tally all read the valset/identity SIBLINGS at
-//!   execute time, so an index fold over governance's own applied ops could
-//!   only reproduce proposal state by re-implementing the consensus tally
-//!   over other modules' state — a second consensus implementation, which is
-//!   worse than a bounded canonical id list. the operator ceremonies (the
-//!   CLI's adopt-an-open-proposal flow) consume this listing;
+//! - the proposal ROSTER (the sorted OPEN-proposal-id list, bounded by
+//!   [`MAX_PROPOSALS`] and, per submitter, by
+//!   [`MAX_OPEN_PROPOSALS_PER_SUBMITTER`]) — the ONE enumeration read. an id
+//!   leaves the roster the moment it settles: `Execute` evicts it when the
+//!   tally passes or rejects it, and `Propose` opportunistically evicts any
+//!   OTHER roster entry whose own voting deadline has passed with nobody
+//!   having executed it (the only way an unexecuted proposal expires
+//!   deterministically without a network-wide per-block tick). the proposal
+//!   RECORD itself is kept forever under its own key — only the roster
+//!   narrows — so a settled id's history is still a point read away. it
+//!   stays canonical because governance's read model CANNOT move to the
+//!   derived index tier: a proposal's frozen electorate, every ballot's
+//!   principal resolution, and the settlement tally all read the
+//!   valset/identity SIBLINGS at execute time, so an index fold over
+//!   governance's own applied ops could only reproduce proposal state by
+//!   re-implementing the consensus tally over other modules' state — a
+//!   second consensus implementation, which is worse than a bounded
+//!   canonical id list. the operator ceremonies (the CLI's
+//!   adopt-an-open-proposal flow) consume this listing;
 //! - the SHARE REGISTRY (bounded by [`MAX_SHARE_ACCOUNTS`]) — consensus
 //!   consumes it whenever a proposal freezes an account electorate;
 //! - the share-MODE flag — consensus consumes it on every `Propose`.
@@ -92,7 +102,7 @@ use identity::{
     IdentityQuery, IdentityReply, decode_reply as identity_decode_reply,
     encode_query as identity_encode_query,
 };
-use lifecycle::{LifecycleMsg, encode_msg as lifecycle_encode_msg};
+use modules::{ModulesMsg, encode_msg as modules_encode_msg};
 use sdk::{
     Ctx, Error, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
     StateRoot, StateSyncHandle,
@@ -107,6 +117,14 @@ use valset::{
 /// horizon. views advance about once per finalized op, so this is generous.
 const MAX_VOTING_PERIOD: u64 = 1_000_000_000;
 
+/// how long a decided-but-unexecuted proposal stays enactable past its
+/// `deadline`. `Execute` tallies against the electorate FROZEN at `Propose`,
+/// so an unbounded window lets a since-removed electorate enact a mandate
+/// long after it lost standing (the whole point of a deadline). Past
+/// `deadline + EXECUTION_GRACE` the proposal is dead: refused on `Execute`
+/// and settled `Rejected` on the spot, same as any other reap.
+const EXECUTION_GRACE: u64 = 100_000;
+
 /// Keep every share value and total exact in the JavaScript operator client.
 const MAX_SAFE_SHARES: u64 = 9_007_199_254_740_991;
 /// The frozen electorate copies the complete allocation into each proposal.
@@ -116,9 +134,19 @@ const MAX_SHARE_ACCOUNTS: usize = 256;
 /// `proposal_id` byte bound — roster arithmetic and record keys need ids that
 /// cannot balloon.
 pub const MAX_PROPOSAL_ID_BYTES: usize = 256;
-/// proposals retained over the network's life (settled proposals keep their
-/// ids forever). proposing past this is refused loudly at execute.
+/// ceiling on the roster of currently-OPEN proposals — settled ids (passed,
+/// rejected, or expired) are evicted, so this bounds live contention, not
+/// the network's lifetime proposal count. proposing past this is refused
+/// loudly at propose.
 pub const MAX_PROPOSALS: usize = 1024;
+/// ceiling on OPEN proposals a single frozen `proposer` principal may hold at
+/// once — closes the roster-filling attack [`MAX_PROPOSALS`] alone does not:
+/// without this, one electorate member submits proposals with a voting
+/// window long enough that nobody can execute them early, and eviction on
+/// expiry never triggers before the cap bites. small on purpose — a
+/// legitimate member has no reason to run more than a handful of proposals
+/// concurrently.
+pub const MAX_OPEN_PROPOSALS_PER_SUBMITTER: usize = 8;
 /// serialized roster-record byte bound, enforced at propose — the backstop
 /// on top of the id-length and count caps that keeps the committed record
 /// far under the qmdb value-decode ceiling (the poison-value lesson: a
@@ -212,7 +240,7 @@ pub struct Governance {
     /// the id of the valset module this governance instance gates. genesis
     /// wiring — identical on every node.
     valset_id: ModuleId,
-    /// the id of the lifecycle module a passing `UpdateModule`/`CancelModuleUpdate`
+    /// the id of the modules registry a passing `UpdateModule`/`CancelModuleUpdate`
     /// authorizes (the code-registry path — the same module, gated separately).
     /// genesis wiring — identical on every node; `None` (a net without the code
     /// registry wired) rejects those proposals at the door, deterministically.
@@ -263,7 +291,7 @@ impl Governance {
     }
 
     /// enable the code-registry path (`UpdateModule`/`CancelModuleUpdate`) on the
-    /// lifecycle module. genesis wiring — every node of a network must wire the
+    /// modules registry. genesis wiring — every node of a network must wire the
     /// same id (or none), or nodes diverge on whether those proposals are
     /// accepted.
     pub fn with_code_registry(mut self, id: impl Into<ModuleId>) -> Self {
@@ -345,12 +373,89 @@ impl Governance {
         )
     }
 
-    /// the proposal roster — every proposal id, sorted. record and roster are
-    /// staged (and commit or abort) together, so membership in one is
-    /// membership in both; the roster is the ONE existence authority at
-    /// propose and the ONE enumeration read (module doc: why it is canonical).
+    /// the proposal roster — every OPEN proposal id, sorted. record and
+    /// roster are staged (and commit or abort) together, so roster
+    /// membership implies an existing record; the roster is the ONE
+    /// existence authority at propose and the ONE enumeration read (module
+    /// doc: why it is canonical, and why it narrows on settlement).
     async fn roster(&self) -> Result<Vec<String>, Error> {
         Ok(self.load(PROPOSAL_ROSTER_KEY).await?.unwrap_or_default())
+    }
+
+    fn stage_roster(&mut self, roster: &Vec<String>) -> Result<(), Error> {
+        self.store_bounded(
+            PROPOSAL_ROSTER_KEY.to_vec(),
+            roster,
+            MAX_ROSTER_RECORD_BYTES,
+            "proposal roster",
+        )
+    }
+
+    /// settle every OPEN roster entry already past its EXECUTION deadline
+    /// (`deadline + EXECUTION_GRACE`) as Rejected — nobody executed it in
+    /// time, or nobody ever will again — and evict it from `roster`. this is
+    /// the one place an unexecuted or now-stale-electorate proposal expires
+    /// deterministically without a network-wide per-block tick, so `Propose`,
+    /// `Vote`, and `Execute` all run it before acting: `Propose` right where
+    /// the roster cap and the per-submitter cap are about to be checked,
+    /// `Vote`/`Execute` so expiry never depends on someone else proposing.
+    /// when `Execute` calls this on the very proposal it targets, reaping it
+    /// here IS the bounded-execution-window refusal — the subsequent "no
+    /// such open proposal" check catches it. returns how many of the
+    /// SURVIVING open proposals belong to `proposer`, computed in the same
+    /// pass so the caps cost one roster walk together (bounded by
+    /// [`MAX_PROPOSALS`] point reads, the same cost class as
+    /// `GovQuery::Proposals`).
+    async fn reap_expired(
+        &mut self,
+        now: u64,
+        proposer: &[u8],
+        roster: &mut Vec<String>,
+    ) -> Result<usize, Error> {
+        let mut open_by_proposer = 0usize;
+        let mut i = 0;
+        while i < roster.len() {
+            let id = roster[i].clone();
+            let mut proposal = self
+                .proposal(&id)
+                .await?
+                .ok_or_else(|| Error::Module(format!("missing proposal record: {id}")))?;
+            let execution_deadline = proposal.deadline.saturating_add(EXECUTION_GRACE);
+            let expired = proposal.status == ProposalStatus::Open && now >= execution_deadline;
+            if expired {
+                proposal.status = ProposalStatus::Rejected;
+                self.store_proposal(&id, &proposal)?;
+                roster.remove(i);
+                continue;
+            }
+            if proposal.proposer.as_slice() == proposer {
+                open_by_proposer += 1;
+            }
+            i += 1;
+        }
+        Ok(open_by_proposer)
+    }
+
+    /// [`Self::reap_expired`] against the whole roster, for callers that
+    /// don't need the per-submitter count `Propose` uses.
+    async fn reap_roster(&mut self, now: u64) -> Result<(), Error> {
+        let mut roster = self.roster().await?;
+        self.reap_expired(now, &[], &mut roster).await?;
+        self.stage_roster(&roster)
+    }
+
+    /// persist a just-tallied proposal (status already terminal — Passed or
+    /// Rejected) and evict its id from the open-proposal roster in the same
+    /// staged write. the proposal RECORD stays under its own key forever;
+    /// only the roster narrows.
+    async fn settle(&mut self, proposal_id: &str, proposal: &Proposal) -> Result<(), Error> {
+        self.store_proposal(proposal_id, proposal)?;
+        let mut roster = self.roster().await?;
+        if let Some(position) = roster.iter().position(|id| id.as_str() == proposal_id) {
+            roster.remove(position);
+            self.stage_roster(&roster)?;
+        }
+        Ok(())
     }
 
     /// the share registry: account number → shares.
@@ -721,7 +826,7 @@ impl Governance {
         // module-update authorizations: shape-checked at the door (a proposal
         // that can never execute is rejected here, not at tally time); the code
         // registry's min-lead / at-most-one / no-op gates are NOT duplicated —
-        // the lifecycle module is their sole authority at ingest. a net without a
+        // the modules registry is their sole authority at ingest. a net without a
         // wired code registry deterministically rejects these (genesis wiring is
         // identical on every node).
         if let GovAction::UpdateModule {
@@ -747,11 +852,11 @@ impl Governance {
         }
         if let GovAction::UpdateModule { code_hash, .. }
         | GovAction::RegisterModule { code_hash, .. } = &action
-            && code_hash.len() != lifecycle::CODE_HASH_LEN
+            && code_hash.len() != modules::CODE_HASH_LEN
         {
             return Err(Error::Module(format!(
                 "code_hash must be {} bytes (sha256 of the component)",
-                lifecycle::CODE_HASH_LEN
+                modules::CODE_HASH_LEN
             )));
         }
         // acl policy authorizations: shape-checked at the door like the module
@@ -777,27 +882,43 @@ impl Governance {
                 )));
             }
         }
+        // AN ID IS SPENT FOREVER, and the check is against the RECORD, not the
+        // roster. The roster holds OPEN ids only, while a settled proposal's
+        // record is kept under its own key for good — so a roster-only check
+        // let a second `Propose` reuse a settled id and OVERWRITE the record,
+        // erasing the settled outcome and its ballots. Worse, it is invisible:
+        // a driver that waits for "the proposal exists" is answered by the
+        // stale record before the new one lands, and reports the old outcome
+        // for a ceremony that never voted (#1766).
+        let id_is_spent = self.proposal(&proposal_id).await?.is_some();
+        if id_is_spent {
+            return Err(Error::Module(format!(
+                "proposal already exists: {proposal_id}"
+            )));
+        }
         let mut roster = self.roster().await?;
-        let position = match roster.binary_search(&proposal_id) {
-            Ok(_) => {
-                return Err(Error::Module(format!(
-                    "proposal already exists: {proposal_id}"
-                )));
-            }
-            Err(position) => position,
-        };
+        let submitter = Self::external_origin(ctx)?;
+        let (proposer, electorate) = self.frozen_electorate(ctx, &submitter, &action).await?;
+        let now = ctx.env().consensus_time;
+        // reap anything already past its own deadline before either cap
+        // below — otherwise a submitter who never calls `Execute` keeps a
+        // permanent roster slot (and a permanent per-submitter slot) past
+        // its own voting window.
+        let open_by_proposer = self.reap_expired(now, &proposer, &mut roster).await?;
         if roster.len() >= MAX_PROPOSALS {
             return Err(Error::Module(format!(
                 "proposal cap reached ({MAX_PROPOSALS})"
             )));
         }
-        let submitter = Self::external_origin(ctx)?;
-        let (proposer, electorate) = self.frozen_electorate(ctx, &submitter, &action).await?;
+        if open_by_proposer >= MAX_OPEN_PROPOSALS_PER_SUBMITTER {
+            return Err(Error::Module(format!(
+                "submitter already has {MAX_OPEN_PROPOSALS_PER_SUBMITTER} open proposals"
+            )));
+        }
         // Gate the submitter before resolving up to MAX_SHARE_ACCOUNTS Identity
         // records for an adoption proposal.
         let action = self.normalize_share_action(ctx, action).await?;
 
-        let now = ctx.env().consensus_time;
         let deadline = now
             .checked_add(voting_period)
             .ok_or_else(|| Error::Module("voting deadline overflows consensus time".into()))?;
@@ -810,23 +931,23 @@ impl Governance {
             votes: BTreeMap::new(),
             electorate,
         };
-        // both byte gates first: a refusal must stage NOTHING. a NEW proposal
-        // is gated at HALF the record cap so accrued ballots (at most one per
-        // electorate entry, each no larger than its entry) can never push the
-        // settled record past the full cap.
+        // both byte gates first: a refusal must stage nothing new for THIS
+        // proposal (any reaping above already staged its own settle writes —
+        // fine either way this call ends: accepted, they're real
+        // settlements that happened anyway; rejected, the whole unit's stage
+        // rolls back with it and the next `Propose` redoes the reap). a NEW
+        // proposal is gated at HALF the record cap so accrued ballots (at
+        // most one per electorate entry, each no larger than its entry) can
+        // never push the settled record past the full cap.
         self.store_bounded(
             prop_key(&proposal_id),
             &proposal,
             MAX_PROPOSAL_RECORD_BYTES / 2,
             "proposal",
         )?;
+        let position = roster.binary_search(&proposal_id).unwrap_or_else(|p| p);
         roster.insert(position, proposal_id);
-        self.store_bounded(
-            PROPOSAL_ROSTER_KEY.to_vec(),
-            &roster,
-            MAX_ROSTER_RECORD_BYTES,
-            "proposal roster",
-        )?;
+        self.stage_roster(&roster)?;
         Ok(())
     }
 
@@ -836,6 +957,7 @@ impl Governance {
         proposal_id: String,
         approve: bool,
     ) -> Result<(), Error> {
+        self.reap_roster(ctx.env().consensus_time).await?;
         let mut proposal = self
             .proposal(&proposal_id)
             .await?
@@ -881,6 +1003,24 @@ impl Governance {
             return Err(Error::Module("proposal is settled".into()));
         }
 
+        let now = ctx.env().consensus_time;
+        // the bounded execution window: a frozen electorate cannot enact its
+        // mandate forever, only until `deadline + EXECUTION_GRACE` — past
+        // that it is settled Rejected right here (an `Ok` write, not a
+        // refusal that would roll it back) instead of tallying a membership
+        // snapshot that may no longer hold standing.
+        let execution_deadline = proposal.deadline.saturating_add(EXECUTION_GRACE);
+        let past_execution_window = now >= execution_deadline;
+        if past_execution_window {
+            proposal.status = ProposalStatus::Rejected;
+            return self.settle(&proposal_id, &proposal).await;
+        }
+
+        // opportunistic hygiene: reap every OTHER roster entry already past
+        // its own execution window too, so expiry never depends on someone
+        // else calling `Propose`.
+        self.reap_roster(now).await?;
+
         let electorate = &proposal.electorate;
         let mut yes = 0u64;
         let mut no = 0u64;
@@ -905,7 +1045,7 @@ impl Governance {
                 (passes, irreversible)
             }
         };
-        if ctx.env().consensus_time < proposal.deadline && !decidable_early {
+        if now < proposal.deadline && !decidable_early {
             return Err(Error::Module(format!(
                 "not decidable yet: voting open until {} (yes={yes}, no={no}, total={total})",
                 proposal.deadline
@@ -954,9 +1094,9 @@ impl Governance {
                     activation_height,
                     code_hash,
                 } => match &self.code_registry_id {
-                    Some(lifecycle) => ctx.emit_msg(Msg {
-                        target: lifecycle.clone(),
-                        payload: lifecycle_encode_msg(&LifecycleMsg::ScheduleSwap {
+                    Some(registry) => ctx.emit_msg(Msg {
+                        target: registry.clone(),
+                        payload: modules_encode_msg(&ModulesMsg::ScheduleSwap {
                             name: name.clone(),
                             module_id: module_id.clone(),
                             activation_height: *activation_height,
@@ -974,9 +1114,9 @@ impl Governance {
                     activation_height,
                     code_hash,
                 } => match &self.code_registry_id {
-                    Some(lifecycle) => ctx.emit_msg(Msg {
-                        target: lifecycle.clone(),
-                        payload: lifecycle_encode_msg(&LifecycleMsg::ScheduleRegister {
+                    Some(registry) => ctx.emit_msg(Msg {
+                        target: registry.clone(),
+                        payload: modules_encode_msg(&ModulesMsg::ScheduleRegister {
                             name: name.clone(),
                             module_id: module_id.clone(),
                             activation_height: *activation_height,
@@ -986,9 +1126,9 @@ impl Governance {
                     None => proposal.status = ProposalStatus::Rejected,
                 },
                 GovAction::CancelModuleUpdate { name, module_id } => match &self.code_registry_id {
-                    Some(lifecycle) => ctx.emit_msg(Msg {
-                        target: lifecycle.clone(),
-                        payload: lifecycle_encode_msg(&LifecycleMsg::CancelSwap {
+                    Some(registry) => ctx.emit_msg(Msg {
+                        target: registry.clone(),
+                        payload: modules_encode_msg(&ModulesMsg::CancelSwap {
                             name: name.clone(),
                             module_id: module_id.clone(),
                         }),
@@ -1026,7 +1166,7 @@ impl Governance {
                 GovAction::SetShares { account_id, shares } => {
                     let Some(mut after) = self.shares().await? else {
                         proposal.status = ProposalStatus::Rejected;
-                        return self.store_proposal(&proposal_id, &proposal);
+                        return self.settle(&proposal_id, &proposal).await;
                     };
                     if *shares == 0 {
                         after.remove(account_id);
@@ -1063,7 +1203,7 @@ impl Governance {
         } else {
             proposal.status = ProposalStatus::Rejected;
         }
-        self.store_proposal(&proposal_id, &proposal)
+        self.settle(&proposal_id, &proposal).await
     }
 
     /// redeem an invite — no ballot, the mint WAS the admission decision.

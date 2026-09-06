@@ -11,7 +11,8 @@
 //!     `commit_block` / discarded at `abort_block` — byte-for-byte the native
 //!     module staging contract.
 //!   * determinism is by construction: fresh instance (no memory carryover),
-//!     fuel-metered termination, no ambient host imports, integer/bytes ABI.
+//!     a per-DISPATCH fuel budget ([`DEFAULT_FUEL`]) spent across the replay
+//!     rounds, no ambient host imports, integer/bytes ABI.
 //!   * cross-module reads (`module-root` / `query-module`) are MEMOIZED REPLAY:
 //!     the sync guest world cannot await the host's async `Ctx`, so a read the
 //!     per-dispatch memo can't answer pauses the run (a deterministic trap), the
@@ -40,6 +41,8 @@
 //!     overlay and the commit/abort boundary are identical in both backings.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, HasSelf, Linker};
@@ -65,23 +68,90 @@ mod bindings {
             "ducktape:module/host.query-module": trappable,
             // object reads pause on a memo miss exactly like the sibling reads:
             // the driver resolves them against the odb backing and replays.
-            // `object-put` is NOT trappable — the host computes the id purely
-            // and returns it, so it can never fail.
             "ducktape:module/host.object-stat": trappable,
             "ducktape:module/host.object-get": trappable,
+            // every WRITING import traps on one thing only: the bytes it would
+            // add push this dispatch past [`MAX_HOST_BYTES`]. the copy happens
+            // in host code, which fuel does not price, so this is the meter
+            // that bounds it. see `HostData::charge`.
+            "ducktape:module/host.state-set": trappable,
+            "ducktape:module/host.state-delete": trappable,
+            "ducktape:module/host.object-put": trappable,
+            "ducktape:module/host.emit-msg": trappable,
+            "ducktape:module/host.emit-event": trappable,
+            "ducktape:module/host.set-assigned": trappable,
         },
     });
 }
 
 use bindings::Module as ModuleWorld;
 use bindings::ducktape::module::host::{
-    self, Env as WitEnv, Error as WitError, Origin as WitOrigin,
+    self, Backing as WitBacking, Env as WitEnv, Error as WitError, ModuleShape as WitShape,
+    Origin as WitOrigin,
 };
 
-/// default per-dispatch fuel budget: the deterministic termination bound. It is
-/// identical on every validator, so a runaway guest traps at the same point on
-/// all of them — a trap is a deterministic rejection, not a per-node fork.
-pub const DEFAULT_FUEL: u64 = 2_000_000_000;
+/// where a wasm module's COMMITTED state lives: the kind a component declares
+/// ([`Shape::backing`]) and the host must wrap it over. the public twin of
+/// the private [`StateBacking`], which carries the substrate itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backing {
+    /// a host-owned key/value map: root = sha256 over the canonical encoding,
+    /// sync = installable snapshot bytes.
+    Map,
+    /// a host-constructed authenticated store (qmdb): root = the store's
+    /// merkle root, sync = the store's resolver lane.
+    Store,
+    /// a host-side content-addressed substrate the host provides by module
+    /// id: root = the substrate's fold of its refs image.
+    Odb,
+}
+
+/// what a component declares about itself — the `module.wit` `shape` export,
+/// read from the bytes by [`WasmModule::declared_shape`] and applied by every
+/// constructor: the backing it must be wrapped over, the network config keys
+/// it needs seeded when it starts fresh, and whether its query lane is
+/// committed-only. a property of the code: the same bytes always answer the
+/// same shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shape {
+    pub backing: Backing,
+    pub config: Vec<String>,
+    pub committed_queries: bool,
+}
+
+impl Shape {
+    fn from_wit(declared: WitShape) -> Self {
+        Self {
+            backing: match declared.backing {
+                WitBacking::Map => Backing::Map,
+                WitBacking::Store => Backing::Store,
+                WitBacking::Odb => Backing::Odb,
+            },
+            config: declared.config,
+            committed_queries: declared.committed_queries,
+        }
+    }
+}
+
+/// the fuel budget of one DISPATCH (and of one query): the deterministic
+/// termination bound. It is identical on every validator, so a runaway guest
+/// traps at the same point on all of them — a trap is a deterministic
+/// rejection, not a per-node fork.
+///
+/// It is spent ACROSS the memoized-replay rounds, not re-granted per round: a
+/// round starts with exactly what the previous round left, and a dispatch that
+/// runs out traps like any single-round fuel exhaustion. Replay re-treads the
+/// pure prefix and that repetition is the GUEST'S cost — otherwise a guest
+/// could buy a fresh full budget per forced replay, up to
+/// [`MAX_SIBLING_READS`] + [`MAX_STORE_READS`] + [`MAX_OBJECT_READS`] times in
+/// one op.
+///
+/// The number covers the replay overhead the read budgets imply: an op that
+/// spends its whole [`MAX_OBJECT_READS`] / [`MAX_STORE_READS`] budget re-treads
+/// a prefix growing by one read per round, so its rounds cost ~n²/2 read calls
+/// — just under 4e9 fuel for a full object-read budget with no guest logic at
+/// all. Half of this is that floor; the other half is the op's own work.
+pub const DEFAULT_FUEL: u64 = 8_000_000_000;
 
 /// per-dispatch bound on DISTINCT sibling reads (`module-root` + `query-module`).
 /// each unresolved read replays the pure guest once with the answer memoized, so
@@ -106,6 +176,82 @@ pub const MAX_STORE_READS: usize = 4096;
 /// identically on every validator. only tenants that call the object imports
 /// (the files guest) ever accrue against it; every other tenant leaves it at 0.
 pub const MAX_OBJECT_READS: usize = 4096;
+
+/// hard cap on the bytes a guest may hand the HOST: the running total across
+/// every guest-fed collection — staged state writes, staged object puts,
+/// emitted msgs and events, the assigned stamp. Fuel prices guest instructions;
+/// the canonical-ABI copy that materializes a `list<u8>` runs in host code and
+/// costs the guest ~10 fuel per call, so without this meter
+/// `loop { emit_msg("x", one_mib) }` allocates hundreds of GB inside one
+/// dispatch and OOM-kills the node before any fuel trap fires. The guest's own
+/// linear memory bounds ONE buffer, never the accumulation.
+///
+/// The counter is seeded with what the block already holds (the staged overlay
+/// and the block's staged objects both ride into every round), so this bounds
+/// the BLOCK's accumulation too — `staged_objects` grows across every dispatch
+/// until the boundary. 64 MiB is orders of magnitude above any real op (an op
+/// is a few hundred bytes and its writes a few KB) and far below what a
+/// validator can lose in a block.
+pub const MAX_HOST_BYTES: usize = 64 * 1024 * 1024;
+
+/// what one guest-fed ENTRY costs against [`MAX_HOST_BYTES`] beside its own
+/// bytes — the map node / vec slot the host allocates for it. Without it a
+/// `loop { emit_msg("", &[]) }` would be free of the meter and unbounded in
+/// count.
+const HOST_ENTRY_BYTES: usize = 64;
+
+/// hard ceiling on a guest's LINEAR MEMORY, in bytes. Without it a `memory.grow`
+/// succeeds or fails according to how much RAM the validator's process happens
+/// to have free — the same bytes and the same inputs then write state A on a
+/// 64 GiB node and state B on a 4 GiB one, a fork out of host hardware. With it
+/// the refusal is a protocol constant: a grow past the ceiling returns -1
+/// identically everywhere (the limiter does not trap on grow failure, so the
+/// guest sees the wasm-defined -1 and may branch on it — deterministically).
+///
+/// 256 MiB is the ceiling because it is far above what any consensus guest
+/// legitimately needs (a dispatch's whole working set is one op, its staged
+/// writes, and the objects it walked) and far below the memory a validator can
+/// lose without the node itself failing.
+pub const MAX_GUEST_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+
+/// hard ceiling on the elements of one guest table (LLVM emits a funcref table
+/// per module). `table.grow` past it returns -1, like the memory ceiling.
+pub const MAX_GUEST_TABLE_ELEMENTS: usize = 1 << 20;
+
+/// hard ceiling on the core instances / tables / memories one component may
+/// bring up in a store. A `ducktape:module` component is a handful of core
+/// instances (the guest plus its adapters); these are generous by an order of
+/// magnitude and exist so the count is a protocol constant rather than
+/// wasmtime's default of 10000.
+pub const MAX_GUEST_INSTANCES: usize = 256;
+pub const MAX_GUEST_TABLES: usize = 128;
+pub const MAX_GUEST_MEMORIES: usize = 16;
+
+/// the native stack a guest call may use, pinned rather than inherited: a
+/// recursion depth that traps here must trap at the same depth on every
+/// validator, and wasmtime's default is free to move between releases. This IS
+/// that default today (512 KiB) — the point is that it stops being a default.
+pub const MAX_GUEST_STACK_BYTES: usize = 512 * 1024;
+
+/// the store-resource ceilings every [`Store`] this crate builds installs (see
+/// [`MAX_GUEST_MEMORY_BYTES`]). Growth past a ceiling is refused, not trapped,
+/// so the guest observes the ordinary wasm -1. It is the `Default`, so no
+/// [`HostData`] — however it is built — can back a store with no ceilings.
+struct GuestLimits(wasmtime::StoreLimits);
+
+impl Default for GuestLimits {
+    fn default() -> Self {
+        Self(
+            wasmtime::StoreLimitsBuilder::new()
+                .memory_size(MAX_GUEST_MEMORY_BYTES)
+                .table_elements(MAX_GUEST_TABLE_ELEMENTS)
+                .instances(MAX_GUEST_INSTANCES)
+                .tables(MAX_GUEST_TABLES)
+                .memories(MAX_GUEST_MEMORIES)
+                .build(),
+        )
+    }
+}
 
 /// the host-side content-addressed object store a wasm odb tenant reads from
 /// and stages puts against. Task 1 ships only the trait + the plumbing that
@@ -229,6 +375,21 @@ pub trait OdbBacking: HostOdb {
 /// of the image, NOT the KV encoding, so there is no `__root` twin. every odb
 /// guest MUST read/write its image under this exact key.
 pub const REFS_KEY: &[u8] = b"__state";
+
+/// an odb-backed round's committed map: the one reserved refs entry, plus
+/// [`sdk::genesis_config::CONFIG_KEY`] when the tenant's shape declared config
+/// keys (`config` — see [`CompiledModule::over_odb`]) — the same key a
+/// Map-backed tenant's `state-get` answers out of its own committed map, so
+/// `guest_adapter::load_config` works regardless of backing. a free function
+/// (not a `WasmModule` method) because both call sites reach it while
+/// `self.backing` is already borrowed by their enclosing match.
+fn odb_committed(backing: &dyn OdbBacking, config: &Option<Vec<u8>>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut committed = BTreeMap::from([(REFS_KEY.to_vec(), backing.refs_bytes())]);
+    if let Some(config) = config {
+        committed.insert(sdk::genesis_config::CONFIG_KEY.to_vec(), config.clone());
+    }
+    committed
+}
 
 /// trap message for a read the memo cannot answer yet. never surfaces to
 /// consensus: the execute/query drivers intercept the run (via
@@ -367,6 +528,48 @@ struct HostData {
     out_msgs: Vec<(String, Vec<u8>)>,
     out_events: Vec<(String, Vec<u8>)>,
     out_assigned: Vec<u8>,
+    /// the store-resource ceilings this round runs under ([`GuestLimits`]).
+    /// Lives in the store DATA because a wasmtime limiter is a projection out
+    /// of `T` — every `Store::new` in this crate pairs with a `.limiter()` that
+    /// hands wasmtime this field.
+    limits: GuestLimits,
+    /// bytes this run has fed the host across `staged`, `object_puts`,
+    /// `out_msgs`, `out_events` and `out_assigned` — seeded with what it
+    /// STARTED holding (the block's stage rides into every round) and charged
+    /// by every writing import. See [`MAX_HOST_BYTES`].
+    host_bytes: usize,
+}
+
+/// what the block's staged writes already cost against [`MAX_HOST_BYTES`] — a
+/// round starts on them, so it starts charged for them.
+fn staged_bytes(staged: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> usize {
+    staged
+        .iter()
+        .map(|(key, value)| HOST_ENTRY_BYTES + key.len() + value.as_ref().map_or(0, Vec::len))
+        .sum()
+}
+
+/// the same seed for the block's staged object puts.
+fn object_bytes(puts: &BTreeMap<Vec<u8>, Vec<u8>>) -> usize {
+    puts.iter()
+        .map(|(id, tagged)| HOST_ENTRY_BYTES + id.len() + tagged.len())
+        .sum()
+}
+
+impl HostData {
+    /// charge `bytes` of guest-fed host allocation, or refuse the import. The
+    /// refusal is a trap, so it rejects the whole op — deterministically, at the
+    /// same call on every validator, because the counter is a pure function of
+    /// consensus state and the guest's own calls.
+    fn charge(&mut self, bytes: usize) -> wasmtime::Result<()> {
+        self.host_bytes = self.host_bytes.saturating_add(HOST_ENTRY_BYTES + bytes);
+        if self.host_bytes > MAX_HOST_BYTES {
+            return Err(wasmtime::Error::msg(format!(
+                "host-output budget exceeded ({MAX_HOST_BYTES} bytes)"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl host::Host for HostData {
@@ -389,11 +592,18 @@ impl host::Host for HostData {
         self.pending = Some(PendingRead::State(key));
         Err(wasmtime::Error::msg(PENDING_READ_TRAP))
     }
-    fn state_set(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    /// the meter charges every call, not the map's net growth: re-setting one
+    /// key in a loop still copies a fresh value per call, and that copy is the
+    /// cost being bounded.
+    fn state_set(&mut self, key: Vec<u8>, value: Vec<u8>) -> wasmtime::Result<()> {
+        self.charge(key.len() + value.len())?;
         self.staged.insert(key, Some(value));
+        Ok(())
     }
-    fn state_delete(&mut self, key: Vec<u8>) {
+    fn state_delete(&mut self, key: Vec<u8>) -> wasmtime::Result<()> {
+        self.charge(key.len())?;
         self.staged.insert(key, None);
+        Ok(())
     }
     fn module_root(&mut self, target: String) -> wasmtime::Result<Option<Vec<u8>>> {
         if let Some(answer) = self.memo.roots.get(&target) {
@@ -448,25 +658,45 @@ impl host::Host for HostData {
         Err(wasmtime::Error::msg(PENDING_READ_TRAP))
     }
     /// stage a put: the host computes `id = sha256(kind ‖ body)` and returns it
-    /// ALONE (a hash mismatch is impossible here — the fail-closed publish check
+    /// (a hash mismatch is impossible here — the fail-closed publish check
     /// rides the disk backing's staged→published seam). the tagged body lands
     /// in this round's overlay so a later stat/get of `id` answers immediately.
-    fn object_put(&mut self, kind: u8, body: Vec<u8>) -> Vec<u8> {
+    /// the ONE way it fails is the host-byte meter: staged objects accumulate
+    /// across the whole block, so they are the hungriest guest-fed collection.
+    fn object_put(&mut self, kind: u8, body: Vec<u8>) -> wasmtime::Result<Vec<u8>> {
+        self.charge(ROOT_LEN + 1 + body.len())?;
         let mut tagged = Vec::with_capacity(1 + body.len());
         tagged.push(kind);
         tagged.extend_from_slice(&body);
         let id = sha256(&tagged);
         self.object_puts.insert(id.clone(), tagged);
-        id
+        Ok(id)
     }
-    fn emit_msg(&mut self, target: String, payload: Vec<u8>) {
+    fn emit_msg(&mut self, target: String, payload: Vec<u8>) -> wasmtime::Result<()> {
+        self.charge(target.len() + payload.len())?;
         self.out_msgs.push((target, payload));
+        Ok(())
     }
-    fn emit_event(&mut self, source: String, payload: Vec<u8>) {
+    fn emit_event(&mut self, source: String, payload: Vec<u8>) -> wasmtime::Result<()> {
+        self.charge(source.len() + payload.len())?;
         self.out_events.push((source, payload));
+        Ok(())
     }
-    fn set_assigned(&mut self, stamp: Vec<u8>) {
+    /// the stamp carries the module-assigned scalars of one applied op, so it
+    /// is capped at [`sdk::MAX_ASSIGNED_BYTES`] — the SAME cap the host applies
+    /// after `execute` returns, moved to the call that allocates. a stamp
+    /// REPLACES the previous one, so only the meter charge accumulates.
+    fn set_assigned(&mut self, stamp: Vec<u8>) -> wasmtime::Result<()> {
+        if stamp.len() > sdk::MAX_ASSIGNED_BYTES {
+            return Err(wasmtime::Error::msg(format!(
+                "assigned stamp exceeds cap ({} > {})",
+                stamp.len(),
+                sdk::MAX_ASSIGNED_BYTES
+            )));
+        }
+        self.charge(stamp.len())?;
         self.out_assigned = stamp;
+        Ok(())
     }
 }
 
@@ -514,6 +744,143 @@ enum StateBacking {
     Odb { backing: Box<dyn OdbBacking> },
 }
 
+impl StateBacking {
+    fn kind(&self) -> Backing {
+        match self {
+            StateBacking::Map { .. } => Backing::Map,
+            StateBacking::Store { .. } => Backing::Store,
+            StateBacking::Odb { .. } => Backing::Odb,
+        }
+    }
+}
+
+/// a compiled component, its declared [`Shape`], and the engine + linker it
+/// instantiates under — the compile-once half of every load. a host wraps it
+/// over the substrate the shape names ([`over_map`](Self::over_map),
+/// [`over_store`](Self::over_store), [`over_odb`](Self::over_odb)) without
+/// compiling the bytes a second time.
+pub struct CompiledModule {
+    engine: Engine,
+    linker: Linker<HostData>,
+    component: Component,
+    code_hash: Vec<u8>,
+    shape: Shape,
+}
+
+impl CompiledModule {
+    /// compile the bytes against this build's real linker and read the shape
+    /// they declare. this is ALSO the loadability proof: a component
+    /// importing a host function this build does not provide fails here, at
+    /// instantiate, rather than per dispatch on the live path (a validator
+    /// must prove the bytes load HERE before it votes a swap ready, or it
+    /// arms a swap it cannot run and forks the instant it activates). the
+    /// shape is read outside any dispatch with no env set, so a `shape` that
+    /// touches an import traps — a shape is a pure constant of the code.
+    pub fn compile(component_bytes: &[u8]) -> Result<Self, SdkError> {
+        let engine = Engine::new(&deterministic_config()).map_err(module_err)?;
+        let component = Component::from_binary(&engine, component_bytes).map_err(module_err)?;
+        let mut linker = Linker::new(&engine);
+        ModuleWorld::add_to_linker::<HostData, HasSelf<HostData>>(&mut linker, |d| d)
+            .map_err(module_err)?;
+        let shape = read_shape(&engine, &linker, &component)?;
+        Ok(Self {
+            engine,
+            linker,
+            component,
+            code_hash: sha256(component_bytes),
+            shape,
+        })
+    }
+
+    /// what the bytes declare about themselves.
+    pub fn shape(&self) -> &Shape {
+        &self.shape
+    }
+
+    /// wrap over an empty host-KV map — for a component declaring
+    /// [`Backing::Map`].
+    pub fn over_map(self, id: impl Into<ModuleId>) -> Result<WasmModule, SdkError> {
+        WasmModule::load(
+            id.into(),
+            self,
+            StateBacking::Map {
+                committed: BTreeMap::new(),
+            },
+            None,
+        )
+    }
+
+    /// wrap over a host-injected authenticated store (already opened, or
+    /// already synced to a verified root) — for a component declaring
+    /// [`Backing::Store`].
+    pub fn over_store(
+        self,
+        id: impl Into<ModuleId>,
+        store: Box<dyn MerkleStore>,
+    ) -> Result<WasmModule, SdkError> {
+        WasmModule::load(id.into(), self, StateBacking::Store { store }, None)
+    }
+
+    /// wrap over a host-side content-addressed substrate — for a component
+    /// declaring [`Backing::Odb`]. `config` is the [`sdk::genesis_config`]-
+    /// encoded `__config` bytes to serve alongside [`REFS_KEY`] on the state
+    /// lane (`None` when the shape declares no config keys) — the odb twin of
+    /// the `__config` record a Map/Store tenant carries inside its own
+    /// committed state.
+    pub fn over_odb(
+        self,
+        id: impl Into<ModuleId>,
+        backing: Box<dyn OdbBacking>,
+        config: Option<Vec<u8>>,
+    ) -> Result<WasmModule, SdkError> {
+        WasmModule::load(id.into(), self, StateBacking::Odb { backing }, config)
+    }
+}
+
+/// instantiate once, outside any dispatch, and read the component's declared
+/// shape (see [`CompiledModule::compile`]). no state is touched; the store
+/// dies with the probe.
+fn read_shape(
+    engine: &Engine,
+    linker: &Linker<HostData>,
+    component: &Component,
+) -> Result<Shape, SdkError> {
+    let mut store = Store::new(engine, HostData::default());
+    store.limiter(|d| &mut d.limits.0);
+    store.set_fuel(DEFAULT_FUEL).map_err(module_err)?;
+    let instance = ModuleWorld::instantiate(&mut store, component, linker).map_err(module_err)?;
+    let declared = instance.call_shape(&mut store).map_err(module_err)?;
+    Ok(Shape::from_wit(declared))
+}
+
+/// the `ducktape:module` world's own exports — what makes a component a
+/// module at all, ahead of any question about whether THIS build can run it.
+const MODULE_WORLD_EXPORTS: [&str; 3] = ["shape", "execute", "query"];
+
+/// whether these bytes are a `ducktape:module` component AT ALL: they parse as
+/// a component and it exports the world's surface.
+///
+/// Deliberately NOT a loadability check ([`CompiledModule::compile`] is that,
+/// and it also links imports and runs `shape`). A genuine module whose bytes
+/// this build cannot run must still fail its boundary CLOSED — skipping it
+/// would seat a different registry set here than on peers that could run it,
+/// which is the silent fork the readiness probe exists to prevent. This asks
+/// the one question whose answer means "not an admission at all": code
+/// committed under an id for ANOTHER plane — the `ducktape:netstack` guest's
+/// configure/step/snapshot/restore — is a commitment record the module
+/// boundary has no business instantiating.
+pub fn speaks_module_abi(component_bytes: &[u8]) -> bool {
+    let Ok(engine) = Engine::new(&deterministic_config()) else {
+        return false;
+    };
+    let Ok(component) = Component::from_binary(&engine, component_bytes) else {
+        return false;
+    };
+    MODULE_WORLD_EXPORTS
+        .iter()
+        .all(|name| component.get_export_index(None, *name).is_some())
+}
+
 /// A wasm module: a `ducktape:module` component plus its host-owned
 /// authenticated state. Presented to the host as an ordinary [`sdk::Module`].
 pub struct WasmModule {
@@ -526,6 +893,15 @@ pub struct WasmModule {
     /// `root()` (code is invisible to the root-hash); per-node realization only.
     code_hash: Vec<u8>,
     backing: StateBacking,
+    /// the [`sdk::genesis_config`]-encoded `__config` bytes an odb-backed
+    /// tenant reads through the state lane, beside [`REFS_KEY`] — `None` for
+    /// a Map/Store backing (they carry their config INSIDE their committed
+    /// state instead, seeded by `noded::compose`) or an odb tenant whose
+    /// shape declares no config keys. unlike Map's `__config` entry, this is
+    /// never installed/staged/rooted: it is a pure function of the network's
+    /// bindings, recomputed identically by every node on every construction
+    /// (genesis, reopen, or a later admission), so there is nothing to persist.
+    odb_config: Option<Vec<u8>>,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// this block's accumulated staged object puts (id → tagged body), across
     /// every dispatch since the last commit/abort — the object-plane twin of
@@ -534,11 +910,12 @@ pub struct WasmModule {
     staged_objects: BTreeMap<Vec<u8>, Vec<u8>>,
     fuel: u64,
     /// serve QUERY rounds from committed state ALONE — the staged overlay is
-    /// dropped for the read (execute rounds are untouched). opt-in, for a ported
-    /// native module whose query surface was committed-only regardless of caller
-    /// (e.g. dispatch, whose between-block delivery injection must never observe a
-    /// same-block staged write). off by default: every other tenant keeps the
-    /// read-your-writes query surface.
+    /// dropped for the read (execute rounds are untouched). the component's
+    /// own declaration ([`Shape::committed_queries`]), for a module whose
+    /// query surface is committed-only regardless of caller (dispatch, whose
+    /// between-block delivery injection must never observe a same-block
+    /// staged write). every other tenant keeps the read-your-writes query
+    /// surface.
     committed_queries: bool,
     /// the height of the block currently staging, captured each `execute` and
     /// consumed at the block boundary. only [`StateBacking::Odb`] reads it — it
@@ -550,58 +927,59 @@ pub struct WasmModule {
 }
 
 impl WasmModule {
-    fn load(id: ModuleId, component_bytes: &[u8], backing: StateBacking) -> Result<Self, SdkError> {
-        let engine = Engine::new(&deterministic_config()).map_err(module_err)?;
-        let component = Component::from_binary(&engine, component_bytes).map_err(module_err)?;
-        let mut linker = Linker::new(&engine);
-        ModuleWorld::add_to_linker::<HostData, HasSelf<HostData>>(&mut linker, |d| d)
-            .map_err(module_err)?;
+    /// wrap a compiled component over `backing`: the ONE constructor. the
+    /// component's declared shape is applied here — its backing must be the
+    /// kind offered (a module runs over the substrate its code declares,
+    /// never another; a mismatch is a wiring bug refused by name, never a
+    /// module silently computing a root over the wrong substrate) and its
+    /// committed-query mode is taken as declared.
+    fn load(
+        id: ModuleId,
+        compiled: CompiledModule,
+        backing: StateBacking,
+        odb_config: Option<Vec<u8>>,
+    ) -> Result<Self, SdkError> {
+        Self::require_declared_backing(&id, &compiled.shape, backing.kind())?;
         Ok(Self {
             id,
-            engine,
-            linker,
-            component,
-            code_hash: sha256(component_bytes),
+            engine: compiled.engine,
+            linker: compiled.linker,
+            component: compiled.component,
+            code_hash: compiled.code_hash,
             backing,
+            odb_config,
             staged: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
-            committed_queries: false,
+            committed_queries: compiled.shape.committed_queries,
             block_height: None,
         })
     }
 
-    /// Load a module from component bytes with an empty host-KV state store.
-    pub fn from_bytes(id: impl Into<ModuleId>, component_bytes: &[u8]) -> Result<Self, SdkError> {
-        Self::load(
-            id.into(),
-            component_bytes,
-            StateBacking::Map {
-                committed: BTreeMap::new(),
-            },
-        )
+    fn require_declared_backing(id: &str, shape: &Shape, offered: Backing) -> Result<(), SdkError> {
+        let runs_over_its_declared_substrate = shape.backing == offered;
+        if runs_over_its_declared_substrate {
+            return Ok(());
+        }
+        Err(SdkError::Module(format!(
+            "module {id}: the component declares a {:?} backing but the host offered {offered:?} — fail-closed",
+            shape.backing
+        )))
     }
 
-    /// Can THIS BINARY actually run these component bytes?
-    ///
-    /// [`Component::from_binary`] only validates and compiles. A component
-    /// importing a host function this build does not provide fails at
-    /// INSTANTIATE — which on the live path happens per dispatch, one block at
-    /// a time, and surfaces as [`SdkError::Module`]: a rejection documented as
-    /// deterministic because "the same code runs on every validator". That
-    /// premise is false under binary skew, so a validator must prove the bytes
-    /// load HERE before it votes a code swap ready; otherwise it arms a swap it
-    /// cannot run and forks the instant the swap activates (#1297).
-    ///
-    /// Instantiates against this build's real linker and throws the instance
-    /// away: no state is touched and the temporary engine dies with it.
-    pub fn check_loadable(component_bytes: &[u8]) -> Result<(), SdkError> {
-        let probe = Self::from_bytes("code-probe", component_bytes)?;
-        let mut store = Store::new(&probe.engine, HostData::default());
-        store.set_fuel(probe.fuel).map_err(module_err)?;
-        ModuleWorld::instantiate(&mut store, &probe.component, &probe.linker)
-            .map_err(module_err)?;
-        Ok(())
+    /// the shape these component bytes declare — what the host must know to
+    /// wrap them over a substrate — and the proof that THIS BINARY can run
+    /// them ([`CompiledModule::compile`]). the compilation is discarded; a
+    /// caller about to wrap the bytes compiles once through
+    /// [`CompiledModule`] instead.
+    pub fn declared_shape(component_bytes: &[u8]) -> Result<Shape, SdkError> {
+        Ok(CompiledModule::compile(component_bytes)?.shape)
+    }
+
+    /// Load a module from component bytes with an empty host-KV state store —
+    /// for a component declaring the [`Backing::Map`] shape.
+    pub fn from_bytes(id: impl Into<ModuleId>, component_bytes: &[u8]) -> Result<Self, SdkError> {
+        CompiledModule::compile(component_bytes)?.over_map(id)
     }
 
     /// Load a module from component bytes over a host-injected authenticated
@@ -610,13 +988,14 @@ impl WasmModule {
     /// sync is the store's resolver lane. this is the STORE-BACKED port shape:
     /// a native module written over `Box<dyn MerkleStore>` compiles into the
     /// guest and drives the very same store through the wit `state-*` imports,
-    /// so the cutover is root-continuous.
+    /// so the cutover is root-continuous. for a component declaring
+    /// [`Backing::Store`].
     pub fn with_store(
         id: impl Into<ModuleId>,
         component_bytes: &[u8],
         store: Box<dyn MerkleStore>,
     ) -> Result<Self, SdkError> {
-        Self::load(id.into(), component_bytes, StateBacking::Store { store })
+        CompiledModule::compile(component_bytes)?.over_store(id, store)
     }
 
     /// Load a module from component bytes over a host-side duckfs substrate —
@@ -626,12 +1005,13 @@ impl WasmModule {
     /// it. this is the ROOT-CONTINUOUS files port: a native module written over
     /// duckfs's disk odb + refs file cuts over with no root movement. the boxed
     /// backing is both the committed refs owner and this tenant's [`HostOdb`].
+    /// for a component declaring [`Backing::Odb`].
     pub fn with_odb(
         id: impl Into<ModuleId>,
         component_bytes: &[u8],
         backing: Box<dyn OdbBacking>,
     ) -> Result<Self, SdkError> {
-        Self::load(id.into(), component_bytes, StateBacking::Odb { backing })
+        CompiledModule::compile(component_bytes)?.over_odb(id, backing, None)
     }
 
     fn is_store_backed(&self) -> bool {
@@ -680,18 +1060,6 @@ impl WasmModule {
                 unreachable!("resolve_object_read only handles object-plane reads")
             }
         }
-    }
-
-    /// serve this tenant's QUERY rounds from committed state ALONE — drop the
-    /// staged overlay for the read (execute rounds keep their read-your-writes
-    /// stage). the opt-in for a ported native module whose query surface was
-    /// committed-only regardless of caller: dispatch answers `Module::query` from
-    /// committed state so a same-block sibling read never observes an uncommitted
-    /// write (the between-block delivery injection depends on it). every other
-    /// tenant leaves this off and keeps the read-your-writes query surface.
-    pub fn with_committed_queries(mut self) -> Self {
-        self.committed_queries = true;
-        self
     }
 
     /// Canonical bytes of a store: count + length-prefixed sorted `(key, value)`
@@ -774,9 +1142,7 @@ impl WasmModule {
             // reserved key; the guest reads it staged-over via the state lane.
             // (queries delegate to the backing, so this only feeds execute
             // rounds — a query never instantiates the guest for this backing.)
-            StateBacking::Odb { backing } => {
-                BTreeMap::from([(REFS_KEY.to_vec(), backing.refs_bytes())])
-            }
+            StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
         }
     }
 
@@ -785,14 +1151,16 @@ impl WasmModule {
     /// query serves from its live struct (out of block the overlay is empty, so
     /// this is the committed projection). writes a guest attempts here land in
     /// the round's own copy and are dropped: read-only by construction. returns
-    /// the outcome plus the memo and any pending read the round paused on.
+    /// the outcome plus the memo, any pending read the round paused on, and the
+    /// fuel it left for the next one.
     fn query_round(
         &self,
         env: WitEnv,
         memo: SiblingMemo,
         sealed: bool,
         req: &[u8],
-    ) -> (Result<Vec<u8>, SdkError>, SiblingMemo, Option<PendingRead>) {
+        fuel: u64,
+    ) -> QueryRound {
         // committed-only tenants (opt-in) answer queries from committed state
         // alone: the staged overlay is dropped for this read. execute rounds are
         // untouched — and a query round never writes, so an empty stage is a pure
@@ -802,6 +1170,10 @@ impl WasmModule {
         } else {
             self.staged.clone()
         };
+        // a round starts charged for what it already holds: the block's staged
+        // writes ride into every round, so the meter bounds the BLOCK, not just
+        // this call.
+        let host_bytes = staged_bytes(&staged);
         let data = HostData {
             env: Some(env),
             committed: self.committed_for_round(),
@@ -817,19 +1189,37 @@ impl WasmModule {
             out_msgs: Vec::new(),
             out_events: Vec::new(),
             out_assigned: Vec::new(),
+            limits: GuestLimits::default(),
+            host_bytes,
         };
         let mut store = Store::new(&self.engine, data);
-        let call: Result<Result<Vec<u8>, WitError>, SdkError> = match store.set_fuel(self.fuel) {
+        store.limiter(|d| &mut d.limits.0);
+        let call: Result<Result<Vec<u8>, WitError>, SdkError> = match store.set_fuel(fuel) {
             Err(e) => Err(module_err(e)),
             Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker) {
                 Err(e) => Err(module_err(e)),
                 Ok(inst) => inst.call_query(&mut store, req).map_err(module_err),
             },
         };
+        let fuel_left = store.get_fuel().unwrap_or(0);
         let data = store.into_data();
-        let outcome = call.and_then(|r| r.map_err(wit_err));
-        (outcome, data.memo, data.pending)
+        QueryRound {
+            outcome: call.and_then(|r| r.map_err(wit_err)),
+            memo: data.memo,
+            pending: data.pending,
+            fuel_left,
+        }
     }
+}
+
+/// what one [`WasmModule::query_round`] round hands back to its driver.
+struct QueryRound {
+    outcome: Result<Vec<u8>, SdkError>,
+    memo: SiblingMemo,
+    pending: Option<PendingRead>,
+    /// the round's UNSPENT fuel — the next round's whole budget. one query
+    /// spends one [`DEFAULT_FUEL`], however many rounds it replays.
+    fuel_left: u64,
 }
 
 /// canonical `install`-able bytes (and their root) for a host-COMPUTED initial
@@ -905,9 +1295,11 @@ fn decode_state(bytes: &[u8]) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, SdkError> {
 }
 
 /// The determinism envelope for module execution: fuel-metered termination, no
-/// ambient imports, canonical NaNs, and every wasm proposal the integer/bytes
-/// component ABI does not need switched OFF — the envelope is identical on
-/// every validator, so the same guest bytes behave identically everywhere.
+/// ambient imports, canonical NaNs, a pinned native-stack ceiling, and every
+/// wasm proposal the integer/bytes component ABI does not need switched OFF —
+/// the envelope is identical on every validator, so the same guest bytes behave
+/// identically everywhere. The memory/table ceilings ride the store's limiter
+/// ([`GuestLimits`]), which a `Config` cannot carry.
 ///
 /// Kept ON (the componentized-Rust baseline): bulk-memory, multi-value,
 /// reference-types (LLVM output uses funcref tables), and multi-memory
@@ -930,7 +1322,37 @@ fn deterministic_config() -> Config {
     c.wasm_stack_switching(false);
     c.wasm_custom_page_sizes(false);
     c.wasm_wide_arithmetic(false);
+    // the recursion ceiling is OURS, not whatever this wasmtime release
+    // defaults to: a guest that recurses too deep must trap at the same depth
+    // on every validator. the per-store memory/table ceilings are the limiter's
+    // ([`GuestLimits`]) — a Config cannot express them.
+    c.max_wasm_stack(MAX_GUEST_STACK_BYTES);
+    if let Some(dir) = COMPILATION_CACHE_DIR.get() {
+        let mut cfg = wasmtime::CacheConfig::new();
+        cfg.with_directory(dir);
+        if let Ok(cache) = wasmtime::Cache::new(cfg) {
+            c.cache(Some(cache));
+        }
+        // `Cache::new` failing (e.g. the directory is unwritable) just means
+        // no cache: the sim runs correctly, only slower.
+    }
     c
+}
+
+/// Set once, by the sim/test lane only, before it composes its first module.
+static COMPILATION_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Turn on wasmtime's own cranelift artifact cache (`Config::cache`) for
+/// every engine this process builds from here on. A node binary NEVER calls
+/// this — there is no environment variable or flag that turns the cache on
+/// in production, only this function, and only `bin/simnode` calls it (from
+/// its own boot, reading `DUCKTAPE_WASM_CACHE_DIR`). The sim/test harness's
+/// 13-plus binaries all compile the same genesis; a cache hit changes wall
+/// time, never the compiled artifact's semantics, so it cannot affect the
+/// root-hash. A second call is ignored (the sim boots repeatedly within one
+/// test process).
+pub fn enable_compilation_cache(dir: PathBuf) {
+    let _ = COMPILATION_CACHE_DIR.set(dir);
 }
 
 fn to_wit_env(env: &SdkEnv) -> WitEnv {
@@ -1075,12 +1497,18 @@ impl Module for WasmModule {
     /// This is the live-update primitive: same store, new logic, and the root is
     /// computed from the (untouched) store — so root-hash is continuous across the
     /// swap. Staged (yet uncommitted) writes are discarded: a swap is only ever
-    /// driven at a clean block boundary, never mid-block.
+    /// driven at a clean block boundary, never mid-block. the replacement must
+    /// declare the backing the store IS — the state layout is the code-swap
+    /// contract, and a component wanting another substrate cannot keep this
+    /// state — while its committed-query mode is taken as it declares.
     fn swap_code(&mut self, component_bytes: &[u8]) -> Result<(), SdkError> {
-        let component =
-            Component::from_binary(&self.engine, component_bytes).map_err(module_err)?;
-        self.component = component;
-        self.code_hash = sha256(component_bytes);
+        let compiled = CompiledModule::compile(component_bytes)?;
+        Self::require_declared_backing(&self.id, &compiled.shape, self.backing.kind())?;
+        self.engine = compiled.engine;
+        self.linker = compiled.linker;
+        self.component = compiled.component;
+        self.code_hash = compiled.code_hash;
+        self.committed_queries = compiled.shape.committed_queries;
         self.staged.clear();
         self.staged_objects.clear();
         Ok(())
@@ -1101,6 +1529,11 @@ impl Module for WasmModule {
         // its puts on top, so the overlay is identical across replay rounds.
         let staged_objects0 = std::mem::take(&mut self.staged_objects);
         let mut memo = SiblingMemo::default();
+        // ONE budget for the whole dispatch: each round starts with what the
+        // previous round left (see [`DEFAULT_FUEL`]). At zero the next round
+        // traps out of fuel immediately — the same deterministic rejection a
+        // single-round exhaustion produces.
+        let mut fuel_left = self.fuel;
         while memo.within_budgets() {
             // move map-backed committed + memo into owned per-round data;
             // staged is a copy. store-backed rounds carry an empty map and
@@ -1112,26 +1545,32 @@ impl Module for WasmModule {
                 // staged-over via the state lane. the backing keeps ownership of
                 // the committed refs (unlike Map's move-in/reclaim), so this
                 // round's copy is discarded after the call.
-                StateBacking::Odb { backing } => {
-                    BTreeMap::from([(REFS_KEY.to_vec(), backing.refs_bytes())])
-                }
+                StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
             };
+            let round_staged = staged0.clone();
+            let round_objects = staged_objects0.clone();
+            // charged for the block's stage + staged objects before the guest
+            // adds a byte (see `MAX_HOST_BYTES`).
+            let host_bytes = staged_bytes(&round_staged) + object_bytes(&round_objects);
             let data = HostData {
                 env: Some(env.clone()),
                 committed: round_committed,
-                staged: staged0.clone(),
+                staged: round_staged,
                 memo: std::mem::take(&mut memo),
                 pending: None,
                 sealed: false,
                 store_backed: self.is_store_backed(),
-                object_puts: staged_objects0.clone(),
+                object_puts: round_objects,
                 out_msgs: Vec::new(),
                 out_events: Vec::new(),
                 out_assigned: Vec::new(),
+                limits: GuestLimits::default(),
+                host_bytes,
             };
             let mut store = Store::new(&self.engine, data);
+            store.limiter(|d| &mut d.limits.0);
 
-            let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(self.fuel) {
+            let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(fuel_left) {
                 Err(e) => Err(module_err(e)),
                 Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
                 {
@@ -1141,6 +1580,8 @@ impl Module for WasmModule {
                         .map_err(module_err),
                 },
             };
+            // carry the unspent fuel into the next replay round.
+            fuel_left = store.get_fuel().unwrap_or(0);
 
             // reclaim state regardless of outcome (a trap leaves the moved-in
             // state in the store; take it back so the module is never left empty).
@@ -1235,11 +1676,13 @@ impl Module for WasmModule {
             origin: WitOrigin::System,
         };
         let mut memo = SiblingMemo::default();
+        let mut fuel_left = self.fuel;
         while memo.within_budgets() {
-            let (outcome, returned, pending) = self.query_round(env.clone(), memo, true, req);
-            memo = returned;
-            match pending {
-                None => return outcome,
+            let round = self.query_round(env.clone(), memo, true, req, fuel_left);
+            memo = round.memo;
+            fuel_left = round.fuel_left;
+            match round.pending {
+                None => return round.outcome,
                 Some(PendingRead::State(key)) => {
                     let answer = self.resolve_state_read(&key).await?;
                     memo.states.insert(key, answer);
@@ -1265,12 +1708,13 @@ impl Module for WasmModule {
             StateBacking::Map { .. } | StateBacking::Store { .. } => {}
         }
         let mut memo = SiblingMemo::default();
+        let mut fuel_left = self.fuel;
         while memo.within_budgets() {
-            let (outcome, returned, pending) =
-                self.query_round(to_wit_env(ctx.env()), memo, false, req);
-            memo = returned;
-            match pending {
-                None => return outcome,
+            let round = self.query_round(to_wit_env(ctx.env()), memo, false, req, fuel_left);
+            memo = round.memo;
+            fuel_left = round.fuel_left;
+            match round.pending {
+                None => return round.outcome,
                 Some(PendingRead::State(key)) => {
                     let answer = self.resolve_state_read(&key).await?;
                     memo.states.insert(key, answer);
@@ -1392,5 +1836,182 @@ impl Module for WasmModule {
             StateBacking::Map { .. } | StateBacking::Store { .. } => {}
         }
         Ok(())
+    }
+}
+
+// ============================================================================
+// the protocol bounds, proven from inside the crate: they read private state
+// (the fuel field) or drive the host imports directly, so they live here rather
+// than in `tests/`. The fixtures are the same committed guest artifacts the
+// integration proofs use.
+// ============================================================================
+
+#[cfg(test)]
+mod bounds {
+    use super::*;
+    use sdk_testkit::TestCtx;
+
+    const SIBLING: &[u8] = include_bytes!("../tests/fixtures/sibling.component.wasm");
+
+    /// `sibling-wasm`'s `'f'` op: `reads` DISTINCT sibling queries, i.e.
+    /// `reads + 1` memoized-replay rounds of the identical pure prefix.
+    fn distinct_reads(reads: u64) -> Msg {
+        let mut payload = b"f".to_vec();
+        payload.extend_from_slice(&reads.to_le_bytes());
+        Msg {
+            target: "sibling".into(),
+            payload,
+        }
+    }
+
+    /// the smallest power-of-two budget under which a `reads`-read dispatch
+    /// completes. The doubling search is deterministic — it waits on the
+    /// module's own answer, never on a clock — and every failing attempt ends
+    /// in a fuel trap, not a hang.
+    async fn min_fuel(reads: u64) -> u64 {
+        let mut fuel = 1 << 12;
+        while fuel <= DEFAULT_FUEL {
+            let mut m = WasmModule::from_bytes("sibling", SIBLING).expect("load");
+            m.fuel = fuel;
+            let mut ctx = TestCtx::at_height(1).on_query("noisy", |req| Ok(req.to_vec()));
+            if m.execute(&mut ctx, &distinct_reads(reads)).await.is_ok() {
+                return fuel;
+            }
+            fuel *= 2;
+        }
+        panic!("{reads} reads never completed inside DEFAULT_FUEL");
+    }
+
+    /// ONE budget per dispatch, spent across the replay rounds: nine rounds of
+    /// the same prefix cost about nine times one round. Re-granting the budget
+    /// per round would make the two budgets equal, and a guest could buy
+    /// `MAX_SIBLING_READS + MAX_STORE_READS + MAX_OBJECT_READS` full budgets
+    /// out of a single op.
+    #[tokio::test]
+    async fn fuel_is_one_budget_per_dispatch_not_per_replay_round() {
+        let one_round = min_fuel(0).await;
+        let nine_rounds = min_fuel(8).await;
+        assert!(
+            nine_rounds >= one_round * 4,
+            "nine replay rounds needed {nine_rounds} fuel against {one_round} for one — \
+             the budget is being re-granted per round"
+        );
+    }
+
+    /// growth past the ceiling is REFUSED (the guest sees wasm's -1), and it is
+    /// refused on the constant alone — the `maximum` wasmtime derives from the
+    /// host's own reservation never enters the decision, so every validator
+    /// answers the same guest the same way.
+    #[test]
+    fn memory_growth_is_capped_by_the_protocol_constant() {
+        use wasmtime::ResourceLimiter;
+
+        let mut limits = GuestLimits::default().0;
+        assert!(
+            limits
+                .memory_growing(0, MAX_GUEST_MEMORY_BYTES, None)
+                .expect("at the ceiling"),
+            "growth to the ceiling is allowed"
+        );
+        assert!(
+            !limits
+                .memory_growing(0, MAX_GUEST_MEMORY_BYTES + 1, None)
+                .expect("over the ceiling"),
+            "growth past the ceiling must be refused, not sized by host RAM"
+        );
+        assert!(
+            !limits
+                .table_growing(0, MAX_GUEST_TABLE_ELEMENTS + 1, None)
+                .expect("over the table ceiling"),
+            "table growth past the ceiling must be refused"
+        );
+    }
+
+    /// the ceilings reach the guest only if EVERY store this crate builds
+    /// installs them — the default `HostData` carries them, and each
+    /// `Store::new` pairs with a `.limiter()`. The pairing is load-bearing and
+    /// invisible to types, so it is checked against the source.
+    #[test]
+    fn every_store_installs_the_limiter() {
+        use wasmtime::ResourceLimiter;
+
+        let mut default_data = HostData::default();
+        assert!(
+            !default_data
+                .limits
+                .0
+                .memory_growing(0, MAX_GUEST_MEMORY_BYTES + 1, None)
+                .expect("over the ceiling"),
+            "an unconfigured HostData would run a store with no ceiling at all"
+        );
+
+        let src = include_str!("lib.rs");
+        let stores = src.matches(concat!("Store", "::new(")).count();
+        let limiters = src.matches(concat!("store", ".limiter(")).count();
+        assert_eq!(
+            stores, limiters,
+            "{stores} Store::new sites against {limiters} store.limiter calls"
+        );
+    }
+
+    /// the unbounded-accumulation op from the report: the same 1 MiB buffer
+    /// handed to `emit_msg` in a tight loop. Fuel prices the loop, not the host
+    /// copy, so the meter is the only thing between this and the node's RSS.
+    #[test]
+    fn a_tight_emit_loop_hits_the_host_byte_meter() {
+        let one_mib = vec![0u8; 1 << 20];
+        let mut data = HostData::default();
+        let mut accepted = 0usize;
+        while host::Host::emit_msg(&mut data, "x".into(), one_mib.clone()).is_ok() {
+            accepted += 1;
+            assert!(
+                accepted <= MAX_HOST_BYTES / one_mib.len(),
+                "the meter never refused: {accepted} MiB accepted"
+            );
+        }
+        assert!(data.host_bytes > MAX_HOST_BYTES, "refused on the cap");
+    }
+
+    /// bytes are not the only cost: an empty-payload loop allocates a vec slot
+    /// per call, so entries are charged too ([`HOST_ENTRY_BYTES`]).
+    #[test]
+    fn empty_entries_are_charged_too() {
+        let mut data = HostData::default();
+        let mut accepted = 0usize;
+        while host::Host::emit_event(&mut data, String::new(), Vec::new()).is_ok() {
+            accepted += 1;
+            assert!(
+                accepted <= MAX_HOST_BYTES / HOST_ENTRY_BYTES,
+                "zero-byte entries were free: {accepted} accepted"
+            );
+        }
+        assert_eq!(data.out_events.len(), accepted);
+    }
+
+    /// staged objects live across the whole block, so a round starts charged
+    /// for what the block already staged — the meter bounds the block, not just
+    /// one dispatch.
+    #[test]
+    fn a_round_starts_charged_for_the_block_stage() {
+        let staged = BTreeMap::from([(b"k".to_vec(), Some(vec![0u8; 4096]))]);
+        let puts = BTreeMap::from([(vec![7u8; ROOT_LEN], vec![0u8; 4096])]);
+        assert_eq!(staged_bytes(&staged), HOST_ENTRY_BYTES + 1 + 4096);
+        assert_eq!(object_bytes(&puts), HOST_ENTRY_BYTES + ROOT_LEN + 4096);
+    }
+
+    /// the assigned stamp keeps its own, smaller cap — the one the host applied
+    /// after `execute` returned, now applied at the call that allocates, so the
+    /// two can never carry different numbers.
+    #[test]
+    fn the_assigned_stamp_keeps_its_own_cap() {
+        let mut data = HostData::default();
+        assert!(
+            host::Host::set_assigned(&mut data, vec![0u8; sdk::MAX_ASSIGNED_BYTES]).is_ok(),
+            "at the cap"
+        );
+        assert!(
+            host::Host::set_assigned(&mut data, vec![0u8; sdk::MAX_ASSIGNED_BYTES + 1]).is_err(),
+            "over the cap"
+        );
     }
 }

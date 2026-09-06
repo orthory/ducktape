@@ -162,26 +162,23 @@ impl MeshWindowTracker {
         Some(latest)
     }
 
+    /// the ONE thing an UNVERIFIED serving hint may do: say that this node's
+    /// own COMMITTED read is behind. a hint is a `TipCoords` window decoded
+    /// off the wire from an untrusted server — it never installs a peer set
+    /// and never advances `last_tracked`, because the latch is monotone and a
+    /// single bogus generation (`u64::MAX`) would otherwise skip every real
+    /// generation for the life of the process, promotion included. `true`
+    /// means "re-read the committed window"; the committed window is what
+    /// [`MeshWindowTracker::track_new`] then tracks.
+    pub(crate) fn hint_owes_committed_read(&self, hint: &[statesync::MeshWindowEntry]) -> bool {
+        hint.iter()
+            .any(|e| self.last_tracked.is_none_or(|last| e.generation > last))
+    }
+
     #[cfg(test)]
     pub(crate) fn last_tracked(&self) -> Option<u64> {
         self.last_tracked
     }
-}
-
-/// the sync-wire window in tracker shape — the parked joiner's tip poll
-/// carries [`statesync::MeshWindowEntry`]s (statesync stays valset-agnostic);
-/// this is the one conversion back.
-pub(crate) fn window_from_sync(
-    entries: &[statesync::MeshWindowEntry],
-) -> Vec<valset::GenerationSet> {
-    entries
-        .iter()
-        .map(|e| valset::GenerationSet {
-            generation: e.generation,
-            validators: e.validators.clone(),
-            residents: e.residents.clone(),
-        })
-        .collect()
 }
 
 /// one snapshot's PRIMARY set: `validators ∪ residents`, decoded, sorted,
@@ -327,6 +324,35 @@ mod tests {
         // a re-sync of the same window is a silent no-op.
         assert!(t.track_new(&mut sink, &book(), &window).is_none());
         assert_eq!(sink.tracked.len(), 3);
+    }
+
+    /// the trust boundary: a wire hint may only ask for a committed read.
+    /// tracking it would latch, and an extreme generation would then skip
+    /// every real one forever.
+    #[test]
+    fn a_hint_only_asks_for_a_committed_read_and_never_latches() {
+        let hint = |generation: u64| statesync::MeshWindowEntry {
+            generation,
+            validators: vec![key_bytes(9)],
+            residents: vec![],
+        };
+        let mut t = MeshWindowTracker::new(&[], "n");
+        let mut sink = Recorder::default();
+        t.track_genesis(&mut sink, &book(), &[key(1)]);
+        assert_eq!(t.last_tracked(), Some(0));
+
+        // a hostile hint: ahead, so it asks for a read — and changes nothing.
+        assert!(t.hint_owes_committed_read(&[hint(u64::MAX)]));
+        assert_eq!(t.last_tracked(), Some(0), "a hint never advances the latch");
+        assert_eq!(sink.tracked.len(), 1, "a hint never installs a peer set");
+
+        // and the real generations still track afterwards.
+        let committed = [snapshot(1, &[1, 2], &[])];
+        let latest = t
+            .track_new(&mut sink, &book(), &committed)
+            .expect("committed state still advances");
+        assert_eq!(latest.generation, 1);
+        assert!(!t.hint_owes_committed_read(&[hint(1)]), "at the latch");
     }
 
     #[test]

@@ -55,9 +55,9 @@ async fn get_on(host: &Host, target: &str, key: &str) -> Option<String> {
 }
 
 /// a module admitted AFTER the checkpoint: the manifest never captured it, and
-/// the composer adopts it EMPTY (`adopt_admitted_modules`). the first block
-/// that touches it must replay from that empty pre-root — not be classed torn
-/// because the manifest holds no root for it.
+/// the composer starts it FRESH (its first activation is past the checkpoint
+/// height). the first block that touches it must replay from that empty
+/// pre-root — not be classed torn because the manifest holds no root for it.
 ///
 /// the module's op must be the FIRST thing sealed after the checkpoint: every
 /// seal records every host root, so an earlier replayed block would carry
@@ -548,4 +548,165 @@ fn range_read_refuses_below_the_retained_floor() {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].height, 2);
     });
+}
+
+/// THE REPLAY WINDOW IS PERSISTED STATE, NOT UPTIME. the journal suffix a
+/// checkpoint leaves behind is shallower than the protocol window on purpose
+/// — that is what checkpointing is for — so a restart that rebuilt the guard
+/// from the suffix alone would refuse fewer replayed batches than a peer that
+/// never restarted, and the two fork on the first batch in the difference.
+/// the checkpoint carries the window; the suffix extends it, one entry per
+/// height.
+#[test]
+fn recovery_restores_the_checkpoint_window_and_extends_it_with_the_suffix() {
+    let executor = deterministic::Runner::default();
+    executor.start(|context| async move {
+        let recovery = Recovery::open(context.child("w1"))
+            .await
+            .expect("open recovery");
+        let mut node = OrderedNode::with_sink(fresh_host(), RoundOrderer::new(), recovery);
+        let signer = sk(3);
+
+        // one block, then a checkpoint carrying a window whose ids are
+        // SENTINELS: nothing in this journal can produce them, so finding one
+        // in the restored window proves it came off the checkpoint.
+        node.submit(&signer, 0, set("k0", "v0"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 1);
+        let checkpoint_height = node.finalized().expect("boundary").height;
+        let inherited = vec![(checkpoint_height, [0xC1; 32])];
+
+        let pos = node.sink_mut().oplog_pos().await;
+        let manifest = Manifest::capture(
+            node.host(),
+            Some(checkpoint_height),
+            0,
+            0,
+            vec![],
+            vec![],
+            None,
+            pos,
+            1,
+        )
+        .expect("capture")
+        .with_replay_window(inherited.clone());
+        node.sink_mut()
+            .write_manifest(&manifest)
+            .await
+            .expect("write manifest");
+
+        // two more blocks above the checkpoint: the suffix the replay walks.
+        node.submit(&signer, 1, set("k1", "v1"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        node.submit(&signer, 2, set("k2", "v2"))
+            .await
+            .expect("submit");
+        node.flush_batch().await.expect("flush");
+        assert_eq!(node.drain_delivered().await.expect("drain"), 2);
+        let tip_height = node.finalized().expect("boundary").height;
+        let live_window = node.replay_window();
+        drop(node);
+
+        let mut recovery = Recovery::open(context.child("w2"))
+            .await
+            .expect("reopen recovery");
+        let restored = recovery
+            .manifest()
+            .expect("manifest decodes")
+            .expect("manifest present");
+        assert_eq!(
+            restored.applied_frames, inherited,
+            "the window survives the checkpoint codec"
+        );
+
+        let mut directory = Directory::new("directory");
+        directory
+            .install(
+                restored.snapshot("directory").expect("directory snapshot"),
+                restored.root("directory").expect("directory root"),
+            )
+            .expect("install");
+        let mut host = Host::genesis(vec![Box::new(directory)]).expect("genesis");
+        let recovered = recovery
+            .recover(&mut host, &restored)
+            .await
+            .expect("replay the suffix");
+
+        // the checkpoint's entry is IN the restored window, sentinel id and
+        // all — and it did not double up with the same height the retained
+        // journal still holds.
+        assert!(
+            recovered
+                .applied_frames
+                .contains(&(checkpoint_height, [0xC1; 32])),
+            "the checkpoint window seeds the restored one"
+        );
+        let heights: Vec<u64> = recovered.applied_frames.iter().map(|(h, _)| *h).collect();
+        let mut one_per_height = heights.clone();
+        one_per_height.sort_unstable();
+        one_per_height.dedup();
+        assert_eq!(
+            heights, one_per_height,
+            "ascending, one entry per height — a duplicate costs a window slot"
+        );
+        // and every block the suffix walked extends it, up to the tip.
+        for (height, id) in live_window {
+            if height > checkpoint_height {
+                assert!(
+                    recovered.applied_frames.contains(&(height, id)),
+                    "the suffix block at {height} extends the restored window"
+                );
+            }
+        }
+        assert_eq!(heights.last().copied(), Some(tip_height));
+    });
+}
+
+/// A CAPTURE COMPUTES A ROOT, IT DOES NOT VERIFY ONE. The host can sit AHEAD of
+/// the last sealed boundary — a module realization that seated a component for a
+/// block the node then failed to apply moves the registry root off any block —
+/// and a manifest labelled with that height while carrying the live root is what
+/// recovery's final compare fatals on, permanently. A caller that knows the
+/// sealed root gets a refusal instead of a manifest.
+#[test]
+fn capture_refuses_a_root_no_block_sealed() {
+    let host = fresh_host();
+    let never_sealed = sdk::StateRoot([9u8; 32]);
+    let zero = || std::time::Duration::ZERO;
+    let err = Manifest::capture_timed(
+        &host,
+        Some(7),
+        0,
+        0,
+        vec![],
+        vec![],
+        None,
+        0,
+        1,
+        Some(never_sealed),
+        zero,
+    )
+    .expect_err("a live root that is not the sealed root writes nothing");
+    assert!(format!("{err}").contains("sealed root"));
+
+    // the same capture against the root the block actually sealed proceeds.
+    let (manifest, _) = Manifest::capture_timed(
+        &host,
+        Some(7),
+        0,
+        0,
+        vec![],
+        vec![],
+        None,
+        0,
+        1,
+        Some(host.root_hash()),
+        zero,
+    )
+    .expect("the sealed root captures");
+    assert_eq!(manifest.root_hash, host.root_hash());
 }

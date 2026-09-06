@@ -58,6 +58,7 @@ fn a_plain_result_delivers_its_prose_and_parsed_actions() {
         vec![TaskMsg::CreateTask {
             task_id: "from_prose".into(),
             title: "prose".into(),
+            owner: None,
         }],
         "the prose-parsed action is applied"
     );
@@ -447,6 +448,7 @@ fn job_finalize_is_a_delivery_receipt_with_output_ref() {
         vec![TaskMsg::CreateTask {
             task_id: "t1".into(),
             title: "todo".into(),
+            owner: None,
         }]
     );
     // the finalize payload is a faceted DeliveryReceipt (not a bare response).

@@ -36,7 +36,7 @@ fn member_key(seed: u8) -> Vec<u8> {
 
 /// a host with governance gating a valset seeded with members 1 and 2.
 async fn gov_host() -> Host {
-    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
     valset.seed(member_key(1)).await.expect("seed valset");
     valset.seed(member_key(2)).await.expect("seed valset");
     valset.finish_seed().await.expect("seed valset");
@@ -94,6 +94,19 @@ async fn residents(host: &Host) -> Vec<Vec<u8>> {
     match valset_decode(&reply).expect("decode") {
         ValsetReply::Residents(v) => v,
         other => panic!("expected Residents, got {other:?}"),
+    }
+}
+
+/// the roster-served listing's length — settled ids are evicted, so this
+/// counts only currently-OPEN proposals.
+async fn open_proposal_count(host: &Host) -> usize {
+    let reply = host
+        .query("governance", &gov_query(&GovQuery::Proposals))
+        .await
+        .expect("gov query");
+    match gov_decode(&reply).expect("decode") {
+        GovReply::Proposals(views) => views.len(),
+        other => panic!("expected Proposals, got {other:?}"),
     }
 }
 
@@ -459,7 +472,7 @@ fn a_single_member_ballot_is_a_deciding_majority() {
     block_on(async {
         let founder = member_key(1);
         let friend = member_key(9);
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
         valset.seed(founder.clone()).await.expect("seed valset");
         valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
@@ -551,7 +564,7 @@ fn a_single_member_ballot_is_a_deciding_majority() {
 fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
     block_on(async {
         let founder = member_key(1);
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
         valset.seed(founder.clone()).await.expect("seed valset");
         valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![
@@ -630,7 +643,7 @@ fn removing_the_last_validator_is_refused_and_the_set_stays_non_empty() {
 fn a_direct_module_origin_leave_of_the_last_validator_is_refused() {
     block_on(async {
         let founder = member_key(1);
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
         valset.seed(founder.clone()).await.expect("seed valset");
         valset.finish_seed().await.expect("seed valset");
         let mut host = Host::genesis(vec![Box::new(valset)]).expect("genesis");
@@ -841,6 +854,541 @@ fn votes_close_at_the_deadline_and_ballots_are_per_member() {
         assert_eq!(
             proposal_status(&host, "p").await,
             Some(ProposalStatus::Rejected)
+        );
+    });
+}
+
+#[test]
+fn a_settled_proposal_frees_its_roster_slot() {
+    // regression for the roster-filling DoS: once Execute tallies a
+    // proposal (Passed or Rejected here), its id must leave the roster —
+    // the listing narrows even though the RECORD (queried by id) survives.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2) = (member_key(1), member_key(2));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "settle-me".into(),
+                action: GovAction::Signal { text: "hi".into() },
+                voting_period: 10,
+            }),
+        )
+        .await
+        .expect("propose");
+        assert_eq!(open_proposal_count(&host).await, 1, "one open proposal");
+
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "settle-me".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote");
+        submit_as(
+            &mut host,
+            &m2,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "settle-me".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote");
+        submit_as(
+            &mut host,
+            &m2,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "settle-me".into(),
+            }),
+        )
+        .await
+        .expect("execute");
+
+        assert_eq!(
+            proposal_status(&host, "settle-me").await,
+            Some(ProposalStatus::Passed),
+            "the record survives, queryable by id"
+        );
+        assert_eq!(
+            open_proposal_count(&host).await,
+            0,
+            "the settled id left the open-proposal roster"
+        );
+    });
+}
+
+#[test]
+fn a_settled_id_can_never_be_proposed_again() {
+    // regression (#1766): a settled id leaves the roster but its RECORD is
+    // kept forever, so a roster-only duplicate check let a second Propose
+    // OVERWRITE the settled record with a fresh Open proposal. That erases a
+    // decided outcome, and it is silent: a ceremony driver that waits for
+    // "the proposal exists" is answered by the STALE record before its own
+    // Propose lands, reports that old outcome, and votes on nothing.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2) = (member_key(1), member_key(2));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "spent".into(),
+                action: GovAction::Signal { text: "hi".into() },
+                voting_period: 10,
+            }),
+        )
+        .await
+        .expect("propose");
+        for (member, seq) in [(&m1, 2u64), (&m2, 3)] {
+            submit_as(
+                &mut host,
+                member,
+                seq,
+                "governance",
+                gov_encode(&GovMsg::Vote {
+                    proposal_id: "spent".into(),
+                    approve: true,
+                }),
+            )
+            .await
+            .expect("vote");
+        }
+        submit_as(
+            &mut host,
+            &m2,
+            4,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "spent".into(),
+            }),
+        )
+        .await
+        .expect("execute");
+        assert_eq!(
+            proposal_status(&host, "spent").await,
+            Some(ProposalStatus::Passed),
+            "the id is settled Passed"
+        );
+        assert_eq!(
+            open_proposal_count(&host).await,
+            0,
+            "and it left the open roster"
+        );
+
+        let reused = submit_as(
+            &mut host,
+            &m1,
+            5,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "spent".into(),
+                action: GovAction::Signal {
+                    text: "again".into(),
+                },
+                voting_period: 10,
+            }),
+        )
+        .await
+        .expect_err("re-proposing a settled id must be refused");
+        assert!(
+            reused.to_string().contains("proposal already exists"),
+            "unexpected refusal: {reused}"
+        );
+        assert_eq!(
+            proposal_status(&host, "spent").await,
+            Some(ProposalStatus::Passed),
+            "the settled record is untouched by the refused reuse"
+        );
+    });
+}
+
+#[test]
+fn an_expired_proposal_frees_its_roster_slot_on_the_next_propose() {
+    // a proposal nobody ever executes still must not squat the roster past
+    // its own voting deadline: `Propose` opportunistically reaps it.
+    block_on(async {
+        let mut host = gov_host().await;
+        let m1 = member_key(1);
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "stale".into(),
+                action: GovAction::Signal {
+                    text: "never executed".into(),
+                },
+                voting_period: 5,
+            }),
+        )
+        .await
+        .expect("propose");
+        assert_eq!(open_proposal_count(&host).await, 1);
+        assert_eq!(
+            proposal_status(&host, "stale").await,
+            Some(ProposalStatus::Open)
+        );
+
+        // past the deadline (proposed at 1, period 5 -> deadline 6) AND past
+        // its execution grace; nobody ever calls Execute on "stale". a fresh
+        // Propose well past deadline + EXECUTION_GRACE must reap it before
+        // staging its own entry.
+        submit_as(
+            &mut host,
+            &m1,
+            200_000,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "fresh".into(),
+                action: GovAction::Signal {
+                    text: "reaps the stale one".into(),
+                },
+                voting_period: 10,
+            }),
+        )
+        .await
+        .expect("propose reaps the expired entry");
+
+        assert_eq!(
+            proposal_status(&host, "stale").await,
+            Some(ProposalStatus::Rejected),
+            "expiry settles it Rejected — nobody executed it in time"
+        );
+        assert_eq!(
+            open_proposal_count(&host).await,
+            1,
+            "only the fresh proposal is open; the stale one was reaped"
+        );
+    });
+}
+
+#[test]
+fn a_submitter_at_its_open_cap_is_refused_while_another_member_is_admitted() {
+    // the per-submitter bound closes the roster-filling attack even before
+    // any of the attacker's own proposals settle: MAX_OPEN_PROPOSALS_PER_SUBMITTER
+    // (8) proposals from m1, long-lived so none can be reaped early, must
+    // refuse a 9th from m1 while m2 can still propose.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2) = (member_key(1), member_key(2));
+
+        for n in 0..governance::MAX_OPEN_PROPOSALS_PER_SUBMITTER {
+            submit_as(
+                &mut host,
+                &m1,
+                1,
+                "governance",
+                gov_encode(&GovMsg::Propose {
+                    proposal_id: format!("m1-{n}"),
+                    action: GovAction::Signal {
+                        text: "filler".into(),
+                    },
+                    voting_period: 1_000_000,
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("propose {n} from m1: {e:?}"));
+        }
+        assert_eq!(
+            open_proposal_count(&host).await,
+            governance::MAX_OPEN_PROPOSALS_PER_SUBMITTER
+        );
+
+        let err = submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "m1-over-cap".into(),
+                action: GovAction::Signal {
+                    text: "one too many".into(),
+                },
+                voting_period: 1_000_000,
+            }),
+        )
+        .await
+        .expect_err("m1 is already at its open-proposal cap");
+        assert!(
+            matches!(err, SubmitError::Rejected(Error::Module(ref m)) if m.contains("open proposals")),
+            "got {err:?}"
+        );
+
+        // a DIFFERENT member is unaffected — the cap is per submitter, and
+        // RemoveValidator (the eviction path) in particular must still go
+        // through even while m1 has filled its own slots.
+        submit_as(
+            &mut host,
+            &m2,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "evict-m1".into(),
+                action: GovAction::RemoveValidator { key: m1.clone() },
+                voting_period: 1_000_000,
+            }),
+        )
+        .await
+        .expect("m2 can still propose while m1 is at its cap");
+        assert_eq!(
+            open_proposal_count(&host).await,
+            governance::MAX_OPEN_PROPOSALS_PER_SUBMITTER + 1
+        );
+    });
+}
+
+#[test]
+fn a_passed_proposal_past_execution_grace_is_refused_and_reaped_rejected() {
+    // a proposal that reached its yes-threshold but was NEVER executed must
+    // not stay enactable forever: past deadline + EXECUTION_GRACE (100_000
+    // consensus-time units) Execute settles it Rejected on the spot instead
+    // of enacting a frozen, possibly long-gone electorate.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2, newcomer) = (member_key(1), member_key(2), member_key(9));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p".into(),
+                action: GovAction::AddValidator {
+                    key: newcomer.clone(),
+                },
+                voting_period: 5,
+            }),
+        )
+        .await
+        .expect("propose");
+
+        // both members vote yes: required_yes = 2/2+1 = 2, met.
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("m1 yes");
+        submit_as(
+            &mut host,
+            &m2,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("m2 yes");
+
+        // deadline is 1 + 5 = 6; nobody ever calls Execute. well past
+        // deadline + EXECUTION_GRACE (100_000), Execute settles it Rejected
+        // in place instead of enacting the frozen electorate's mandate — it
+        // is an ordinary committed write (`Ok`), not an error, so the
+        // settlement is never rolled back by an outer refusal.
+        submit_as(
+            &mut host,
+            &m1,
+            200_000,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "p".into(),
+            }),
+        )
+        .await
+        .expect("execute past the execution grace window settles it in place");
+        assert_eq!(
+            proposal_status(&host, "p").await,
+            Some(ProposalStatus::Rejected),
+            "expiry settles a passed-but-unexecuted proposal Rejected"
+        );
+        assert!(
+            !validators(&host).await.contains(&newcomer),
+            "an expired mandate must never be enacted"
+        );
+    });
+}
+
+#[test]
+fn a_passed_proposal_inside_execution_grace_still_executes() {
+    // symmetric to the above: past the plain deadline but still inside
+    // EXECUTION_GRACE, Execute tallies and enacts normally.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2, newcomer) = (member_key(1), member_key(2), member_key(9));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "p".into(),
+                action: GovAction::AddValidator {
+                    key: newcomer.clone(),
+                },
+                voting_period: 5,
+            }),
+        )
+        .await
+        .expect("propose");
+        submit_as(
+            &mut host,
+            &m1,
+            2,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("m1 yes");
+        submit_as(
+            &mut host,
+            &m2,
+            3,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "p".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("m2 yes");
+
+        // deadline is 6; far past it but well inside deadline + 100_000.
+        submit_as(
+            &mut host,
+            &m1,
+            50_000,
+            "governance",
+            gov_encode(&GovMsg::Execute {
+                proposal_id: "p".into(),
+            }),
+        )
+        .await
+        .expect("still inside the execution grace window");
+        assert_eq!(
+            proposal_status(&host, "p").await,
+            Some(ProposalStatus::Passed)
+        );
+        assert!(validators(&host).await.contains(&newcomer));
+    });
+}
+
+#[test]
+fn an_expired_proposal_is_reaped_by_a_later_vote_or_execute_on_another_proposal() {
+    // expiry must not depend on someone else calling Propose: a later Vote
+    // or Execute targeting a DIFFERENT, still-open proposal reaps the
+    // long-expired one too.
+    block_on(async {
+        let mut host = gov_host().await;
+        let (m1, m2) = (member_key(1), member_key(2));
+
+        submit_as(
+            &mut host,
+            &m1,
+            1,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "stale".into(),
+                action: GovAction::Signal {
+                    text: "never executed".into(),
+                },
+                voting_period: 5,
+            }),
+        )
+        .await
+        .expect("propose stale");
+
+        // a second, long-lived proposal that is still open at the time we
+        // act on it below.
+        submit_as(
+            &mut host,
+            &m2,
+            200_000,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "fresh".into(),
+                action: GovAction::Signal {
+                    text: "still open".into(),
+                },
+                voting_period: 1_000_000,
+            }),
+        )
+        .await
+        .expect("propose fresh (this ALSO reaps stale via Propose's own reap)");
+
+        // "stale"'s deadline was 6; "fresh" was proposed at 200_000, which
+        // is already past stale's deadline + EXECUTION_GRACE (100_006), so
+        // Propose's own reap already caught it. Cast a Vote on "fresh" at a
+        // LATER time to prove Vote's reap is independently wired too (using
+        // a second stale proposal created after the first reap already ran).
+        submit_as(
+            &mut host,
+            &m1,
+            200_001,
+            "governance",
+            gov_encode(&GovMsg::Propose {
+                proposal_id: "stale-2".into(),
+                action: GovAction::Signal {
+                    text: "never executed either".into(),
+                },
+                voting_period: 5,
+            }),
+        )
+        .await
+        .expect("propose stale-2");
+        assert_eq!(
+            proposal_status(&host, "stale-2").await,
+            Some(ProposalStatus::Open)
+        );
+
+        submit_as(
+            &mut host,
+            &m2,
+            400_000,
+            "governance",
+            gov_encode(&GovMsg::Vote {
+                proposal_id: "fresh".into(),
+                approve: true,
+            }),
+        )
+        .await
+        .expect("vote on fresh reaps stale-2 too");
+
+        assert_eq!(
+            proposal_status(&host, "stale-2").await,
+            Some(ProposalStatus::Rejected),
+            "Vote's own reap_roster call caught the unrelated expired proposal"
         );
     });
 }

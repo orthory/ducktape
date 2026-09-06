@@ -68,10 +68,16 @@ use std::time::Duration;
 use common::{Cluster, create_account, sandbox_toml, skip_unless_sandboxed, submit_frame};
 use commonware_cryptography::{Signer as _, ed25519};
 
-use airlock::attest::{self, Measurement};
+// The attested-gateway helpers below (an in-process testkit-minted TEE quote,
+// really verified) are the opt-in `verify` feature; the delegated-grant test
+// uses only the self-host lender (`airlock::client`/`airlock::seal`, no quote).
+#[cfg(feature = "verify")]
+use airlock::{
+    attest::{self, Measurement},
+    server::{self, AttestMode, GatewayConfig},
+    wire::{CredentialKind as WireCredentialKind, CredentialPayload},
+};
 use airlock::client::Gateway as AirlockClient;
-use airlock::server::{self, AttestMode, GatewayConfig};
-use airlock::wire::{CredentialKind as WireCredentialKind, CredentialPayload};
 
 use gateway::{
     CredentialKind, CredentialRecord, DuckDnsName, GATEWAY_CREDENTIAL_NS, GATEWAY_ROUTE_NS,
@@ -84,10 +90,13 @@ use saga::{SagaMsg, SagaQuery, SagaReply, SagaStatus, SagaView};
 use axum::extract::State;
 use axum::routing::post;
 use axum::{Json, Router};
+// only `run_output_has` (the attested test's ws subscribe) needs these.
+#[cfg(feature = "verify")]
 use futures::{SinkExt as _, StreamExt as _};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
+#[cfg(feature = "verify")]
 use tokio_tungstenite::tungstenite::Message;
 
 const CONVERGE: Duration = Duration::from_secs(180);
@@ -106,12 +115,14 @@ const TAG: &str = "sched-claude";
 // mock Anthropic upstream + testkit airlock gateway (mirrors airlock_gateway_e2e)
 // ===========================================================================
 
+#[cfg(feature = "verify")]
 fn measurement_hex() -> String {
     "11".repeat(attest::MRTD_LEN)
 }
 
 /// ONE test enclave (measures `0x11`x48). Its minted SNP chain is verified
 /// through the REAL `airlock::verify` path, but only under its own roots.
+#[cfg(feature = "verify")]
 fn test_enclave() -> &'static Arc<airlock::testkit::SnpTestEnclave> {
     static ENCLAVE: std::sync::OnceLock<Arc<airlock::testkit::SnpTestEnclave>> =
         std::sync::OnceLock::new();
@@ -171,6 +182,7 @@ async fn bind_and_serve(app: Router) -> String {
 
 /// Boot the mock upstream and the testkit airlock gateway pointed at it.
 /// Returns `(gateway_base_url, gateway_loopback_port, upstream_counters)`.
+#[cfg(feature = "verify")]
 async fn boot_gateway_and_upstream() -> (String, u16, Arc<MockUpstream>) {
     let counters = Arc::new(MockUpstream::default());
     let upstream = bind_and_serve(
@@ -209,6 +221,7 @@ async fn boot_gateway_and_upstream() -> (String, u16, Arc<MockUpstream>) {
 /// Verify the gateway quote and seal a credential under `name` (the mock mints
 /// access tokens from this refresh seed). Returns the attested seal key — the
 /// on-chain anchor the resolver pins.
+#[cfg(feature = "verify")]
 async fn seal_credential(gw_base: &str, name: &str) -> [u8; 32] {
     let gw = AirlockClient::local(gw_base.to_string());
     let (quote, _vendor) = gw.fetch_quote().await.unwrap();
@@ -527,6 +540,7 @@ fn wait_terminal(cluster: &Cluster, reader: usize, saga_id: &str, budget: Durati
 /// `secret` is the node's own 0600 service-link token: `run-output:` carries
 /// provider stdout, so it is a workspace-gated topic and an un-tokened subscribe
 /// is refused.
+#[cfg(feature = "verify")]
 async fn run_output_has(port: u16, id: &str, marker: &str, secret: &str, budget: Duration) -> bool {
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/v1/ws"))
         .await
@@ -704,6 +718,7 @@ fn hide_builtins(root: &Path, name: &str) -> Vec<(String, String)> {
 // the tests
 // ===========================================================================
 
+#[cfg(feature = "verify")]
 #[test]
 fn a_granted_scheduled_run_executes_against_the_mock_upstream() {
     if skip_unless_sandboxed("a_granted_scheduled_run_executes_against_the_mock_upstream").is_some()

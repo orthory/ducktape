@@ -56,5 +56,6 @@ use guest_adapter::WitStore;
 guest_adapter::store_guest! {
     id: MODULE_ID,
     module: AgentModule,
+    shape: guest_adapter::store_shape(),
     new: AgentModule::new(MODULE_ID, Box::new(WitStore), SAGA_ID, Some(HOOK_ID.into())),
 }

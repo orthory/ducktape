@@ -4,15 +4,24 @@ use std::time::Duration;
 
 use super::{Cluster, FIXTURES};
 
-/// blocks a ceremony's activation is placed out: three sequential runs plus
-/// the readiness signals must all land under the lifecycle floor
-/// (`height + MIN_SWAP_LEAD`) at execute time, and each validator beats one
-/// nop per block time, so a 3-founder chain ticks three blocks per block time while idle.
-/// it also bounds the MATCHER: run 1 joins run 0's
-/// proposal only while that activation still clears run 1's own floor, so a
-/// lead this far above the runs' wall-clock spacing is what keeps
-/// `deciding == 1` exact on a loaded box.
-pub const AFTER: &str = "60";
+/// blocks a ceremony's activation is placed out. it bounds the MATCHER: run 1
+/// joins run 0's proposal only while run 0's activation still clears run 1's
+/// own floor (`height + MIN_SWAP_LEAD`), so the lead has to outlast the WHOLE
+/// ceremony — and the ceremony is three sequential `ducktape` PROCESSES, each
+/// staging a component, fanning it out and driving governance round trips,
+/// while the chain ticks on regardless: every founder beats one nop per
+/// `TEST_BLOCK_TIME_MS`, so this harness's 3-founder network burns 30 blocks
+/// a second while idle. the lead is therefore spent in wall clock, and a
+/// number sized for a one-second beat is under two seconds of it here — which
+/// is what turned `deciding == 1` into a coin flip on a loaded box.
+///
+/// 900 blocks is 30 s at the harness beat: ten seconds of ceiling per run.
+pub const AFTER: &str = "900";
+
+/// the beat [`AFTER`] is counted in. the lead above is a wall-clock budget
+/// expressed in blocks, so a change to the beat resizes it and it has to be
+/// re-derived rather than silently shrink.
+const _: () = assert!(super::TEST_BLOCK_TIME_MS == 100);
 
 /// the checked-in component for `<id>`.
 pub fn fixture(id: &str) -> String {
@@ -89,6 +98,14 @@ pub fn spawn_founders(mut cluster: Cluster) -> Cluster {
 pub fn run_on_each(cluster: &Cluster, verb: &[&str]) -> Vec<(bool, String)> {
     (0..3)
         .map(|idx| {
+            // the ceremony's own drift, named: the runs are spaced in wall
+            // clock and the matcher is bounded in blocks, so these three
+            // heights are the diagnosis when a run mints its own proposal
+            // instead of joining.
+            let height = cluster.status(idx)["height"]
+                .as_u64()
+                .expect("node status carries a height");
+            println!("node {idx} runs the verb at height {height}");
             let cfg = cluster.config_file(idx);
             let mut args = verb.to_vec();
             args.extend(["--config", cfg.to_str().unwrap()]);

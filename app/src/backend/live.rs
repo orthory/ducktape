@@ -845,6 +845,11 @@ pub(crate) async fn folded_update(
             // is warm by the connect that opened this stream.
             let facts = ReaderFacts::current().await;
             let origin_kind = stream_origin_kind(&op.origin.kind);
+            // THE ONE ARRIVAL A READER CANNOT AFFORD TO FIND LATER. A mention
+            // and a DM used to reach nothing but the in-app bell, which is
+            // worth nothing behind another window. Pure decision, cached
+            // reads, no query — see `notify`.
+            notify_chat_op(&payload, op.origin.id.as_deref(), facts.names());
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
@@ -1328,8 +1333,8 @@ pub fn keep_members(
 /// for the five folds that used to spell it out in four lines each.
 ///
 /// A LOAD CARRIES THE ROSTER OF THE CHANNEL IT LOADED, AND THAT IS NOT ALWAYS
-/// THE HUDDLE'S. The docked pill and the popped panel follow you onto every
-/// other room and every other screen — that is what they are FOR — so reading
+/// THE HUDDLE'S. The huddle window follows you onto every other room and
+/// every other screen — that is what it is FOR — so reading
 /// "am I in a huddle" off the room you happen to be looking at answered no the
 /// moment you clicked a second channel. And that answer is not cosmetic:
 /// `huddle_joined` is the media leg's subscription gate, so a channel click cut
@@ -1840,6 +1845,10 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
                 channel_id,
             });
         }
+        // THE DM ROOMS RIDE THIS LOAD TOO, for the reason the directory does:
+        // the live decoder cannot ask which rooms are mine without a query
+        // inside the fold, and this load already derived every one of them.
+        note_dm_rooms(&peers);
         Ok(DmPeersData { generation, peers })
     }
     .await

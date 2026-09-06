@@ -37,6 +37,11 @@ miss() {
   MISSING=1
   [[ $# -ge 3 && -n "$3" ]] && FIX_CMDS+=("$3")
 }
+# note <what> <fix-text> — the same shape as miss(), for a section that is NOT
+# a sandbox prerequisite. Nothing here can fail the run: this script's exit
+# code answers "will the node's sandbox probe pass", and `make dev` gates on
+# it, so a dev Mac with no Developer ID must still exit 0.
+note() { printf '  n/a   %s\n        fix: %s\n' "$1" "$2"; }
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "this preflight is for macOS; on Linux the probe wants firecracker + kvm" >&2; exit 1; }
 
@@ -126,6 +131,38 @@ if [[ -f "$GUEST_DIR/vmlinux" && -f "$GUEST_DIR/rootfs.ext4" ]]; then
 else
   miss "guest kernel + rootfs" "OUT=\"$GUEST_DIR\" ops/build-guest-rootfs.sh" \
     "OUT=\"$GUEST_DIR\" bash \"$HERE/ops/build-guest-rootfs.sh\""
+fi
+
+# ---- release signing (informational) ----------------------------------------
+# Not a prerequisite for running anything locally: `make app` ad-hoc signs, and
+# an ad-hoc bundle runs on the machine that built it. It is a prerequisite for
+# a bundle that leaves this Mac, and the two halves fail far apart (Gatekeeper
+# on someone else's machine, or a notarytool rejection after the upload), so
+# both are reported here. The recipe is app/README.md "Release build".
+echo
+echo "release signing (only for a bundle that leaves this Mac):"
+DEVELOPER_ID="$(security find-identity -v -p codesigning 2>/dev/null | grep 'Developer ID Application' || true)"
+if [[ -n "$DEVELOPER_ID" ]]; then
+  # one line per identity, quoted name only — that string is what
+  # ICE_CODESIGN_IDENTITY takes.
+  while IFS= read -r line; do
+    ok "codesigning identity: ${line#*\"}"
+  done <<< "$(printf '%s\n' "$DEVELOPER_ID" | sed 's/"$//')"
+else
+  note "no \"Developer ID Application\" identity in the keychain" \
+    "enroll in the Apple Developer Program, then download the certificate; without one \`make app\` signs ad-hoc"
+fi
+
+if [[ -n "${ICE_NOTARY_KEY:-}" && -n "${ICE_NOTARY_KEY_ID:-}" && -n "${ICE_NOTARY_ISSUER:-}" ]]; then
+  if [[ -f "$ICE_NOTARY_KEY" ]]; then
+    ok "notary credentials (ICE_NOTARY_KEY exists, KEY_ID and ISSUER set)"
+  else
+    note "ICE_NOTARY_KEY points at no file ($ICE_NOTARY_KEY)" \
+      "point it at the App Store Connect API key .p8, stored outside this repo"
+  fi
+else
+  note "notary credentials not exported" \
+    "export ICE_NOTARY_KEY=<path to .p8> ICE_NOTARY_KEY_ID=<id> ICE_NOTARY_ISSUER=<uuid>; all three or none"
 fi
 
 echo

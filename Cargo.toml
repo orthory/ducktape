@@ -28,7 +28,7 @@
 #                      does not belongs somewhere else in this list. (module =
 #                      onchain, service = offchain.)
 #   crates/modules/system/ — system modules: consensus infrastructure (acl,
-#                      kv, valset, governance, identity, lifecycle, saga,
+#                      kv, valset, governance, identity, modules, saga,
 #                      capability, dispatch, tagging, gateway — which absorbed
 #                      the duckdns naming library it now consumes from
 #                      crates/duckdns)
@@ -115,7 +115,7 @@ members = [
     "crates/modules/system/valset",
     "crates/modules/system/governance",
     "crates/modules/system/identity",
-    "crates/modules/system/lifecycle",
+    "crates/modules/system/modules",
     "crates/modules/system/saga",
     "crates/modules/system/capability",
     "crates/modules/system/dispatch",
@@ -249,6 +249,11 @@ commonware-actor = "2026.5.0"
 # core used sans-io (`noise::Tunn`, no device layer) — WireGuard-compatible on
 # the wire by construction.
 defguard_boringtun = "0.6.5"
+# tests only: forging a WireGuard mac1 the way boringtun's rate limiter
+# computes it (blake2s keyed by HASH(LABEL_MAC1 || responder public)). the
+# helpers are `pub(crate)` in boringtun, and this is the same blake2 build its
+# own handshake code links.
+blake2 = "0.10"
 # the userspace backend's virtual host: a TUN-less TCP/UDP stack terminating
 # at the node's overlay ULA, entirely in-process. `medium-ip` because the
 # tunnel carries raw IP (WireGuard has no link layer), `async` for the
@@ -340,7 +345,7 @@ acl = { path = "crates/modules/system/acl" }
 valset = { path = "crates/modules/system/valset" }
 governance = { path = "crates/modules/system/governance" }
 identity = { path = "crates/modules/system/identity" }
-lifecycle = { path = "crates/modules/system/lifecycle" }
+modules = { path = "crates/modules/system/modules" }
 saga = { path = "crates/modules/system/saga" }
 capability = { path = "crates/modules/system/capability" }
 dispatch = { path = "crates/modules/system/dispatch" }

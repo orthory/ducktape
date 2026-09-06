@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use futures::executor::block_on;
 use sha2::Digest;
 
-use host::{BlockContext, CodeSource, Host, LIFECYCLE_MODULE_ID};
-use lifecycle::{Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply};
+use host::{BlockContext, CodeSource, Host, MODULES_ID};
+use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
 use sdk::{Error, Msg, Origin, StateRoot};
 use wasm_host::WasmModule;
 
@@ -35,7 +35,7 @@ const HELLO_V1: &[u8] = include_bytes!("fixtures/hello.component.wasm");
 const HELLO_REPLACEMENT: &[u8] = include_bytes!("fixtures/hello-replacement.component.wasm");
 
 /// the swap boundary used throughout: far enough past genesis to clear
-/// `lifecycle::MIN_SWAP_LEAD` from the scheduling block.
+/// `modules::MIN_SWAP_LEAD` from the scheduling block.
 const H: u64 = 10;
 
 fn sha(bytes: &[u8]) -> Vec<u8> {
@@ -57,6 +57,10 @@ impl CodeSource for MapSource {
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
         self.0.get(code_hash).cloned()
     }
+
+    fn origin(&self) -> &'static str {
+        "test_map"
+    }
 }
 
 /// the one validator key the readiness gate counts in these proofs.
@@ -67,12 +71,17 @@ const MEMBER: [u8; 32] = [7; 32];
 /// as hello's genesis-active code.
 fn host_with_wasm() -> Host {
     let mut host = Host::new();
-    host.register(Box::new(Lifecycle::new(
-        LIFECYCLE_MODULE_ID,
+    host.register(Box::new(Modules::new(
+        MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
+        "governance",
     )));
-    let mut valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut valset = valset::Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     block_on(valset.seed(MEMBER.to_vec())).expect("seed valset");
     block_on(valset.finish_seed()).expect("seed valset");
     host.register(Box::new(valset));
@@ -83,7 +92,7 @@ fn host_with_wasm() -> Host {
         &mut host,
         0,
         Origin::System,
-        lifecycle_msg(&LifecycleMsg::RegisterModule {
+        modules_msg(&ModulesMsg::RegisterModule {
             module_id: "hello".into(),
             code_hash: sha(HELLO_V1),
         }),
@@ -100,15 +109,15 @@ fn submit(host: &mut Host, height: u64, origin: Origin, msg: Msg) {
     block_on(host.submit_at(ctx, msg)).expect("block applies");
 }
 
-fn lifecycle_msg(m: &LifecycleMsg) -> Msg {
+fn modules_msg(m: &ModulesMsg) -> Msg {
     Msg {
-        target: LIFECYCLE_MODULE_ID.into(),
-        payload: lifecycle::encode_msg(m),
+        target: MODULES_ID.into(),
+        payload: modules::encode_msg(m),
     }
 }
 
 fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
-    lifecycle_msg(&LifecycleMsg::ScheduleSwap {
+    modules_msg(&ModulesMsg::ScheduleSwap {
         name: "hello-replacement".into(),
         module_id: "hello".into(),
         activation_height,
@@ -119,9 +128,10 @@ fn schedule_msg(activation_height: u64, code_hash: Vec<u8>) -> Msg {
 /// the member's byte-receipt signal: what `code_announce` self-submits once
 /// the component is verified-resident. latches the swap `ready` (R = n = 1).
 fn signal_ready_msg() -> Msg {
-    lifecycle_msg(&LifecycleMsg::SwapReady {
+    modules_msg(&ModulesMsg::SwapReady {
         name: "hello-replacement".into(),
         module_id: "hello".into(),
+        code_hash: sha(HELLO_REPLACEMENT),
     })
 }
 
@@ -138,10 +148,10 @@ fn count(host: &Host) -> u64 {
 }
 
 fn active_hash(host: &Host) -> (Vec<u8>, bool) {
-    let req = lifecycle::encode_query(&LifecycleQuery::ModuleStatus);
-    let bytes = block_on(host.query(LIFECYCLE_MODULE_ID, &req)).expect("status");
-    match lifecycle::decode_reply(&bytes).expect("decode") {
-        LifecycleReply::ModuleStatus { modules } => {
+    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
+    match modules::decode_reply(&bytes).expect("decode") {
+        ModulesReply::ModuleStatus { modules } => {
             let m = modules
                 .iter()
                 .find(|m| m.module_id == "hello")
@@ -297,21 +307,24 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     assert!(!pending, "post-activation: nothing pending");
 
     // joiner: modreg rebuilt to the source's committed state (the real
-    // joiner pulls the qmdb op range — `lifecycle/tests/sync_round_trip.rs`
+    // joiner pulls the qmdb op range — `modules/tests/sync_round_trip.rs`
     // pins that wire; here the deterministic REPLAY of the same admin ops
     // reconstructs the identical record set over the MemStore double, and
     // the roots must agree), wasm module freshly wired from GENESIS (v1)
     // code.
-    let modreg_root = source
-        .module_root(LIFECYCLE_MODULE_ID)
-        .expect("modreg root");
+    let modreg_root = source.module_root(MODULES_ID).expect("modreg root");
     let mut joiner = Host::new();
-    joiner.register(Box::new(Lifecycle::new(
-        LIFECYCLE_MODULE_ID,
+    joiner.register(Box::new(Modules::new(
+        MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
+        "governance",
     )));
-    let mut joiner_valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut joiner_valset = valset::Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     block_on(joiner_valset.seed(MEMBER.to_vec())).expect("seed valset");
     block_on(joiner_valset.finish_seed()).expect("seed valset");
     joiner.register(Box::new(joiner_valset));
@@ -322,7 +335,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
         &mut joiner,
         0,
         Origin::System,
-        lifecycle_msg(&LifecycleMsg::RegisterModule {
+        modules_msg(&ModulesMsg::RegisterModule {
             module_id: "hello".into(),
             code_hash: sha(HELLO_V1),
         }),
@@ -349,7 +362,7 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
         signal_ready_msg(),
     );
     assert_eq!(
-        joiner.module_root(LIFECYCLE_MODULE_ID).expect("modreg root"),
+        joiner.module_root(MODULES_ID).expect("modreg root"),
         modreg_root,
         "the replayed registry converges on the source's committed root"
     );
@@ -437,4 +450,272 @@ fn inert_without_modreg() {
         1,
         "plain active behavior, no swap side-effects"
     );
+}
+
+// ---- the RESIDENT's code source: local store first, then the mesh -------------
+
+/// the node-side source shape a resident actually runs: a local content store
+/// that does NOT hold the committed bytes, plus a remote that does. `fetch`
+/// serves a local hit, else pulls the remote, verifies the digest, and
+/// publishes into the local store — `blob_fetch::FetchingCodeSource` in
+/// miniature. a resident is not a module-code PUSH fan-out target, so this is
+/// the ONLY way it ever holds a committed component.
+struct MeshSource {
+    local: std::sync::Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
+    remote: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl MeshSource {
+    /// a resident that holds NOTHING locally and a mesh that serves
+    /// `served` — the live shape at a code-swap boundary.
+    fn serving(served: &[&[u8]]) -> Self {
+        Self {
+            local: std::sync::Mutex::new(BTreeMap::new()),
+            remote: served.iter().map(|c| (sha(c), c.to_vec())).collect(),
+        }
+    }
+
+    /// a resident whose local store is empty and whose mesh serves nothing:
+    /// no peer can answer, so the boundary must fail closed.
+    fn unservable() -> Self {
+        Self {
+            local: std::sync::Mutex::new(BTreeMap::new()),
+            remote: BTreeMap::new(),
+        }
+    }
+
+    fn holds_locally(&self, code_hash: &[u8]) -> bool {
+        self.local
+            .lock()
+            .expect("local store")
+            .contains_key(code_hash)
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl CodeSource for MeshSource {
+    async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>> {
+        if let Some(hit) = self.local.lock().expect("local store").get(code_hash) {
+            return Some(hit.clone());
+        }
+        let pulled = self.remote.get(code_hash)?;
+        let verified = sha(pulled) == code_hash;
+        if !verified {
+            return None; // content-addressed: an unverified pull is never published.
+        }
+        self.local
+            .lock()
+            .expect("local store")
+            .insert(code_hash.to_vec(), pulled.clone());
+        Some(pulled.clone())
+    }
+
+    fn origin(&self) -> &'static str {
+        "blob_mesh"
+    }
+}
+
+/// THE RESIDENT FOLD: a node that never received the PUSH fan-out (its local
+/// store is empty at the boundary) realizes the committed swap by pulling the
+/// bytes through its source — and publishes them locally on the way, so the
+/// next boundary is a local hit. the local-only source over the SAME empty
+/// store is the halt this replaces.
+#[test]
+fn resident_fold_realizes_by_pulling_absent_bytes() {
+    let mut host = host_with_wasm();
+    submit(
+        &mut host,
+        3,
+        Origin::System,
+        schedule_msg(H, sha(HELLO_REPLACEMENT)),
+    );
+    submit(
+        &mut host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
+
+    // the local-only source over an empty store: exactly the halt a resident hit.
+    let local_only = MapSource(BTreeMap::new());
+    realize(&mut host, H, &local_only).expect_err("a local-only miss fails closed");
+
+    let mesh = MeshSource::serving(&[HELLO_V1, HELLO_REPLACEMENT]);
+    assert!(
+        !mesh.holds_locally(&sha(HELLO_REPLACEMENT)),
+        "the resident holds no bytes for the committed hash before the fold"
+    );
+    realize(&mut host, H, &mesh).expect("the pulled bytes realize the swap");
+    assert!(
+        mesh.holds_locally(&sha(HELLO_REPLACEMENT)),
+        "a verified pull publishes into the local store"
+    );
+
+    submit(&mut host, H, Origin::External(vec![7; 32]), inc_msg());
+    assert_eq!(count(&host), 100, "the pulled replacement code is what ran");
+    let (active, pending) = active_hash(&host);
+    assert_eq!(active, sha(HELLO_REPLACEMENT));
+    assert!(!pending, "the pending slot is freed at H");
+}
+
+/// a hash NO peer can serve is still a hard stop — but the operator gets one
+/// line naming the module, the hash and the source that could not serve it
+/// BEFORE the fatal, so "unfetchable" reads apart from "never asked".
+#[test]
+fn unservable_hash_fails_closed_with_the_reason_logged() {
+    let mut host = host_with_wasm();
+    submit(
+        &mut host,
+        3,
+        Origin::System,
+        schedule_msg(H, sha(HELLO_REPLACEMENT)),
+    );
+    submit(
+        &mut host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
+
+    let captured = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(captured.clone())
+        .with_ansi(false)
+        .finish();
+    let err = tracing::subscriber::with_default(subscriber, || {
+        realize(&mut host, H, &MeshSource::unservable()).expect_err("no peer serves it")
+    });
+    assert!(matches!(err, Error::Module(m) if m.contains("absent")));
+
+    let line = captured.text();
+    assert!(
+        line.contains("event=\"module_code_unresolved\""),
+        "the stable event name must precede the fatal: {line}"
+    );
+    assert!(
+        line.contains("reason=\"code_bytes_absent\""),
+        "the stable reason must precede the fatal: {line}"
+    );
+    assert!(
+        line.contains(&hex_lower(&sha(HELLO_REPLACEMENT))),
+        "the unfetchable hash must be in the line: {line}"
+    );
+    assert!(
+        line.contains("source=\"blob_mesh\""),
+        "the source that could not serve must be in the line: {line}"
+    );
+
+    // still fail-closed: nothing swapped.
+    submit(&mut host, H, Origin::External(vec![7; 32]), inc_msg());
+    assert_eq!(count(&host), 1, "still v1 after the refused boundary");
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// a `MakeWriter` over a shared buffer: the test reads what an operator reads.
+#[derive(Clone, Default)]
+struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("captured log")).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("captured log").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// ALL-OR-NOTHING: two modules swap at the SAME height and this node has only
+/// the first one's bytes. The boundary must refuse having changed NOTHING —
+/// realizing the first would leave the node running `H`'s code over state still
+/// at `H - 1` (the drain turns the Err into a stall that never applies `H`) and
+/// answering queries from it.
+#[test]
+fn a_missing_second_module_realizes_neither() {
+    let mut host = host_with_wasm();
+    // a SECOND hot-swappable module, sorted AFTER `hello` in the roster — so the
+    // resolvable entry is reached first and, unguarded, would swap.
+    host.register(Box::new(
+        WasmModule::from_bytes("zz-hello", HELLO_V1).expect("load v1"),
+    ));
+    submit(
+        &mut host,
+        0,
+        Origin::System,
+        modules_msg(&ModulesMsg::RegisterModule {
+            module_id: "zz-hello".into(),
+            code_hash: sha(HELLO_V1),
+        }),
+    );
+    // hello -> the replacement (bytes present); zz-hello -> a hash whose bytes
+    // this node does not have. both arm at H.
+    let absent = sha(b"a component this node never received");
+    for (name, module_id, code_hash) in [
+        ("hello-replacement", "hello", sha(HELLO_REPLACEMENT)),
+        ("zz-replacement", "zz-hello", absent.clone()),
+    ] {
+        submit(
+            &mut host,
+            3,
+            Origin::System,
+            modules_msg(&ModulesMsg::ScheduleSwap {
+                name: name.into(),
+                module_id: module_id.into(),
+                activation_height: H,
+                code_hash: code_hash.clone(),
+            }),
+        );
+        submit(
+            &mut host,
+            4,
+            Origin::External(MEMBER.to_vec()),
+            modules_msg(&ModulesMsg::SwapReady {
+                name: name.into(),
+                module_id: module_id.into(),
+                code_hash,
+            }),
+        );
+    }
+
+    // the order the boundary walks: `hello` (resolvable) BEFORE `zz-hello`
+    // (absent) is what makes this a partial-realization test at all.
+    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
+    let ModulesReply::ModuleStatus { modules } = modules::decode_reply(&bytes).expect("decode")
+    else {
+        panic!("expected ModuleStatus");
+    };
+    let ids: Vec<&str> = modules.iter().map(|m| m.module_id.as_str()).collect();
+    assert_eq!(ids, vec!["hello", "zz-hello"], "roster order");
+
+    let root0 = host.root_hash();
+    let src = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
+    let err = realize(&mut host, H, &src).expect_err("the absent second entry fails closed");
+    assert!(matches!(err, Error::Module(m) if m.contains("absent")));
+
+    assert_eq!(
+        host.module_code_hash("hello"),
+        Some(sha(HELLO_V1)),
+        "the resolvable FIRST module must not have swapped — the boundary is all-or-nothing"
+    );
+    assert_eq!(host.module_code_hash("zz-hello"), Some(sha(HELLO_V1)));
+    assert_eq!(root0, host.root_hash(), "nothing moved the root-hash");
 }

@@ -18,7 +18,7 @@ nothing cites is deleted, not archived.
 
 | Question | Read |
 | --- | --- |
-| Keep a node and its service daemons up under systemd; ports; logs; why three validators tolerate nothing | [`deploy/node-service.md`](deploy/node-service.md) |
+| Keep a node and its service daemons up under systemd (Linux) or launchd (macOS); ports; logs; why three validators tolerate nothing | [`deploy/node-service.md`](deploy/node-service.md) |
 | Which files are secrets, which are irreplaceable, what to copy, what a restore looks like | [`deploy/backup-and-keys.md`](deploy/backup-and-keys.md) |
 | Run the untrusted coordinator (rendezvous + first-contact relay); stand up two NAT'd validators | [`deploy/coordinator.md`](deploy/coordinator.md) |
 | Front a validator with a sentry so it exposes no inbound port | [`deploy/sentry-deployment.md`](deploy/sentry-deployment.md) |

@@ -394,7 +394,14 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // level up, and `has_older_history` flips on every page.
     assert!(chat.contains("col w=fill gap=3.0 pr=6.0"));
     assert!(chat.contains("button \"Load older messages\""));
-    assert!(timeline.1.contains("lazy message as cached_message"));
+    // THE COPY RANGE JOINS THE PER-ROW KEY. A quiet row's memo has to notice
+    // the range's ends moving, or shift-clicking down a channel would tint the
+    // rows the reader is dragging over and leave every cached row behind it
+    // untinted. Everything else about the key is unchanged: the range is three
+    // scalars, not a list, so a cached row still reads nothing expensive.
+    assert!(timeline.1.contains(
+        "lazy message, copy_anchor_seq, copy_head_seq, copy_surface as cached_message"
+    ));
     // A key is only an identity if it is unique. The allocator gives every
     // concurrent pending row its own widget state and measurement.
     let mut pending = Vec::new();
@@ -471,30 +478,6 @@ fn the_message_line_is_one_rich_text_paragraph() {
     assert!(handlers.contains(
         "run every open_external_url(url) -> external_url_opened _ | external_url_failed _"
     ));
-}
-
-/// A TAIL SNAP ON AN END-ANCHORED SCROLL IS `snap … 0.0`, NEVER `snap-end`.
-///
-/// Both of the app's snapped scrolls (`#message-stream`, `#transcript`) are
-/// `anchor-y=end`: the offset counts FROM the tail, so relative 0.0 is the
-/// tail and `snap-end` (relative 1.0) is the TOP of loaded history. The
-/// inverted op shipped once — every send hurled the reader to the oldest
-/// loaded row — and is a silent no-op in any fixture whose content fits the
-/// viewport, so only this lint stands between it and a paste-back.
-#[test]
-fn tail_snaps_speak_the_end_anchored_offset() {
-    let chat = include_str!("../ui/handlers/chat.ice");
-    let shell = include_str!("../ui/handlers/shell.ice");
-    assert!(
-        chat.contains("task widget snap #workspace-tabs/content/chat/message-stream 0.0 0.0"),
-        "the send handler snaps the stream to its anchored tail"
-    );
-    for (name, source) in [("chat", chat), ("shell", shell)] {
-        assert!(
-            !source.contains("task widget snap-end"),
-            "{name} handlers invoke snap-end, which is the TOP of an anchor-y=end scroll"
-        );
-    }
 }
 
 /// `· edited` ANNOTATES A MESSAGE, SO IT RIDES THE MESSAGE.

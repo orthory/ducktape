@@ -114,6 +114,7 @@ where
             disposition: seal.disposition,
             root_hash: seal.root_hash,
             dispatches: &dispatches,
+            roots: &seal.roots,
         });
     }
     Ok(())
@@ -327,4 +328,118 @@ pub(crate) fn derive_pending_boot(manifest: &Manifest, rec: &recovery::Recovered
         }
         armed
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use consensus::{ObservationOutcome, ValsetOrchestrator};
+    use sdk::StateRoot;
+
+    use super::*;
+
+    const VALSET_ROOT: StateRoot = StateRoot([9; sdk::ROOT_LEN]);
+
+    /// the drain's checkpoint capture, with the manifest fields this path
+    /// reads and defaults for the rest.
+    fn manifest(height: u64, pending_cutover_view: Option<u64>) -> Manifest {
+        Manifest {
+            height: Some(height),
+            epoch: 0,
+            view_base: 0,
+            participants: vec![vec![1], vec![2]],
+            residents: Vec::new(),
+            pending_cutover_view,
+            root_hash: StateRoot([0; sdk::ROOT_LEN]),
+            // the change is already IN the checkpointed valset root: it is the
+            // block at `height` that moved it.
+            roots: vec![("valset".to_string(), VALSET_ROOT)],
+            snapshots: Vec::new(),
+            oplog_pos: 0,
+            next_seq: 0,
+            applied_frames: Vec::new(),
+        }
+    }
+
+    /// what the journal retained above that checkpoint when the node died a
+    /// few block times later: sealed heights whose valset root never moves
+    /// again, because the move already happened AT the checkpoint.
+    fn recovered_above(manifest: &Manifest, heights: &[u64]) -> recovery::Recovered {
+        recovery::Recovered {
+            height: heights.last().copied().or(manifest.height),
+            root_hash: manifest.root_hash,
+            epoch: manifest.epoch,
+            view_base: manifest.view_base,
+            participants: manifest.participants.clone(),
+            residents: manifest.residents.clone(),
+            frames: Vec::new(),
+            blocks: heights
+                .iter()
+                .map(|h| (*h, vec![("valset".to_string(), VALSET_ROOT)]))
+                .collect(),
+            applied_frames: Vec::new(),
+            applied: 0,
+            skipped: 0,
+            rolled_forward: false,
+        }
+    }
+
+    /// THE CHECKPOINT MUST CARRY THE CUTOVER THE SAME DRAIN PASS ARMED.
+    ///
+    /// A valset change lands at engine view V and the checkpoint cadence fires
+    /// on that same pass. The manifest's height IS V's height — the
+    /// observation barrier makes that alignment exact, not unlikely — so the
+    /// re-arm scan on the next boot can never see the change: it reads only
+    /// blocks ABOVE the manifest height, seeded with the manifest's
+    /// already-changed valset root. `pending_cutover_view` is the ONLY re-arm
+    /// path in this case, and it is only truthful if the checkpoint is
+    /// captured AFTER the drain's orchestration step.
+    #[test]
+    fn a_drain_checkpoint_at_the_changing_view_re_arms_the_ceiling_peers_use() {
+        let changing_view = 40;
+        let mut orchestrator = ValsetOrchestrator::new(CUTOVER_DELAY, [vec![1u8], vec![2]]);
+        let ObservationOutcome::Scheduled(armed) =
+            orchestrator.observe_members(changing_view, [vec![1u8], vec![2], vec![3]], [])
+        else {
+            panic!("a membership change schedules a cutover");
+        };
+        // every peer that observed the same block armed exactly this view.
+        let peers_ceiling = changing_view + CUTOVER_DELAY;
+        assert_eq!(armed.cutover_view(), peers_ceiling);
+
+        // the checkpoint, captured after the orchestration step.
+        let captured = manifest(
+            changing_view,
+            orchestrator.pending_cutover().map(|c| c.cutover_view()),
+        );
+        let rec = recovered_above(&captured, &[changing_view + 1]);
+
+        let pending_boot = derive_pending_boot(&captured, &rec);
+        assert_eq!(
+            pending_boot,
+            Some(peers_ceiling),
+            "the restart must re-arm the ceiling its peers are converging on"
+        );
+        let resumed = ValsetOrchestrator::resume(
+            CUTOVER_DELAY,
+            rec.participants.clone(),
+            rec.residents.clone(),
+            rec.epoch,
+            rec.view_base,
+            pending_boot,
+        );
+        assert_eq!(
+            resumed.pending_cutover().map(|c| c.cutover_view()),
+            Some(peers_ceiling)
+        );
+
+        // ...and the pre-fix capture point, for the record: a manifest written
+        // before the pass armed the cutover leaves NOTHING to recover it from.
+        // The node then applies the views its peers discarded and cuts over
+        // one view late — a silent fork.
+        assert_eq!(
+            derive_pending_boot(&manifest(changing_view, None), &rec),
+            None,
+            "the scan cannot see a change that happened at the manifest height"
+        );
+    }
 }

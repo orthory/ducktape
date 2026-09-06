@@ -200,6 +200,43 @@ fn request_run_validates_agent_origin_and_anchor() {
 }
 
 #[test]
+fn request_run_is_gated_on_the_submitters_chat_standing() {
+    // #1630: an external submitter who is not a member of a members-only
+    // channel must not be able to have an agent pin its transcript and post
+    // into it under module authority.
+    let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+    let mut m = watched(TurnPolicy::Mention, &registry);
+    let request = admin(&RunsMsg::RequestRun {
+        agent_id: "bot".into(),
+        channel_id: "board".into(),
+        anchor_seq: 3,
+        demands: Default::default(),
+        skills: Vec::new(),
+    });
+
+    // mallory (user 1) is not a member of "board".
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(1))
+        .with_registry(&registry)
+        .with_transcript("board", transcript(3))
+        .with_members_only("board", vec![2; 32]);
+    let err = exec(&mut m, &mut ctx, &request).unwrap_err();
+    assert!(matches!(err, Error::Module(_)));
+    assert!(ctx.dispatch_msgs().is_empty());
+    abort(&mut m);
+
+    // a member (user 2) is admitted and the run is staged normally.
+    let mut ctx = CaptureCtx::new()
+        .with_origin(user(2))
+        .with_registry(&registry)
+        .with_transcript("board", transcript(3))
+        .with_members_only("board", vec![2; 32]);
+    exec(&mut m, &mut ctx, &request).unwrap();
+    assert_eq!(ctx.dispatch_msgs().len(), 1);
+    commit(&mut m);
+}
+
+#[test]
 fn request_run_threads_demands_into_the_dispatch_emit() {
     // an explicit RequestRun's demands ride verbatim onto the emitted
     // DispatchMsg::Dispatch — the only demand surface in this phase.

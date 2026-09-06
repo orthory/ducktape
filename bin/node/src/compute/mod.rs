@@ -295,8 +295,8 @@ async fn build_pool(
             target: "ducktape::compute",
             reason = "no_browser_gateway",
             "this node serves no browser gateway, so every run naming a --cred \
-             will fail to resolve it (the browser gateway starts only when the \
-             node api binds a loopback address)"
+             will fail to resolve it (the browser gateway starts only on a node \
+             with a gateway_listen and a WireGuard overlay, never under --sync-only)"
         );
     }
     let resolver: compute_service::SharedCredentialResolver =

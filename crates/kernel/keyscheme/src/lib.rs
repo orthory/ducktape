@@ -50,11 +50,21 @@ pub use webauthn::{webauthn_challenge, webauthn_proof};
 pub enum KeyScheme {
     /// everything native: device keys, node keys, SSH keys. 32-byte pubkey.
     Ed25519,
-    /// an Ethereum wallet. SEC1 33/65-byte pubkey; proof is `personal_sign`.
+    /// an Ethereum wallet. 33-byte compressed SEC1 pubkey; proof is `personal_sign`.
     Secp256k1,
-    /// a WebAuthn passkey. SEC1 33/65-byte pubkey; proof is the assertion envelope.
+    /// a WebAuthn passkey. 33-byte compressed SEC1 pubkey; proof is the assertion envelope.
     Secp256r1,
 }
+
+/// the ONE encoding a secp256k1/secp256r1 key is ever known by: compressed
+/// SEC1, `0x02|0x03 ‖ X`. the uncompressed 65-byte form denotes the SAME curve
+/// point, and every point-based verifier accepts either — but every index and
+/// membership check in the system compares RAW BYTES, so admitting both would
+/// make one private key two principals (two accounts, and a member key able to
+/// re-join under an alternate encoding after `RemoveKey`). the trust boundary
+/// refuses the non-canonical form rather than re-encoding it: the origin bytes
+/// in a frame are exactly what the signer signed over in `frame_preimage`.
+const COMPRESSED_SEC1_LEN: usize = 33;
 
 impl KeyScheme {
     /// the one-byte wire tag: folded into signing preimages and the frame
@@ -79,19 +89,30 @@ impl KeyScheme {
 
     /// a fast, allocation-free well-formedness check on a public key's bytes
     /// for this scheme — rules out bytes that could never be a key of this
-    /// scheme. NOT a substitute for [`KeyScheme::verify`].
+    /// scheme, AND every non-canonical spelling of one that could
+    /// ([`COMPRESSED_SEC1_LEN`]). NOT a substitute for [`KeyScheme::verify`].
     pub fn pubkey_wellformed(self, pubkey: &[u8]) -> bool {
+        let is_canonical_sec1 = pubkey.len() == COMPRESSED_SEC1_LEN;
         match self {
             KeyScheme::Ed25519 => pubkey.len() == 32,
-            KeyScheme::Secp256k1 => k256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey).is_ok(),
-            KeyScheme::Secp256r1 => p256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey).is_ok(),
+            KeyScheme::Secp256k1 => {
+                is_canonical_sec1 && k256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey).is_ok()
+            }
+            KeyScheme::Secp256r1 => {
+                is_canonical_sec1 && p256::ecdsa::VerifyingKey::from_sec1_bytes(pubkey).is_ok()
+            }
         }
     }
 
     /// does `proof` demonstrate that the holder of `pubkey` (read as this
     /// scheme) authorized `preimage` under `ns`? a proof whose envelope does
-    /// not fit this scheme is a categorical `false`.
+    /// not fit this scheme is a categorical `false`, and so is a key spelled
+    /// any way but the canonical one — the arms below compare CURVE POINTS, so
+    /// only this gate keeps one key from answering to two byte strings.
     pub fn verify(self, pubkey: &[u8], ns: &[u8], preimage: &[u8], proof: &[u8]) -> bool {
+        if !self.pubkey_wellformed(pubkey) {
+            return false;
+        }
         match self {
             KeyScheme::Ed25519 => verify_ed25519(pubkey, ns, preimage, proof),
             KeyScheme::Secp256k1 => eth::verify_personal_sign(pubkey, ns, preimage, proof),
@@ -207,10 +228,37 @@ mod tests {
         assert!(KeyScheme::Ed25519.pubkey_wellformed(&[0u8; 32]));
         assert!(!KeyScheme::Ed25519.pubkey_wellformed(&[0u8; 33]));
         let r1 = p256::ecdsa::SigningKey::from_slice(&[0x11u8; 32]).unwrap();
-        assert!(KeyScheme::Secp256r1.pubkey_wellformed(&r1.verifying_key().to_sec1_bytes()));
+        assert!(
+            KeyScheme::Secp256r1
+                .pubkey_wellformed(r1.verifying_key().to_encoded_point(true).as_bytes())
+        );
         assert!(!KeyScheme::Secp256r1.pubkey_wellformed(&[0u8; 33]));
         let k1 = k256::ecdsa::SigningKey::from_slice(&[0x22u8; 32]).unwrap();
-        assert!(KeyScheme::Secp256k1.pubkey_wellformed(&k1.verifying_key().to_sec1_bytes()));
+        assert!(
+            KeyScheme::Secp256k1
+                .pubkey_wellformed(k1.verifying_key().to_encoded_point(true).as_bytes())
+        );
         assert!(!KeyScheme::Secp256k1.pubkey_wellformed(&[0u8; 33]));
+        // the uncompressed SEC1 spelling of those very keys: a valid curve
+        // point that `from_sec1_bytes` would parse, and NOT a well-formed key.
+        for (scheme, uncompressed) in [
+            (
+                KeyScheme::Secp256r1,
+                r1.verifying_key()
+                    .to_encoded_point(false)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+            (
+                KeyScheme::Secp256k1,
+                k1.verifying_key()
+                    .to_encoded_point(false)
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        ] {
+            assert_eq!(uncompressed.len(), 65);
+            assert!(!scheme.pubkey_wellformed(&uncompressed));
+        }
     }
 }

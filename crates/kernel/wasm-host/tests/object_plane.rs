@@ -5,7 +5,7 @@
 //! memoized-replay resolver, not a trap loop), the object-read budget rejects
 //! deterministically, and staged puts are discarded on an aborted dispatch.
 //!
-//! Task 1 wires NO backing (`HostOdb` is implemented by Task 2), so every read
+//! the backing holds nothing (an empty odb, an empty refs image), so every read
 //! that misses the same-dispatch put overlay resolves to `None` — exactly the
 //! absent-id contract this proof pins.
 //!
@@ -14,12 +14,51 @@
 
 use sdk::{Ctx, Env, Error, Event, Module, Msg, Origin, StateRoot};
 use sha2::{Digest, Sha256};
-use wasm_host::{MAX_OBJECT_READS, WasmModule};
+use wasm_host::{HostOdb, MAX_OBJECT_READS, OdbBacking, WasmModule};
 
 const OBJECT: &[u8] = include_bytes!("fixtures/object.component.wasm");
 
+/// the odb substrate the fixture runs over: it holds no object and no refs,
+/// and a staged put is dropped at the boundary. every miss of the
+/// same-dispatch overlay is a `None`.
+struct EmptyOdb;
+
+impl HostOdb for EmptyOdb {
+    fn stat(&self, _id: &[u8]) -> Option<(u8, u64)> {
+        None
+    }
+    fn get(&self, _id: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    fn stage_put(&mut self, kind: u8, body: &[u8]) -> [u8; 32] {
+        object_id(kind, body)
+    }
+}
+
+impl OdbBacking for EmptyOdb {
+    fn refs_bytes(&self) -> Vec<u8> {
+        Vec::new()
+    }
+    fn adopt_refs(&mut self, _bytes: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+    fn publish_block(&mut self, _height: u64) -> Result<(), Error> {
+        Ok(())
+    }
+    fn discard_block(&mut self) {}
+    fn query(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::QueryUnsupported)
+    }
+    fn serve_sync(&self, _req: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::SyncUnsupported)
+    }
+    fn durable_commit_height(&self) -> Option<u64> {
+        None
+    }
+}
+
 /// the minimal ctx: object reads never route through it (they resolve against
-/// the odb backing, `None` in Task 1), so a stub ctx is enough.
+/// the odb backing), so a stub ctx is enough.
 struct MockCtx {
     env: Env,
     msgs: Vec<Msg>,
@@ -61,7 +100,7 @@ impl Ctx for MockCtx {
 }
 
 fn module() -> WasmModule {
-    WasmModule::from_bytes("object", OBJECT).expect("load")
+    WasmModule::with_odb("object", OBJECT, Box::new(EmptyOdb)).expect("load")
 }
 
 async fn exec(m: &mut WasmModule, ctx: &mut MockCtx, payload: Vec<u8>) -> Result<(), Error> {
@@ -83,9 +122,11 @@ fn object_id(kind: u8, body: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// `[b'p', kind, body..]` — put then same-dispatch stat/get of the returned id.
+/// `[b'p', kind, id(32), body..]` — put, check the host returned `id` (the
+/// caller's sha256(kind ‖ body)), then same-dispatch stat/get of it.
 fn put_op(kind: u8, body: &[u8]) -> Vec<u8> {
     let mut p = vec![b'p', kind];
+    p.extend_from_slice(&object_id(kind, body));
     p.extend_from_slice(body);
     p
 }
@@ -109,16 +150,13 @@ async fn put_is_visible_to_same_dispatch_stat_and_get() {
     let mut m = module();
     let mut ctx = MockCtx::new("object");
 
-    // the guest puts (kind=2 tree, body "hi"), then stats and gets the returned
-    // id IN THE SAME DISPATCH; the op only returns Ok if the overlay answered
+    // the guest puts (kind=2 tree, body "hi"), checks the host answered the
+    // content-addressed id sha256(tag ‖ body), then stats and gets it IN THE
+    // SAME DISPATCH; the op only returns Ok if the overlay answered
     // stat = Some((2, 2)) and get = Some([2, 'h', 'i']) — no pause, no backing.
     exec(&mut m, &mut ctx, put_op(2, b"hi"))
         .await
         .expect("put then same-dispatch stat/get resolve from the staged overlay");
-
-    // and the host computed the content-addressed id the guest stored.
-    let stored = m.query(b"i").await.expect("query stored id");
-    assert_eq!(stored, object_id(2, b"hi"), "host returns sha256(tag ‖ body)");
 }
 
 #[tokio::test]

@@ -102,7 +102,9 @@ pub mod services;
 /// A service daemon's handle on the node it serves: the `/v1` twin of the
 /// in-process `NodeCommand` actor lane. See [`node_link::NodeLink`].
 pub mod node_link;
-pub use term_remote::{RemoteSessions, SessionInputWire, SessionJob, SessionLane};
+pub use term_remote::{
+    CONTROL_DEADLINE, RemoteSessions, SessionInputWire, SessionJob, SessionLane,
+};
 // PR2 consensus command source: the chat<->pty bridge (channel scheme + the
 // off-loop projector that drives committed chat commands into a session's pty).
 mod term_consensus;
@@ -116,7 +118,8 @@ pub use term_consensus::{command_blocks, command_text, session_channel};
 mod index;
 pub use index::{
     BlocksParams, FOLDED_HEADER, IndexGuests, IndexScanParams, converge_index_guests,
-    index_block_ops, index_origin, open_index_store, stale_modules, stamp_stale_modules,
+    index_block_ops, index_host_modules, index_origin, open_index_store, stale_modules,
+    stamp_stale_modules,
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;
@@ -308,6 +311,16 @@ pub struct NodeStatus {
     pub version: String,
     pub root_hash: String,
     pub height: u64,
+    /// the `Env` clock every module compares `expires_at` against, stamped
+    /// from `height` under this node's `ConsensusTimePolicy` — a block height
+    /// on the validator/replica lanes, a millisecond epoch on the sim lane.
+    /// a client minting a TTL-bounded consent (identity's `AddKey`) MUST read
+    /// this, never `height`: the two units diverge on simnode.
+    pub consensus_time: u64,
+    /// which unit [`Self::consensus_time`] is expressed in, so a client can
+    /// scale a TTL window correctly regardless of which lane it is talking
+    /// to. defaults to `Height` (the validator/replica lanes' only policy).
+    pub consensus_time_unit: ConsensusTimeUnit,
     pub modules: Vec<ModuleStatus>,
     /// this node's mesh identity (hex ed25519 key) — what a client stamps
     /// into ops that route peer traffic to it (chat's `JoinHuddle.node`).
@@ -487,6 +500,31 @@ pub struct StoreOperationalStatus {
     /// blobstore is ONE FLAT DIRECTORY of op-payload blobs, so this is also
     /// the count an operator's `ls` has to survive.
     pub files: u64,
+}
+
+/// the unit a `NodeStatus::consensus_time` reading is in — mirrors
+/// [`node::ConsensusTimePolicy`]'s two arms, so a status client never needs
+/// the kernel crate just to scale a TTL correctly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsensusTimeUnit {
+    /// `consensus_time` IS the block height (the validator/replica lanes'
+    /// only policy); one unit is roughly one second at a one-block-per-second
+    /// heartbeat.
+    #[default]
+    Height,
+    /// `consensus_time` is a millisecond epoch clock (the sim lane); one unit
+    /// is one millisecond.
+    Millis,
+}
+
+impl From<node::ConsensusTimePolicy> for ConsensusTimeUnit {
+    fn from(policy: node::ConsensusTimePolicy) -> Self {
+        match policy {
+            node::ConsensusTimePolicy::HeightIsTime => Self::Height,
+            node::ConsensusTimePolicy::Epoch { .. } => Self::Millis,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -747,7 +785,10 @@ pub fn router(handle: NodeHandle) -> Router {
             "/forge/{repo}/git-upload-pack",
             post(git_upload_pack).layer(DefaultBodyLimit::max(GIT_PACK_BODY_LIMIT)),
         );
-    // EVERY mutating route above carries a user signature; the reads do not.
+    // EVERY mutating route above carries a credential; the reads do not. WHICH
+    // credential is `signed_req::Lane::authority`'s call: a module-bound write
+    // takes any acting key (the module decides), a node-level one takes this
+    // node's operator.
     // `route_layer`, NOT `layer`: a layer would also wrap the fallback, and an
     // unmatched path must 404 rather than be told it needs a signature.
     // `signed_req::lane_of` is the whole table — a new mutating route is added
@@ -787,8 +828,11 @@ pub const DEFAULT_ORIGIN: &str = "noded";
 /// committed. the real node has a keypair for this and signs; the embedded
 /// daemon has only its trusted-client origin string, so it must be ONE string
 /// — the binary's actor loop, its oracle pool, and the provisioner all name it
-/// here rather than each inventing a spelling.
-pub const ORACLE_ORIGIN: &[u8] = b"oracle";
+/// here rather than each inventing a spelling. 32 bytes: `Accept` gates on
+/// valset standing (and, for a tagged saga, an announced capability), the
+/// same shape a real node's ed25519 key has — a scenario that needs this
+/// identity to actually claim a saga registers it via `--with-valset`.
+pub const ORACLE_ORIGIN: &[u8] = &[b'o'; 32];
 
 /// the network name BOTH single-writer daemons compose under: the composer
 /// binds it into the identity and gateway guests' genesis `__config`, and
@@ -999,11 +1043,13 @@ pub(crate) async fn shutdown(State(handle): State<NodeHandle>) -> Response {
 /// tree is unreachable without a restart — and restarting a wedged node destroys
 /// the state you restarted it to look at.
 ///
-/// AUTH: it MUTATES the running process, so it carries a user signature like
-/// every other mutating route ([`signed_req`]). turning `ducktape::x=trace` on
-/// is a real denial-of-service against the node's own disk — `daemon.log` has
-/// no rate limit — and a bare `curl` from anything that could dial the port
-/// used to be enough. the operator verb signs for you.
+/// AUTH: it MUTATES the running PROCESS and reads no acting identity, so it is
+/// one of the node-level routes (`signed_req`, `Authority::Operator`): this
+/// node's operator credential, or a signature by the key it knows as its
+/// operator's. turning `ducktape::x=trace` on is a real denial-of-service
+/// against the node's own disk — `daemon.log` has no rate limit — and any key a
+/// caller minted for itself must not buy it. `ducktape node log-filter` signs
+/// with the active wallet key, which is the key the node read at boot.
 async fn log_filter(body: String) -> Response {
     match crate::log::set_filter(body.trim()) {
         Ok(()) => (StatusCode::OK, body).into_response(),
@@ -1027,11 +1073,12 @@ async fn log_filter(body: String) -> Response {
 /// descriptor to fold a hint into.
 ///
 /// AUTH: a bearer invite is a real capability — a right to join this mesh for
-/// up to 365 days — so minting one is behind the signed-write gate
-/// ([`signed_req`]) like every other mutation: a user signature, or this node's
-/// operator credential from a local process that can read its workspace. The
-/// desktop app presents the latter (it already reads the same workspace for the
-/// service-link token).
+/// up to 365 days — and this handler reads no acting identity, so possession of
+/// a self-minted key buys nothing here. It is node-level
+/// (`signed_req`, `Authority::Operator`): this node's operator credential from
+/// a local process that can read its workspace, or a signature by the key the
+/// node knows as its operator's. The desktop app presents the former (it
+/// already reads the same workspace for the service-link token).
 async fn mint_invite(
     State(handle): State<NodeHandle>,
     body: Option<Json<serde_json::Value>>,
@@ -1139,7 +1186,13 @@ pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std
 }
 
 async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| stream::stream_session(socket, handle))
+    // unauthenticated surface: cap the frame/message tungstenite otherwise
+    // defaults to 64 MiB, so a single frame cannot force a large buffer before
+    // any handler gets to look at it (see `stream::MAX_WS_MESSAGE_BYTES`).
+    upgrade
+        .max_message_size(stream::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(stream::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| stream::stream_session(socket, handle))
 }
 
 #[cfg(test)]

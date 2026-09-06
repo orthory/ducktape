@@ -30,6 +30,17 @@ on set_appearance_dark
 
 on appearance_saved(_written)
 
+// The banner preference, the same arrangement: pin the reading, persist it
+// last, and treat a failed write as costing the NEXT boot's default.
+on desktop_notifications_loaded(enabled)
+  desktop_notifications = enabled
+
+on set_desktop_notifications(enabled)
+  desktop_notifications = enabled
+  run replace lane=notify_save save_desktop_notifications(enabled) -> desktop_notifications_saved _
+
+on desktop_notifications_saved(_written)
+
 // A SAME-ENDPOINT retry: the launch window's picker owns which network, so
 // reconnect no longer changes endpoints — the per-endpoint draft retention
 // that lived here collapsed to identity calls and is gone. Typed drafts
@@ -960,9 +971,31 @@ subscribe
   // whose target is not on screen is a no-op.
   keyboard press status=ignored -> content_scroll_key _
   window file-dropped -> fs_file_dropped _
-  // A daemon outlives its windows, so process exit is an explicit decision:
-  // when the LAST tracked window closes, leave.
+  // A daemon outlives its windows: a close just unregisters the slot (below).
+  // The process leaves only when someone says so — the tray's Quit, or ⌘Q.
   window closed with-id -> window_was_closed _
+  // ⌘Q AND ⌘W, WITHOUT TAXING EVERY KEYSTROKE. macOS binds both through an app
+  // menu this app does not have, so it reads them itself. A key-press
+  // subscription publishes a proxied message and an unconditional iced rebuild
+  // for EVERY key it sees (the cost the `status=ignored` note above is about),
+  // so an always-on route just to catch two chords would double what typing
+  // costs. The modifier stream is the cheap half — it fires only when a
+  // modifier goes down or up — so it arms the expensive half, and the press
+  // route exists only while ⌘ is actually held. It carries no `connected` term
+  // on purpose: both chords have to work on the launch window too.
+  keyboard modifiers -> modifier_state_changed _
+  keyboard press status=ignored when cmd_held -> command_chord_pressed _
+  // ⌘C FOR THE CHAT'S COPY RANGE, armed by the range itself AND by the tab it
+  // belongs to. A reader with nothing selected has no such route at all —
+  // which is why this is not an arm on the quit/close chord, whose route is
+  // armed by ⌘ alone and so runs on every screen. The tab term is the same
+  // rule applied twice: a range left standing in chat must not tax a keystroke
+  // typed in Pages, Forge or the console. `status=ignored` keeps a focused
+  // field's own copy.
+  keyboard press status=ignored when (copy_anchor_seq > 0 && shell_tab == ShellTab.chat) -> copy_chord_pressed _
+  // WHICH window ⌘W closes. The OS says which one has focus; guessing (the
+  // console, the last opened) would close a window nobody was looking at.
+  window focused with-id -> window_focused _
   run node_logs(connected_rpc) when (connected && shell_tab == ShellTab.node && node_tab == NodeTab.activity) -> node_log_line _
   // THE NODE'S OWN TWO PLANES. Peers and the consensus facts have no op behind
   // them — nothing in the index names a mesh connection or a checkpoint height
@@ -990,31 +1023,80 @@ subscribe
   // buffer has drifted from the last text known written.
   every 900ms when (connected && !empty(active_page) && editor_text(page_editor) != page_saved_text) -> page_autosave_tick
 
-// The daemon's exit rule: closing a window unregisters it, and the process
-// leaves with the last one. The handoff paths (`console_opened`,
-// `onboarding_reopened`) close their predecessor AFTER the successor is
-// registered, so this never fires with a survivor still tracked.
-// The huddle window is deliberately NOT in the survivor guard: closing it is a
-// dock, not an exit, and a lone huddle window must never keep the daemon alive
-// after its console is gone.
+// CLOSING A WINDOW IS NOT QUITTING — where there is somewhere else to live.
+// This unregisters the slot the closed window held; on a Mac the daemon goes
+// on in the status item with no window at all, the way a menu-bar app does,
+// and leaving is an explicit act — the tray's "Quit Ducktape" or ⌘Q
+// (`command_chord_pressed`) — never the side effect of a red button. Off macOS
+// there is no status item, so a window is the only handle on the process and
+// the last close leaves; `last_window_closed_exits` is the one place that
+// decides. The handoff paths (`console_opened`, `onboarding_reopened`) close
+// their predecessor after the successor is registered, so a handoff never
+// counts as the last close.
 on window_was_closed(id)
   onboarding_win = without_window(onboarding_win, id)
   console_win = without_window(console_win, id)
   huddle_win = without_window(huddle_win, id)
-  return if (onboarding_win != none) || (console_win != none)
+  let leaving = last_window_closed_exits(console_win, onboarding_win)
+  return if !leaving
   exit
 
-// THE STATUS ITEM'S MENU. The daemon leaves with its last tracked window
-// (above), so one of the two is always there to raise; `window_target` on
-// the untracked slot names a fresh id, and focusing a window that does not
-// exist is a no-op.
+// THE STATUS ITEM'S MENU. Since a close no longer ends the process, "Open" has
+// to be able to OPEN: with both slots empty there is nothing to raise, and
+// `window_target` on an untracked slot names a fresh id whose focus is a no-op,
+// so a raise-only menu row would do nothing at all. One predicate, one branch.
 on tray_open
-  parallel
-    task window focus target=window_target(console_win)
-    task window focus target=window_target(onboarding_win)
+  let raising = tray_open_action(console_win, onboarding_win)
+  match raising
+    WindowSummon.open
+      task window open onboarding -> onboarding_opened _
+    WindowSummon.raise
+      parallel
+        task window focus target=window_target(console_win)
+        task window focus target=window_target(onboarding_win)
 
 on tray_quit
   exit
+
+// ⌘ IS HELD OR IT IS NOT. The whole of this state, set from the one event that
+// knows it — it exists to arm the key-press route above, and nothing reads it
+// for anything else.
+on modifier_state_changed(mods)
+  cmd_held = command_held(mods)
+  shift_held = shift_held(mods)
+
+// THE LAUNCH WINDOW'S OWN CHROME. It is undecorated (app.ice), so the rail at
+// the top of `HubColumn` carries what the OS strip used to: a press anywhere
+// along it hands the drag to the window server, and the × closes the window.
+// Closing is not quitting — `window_was_closed` only unregisters it, and the
+// status item is still there to open another.
+on drag_launch_window
+  task window drag
+
+on close_launch_window
+  task window close target=window_target(onboarding_win)
+
+// WHICH WINDOW HAS FOCUS. Read by ⌘W and nothing else.
+on window_focused(id)
+  focused_win = some(id)
+
+// THE COMMAND CHORDS, ON ONE DISPATCH. The classification is one pure extern
+// so ⌘Q and ⌘W are answered in a single place, and this branches once on what
+// it says. The route that delivers the press is armed by `cmd_held`, so an
+// ordinary keystroke never reaches here at all.
+on command_chord_pressed(event)
+  let chord = command_chord(event.key, event.physical_key, event.modifiers)
+  match chord
+    CommandChord.quit
+      exit
+    CommandChord.close_window
+      task window close target=window_target(focused_win)
+    // ⌘ plus any other key is not ours. The route is armed by the modifier
+    // alone, so this is the ORDINARY case — every ⌘C, ⌘V and ⌘A lands here —
+    // and the arm exists because the match is exhaustive on purpose: a chord
+    // added to the enum has to be routed before this file compiles again.
+    CommandChord.ignored
+      return if true
 
 // The rest of the menu is the console's: the bell, a tab, a key. With no
 // console there is nothing to show them in, so each returns rather than

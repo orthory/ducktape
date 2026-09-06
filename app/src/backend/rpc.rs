@@ -242,14 +242,17 @@ async fn sign_frame(target: &str, payload: &[u8], password: String) -> Result<Ve
 
 /// The member consent an identity `AddKey` ticket carries: this device's key
 /// signs the module's own `add_key_preimage` for `new_key` at its current
-/// `generation` on `chain_id` — the same seat [`sign_frame`] uses, so a ticket
-/// costs no argon2 pass of its own.
+/// `generation` on `chain_id`, naming `account` and dying at `expires_at` —
+/// the same seat [`sign_frame`] uses, so a ticket costs no argon2 pass of its
+/// own.
 pub(crate) async fn sign_add_key_consent(
     password: String,
     chain_id: &str,
     scheme: identity::KeyScheme,
     new_key: &[u8],
     generation: u64,
+    account: u64,
+    expires_at: u64,
 ) -> Result<identity::Authorizer, String> {
     let session = seated_signer(password).await?;
     let signer = session.as_ref().expect("the session was seated above");
@@ -259,6 +262,8 @@ pub(crate) async fn sign_add_key_consent(
         scheme,
         new_key,
         generation,
+        account,
+        expires_at,
     ))
 }
 

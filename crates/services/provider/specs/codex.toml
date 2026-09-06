@@ -1,6 +1,6 @@
 # Capability spec: OpenAI Codex CLI.
 #
-# This file is EMBEDDED in the capability-host crate as a built-in default and
+# This file is EMBEDDED in the provider crate as a built-in default and
 # parsed by the exact same code path as operator-provided specs — it is the
 # reference example of the format. An operator spec with `tag = "codex"` in
 # $DUCKTAPE_CAPABILITY_DIR overrides this file entirely (no field merging);

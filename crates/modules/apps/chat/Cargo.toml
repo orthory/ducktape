@@ -34,6 +34,11 @@ guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 index_guest = { workspace = true }
 # types-only: the tag-report edge (chat translates its shapes, the plane routes).
 tagging = { workspace = true }
+# the ONE resolver (`OfKey`) that turns a DM creator's signing key into its
+# account number — `CreateDmChannel` derives the channel id from the pair of
+# account numbers, so a squatter cannot mint another pair's DM (see
+# `Chat::resolve_dm_creator`).
+identity = { workspace = true }
 async-trait = { workspace = true }
 # NFC label normalization for the derived tag index (src/index/tags.rs) —
 # unconditional like the index core it serves (pure, wasm32-clean).

@@ -35,15 +35,23 @@ fn a_dm_id_is_pair_derived_and_cannot_be_forged() {
     let rooms = chat_sidebar_rooms(listing.clone(), peers.clone(), Vec::new());
     assert_eq!(rooms.len(), 1);
     assert_eq!(rooms[0].channel.id, "general");
-    // AND THE DIRECTORY IS THE ONLY THING THAT DECIDES IT. A peer row whose
-    // load resolved no account number of ours carries no `channel_id`, so it
-    // claims nothing — the DM falls back into the room list rather than
-    // swallowing every channel whose id happens to be empty.
+    // AND AN EMPTY `channel_id` CLAIMS NOTHING. A peer row whose load resolved
+    // no account number of ours carries none, and it must not swallow every
+    // channel whose id happens to be empty — but the DM does NOT fall back
+    // into the room list either: a derived two-party id is never a CHANNELS
+    // row, whoever's it is (`another_members_dm_is_not_a_channel_of_mine`).
     let unresolved = vec![DmPeer {
         channel_id: String::new(),
         ..peers[0].clone()
     }];
-    assert_eq!(chat_sidebar_rooms(listing, unresolved, Vec::new()).len(), 2);
+    let without_the_directory = chat_sidebar_rooms(listing, unresolved, Vec::new());
+    assert_eq!(
+        without_the_directory
+            .iter()
+            .map(|row| row.channel.id.as_str())
+            .collect::<Vec<_>>(),
+        ["general"]
+    );
 
     // the id the app mints is the id chat will accept from a USER author:
     // ':' is reserved for module origins and '/' is refused outright, so a
@@ -409,7 +417,7 @@ fn history_pagination_prepends_older_and_flags_more() {
 }
 
 /// The composer's grammar loop, closed over a real node: the SAME parser
-/// the rich composer previews (`parse_message_with_members`) builds the
+/// the rich composer previews (`parse_message_with_mentions`) builds the
 /// committed blocks, and the spans read back off the node still carry the
 /// marks. If the preview grammar and the renderer grammar ever drift, one
 /// of the two ends of this test moves.
@@ -449,7 +457,10 @@ async fn composer_markdown_round_trips_rich_spans() {
         chat::encode_msg(&ChatMsg::PostMessage {
             channel_id: "general".into(),
             message_id: "styled-1".into(),
-            blocks: parse_message_with_members("say **hi** to _all_", &[]),
+            blocks: parse_message_with_mentions(
+                "say **hi** to _all_",
+                &MentionCandidates::default(),
+            ),
             thread: None,
             as_agent: None,
         }),
@@ -935,4 +946,174 @@ fn every_key_of_an_account_renders_as_that_accounts_name() {
     // And a cold directory (a resident whose identity module cannot answer yet)
     // degrades to exactly that, for everyone.
     assert!(directory_of(&[]).is_empty());
+}
+
+// ============================================================================
+// THE COPY RANGE. Every decision the two handler bodies apply is here, so this
+// is where the feature is actually pinned: which rows a range covers, what
+// comes out of it, and where a press leaves it.
+// ============================================================================
+
+fn message(seq: i64, author: &str, body: &str) -> ChatMessage {
+    ChatMessage {
+        id: format!("m{seq}"),
+        view_key: seq,
+        seq,
+        author: author.into(),
+        meta: String::new(),
+        body: body.into(),
+        blocks: Vec::new(),
+        pending: false,
+        rev: 0,
+        edited: false,
+        deleted: false,
+        reply_count: 0,
+        thread_seq: 0,
+        show_author: true,
+        initial: author[..1].to_uppercase(),
+        avatar_kind: "person".into(),
+        height: 0,
+        time: 0,
+        reactions: Vec::new(),
+        render_rev: 0,
+    }
+}
+
+fn room() -> Vec<ChatMessage> {
+    vec![
+        message(1, "ana", "first"),
+        message(2, "bo", "second"),
+        message(3, "ana", "third"),
+        message(4, "bo", "fourth"),
+    ]
+}
+
+/// A RANGE IS ITS TWO ENDS, IN EITHER ORDER. Dragging up a channel is as
+/// ordinary as dragging down it, and the reader's anchor is as often the newest
+/// row as the oldest — so `anchor` is not required to be the smaller seq.
+#[test]
+fn a_copy_range_covers_its_ends_whichever_way_round_they_are() {
+    let rows = room();
+    assert_eq!(copy_range_count(&rows, 2, 3), 2, "downwards");
+    assert_eq!(copy_range_count(&rows, 3, 2), 2, "and upwards");
+    assert_eq!(copy_range_count(&rows, 2, 2), 1, "one message is a range");
+    assert_eq!(copy_range_count(&rows, 0, 0), 0, "and none is not");
+    // An end that is no longer on screen is not an end. A range whose anchor
+    // was deleted or paged out covers nothing rather than silently widening to
+    // whatever is left.
+    assert_eq!(copy_range_count(&rows, 9, 9), 0, "an end nobody holds");
+}
+
+/// WHAT COMES OUT IS WHAT YOU COULD READ. Oldest first regardless of which end
+/// was clicked, one entry per message, blank-line separated so a multi-line
+/// body survives the paste.
+#[test]
+fn the_copied_text_reads_in_timeline_order() {
+    let rows = room();
+    assert_eq!(
+        copy_range_text(&rows, 3, 1),
+        "ana: first\n\nbo: second\n\nana: third",
+        "clicked bottom-up, pasted top-down"
+    );
+    assert_eq!(copy_range_text(&rows, 2, 2), "bo: second");
+}
+
+/// A TOMBSTONE IS NOT A LINE. A deleted row inside the range contributes
+/// nothing — there is no body to lift, and a placeholder would be a line the
+/// reader never wrote. The count follows the text, so the toast cannot claim
+/// more than reached the clipboard.
+#[test]
+fn a_deleted_row_inside_the_range_contributes_nothing() {
+    let mut rows = room();
+    rows[1].deleted = true;
+    rows[1].body = String::new();
+    assert_eq!(copy_range_text(&rows, 1, 3), "ana: first\n\nana: third");
+    assert_eq!(copy_range_toast(&rows, 1, 1), "Message copied");
+}
+
+/// SHIFT KEEPS THE ANCHOR, A PLAIN CLICK MOVES IT. This is the whole gesture.
+#[test]
+fn shift_extends_and_a_plain_click_starts_over() {
+    use crate::CopySurface::{Nowhere, Thread, Timeline};
+    let started = copy_range_after_press(0, Nowhere, 2, Timeline, false);
+    assert_eq!((started.anchor, started.head), (2, 2), "a click is a range of one");
+
+    let widened = copy_range_after_press(2, Timeline, 5, Timeline, true);
+    assert_eq!((widened.anchor, widened.head), (2, 5), "⇧ moves the far end");
+
+    let restarted = copy_range_after_press(2, Timeline, 5, Timeline, false);
+    assert_eq!((restarted.anchor, restarted.head), (5, 5), "no ⇧ starts over");
+
+    // ⇧ with nothing open is a plain click: there is no anchor to keep.
+    let nothing_to_extend = copy_range_after_press(0, Nowhere, 5, Timeline, true);
+    assert_eq!((nothing_to_extend.anchor, nothing_to_extend.head), (5, 5));
+
+    // AND A RANGE NEVER SPANS THE TWO SURFACES. A ⇧-click in the rail while a
+    // range is open in the stream starts a fresh one in the rail, because the
+    // rows between them are not a run of anything.
+    let crossed = copy_range_after_press(2, Timeline, 7, Thread, true);
+    assert_eq!((crossed.anchor, crossed.head), (7, 7));
+    assert_eq!(crossed.surface, Thread);
+}
+
+/// A ROW LIGHTS UP ONLY FOR A RANGE DRAWN WHERE IT LIVES. A reply and a
+/// timeline row draw their seqs from the SAME channel sequence, so without the
+/// surface a reply would tint inside a range whose copy never included it.
+#[test]
+fn the_surface_keeps_a_reply_out_of_the_streams_range() {
+    use crate::CopySurface::{Thread, Timeline};
+    assert!(seq_in_copy_range(3, 2, 5, Timeline, Timeline));
+    assert!(!seq_in_copy_range(3, 2, 5, Timeline, Thread), "a reply in the rail");
+    assert!(!seq_in_copy_range(6, 2, 5, Timeline, Timeline), "past the end");
+    assert!(!seq_in_copy_range(3, 0, 0, Timeline, Timeline), "no range at all");
+}
+
+/// THE PLATE IS ONE ANSWER, AND IT IS ORDERED. The row you are ON outranks a
+/// row that merely sits in a range; a deleted row wears neither, because a
+/// tint would say there is something there to lift.
+#[test]
+fn the_row_plate_ranks_selection_over_range_and_skips_a_tombstone() {
+    use crate::RowPlate::{Plain, Ranged, Selected};
+    assert_eq!(message_plate(false, false, false), Plain);
+    assert_eq!(message_plate(false, false, true), Ranged);
+    assert_eq!(message_plate(false, true, true), Selected);
+    assert_eq!(message_plate(true, true, true), Plain, "a tombstone tints for nothing");
+}
+
+/// THE CHORD LIFTS THE ROWS THE BAR COUNTED. The surface picks the list, so
+/// ⌘C in a rail-drawn range never reaches into the stream behind it.
+#[test]
+fn the_surface_picks_the_list_the_copy_reads() {
+    use crate::CopySurface::{Nowhere, Thread, Timeline};
+    let timeline = room();
+    let thread = vec![message(7, "cy", "a reply")];
+    assert_eq!(copy_range_rows(&timeline, &thread, Timeline).len(), 4);
+    assert_eq!(copy_range_rows(&timeline, &thread, Thread).len(), 1);
+    assert!(copy_range_rows(&timeline, &thread, Nowhere).is_empty());
+}
+
+/// A PENDING ROW IS NOT AN END OF ANYTHING. A message still in flight carries a
+/// negative seq, and a range with one at either end covers no rows: the bar
+/// holding the only Clear button would vanish while the ⌘C route, armed on the
+/// anchor, stayed armed with nothing able to disarm it. Pressing one ends the
+/// range instead of opening an unclearable one.
+#[test]
+fn a_press_on_a_pending_row_ends_the_range_rather_than_arming_a_dead_one() {
+    use crate::CopySurface::{Nowhere, Timeline};
+    let cleared = copy_range_after_press(0, Nowhere, -1, Timeline, false);
+    assert_eq!((cleared.anchor, cleared.head), (0, 0), "a plain click on one");
+    assert_eq!(cleared.surface, Nowhere);
+
+    let dropped = copy_range_after_press(2, Timeline, -3, Timeline, true);
+    assert_eq!(
+        (dropped.anchor, dropped.head),
+        (0, 0),
+        "and ⇧-clicking one drops the range it would otherwise have widened"
+    );
+    assert_eq!(dropped.surface, Nowhere);
+    assert_eq!(
+        copy_range_count(&room(), dropped.anchor, dropped.head),
+        0,
+        "which is the count the bar was already showing"
+    );
 }

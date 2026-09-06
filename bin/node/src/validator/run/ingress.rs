@@ -8,7 +8,7 @@ use sdk::Msg;
 
 use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
-use crate::constants::{GATE_SETTLE_TIMEOUT, MODULE_IDS, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
+use crate::constants::{GATE_SETTLE_TIMEOUT, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
 use crate::host_reads::{read_redemption_from_host, read_valset_members, read_valset_residents};
 use crate::rpc::{
     JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
@@ -31,11 +31,9 @@ impl ValidatorRuntime<'_> {
         self.metrics.update_storage(
             self.prev_ckpt.0.unwrap_or_default(),
             self.index.is_poisoned(),
-            MODULE_IDS.iter().map(|module| {
-                (
-                    (*module).to_string(),
-                    self.index.applied_height(module).unwrap_or_default(),
-                )
+            self.index.module_ids().into_iter().map(|module| {
+                let height = self.index.applied_height(&module).unwrap_or_default();
+                (module, height)
             }),
         );
     }
@@ -124,12 +122,7 @@ impl ValidatorRuntime<'_> {
                 Err(e) => RpcReply::err(format!("bad req_hex: {e}")),
             },
             RpcRequest::Status => {
-                let mut modules = std::collections::BTreeMap::new();
-                for &m in MODULE_IDS {
-                    if let Some(root) = node.host().module_root(m) {
-                        modules.insert(m.to_string(), hex(&root));
-                    }
-                }
+                let modules = crate::util::module_roots_hex(node.host());
                 RpcReply {
                     status: Some(RpcStatus {
                         height: node.finalized().map(|f| f.height),
@@ -250,6 +243,7 @@ impl ValidatorRuntime<'_> {
                         .into(),
                     terminal: true,
                 },
+                context.current(),
             );
             return;
         }
@@ -272,18 +266,26 @@ impl ValidatorRuntime<'_> {
                         .into(),
                     terminal: false,
                 },
+                context.current(),
             );
             return;
         }
         // V9: already holding standing (validator OR resident) → idempotent
         // SUCCESS. a re-gated joiner is not an error — answer Admitted at the
         // current committed height.
+        // the ack carries the cap on BOTH admit paths: a multi-candidate race
+        // routinely lands the joiner's winning ack on THIS arm (a sibling
+        // member's Redeem already applied), and the sealed `Admitted` is the
+        // cap's only delivery channel — the joiner deletes its invite token on
+        // the first Admitted it accepts, so a cap-less one is unrecoverable.
         if members.contains(&joiner_bytes) || residents_now.contains(&joiner_bytes) {
             let height = node.finalized().map(|f| f.height).unwrap_or(0);
+            let cap = mint_joiner_cap(coordination, validators, signer, &joiner_bytes);
             super::settle_gate(
                 gate_outcomes,
                 joiner_bytes,
-                join_gate::IntroReply::Admitted { height, cap: None },
+                join_gate::IntroReply::Admitted { height, cap },
+                context.current(),
             );
             return;
         }
@@ -298,29 +300,7 @@ impl ValidatorRuntime<'_> {
             return;
         }
 
-        // MINT the coordinator capability for the joiner (private coordination
-        // only, and only a GENESIS validator's cap is trusted by the
-        // coordinator). additive, side-effect-free (a pure ed25519 sign). the
-        // cap cannot ride the invite (the joiner's key did not exist at
-        // invite-mint time), so the sealed `Admitted` ack is its only delivery
-        // channel. delivered when the gate settles.
-        let minted_cap = if *coordination == config::Coordination::Private
-            && validators.contains(&signer.public_key())
-        {
-            let Ok(subj) = <[u8; 32]>::try_from(joiner_bytes.as_slice()) else {
-                // `verify_intro` decoded this key upstream — a non-32-byte
-                // joiner cannot reach the loop; refuse rather than panic.
-                return;
-            };
-            let cap = nat_traversal::mint_coord_cap(
-                signer,
-                nat_traversal::NodeKey(subj),
-                nat_traversal::now_secs() + nat_traversal::COORD_CAP_TTL_SECS,
-            );
-            Some(config::pack_coord_cap(&cap))
-        } else {
-            None
-        };
+        let minted_cap = mint_joiner_cap(coordination, validators, signer, &joiner_bytes);
 
         // SETTLE-THEN-ANSWER: submit the Redeem and hold the joiner's
         // outcome against the frame id. `submit` returns the FrameId; the drain
@@ -395,6 +375,7 @@ impl ValidatorRuntime<'_> {
                         detail: format!("could not submit redemption: {e}"),
                         terminal: false,
                     },
+                    context.current(),
                 );
             }
         }
@@ -580,6 +561,34 @@ impl ValidatorRuntime<'_> {
     }
 }
 
+/// MINT the coordinator capability for a joiner (private coordination only,
+/// and only a GENESIS validator's cap is trusted by the coordinator).
+/// Additive and side-effect-free — a pure ed25519 sign. The cap cannot ride
+/// the invite (the joiner's key did not exist at invite-mint time), so the
+/// sealed `Admitted` ack is its only delivery channel; EVERY arm that answers
+/// Admitted mints through here.
+fn mint_joiner_cap(
+    coordination: &config::Coordination,
+    validators: &[ed25519::PublicKey],
+    signer: &ed25519::PrivateKey,
+    joiner: &[u8],
+) -> Option<Vec<u8>> {
+    let private_coordination = *coordination == config::Coordination::Private;
+    let signer_is_genesis_validator = validators.contains(&signer.public_key());
+    if !private_coordination || !signer_is_genesis_validator {
+        return None;
+    }
+    // `verify_intro` decoded this key upstream — a non-32-byte joiner cannot
+    // reach the loop; mint nothing rather than panic.
+    let subj = <[u8; 32]>::try_from(joiner).ok()?;
+    let cap = nat_traversal::mint_coord_cap(
+        signer,
+        nat_traversal::NodeKey(subj),
+        nat_traversal::now_secs() + nat_traversal::COORD_CAP_TTL_SECS,
+    );
+    Some(config::pack_coord_cap(&cap))
+}
+
 /// Commonware owns the detailed peer series. This bounded adapter counts only
 /// current validators and includes self, insulating the stable Ducktape facade
 /// from dashboard knowledge of dependency-specific metric names.
@@ -629,5 +638,58 @@ mod tests {
         );
 
         assert_eq!(reachable_validators(&exposition, &validators, &me), 2);
+    }
+
+    #[test]
+    fn private_coordination_genesis_validator_mints_a_cap_for_the_joiner() {
+        let signer = ed25519::PrivateKey::from_seed(1);
+        let validators = vec![signer.public_key()];
+        let joiner = ed25519::PrivateKey::from_seed(9).public_key();
+
+        let packed = mint_joiner_cap(
+            &config::Coordination::Private,
+            &validators,
+            &signer,
+            joiner.as_ref(),
+        )
+        .expect("a genesis validator on a private network mints a cap");
+        let cap = config::unpack_coord_cap(&packed).expect("the packed cap round-trips");
+        assert_eq!(cap.issuer, signer.public_key());
+
+        // public coordination needs none, and a non-genesis signer's cap is
+        // not trusted by the coordinator — both mint nothing.
+        assert!(
+            mint_joiner_cap(
+                &config::Coordination::Public,
+                &validators,
+                &signer,
+                joiner.as_ref()
+            )
+            .is_none()
+        );
+        assert!(
+            mint_joiner_cap(
+                &config::Coordination::Private,
+                &[],
+                &signer,
+                joiner.as_ref()
+            )
+            .is_none()
+        );
+    }
+
+    /// The V9 "joiner already holds standing" arm answers Admitted without a
+    /// consensus round, so on a multi-candidate race its ack routinely reaches
+    /// the joiner first — and the joiner deletes its invite token on the first
+    /// Admitted it accepts. A hardcoded empty cap in this file means some
+    /// Admitted path lost the coordinator capability for good.
+    #[test]
+    fn no_admitted_path_settles_without_a_minted_cap() {
+        // built at runtime so this needle does not match its own source line.
+        let hardcoded_empty_cap = format!("cap: {}", "None");
+        assert!(
+            !include_str!("ingress.rs").contains(&hardcoded_empty_cap),
+            "every Admitted arm must mint through mint_joiner_cap"
+        );
     }
 }

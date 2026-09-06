@@ -18,7 +18,7 @@
 //!
 //! - **the host writer** (this crate, [`IndexStore::apply_block`], called by
 //!   the node's block loop): writes one borsh [`OpRow`] per dispatch under
-//!   `op/{height:016x}/{seq:04x}` plus the watermark, one atomic batch per
+//!   `op/{height:016x}/{seq:08x}` plus the watermark, one atomic batch per
 //!   module per block. NO domain logic lives host-side.
 //! - **the fold** (the module's index guest, installed IN the module's
 //!   database as fluentabi module `"index"`): a changes-mode trigger
@@ -86,8 +86,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -132,8 +132,13 @@ const CLEAR_FLUSH_EVERY: usize = 1024;
 const REPLAY_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 /// how long a fold drain may sit at the SAME pending count before it is called
 /// stuck. not a total budget — a long backlog drains as long as it needs, as
-/// long as it keeps shrinking (see [`drain_fold`]).
+/// long as it keeps shrinking (see [`drain_fold`]). shrunk under `cfg(test)`
+/// so a test that drives a genuinely wedged fold to its stall costs
+/// milliseconds, not a minute of every test run.
+#[cfg(not(test))]
 const FOLD_DRAIN_STALL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const FOLD_DRAIN_STALL: Duration = Duration::from_millis(200);
 /// ceiling on [`drain_fold`]'s poll backoff. every poll costs a queue count,
 /// so a long drain must not ask a thousand times a second.
 const FOLD_DRAIN_POLL_MAX: Duration = Duration::from_millis(50);
@@ -300,12 +305,19 @@ impl ModuleIndex {
     }
 }
 
-/// the per-module index store: one fluent31 database per registered module,
-/// one host writer (the block loop), the engine's trigger runner folding
-/// behind it, snapshot readers everywhere else.
+/// the per-module index store: one fluent31 database per module the host
+/// runs, one host writer (the block loop), the engine's trigger runner
+/// folding behind it, snapshot readers everywhere else.
+///
+/// the module set GROWS while the store is open: a module the modules
+/// registry admits after boot gets its database at the block that seats it
+/// ([`IndexStore::open_module`]), so the set is behind a lock. it never
+/// shrinks — a database, once open, serves until the process ends.
 pub struct IndexStore {
     base: PathBuf,
-    modules: BTreeMap<String, ModuleIndex>,
+    /// the open options every module database shares.
+    opts: Options,
+    modules: RwLock<BTreeMap<String, Arc<ModuleIndex>>>,
     /// the internal blocks database: `blk/…` explorer rows plus its own
     /// `meta/height` watermark. never listed in `modules` — it is not a
     /// module, must not surface on the per-module scan routes, and never
@@ -349,36 +361,67 @@ impl IndexStore {
             io_backend: IoBackend::Std,
             ..Options::default()
         };
-        let mut open = BTreeMap::new();
-        for id in module_ids {
-            let db = Arc::new(Db::open(base.join(id), opts.clone())?);
-            let (has_fold, has_view) = installed_roles(&db)?;
-            open.insert(
-                (*id).to_string(),
-                ModuleIndex {
-                    db,
-                    has_fold: AtomicBool::new(has_fold),
-                    has_view: AtomicBool::new(has_view),
-                },
-            );
-        }
-        let blocks = Arc::new(Db::open(base.join(BLOCKS_DB_ID), opts)?);
+        let blocks = Arc::new(Db::open(base.join(BLOCKS_DB_ID), opts.clone())?);
         let store = Self {
             base,
-            modules: open,
+            opts,
+            modules: RwLock::new(BTreeMap::new()),
             blocks,
             poisoned: AtomicBool::new(false),
         };
+        for id in module_ids {
+            store.open_database(id)?;
+        }
         // the height the node resumes above — read here, not inside the
         // macro, so a read failure refuses the open at every filter level.
         let height = store.resume_height()?;
         tracing::info!(
             target: "ducktape::index",
             height,
-            modules = store.modules.len(),
+            modules = module_ids.len(),
             "index store opened"
         );
         Ok(store)
+    }
+
+    /// open (creating if missing) the database for one more module, deciding
+    /// nothing about its guest (roles read back from the marker, exactly as
+    /// [`Self::open_bare`] does). idempotent and free for a module this
+    /// store already holds. this is how the index keeps covering every module
+    /// the host runs: a module the modules registry admits after boot gets
+    /// its database here, before the block that seats it folds, so its feed
+    /// begins at that block.
+    pub fn open_module(&self, id: &str) -> Result<()> {
+        if self.modules().contains_key(id) {
+            return Ok(());
+        }
+        // a write path like the folds: refused once poisoned, and a failure
+        // poisons — the block that needed the database cannot fold without it.
+        if self.is_poisoned() {
+            return Err(Error::Poisoned);
+        }
+        self.poison_on_err("open_module", self.open_database(id))
+    }
+
+    fn open_database(&self, id: &str) -> Result<()> {
+        let db = Arc::new(Db::open(self.base.join(id), self.opts.clone())?);
+        let (has_fold, has_view) = installed_roles(&db)?;
+        let module = ModuleIndex {
+            db,
+            has_fold: AtomicBool::new(has_fold),
+            has_view: AtomicBool::new(has_view),
+        };
+        self.modules
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id.to_string(), Arc::new(module));
+        Ok(())
+    }
+
+    /// the module map for readers; a poisoned lock is recovered, since every
+    /// writer only ever inserts a fully built entry.
+    fn modules(&self) -> RwLockReadGuard<'_, BTreeMap<String, Arc<ModuleIndex>>> {
+        self.modules.read().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// converge every named module's database onto its declared index guest:
@@ -399,22 +442,24 @@ impl IndexStore {
         &self.base
     }
 
-    pub fn module_ids(&self) -> impl Iterator<Item = &str> {
-        self.modules.keys().map(String::as_str)
+    /// every module this store holds a database for, sorted by id.
+    pub fn module_ids(&self) -> Vec<String> {
+        self.modules().keys().cloned().collect()
     }
 
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
     }
 
-    fn module(&self, module: &str) -> Result<&ModuleIndex> {
-        self.modules
+    fn module(&self, module: &str) -> Result<Arc<ModuleIndex>> {
+        self.modules()
             .get(module)
+            .cloned()
             .ok_or_else(|| Error::UnknownModule(module.to_string()))
     }
 
-    fn db(&self, module: &str) -> Result<&Arc<Db>> {
-        Ok(&self.module(module)?.db)
+    fn db(&self, module: &str) -> Result<Arc<Db>> {
+        Ok(self.module(module)?.db.clone())
     }
 
     /// the ONE place the store poisons. every write path hands its outcome
@@ -440,7 +485,7 @@ impl IndexStore {
     /// view, which trails by [`IndexStore::fold_status`]'s backlog.
     pub fn applied_height(&self, module: &str) -> Result<u64> {
         let db = self.db(module)?;
-        Ok(read_height(db)?)
+        Ok(read_height(&db)?)
     }
 
     /// the height the node's block counter must resume ABOVE: the max
@@ -451,7 +496,7 @@ impl IndexStore {
     /// them all: it only advances when a block carries an explorer row.
     pub fn resume_height(&self) -> Result<u64> {
         let mut max = read_height(&self.blocks)?;
-        for module in self.modules.values() {
+        for module in self.modules().values() {
             max = max.max(read_height(&module.db)?);
         }
         Ok(max)
@@ -484,7 +529,8 @@ impl IndexStore {
     /// the backfill floor: when present, the module was stamped at a boundary
     /// — its op feed (and everything derived) visibly begins above it.
     pub fn backfill_height(&self, module: &str) -> Result<Option<u64>> {
-        Ok(read_backfill(self.db(module)?)?)
+        let db = self.db(module)?;
+        Ok(read_backfill(&db)?)
     }
 
     /// the fold trigger's backlog + last drain error, `None` for a module
@@ -518,16 +564,17 @@ impl IndexStore {
     }
 
     fn apply_inner(&self, block: &BlockOps) -> Result<()> {
-        // group by module, keeping the block-wide dispatch index as seq. a
-        // module this store does not index — one admitted after boot by the
-        // lifecycle registry, whose guest (if any) is not bundled — writes no
-        // rows: the index is a read model over the DECLARED tenants, and
-        // skipping an undeclared op on every block leaves nothing torn.
-        // refusing it poisoned every node on a real network for the rest of
-        // its life the first time a live-registered module received an op.
+        // group by module, keeping the block-wide dispatch index as seq. the
+        // host applies a dispatch only to a module it runs, and the caller
+        // opened a database for every module the host runs before this fold
+        // (`open_module`), so an op naming a module this store lacks is a
+        // caller that skipped that step: the index is a read model, so the op
+        // is dropped rather than poisoning every later block, and the gap
+        // is visible as a module the status route never lists.
+        let modules = self.modules();
         let mut per: BTreeMap<&str, Vec<(u32, &AppliedOp)>> = BTreeMap::new();
         for (seq, op) in block.ops.iter().enumerate() {
-            let indexed = self.modules.contains_key(op.module.as_str());
+            let indexed = modules.contains_key(op.module.as_str());
             if !indexed {
                 continue;
             }
@@ -539,7 +586,7 @@ impl IndexStore {
         // mean "blocks are missing", never "the module was quiet" — that is
         // what lets the staleness check tell a wiped database from a lagging
         // one. a quiet module's batch is the watermark key alone.
-        for (id, module) in &self.modules {
+        for (id, module) in modules.iter() {
             if read_height(&module.db)? >= block.height {
                 continue; // replay of an already-folded block — idempotent skip
             }
@@ -577,7 +624,7 @@ impl IndexStore {
     /// `wait_flushed` progress-wait idiom. `Err` = a fold failed with a
     /// backlog still pending — the views cannot catch up.
     pub fn wait_folds_drained(&self) -> Result<()> {
-        for (id, m) in &self.modules {
+        for (id, m) in self.modules().iter() {
             if !m.folds() {
                 continue;
             }
@@ -778,11 +825,21 @@ impl IndexStore {
             // AND WAIT FOR IT, for `converge_guest`'s reason: returning over a
             // cleared keyspace serves "no such page" for every page, which is
             // indistinguishable from a workspace that lost its documents.
-            refold_feed(&m.db, module)?;
+            //
+            // the marker goes back up EITHER WAY. #1725: a failed refold (the
+            // guest's own fold rejecting a row, surfaced as `FoldStuck`) used
+            // to leave `meta/guest` absent on the error path — so the NEXT
+            // open found no marker, replayed the whole feed from scratch, hit
+            // the identical failure, and refused to open at all. Restoring it
+            // here regardless of outcome leaves the module's own fold trigger
+            // — still registered, still holding its backlog — as the one
+            // place this failure is visible (`fold_status`), exactly like a
+            // guest stuck at converge.
+            let folded = refold_feed(&m.db, module);
             if let Some(marker) = marker {
                 m.db.put(META_GUEST, marker)?;
             }
-            Ok(())
+            folded
         })();
         self.poison_on_err("refold", out)
     }
@@ -800,7 +857,7 @@ impl IndexStore {
         }
         let db = self.db(module)?;
         let out = (|| -> Result<()> {
-            if read_height(db)? >= height {
+            if read_height(&db)? >= height {
                 return Ok(());
             }
             db.put(META_HEIGHT, height.to_be_bytes())?;
@@ -977,11 +1034,33 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         // answer is worse than a slow boot: it is indistinguishable from a
         // workspace that lost its documents.
         //
-        // `Err` here refuses the OPEN, matching what a broken artifact already
-        // does at `wasm_entries` above: a guest that cannot fold its own feed
-        // has no read model to serve, and saying so beats serving nothing
-        // quietly.
-        refold_feed(db, spec.id)?;
+        // a `FoldStuck` here does NOT refuse the open: the derived tier is
+        // node-local and rebuildable (module docs at the top of this file),
+        // so one module's guest rejecting its own feed must not take the
+        // whole node down with it — #1725 was exactly that, a step further
+        // (the marker left absent so the NEXT boot replayed the identical
+        // failure into a boot abort). The module is left exactly as stuck as
+        // `drain_fold` found it: its fold trigger stays registered, still
+        // holding its backlog, and `IndexStore::fold_status` reports the
+        // pending count and the recorded error — the same surface a stuck
+        // live fold already uses. Anything else here IS the engine itself
+        // failing and still refuses the open, exactly as a broken artifact
+        // does at `wasm_entries` above.
+        match refold_feed(db, spec.id) {
+            Ok(()) => {}
+            Err(err @ Error::FoldStuck(_)) => {
+                tracing::warn!(
+                    target: "ducktape::index",
+                    reason = "converge_refold_stuck",
+                    module = spec.id,
+                    error = %err,
+                    "index guest could not fold its own feed at converge; its fold trigger \
+                     stays registered with the backlog as the honest state — see fold_status \
+                     — while the node boots and every other module indexes normally"
+                );
+            }
+            Err(err) => return Err(err),
+        }
     }
     // written LAST, so an interrupted refold re-runs whole at the next open
     // instead of leaving a marker that vouches for a half-derived read model.
@@ -992,6 +1071,60 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     };
     db.put(META_GUEST, borsh::to_vec(&marker)?)?;
     Ok((has_fold, has_view))
+}
+
+/// one drain poll's verdict against the progress/stall rule, pulled out of
+/// [`drain_fold`]'s loop so it is testable without driving the engine:
+/// pending strictly below every count seen so far is [`DrainVerdict::Progress`]
+/// (resets the stall clock); anything else is [`DrainVerdict::Stuck`] only
+/// once the clock has run past `stall_budget`, and merely
+/// [`DrainVerdict::Waiting`] before that.
+///
+/// #1726: a recorded `last_error` plays NO part in this decision. fluent31
+/// sets it on the FIRST failed attempt and clears it only on the next
+/// SUCCESSFUL drain (100ms→6.4s backoff between attempts), so an error that
+/// is about to be retried into success is not evidence of anything by
+/// itself — only a backlog that has genuinely stopped shrinking is. a guest
+/// `Fail` the engine will retry forever still surfaces as `Stuck`, just not
+/// before the stall budget has had its say.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainVerdict {
+    Progress,
+    Stuck,
+    Waiting,
+}
+
+fn drain_verdict(
+    pending: u64,
+    fewest_pending: u64,
+    since_progress: Duration,
+    stall_budget: Duration,
+) -> DrainVerdict {
+    if pending < fewest_pending {
+        DrainVerdict::Progress
+    } else if since_progress >= stall_budget {
+        DrainVerdict::Stuck
+    } else {
+        DrainVerdict::Waiting
+    }
+}
+
+/// the message a stuck drain gives up with: the module, how much is still
+/// queued, and — when the engine ever recorded one — the last error it saw.
+/// that error need not be WHY the queue stopped shrinking (fluent31 only
+/// clears it on the next successful drain, so a since-resolved transient
+/// error can still be sitting there when a different jam is the real cause),
+/// so it rides along as context, never as the verdict.
+fn fold_stuck_message(module: &str, pending: u64, last_error: Option<&str>) -> String {
+    let stall_secs = FOLD_DRAIN_STALL.as_secs();
+    match last_error {
+        Some(err) => {
+            format!(
+                "{module}: {pending} events pending, no progress for {stall_secs}s (last error: {err})"
+            )
+        }
+        None => format!("{module}: {pending} events pending, no progress for {stall_secs}s"),
+    }
 }
 
 /// block until one module's fold trigger has nothing queued: fluent31 drains
@@ -1028,18 +1161,25 @@ fn drain_fold(db: &Db, module: &str) -> Result<()> {
         if trigger.pending == 0 {
             return Ok(());
         }
-        if let Some(err) = trigger.last_error {
-            return Err(Error::FoldStuck(format!("{module}: {err}")));
-        }
-        if trigger.pending < fewest_pending {
-            fewest_pending = trigger.pending;
-            since_progress = std::time::Instant::now();
-        } else if since_progress.elapsed() >= FOLD_DRAIN_STALL {
-            return Err(Error::FoldStuck(format!(
-                "{module}: {} events pending, no progress for {}s",
-                trigger.pending,
-                FOLD_DRAIN_STALL.as_secs()
-            )));
+        let verdict = drain_verdict(
+            trigger.pending,
+            fewest_pending,
+            since_progress.elapsed(),
+            FOLD_DRAIN_STALL,
+        );
+        match verdict {
+            DrainVerdict::Progress => {
+                fewest_pending = trigger.pending;
+                since_progress = std::time::Instant::now();
+            }
+            DrainVerdict::Stuck => {
+                return Err(Error::FoldStuck(fold_stuck_message(
+                    module,
+                    trigger.pending,
+                    trigger.last_error.as_deref(),
+                )));
+            }
+            DrainVerdict::Waiting => {}
         }
         std::thread::sleep(poll);
         poll = (poll * 2).min(FOLD_DRAIN_POLL_MAX);
@@ -1111,7 +1251,7 @@ fn refold_feed(db: &Db, module: &str) -> Result<()> {
 /// re-registering one over a populated range replays nothing. re-writing each
 /// row does: an identical put is still a committed change, and capture happens
 /// inside the commit critical section, so the guest receives the feed in key
-/// order — which for `op/{height:016x}/{seq:04x}` IS block-and-drain order.
+/// order — which for `op/{height:016x}/{seq:08x}` IS block-and-drain order.
 fn replay_op_feed(db: &Db) -> Result<u64> {
     let lo = OP_PREFIX.as_bytes();
     let hi = prefix_successor(lo);

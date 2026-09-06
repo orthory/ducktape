@@ -102,9 +102,10 @@ fn work_workspace(selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Er
         .to_path_buf())
 }
 
-/// `anyone` is the literal, everything else is an account (a number or a
-/// display name — the same resolution `user cred grant` takes). A number
-/// resolves offline; a display name needs the node to answer.
+/// `anyone` is the literal, everything else is an account NUMBER (the same
+/// authority resolution `cred grant` takes — a display name is refused, never
+/// matched: it is freely rewritable and not unique, and this decision is
+/// whose workload the node runs). A number resolves offline.
 fn resolve_work_target(
     workspace: &std::path::Path,
     input: &str,
@@ -113,9 +114,9 @@ fn resolve_work_target(
         return Ok(AdmitTarget::Anyone);
     }
     let base = config::http_base_in(workspace)?;
-    Ok(AdmitTarget::Account(crate::account_cli::resolve_account(
-        &base, input,
-    )?))
+    Ok(AdmitTarget::Account(
+        crate::account_cli::resolve_account_authority(&base, input)?,
+    ))
 }
 
 fn cmd_work_list(args: SelectorArgs) -> CommandResult {
@@ -578,19 +579,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     // descriptor, so the two never silently disagree (see `docs`:
     // coordinator is ambient, node-local).
     let fresh_workspace = !dir.join("node.toml").exists();
-    let mut plumbing = config::merged_plumbing(
-        &dir,
-        net.listen.as_deref(),
-        net.advertised.as_deref(),
-        net.http.as_deref(),
-        net.gateway.as_deref(),
-        net.rpc.as_deref(),
-        net.wireguard_listen.as_deref(),
-        net.invite_listen.as_deref(),
-        net.primary_coordinator.as_deref(),
-        net.wireguard_advertised.as_deref(),
-        net.block_time_ms,
-    )?;
+    let mut plumbing = config::merged_plumbing(&dir, &net.overrides())?;
     // a FRESH workspace detects the platform runtime and writes the table (it
     // describes HOW runs are isolated, and grants nothing); an existing
     // node.toml keeps whatever the operator chose — a deleted table is never
@@ -624,6 +613,9 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         coordination: None,
         modules,
         genesis: hex_bytes(&genesis_hash),
+        // the founding beat: stated once here, carried by the invite, and
+        // inherited by every joiner — it is a genesis fact, not plumbing.
+        block_time_ms: args.block_time_ms,
     };
     if let Some(addr) = config::dialable(Some(&plumbing.advertised), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -785,10 +777,13 @@ pub(crate) fn mint_invite_blob(
     let key = config::load_identity(&base.join(&raw.key_file))?;
     let dial_hint = config::dialable(Some(&raw.advertised), &raw.listen)?;
     let has_coordinated_reach = descriptor.has_coordinated_reach()?;
-    if let Some(addr) = &dial_hint {
-        descriptor.add_bootstrap(&key.public_key(), addr);
+    let descriptor_changed = match &dial_hint {
+        Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
+        None => false,
+    };
+    if descriptor_changed {
+        descriptor.save(&descriptor_path)?;
     }
-    descriptor.save(&descriptor_path)?;
 
     // the WireGuard bootstrap: endpoints are minted from the advertised host
     // (the listen IP is usually unspecified) + the plane's UDP ports; the
@@ -1399,7 +1394,7 @@ fn cast_yes_once(
 pub(super) enum CeremonyOutcome {
     /// passed and executed. what that execution CHANGED is the caller's to
     /// confirm: a membership set turns over at the next epoch cutover, a
-    /// module swap lands in the lifecycle registry.
+    /// module swap lands in the modules registry.
     Passed,
     /// this ballot landed but the proposal's frozen threshold is outstanding.
     AwaitingBallots,
@@ -1460,10 +1455,23 @@ pub(super) fn drive_proposal_ceremony(
         }
         None => {
             let prefix: String = pubkey_hex.chars().take(16).collect();
+            // MINT AGAINST THE RECORD, not the roster. `GovQuery::Proposals`
+            // walks the OPEN roster, but a settled proposal's record is kept
+            // forever under its id — so an id missing from that list can still
+            // be taken by an earlier ceremony for the same key. Reusing one
+            // makes every wait below adopt that stale record: `await_proposal`
+            // sees it the instant it is asked, `cast_yes_once` returns early on
+            // its settled status, `Execute` is skipped, and the verb reports
+            // the PREVIOUS ceremony's outcome while this one votes on nothing
+            // (a re-grant that silently changes no state — #1766).
             let id = (0u64..)
                 .map(|n| format!("{id_prefix}{prefix}:{n}"))
-                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
-                .expect("the id space is unbounded");
+                .find_map(|candidate| match read_proposal(node.rpc(), &candidate) {
+                    Ok(None) => Some(Ok(candidate)),
+                    Ok(Some(_)) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .expect("the id space is unbounded")?;
             signer.submit(
                 node.rpc(),
                 &GovMsg::Propose {
@@ -1921,9 +1929,9 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
     // read BEFORE anything lands on disk: a mistyped path is refused with
     // nothing written, like a bad blob.
     let genesis_bytes = match &args.genesis {
-        Some(file) => Some(
-            std::fs::read(file).map_err(|e| format!("read genesis {}: {e}", file.display()))?,
-        ),
+        Some(file) => {
+            Some(std::fs::read(file).map_err(|e| format!("read genesis {}: {e}", file.display()))?)
+        }
         None => None,
     };
     // argv words are rejoined (a blob pasted unquoted splits on its wrapped
@@ -1936,19 +1944,7 @@ fn cmd_join(args: JoinCmd) -> Result<(), Box<dyn std::error::Error>> {
         false => args.blob.concat(),
         true => read_invite_blob_from_stdin()?,
     };
-    let net = &args.plumbing;
-    let overrides = config::PlumbingOverrides {
-        listen: net.listen.clone(),
-        advertised: net.advertised.clone(),
-        http: net.http.clone(),
-        gateway: net.gateway.clone(),
-        rpc: net.rpc.clone(),
-        primary_coordinator: net.primary_coordinator.clone(),
-        wireguard_listen: net.wireguard_listen.clone(),
-        wireguard_advertised: net.wireguard_advertised.clone(),
-        invite_listen: net.invite_listen.clone(),
-        block_time_ms: net.block_time_ms,
-    };
+    let overrides = args.plumbing.overrides();
     let joined = config::join_workspace(&blob, args.dir.clone(), &overrides)?;
     match (&genesis_bytes, joined.is_member) {
         (Some(bytes), _) => install_joiner_genesis(&joined.dir, bytes)?,

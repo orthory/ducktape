@@ -16,8 +16,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize as _;
 
+use super::DEFAULT_CHECKPOINT_BLOCKS;
 use super::DEFAULT_PRIMARY_COORDINATOR;
-use super::{DEFAULT_BLOCK_TIME_MS, DEFAULT_CHECKPOINT_BLOCKS};
+use super::PlumbingOverrides;
 
 /// the generated defaults: a fresh init/join with no flags yields a node
 /// with every surface up. Loopback for the operator surfaces (HTTP app
@@ -32,7 +33,13 @@ use super::{DEFAULT_BLOCK_TIME_MS, DEFAULT_CHECKPOINT_BLOCKS};
 /// losing that race is an unwinding panic ten seconds into boot. It now sits
 /// beside the two operator surfaces, which were never at risk.
 pub const DEFAULT_MESH_LISTEN: &str = "[::]:8846";
-pub const DEFAULT_HTTP_LISTEN: &str = "127.0.0.1:8844";
+/// every interface: the app API is a network peer's surface, not a localhost
+/// service. Its access rules do not depend on the bind — reads are open, a
+/// mutation carries a per-request user signature, the operator credential is
+/// honored only from a loopback peer, `/v1/admin/*` follows `DUCKTAPE_ADMIN` —
+/// and every co-located process dials it over loopback whatever it is bound
+/// to (`http_base_of`).
+pub const DEFAULT_HTTP_LISTEN: &str = "0.0.0.0:8844";
 pub const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:8845";
 /// port 0 on purpose: the browser gateway prints its bound port and its
 /// consumers re-read it per session; a fixed port would only collide.
@@ -94,9 +101,6 @@ pub struct NodeToml {
     pub coordinator_relay: String,
     /// sealed blocks between recovery checkpoints.
     pub checkpoint_blocks: u64,
-    /// milliseconds between idle blocks; every consensus timer is a fixed
-    /// multiple of it.
-    pub block_time_ms: u64,
     /// the compute plane: PRESENT = provider runs execute in this sandbox;
     /// ABSENT = consensus-only node (no provider discovery, no announce, no
     /// terminal plane).
@@ -236,24 +240,19 @@ pub struct Plumbing {
     pub primary_coordinator: String,
     pub coordinator_relay: String,
     pub checkpoint_blocks: u64,
-    pub block_time_ms: u64,
     pub sandbox: Option<SandboxToml>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn merged_plumbing(
-    dir: &Path,
-    listen: Option<&str>,
-    advertised: Option<&str>,
-    http_listen: Option<&str>,
-    gateway_listen: Option<&str>,
-    rpc_listen: Option<&str>,
-    wireguard_listen: Option<&str>,
-    invite_listen: Option<&str>,
-    primary_coordinator: Option<&str>,
-    wireguard_advertised: Option<&str>,
-    block_time_ms: Option<u64>,
-) -> Result<Plumbing, String> {
+pub fn merged_plumbing(dir: &Path, overrides: &PlumbingOverrides) -> Result<Plumbing, String> {
+    let listen = overrides.listen.as_deref();
+    let advertised = overrides.advertised.as_deref();
+    let http_listen = overrides.http.as_deref();
+    let gateway_listen = overrides.gateway.as_deref();
+    let rpc_listen = overrides.rpc.as_deref();
+    let wireguard_listen = overrides.wireguard_listen.as_deref();
+    let invite_listen = overrides.invite_listen.as_deref();
+    let primary_coordinator = overrides.primary_coordinator.as_deref();
+    let wireguard_advertised = overrides.wireguard_advertised.as_deref();
     let path = dir.join("node.toml");
     // an existing file must be a VALID network-shape file to contribute —
     // an incomplete or dev-seed file aborts the verb instead of being
@@ -320,9 +319,6 @@ pub fn merged_plumbing(
         checkpoint_blocks: e
             .map(|r| r.checkpoint_blocks)
             .unwrap_or(DEFAULT_CHECKPOINT_BLOCKS),
-        block_time_ms: block_time_ms
-            .or_else(|| e.map(|r| r.block_time_ms))
-            .unwrap_or(DEFAULT_BLOCK_TIME_MS),
         sandbox: e.and_then(|r| r.sandbox.clone()),
         wireguard_listen,
         primary_coordinator,
@@ -406,7 +402,7 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
         &mut s,
         "http_listen",
         format_args!("\"{}\"", p.http_listen),
-        "HTTP app API (keep loopback)",
+        "HTTP app API; reads open to any peer, writes signed",
     );
     keyline(
         &mut s,
@@ -455,12 +451,6 @@ pub fn write_node_toml(dir: &Path, p: &Plumbing) -> Result<PathBuf, String> {
         "checkpoint_blocks",
         format_args!("{}", p.checkpoint_blocks),
         "sealed blocks between recovery checkpoints",
-    );
-    keyline(
-        &mut s,
-        "block_time_ms",
-        format_args!("{}", p.block_time_ms),
-        "milliseconds between idle blocks; every consensus timer scales with it",
     );
     // the [sandbox] table LAST — everything after a toml table header belongs
     // to the table, so no top-level key may follow it.
@@ -543,10 +533,7 @@ mod tests {
     }
 
     fn fresh_default_plumbing(dir: &Path) -> Plumbing {
-        merged_plumbing(
-            dir, None, None, None, None, None, None, None, None, None, None,
-        )
-        .expect("fresh merge")
+        merged_plumbing(dir, &PlumbingOverrides::default()).expect("fresh merge")
     }
 
     /// the generated file round-trips through the strict parser and its
@@ -607,7 +594,6 @@ mod tests {
             derive_coordinator_relay(DEFAULT_PRIMARY_COORDINATOR)
         );
         assert_eq!(raw.checkpoint_blocks, DEFAULT_CHECKPOINT_BLOCKS);
-        assert_eq!(raw.block_time_ms, DEFAULT_BLOCK_TIME_MS);
         // no [sandbox] table by default: a fresh node is consensus-only, and
         // the commented example in the file must not parse as a live table.
         assert_eq!(raw.sandbox, None);
@@ -653,16 +639,11 @@ mod tests {
 
         let p = merged_plumbing(
             &dir,
-            Some("127.0.0.1:53000"),
-            None,
-            Some("127.0.0.1:53001"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            &PlumbingOverrides {
+                listen: Some("127.0.0.1:53000".to_string()),
+                http: Some("127.0.0.1:53001".to_string()),
+                ..Default::default()
+            },
         )
         .expect("merge");
         assert_eq!(p.listen, "127.0.0.1:53000");
@@ -689,18 +670,13 @@ mod tests {
         let edited = std::fs::read_to_string(dir.join("node.toml"))
             .expect("read")
             .replace("checkpoint_blocks = 32", "checkpoint_blocks = 7")
-            .replace("block_time_ms = 1000", "block_time_ms = 250")
             + "\n[sandbox]\nruntime = \"firecracker\"\nkernel = \"/g/vmlinux\"\n\
                rootfs = \"/g/rootfs.ext4\"\ncores = 4\nmem_gb = 0\n";
         std::fs::write(dir.join("node.toml"), edited).expect("write");
-        let p = merged_plumbing(
-            &dir, None, None, None, None, None, None, None, None, None, None,
-        )
-        .expect("merge");
+        let p = merged_plumbing(&dir, &PlumbingOverrides::default()).expect("merge");
         write_node_toml(&dir, &p).expect("rewrite");
         let (raw, _) = load_node_toml(&dir.join("node.toml")).expect("reload");
         assert_eq!(raw.checkpoint_blocks, 7);
-        assert_eq!(raw.block_time_ms, 250);
         let sandbox = raw.sandbox.expect("hand-added [sandbox] survives rewrite");
         assert_eq!(sandbox.runtime, "firecracker");
         assert_eq!(sandbox.cores, 4);

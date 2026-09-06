@@ -27,7 +27,7 @@ pub(crate) const NOP_TARGET: &str = noded::projection::NOP_TARGET;
 // pending ops the moment nothing of ours is in flight (`pump_eager_flush`),
 // so the network's own agreement speed paces blocks and ops aggregate behind
 // the one batch in flight. IDLE is the only timed cadence: the heartbeat
-// beats one nop block per block time (node.toml `block_time_ms`) so an idle
+// beats one nop block per block time (network.toml `block_time_ms`) so an idle
 // chain still finalizes (its height keeps ticking) and any pending cutover
 // still crosses — paced to the same interval the leader's idle-propose holds
 // a view open, so the idle beat never outpaces the view hold.
@@ -57,6 +57,12 @@ const _: () = assert!(MAX_MESSAGE_SIZE as usize >= duckfs_core::MAX_SYNC_REPLY_B
 // (`sync::serve::encode_bounded_response`) — that is the last line; this pin
 // keeps the honest path from ever needing it.
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::qmdb::MAX_MODULE_REPLY_BYTES + 1024);
+// the replay window a manifest carries is the SAME window the drain enforces:
+// a joiner seating on a shallower one applies a re-proposed batch its peers
+// refuse. `statesync` does not link `node`, so the equality is pinned here,
+// where both are in scope. the window's wire cost rides under the cap above.
+const _: () = assert!(statesync::MAX_APPLIED_FRAMES == node::REPLAY_WINDOW_HEIGHTS);
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::MAX_APPLIED_FRAMES * 40 + (64 << 10));
 /// inbound backlog per channel. NOT backpressure: commonware's peer actor
 /// DROPS an inbound message when the application buffer is full (it never
 /// blocks a peer), so this is a drop boundary — `relay::MAX_RELAY_BLOB_BYTES`
@@ -133,17 +139,6 @@ pub(crate) const EPOCH_CHANNEL_BANK: u64 = 64;
 /// the same deterministic discard ceiling. small for the demo network; a
 /// production mesh would size this in minutes of views.
 pub(crate) const CUTOVER_DELAY: u64 = 3;
-/// every module in the production genesis set, in status-report order — the
-/// `production` selection of the single-source [`topology`]. pinned to the
-/// composed host's registry by the parity test in `host_state`; the
-/// topology's own tests pin the selection to today's 19 (the founder bundles
-/// each wasm tenant's component; the descriptor commits its hash).
-///
-/// A module here is in the root-hash: every node must run it, agree on its root
-/// at every height, and keep doing so forever. Experiments therefore live
-/// unwired in `crates/labs` and appear in no genesis set.
-pub(crate) const MODULE_IDS: &[&str] = topology::PRODUCTION;
-
 /// how long an app-surface submit reply may be held awaiting finalization
 /// before it errors out (the op may still land later; clients re-query on
 /// block events). mirrors the rpc bridge's stuck-node budget.

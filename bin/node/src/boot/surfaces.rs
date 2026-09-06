@@ -1,5 +1,3 @@
-use crate::constants::MODULE_IDS;
-
 /// `run_node`'s out-of-runtime surface bring-up (phase P1): the listener
 /// binds that must fail as a clean startup error rather than an async
 /// surprise, plus the app-surface HTTP server's own OS thread and the
@@ -26,6 +24,10 @@ pub(crate) struct Surfaces {
     pub(crate) terminals: Option<noded::TerminalSessions>,
     /// the guest-side remote-session lane the term plane's client half drains.
     pub(crate) session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    /// the guest-side session-id → host-node registry the http handle writes on
+    /// a remote create. The term plane's inbound feeds gate on it: a session's
+    /// chunks and command rows are accepted only from the peer that hosts it.
+    pub(crate) remote_sessions: noded::RemoteSessions,
     /// the host's own browser-gateway base URL — the `via` a resolved credential
     /// routes through. Empty when no browser gateway is bound.
     pub(crate) local_gateway_via: String,
@@ -88,7 +90,7 @@ pub(crate) fn bind_listener(
 /// whose keystore cannot be read, boots operator-gated instead of refusing to
 /// boot. Not the user's node: the wallet is per operator, shared by the CLI
 /// and the app.
-fn operator_wallet_key() -> Option<Vec<u8>> {
+pub(crate) fn operator_wallet_key() -> Option<Vec<u8>> {
     let path = keystore::wallet::active_user_key().ok()?;
     let key = keystore::userkey::read_user_key_file(&path).ok()?;
     Some(key.pubkey)
@@ -166,10 +168,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // /v1/index/* lanes light up through the handle below. an open failure
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index". opened
-    // BARE: the index guests are the network's, carried by its genesis, and
-    // a joiner fetches that off the mesh after these surfaces are up — the
-    // boot's genesis hydration (`host_state::hydrate_genesis`) converges them.
-    let index = noded::open_index_store(storage, MODULE_IDS)?;
+    // BARE over the genesis set: the index guests are the network's, carried
+    // by its genesis, and a joiner fetches that off the mesh after these
+    // surfaces are up — the boot's genesis hydration
+    // (`host_state::hydrate_genesis`) converges them. a module the registry
+    // admitted after genesis gets its database when the host composes.
+    let index = noded::open_index_store(storage, topology::PRODUCTION)?;
     // this node's operator credential: minted fresh each boot and written 0600
     // beside node.toml, exactly like the service link token. Minted on EVERY
     // boot, `DUCKTAPE_ADMIN=off` included — it is no longer the admin
@@ -293,6 +297,10 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
             http_handle
         }
     };
+    // the guest-side session→host registry, taken before the handle moves into
+    // the surface thread: the http routes write it on a remote create, the term
+    // plane's inbound feeds read it to bind a session's grains to its host.
+    let remote_sessions = http_handle.remote_sessions().clone();
     // (like the rpc surface above, a joiner binds and the park loop pumps —
     // reads only until promotion re-execs this process into a validator.)
     let mut http_port = None;
@@ -372,6 +380,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         gateway_commands,
         terminals,
         session_requests,
+        remote_sessions,
         local_gateway_via,
         node_api_ports: [rpc_port, gateway_port, http_port]
             .into_iter()

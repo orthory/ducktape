@@ -1,13 +1,20 @@
 //! the composer over REAL substrates: the repo's fixture components, qmdb
 //! stores on a temp runtime, an empty blob plane — genesis, then a reopen of
-//! the same stores with a Map snapshot re-installed.
+//! the same stores off the modules registry with a map snapshot re-installed;
+//! and the ONE wasm path's refusals, by name.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-use commonware_runtime::{Runner as _, Supervisor as _};
-use noded::bundle::DirCodeSource;
-use noded::compose::{Bindings, Boot, BoxFut, Substrates, compose};
-use sdk::{MerkleStore, StateRoot, StateSyncHandle};
+use commonware_runtime::Runner as _;
+use host::CapturePayloads;
+use noded::bundle::{DirCodeSource, qmdb_stores};
+use noded::compose::{
+    Admissions, Bindings, Boot, BoxFut, Start, Substrates, check_realizable, compose, wasm_module,
+};
+use sdk::{Module, StateRoot, StateSyncHandle};
+use sdk_testkit::TestCtx;
+use wasm_host::{Backing, Shape};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../kernel/host/tests/fixtures")
@@ -16,7 +23,12 @@ fn fixtures() -> PathBuf {
 /// one `SnapshotSource` call's future.
 type SnapshotFut<'a> = BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>>;
 
-const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "lifecycle", "runs"];
+const SELECTION: &[&str] = &["kv", "valset", "acl", "governance", "modules", "runs"];
+
+const BINDINGS: Bindings<'static> = Bindings {
+    invite: b"t",
+    chain_id: "t",
+};
 
 fn run(body: impl FnOnce(commonware_runtime::tokio::Context, PathBuf) -> BoxFut<'static, ()>) {
     let dir = tempfile::tempdir().unwrap();
@@ -26,6 +38,14 @@ fn run(body: impl FnOnce(commonware_runtime::tokio::Context, PathBuf) -> BoxFut<
     commonware_runtime::tokio::Runner::new(cfg).start(|context| body(context, root));
 }
 
+fn substrates(dir: &std::path::Path) -> Substrates {
+    Substrates {
+        forge_repo: dir.join("forge"),
+        duckfs_dir: dir.join("duckfs"),
+        blobs: blobstore::BlobHandle::default(),
+    }
+}
+
 #[test]
 fn composes_wasm_store_map_and_native_over_injected_stores() {
     run(|context, dir| {
@@ -33,49 +53,32 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
             let (code, by_id) =
                 DirCodeSource::open(&fixtures(), &["acl", "governance", "runs"]).unwrap();
             let validators = vec![vec![7u8; 32]];
-            let bindings = Bindings {
-                invite: b"t",
-                chain_id: "t",
-                validators: &validators,
-                code_hashes: &by_id,
-            };
-            let substrates = Substrates {
-                forge_repo: dir.join("forge"),
-                duckfs_dir: dir.join("duckfs"),
-                blobs: blobstore::BlobHandle::default(),
-            };
-            let mut stores =
-                |id: &'static str| -> BoxFut<'_, Result<Box<dyn MerkleStore>, String>> {
-                    let context = context.child(id);
-                    Box::pin(async move {
-                        Ok(
-                            Box::new(statesync::qmdb::QmdbStore::init(context, id).await)
-                                as Box<dyn MerkleStore>,
-                        )
-                    })
-                };
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
 
             // ---- genesis ----
-            let modules = compose(
+            let genesis = compose(
                 SELECTION,
                 &code,
                 &mut stores,
                 &substrates,
-                &bindings,
-                Boot::Genesis,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &validators,
+                    bundle: &by_id,
+                },
             )
             .await
             .unwrap();
-            let ids: Vec<String> = modules.iter().map(|m| m.id().to_string()).collect();
-            assert_eq!(
-                ids,
-                SELECTION.iter().map(|s| s.to_string()).collect::<Vec<_>>()
-            );
-            let runs = modules.iter().find(|m| m.id() == "runs").unwrap();
-            let Ok(StateSyncHandle::SnapshotBytes(runs_snapshot)) = runs.state_sync_handle() else {
-                panic!("a Map tenant syncs by snapshot bytes");
-            };
-            let genesis = host::Host::genesis(modules).unwrap();
+            let mut ids: Vec<String> = genesis
+                .module_roots()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            ids.sort_unstable();
+            let mut want: Vec<String> = SELECTION.iter().map(|s| s.to_string()).collect();
+            want.sort_unstable();
+            assert_eq!(ids, want);
             assert!(
                 genesis.module_code_hash("valset").is_none(),
                 "native modules carry no code hash"
@@ -93,31 +96,41 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
                 "governance's genesis config was seeded into its store"
             );
             let genesis_root = genesis.root_hash();
-            let runs_root = genesis.module_root("runs").unwrap();
+            let (captured, _) =
+                genesis.capture_current_snapshot(0, CapturePayloads::All, || Duration::ZERO);
+            let runs = captured.module("runs").expect("runs composed");
+            let StateSyncHandle::SnapshotBytes(runs_snapshot) = runs.state_sync.clone() else {
+                panic!("a map tenant syncs by snapshot bytes");
+            };
+            let runs_root = runs.root;
             drop(genesis);
 
-            // ---- reopen the same stores: no re-seed, the Map tenant installs
+            // ---- reopen the same stores at block zero: the wasm set comes off
+            // the modules registry, no store re-seeds, the map tenant installs
             // its snapshot, and the composed root-hash is the genesis one ----
-            let mut snapshots = |id: &'static str| -> SnapshotFut<'_> {
+            let mut snapshots = |id: &str, backing: Backing| -> SnapshotFut<'_> {
+                assert_ne!(
+                    backing,
+                    Backing::Store,
+                    "a store-backed module is never asked"
+                );
                 let bytes = runs_snapshot.clone();
-                Box::pin(async move {
-                    let is_runs = id == "runs";
-                    Ok(is_runs.then_some((bytes, runs_root)))
-                })
+                let is_runs = id == "runs";
+                Box::pin(async move { Ok(is_runs.then_some((bytes, runs_root))) })
             };
             let reopened = compose(
                 SELECTION,
                 &code,
                 &mut stores,
                 &substrates,
-                &bindings,
+                &BINDINGS,
                 Boot::Reopen {
+                    height: 0,
                     snapshots: &mut snapshots,
                 },
             )
             .await
             .unwrap();
-            let reopened = host::Host::genesis(reopened).unwrap();
             assert_eq!(
                 reopened.root_hash(),
                 genesis_root,
@@ -128,39 +141,23 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
 }
 
 #[test]
-fn code_hash_drift_and_unknown_ids_are_refused_by_name() {
+fn bundle_drift_and_unknown_ids_are_refused_by_name() {
     run(|context, dir| {
         Box::pin(async move {
             let (code, by_id) = DirCodeSource::open(&fixtures(), &["acl"]).unwrap();
             let (_, with_extra) = DirCodeSource::open(&fixtures(), &["acl", "governance"]).unwrap();
-            let bindings = Bindings {
-                invite: b"t",
-                chain_id: "t",
-                validators: &[],
-                code_hashes: &by_id,
-            };
-            let substrates = Substrates {
-                forge_repo: dir.join("forge"),
-                duckfs_dir: dir.join("duckfs"),
-                blobs: blobstore::BlobHandle::default(),
-            };
-            let mut stores =
-                |id: &'static str| -> BoxFut<'_, Result<Box<dyn MerkleStore>, String>> {
-                    let context = context.child(id);
-                    Box::pin(async move {
-                        Ok(
-                            Box::new(statesync::qmdb::QmdbStore::init(context, id).await)
-                                as Box<dyn MerkleStore>,
-                        )
-                    })
-                };
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
             let Err(err) = compose(
                 &["acl", "governance"],
                 &code,
                 &mut stores,
                 &substrates,
-                &bindings,
-                Boot::Genesis,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &[],
+                    bundle: &by_id,
+                },
             )
             .await
             else {
@@ -175,8 +172,11 @@ fn code_hash_drift_and_unknown_ids_are_refused_by_name() {
                 &code,
                 &mut stores,
                 &substrates,
-                &bindings,
-                Boot::Genesis,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &[],
+                    bundle: &by_id,
+                },
             )
             .await
             else {
@@ -186,19 +186,18 @@ fn code_hash_drift_and_unknown_ids_are_refused_by_name() {
                 err.contains("not-a-module"),
                 "an unknown id is refused by name: {err}"
             );
-            // a stray extra hash would seed the lifecycle registry (and move
+            // a stray extra hash would seed the modules registry (and move
             // the genesis root) for a module the selection never composes.
-            let extra = Bindings {
-                code_hashes: &with_extra,
-                ..bindings
-            };
             let Err(err) = compose(
                 &["acl"],
                 &code,
                 &mut stores,
                 &substrates,
-                &extra,
-                Boot::Genesis,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &[],
+                    bundle: &with_extra,
+                },
             )
             .await
             else {
@@ -222,10 +221,14 @@ impl host::CodeSource for LiarSource {
     async fn fetch(&self, _code_hash: &[u8]) -> Option<Vec<u8>> {
         std::fs::read(&self.0).ok()
     }
+
+    fn origin(&self) -> &'static str {
+        "test_liar"
+    }
 }
 
 /// a code source is a lookup, not a guarantee: bytes that do not hash to the
-/// genesis entry never seat, or the running code and the lifecycle registry
+/// genesis entry never seat, or the running code and the modules registry
 /// would silently disagree.
 #[test]
 fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
@@ -234,34 +237,18 @@ fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
             let (_, by_id) = DirCodeSource::open(&fixtures(), &["acl"]).unwrap();
             // the liar answers acl's hash with governance's component.
             let liar = LiarSource(fixtures().join("governance.component.wasm"));
-            let bindings = Bindings {
-                invite: b"t",
-                chain_id: "t",
-                validators: &[],
-                code_hashes: &by_id,
-            };
-            let substrates = Substrates {
-                forge_repo: dir.join("forge"),
-                duckfs_dir: dir.join("duckfs"),
-                blobs: blobstore::BlobHandle::default(),
-            };
-            let mut stores =
-                |id: &'static str| -> BoxFut<'_, Result<Box<dyn MerkleStore>, String>> {
-                    let context = context.child(id);
-                    Box::pin(async move {
-                        Ok(
-                            Box::new(statesync::qmdb::QmdbStore::init(context, id).await)
-                                as Box<dyn MerkleStore>,
-                        )
-                    })
-                };
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
             let Err(err) = compose(
                 &["acl"],
                 &liar,
                 &mut stores,
                 &substrates,
-                &bindings,
-                Boot::Genesis,
+                &BINDINGS,
+                Boot::Genesis {
+                    validators: &[],
+                    bundle: &by_id,
+                },
             )
             .await
             else {
@@ -271,6 +258,149 @@ fn a_code_source_whose_bytes_miss_the_hash_is_refused() {
                 err.contains("acl") && err.contains("do not match"),
                 "the mismatch is refused by module name: {err}"
             );
+        })
+    });
+}
+
+/// a shape this host cannot realize is refused BY NAME, before any substrate
+/// is touched: an odb declaration under an id the host has no substrate for,
+/// or a config key no network binds. the same check the readiness probe runs
+/// before a validator signals a swap ready.
+#[test]
+fn a_shape_the_host_cannot_realize_is_refused_by_name() {
+    let odb = Shape {
+        backing: Backing::Odb,
+        config: Vec::new(),
+        committed_queries: false,
+    };
+    let err = check_realizable("kanban", &odb).unwrap_err();
+    assert!(
+        err.contains("kanban") && err.contains("odb"),
+        "an odb declaration without a substrate names the module: {err}"
+    );
+    check_realizable("files", &odb).expect("files has an odb substrate");
+    check_realizable("forge", &odb).expect("forge has an odb substrate");
+
+    let unknown_key = Shape {
+        backing: Backing::Store,
+        config: vec!["tenant".into()],
+        committed_queries: false,
+    };
+    let err = check_realizable("kanban", &unknown_key).unwrap_err();
+    assert!(
+        err.contains("kanban") && err.contains("tenant"),
+        "an unbound config key names the module and the key: {err}"
+    );
+    let bound = Shape {
+        backing: Backing::Store,
+        config: vec![
+            sdk::genesis_config::INVITE.into(),
+            sdk::genesis_config::CHAIN_ID.into(),
+        ],
+        committed_queries: true,
+    };
+    check_realizable("kanban", &bound).expect("the network binds both keys");
+}
+
+/// a post-genesis admission builds through the SAME wasm path a genesis
+/// tenant took: the factory wraps the bytes over the substrate they declare
+/// (a map-declared fixture over a fresh map) and refuses a declaration the
+/// host cannot realize under that id (the odb-declared fixture under an id
+/// with no substrate), by name.
+#[test]
+fn admissions_build_through_the_one_wasm_path() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let hello = std::fs::read(fixtures().join("hello.component.wasm")).unwrap();
+            let object = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../kernel/wasm-host/tests/fixtures/object.component.wasm"),
+            )
+            .unwrap();
+            let substrates = substrates(&dir);
+            let admissions = Admissions::new(&context, &substrates, &BINDINGS);
+            let admitted = host::ModuleFactory::instantiate(&admissions, "hello", &hello)
+                .await
+                .expect("a map-declared component admits over a fresh map");
+            let host::Admitted::Module(module) = admitted else {
+                panic!("the hello fixture is a `ducktape:module`");
+            };
+            assert_eq!(module.id(), "hello");
+            let err = host::ModuleFactory::instantiate(&admissions, "kanban", &object)
+                .await
+                .err()
+                .expect("an odb declaration under an id with no substrate is refused");
+            assert!(
+                err.to_string().contains("kanban"),
+                "the refusal names the module: {err}"
+            );
+            // and the ONE refusal that is not fail-closed: bytes that are no
+            // `ducktape:module` at all are another plane's commitment record.
+            let netstack = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../networking/netstack-machine/component.wasm"),
+            )
+            .unwrap();
+            let admitted = host::ModuleFactory::instantiate(&admissions, "netstack", &netstack)
+                .await
+                .expect("a foreign-world component is answered, not errored");
+            assert!(
+                matches!(admitted, host::Admitted::ForeignAbi),
+                "the netstack guest is no module admission"
+            );
+        })
+    });
+}
+
+/// an ODB-BACKED tenant reads its network's chain id through the same
+/// `sdk::genesis_config` seam a Map/Store tenant does — the kernel half of
+/// #1773: `compose::wasm_module` used to skip the `Backing::Odb` arm
+/// entirely, so a component like forge (or this fixture, wearing files' odb
+/// substrate) never saw a `__config` record and could not learn its chain id.
+#[test]
+fn an_odb_backed_module_reads_its_chain_id_from_genesis_config() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let object = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../kernel/wasm-host/tests/fixtures/object.component.wasm"),
+            )
+            .unwrap();
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let bindings = Bindings {
+                invite: b"t",
+                chain_id: "net#odb-1773",
+            };
+            let mut module = wasm_module(
+                "files",
+                &object,
+                &mut stores,
+                &substrates,
+                &bindings,
+                Start::Fresh,
+            )
+            .await
+            .expect("an odb-declared component wraps over the files substrate");
+
+            let mut ctx = TestCtx::at_height(0);
+            let matching = sdk::Msg {
+                target: "files".into(),
+                payload: [b"c".as_slice(), bindings.chain_id.as_bytes()].concat(),
+            };
+            module
+                .execute(&mut ctx, &matching)
+                .await
+                .expect("the guest read chain_id straight out of __config");
+
+            let mismatched = sdk::Msg {
+                target: "files".into(),
+                payload: [b"c".as_slice(), b"some-other-chain".as_slice()].concat(),
+            };
+            module
+                .execute(&mut ctx, &mismatched)
+                .await
+                .expect_err("a wrong expectation against the same __config is rejected");
         })
     });
 }

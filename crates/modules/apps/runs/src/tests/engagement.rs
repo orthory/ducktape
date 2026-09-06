@@ -99,7 +99,8 @@ fn mention_policy_engages_only_this_modules_tagged_active_agents() {
     let run_id = run_id_for("general", 3, "bot1");
     let entry = get_pending(&m, &run_id).expect("bot1 engaged");
     assert_eq!(entry.dispatch_id, dispatch_id_for(&run_id));
-    assert_eq!(entry.requester, SagaOrigin::Module("tagging".into()));
+    // the engaging AUTHOR, not the plane that routed the event.
+    assert_eq!(entry.requester, SagaOrigin::External(vec![1; 32]));
     assert_eq!(get_pending(&m, &run_id_for("general", 3, "bot2")), None);
 
     // exactly one dispatch, under the agent's own recipe, carrying the

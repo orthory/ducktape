@@ -21,6 +21,7 @@ on onboarding_opened(id)
   onboarding_win = some(id)
   parallel
     run replace lane=appearance_load load_appearance() -> appearance_loaded _
+    run replace lane=notify_load load_desktop_notifications() -> desktop_notifications_loaded _
     run replace lane=hub_state hub_state() -> hub_booted _
 
 // Boot answer: pick the entry step from the keystore and start probing the

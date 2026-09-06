@@ -14,7 +14,7 @@ use futures::{FutureExt as _, StreamExt as _};
 use recovery::Manifest;
 
 use crate::constants::{DRAIN_TICK, WORKSPACE_CHECK_INTERVAL};
-use crate::reachability_plane::GateOutcomes;
+use crate::reachability_plane::{GateOutcomes, insert_gate_outcome};
 use crate::rpc::{JoinRequestRecord, RpcJob};
 use crate::sync::serve::SyncStateRequest;
 use crate::util::{participant_bytes, resident_bytes};
@@ -42,12 +42,21 @@ struct GatePending {
 }
 
 /// write a resolved gate outcome where the intro doorbell reads it — the
-/// shared map the joiner's next retransmit is answered from.
-fn settle_gate(outcomes: &GateOutcomes, joiner: Vec<u8>, reply: join_gate::IntroReply) {
-    outcomes
-        .lock()
-        .expect("gate outcomes lock")
-        .insert(joiner, reply);
+/// shared map the joiner's next retransmit is answered from. `now` stamps
+/// the entry for [`crate::reachability_plane::sweep_gate_outcomes`] and the
+/// cap eviction in [`insert_gate_outcome`].
+fn settle_gate(
+    outcomes: &GateOutcomes,
+    joiner: Vec<u8>,
+    reply: join_gate::IntroReply,
+    now: std::time::SystemTime,
+) {
+    insert_gate_outcome(
+        &mut outcomes.lock().expect("gate outcomes lock"),
+        joiner,
+        reply,
+        now,
+    );
 }
 
 /// assemble this node's boundary facts and publish them into the shared
@@ -63,23 +72,14 @@ pub(super) fn publish_boundary_status(
     metrics: &noded::NodeMetrics,
     status_public_key: &str,
 ) {
-    let modules = crate::constants::MODULE_IDS
-        .iter()
-        .map(|m| noded::ModuleStatus {
-            id: (*m).into(),
-            root: node
-                .host()
-                .module_root(m)
-                .map(|r| crate::util::hex(&r))
-                .unwrap_or_default(),
-            category: noded::ModuleCategory::of(m),
-        })
-        .collect();
+    let height = node.finalized().map(|f| f.height).unwrap_or(0);
     status.publish(noded::NodeStatus {
         version: crate::build_version(),
         root_hash: crate::util::hex(&node.root_hash()),
-        height: node.finalized().map(|f| f.height).unwrap_or(0),
-        modules,
+        height,
+        consensus_time: node.stamp_consensus_time(height),
+        consensus_time_unit: node.consensus_time_policy().into(),
+        modules: crate::util::module_statuses(node.host()),
         public_key: status_public_key.into(),
         // the cell overlays the boot-wired chain id on every read.
         chain_id: String::new(),
@@ -149,6 +149,10 @@ pub(super) struct ValidatorLoopState<'a> {
     /// where a SIGUSR1 task dump lands (`<workspace>/tasks.txt`).
     pub(super) workspace: std::path::PathBuf,
 }
+
+/// one finished pending-swap code fetch: the digest, and the error if the
+/// bytes did not land.
+type FetchOutcome = ([u8; 32], Option<crate::blob_fetch::BlobFetchError>);
 
 struct ValidatorRuntime<'a> {
     context: &'a commonware_runtime::tokio::Context,
@@ -225,6 +229,13 @@ struct ValidatorRuntime<'a> {
     last_written_root: Option<sdk::StateRoot>,
     last_reach_view: Option<u64>,
     last_flush: std::time::SystemTime,
+    /// when this loop last SEALED a block, and how many stall windows have
+    /// passed since — the halt detector (`drain_pass`). every way this loop
+    /// can stop producing blocks is silent by construction (a wedged release
+    /// gate delivers nothing, a non-idle orderer FIFO makes the beat restamp
+    /// forever), so the absence of blocks is itself the event to narrate.
+    last_seal: std::time::SystemTime,
+    stall_windows: u64,
     pending_retarget: Option<reachability::MeshEpochEvent>,
     heartbeat_disabled: bool,
     /// the sender half of the finalization delivery wake — re-installed on
@@ -242,10 +253,12 @@ struct ValidatorRuntime<'a> {
     last_nudge: std::time::SystemTime,
     workers: Vec<Box<dyn host::worker::Worker>>,
     code_signaller: super::code_announce::CodeReadinessSignaller,
-    /// completed pending-swap code fetches, reaped at each readiness pump so
-    /// a failed fetch retries next tick (the sender rides in each task).
-    fetch_done_tx: tokio::sync::mpsc::UnboundedSender<[u8; 32]>,
-    fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<[u8; 32]>,
+    /// completed pending-swap code fetches and their outcome (`None` = the
+    /// bytes landed), reaped at each readiness pump: a failed fetch is counted,
+    /// backed off and — on the first failure and every Nth after it — reported
+    /// there, where the attempt counter lives. The sender rides in each task.
+    fetch_done_tx: tokio::sync::mpsc::UnboundedSender<FetchOutcome>,
+    fetch_done_rx: tokio::sync::mpsc::UnboundedReceiver<FetchOutcome>,
     next_drain: std::time::SystemTime,
     /// the workspace directory as it was at boot, and the next instant the
     /// drain re-checks it is still there — the fail-stop for a workspace
@@ -253,6 +266,10 @@ struct ValidatorRuntime<'a> {
     /// the node then runs unguarded rather than dying over a stat.
     workspace_mark: Option<crate::util::WorkspaceMark>,
     next_workspace_check: std::time::SystemTime,
+    /// consecutive checks that found the workspace's mark file missing while
+    /// the directory itself was unchanged. Not a deletion — it paces the
+    /// warning for a filesystem that will never accept the rewrite.
+    workspace_mark_lost_checks: u64,
 }
 
 pub(super) async fn run(state: ValidatorLoopState<'_>) {
@@ -531,6 +548,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_written_root: None,
         last_reach_view,
         last_flush,
+        last_seal: context.current(),
+        stall_windows: 0,
         pending_retarget,
         heartbeat_disabled,
         delivery_wake_tx,
@@ -545,6 +564,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         next_drain: context.current() + DRAIN_TICK,
         workspace_mark,
         next_workspace_check: context.current() + WORKSPACE_CHECK_INTERVAL,
+        workspace_mark_lost_checks: 0,
     };
     // the startup snapshot: the RECOVERED boundary serves on /v1/status the
     // moment the loop exists, not after the first drain.
@@ -693,7 +713,7 @@ async fn graceful_checkpoint(
 ) {
     if let Some(f) = node.finalized() {
         let pos = node.sink_mut().oplog_pos().await;
-        if let Ok(manifest) = Manifest::capture(
+        let captured = Manifest::capture(
             node.host(),
             Some(f.height),
             orchestrator.epoch(),
@@ -705,7 +725,12 @@ async fn graceful_checkpoint(
                 .map(|cutover| cutover.cutover_view()),
             pos,
             next_seq,
-        ) {
+        );
+        // the replay guard rides the checkpoint: the journal suffix a
+        // checkpoint leaves is shallower than the protocol window, so a
+        // restart that rebuilt from the suffix alone would refuse fewer
+        // replayed batches than its peers.
+        if let Ok(manifest) = captured.map(|m| m.with_replay_window(node.replay_window())) {
             let _ = node.sink_mut().write_manifest(&manifest).await;
         }
     }

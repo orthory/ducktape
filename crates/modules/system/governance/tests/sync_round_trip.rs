@@ -96,7 +96,11 @@ fn redeem(issuer: &PrivateKey, nonce_byte: u8, joiner: &PrivateKey) -> Msg {
 // drive one op through the REAL module path: execute + commit_block (one op
 // per block-height), so the committed op log is what a validator produces.
 async fn apply_commit(m: &mut Governance, height: u64, member: &PrivateKey, op: Msg) {
-    let mut c = ctx(height, Origin::External(key_bytes(member)), key_bytes(member));
+    let mut c = ctx(
+        height,
+        Origin::External(key_bytes(member)),
+        key_bytes(member),
+    );
     m.execute(&mut c, &op).await.unwrap();
     m.commit_block().await.unwrap();
 }
@@ -126,7 +130,7 @@ async fn replies(m: &Governance) -> Vec<GovReply> {
 fn governance_over(store: Box<dyn sdk::MerkleStore>) -> Governance {
     Governance::new("governance", store, "valset", "identity")
         .with_invite_binding(BINDING)
-        .with_code_registry("lifecycle")
+        .with_code_registry("modules")
 }
 
 #[test]
@@ -212,7 +216,11 @@ fn synced_store_reconstructs_source_root_proposals_and_redemptions() {
         let GovReply::Proposals(views) = &src_replies[0] else {
             panic!("expected the listing");
         };
-        assert_eq!(views.len(), 2, "both proposals are rostered");
+        assert_eq!(
+            views.len(),
+            1,
+            "the settled proposal left the roster; only the open one remains"
+        );
 
         // the module consumed its store, so REOPEN the committed partitions
         // as a bare store for the handoff (drop first — one owner at a time).

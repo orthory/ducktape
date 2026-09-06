@@ -16,9 +16,9 @@ use governance::{
     encode_msg as gov_encode, encode_query as gov_query,
 };
 use host::{BlockContext, Host, SubmitError};
-use lifecycle::{
-    Lifecycle, LifecycleMsg, LifecycleQuery, LifecycleReply, decode_reply as lifecycle_decode,
-    encode_msg as lifecycle_encode, encode_query as lifecycle_query,
+use modules::{
+    Modules, ModulesMsg, ModulesQuery, ModulesReply, decode_reply as modules_decode,
+    encode_msg as modules_encode, encode_query as modules_query,
 };
 use sdk::{Error, Msg, Origin};
 use sdk_testkit::MemStore;
@@ -34,13 +34,13 @@ fn member_key(seed: u8) -> Vec<u8> {
 }
 
 fn hash(seed: u8) -> Vec<u8> {
-    vec![seed; lifecycle::CODE_HASH_LEN]
+    vec![seed; modules::CODE_HASH_LEN]
 }
 
 /// a host with valset (members 1,2) + governance wired to the REAL code
 /// registry, and the `hello` module pre-registered (active code = hash(1)).
 async fn gov_host_with_modreg() -> Host {
-    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
     valset.seed(member_key(1)).await.expect("seed valset");
     valset.seed(member_key(2)).await.expect("seed valset");
     valset.finish_seed().await.expect("seed valset");
@@ -53,12 +53,13 @@ async fn gov_host_with_modreg() -> Host {
                 "valset",
                 "identity",
             )
-            .with_code_registry("lifecycle"),
+            .with_code_registry("modules"),
         ),
-        Box::new(Lifecycle::new(
-            "lifecycle",
+        Box::new(Modules::new(
+            "modules",
             Box::new(MemStore::new()),
             "valset",
+            "governance",
         )),
     ])
     .expect("genesis");
@@ -70,8 +71,8 @@ async fn gov_host_with_modreg() -> Host {
             origin: Origin::System,
         },
         Msg {
-            target: "lifecycle".into(),
-            payload: lifecycle_encode(&LifecycleMsg::RegisterModule {
+            target: "modules".into(),
+            payload: modules_encode(&ModulesMsg::RegisterModule {
                 module_id: "hello".into(),
                 code_hash: hash(1),
             }),
@@ -119,13 +120,13 @@ async fn proposal_status(host: &Host, id: &str) -> Option<ProposalStatus> {
     }
 }
 
-async fn hello_code(host: &Host) -> lifecycle::ModuleCode {
+async fn hello_code(host: &Host) -> modules::ModuleCode {
     let reply = host
-        .query("lifecycle", &lifecycle_query(&LifecycleQuery::ModuleStatus))
+        .query("modules", &modules_query(&ModulesQuery::ModuleStatus))
         .await
         .expect("modreg status");
-    match lifecycle_decode(&reply).expect("decode") {
-        LifecycleReply::ModuleStatus { modules } => modules
+    match modules_decode(&reply).expect("decode") {
+        ModulesReply::ModuleStatus { modules } => modules
             .into_iter()
             .find(|m| m.module_id == "hello")
             .expect("hello entry"),
@@ -329,7 +330,7 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
         assert_eq!(proposal_status(&host, "mod-short").await, None);
 
         // an UNWIRED registry (Governance::new without with_code_registry).
-        let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+        let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
         valset.seed(member_key(1)).await.expect("seed valset");
         valset.finish_seed().await.expect("seed valset");
         let mut unwired = Host::genesis(vec![
@@ -367,13 +368,13 @@ fn door_checks_refuse_bad_hash_and_unwired_registry() {
 }
 
 /// the module lookup, admission flavor: any id, absent allowed.
-async fn module_code(host: &Host, id: &str) -> Option<lifecycle::ModuleCode> {
+async fn module_code(host: &Host, id: &str) -> Option<modules::ModuleCode> {
     let reply = host
-        .query("lifecycle", &lifecycle_query(&LifecycleQuery::ModuleStatus))
+        .query("modules", &modules_query(&ModulesQuery::ModuleStatus))
         .await
         .expect("modreg status");
-    match lifecycle_decode(&reply).expect("decode") {
-        LifecycleReply::ModuleStatus { modules } => modules.into_iter().find(|m| m.module_id == id),
+    match modules_decode(&reply).expect("decode") {
+        ModulesReply::ModuleStatus { modules } => modules.into_iter().find(|m| m.module_id == id),
         other => panic!("expected Status, got {other:?}"),
     }
 }
