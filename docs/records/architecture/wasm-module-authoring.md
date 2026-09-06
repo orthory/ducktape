@@ -144,7 +144,10 @@ One module: `cargo run -p guest-builder -- crates/modules/<plane>/<id>`
 
 Bytes are stable across revisions that change nothing the module compiles:
 the shell names the module by git source alone and the revision lives in the
-lock, which is not hashed into symbol names. They are identical from any box:
+lock, which is not hashed into symbol names. "Compiles" includes line numbers:
+a panic location names its line, and a guest expands the SDK's macros, so a
+line added anywhere above them in `crates/module-sdk/src/lib.rs` (a comment
+included) moves every guest that expands them. They are identical from any box:
 the unpacked revision, the cargo home, the rustup home and the scratch are
 remapped to fixed tokens. They are toolchain-dependent: a rebuild on another
 rustc may legitimately differ, so a channel move rebuilds the whole set and

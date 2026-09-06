@@ -171,4 +171,5 @@ make wasm-rebuild-check                                   # 7. every guest match
 | Node pins run before `make wasm-modules` | the fixtures dir lacks the component; `hash_bundle` refuses by name |
 | Building a guest before pushing | guest-builder reads the module out of the repository at HEAD: an unpushed HEAD fails to fetch, an uncommitted edit is refused. Commit, push, then build |
 | Moving the rust channel for one guest | bytes are toolchain-dependent; a channel move rebuilds the whole set (`make wasm-modules`) and commits it as one change |
+| Touching `crates/module-sdk/src/lib.rs` without a rebuild | panic locations carry line numbers and every guest expands the SDK's macros, so even a comment line above them moves the set; `make wasm-rebuild-check` names the stale ones |
 | Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files` shape) |
