@@ -8,14 +8,46 @@
 //! covered by the native tests in `src/index.rs`.
 
 use chat::Chat;
+use chat::client::dm_channel_id;
 use chat::{
-    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_HOOKS_PER_CHANNEL,
-    MAX_QUERY_LIMIT, Mark, PostPolicy, Span, decode_event, decode_reply, encode_msg, encode_query,
+    AuthorRef, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_CHANNELS_PER_CREATOR,
+    MAX_HOOKS_PER_CHANNEL, MAX_QUERY_LIMIT, Mark, PostPolicy, Span, decode_event, decode_reply,
+    encode_msg, encode_query,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+use identity::{
+    AccountView, IdentityQuery, IdentityReply, decode_query as identity_decode_query,
+    encode_reply as identity_encode_reply,
+};
 use sdk::{Error, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
+
+/// a minimal identity double: `key` (a 32-byte user origin id, as `user()`
+/// mints) resolves to `number` through `OfKey`, and nothing else. registered
+/// on a [`TestCtx`] via `.on_query("identity", ...)`.
+fn identity_stub(accounts: Vec<(Vec<u8>, u64)>) -> impl FnMut(&[u8]) -> Result<Vec<u8>, Error> {
+    move |req| {
+        let IdentityQuery::OfKey { key } = identity_decode_query(req).map_err(Error::Module)?
+        else {
+            return Err(Error::Module(
+                "test identity stub only answers OfKey".into(),
+            ));
+        };
+        let account = accounts
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, number)| AccountView {
+                number: *number,
+                name: String::new(),
+                keys: Vec::new(),
+                avatar: None,
+                bio: None,
+                updated_at: 0,
+            });
+        Ok(identity_encode_reply(&IdentityReply::Account(account)))
+    }
+}
 
 // build the module the way a host does: concrete store first, injected as
 // `Box<dyn MerkleStore>`. a macro (not an fn) so the tests need no
@@ -2474,5 +2506,189 @@ fn access_answers_one_users_standing_from_chats_own_gates() {
         let archived = access(&module, "core", 2).await;
         assert!(archived.may_read, "archival does not close reading");
         assert!(!archived.may_post, "an archived channel takes no posts");
+    });
+}
+
+#[test]
+fn a_bare_dm_shaped_id_is_reserved_from_plain_create_channel() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        let squatted = dm_channel_id("1", "2");
+
+        // any user origin, including one of the pair itself, is refused —
+        // minting a dm- id always goes through CreateDmChannel.
+        let err = module
+            .execute(
+                &mut ctx_with_origin(10, user(1)),
+                &module_msg(create_channel(&squatted)),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("reserved"));
+    });
+}
+
+#[test]
+fn a_third_account_can_never_mint_the_pairs_derived_dm_id() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat").with_identity("identity");
+        let alice_number = 1u64;
+        let bob_number = 2u64;
+        let mallory_number = 3u64;
+        let pairs = vec![
+            (vec![1u8; 32], alice_number),
+            (vec![3u8; 32], mallory_number),
+        ];
+        let their_dm = dm_channel_id(&alice_number.to_string(), &bob_number.to_string());
+
+        // mallory can only ever derive HER OWN pair's id — never alice &
+        // bob's — because the module resolves the creator from mallory's
+        // OWN key, not from anything the payload claims.
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(3))
+                    .on_query("identity", identity_stub(pairs.clone())),
+                &module_msg(ChatMsg::CreateDmChannel {
+                    counterpart: bob_number,
+                    name: "not alice and bob".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let minted = dm_channel_id(&mallory_number.to_string(), &bob_number.to_string());
+        assert_ne!(
+            minted, their_dm,
+            "mallory must land in her own DM, never alice's"
+        );
+        let ChatReply::Channel(None) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: their_dm,
+            },
+        )
+        .await
+        else {
+            panic!("alice & bob's DM must not exist — mallory never touched it");
+        };
+    });
+}
+
+#[test]
+fn a_participant_opens_their_derived_dm_and_both_get_seated() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat").with_identity("identity");
+        let alice_number = 1u64;
+        let bob_number = 2u64;
+        let pairs = vec![(vec![1u8; 32], alice_number)];
+        let expected_id = dm_channel_id(&alice_number.to_string(), &bob_number.to_string());
+
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(1)).on_query("identity", identity_stub(pairs)),
+                &module_msg(ChatMsg::CreateDmChannel {
+                    counterpart: bob_number,
+                    name: "Bob".into(),
+                }),
+            )
+            .await
+            .unwrap();
+        // seat both ends, exactly like `app::open_dm`'s follow-up writes.
+        for byte in [1u8, 2u8] {
+            module
+                .execute(
+                    &mut ctx_with_origin(11, user(1)),
+                    &module_msg(ChatMsg::SetMembership {
+                        channel_id: expected_id.clone(),
+                        user: vec![byte; 32],
+                        member: true,
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        module.commit_block().await.unwrap();
+
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: expected_id.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("the derived DM must exist under its canonical id");
+        };
+        assert_eq!(channel.id, expected_id);
+        assert_eq!(channel.post_policy, PostPolicy::MembersOnly);
+
+        let alice_access = access(&module, &expected_id, 1).await;
+        let bob_access = access(&module, &expected_id, 2).await;
+        assert!(
+            alice_access.may_post && bob_access.may_post,
+            "both ends must be seated"
+        );
+    });
+}
+
+#[test]
+fn a_non_dm_channel_id_is_unaffected_by_the_dm_reservation() {
+    deterministic::Runner::default().start(|context| async move {
+        // no `.with_identity` at all — a host with no identity sibling wired
+        // must still create ordinary channels exactly as before.
+        let mut module = chat_on!(context, "chat");
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(1)),
+                &module_msg(create_channel("general")),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let ChatReply::Channel(Some(channel)) = query(
+            &module,
+            ChatQuery::Channel {
+                channel_id: "general".into(),
+            },
+        )
+        .await
+        else {
+            panic!("an ordinary channel must still be created with no identity sibling");
+        };
+        assert_eq!(channel.id, "general");
+    });
+}
+
+#[test]
+fn a_creator_is_capped_and_a_different_origin_is_not() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        for n in 0..MAX_CHANNELS_PER_CREATOR as u64 {
+            module
+                .execute(
+                    &mut ctx_with_origin(n, user(1)),
+                    &module_msg(create_channel(&format!("room-{n}"))),
+                )
+                .await
+                .unwrap();
+        }
+        let err = module
+            .execute(
+                &mut ctx_with_origin(MAX_CHANNELS_PER_CREATOR as u64, user(1)),
+                &module_msg(create_channel("one-too-many")),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("already have"));
+
+        // a different origin is untouched by user(1)'s cap.
+        module
+            .execute(
+                &mut ctx_with_origin(MAX_CHANNELS_PER_CREATOR as u64 + 1, user(2)),
+                &module_msg(create_channel("someone-elses-room")),
+            )
+            .await
+            .unwrap();
     });
 }

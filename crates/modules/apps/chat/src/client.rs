@@ -342,6 +342,24 @@ pub fn delta_from_op(
                 head_seq: 0,
             },
         },
+        ChatMsg::CreateDmChannel {
+            counterpart: _,
+            name,
+        } => {
+            let ChatAssigned::DmChannel { channel_id } = decode_stamp(assigned)? else {
+                return Err("applied CreateDmChannel carried a non-DmChannel stamp".into());
+            };
+            ChatDelta::ChannelCreated {
+                channel: ChatChannel {
+                    id: channel_id,
+                    name,
+                    archived: false,
+                    members_only: true,
+                    huddle_count: 0,
+                    head_seq: 0,
+                },
+            }
+        }
         ChatMsg::RenameChannel { channel_id, name } => {
             ChatDelta::ChannelRenamed { channel_id, name }
         }
