@@ -15,9 +15,20 @@ pub enum Msg {
     },
     BindResponse {
         reflexive: SocketAddr,
+        /// A stateless return-routability proof for `reflexive`
+        /// (`CookieKey::mint`): the caller echoes this back in `Register` to
+        /// prove it actually received a coordinator reply at that source,
+        /// rather than having a first-seen mapping planted by a spoofed
+        /// source address.
+        cookie: [u8; 32],
     },
     Register {
         key: NodeKey,
+        /// Required only when the coordinator holds no LIVE mapping for
+        /// `key` (first-seen or expired) — see
+        /// `CookieKey::verify`. A same-source refresh of a live mapping
+        /// ignores this field.
+        cookie: [u8; 32],
     },
     /// Rebind re-advertisement: republish the sender's reflexive under a
     /// strictly-monotonic `nonce`. Unlike `Register` (an unconditional nonce-0
@@ -88,6 +99,10 @@ pub(crate) fn put_key<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, key: &NodeK
     put(out, &key.0);
 }
 
+pub(crate) fn put_cookie<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, cookie: &[u8; 32]) {
+    put(out, cookie);
+}
+
 #[cfg(feature = "runtime")]
 pub(crate) fn put_u16<const CAP: usize>(out: &mut ArrayVec<u8, CAP>, value: u16) {
     put(out, &value.to_be_bytes());
@@ -140,6 +155,12 @@ impl<'a> Reader<'a> {
         k.copy_from_slice(s);
         Ok(NodeKey(k))
     }
+    pub(crate) fn cookie(&mut self) -> Result<[u8; 32], WireError> {
+        let s = self.take(32)?;
+        let mut c = [0u8; 32];
+        c.copy_from_slice(s);
+        Ok(c)
+    }
     #[cfg(feature = "runtime")]
     pub(crate) fn u16(&mut self) -> Result<u16, WireError> {
         let s = self.take(2)?;
@@ -185,11 +206,10 @@ impl<'a> Reader<'a> {
 }
 
 impl Msg {
-    /// Largest encoded bare message — a `LookupResponse` carrying a v6 addr
-    /// (tag + key + present + family + 16-byte ip + port). This fixed upper
-    /// bound lets the hot UDP loop encode replies on its stack instead of
-    /// allocating per datagram.
-    pub const MAX_ENCODED_LEN: usize = 1 + 32 + 1 + 1 + 16 + 2;
+    /// Largest encoded bare message — a `Register` (tag + key + 32-byte
+    /// cookie). This fixed upper bound lets the hot UDP loop encode replies
+    /// on its stack instead of allocating per datagram.
+    pub const MAX_ENCODED_LEN: usize = 1 + 32 + 32;
 
     /// Encode into a stack-backed, fixed-capacity vector.
     pub fn encode_inline(&self) -> ArrayVec<u8, { Self::MAX_ENCODED_LEN }> {
@@ -208,13 +228,15 @@ impl Msg {
                 out.push(TAG_BIND_REQ);
                 put_key(out, from);
             }
-            Msg::BindResponse { reflexive } => {
+            Msg::BindResponse { reflexive, cookie } => {
                 out.push(TAG_BIND_RESP);
                 put_addr(out, reflexive);
+                put_cookie(out, cookie);
             }
-            Msg::Register { key } => {
+            Msg::Register { key, cookie } => {
                 out.push(TAG_REGISTER);
                 put_key(out, key);
+                put_cookie(out, cookie);
             }
             Msg::Readvertise { key, nonce } => {
                 out.push(TAG_READVERTISE);
@@ -255,7 +277,7 @@ impl Msg {
     pub fn subject_key(&self) -> Option<NodeKey> {
         match self {
             Msg::BindRequest { from } => Some(*from),
-            Msg::Register { key } | Msg::Readvertise { key, .. } | Msg::Lookup { key } => {
+            Msg::Register { key, .. } | Msg::Readvertise { key, .. } | Msg::Lookup { key } => {
                 Some(*key)
             }
             _ => None,
@@ -286,8 +308,12 @@ impl Msg {
             TAG_BIND_REQ => Msg::BindRequest { from: r.key()? },
             TAG_BIND_RESP => Msg::BindResponse {
                 reflexive: r.addr()?,
+                cookie: r.cookie()?,
             },
-            TAG_REGISTER => Msg::Register { key: r.key()? },
+            TAG_REGISTER => Msg::Register {
+                key: r.key()?,
+                cookie: r.cookie()?,
+            },
             TAG_READVERTISE => Msg::Readvertise {
                 key: r.key()?,
                 nonce: r.u64()?,
@@ -424,9 +450,11 @@ mod tests {
             },
             Msg::BindResponse {
                 reflexive: addr(2, 51820),
+                cookie: [0xcau8; 32],
             },
             Msg::Register {
                 key: NodeKey([3u8; 32]),
+                cookie: [0xcbu8; 32],
             },
             Msg::Readvertise {
                 key: NodeKey([13u8; 32]),
@@ -526,7 +554,10 @@ mod tests {
 
         let inners = vec![
             Msg::BindRequest { from: subject },
-            Msg::Register { key: subject },
+            Msg::Register {
+                key: subject,
+                cookie: [0xccu8; 32],
+            },
             Msg::Readvertise {
                 key: subject,
                 nonce: 42,
@@ -582,6 +613,7 @@ mod tests {
         let node = ed25519::PrivateKey::from_seed(1);
         let inner = Msg::Register {
             key: NodeKey([2u8; 32]),
+            cookie: [0xcdu8; 32],
         };
         let auth = sign_authenticator(&node, &inner.encode(), 1, None);
         let mut bytes = AuthRequest {
@@ -597,11 +629,13 @@ mod tests {
             caller: NodeKey([2u8; 32]),
             inner: Msg::Register {
                 key: NodeKey([2u8; 32]),
+                cookie: [0xcdu8; 32],
             },
             auth: sign_authenticator(
                 &node,
                 &Msg::Register {
                     key: NodeKey([2u8; 32]),
+                    cookie: [0xcdu8; 32],
                 }
                 .encode(),
                 1,

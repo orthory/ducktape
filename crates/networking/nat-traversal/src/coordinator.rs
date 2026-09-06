@@ -12,7 +12,7 @@ use crate::advert::{
     Admission, AdmitEvent, AdvertBook, AdvertOutcome, MAX_ADVERTS, MAX_ADVERTS_PER_SOURCE_IP,
     SharedAdverts,
 };
-use crate::auth::{AuthPolicy, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
+use crate::auth::{AuthPolicy, CookieKey, DEFAULT_FRESHNESS_WINDOW_SECS, verify_request_using};
 use crate::{Latch, Msg, NodeKey, short_key};
 
 const AUTH_KEY_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(64).unwrap();
@@ -141,6 +141,10 @@ pub struct Coordinator {
     adverts: SharedAdverts,
     auth: AuthVerifier,
     rejects: u64,
+    /// Boot-random return-routability key: mints the cookie `BindResponse`
+    /// hands out and verifies the one a first-seen/expired `Register` must
+    /// echo. See [`CookieKey`].
+    cookie_key: CookieKey,
 }
 
 impl Default for Coordinator {
@@ -149,6 +153,7 @@ impl Default for Coordinator {
             adverts: SharedAdverts::wrap(AdvertBook::default()),
             auth: AuthVerifier::new(AuthPolicy::default()),
             rejects: 0,
+            cookie_key: CookieKey::boot_random(),
         }
     }
 }
@@ -171,6 +176,7 @@ impl Coordinator {
             adverts: SharedAdverts::wrap(AdvertBook::default()),
             auth: AuthVerifier::with_shared_policy(policy),
             rejects: 0,
+            cookie_key: CookieKey::boot_random(),
         }
     }
 
@@ -302,9 +308,39 @@ impl Coordinator {
         // consumer never parks a relay session's read-only resolution.
         match msg {
             Msg::BindRequest { .. } => {
-                CoordinatorReplies::from_iter([(from, Msg::BindResponse { reflexive: from })])
+                let cookie = self.cookie_key.mint(from, now);
+                CoordinatorReplies::from_iter([(
+                    from,
+                    Msg::BindResponse {
+                        reflexive: from,
+                        cookie,
+                    },
+                )])
             }
-            Msg::Register { key } => {
+            Msg::Register { key, cookie } => {
+                // A key with no LIVE mapping (first-seen, or its previous
+                // mapping expired) needs a return-routability proof: without
+                // this, one spoofed-source datagram plants a `ReflexiveAdvert`
+                // for a victim address the sender never touched. A same-source
+                // refresh of an already-live mapping needs no cookie — it
+                // proves nothing `observe` doesn't already re-derive from the
+                // stored mapping itself.
+                let needs_cookie = self.adverts.current(key, now).is_none();
+                if needs_cookie && !self.cookie_key.verify(from, now, &cookie) {
+                    static NO_COOKIE: Latch = Latch::new();
+                    if let Some(occurrences) = NO_COOKIE.hit("register_missing_cookie") {
+                        tracing::warn!(
+                            target: "ducktape::reachability",
+                            event = "advert_refused",
+                            reason = "register_missing_cookie",
+                            source = %from,
+                            key = short_key(key),
+                            occurrences,
+                            "first-seen Register missing a valid return-routability cookie"
+                        );
+                    }
+                    return CoordinatorReplies::new();
+                }
                 // The registered reflexive address IS the observed source: the
                 // coordinator never trusts a self-reported address.
                 let Admission { outcome, event } = self.adverts.lock().observe(key, from, now);
@@ -504,6 +540,17 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, o)), p)
     }
 
+    /// A `Register` carrying a cookie that verifies for `src` at `now` — the
+    /// tests exercise `handle_replies` directly (bypassing the wire auth
+    /// envelope), so they mint against the coordinator's own key rather than
+    /// going through a `BindRequest` round trip.
+    fn reg(c: &Coordinator, key: NodeKey, src: SocketAddr, now: u64) -> Msg {
+        Msg::Register {
+            key,
+            cookie: c.cookie_key.mint(src, now),
+        }
+    }
+
     #[test]
     fn readvertise_supersedes_stale_mapping_and_lookup_reflects_it() {
         let mut c = Coordinator::new();
@@ -511,8 +558,8 @@ mod tests {
         let b_src = addr(2, 2222);
         let a = NodeKey([0xaa; 32]);
         let b = NodeKey([0xbb; 32]);
-        c.handle_verified(a, a_src, Msg::Register { key: a });
-        c.handle_verified(b, b_src, Msg::Register { key: b });
+        c.handle_verified(a, a_src, reg(&c, a, a_src, 0));
+        c.handle_verified(b, b_src, reg(&c, b, b_src, 0));
 
         // A keepalives from its OWN reflexive under a higher nonce.
         assert_eq!(c.readvertise(a, a_src, 1, 0), AdvertOutcome::Superseded);
@@ -577,13 +624,13 @@ mod tests {
 
         // Boot: A registers from its old mapping (implicit nonce 0).
         assert!(
-            c.handle_verified(a, old, Msg::Register { key: a })
+            c.handle_verified(a, old, reg(&c, a, old, 0))
                 .is_empty()
         );
         // B registers from its own source too — a Lookup is only answered to a
         // caller the coordinator has already bound to that source.
         assert!(
-            c.handle_verified(b, b_src, Msg::Register { key: b })
+            c.handle_verified(b, b_src, reg(&c, b, b_src, 0))
                 .is_empty()
         );
 
@@ -625,7 +672,7 @@ mod tests {
         // A duplicated/reordered/replayed Register from the OLD mapping arrives
         // late. It must NOT roll the fresh {old, nonce=1} mapping back to nonce 0.
         assert!(
-            c.handle_verified(a, old, Msg::Register { key: a })
+            c.handle_verified(a, old, reg(&c, a, old, 0))
                 .is_empty()
         );
         let out2 = c.handle_verified(b, b_src, Msg::Lookup { key: a });
@@ -661,7 +708,8 @@ mod tests {
         let src = addr(7, 40000);
         let caller = NodeKey([1u8; 32]);
         let out = c.handle_verified(caller, src, Msg::BindRequest { from: caller });
-        assert_eq!(out, vec![(src, Msg::BindResponse { reflexive: src })]);
+        let cookie = c.cookie_key.mint(src, 0);
+        assert_eq!(out, vec![(src, Msg::BindResponse { reflexive: src, cookie })]);
     }
 
     #[test]
@@ -672,11 +720,11 @@ mod tests {
         let a = NodeKey([0xaa; 32]);
         let b = NodeKey([0xbb; 32]);
         assert!(
-            c.handle_verified(a, a_src, Msg::Register { key: a })
+            c.handle_verified(a, a_src, reg(&c, a, a_src, 0))
                 .is_empty()
         );
         assert!(
-            c.handle_verified(b, b_src, Msg::Register { key: b })
+            c.handle_verified(b, b_src, reg(&c, b, b_src, 0))
                 .is_empty()
         );
 
@@ -714,7 +762,7 @@ mod tests {
         let missing = NodeKey([0xcc; 32]);
         // The caller must be bound to `a_src` before any Lookup is answered.
         assert!(
-            c.handle_verified(a, a_src, Msg::Register { key: a })
+            c.handle_verified(a, a_src, reg(&c, a, a_src, 0))
                 .is_empty()
         );
         let out = c.handle_verified(a, a_src, Msg::Lookup { key: missing });
@@ -749,7 +797,7 @@ mod tests {
         let src = addr(1, 1111);
 
         // Authorized: joiner with a valid genesis cap registers -> mapping created.
-        let reg = Msg::Register { key: subject };
+        let reg = Msg::Register { key: subject, cookie: c.cookie_key.mint(src, now) };
         let cap = mint_coord_cap(&g, subject, now + 3600);
         let auth = sign_authenticator(&node, &reg.encode(), now, Some(cap));
         let out = c.handle_auth(
@@ -794,7 +842,7 @@ mod tests {
         ob.copy_from_slice(outsider.public_key().as_ref());
         let osub = NodeKey(ob);
         let before = c.rejects();
-        let oreg = Msg::Register { key: osub };
+        let oreg = Msg::Register { key: osub, cookie: c.cookie_key.mint(addr(2, 2222), now) };
         let oauth = sign_authenticator(&outsider, &oreg.encode(), now, None);
         let out = c.handle_auth(
             addr(2, 2222),
@@ -911,7 +959,7 @@ mod tests {
         let b_src = addr(2, 2222);
 
         // Both register (self-ops, caller == inner key).
-        let a_reg = Msg::Register { key: a_key };
+        let a_reg = Msg::Register { key: a_key, cookie: c.cookie_key.mint(a_src, now) };
         let a_auth = sign_authenticator(
             &a,
             &a_reg.encode(),
@@ -930,7 +978,7 @@ mod tests {
             )
             .is_empty()
         );
-        let b_reg = Msg::Register { key: b_key };
+        let b_reg = Msg::Register { key: b_key, cookie: c.cookie_key.mint(b_src, now) };
         let b_auth = sign_authenticator(
             &b,
             &b_reg.encode(),
@@ -1026,7 +1074,7 @@ mod tests {
         // Attacker (validly admitted for its OWN key) tries to Register the
         // victim's key. The PoP verifies against the caller, but the inner key
         // is the victim's — a self-op mismatch, rejected before dispatch.
-        let reg = Msg::Register { key: victim_key };
+        let reg = Msg::Register { key: victim_key, cookie: c.cookie_key.mint(src, now) };
         let auth = sign_authenticator(
             &attacker,
             &reg.encode(),
@@ -1052,7 +1100,7 @@ mod tests {
         // The attacker legitimately registers its OWN key from `src` — needed
         // only so the Lookup below is answered at all (a Lookup is refused
         // outright from a caller the book has not bound to its source).
-        let self_reg = Msg::Register { key: attacker_key };
+        let self_reg = Msg::Register { key: attacker_key, cookie: c.cookie_key.mint(src, now) };
         let self_auth = sign_authenticator(
             &attacker,
             &self_reg.encode(),
@@ -1104,11 +1152,11 @@ mod tests {
         let a_src = addr(1, 1111);
         let b_src = addr(2, 2222);
         assert!(
-            c.handle_verified_at(a, a_src, Msg::Register { key: a }, 1_000)
+            c.handle_verified_at(a, a_src, reg(&c, a, a_src, 1_000), 1_000)
                 .is_empty()
         );
         assert!(
-            c.handle_verified_at(b, b_src, Msg::Register { key: b }, 1_000)
+            c.handle_verified_at(b, b_src, reg(&c, b, b_src, 1_000), 1_000)
                 .is_empty()
         );
 
@@ -1116,7 +1164,7 @@ mod tests {
         // (same source, own key) so its Lookup keeps being bound and answered
         // — this test is about A's mapping expiring, not B's.
         assert!(
-            c.handle_verified_at(b, b_src, Msg::Register { key: b }, 1_100)
+            c.handle_verified_at(b, b_src, reg(&c, b, b_src, 1_100), 1_100)
                 .is_empty()
         );
         let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: a }, 1_100);
@@ -1134,7 +1182,7 @@ mod tests {
 
         // Past TTL: honest None, and crucially NO PunchSync toward the dead pinhole.
         assert!(
-            c.handle_verified_at(b, b_src, Msg::Register { key: b }, 1_121)
+            c.handle_verified_at(b, b_src, reg(&c, b, b_src, 1_121), 1_121)
                 .is_empty()
         );
         let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: a }, 1_121);
@@ -1158,7 +1206,7 @@ mod tests {
         let a_src = addr(1, 1111);
         let b_src = addr(2, 2222);
         assert!(
-            c.handle_verified_at(a, a_src, Msg::Register { key: a }, 1_000)
+            c.handle_verified_at(a, a_src, reg(&c, a, a_src, 1_000), 1_000)
                 .is_empty()
         );
         assert!(
@@ -1172,7 +1220,7 @@ mod tests {
         // B registers right before its Lookup — a Lookup is only answered to
         // a caller the book has bound to its source.
         assert!(
-            c.handle_verified_at(b, b_src, Msg::Register { key: b }, 1_300)
+            c.handle_verified_at(b, b_src, reg(&c, b, b_src, 1_300), 1_300)
                 .is_empty()
         );
         let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: a }, 1_300);
@@ -1211,11 +1259,14 @@ mod tests {
         let b_src = addr(2, 2222);
 
         // The victim registers from its own source (nonce-0 baseline, live).
-        let reg = Msg::Register { key: victim };
-        let auth = sign_authenticator(&node, &reg.encode(), now, None);
+        let victim_reg = Msg::Register {
+            key: victim,
+            cookie: c.cookie_key.mint(victim_src, now),
+        };
+        let auth = sign_authenticator(&node, &victim_reg.encode(), now, None);
         let authreq = AuthRequest {
             caller: victim,
-            inner: reg,
+            inner: victim_reg,
             auth,
         };
         assert!(c.handle_auth(victim_src, authreq.clone(), now).is_empty());
@@ -1229,7 +1280,7 @@ mod tests {
         // bound to its source.
         let b = NodeKey([0xbb; 32]);
         assert!(
-            c.handle_verified_at(b, b_src, Msg::Register { key: b }, now)
+            c.handle_verified_at(b, b_src, reg(&c, b, b_src, now), now)
                 .is_empty()
         );
 
@@ -1258,6 +1309,85 @@ mod tests {
     }
 
     #[test]
+    fn first_seen_register_without_cookie_is_refused() {
+        // The reflection issue #1787 closes: one spoofed-source datagram
+        // with no return-routability proof must not plant a mapping for a
+        // key the coordinator has never seen before.
+        let mut c = Coordinator::new();
+        let attacker_key = NodeKey([0x11; 32]);
+        let victim_src = addr(9, 9999);
+        let out = c.handle_verified(
+            attacker_key,
+            victim_src,
+            Msg::Register {
+                key: attacker_key,
+                cookie: [0u8; 32],
+            },
+        );
+        assert!(out.is_empty());
+        assert_eq!(
+            c.adverts().current(attacker_key, 0),
+            None,
+            "no cookie -> no mapping, so the relay resolves nothing for this key either"
+        );
+    }
+
+    #[test]
+    fn first_seen_register_with_wrong_cookie_is_refused() {
+        let mut c = Coordinator::new();
+        let key = NodeKey([0x22; 32]);
+        let src = addr(9, 9999);
+        // A cookie that verifies for a DIFFERENT source is exactly as useless
+        // as no cookie at all.
+        let wrong_cookie = c.cookie_key.mint(addr(1, 1), 0);
+        let out = c.handle_verified(
+            key,
+            src,
+            Msg::Register {
+                key,
+                cookie: wrong_cookie,
+            },
+        );
+        assert!(out.is_empty());
+        assert_eq!(c.adverts().current(key, 0), None);
+    }
+
+    #[test]
+    fn first_seen_register_with_correct_cookie_is_admitted() {
+        let mut c = Coordinator::new();
+        let key = NodeKey([0x33; 32]);
+        let src = addr(9, 9999);
+        let out = c.handle_verified(key, src, reg(&c, key, src, 0));
+        assert!(out.is_empty());
+        assert_eq!(c.adverts().current(key, 0), Some(src));
+    }
+
+    #[test]
+    fn same_source_refresh_needs_no_cookie() {
+        let mut c = Coordinator::new();
+        let key = NodeKey([0x44; 32]);
+        let src = addr(9, 9999);
+        // First-seen registration with a valid cookie establishes the LIVE
+        // mapping.
+        c.handle_verified(key, src, reg(&c, key, src, 0));
+        assert_eq!(c.adverts().current(key, 0), Some(src));
+
+        // A same-source refresh with an all-zero (invalid) cookie must still
+        // succeed: `observe`'s own same-source check is the proof here, not
+        // the cookie.
+        let out = c.handle_verified(
+            key,
+            src,
+            Msg::Register {
+                key,
+                cookie: [0u8; 32],
+            },
+        );
+        assert!(out.is_empty());
+        assert_eq!(c.adverts().current(key, 0), Some(src));
+    }
+
+    #[test]
     fn spoofed_source_lookup_gets_no_reply_and_no_punch_sync() {
         // The reflection this guard closes: a fresh, never-registered caller
         // key riding a datagram whose source is forged to a victim address.
@@ -1274,7 +1404,7 @@ mod tests {
         let victim_src = addr(9, 9999);
 
         assert!(
-            c.handle_verified(member, member_src, Msg::Register { key: member })
+            c.handle_verified(member, member_src, reg(&c, member, member_src, 0))
                 .is_empty()
         );
 
@@ -1297,11 +1427,11 @@ mod tests {
         let peer_src = addr(2, 2222);
 
         assert!(
-            c.handle_verified(caller, caller_src, Msg::Register { key: caller })
+            c.handle_verified(caller, caller_src, reg(&c, caller, caller_src, 0))
                 .is_empty()
         );
         assert!(
-            c.handle_verified(peer, peer_src, Msg::Register { key: peer })
+            c.handle_verified(peer, peer_src, reg(&c, peer, peer_src, 0))
                 .is_empty()
         );
 

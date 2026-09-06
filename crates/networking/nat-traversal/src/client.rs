@@ -196,14 +196,19 @@ impl NatClient {
         self.sock.local_addr()
     }
 
-    pub async fn discover_reflexive(&self) -> std::io::Result<SocketAddr> {
+    /// `BindRequest`/`BindResponse` round trip against `self.coord`: the
+    /// coordinator-observed reflexive AND the return-routability cookie a
+    /// first-seen/expired `Register` must echo (see `auth::CookieKey`).
+    /// `discover_reflexive` and `register` both bottom out here so neither
+    /// duplicates the "only the coordinator's own reply counts" check.
+    async fn bind_cookie(&self) -> std::io::Result<(SocketAddr, [u8; 32])> {
         self.sock
             .send_to(
                 &self.authed(Msg::BindRequest { from: self.key }),
                 self.coord,
             )
             .await?;
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 96];
         loop {
             let (n, from) = self.sock.recv_from(&mut buf).await?;
             // Only the coordinator's own reply is trustworthy: anyone else
@@ -212,10 +217,29 @@ impl NatClient {
             if from != self.coord {
                 continue;
             }
-            if let Ok(Msg::BindResponse { reflexive }) = Msg::decode(&buf[..n]) {
-                return Ok(reflexive);
+            if let Ok(Msg::BindResponse { reflexive, cookie }) = Msg::decode(&buf[..n]) {
+                return Ok((reflexive, cookie));
             }
         }
+    }
+
+    pub async fn discover_reflexive(&self) -> std::io::Result<SocketAddr> {
+        self.bind_cookie().await.map(|(reflexive, _)| reflexive)
+    }
+
+    /// [`Self::bind_cookie`], but never worth blocking [`Self::register`] over:
+    /// a coordinator that never answers `BindRequest` (unreachable, or —
+    /// under `AuthPolicy::Private` — refusing an unadmitted caller) must not
+    /// hang the caller's `register`, which is otherwise a fire-and-forget
+    /// send. `None` on timeout or any transport error; the caller falls back
+    /// to whatever cookie (possibly none) it already has.
+    async fn try_bind_cookie(&self) -> Option<[u8; 32]> {
+        const AUTO_BIND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+        tokio::time::timeout(AUTO_BIND_TIMEOUT, self.bind_cookie())
+            .await
+            .ok()?
+            .ok()
+            .map(|(_, cookie)| cookie)
     }
 
     /// Discover this node's reflexive address, trying each coordinator hint in
@@ -256,7 +280,7 @@ impl NatClient {
                     if from != c {
                         continue;
                     }
-                    if let Ok(Msg::BindResponse { reflexive }) = Msg::decode(&buf[..n]) {
+                    if let Ok(Msg::BindResponse { reflexive, .. }) = Msg::decode(&buf[..n]) {
                         return Ok::<SocketAddr, std::io::Error>(reflexive);
                     }
                 }
@@ -277,9 +301,25 @@ impl NatClient {
         ))
     }
 
+    /// Register this node's reflexive with the coordinator. A first-seen (or
+    /// expired) registration needs a return-routability cookie, so this
+    /// mints a fresh one with a bounded bind round trip first — bounded,
+    /// because `register` is otherwise fire-and-forget (it never used to
+    /// wait for anything), and a coordinator that never answers `BindRequest`
+    /// (unreachable, or refusing an unadmitted caller under
+    /// `AuthPolicy::Private`) must not turn that into an indefinite hang. A
+    /// same-source refresh of an already-live mapping ignores the cookie
+    /// entirely, so a timed-out bind costs that registration nothing.
     pub async fn register(&self) -> std::io::Result<()> {
+        let cookie = self.try_bind_cookie().await.unwrap_or([0u8; 32]);
         self.sock
-            .send_to(&self.authed(Msg::Register { key: self.key }), self.coord)
+            .send_to(
+                &self.authed(Msg::Register {
+                    key: self.key,
+                    cookie,
+                }),
+                self.coord,
+            )
             .await?;
         Ok(())
     }
@@ -405,7 +445,7 @@ impl NatClient {
             };
             let from_coord = from == self.coord;
             match msg {
-                Msg::BindResponse { reflexive } if from_coord => {
+                Msg::BindResponse { reflexive, .. } if from_coord => {
                     return Ok(SocketEvent::Rendezvous(ClientEvent::BindResponse {
                         reflexive,
                     }));
@@ -1366,7 +1406,11 @@ mod tests {
         let forged = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 5555);
         forger
             .send_to(
-                &Msg::BindResponse { reflexive: forged }.encode(),
+                &Msg::BindResponse {
+                    reflexive: forged,
+                    cookie: [0u8; 32],
+                }
+                .encode(),
                 client_dst,
             )
             .await
@@ -1879,6 +1923,7 @@ mod tests {
             .send_to(
                 &Msg::BindResponse {
                     reflexive: client_addr,
+                    cookie: [0u8; 32],
                 }
                 .encode(),
                 client_addr,

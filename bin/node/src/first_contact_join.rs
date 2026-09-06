@@ -1488,10 +1488,33 @@ mod tests {
         let mut coordinator =
             nat_traversal::Coordinator::with_policy(nat_traversal::AuthPolicy::Public);
         let member_node_key = reachability::node_key(reachability::identity_of(&member_key));
+        let now = nat_traversal::now_secs();
+        // A first-seen `Register` needs the return-routability cookie the
+        // coordinator hands out in `BindResponse` — the honest client's own
+        // boot sequence, done by hand here since this rig drives the
+        // coordinator directly rather than through `nat_traversal::NatClient`.
+        let bind = nat_traversal::Msg::BindRequest {
+            from: member_node_key,
+        };
+        let bind_auth =
+            nat_traversal::sign_authenticator(&member_signer, &bind.encode(), now, None);
+        let bind_out = coordinator.handle_auth(
+            member_addr,
+            nat_traversal::AuthRequest {
+                caller: member_node_key,
+                inner: bind,
+                auth: bind_auth,
+            },
+            now,
+        );
+        let cookie = match bind_out.as_slice() {
+            [(_, nat_traversal::Msg::BindResponse { cookie, .. })] => *cookie,
+            other => panic!("expected exactly one BindResponse, got {other:?}"),
+        };
         let register = nat_traversal::Msg::Register {
             key: member_node_key,
+            cookie,
         };
-        let now = nat_traversal::now_secs();
         let auth = nat_traversal::sign_authenticator(&member_signer, &register.encode(), now, None);
         coordinator.handle_auth(
             member_addr,
