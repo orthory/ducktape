@@ -197,6 +197,7 @@ mod tests {
             floor_cert: None,
             entries: vec![],
             applied_frames: vec![],
+            pending_cutover_view: None,
         }
     }
 

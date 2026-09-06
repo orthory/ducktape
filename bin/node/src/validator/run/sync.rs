@@ -111,6 +111,13 @@ impl ValidatorRuntime<'_> {
                             .collect(),
                         None => Vec::new(),
                     },
+                    // this orchestrator's own armed cutover, if any — a seat
+                    // built from this boundary resumes with the SAME ceiling
+                    // instead of observing the already-changed valset itself
+                    // and arming a later one (#1821).
+                    pending_cutover_view: orchestrator
+                        .pending_cutover()
+                        .map(|cutover| cutover.cutover_view()),
                 };
                 let finalized_for_sync = node
                     .finalized()

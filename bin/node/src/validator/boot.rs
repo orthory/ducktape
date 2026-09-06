@@ -326,7 +326,9 @@ where
     let mut attempts = 0u32;
     let mut answers = Vec::new();
     loop {
-        let answer = statesync::fetch_frames(client, floor, floor + 1).await;
+        let answer =
+            statesync::fetch_frames_capped(client, floor, floor + 1, statesync::MAX_CATCHUP_BYTES)
+                .await;
         attempts += 1;
         let mesh_not_up_yet = matches!(answer, Err(statesync::SyncError::Transport(_)));
         let reports_a_gap = gap_retained_from(&answer).is_some();
@@ -685,10 +687,12 @@ where
         member_keys,
         participants,
         resume_epoch: boundary.epoch,
-        // the checkpoint just written arms no cutover, and it is now the
-        // journal's base — there is no pre-checkpoint block left to derive
-        // one from.
-        pending_boot: None,
+        // the checkpoint just written arms no cutover of its OWN — the
+        // journal's new base has no pre-checkpoint block to derive one from
+        // — but the serving validator's own armed cutover rides the
+        // boundary, and this seat must stop at the same ceiling it stops at
+        // (#1821).
+        pending_boot: boundary.pending_cutover_view,
     }
 }
 
@@ -941,6 +945,7 @@ mod tests {
             floor_cert: Some(vec![9; 8]),
             entries: Vec::new(),
             applied_frames: vec![(8_190, [0xA1; 32]), (8_192, [0xA2; 32])],
+            pending_cutover_view: Some(8_195),
         };
         let rec = synced_recovered(&boundary);
         assert_eq!(rec.height, Some(8_192));
@@ -961,5 +966,44 @@ mod tests {
         assert_eq!(rec.applied, 0);
         assert_eq!(rec.skipped, 0);
         assert!(!rec.rolled_forward);
+    }
+
+    /// #1821: a served manifest carrying an armed cutover seats an
+    /// orchestrator whose ceiling matches it — no drain required. this is
+    /// the exact wiring `catch_up`'s `Seat.pending_boot` and
+    /// `engine::resume`'s `ValsetOrchestrator::resume` share; a seat that
+    /// instead resumed with `None` would observe the already-changed valset
+    /// on its own first drain and arm a LATER ceiling than every peer did.
+    #[test]
+    fn a_served_pending_cutover_seats_the_orchestrator_ceiling_with_no_drain() {
+        let boundary = statesync::Manifest {
+            height: 100,
+            root_hash: sdk::StateRoot([1; 32]),
+            epoch: 2,
+            view_base: 90,
+            participants: vec![vec![1; 32], vec![2; 32]],
+            residents: Vec::new(),
+            floor_cert: None,
+            entries: Vec::new(),
+            applied_frames: Vec::new(),
+            pending_cutover_view: Some(13),
+        };
+        let member_keys: Vec<ed25519::PublicKey> = boundary
+            .participants
+            .iter()
+            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+            .collect();
+        let orchestrator = consensus::ValsetOrchestrator::resume(
+            crate::constants::CUTOVER_DELAY,
+            member_keys,
+            Vec::new(),
+            boundary.epoch,
+            boundary.view_base,
+            boundary.pending_cutover_view,
+        );
+        let cutover = orchestrator
+            .pending_cutover()
+            .expect("the served cutover re-arms without any drain");
+        assert_eq!(cutover.cutover_view(), 13);
     }
 }
