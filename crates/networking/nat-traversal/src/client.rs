@@ -1148,10 +1148,43 @@ mod tests {
             inner,
         }
         .encode_inline();
+        // Comfortably over the 4-worker bounded window (`AUTH_QUEUE_DEPTH` *
+        // workers, see `run_coordinator_workers_with_metrics`) so the flood
+        // still saturates it, without paying for 5000 ed25519 verifications
+        // the assertions never needed.
+        const FLOOD_SIZE: u64 = 1024;
         let flood = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        for _ in 0..5_000 {
+        for _ in 0..FLOOD_SIZE {
             flood.send_to(&forged, coord_addr).await.unwrap();
         }
+
+        // Wait for the coordinator's OWN signal that the flood is drained,
+        // before sending anything valid. A back-to-back burst this size can
+        // outrun the destination socket's receive buffer even on loopback —
+        // some datagrams are legitimately dropped by the kernel before the
+        // coordinator ever reads them — so this waits for the received
+        // counter to stop growing (nothing left buffered) with nothing left
+        // inflight, rather than an exact count the flood may never reach.
+        let drained = timeout(Duration::from_secs(10), async {
+            let mut last_received = metrics.snapshot().received;
+            loop {
+                tokio::task::yield_now().await;
+                let snapshot = metrics.snapshot();
+                let quiesced = snapshot.inflight == 0 && snapshot.received == last_received;
+                last_received = snapshot.received;
+                if quiesced {
+                    break snapshot;
+                }
+            }
+        })
+        .await
+        .expect("coordinator drains the flood");
+        assert!(drained.received > 0, "flood reached the coordinator");
+        assert_eq!(
+            drained.rejected, drained.received,
+            "every forged datagram the coordinator received must be rejected"
+        );
+        assert!(drained.saturated != 0, "flood reached the bounded window");
 
         let valid_signer = ed25519::PrivateKey::from_seed(912);
         let valid_key = {
@@ -1162,35 +1195,14 @@ mod tests {
         let valid = NatClient::bind(valid_key, vec![coord_addr], valid_signer, None)
             .await
             .unwrap();
-        timeout(Duration::from_secs(5), async {
-            loop {
-                if timeout(Duration::from_millis(100), valid.discover_reflexive())
-                    .await
-                    .is_ok_and(|result| result.is_ok())
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("valid requests recover after the flood");
+        timeout(Duration::from_secs(5), valid.discover_reflexive())
+            .await
+            .expect("valid requests recover after the flood")
+            .expect("discover_reflexive succeeds against a drained coordinator");
 
-        timeout(Duration::from_secs(5), async {
-            loop {
-                let snapshot = metrics.snapshot();
-                if snapshot.rejected != 0 && snapshot.inflight == 0 {
-                    break snapshot;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .map(|snapshot| {
-            assert!(snapshot.authenticated != 0);
-            assert!(snapshot.replies != 0);
-            assert!(snapshot.saturated != 0, "flood reached the bounded window");
-        })
-        .expect("coordinator drains its bounded queue after overload");
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.authenticated != 0);
+        assert!(snapshot.replies != 0);
 
         coordinator.abort();
         let _ = coordinator.await;
