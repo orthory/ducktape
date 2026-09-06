@@ -670,10 +670,6 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                     // height its content needs (still capped by the box's
                     // limits, so a long timeline scrolls exactly as before) and
                     // `align-y=end` drops that block onto the composer.
-                    // THE INSET THE FLOATING HUDDLE COSTS. The stream is
-                    // bottom-anchored, so this is what lifts its newest rows
-                    // clear of the card in the corner instead of leaving them
-                    // behind it. Zero when there is no card.
                     box
                       with
                         w=fill
