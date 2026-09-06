@@ -8,10 +8,13 @@
 //! socket; the door consumes the token, re-checking the `Origin`.
 //!
 //! Security properties (audit S3): a token is single-use, short-lived, and
-//! bound to the exact origin that minted it. A local process that guesses or
-//! steals a token still cannot use it without also presenting the bound origin,
-//! and a token is destroyed the instant it is consumed (or found expired), so a
-//! race between two upgrades cannot reuse one.
+//! bound to the exact origin the mint route derived from the request's own
+//! `Origin`/`x-duck-authority` headers (never from the request body — see
+//! `gateway_ws_token_mint` in `gateway_http.rs`). A local process that guesses
+//! or steals a token still cannot use it without also presenting that exact
+//! bound origin on the handshake, and a token is destroyed the instant it is
+//! consumed (or found expired), so a race between two upgrades cannot reuse
+//! one.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -79,12 +82,12 @@ impl WsTokenStore {
         if entry.expires_at <= Instant::now() {
             return None;
         }
-        // CEF serializes a custom-scheme page's origin as the literal "null"
-        // on WebSocket handshakes, so the exact pin cannot hold for the very
-        // browser this door serves. Accept that serialization: the mint is
-        // already same-origin-gated at the trusted duck:// scheme handler, and
-        // single-use + TTL + token secrecy remain the transport defense.
-        if entry.origin != origin && origin != "null" {
+        // Exact match only. "null" is a valid bound origin like any other
+        // (the mint pins whatever request.origin resolved to), but it is
+        // never a wildcard: a handshake sending literal "null" matches only a
+        // token minted for that literal string, which the mint never issues
+        // for a real caller.
+        if entry.origin != origin {
             return None;
         }
         Some(WsGrant {
