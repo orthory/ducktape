@@ -90,12 +90,13 @@ routes (a network-hosted DuckFS site and a user-hosted loopback app).
 ## Wasm guests
 
 - `wasm-repro-check.sh` (`make wasm-repro-check`) — builds one guest component
-  from this checkout and from a copy of the tree at a different absolute path
-  and asserts the bytes are identical, so a committed artifact never depends on
-  the builder's `/home/...`. Needs the wasm32 target and `wasm-tools`.
-- `make wasm-index-check` — the other reproducibility gate, a Makefile target
-  with no script here: it rebuilds each committed `index.wasm` from its source
-  and cmps it against the bytes in the tree. Also needs the wasm32 target.
+  twice, in two scratch directories, and asserts the bytes are identical and
+  carry no host path, so a committed artifact never depends on the builder's
+  `/home/...`. Needs the wasm32 target, `wasm-tools` and a pushed HEAD.
+- `make wasm-rebuild-check` — the other reproducibility gate, a Makefile target
+  with no script here: it rebuilds every committed guest (each `component.wasm`
+  and `index.wasm`) out of the repository at HEAD and cmps it against the bytes
+  in the tree, and refuses a moved `guest.lock`. Same needs.
 - `make audit` — the third out-of-band gate: `cargo deny check advisories` over
   the committed `Cargo.lock`, under the repo-root `deny.toml` where every
   carried advisory names why it is carried and what clears it. Needs `cargo

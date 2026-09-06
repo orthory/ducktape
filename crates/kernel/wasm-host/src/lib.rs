@@ -53,7 +53,7 @@ use sdk::{
 mod bindings {
     wasmtime::component::bindgen!({
         world: "module",
-        path: "../module-guest/wit",
+        path: "../../module-sdk/wit",
         // these imports may TRAP: a read the per-dispatch memo cannot answer
         // pauses the run (deterministically — same point on every validator),
         // the async wrapper resolves it (sibling reads through the host `Ctx`,

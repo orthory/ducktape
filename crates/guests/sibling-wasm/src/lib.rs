@@ -5,7 +5,7 @@
 
 wit_bindgen::generate!({
     world: "module",
-    path: "../../kernel/module-guest/wit",
+    path: "../../module-sdk/wit",
 });
 
 use ducktape::module::host;

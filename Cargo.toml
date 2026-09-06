@@ -11,8 +11,11 @@
 #                      consensus (BFT orderer), statesync, recovery, indexer,
 #                      blobstore (node-local receipt-lane byte store — like
 #                      indexer, never in any root), wasm-host (runs a
-#                      ducktape:module component as a native sdk::Module),
-#                      module-guest (that world's WIT definition)
+#                      ducktape:module component as a native sdk::Module)
+#   crates/module-sdk/ — the module SDK, the one crate a wasm module pins by
+#                      git revision: the ducktape:module WIT world, the
+#                      bindings + adapter every port shares, `sdk` re-exported,
+#                      and the wasm32 patch crates (stubs/) a guest graph needs
 #   crates/networking/ — the netstack: transport infra ONLY (wireguard,
 #                      nat-traversal, netstack-machine [the sans-I/O
 #                      reachability decision core, its ducktape:netstack
@@ -55,13 +58,12 @@
 #                      than under the one module that happens to wrap it
 #   crates/duckfs/   — the versioned-filesystem engine: core (pure, wasm-ready
 #                      — the `files` module wraps it), disk, client (OS-side)
-#   crates/guests/   — shared wasm-port infra ONLY: guest-adapter (the
-#                      ducktape:module world binding every port shares), the
-#                      wasm32 dep stubs, and the kernel-fixture test guests
-#                      (hello, hello-replacement, sibling, object). every module
-#                      carries its OWN port (src/guest.rs behind the `guest`
-#                      feature) and bin/guest-builder synthesizes the
-#                      packaging — no per-module crate lives here
+#   crates/guests/   — the kernel-fixture test guests ONLY (hello,
+#                      hello-replacement, noop, sibling, object), standalone
+#                      workspaces over the raw WIT world. every module carries
+#                      its OWN port (src/guest.rs behind the `guest` feature)
+#                      and bin/guest-builder builds it out of this repository
+#                      at a revision — no per-module crate lives here
 #   crates/examples/ — reference modules: directory (the first wasm port; a test
 #                      tenant, in no genesis set), greeter (the types-only
 #                      composition example)
@@ -195,7 +197,7 @@ members = [
 # labs is a standalone crate (its own [workspace] + Cargo.lock), NOT a member:
 # its quarantined evm/multisig deps (revm, alloy) must never enter — or slow —
 # the shipping workspace build. It stays in-tree and is gated via `make labs-gate`.
-exclude = ["crates/labs", "crates/guests/guest-adapter"]
+exclude = ["crates/labs", "crates/module-sdk"]
 
 [workspace.package]
 edition = "2024"
@@ -315,6 +317,9 @@ wit-bindgen = "0.57"
 
 # internal — kernel crates (the platform)
 sdk = { path = "crates/kernel/sdk" }
+# the module SDK a guest port compiles against. wasm-only: every module's
+# `guest` feature turns it on, and only guest-builder's shell workspace does.
+ducktape-module-sdk = { path = "crates/module-sdk" }
 keyscheme = { path = "crates/kernel/keyscheme" }
 # dev-only shared test doubles for the sdk boundary traits (TestCtx +
 # in-memory MerkleStore). MAY ONLY appear in `[dev-dependencies]` of consumers —

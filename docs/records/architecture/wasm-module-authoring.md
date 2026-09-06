@@ -2,7 +2,8 @@
 
 How to write, build, and live-update a Ducktape wasm module. The runtime is
 `crates/kernel/wasm-host` (wasmtime, pinned `=46.0.3`); the authoring contract is
-the `ducktape:module` WIT world (`crates/kernel/module-guest/wit/module.wit`);
+the `ducktape:module` WIT world (`crates/module-sdk/wit/module.wit`, inside the
+module SDK a module pins by git revision, `crates/module-sdk`);
 the reference modules are `crates/guests/noop-wasm` (the smallest compliant
 module: two exports, no state, every op a no-op — the template a new module
 starts from and the admission fixture that touches nothing),
@@ -59,7 +60,7 @@ Implement the three exports:
   regardless of caller). A pure constant of the code: the host reads it once
   from the bytes on every path a module enters a host — genesis, a registry
   admission, a reopen, a code swap — before wrapping them over a substrate,
-  and refuses a backing other than the declared one. `guest_adapter` names
+  and refuses a backing other than the declared one. `ducktape_module_sdk` names
   the three plain shapes (`store_shape()`, `map_shape()`, `odb_shape()`);
   a network-bound module sets `config` on top.
 - `execute(payload) -> result<_, error>` — apply one op addressed to this
@@ -110,31 +111,93 @@ replacement reads the exact same keys and value encodings:
 - `hello-wasm-replacement` demonstrates the discipline: same `count` key, same
   little-endian `u64` value, different logic (`inc` steps 100, not 1).
 
-## Build: crate → component
+## Build: a module is built alone, out of a repository at a revision
 
-Guest crates are standalone workspaces (never members of the root workspace)
-building to `wasm32-unknown-unknown`, componentized with `wasm-tools`:
+A module's build inputs are its own source, one revision of the platform (the
+module SDK `crates/module-sdk`, plus any sibling's wire types it reads), its
+lock, and the toolchain `rust-toolchain.toml` pins — nothing else. The network
+takes the result by hash. A module in this tree and a module in its own
+repository are built the same way; only who writes the shell differs.
+
+### In-tree modules
+
+`bin/guest-builder` builds one module out of the platform repository
+(`https://github.com/orthory/ducktape`) at a revision — the checkout's HEAD by
+default, so push first — and never out of the checkout in place: it synthesizes
+a shell workspace under `target/guest-builder/<id>/` whose one dependency is
+the module (its `guest` feature on) as a git source, pins the revision in the
+shell lock, builds for `wasm32-unknown-unknown`, componentizes with
+`wasm-tools`, and writes `component.wasm` and `guest.lock` into the module
+directory. The lock is the record of the build (the revision, every registry
+version) and the seed of the next one. A module edited but not committed is
+refused, since the build would compile HEAD instead.
 
 ```
-make wasm-modules        # rebuild every guest module + refresh ALL committed copies
-make wasm-modules-check  # the drift gate: every committed copy is byte-identical
+make wasm-modules        # rebuild every guest + refresh ALL committed copies
+make wasm-modules-check  # every committed copy is byte-identical, every guest has its lock
+make wasm-rebuild-check  # every artifact matches a rebuild of its source at HEAD
+make wasm-repro-check    # one guest, two scratch dirs: identical bytes, no host path
 ```
 
-One-off equivalent, per crate:
+One module: `cargo run -p guest-builder -- crates/modules/<plane>/<id>`
+(`--index` for its index guest, `--rev <sha>` for a revision other than HEAD).
 
-```
-cd crates/guests/hello-wasm
-cargo build --target wasm32-unknown-unknown --release
-wasm-tools component new target/wasm32-unknown-unknown/release/hello_wasm.wasm -o component.wasm
-```
+Bytes are stable across revisions that change nothing the module compiles:
+the shell names the module by git source alone and the revision lives in the
+lock, which is not hashed into symbol names. They are identical from any box:
+the unpacked revision, the cargo home, the rustup home and the scratch are
+remapped to fixed tokens. They are toolchain-dependent: a rebuild on another
+rustc may legitimately differ, so a channel move rebuilds the whole set and
+commits it as one change.
 
 The committed copies of one module's component MUST stay byte-identical
 (nothing is embedded: the founder bundles the canonical artifact and the
 descriptor commits its sha256 as the genesis-seeded active hash; the kernel
-test fixtures — the node pins' bundle — carry the same bytes). Component bytes are
-toolchain-dependent, so `wasm-modules-check` gates mutual consistency, not
-reproducibility; refresh the whole set together with `make wasm-modules` and
-commit it as one change. The check rides the pre-push `make test` gate.
+test fixtures — the node pins' bundle — carry the same bytes).
+`wasm-modules-check` gates that and rides the pre-push `make test` gate;
+`wasm-rebuild-check` gates the artifact against its source and needs the wasm32
+target, `wasm-tools` and a pushed HEAD.
+
+### Out-of-tree modules
+
+A module authored in its own repository is a cdylib crate over the SDK, pinned
+by git revision, built with plain cargo. The manifest:
+
+```toml
+[package]
+name = "example-module"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ducktape-module-sdk = { git = "https://github.com/orthory/ducktape", rev = "<sha>" }
+
+# the wasm32 patch set every guest graph needs (crates/module-sdk/stubs at the
+# same revision): deterministic getrandom refusals, a C-free blst.
+[patch.crates-io]
+getrandom-02 = { package = "getrandom", version = "0.2", git = "https://github.com/orthory/ducktape", rev = "<sha>" }
+getrandom-03 = { package = "getrandom", version = "0.3", git = "https://github.com/orthory/ducktape", rev = "<sha>" }
+getrandom-04 = { package = "getrandom", version = "0.4", git = "https://github.com/orthory/ducktape", rev = "<sha>" }
+blst = { git = "https://github.com/orthory/ducktape", rev = "<sha>" }
+```
+
+`src/lib.rs` is the guest itself: `ducktape_module_sdk::store_guest!` (or
+`snapshot_guest!`) over the crate's `sdk::Module` impl, or a hand-written
+`Guest` + `ducktape_module_sdk::export_module!`; the module contract is
+`ducktape_module_sdk::sdk`. Build and componentize:
+
+```
+cargo build --target wasm32-unknown-unknown --release
+wasm-tools component new target/wasm32-unknown-unknown/release/example_module.wasm -o component.wasm
+```
+
+Every platform crate the module reads must come from that ONE revision: a
+sibling's wire types pinned at another revision bring a second `sdk`, and the
+types no longer match. Hand the result to `ducktape module register <id>
+component.wasm`; the network verifies the bytes by hash.
 
 ## Live update: how new code ships
 

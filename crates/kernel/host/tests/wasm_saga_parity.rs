@@ -1,6 +1,6 @@
 //! the STORE-BACKED cutover-continuity proof for the saga ledger: the `saga`
 //! guest component (the NATIVE `saga` crate compiled to wasm behind
-//! `guest-adapter`) over `WasmModule::with_store(QmdbStore)` and the native
+//! `ducktape-module-sdk`) over `WasmModule::with_store(QmdbStore)` and the native
 //! `SagaModule` over the same store shape are ROOT-CONTINUOUS — the same op
 //! sequence commits the IDENTICAL qmdb merkle root after every block, not
 //! merely lockstep-moving distinct roots. both roots ARE the store's root;

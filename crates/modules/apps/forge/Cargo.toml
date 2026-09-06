@@ -13,9 +13,9 @@ default = ["native"]
 # the wasm tenant, snapshot packing, and materialization.
 native = ["dep:git2", "dep:blobstore", "dep:tracing", "dep:wasm-host"]
 # the wasm-guest port: the pure `ForgeState` core over the host state lane +
-# object plane. non-default and wasm-only (the guest-adapter bindings compile
+# object plane. non-default and wasm-only (the ducktape-module-sdk bindings compile
 # only for wasm32-unknown-unknown).
-guest = ["dep:guest-adapter"]
+guest = ["dep:ducktape-module-sdk"]
 # the git-history/packfile builder (`forge::testkit`). no extra deps beyond
 # the substrate, but gating keeps it out of the shipped binary, exactly as
 # identity/noded do with theirs.
@@ -57,7 +57,7 @@ wasm-host = { workspace = true, optional = true }
 # wasm-only, behind `guest`: the port harness (WitCtx / host imports). a
 # standalone-workspace path crate, pulled only when the `guest` feature builds
 # for wasm32 — never by the native gate.
-guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
+ducktape-module-sdk = { workspace = true, optional = true }
 
 [dev-dependencies]
 # forge's OWN integration tests need `forge::testkit`, and a crate does not

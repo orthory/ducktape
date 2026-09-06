@@ -44,10 +44,11 @@ starts fresh and is rebuilt by replay (`seat_at`, unit-pinned in
 
 The CLI stages bytes, it never builds them: the component still comes from
 `make wasm-modules` / `guest-builder` (§2). A module written outside this
-tree needs none of that: `crates/guests/noop-wasm` is the whole contract —
-a standalone crate against the `ducktape:module` WIT world, built with
-`cargo build --target wasm32-unknown-unknown --release` and `wasm-tools
-component new`, then handed to `module register`.
+tree needs none of that: it is a cdylib crate pinning `ducktape-module-sdk`
+(`crates/module-sdk`) by git revision, built with `cargo build --target
+wasm32-unknown-unknown --release` and `wasm-tools component new`, then handed
+to `module register` — the manifest and recipe are in
+`docs/records/architecture/wasm-module-authoring.md` ("Out-of-tree modules").
 Experiments that shouldn't pay the genesis cost live unwired in `crates/labs`.
 
 ## 1. Native crate — `crates/modules/{apps|system}/<id>`
@@ -62,26 +63,31 @@ Clone the `tasks` shape:
 - Native-only deps (media engines, unix IO, tokio) must sit behind a `native`
   feature or be absent — the guest builds compile this same crate to wasm32.
 
-## 2. Wasm guest — `src/guest.rs` in the module crate, packaged by guest-builder
+## 2. Wasm guest — `src/guest.rs` in the module crate, built by guest-builder
 
 The module carries its OWN port (the `tasks`/`chat`/`files` shape): a
-`src/guest.rs` behind a wasm-only `guest = ["dep:guest-adapter"]` feature —
-the doc header, the id consts, and ONE dispatch-shell macro
-(`guest_adapter::snapshot_guest!` for whole-state `SnapshotBytes` modules,
-`store_guest!` for store-backed ones, or a hand-written `Guest` impl +
-`export_module!` for odd tenants like files). Each macro takes the
+`src/guest.rs` behind a wasm-only `guest = ["dep:ducktape-module-sdk"]`
+feature — the doc header, the id consts, and ONE dispatch-shell macro
+(`ducktape_module_sdk::snapshot_guest!` for whole-state `SnapshotBytes`
+modules, `store_guest!` for store-backed ones, or a hand-written `Guest` impl
++ `export_module!` for odd tenants like files). Each macro takes the
 component's `shape:` — the host learns everything it needs to run the
 module from the `shape` export, never from a table: `store_shape()` /
 `map_shape()` / `odb_shape()`, with `config: vec![CHAIN_ID.into()]` (or
 `INVITE`) on top for a network-bound module and `committed_queries: true`
 for a committed-only query lane. `#[cfg(feature = "guest")] mod guest;` in
-lib.rs. No packaging crate is checked in: `bin/guest-builder` synthesizes
-the ephemeral cdylib workspace (wasm32 dep resolution + the getrandom/blst
-patch set, isolated from the host workspace) and writes the canonical
-COMMITTED `component.wasm` into the module directory.
+lib.rs. No packaging crate is checked in: `bin/guest-builder` builds the
+module ALONE, out of the platform repository at the checkout's HEAD (so
+push first — an uncommitted edit to the module is refused, an unpushed HEAD
+fails to fetch), through an ephemeral shell workspace under
+`target/guest-builder/<id>/`, and writes the canonical COMMITTED
+`component.wasm` and `guest.lock` (the revision and every registry version
+the artifact came from; the seed of the next build) into the module
+directory. Bytes move only when something the module compiles moves.
 
 `Makefile`: add the module to `BUILDER_MODULES` — that one entry covers the
-build, the fixture `cp`, and the `wasm-modules-check` `cmp`.
+build, the fixture `cp`, and the `wasm-modules-check` / `wasm-rebuild-check`
+`cmp`s.
 
 ## 2b. Index guest (optional) — the module's derived-tier mapper
 
@@ -145,13 +151,14 @@ membership pins and `host_state.rs`'s `GENESIS_ROOT_HASH` in the SAME commit
 
 ```
 cargo test -p <id>                                        # 1. native logic
-cargo run -p guest-builder -- crates/modules/<plane>/<id> # 2. catches native-dep leaks
-make wasm-modules                                         # 3. BEFORE the node pins run —
+git push                                                  # 2. the guest build reads HEAD out of the repository
+cargo run -p guest-builder -- crates/modules/<plane>/<id> # 3. catches native-dep leaks
+make wasm-modules                                         # 4. BEFORE the node pins run —
                                                           #    the fixtures dir needs the artifact
-cargo check --workspace --all-targets                     # 4. registry parity test gates
+cargo check --workspace --all-targets                     # 5. registry parity test gates
 cargo clippy -p <id> --tests --no-deps                    #    topology↔composed-host drift
-make wasm-modules-check                                   # 5. committed copies byte-identical
-make wasm-index-check                                     # 6. index guests match a rebuild (needs wasm32)
+make wasm-modules-check                                   # 6. committed copies byte-identical, locks present
+make wasm-rebuild-check                                   # 7. every guest matches a rebuild of its source (needs wasm32)
 ```
 
 ## Common mistakes
@@ -162,5 +169,6 @@ make wasm-index-check                                     # 6. index guests matc
 | Topology pins or `GENESIS_ROOT_HASH` left stale after adding/removing a module | `cargo test -p topology` and the root-hash pin fail; update both in the same commit |
 | Guest added to root workspace members | guests are standalone BY DESIGN; membership poisons native feature unification |
 | Node pins run before `make wasm-modules` | the fixtures dir lacks the component; `hash_bundle` refuses by name |
-| Rebuilding one guest's component alone | bytes are toolchain-dependent; refresh the set together or `wasm-modules-check` fails |
+| Building a guest before pushing | guest-builder reads the module out of the repository at HEAD: an unpushed HEAD fails to fetch, an uncommitted edit is refused. Commit, push, then build |
+| Moving the rust channel for one guest | bytes are toolchain-dependent; a channel move rebuilds the whole set (`make wasm-modules`) and commits it as one change |
 | Native-only dep in the module crate | wasm32 build breaks; gate it behind the `native` feature (the `files` shape) |

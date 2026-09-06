@@ -14,9 +14,9 @@ version.workspace = true
 # drives but never depends on.
 [features]
 # the wasm consensus port (src/guest.rs): the store-backed dispatch shell over
-# guest-adapter. non-default and wasm-only — enabled solely by the
+# ducktape-module-sdk. non-default and wasm-only — enabled solely by the
 # guest-builder's synthesized cdylib workspace, never by the native gate.
-guest = ["dep:guest-adapter"]
+guest = ["dep:ducktape-module-sdk"]
 # the wasm index mapper shell (src/index_guest.rs): wires the pure index core
 # into the fluent31 engine. wasm-only — enabled solely by
 # `guest-builder --index`.
@@ -27,7 +27,7 @@ sdk = { workspace = true }
 # wasm-only, behind `guest`: the port harness (WitStore / WitCtx / host
 # imports / the dispatch-shell macros). a standalone-workspace path crate,
 # pulled only when the guest build compiles this crate for wasm32.
-guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
+ducktape-module-sdk = { workspace = true, optional = true }
 # the index CONTRACT (op-row envelope + the pure StateRead/Writes kit) — not
 # the engine: the default surface is pure types, wasm32-clean, and is all the
 # native build sees. the engine shell rides the `index-guest` feature.

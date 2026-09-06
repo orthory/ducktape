@@ -26,7 +26,7 @@ The tree groups by function into three layers — module / kernel / networking:
 
 | Path | Contents |
 | --- | --- |
-| `crates/kernel/` | The platform: `sdk` (module contract + codec), `sdk-testkit` (dev-only `TestCtx`/`MemStore` doubles for the sdk traits), `host` (submit/execute loop, root-hash composition, the `host::worker` non-deterministic-effect seam), `node` (ordered replication), `consensus` (commonware Simplex BFT orderer), `statesync`, `recovery`, `indexer` (derived read-model tier), `index-guest` (the index-mapper guest contract the indexer and per-module mappers share), `blobstore` (node-local op-receipt byte store — like `indexer`, never in any root), `wasm-host` (pinned wasmtime runtime for hot-swappable module components), `module-guest` (the `ducktape:module` WIT world every wasm module implements), `keyscheme` (the closed set of signature schemes a ducktape key can carry, and the one verifier every signed artifact dispatches through) |
+| `crates/kernel/` | The platform: `sdk` (module contract + codec), `sdk-testkit` (dev-only `TestCtx`/`MemStore` doubles for the sdk traits), `host` (submit/execute loop, root-hash composition, the `host::worker` non-deterministic-effect seam), `node` (ordered replication), `consensus` (commonware Simplex BFT orderer), `statesync`, `recovery`, `indexer` (derived read-model tier), `index-guest` (the index-mapper guest contract the indexer and per-module mappers share), `blobstore` (node-local op-receipt byte store — like `indexer`, never in any root), `wasm-host` (pinned wasmtime runtime for hot-swappable module components), `keyscheme` (the closed set of signature schemes a ducktape key can carry, and the one verifier every signed artifact dispatches through) |
 | `crates/networking/` | The netstack: host-side transport infra only — `wireguard`, `nat-traversal`, `reachability`, `data-plane`, `overlay-net`, plus the sans-I/O reachability core `netstack-machine` (pure event-in/effects-out state machine), `netstack-scenarios` (its frozen golden lifecycle traces) and `netstack-wasm` (the wasmtime embedding of the `ducktape:netstack` world). Owns no consensus module |
 | `crates/modules/` | **Consensus modules and nothing else** — every crate under `system/` or `apps/` implements `sdk::Module`. Module = onchain, service = offchain; a crate that holds no consensus state belongs in `kernel/`, `services/`, or beside `airlock`/`duckdns` |
 | `crates/modules/system/` | System modules: `kv` (byte-KV), `valset` (ed25519 validator membership), `governance`, `identity`, `modules` (module code registry), `saga` (deterministic async continuations), `capability`, `dispatch`, `tagging`, `acl` (the submit-policy federation: which standing a target module requires of an external submitter), `gateway` (the merged name→AccountId→route module, which absorbed the on-chain half of `duckdns`) |
@@ -38,7 +38,8 @@ The tree groups by function into three layers — module / kernel / networking:
 | `crates/noded/`, `crates/rpc-client/`, `crates/workspace-config/` | The node's host-side libraries: `noded` (the embedded host behind http/ws — status cell, log ring, service catalog, projection), `rpc-client` (bounded async client for the public `/v1` surface), `workspace-config` (node.toml/network.toml shapes, `DUCKTAPE_HOME`, identity files, invites) |
 | `crates/keystore/`, `crates/authpage/`, `crates/run-envelope/` | `keystore` (the device keystore: named encrypted user keys + the `active` wallet pointer), `authpage` (the client half of the `auth.ducktape.industries` WebAuthn relying-party page; the page itself is `ops/auth-page/`), `run-envelope` (the run payload's magic and the headless composer that stamps it) |
 | `crates/topology/` | ONE source for the module id universe (each id and where its code comes from) and the named genesis selections (`PRODUCTION`, `SIM_BASE`, `SIM_VALSET`) every composer draws from; what a module needs from the host is its own component's `shape` export |
-| `crates/guests/` | Shared wasm-port infra only: `guest-adapter` (the `ducktape:module` world binding every port shares), the wasm32 dep stubs, and the kernel-fixture test guests. Every module carries its own port (`src/guest.rs` behind the `guest` feature) and `bin/guest-builder` synthesizes the packaging — no per-module crate lives here |
+| `crates/module-sdk/` | The module SDK, the one crate a wasm module pins by git revision: the `ducktape:module` WIT world, the bindings and adapter every port shares, `sdk` re-exported, and the wasm32 patch crates (`stubs/`) a guest graph needs |
+| `crates/guests/` | The kernel-fixture test guests only (hello, hello-replacement, noop, sibling, object). Every module carries its own port (`src/guest.rs` behind the `guest` feature) and `bin/guest-builder` builds it out of the repository at a revision — no per-module crate lives here |
 | `crates/examples/` | Reference modules: `directory` (the first wasm port; a test tenant, in no genesis set), `greeter` (types-only composition example) |
 | `crates/testing/` | `nettest` — the raw-HTTP-over-TCP test client, collision-safe port allocation and coarse event poll every node/daemon/sim integration harness shares |
 | `crates/design/` | The desktop app's font identity and type scale (shared tokens come from `ducktape-ui`) |
@@ -141,29 +142,27 @@ To build one module directly:
 cargo run -p guest-builder -- crates/modules/apps/tasks
 ```
 
-This synthesizes the packaging workspace under `target/guest-builder/`, builds
-it for wasm32, componentizes, and writes the canonical committed artifact to
-`crates/modules/apps/tasks/component.wasm` (path printed on stdout). If kernel
-tests pin a fixture copy, refresh it too — `make wasm-modules` does both.
-
-An out-of-tree module directory — the distributable-as-git case — builds the
-same way:
-
-```sh
-cargo run -p guest-builder -- ~/src/my-module --out /tmp/my-module.component.wasm
-```
-
-`--platform-root` overrides the ducktape checkout supplying `guest-adapter` and
-the wasm32 dep patches (it defaults to the checkout the tool was built from);
-`--scratch` overrides the synthesis directory.
+This builds the module ALONE, out of the platform repository at the checkout's
+HEAD — push first; the tool refuses a module with uncommitted edits, since it
+would compile HEAD instead — through a shell workspace under
+`target/guest-builder/tasks/`, componentizes, and writes the canonical
+committed artifact to `crates/modules/apps/tasks/component.wasm` (path printed
+on stdout) beside `guest.lock`, the record of the revision and registry
+versions it came from. If kernel tests pin a fixture copy, refresh it too —
+`make wasm-modules` does both. `--rev <sha>` builds another revision,
+`--scratch` overrides the shell directory.
 
 For the tool to accept a module it must declare the port contract: a
-`guest = ["dep:guest-adapter"]` feature, an optional `guest-adapter` path dep,
-and a `src/guest.rs` behind `#[cfg(feature = "guest")]` containing either
-`guest_adapter::snapshot_guest!` (whole-state modules), `store_guest!`
+`guest = ["dep:ducktape-module-sdk"]` feature, the optional
+`ducktape-module-sdk` workspace dep, and a `src/guest.rs` behind
+`#[cfg(feature = "guest")]` containing either
+`ducktape_module_sdk::snapshot_guest!` (whole-state modules), `store_guest!`
 (store-backed), or a hand-written `Guest` impl + `export_module!` (the `files`
 shape). `crates/modules/apps/tasks` is the reference; the full wiring runbook
-is `skills/module-dev/SKILL.md`.
+is `skills/module-dev/SKILL.md`. A module authored in its own repository needs
+no tool at all: it is a cdylib crate pinning `ducktape-module-sdk` by git
+revision, built with cargo and `wasm-tools` — the recipe is in
+`docs/records/architecture/wasm-module-authoring.md`.
 
 ## Run a node
 

@@ -1,4 +1,4 @@
-//! `guest-adapter` — the port harness for running NATIVE module crates as wasm
+//! `ducktape-module-sdk` — the port harness for running NATIVE module crates as wasm
 //! guests without rewriting their logic.
 //!
 //! a ported module's guest (its `src/guest.rs` behind the `guest` feature —
@@ -44,26 +44,29 @@
 /// the raw generated bindings. a named module (not the crate root) because the
 /// generated `#[macro_export]` machinery re-imports its own crate-root macro
 /// names — at the root those two bindings collide. public because the export
-/// macro's expansion names `guest_adapter::bindings` from the DOWNSTREAM crate.
+/// macro's expansion names `ducktape_module_sdk::bindings` from the DOWNSTREAM crate.
 #[doc(hidden)]
 pub mod bindings {
     wit_bindgen::generate!({
         world: "module",
-        path: "../../kernel/module-guest/wit",
+        path: "wit",
         // downstream guest crates invoke the export macro and reuse the
         // generated types from THIS crate (bindings are generated once, here,
         // never per guest).
         pub_export_macro: true,
         export_macro_name: "export_module",
-        default_bindings_module: "guest_adapter::bindings",
+        default_bindings_module: "ducktape_module_sdk::bindings",
     });
 }
 
 // the host import surface, the world trait, and the export macro, re-exported
-// so a guest crate needs only `use guest_adapter::{Guest, host, ...}` plus one
-// `guest_adapter::export_module!(Component)`.
+// so a guest crate needs only `use ducktape_module_sdk::{Guest, host, ...}` plus one
+// `ducktape_module_sdk::export_module!(Component)`. `sdk` rides along so a
+// module authored outside this repository pins ONE crate and reaches the
+// module contract (`sdk::Module`, `sdk::Ctx`, the codecs) through it.
 pub use bindings::ducktape::module::host;
 pub use bindings::{export_module, Guest};
+pub use sdk;
 
 // ============================================================================
 // the declared shape — what the host must know to run this component

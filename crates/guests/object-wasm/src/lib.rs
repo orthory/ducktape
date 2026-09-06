@@ -4,7 +4,7 @@
 //! `None` resolution, the object-read budget, staged-put discard on abort) AND
 //! the `StateBacking::Odb` seam (cross-dispatch overlay visibility via 'P', the
 //! refs state lane via 'r'). It calls the raw host imports directly (the
-//! `GuestOdb` ObjectStore wrapper in `guest-adapter` is proven separately by
+//! `GuestOdb` ObjectStore wrapper in `ducktape-module-sdk` is proven separately by
 //! compile).
 //!
 //! ops: 'p' put+same-dispatch-check · 'a' assert-absent · 'P' assert-present ·
@@ -12,7 +12,7 @@
 
 wit_bindgen::generate!({
     world: "module",
-    path: "../../kernel/module-guest/wit",
+    path: "../../module-sdk/wit",
 });
 
 use ducktape::module::host;

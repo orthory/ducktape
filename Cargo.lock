@@ -98,8 +98,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-cryptography",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "identity",
  "sdk",
@@ -152,8 +152,8 @@ dependencies = [
  "capability",
  "commonware-runtime",
  "duckdns",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -888,8 +888,8 @@ dependencies = [
  "borsh",
  "chat",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "inbox",
  "sdk",
@@ -1382,8 +1382,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -1506,7 +1506,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
- "guest-adapter",
+ "ducktape-module-sdk",
  "host",
  "index-guest",
  "sdk",
@@ -3114,8 +3114,8 @@ name = "directory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -3162,8 +3162,8 @@ dependencies = [
  "async-trait",
  "capability",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -3355,6 +3355,16 @@ dependencies = [
 [[package]]
 name = "ducktape-home"
 version = "0.1.0"
+
+[[package]]
+name = "ducktape-module-sdk"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "duckfs-core",
+ "sdk",
+ "wit-bindgen",
+]
 
 [[package]]
 name = "ducktape-rpc"
@@ -3638,8 +3648,8 @@ dependencies = [
  "base64 0.22.1",
  "duckfs-core",
  "duckfs-disk",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "sdk",
  "sdk-testkit",
@@ -3846,10 +3856,10 @@ dependencies = [
  "base64 0.22.1",
  "blobstore",
  "chat",
+ "ducktape-module-sdk",
  "forge",
  "futures",
  "git2",
- "guest-adapter",
  "host",
  "identity",
  "keyscheme",
@@ -4032,8 +4042,8 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "duckdns",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "identity",
  "sdk",
  "sdk-testkit",
@@ -4228,8 +4238,8 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "identity",
  "modules",
@@ -4336,21 +4346,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "guest-adapter"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "duckfs-core",
- "sdk",
- "wit-bindgen",
-]
-
-[[package]]
 name = "guest-builder"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -5071,8 +5070,8 @@ dependencies = [
  "borsh",
  "commonware-cryptography",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "k256",
  "keyscheme",
  "p256",
@@ -5156,8 +5155,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "inbox",
  "index-guest",
@@ -5563,7 +5562,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
- "guest-adapter",
+ "ducktape-module-sdk",
  "host",
  "sdk",
  "sdk-testkit",
@@ -7236,7 +7235,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
- "guest-adapter",
+ "ducktape-module-sdk",
  "host",
  "index-guest",
  "sdk",
@@ -8472,10 +8471,10 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch 0.1.0",
+ "ducktape-module-sdk",
  "files",
  "forge",
  "futures",
- "guest-adapter",
  "host",
  "pages",
  "saga",
@@ -8667,8 +8666,8 @@ dependencies = [
  "borsh",
  "capability",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "index-guest",
  "sdk",
@@ -9504,8 +9503,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -9537,8 +9536,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "index-guest",
  "sdk",

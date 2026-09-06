@@ -34,7 +34,7 @@
 //! put, so the host aborts the block with nothing staged — the native
 //! reject-then-`abort_block` sequence.
 
-use guest_adapter::{Guest, WitCtx, block_on, host};
+use ducktape_module_sdk::{Guest, WitCtx, block_on, host};
 use sdk::Error;
 
 use crate::state::{
@@ -114,7 +114,7 @@ impl Guest for Component {
     /// an odb port: the host wraps this component over the git substrate it
     /// provides for the module's id.
     fn shape() -> host::ModuleShape {
-        guest_adapter::odb_shape()
+        ducktape_module_sdk::odb_shape()
     }
 
     fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
@@ -131,4 +131,4 @@ impl Guest for Component {
     }
 }
 
-guest_adapter::export_module!(Component);
+ducktape_module_sdk::export_module!(Component);
