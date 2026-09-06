@@ -712,7 +712,18 @@ pub(super) async fn park(
         let mut recovery = recovery_slot
             .take()
             .expect("the journal slot is filled before the first ascension");
-        let rec = match recovery.recover_with_sink(&mut host, ckpt, None).await {
+        // the SAME observer the validator boot passes (validator/mod.rs): the
+        // (checkpoint, tip] suffix is what re-derives this window's explorer
+        // block rows — the one derived tier a from-state rebuild cannot
+        // repair — and converges the admitted module set per height. without
+        // it `GET /v1/blocks` loses those heights for good and every module
+        // is found stale at tip.
+        let mut replay_fold =
+            crate::explorer::IndexFold::new(&index, std::sync::Arc::new(blobs.clone()));
+        let rec = match recovery
+            .recover_with_sink(&mut host, ckpt, Some(&mut replay_fold))
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 fatal!(
@@ -832,11 +843,14 @@ pub(super) async fn park(
         // restart passes through: the same helper the ascension runs, because
         // a restart over a WIPED index directory lands here holding nothing
         // but a floor. The replay above stamped it (`heal_index` at the
-        // checkpoint) and then folded the suffix back on top, so no module is
-        // stale and no later seam looks again — the pre-boundary history is
-        // reachable only here, and only from a source. An unreachable one
-        // leaves every floor standing, which is exactly where this line
-        // stood before.
+        // checkpoint) and then folded the suffix back on top through
+        // `replay_fold`, so after a clean replay nothing is stale and the
+        // stale pass finds nothing — what is left for this call is the
+        // history BELOW that floor, reachable only here and only from a
+        // source, plus the one case the fold cannot cover: an opaque height
+        // stopped it, leaving the modules above it stale at tip. An
+        // unreachable source leaves every floor standing, which is exactly
+        // where this line stood before.
         backfill_debt.absorb(heal_and_backfill_index(&index, &client, tip, &label).await);
         last_indexed_root = Some(root);
         serving = Some((tip, node_r));
@@ -2902,5 +2916,38 @@ mod tests {
                 "unexpected code source wired in the replica park: {line}"
             );
         }
+    }
+
+    /// #1857: the resident restart replays the journal suffix through an
+    /// `IndexFold`, exactly as the validator boot does. Without an observer
+    /// the (checkpoint, tip] block rows are lost for good — a from-state
+    /// rebuild cannot repair the blocks database — and every module is found
+    /// stale at tip and backfilled from a peer for data the local replay
+    /// already held. A source lint because the seam is a whole node boot: the
+    /// smallest thing that fails when someone passes `None` again.
+    #[test]
+    fn the_resident_restart_replay_folds_the_suffix_into_the_index() {
+        let source = include_str!("park.rs");
+        // spelled in parts so this lint does not match itself.
+        let call = format!(".recover_with_{}(", "sink");
+        let calls: Vec<&str> = source.lines().filter(|l| l.contains(&call)).collect();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one replay seam in the park loop: {calls:?}"
+        );
+        let heal_at = source
+            .find("heal_index(&index, ckpt_height, &label);")
+            .expect("the checkpoint boundary is healed before replay");
+        let fold_at = source
+            .find("let mut replay_fold =")
+            .expect("the resident restart builds an IndexFold for the replay");
+        let sink_at = source
+            .find("Some(&mut replay_fold)")
+            .expect("the resident restart passes the fold as the replay sink");
+        assert!(
+            heal_at < fold_at && fold_at < sink_at,
+            "heal the checkpoint boundary, then fold the suffix on top of it"
+        );
     }
 }
