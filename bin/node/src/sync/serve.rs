@@ -932,9 +932,11 @@ pub(crate) async fn drive_sync_request(
             })
             .await;
             match rx.await {
+                // the source already stopped at `FRAME_BATCH_LEN` (#1814):
+                // `read_finalized_frames` takes the cap as its own bound
+                // rather than decoding the whole range and trimming here.
                 Ok(Ok(frames)) => match frames
                     .into_iter()
-                    .take(statesync::FRAME_BATCH_LEN)
                     .map(recovery_frame_to_sync)
                     .collect::<Result<Vec<_>, _>>()
                 {
