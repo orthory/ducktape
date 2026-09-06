@@ -125,6 +125,21 @@ pub struct RepoTracker {
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct Tracker {
     pub repos: BTreeMap<String, RepoTracker>,
+    /// the chain-half of the nonce (`<chain id>/<repo>`) the FIRST
+    /// cert-verified `PushRefs` this forge instance ever accepted carried —
+    /// pinned once and never reassigned, like a repo's owner. consensus
+    /// cannot otherwise learn its own network's chain id (see
+    /// [`crate::pushcert`]'s module doc), so this is the strictest available
+    /// mitigation against a certificate harvested on one ducktape network
+    /// being replayed onto another through `/v1/submit` (#1761): once this
+    /// forge has accepted even ONE certified push, every later one — for ANY
+    /// repo — must carry the identical chain half, so a cert minted for a
+    /// different network is refused regardless of which unborn repo name it
+    /// targets. this does NOT close the very first certified push after
+    /// genesis (nothing has been pinned yet, so whichever chain-half arrives
+    /// first is trusted) — see the crate doc for why that residual gap needs
+    /// host wiring this module cannot reach on its own.
+    pub accepted_chain: Option<String>,
 }
 
 /// derive the item author from the dispatch origin — the same posture as
@@ -512,26 +527,26 @@ impl Tracker {
         ))
     }
 
-    /// a PR's author plus its submitted reviewers — the merge-authorization
-    /// inputs `ForgeState::require_merge_authorized` reads. unlike
-    /// [`Self::pr_branches`] this does not require the PR still be open: a
-    /// merge's tracker-side gate already runs `pr_branches` first, and the
-    /// same participants own a re-check without a second open-state error.
-    pub fn pr_participants(
-        &self,
-        repo: &str,
-        number: u64,
-    ) -> Result<(AuthorRef, Vec<AuthorRef>), Error> {
+    /// a PR's author — the merge-authorization input
+    /// `ForgeState::require_merge_authorized` reads for an unprotected target.
+    /// unlike [`Self::pr_branches`] this does not require the PR still be
+    /// open: a merge's tracker-side gate already runs `pr_branches` first, and
+    /// the same author owns a re-check without a second open-state error.
+    ///
+    /// `SubmitReview` has no standing gate of its own (any account may review
+    /// any PR, #1760) and forge carries no collaborator/member list, so a
+    /// submitted review's author is NOT sound merge standing — a stranger's
+    /// self-filed review must never unlock `MergePr`. reviews are still
+    /// stored and shown (`ItemDetail::reviews`); they just no longer feed
+    /// authorization.
+    pub fn pr_author(&self, repo: &str, number: u64) -> Result<AuthorRef, Error> {
         let item = self.item(repo, number)?;
         if item.kind != ItemKind::Pr {
             return Err(Error::Module(format!(
                 "forge: item #{number} is an issue, not a pull request"
             )));
         }
-        Ok((
-            item.author.clone(),
-            item.reviews.iter().map(|r| r.author.clone()).collect(),
-        ))
+        Ok(item.author.clone())
     }
 
     /// mint the next system-message id for an item's discussion channel.
@@ -564,6 +579,9 @@ impl Tracker {
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = TRACKER_MAGIC.to_vec();
+        // an EMPTY chain half is `None` — a real chain id is never empty
+        // (see `sdk::genesis_config::CHAIN_ID`'s producers).
+        codec::put_str(&mut out, self.accepted_chain.as_deref().unwrap_or_default());
         codec::put_u32(&mut out, self.repos.len() as u32);
         for (repo, rt) in &self.repos {
             codec::put_str(&mut out, repo);
@@ -586,6 +604,8 @@ impl Tracker {
                 Error::Module("forge tracker: bad magic (not a TRK1 container)".into())
             })?;
         let mut r = Reader::new(body);
+        let accepted_chain_raw = r.str_()?;
+        let accepted_chain = (!accepted_chain_raw.is_empty()).then_some(accepted_chain_raw);
         let repo_count = r.u32()?;
         let mut repos = BTreeMap::new();
         for _ in 0..repo_count {
@@ -639,7 +659,10 @@ impl Tracker {
                 "forge tracker: trailing bytes after the container".into(),
             ));
         }
-        Ok(Self { repos })
+        Ok(Self {
+            repos,
+            accepted_chain,
+        })
     }
 }
 

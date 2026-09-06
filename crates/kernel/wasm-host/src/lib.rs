@@ -376,6 +376,21 @@ pub trait OdbBacking: HostOdb {
 /// guest MUST read/write its image under this exact key.
 pub const REFS_KEY: &[u8] = b"__state";
 
+/// an odb-backed round's committed map: the one reserved refs entry, plus
+/// [`sdk::genesis_config::CONFIG_KEY`] when the tenant's shape declared config
+/// keys (`config` — see [`CompiledModule::over_odb`]) — the same key a
+/// Map-backed tenant's `state-get` answers out of its own committed map, so
+/// `guest_adapter::load_config` works regardless of backing. a free function
+/// (not a `WasmModule` method) because both call sites reach it while
+/// `self.backing` is already borrowed by their enclosing match.
+fn odb_committed(backing: &dyn OdbBacking, config: &Option<Vec<u8>>) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut committed = BTreeMap::from([(REFS_KEY.to_vec(), backing.refs_bytes())]);
+    if let Some(config) = config {
+        committed.insert(sdk::genesis_config::CONFIG_KEY.to_vec(), config.clone());
+    }
+    committed
+}
+
 /// trap message for a read the memo cannot answer yet. never surfaces to
 /// consensus: the execute/query drivers intercept the run (via
 /// [`HostData::pending`]) and replay with the answer resolved.
@@ -791,6 +806,7 @@ impl CompiledModule {
             StateBacking::Map {
                 committed: BTreeMap::new(),
             },
+            None,
         )
     }
 
@@ -802,17 +818,22 @@ impl CompiledModule {
         id: impl Into<ModuleId>,
         store: Box<dyn MerkleStore>,
     ) -> Result<WasmModule, SdkError> {
-        WasmModule::load(id.into(), self, StateBacking::Store { store })
+        WasmModule::load(id.into(), self, StateBacking::Store { store }, None)
     }
 
     /// wrap over a host-side content-addressed substrate — for a component
-    /// declaring [`Backing::Odb`].
+    /// declaring [`Backing::Odb`]. `config` is the [`sdk::genesis_config`]-
+    /// encoded `__config` bytes to serve alongside [`REFS_KEY`] on the state
+    /// lane (`None` when the shape declares no config keys) — the odb twin of
+    /// the `__config` record a Map/Store tenant carries inside its own
+    /// committed state.
     pub fn over_odb(
         self,
         id: impl Into<ModuleId>,
         backing: Box<dyn OdbBacking>,
+        config: Option<Vec<u8>>,
     ) -> Result<WasmModule, SdkError> {
-        WasmModule::load(id.into(), self, StateBacking::Odb { backing })
+        WasmModule::load(id.into(), self, StateBacking::Odb { backing }, config)
     }
 }
 
@@ -872,6 +893,15 @@ pub struct WasmModule {
     /// `root()` (code is invisible to the root-hash); per-node realization only.
     code_hash: Vec<u8>,
     backing: StateBacking,
+    /// the [`sdk::genesis_config`]-encoded `__config` bytes an odb-backed
+    /// tenant reads through the state lane, beside [`REFS_KEY`] — `None` for
+    /// a Map/Store backing (they carry their config INSIDE their committed
+    /// state instead, seeded by `noded::compose`) or an odb tenant whose
+    /// shape declares no config keys. unlike Map's `__config` entry, this is
+    /// never installed/staged/rooted: it is a pure function of the network's
+    /// bindings, recomputed identically by every node on every construction
+    /// (genesis, reopen, or a later admission), so there is nothing to persist.
+    odb_config: Option<Vec<u8>>,
     staged: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     /// this block's accumulated staged object puts (id → tagged body), across
     /// every dispatch since the last commit/abort — the object-plane twin of
@@ -907,6 +937,7 @@ impl WasmModule {
         id: ModuleId,
         compiled: CompiledModule,
         backing: StateBacking,
+        odb_config: Option<Vec<u8>>,
     ) -> Result<Self, SdkError> {
         Self::require_declared_backing(&id, &compiled.shape, backing.kind())?;
         Ok(Self {
@@ -916,6 +947,7 @@ impl WasmModule {
             component: compiled.component,
             code_hash: compiled.code_hash,
             backing,
+            odb_config,
             staged: BTreeMap::new(),
             staged_objects: BTreeMap::new(),
             fuel: DEFAULT_FUEL,
@@ -979,7 +1011,7 @@ impl WasmModule {
         component_bytes: &[u8],
         backing: Box<dyn OdbBacking>,
     ) -> Result<Self, SdkError> {
-        CompiledModule::compile(component_bytes)?.over_odb(id, backing)
+        CompiledModule::compile(component_bytes)?.over_odb(id, backing, None)
     }
 
     fn is_store_backed(&self) -> bool {
@@ -1110,9 +1142,7 @@ impl WasmModule {
             // reserved key; the guest reads it staged-over via the state lane.
             // (queries delegate to the backing, so this only feeds execute
             // rounds — a query never instantiates the guest for this backing.)
-            StateBacking::Odb { backing } => {
-                BTreeMap::from([(REFS_KEY.to_vec(), backing.refs_bytes())])
-            }
+            StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
         }
     }
 
@@ -1515,9 +1545,7 @@ impl Module for WasmModule {
                 // staged-over via the state lane. the backing keeps ownership of
                 // the committed refs (unlike Map's move-in/reclaim), so this
                 // round's copy is discarded after the call.
-                StateBacking::Odb { backing } => {
-                    BTreeMap::from([(REFS_KEY.to_vec(), backing.refs_bytes())])
-                }
+                StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
             };
             let round_staged = staged0.clone();
             let round_objects = staged_objects0.clone();

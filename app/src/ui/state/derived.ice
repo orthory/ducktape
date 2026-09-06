@@ -5,5 +5,4 @@ derived
   app_background = keep_str(appearance == Appearance.dark, "#1b1a16", "#fdfdfb")
   app_text = keep_str(appearance == Appearance.dark, "#e8e6df", "#2c2b27")
   has_error = !empty(error)
-  huddle_popped = huddle_win != none
   mutation_busy = mutation_phase != MutationPhase.idle

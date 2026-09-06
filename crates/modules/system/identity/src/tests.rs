@@ -506,6 +506,31 @@ fn a_malformed_key_for_its_declared_scheme_is_refused() {
     );
 }
 
+/// a secp key has ONE spelling here. the uncompressed SEC1 form of a wallet's
+/// key is the same curve point — every consent over it verifies — but the key
+/// index is raw bytes, so admitting it would found a second account for one
+/// private key, and let a member re-join under a spelling `RemoveKey` on the
+/// compressed form does not touch.
+#[test]
+fn the_uncompressed_spelling_of_a_secp_key_is_refused() {
+    let mut id = new_identity();
+    let w = wallet(3);
+    let uncompressed = w.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+    assert_eq!(uncompressed.len(), 65);
+    refused(
+        create(&mut id, &uncompressed, "wallet", KeyScheme::Secp256k1).unwrap_err(),
+        "malformed for its scheme",
+    );
+
+    // and it can never be consented INTO the account its compressed form owns.
+    create(&mut id, &wallet_pub(&w), "wallet", KeyScheme::Secp256k1).unwrap();
+    refused(
+        add_key(&mut id, &uncompressed, KeyScheme::Secp256k1, wallet_consent(&w, KeyScheme::Secp256k1, &uncompressed, 0, 1)).unwrap_err(),
+        "malformed for its scheme",
+    );
+    assert_eq!(get(&id, 1).unwrap().keys.len(), 1);
+}
+
 #[test]
 fn set_name_and_profile_are_member_gated_trimmed_and_capped() {
     let mut id = new_identity();

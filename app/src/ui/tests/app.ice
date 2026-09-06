@@ -224,8 +224,6 @@ test palette_escape_contract
         toggle_bell -> toggle_bell
         switch_network -> switch_network
 
-      huddle:
-        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -381,8 +379,6 @@ test minimum_window_layout_contract
         toggle_bell -> toggle_bell
         switch_network -> switch_network
 
-      huddle:
-        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -471,6 +467,8 @@ test launch_wallets_contract
         restore_empty=true
         join_empty=true
       events
+        drag_launch_window -> drag_launch_window
+        close_launch_window -> close_launch_window
         pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -652,6 +650,8 @@ test launch_networks_empty_contract
         restore_empty=true
         join_empty=true
       events
+        drag_launch_window -> drag_launch_window
+        close_launch_window -> close_launch_window
         pick_wallet -> pick_wallet _
         unlock_submit -> unlock_submit _
         login_skip -> login_skip
@@ -913,9 +913,12 @@ preset ui_settings_scroll
 // pane. The mount is the REAL id path the handler names
 // (`#workspace-tabs/content/settings/settings-body`) — a scaffold that merely
 // imitated that path would stay green while the shipping app stayed dead.
+// The viewport is deliberately short. Settings is a tab strip over one group
+// at a time now, so no single pane is the nine-card scroll the old grid was —
+// 260px is what makes the pane under test taller than its window.
 test settings_keyboard_scroll_contract
   preset ui_settings_scroll
-  viewport 1120 460
+  viewport 1120 260
   mount
     WorkspaceTabs wall_now=wall_now #workspace-tabs
       with
@@ -943,8 +946,6 @@ test settings_keyboard_scroll_contract
         toggle_bell -> toggle_bell
         switch_network -> switch_network
 
-      huddle:
-        space w=1.0 h=1.0
       notice:
         space w=1.0 h=1.0
       chat:
@@ -1028,11 +1029,17 @@ test settings_keyboard_scroll_contract
       bell:
         space w=1.0 h=1.0
   target body = #workspace-tabs/content/settings/settings-body
+  target account_tab = #workspace-tabs/content/settings/settings-body/settings-account-tab
   // The scroll handlers qualify their targets with the console window
   // (`window=window_target(console_win)`), so the test first tells the app
   // the harness window IS the console — the same fact `task window open`
   // delivers in the real flow.
   dispatch console_opened(window)
+  // Settings opens on General, whose three cards fit a 460px viewport with
+  // nothing to scroll. The pane this scenario is about is Account: it is the
+  // long one, and it is the one holding the rename field the caret half of
+  // the arbitration needs.
+  click account_tab
   expect body.content_height > body.visible_height
   expect body.scroll_y ~= 0.0
   key escape
@@ -1190,7 +1197,6 @@ test message_stream_reset_contract
         huddle_joined_at
         huddle_now
         call_muted
-        huddle_popped=false
         messages
         has_older_history
         history_view
@@ -1219,8 +1225,7 @@ test message_stream_reset_contract
         choose_channel -> choose_channel _
         choose_dm -> choose_dm _
         toggle_channel_settings -> toggle_channel_settings
-        pop_huddle -> pop_huddle
-        focus_huddle -> focus_huddle
+        show_huddle -> show_huddle
         leave_huddle_here -> leave_huddle_here
         huddle_go_channel -> huddle_go_channel
         join_huddle_submit -> join_huddle_submit
@@ -1327,7 +1332,6 @@ test message_body_renders_as_one_rich_paragraph
         huddle_joined_at
         huddle_now
         call_muted
-        huddle_popped=false
         messages
         has_older_history
         history_view
@@ -1356,8 +1360,7 @@ test message_body_renders_as_one_rich_paragraph
         choose_channel -> choose_channel _
         choose_dm -> choose_dm _
         toggle_channel_settings -> toggle_channel_settings
-        pop_huddle -> pop_huddle
-        focus_huddle -> focus_huddle
+        show_huddle -> show_huddle
         leave_huddle_here -> leave_huddle_here
         huddle_go_channel -> huddle_go_channel
         join_huddle_submit -> join_huddle_submit
@@ -1613,16 +1616,63 @@ test the_huddle_controls_survive_the_narrowest_panel
         stage=huddle_stage
         video_live=call_video_live
       events
-        dock_huddle -> dock_huddle
         huddle_go_channel -> huddle_go_channel
         leave_huddle_here -> leave_huddle_here
         toggle_call_mute -> toggle_call_mute
         toggle_call_camera -> toggle_call_camera
         toggle_call_screen -> toggle_call_screen
   target panel = #huddle/root
-  target share = #huddle/root/share-stop
-  target leave = #huddle/root/leave
+  target share = #huddle/root/controls/root/share-stop
+  target leave = #huddle/root/controls/root/leave
   expect call_sharing
   expect leave.x + leave.width <= panel.x + panel.width
   expect share.width ~= 32.0
   capture huddle_sharing_light
+
+// CLOSING A WINDOW IS NOT QUITTING on a Mac. The process used to leave with
+// its last tracked window, which made the red button a quit nobody asked for;
+// now a close only unregisters the slot and the daemon goes on living in the
+// status item. The one thing this cannot assert is an exit or its absence —
+// the harness swallows `Action::Exit`, which is also why it runs the same off
+// macOS, where the last close does leave — so it asserts the observable
+// consequence: after the close, the menu still answers and can put a window
+// back.
+test closing_the_last_window_only_unregisters_it
+  preset ui_offline
+  tray choose "Open Ducktape"
+  expect onboarding_win != none
+  window closed
+  expect onboarding_win == none
+  expect console_win == none
+  tray choose "Open Ducktape"
+  expect onboarding_win != none
+
+// "OPEN" HAS TO OPEN. With both slots empty there is nothing to raise, and
+// `window_target` on an empty slot names a fresh id whose focus is a no-op —
+// so the raise-only row this replaced did nothing at all once every window was
+// closed, which is exactly the state the change above made reachable.
+test the_status_item_opens_a_window_when_none_is_tracked
+  preset ui_offline
+  expect onboarding_win == none
+  expect console_win == none
+  tray choose "Open Ducktape"
+  expect onboarding_win != none
+
+// ⌘Q IS ARMED BY ⌘, AND BY NOTHING ELSE. The key-press route that carries the
+// chord costs a proxied message and a rebuild for every key it sees, so it
+// exists only while the command modifier is down: the modifier stream is the
+// cheap half and `cmd_held` is the arming. That arming is what this can watch —
+// the exit the chord ends in is swallowed by the harness — and it is the half
+// that decides whether ordinary typing pays anything.
+test the_quit_chord_route_is_armed_only_while_command_is_held
+  preset ui_offline
+  expect !cmd_held
+  key "q"
+  expect !cmd_held
+  // Both modifiers at once, because the command key is ⌘ on a Mac and Ctrl
+  // everywhere else and this scenario runs on both.
+  modifiers control logo
+  expect cmd_held
+  modifiers
+  expect !cmd_held
+

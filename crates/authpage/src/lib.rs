@@ -176,10 +176,23 @@ pub fn parse_result(json: &str) -> Result<Outcome, String> {
         ));
     }
     match op.as_str() {
-        "create" => Ok(Outcome::Create {
-            credential_id: binary(&value, "credentialId")?,
-            public_key: binary(&value, "publicKey")?,
-        }),
+        "create" => {
+            // the browser is a trust boundary: the page compresses the SPKI
+            // point itself, and a key spelled any other way is one the chain
+            // would refuse as an origin AFTER a consent and a second touch had
+            // already been spent on it.
+            let public_key = binary(&value, "publicKey")?;
+            if !KeyScheme::Secp256r1.pubkey_wellformed(&public_key) {
+                return Err(format!(
+                    "the auth page returned {} bytes that are not a compressed SEC1 P-256 point",
+                    public_key.len()
+                ));
+            }
+            Ok(Outcome::Create {
+                credential_id: binary(&value, "credentialId")?,
+                public_key,
+            })
+        }
         "get" => Ok(Outcome::Get {
             authenticator_data: binary(&value, "authenticatorData")?,
             client_data_json: binary(&value, "clientDataJSON")?,
@@ -831,16 +844,24 @@ mod tests {
 
     #[test]
     fn results_decode_and_a_failure_names_itself() {
-        let create = parse_result(
-            r#"{"op":"create","credentialId":"AQID","publicKey":"AgME","alg":-7,"attestationObject":"","clientDataJSON":""}"#,
-        )
+        let registered = passkey_pubkey(&passkey(0x51));
+        let create = parse_result(&format!(
+            r#"{{"op":"create","credentialId":"AQID","publicKey":"{}","alg":-7,"attestationObject":"","clientDataJSON":""}}"#,
+            B64.encode(&registered)
+        ))
         .unwrap();
         assert_eq!(
             create,
             Outcome::Create {
                 credential_id: vec![1, 2, 3],
-                public_key: vec![2, 3, 4]
+                public_key: registered
             }
+        );
+        // a key the page did not compress is refused right here, before a
+        // consent or a second touch is spent on it.
+        assert!(
+            parse_result(r#"{"op":"create","credentialId":"AQID","publicKey":"AgME","alg":-7}"#)
+                .is_err()
         );
         let get = parse_result(
             r#"{"op":"get","credentialId":"AQID","authenticatorData":"AQ","clientDataJSON":"Ag","signature":"Aw","userHandle":"KgAAAAAAAAA"}"#,

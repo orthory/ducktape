@@ -1455,10 +1455,23 @@ pub(super) fn drive_proposal_ceremony(
         }
         None => {
             let prefix: String = pubkey_hex.chars().take(16).collect();
+            // MINT AGAINST THE RECORD, not the roster. `GovQuery::Proposals`
+            // walks the OPEN roster, but a settled proposal's record is kept
+            // forever under its id — so an id missing from that list can still
+            // be taken by an earlier ceremony for the same key. Reusing one
+            // makes every wait below adopt that stale record: `await_proposal`
+            // sees it the instant it is asked, `cast_yes_once` returns early on
+            // its settled status, `Execute` is skipped, and the verb reports
+            // the PREVIOUS ceremony's outcome while this one votes on nothing
+            // (a re-grant that silently changes no state — #1766).
             let id = (0u64..)
                 .map(|n| format!("{id_prefix}{prefix}:{n}"))
-                .find(|id| !proposals.iter().any(|p| &p.proposal_id == id))
-                .expect("the id space is unbounded");
+                .find_map(|candidate| match read_proposal(node.rpc(), &candidate) {
+                    Ok(None) => Some(Ok(candidate)),
+                    Ok(Some(_)) => None,
+                    Err(e) => Some(Err(e)),
+                })
+                .expect("the id space is unbounded")?;
             signer.submit(
                 node.rpc(),
                 &GovMsg::Propose {

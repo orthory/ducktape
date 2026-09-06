@@ -953,12 +953,21 @@ impl Governance {
                 ));
             }
         }
-        let mut roster = self.roster().await?;
-        if roster.binary_search(&proposal_id).is_ok() {
+        // AN ID IS SPENT FOREVER, and the check is against the RECORD, not the
+        // roster. The roster holds OPEN ids only, while a settled proposal's
+        // record is kept under its own key for good — so a roster-only check
+        // let a second `Propose` reuse a settled id and OVERWRITE the record,
+        // erasing the settled outcome and its ballots. Worse, it is invisible:
+        // a driver that waits for "the proposal exists" is answered by the
+        // stale record before the new one lands, and reports the old outcome
+        // for a ceremony that never voted (#1766).
+        let id_is_spent = self.proposal(&proposal_id).await?.is_some();
+        if id_is_spent {
             return Err(Error::Module(format!(
                 "proposal already exists: {proposal_id}"
             )));
         }
+        let mut roster = self.roster().await?;
         let submitter = Self::external_origin(ctx)?;
         let (proposer, electorate) = self.frozen_electorate(ctx, &submitter, &action).await?;
         let now = ctx.env().consensus_time;

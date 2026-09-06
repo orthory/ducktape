@@ -287,8 +287,10 @@ pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
 /// and the proof (exactly one valid encoding per frame — this is what makes
 /// an appended continuation section unrepresentable; every scheme's proof is
 /// self-delimiting so the boundary is the preimage's own end), an origin
-/// malformed for its scheme, or a proof that does not bind the whole
-/// preimage. the ordered drain treats any rejection as a deterministic no-op:
+/// malformed for its scheme — which INCLUDES a secp key spelled any way but
+/// the canonical 33-byte compressed SEC1 form, so one private key can never
+/// enter a block as two distinct origins — or a proof that does not bind the
+/// whole preimage. the ordered drain treats any rejection as a deterministic no-op:
 /// every honest validator rejects the identical forged frame identically.
 /// the verified `origin` becomes the block's `Origin::External(pubkey)` — raw
 /// key bytes, scheme not surfaced (a key's bytes cannot collide across
@@ -1561,6 +1563,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // height is the same deterministic no-op everywhere.
             let is_resume_replay = self.resume_floor.is_some_and(|floor| height <= floor);
             if is_resume_replay {
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    reason = "resume_replay",
+                    "skipped a re-reported frame the recovered state already contains"
+                );
                 continue;
             }
             // MONOTONICITY. above the resume floor every height is this
@@ -1611,6 +1620,17 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         reason: None,
                     }),
                 }
+                // a discard seals nothing and journals nothing, so without
+                // this line a batch vanishes from the log entirely — the one
+                // shape that looks exactly like a halted chain (#1766).
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    ceiling,
+                    reason = "cutover_ceiling",
+                    "discarded a batch finalized past the cutover ceiling"
+                );
                 continue;
             }
             // THE REPLAY WINDOW: this exact batch already applied at a recent
@@ -1902,7 +1922,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     "block committed"
                 );
             } else {
-                tracing::debug!(target: "ducktape::consensus", height, view, "idle block");
+                // the member counts ride it: an "idle block" carrying rejected
+                // members is a REAL op silently dying, not the heartbeat nop.
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    rejected = rejected_count,
+                    "idle block"
+                );
             }
             last_sealed_view = Some(view);
             // OBSERVATION BARRIER (once per batch): end the drain right after a
