@@ -71,13 +71,16 @@ impl UnreachableLatch {
     }
 }
 
-/// cap on live gate outcomes. An invite is bearer (`join_gate.rs`: no target
-/// lock, the join proof binds only the announced key), so one unexpired
-/// token mints unlimited joiner keys and each verified intro settles an
-/// entry — sized generously above the invite-peer table's own concurrency
-/// limit (`reachability::MAX_INVITE_PEERS`, 64 uncovered tunnels per join
-/// window) so ordinary churn never evicts a live outcome.
-pub(crate) const MAX_GATE_OUTCOMES: usize = 4096;
+/// cap shared by every per-joiner map this plane and its callers bound: the
+/// gate-outcome map below, and the join-request map in
+/// `validator/run/ingress.rs` (`crate::rpc::insert_join_request`). An invite
+/// is bearer (`join_gate.rs`: no target lock, the join proof binds only the
+/// announced key), so one unexpired token mints unlimited joiner keys and
+/// each verified intro settles an entry — sized generously above the
+/// invite-peer table's own concurrency limit (`reachability::MAX_INVITE_PEERS`,
+/// 64 uncovered tunnels per join window) so ordinary churn never evicts a
+/// live entry.
+pub(crate) const MAX_TRACKED_JOINERS: usize = 4096;
 
 pub(crate) type GateOutcomeMap = HashMap<Vec<u8>, GateOutcomeEntry>;
 
@@ -86,7 +89,7 @@ pub(crate) type GateOutcomeMap = HashMap<Vec<u8>, GateOutcomeEntry>;
 /// on the joiner's next retransmit and seals it back down the tunnel.
 pub(crate) type GateOutcomes = std::sync::Arc<std::sync::Mutex<GateOutcomeMap>>;
 
-/// Insert a freshly-settled outcome, capped at [`MAX_GATE_OUTCOMES`] live
+/// Insert a freshly-settled outcome, capped at [`MAX_TRACKED_JOINERS`] live
 /// entries: past the cap the OLDEST entry is evicted to make room. A
 /// re-settle of a joiner already tracked (a held gate resolving after an
 /// earlier `Installed`/`Busy` write) never grows the map, so it never evicts.
@@ -96,7 +99,7 @@ pub(crate) fn insert_gate_outcome(
     reply: join_gate::IntroReply,
     now: std::time::SystemTime,
 ) {
-    if map.len() >= MAX_GATE_OUTCOMES
+    if map.len() >= MAX_TRACKED_JOINERS
         && !map.contains_key(&joiner)
         && let Some(oldest) = map
             .iter()

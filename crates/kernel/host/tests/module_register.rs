@@ -42,6 +42,16 @@ impl MapSource {
     fn with(components: &[&[u8]]) -> Self {
         Self(components.iter().map(|c| (sha(c), deployment(c))).collect())
     }
+
+    /// a blob served exactly as committed — no artifact frame around it.
+    fn and_raw(mut self, blob: &[u8]) -> Self {
+        self.0.insert(raw_sha(blob), blob.to_vec());
+        self
+    }
+}
+
+fn raw_sha(bytes: &[u8]) -> Vec<u8> {
+    sha2::Sha256::digest(bytes).to_vec()
 }
 
 #[async_trait::async_trait(?Send)]
@@ -63,8 +73,11 @@ impl ModuleFactory for WasmFactory {
     async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<Admitted, Error> {
         // the node's own answer, in miniature: a module that will not load
         // HERE stays fail-closed; bytes that are no module at all are another
-        // plane's record (see `noded::compose::Admissions`).
-        let artifact = module_artifact::ModuleArtifactRef::decode(bytes).map_err(Error::Module)?;
+        // plane's record (see `noded::compose::Admissions`) — including bytes
+        // that carry no artifact frame in the first place.
+        let Ok(artifact) = module_artifact::ModuleArtifactRef::decode(bytes) else {
+            return Ok(Admitted::ForeignAbi);
+        };
         match wasm_host::CompiledModule::compile_artifact(bytes)
             .and_then(|compiled| compiled.over_map(id))
         {
@@ -82,10 +95,14 @@ const MEMBER: [u8; 32] = [7; 32];
 /// a host with the code registry and a one-member valset — and NO `kanban`
 /// anywhere: the module this proof admits does not exist at genesis.
 fn bare_host(with_factory: bool) -> Host {
+    host_over(Box::new(sdk_testkit::MemStore::new()), with_factory)
+}
+
+fn host_over(registry_store: Box<dyn sdk::MerkleStore>, with_factory: bool) -> Host {
     let mut host = Host::new();
     host.register(Box::new(Modules::new(
         MODULES_ID,
-        Box::new(sdk_testkit::MemStore::new()),
+        registry_store,
         "valset",
         "governance",
     )));
@@ -448,6 +465,153 @@ fn a_foreign_abi_record_is_skipped_and_the_boundary_keeps_sealing() {
     assert_eq!(host.root_hash(), sealed, "the skip moves nothing");
     submit(&mut host, H + 2, Origin::External(vec![9; 32]), inc_msg());
     assert_eq!(count(&host), 2, "and blocks keep sealing");
+}
+
+/// THE SAME ANSWER ONE STEP EARLIER. The registry commits a hash, not a
+/// shape: a blob that is not a `ModuleArtifact` frame at all — a bare
+/// component, or any other plane's bytes — is another plane's record too. The
+/// failure is a pure function of committed bytes, so a hard error here is not
+/// a refused swap but a chain that never applies the activation block again,
+/// on every honest node, with no governance op able to reach the fix.
+#[test]
+fn a_non_frame_registry_blob_is_skipped_and_the_boundary_keeps_sealing() {
+    // a bare wasm preamble: valid-looking bytes, no artifact frame.
+    const RAW: &[u8] = b"\0asm\x01\0\0\0";
+
+    let mut host = bare_host(true);
+    let src = MapSource::with(&[COMPONENT]).and_raw(RAW);
+    for (name, id, code_hash) in [
+        ("blob-v1", "blob", raw_sha(RAW)),
+        ("kanban-v1", "kanban", sha(COMPONENT)),
+    ] {
+        submit(
+            &mut host,
+            3,
+            Origin::System,
+            modules_msg(&ModulesMsg::ScheduleRegister {
+                name: name.into(),
+                module_id: id.into(),
+                activation_height: H,
+                code_hash: code_hash.clone(),
+            }),
+        );
+        submit(
+            &mut host,
+            4,
+            Origin::External(MEMBER.to_vec()),
+            modules_msg(&ModulesMsg::SwapReady {
+                name: name.into(),
+                module_id: id.into(),
+                code_hash,
+            }),
+        );
+    }
+
+    realize(&mut host, H, &src).expect("an unframed blob must not stop the boundary");
+    assert!(
+        host.module_root("blob").is_none(),
+        "nothing seated for bytes that are no module"
+    );
+    assert!(
+        host.module_root("kanban").is_some(),
+        "the real admission still lands"
+    );
+    submit(&mut host, H, Origin::External(vec![9; 32]), inc_msg());
+    assert_eq!(count(&host), 1, "the block applied");
+}
+
+/// a registry store whose reads fail while armed — the node-local read
+/// failure the wasm registry's query can hit for reasons that are nobody's
+/// consensus decision (fuel, a store read, instantiation).
+struct FlakyStore {
+    inner: sdk_testkit::MemStore,
+    failing: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl sdk::MerkleStore for FlakyStore {
+    async fn get(&self, key: &[u8; sdk::ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
+        if self.failing.get() {
+            return Err(Error::Module("injected registry read failure".into()));
+        }
+        self.inner.get(key).await
+    }
+
+    async fn commit_batch(
+        &mut self,
+        writes: Vec<([u8; sdk::ROOT_LEN], Option<Vec<u8>>)>,
+    ) -> Result<(), Error> {
+        self.inner.commit_batch(writes).await
+    }
+
+    fn root(&self) -> StateRoot {
+        self.inner.root()
+    }
+
+    async fn sync_target(&self) -> Result<sdk::ResolverSyncTarget, Error> {
+        self.inner.sync_target().await
+    }
+
+    async fn serve_sync(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+        self.inner.serve_sync(req).await
+    }
+}
+
+/// A FAILED REGISTRY READ IS A STALL, NOT AN EMPTY REGISTRY. The registry is
+/// a wasm deployment now, so its query fails node-locally for reasons that are
+/// nobody's committed decision. Reading such a failure as "no registry" would
+/// realize no swap and inject no `Advance` — this node then seals a block on
+/// stale code and a different root than its peers, and only learns it later as
+/// a hard root-hash mismatch. It must fail closed and retry instead.
+#[test]
+fn a_failed_registry_query_stalls_the_boundary() {
+    let failing = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut host = host_over(
+        Box::new(FlakyStore {
+            inner: sdk_testkit::MemStore::new(),
+            failing: failing.clone(),
+        }),
+        true,
+    );
+    let src = MapSource::with(&[COMPONENT]);
+    submit(&mut host, 3, Origin::System, schedule_register_msg());
+    submit(
+        &mut host,
+        4,
+        Origin::External(MEMBER.to_vec()),
+        signal_ready_msg(),
+    );
+
+    failing.set(true);
+    let err = realize(&mut host, H, &src).expect_err("a failed registry read must not look empty");
+    assert!(
+        err.to_string().contains("injected registry read failure"),
+        "the read failure propagates verbatim: {err}"
+    );
+    assert!(
+        host.module_root("kanban").is_none(),
+        "nothing realized under a failed read"
+    );
+
+    // and the in-block half fails closed too: no block seals without the
+    // `Advance` tick the injection could not compute.
+    let ctx = BlockContext {
+        height: H,
+        consensus_time: H,
+        origin: Origin::External(vec![9; 32]),
+    };
+    let err = block_on(host.submit_at(ctx, inc_msg()))
+        .expect_err("the drain must stall on an unreadable registry");
+    assert!(
+        err.to_string().contains("injected registry read failure"),
+        "the drain stalls on THAT failure, not on the absent module: {err}"
+    );
+
+    // the failure was node-local and transient: the retry lands.
+    failing.set(false);
+    realize(&mut host, H, &src).expect("the retry realizes the admission");
+    submit(&mut host, H, Origin::External(vec![9; 32]), inc_msg());
+    assert_eq!(count(&host), 1, "and the block applies");
 }
 
 /// an admission that never latches ready never arms — however high the height.

@@ -1562,18 +1562,20 @@ impl Host {
     /// armed swap ([`modules::ScheduledSwap::armed_at`] — readiness latched
     /// before `height`, floor reached). idempotent — the first block
     /// at/after `H` clears it, so later blocks inject nothing. ABSENT until
-    /// the module is registered (the query errors → `None`), so the drain is
-    /// byte-identical on a net without the module.
-    async fn pending_modules_advance(&self, height: u64) -> Option<Msg> {
-        let swap_armed = self.module_status().await.is_some_and(|modules| {
-            modules
-                .iter()
-                .any(|m| m.pending.as_ref().is_some_and(|p| p.armed_at(height)))
-        });
-        swap_armed.then(|| Msg {
+    /// the module is registered (`Ok(None)`), so the drain is byte-identical
+    /// on a net without the module; a FAILED registry read is `Err`, which
+    /// stalls the block rather than sealing one without the tick.
+    async fn pending_modules_advance(&self, height: u64) -> Result<Option<Msg>, Error> {
+        let Some(modules) = self.module_status().await? else {
+            return Ok(None);
+        };
+        let swap_armed = modules
+            .iter()
+            .any(|m| m.pending.as_ref().is_some_and(|p| p.armed_at(height)));
+        Ok(swap_armed.then(|| Msg {
             target: MODULES_ID.into(),
             payload: modules::encode_msg(&modules::ModulesMsg::Advance),
-        })
+        }))
     }
 
     /// the block's internal work, read from COMMITTED pre-block state: the
@@ -1622,7 +1624,7 @@ impl Host {
             }
         }
         Ok(PreparedWork {
-            advance: self.pending_modules_advance(height).await,
+            advance: self.pending_modules_advance(height).await?,
             calls,
             deliveries,
         })
@@ -1757,18 +1759,32 @@ impl Host {
         answer
     }
 
-    /// the modules registry's committed per-module code state, or `None` when the
-    /// module is absent / its reply is unreadable — the shared out-of-block
-    /// committed read behind [`Host::pending_modules_advance`] and
-    /// [`Host::realize_module_swaps`] (a missing registry is never an error,
-    /// just nothing to do). `pub` for the node's restore/sync composers, which
-    /// adopt the modules the registry admitted after genesis.
-    pub async fn module_status(&self) -> Option<Vec<modules::ModuleCode>> {
+    /// the modules registry's committed per-module code state — the shared
+    /// out-of-block committed read behind [`Host::pending_modules_advance`]
+    /// and [`Host::realize_module_swaps`]. `pub` for the node's restore/sync
+    /// composers, which adopt the modules the registry admitted after genesis.
+    ///
+    /// `Ok(None)` ONLY for a net without the registry (the module is not
+    /// registered at all — nothing to do). Every other failure is `Err`: the
+    /// registry is a wasm deployment, so a query runs the guest and can fail
+    /// node-locally (fuel, store-read, instantiation), and reading such a
+    /// failure as "no registry" would silently skip swaps and the `Advance`
+    /// injection — the node then seals a different root than its peers instead
+    /// of stalling and retrying.
+    pub async fn module_status(&self) -> Result<Option<Vec<modules::ModuleCode>>, Error> {
         let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
-        let bytes = self.query(MODULES_ID, &req).await.ok()?;
-        match modules::decode_reply(&bytes).ok()? {
-            modules::ModulesReply::ModuleStatus { modules } => Some(modules),
-            _ => None,
+        let bytes = match self.query(MODULES_ID, &req).await {
+            Ok(bytes) => bytes,
+            Err(Error::UnknownModule(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let reply = modules::decode_reply(&bytes)
+            .map_err(|e| Error::Module(format!("modules registry reply is unreadable: {e}")))?;
+        match reply {
+            modules::ModulesReply::ModuleStatus { modules } => Ok(Some(modules)),
+            other => Err(Error::Module(format!(
+                "modules registry answered ModuleStatus with {other:?}"
+            ))),
         }
     }
 
@@ -1851,7 +1867,7 @@ impl Host {
         height: u64,
         src: &dyn CodeSource,
     ) -> Result<(), Error> {
-        let Some(modules) = self.module_status().await else {
+        let Some(modules) = self.module_status().await? else {
             return Ok(());
         };
         // PHASE 1 — RESOLVE. every fallible step happens here, against an

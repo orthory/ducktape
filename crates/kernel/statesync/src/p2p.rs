@@ -38,7 +38,7 @@
 //! [`TIMEOUT_WARN_EVERY`]).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -134,25 +134,83 @@ struct Shared {
     next_id: AtomicU64,
 }
 
+/// The cursor, membership, and timeout counts change under one lock so a
+/// replacement cannot overwrite a concurrent source rotation.
+struct SourceSet<P> {
+    candidates: Vec<P>,
+    cursor: usize,
+    /// see the module doc's BUSY-MESH RETRY.
+    timeout_counts: Vec<u64>,
+}
+
 /// the rotating candidate source set (see the module doc's SOURCE ROTATION).
 struct Sources<P> {
-    candidates: Vec<P>,
-    cursor: AtomicUsize,
-    /// per-candidate reaper-timeout occurrence count, indexed the same way
-    /// `current()`/`advance_past` index `candidates` (raw cursor modulo
-    /// len) — see the module doc's BUSY-MESH RETRY.
-    timeout_counts: Vec<AtomicU64>,
+    set: std::sync::RwLock<SourceSet<P>>,
 }
 
 impl<P: Clone + PartialEq> Sources<P> {
+    fn new(candidates: Vec<P>, cursor: usize) -> Self {
+        let timeout_counts = vec![0; candidates.len()];
+        Self {
+            set: std::sync::RwLock::new(SourceSet {
+                candidates,
+                cursor,
+                timeout_counts,
+            }),
+        }
+    }
+
     /// the RAW cursor and the candidate it selects. the token is the raw
     /// counter, never the modular index: [`Sources::advance_past`] compares
     /// it against the same raw counter, so folding the wrap in here would
     /// freeze the rotation on index 0 for the process's life the moment the
     /// cursor passed `len`.
     fn current(&self) -> (usize, P) {
-        let raw = self.cursor.load(Ordering::Relaxed);
-        (raw, self.candidates[raw % self.candidates.len()].clone())
+        let set = self.set.read().expect("sources poisoned");
+        let raw = set.cursor;
+        (raw, set.candidates[raw % set.candidates.len()].clone())
+    }
+
+    /// may `peer` complete a request filed by this client?
+    fn is_candidate(&self, peer: &P) -> bool {
+        self.set
+            .read()
+            .expect("sources poisoned")
+            .candidates
+            .contains(peer)
+    }
+
+    /// swap the candidate list for the CURRENT membership. an empty list is
+    /// ignored (the seed set stays; `current()` indexes unconditionally).
+    ///
+    /// Every changed membership advances the token, including replacement
+    /// of the selected peer at the same index. A request from the old set
+    /// cannot rotate a new source that never failed. Identical membership
+    /// reads preserve the token and timeout counts.
+    fn replace(&self, candidates: Vec<P>) {
+        if candidates.is_empty() {
+            return;
+        }
+        let mut set = self.set.write().expect("sources poisoned");
+        if set.candidates == candidates {
+            return;
+        }
+        let raw = set.cursor;
+        let serving = set.candidates[raw % set.candidates.len()].clone();
+        let wanted = candidates.iter().position(|k| *k == serving).unwrap_or(0);
+        let len = candidates.len();
+        let next = raw + 1;
+        set.cursor = next + (wanted + len - next % len) % len;
+        set.timeout_counts = candidates
+            .iter()
+            .map(|candidate| {
+                set.candidates
+                    .iter()
+                    .position(|existing| existing == candidate)
+                    .map_or(0, |index| set.timeout_counts[index])
+            })
+            .collect();
+        set.candidates = candidates;
     }
 
     /// advance past the source at `observed` (a RAW cursor token from
@@ -160,20 +218,27 @@ impl<P: Clone + PartialEq> Sources<P> {
     /// request that saw the same source fail leaves the cursor where the
     /// first advance put it.
     fn advance_past(&self, observed: usize) {
-        let _ = self.cursor.compare_exchange(
-            observed,
-            observed + 1,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        let mut set = self.set.write().expect("sources poisoned");
+        if set.cursor == observed {
+            set.cursor += 1;
+        }
     }
 
-    /// record one reaper-timeout occurrence against the source at `observed`
-    /// and return the occurrence count AFTER this one (1 on the first
-    /// occurrence) — the caller latches its `warn!` on this count.
-    fn record_timeout(&self, observed: usize) -> u64 {
-        self.timeout_counts[observed % self.timeout_counts.len()].fetch_add(1, Ordering::Relaxed)
-            + 1
+    fn advance(&self) {
+        let mut set = self.set.write().expect("sources poisoned");
+        set.cursor += 1;
+    }
+
+    /// Count the peer that timed out, even if its position has changed.
+    /// Retired peers cannot charge timeouts to their replacements.
+    fn record_timeout(&self, peer: &P) -> Option<u64> {
+        let mut set = self.set.write().expect("sources poisoned");
+        let slot = set
+            .candidates
+            .iter()
+            .position(|candidate| candidate == peer)?;
+        set.timeout_counts[slot] += 1;
+        Some(set.timeout_counts[slot])
     }
 }
 
@@ -258,12 +323,7 @@ where
         R: Receiver<PublicKey = S::PublicKey> + Send + 'static,
     {
         assert!(!candidates.is_empty(), "at least one sync source");
-        let timeout_counts = candidates.iter().map(|_| AtomicU64::new(0)).collect();
-        let sources = Arc::new(Sources {
-            candidates,
-            cursor: AtomicUsize::new(0),
-            timeout_counts,
-        });
+        let sources = Arc::new(Sources::new(candidates, 0));
         let shared = Arc::new(Shared {
             pending: Mutex::new(HashMap::new()),
             tick: AtomicU64::new(0),
@@ -325,7 +385,7 @@ where
                 };
                 let Ok((peer, msg)) = frame else { break };
                 // only a candidate source may complete requests.
-                if !expected.candidates.contains(&peer) {
+                if !expected.is_candidate(&peer) {
                     continue;
                 }
                 let bytes: Vec<u8> = msg.into();
@@ -408,7 +468,16 @@ where
     /// blob fetch's "don't have it" is a valid response the failure path
     /// never sees.
     pub fn advance_source(&self) {
-        self.sources.cursor.fetch_add(1, Ordering::Relaxed);
+        self.sources.advance();
+    }
+
+    /// point this client (and every clone of it — the candidate set is shared)
+    /// at the CURRENT membership. the set a client is built with is the
+    /// GENESIS one, which goes stale the moment a founder is rotated out; the
+    /// caller refreshes it from the tip it just read. an empty list is
+    /// ignored, and the peer being served right now keeps being served.
+    pub fn set_sources(&self, candidates: Vec<S::PublicKey>) {
+        self.sources.replace(candidates);
     }
 }
 
@@ -477,10 +546,10 @@ where
             match rx.await {
                 Ok(bytes) => return Ok((decode_response(&bytes)?, server)),
                 Err(_) => {
-                    let occurrences = sources.record_timeout(at);
-                    let latched =
-                        occurrences == 1 || occurrences.is_multiple_of(TIMEOUT_WARN_EVERY);
-                    if latched {
+                    let occurrences = sources.record_timeout(&server);
+                    let latched = occurrences
+                        .filter(|count| *count == 1 || count.is_multiple_of(TIMEOUT_WARN_EVERY));
+                    if let Some(occurrences) = latched {
                         warn!(
                             target: "ducktape::statesync",
                             reason = "request_timeout",
@@ -523,19 +592,9 @@ where
 mod tests {
     use super::*;
 
-    /// three zeroed timeout counters — matches every inline `Sources` fixture
-    /// below, which all use a 3-candidate `["a", "b", "c"]` list.
-    fn three_zero_counters() -> Vec<AtomicU64> {
-        (0..3).map(|_| AtomicU64::new(0)).collect()
-    }
-
     #[test]
     fn a_failure_wave_advances_the_cursor_exactly_once() {
-        let sources = Sources {
-            candidates: vec!["a", "b", "c"],
-            cursor: AtomicUsize::new(0),
-            timeout_counts: three_zero_counters(),
-        };
+        let sources = Sources::new(vec!["a", "b", "c"], 0);
         let (at, first) = sources.current();
         assert_eq!((at, first), (0, "a"));
 
@@ -564,11 +623,7 @@ mod tests {
     fn an_out_of_band_bump_does_not_freeze_the_rotation() {
         // `advance_source` bumps the same raw cursor from another lane; the
         // failure path must still rotate from wherever it left it.
-        let sources = Sources {
-            candidates: vec!["a", "b", "c"],
-            cursor: AtomicUsize::new(7),
-            timeout_counts: three_zero_counters(),
-        };
+        let sources = Sources::new(vec!["a", "b", "c"], 7);
         let (at, server) = sources.current();
         assert_eq!((at, server), (7, "b"));
         sources.advance_past(at);
@@ -577,26 +632,87 @@ mod tests {
 
     #[test]
     fn record_timeout_latches_first_then_every_nth() {
-        let sources = Sources {
-            candidates: vec!["a", "b"],
-            cursor: AtomicUsize::new(0),
-            timeout_counts: vec![AtomicU64::new(0), AtomicU64::new(0)],
-        };
+        let sources = Sources::new(vec!["a", "b"], 0);
         // the first occurrence always latches (the caller's `occurrences ==
         // 1` check).
-        assert_eq!(sources.record_timeout(0), 1);
+        assert_eq!(sources.record_timeout(&"a"), Some(1));
         // 2..TIMEOUT_WARN_EVERY are silent — the caller's `% N == 0` check
         // is false for all of them — then the Nth relatches.
         for expected in 2..TIMEOUT_WARN_EVERY {
-            let occurrences = sources.record_timeout(0);
+            let occurrences = sources.record_timeout(&"a").unwrap();
             assert_eq!(occurrences, expected);
             assert!(!occurrences.is_multiple_of(TIMEOUT_WARN_EVERY));
         }
-        let latched_again = sources.record_timeout(0);
+        let latched_again = sources.record_timeout(&"a").unwrap();
         assert_eq!(latched_again, TIMEOUT_WARN_EVERY);
         assert!(latched_again.is_multiple_of(TIMEOUT_WARN_EVERY));
         // a different source's counter is independent.
-        assert_eq!(sources.record_timeout(1), 1);
+        assert_eq!(sources.record_timeout(&"b"), Some(1));
+    }
+
+    #[test]
+    fn a_removed_source_cannot_rotate_its_same_position_replacement() {
+        let sources = Sources::new(vec!["a", "b"], 0);
+        let (old, _) = sources.current();
+        sources.replace(vec!["c", "d"]);
+        let replacement = sources.current();
+        assert_eq!(replacement.1, "c");
+        assert!(replacement.0 > old);
+        sources.advance_past(old);
+        assert_eq!(sources.current(), replacement);
+    }
+
+    #[test]
+    fn repeated_membership_read_preserves_timeout_latching() {
+        let sources = Sources::new(vec!["a", "b"], 0);
+        assert_eq!(sources.record_timeout(&"a"), Some(1));
+        sources.replace(vec!["a", "b"]);
+        assert_eq!(sources.current(), (0, "a"));
+        assert_eq!(sources.record_timeout(&"a"), Some(2));
+    }
+
+    #[test]
+    fn membership_changes_keep_timeout_counts_with_the_actual_peer() {
+        let sources = Sources::new(vec!["a", "b"], 0);
+        assert_eq!(sources.record_timeout(&"a"), Some(1));
+        sources.replace(vec!["b", "a", "c"]);
+        assert_eq!(sources.record_timeout(&"a"), Some(2));
+        assert_eq!(sources.record_timeout(&"b"), Some(1));
+        sources.replace(vec!["b", "c"]);
+        assert_eq!(sources.record_timeout(&"a"), None);
+        assert_eq!(sources.record_timeout(&"b"), Some(2));
+    }
+
+    #[test]
+    fn replacing_the_candidates_keeps_the_cursor_serving_and_monotonic() {
+        let sources = Sources::new(vec!["a", "b", "c"], 7);
+        let (before, serving) = sources.current();
+        assert_eq!((before, serving), (7, "b"));
+
+        // the membership rotated: "a" is gone, "d" was promoted. the peer we
+        // were serving from survives, so it keeps serving — and the raw
+        // cursor never moved backwards.
+        sources.replace(vec!["b", "c", "d"]);
+        let (after, still_serving) = sources.current();
+        assert_eq!(still_serving, "b");
+        assert!(after > before);
+        // rotation still works off the fresh token, and only off it: the
+        // stale pre-swap token can no longer rotate anyone.
+        sources.advance_past(before);
+        assert_eq!(sources.current().1, "b");
+        sources.advance_past(after);
+        assert_eq!(sources.current().1, "c");
+
+        // the serving peer is dropped by the swap: the head takes over.
+        sources.replace(vec!["d", "e"]);
+        assert_eq!(sources.current().1, "d");
+        assert_eq!(sources.record_timeout(&"e"), Some(1));
+        // an empty membership reading is ignored, never a panic-on-index.
+        sources.replace(vec![]);
+        assert_eq!(sources.current().1, "d");
+        // only a candidate may complete a request.
+        assert!(sources.is_candidate(&"e"));
+        assert!(!sources.is_candidate(&"a"));
     }
 
     // ========================================================================

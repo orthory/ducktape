@@ -528,6 +528,11 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let genesis = config::Genesis::compose(&founding_set).map_err(|e| {
         format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")
     })?;
+    // discovery above only checked filenames, ids, and the mapper/component
+    // framing — a zero-byte or truncated artifact decodes fine and would
+    // otherwise mint a network that never boots (#1840). Compile every
+    // component and mapper now, before anything is written.
+    config::validate_founding_set(&founding_set, &genesis)?;
     let genesis_bytes = genesis.encode();
     let genesis_hash = config::sha256(&genesis_bytes);
     let hashes = genesis.module_hashes();
