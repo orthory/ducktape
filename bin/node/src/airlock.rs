@@ -385,7 +385,24 @@ fn committed_grant_check(node: NodeLink) -> airlock::server::GrantCheck {
 /// who can reach the route, so everything about it is a stranger's input. An
 /// admission is the owner's audit record and goes to [`admit`] at `info`,
 /// because the person who needs it is the one who was not watching.
+///
+/// **Ordering mirrors [`delegated_answer`]'s doctrine**: a FREE refusal (one
+/// decided on bytes already in the question, no committed read needed) runs
+/// before the identity read. `WorkRef::Direct` is decided a priori — there is
+/// never a committed record of who asked for a pty, so this arm always
+/// refuses (`a_direct_session_never_delegates` pins it) — and must cost this
+/// node's command lane nothing. Reading the credential record before this
+/// match, as the code once did, meant every Direct question still paid one
+/// `/v1/query` round trip it could never turn into an admission: any
+/// admitted network member could loop a known credential name against a
+/// Direct question and saturate the lender's gateway plane for free.
 async fn grant_answer(reader: &dyn CommittedReader, question: &GrantQuestion) -> GrantAnswer {
+    let saga_id = match &question.work {
+        // Nothing to delegate against. An interactive session takes this arm by
+        // construction: there is no committed record of who asked for a pty.
+        WorkRef::Direct => return refuse("credential_not_granted"),
+        WorkRef::Saga { saga_id } => saga_id,
+    };
     let record = match committed_credential_record(reader, &question.credential).await {
         Ok(Some(record)) => record,
         Ok(None) => return refuse("credential_record_absent"),
@@ -402,12 +419,7 @@ async fn grant_answer(reader: &dyn CommittedReader, question: &GrantQuestion) ->
             return GrantAnswer::Undetermined;
         }
     };
-    match &question.work {
-        // Nothing to delegate against. An interactive session takes this arm by
-        // construction: there is no committed record of who asked for a pty.
-        WorkRef::Direct => refuse("credential_not_granted"),
-        WorkRef::Saga { saga_id } => delegated_answer(reader, &record, question, saga_id).await,
-    }
+    delegated_answer(reader, &record, question, saga_id).await
 }
 
 /// One resolved condition of the delegated check that needed a committed read.
@@ -1160,6 +1172,26 @@ mod tests {
             answered(&state, &question(EXEC_NODE, WorkRef::Direct)).await,
             GrantAnswer::Refused,
             "a delegable saga existing does not delegate a session that never named it"
+        );
+    }
+
+    /// **A Direct question is decided a priori and must cost zero reads.**
+    /// The refusal above (`a_direct_session_never_delegates`) proves the
+    /// ANSWER; this proves the COST — the fake reader panics on any call at
+    /// all, so this only stays green while the match on `question.work` runs
+    /// before `committed_credential_record`.
+    #[tokio::test]
+    async fn a_direct_question_performs_zero_reads() {
+        struct PanicsOnAnyRead;
+        #[async_trait::async_trait]
+        impl CommittedReader for PanicsOnAnyRead {
+            async fn read(&self, target: &str, _request: Vec<u8>) -> Result<Vec<u8>, String> {
+                panic!("a Direct question must never reach a committed read (target={target})");
+            }
+        }
+        assert_eq!(
+            answered(&PanicsOnAnyRead, &question(EXEC_NODE, WorkRef::Direct)).await,
+            GrantAnswer::Refused
         );
     }
 
