@@ -192,22 +192,36 @@ pub fn node_log_timeline<'a>(
         family: iced::font::Family::Name(design::fonts::FAMILY_MONO),
         ..Font::DEFAULT
     };
-    let tail: iced::Element<'_, NodeLogTimelineEvent> = if inspection.following_tail {
-        text("LIVE")
-            .size(10)
-            .font(mono)
-            .color(DARK.palette.success)
-            .into()
-    } else {
-        button(
-            text(format!("RESUME · {} NEW", inspection.unread_count))
-                .size(10)
-                .font(mono),
-        )
-        .padding([3, 7])
-        .on_press(LogTimelineEvent::ResumeTail)
-        .into()
+    // ALWAYS A BUTTON, NEVER A BUTTON-OR-A-TEXT. A `button` carries widget
+    // state and a `text` carries none, so alternating the two at one position
+    // hands iced a state slot whose type changed under it — `Tree`'s downcast
+    // then aborts the process (`iced_core widget/tree.rs`), and this position
+    // flips the moment a line arrives while the reader is scrolled back. The
+    // resting state is the same button with no `on_press`, which is how iced
+    // spells "not pressable", and the label carries the difference.
+    let following_tail = inspection.following_tail;
+    let tail_label = match following_tail {
+        true => "LIVE".to_owned(),
+        false => format!("RESUME · {} NEW", inspection.unread_count),
     };
+    let tail_color = match following_tail {
+        true => DARK.palette.success,
+        false => DARK.palette.foreground,
+    };
+    let tail: iced::Element<'_, NodeLogTimelineEvent> =
+        button(text(tail_label).size(10).font(mono).color(tail_color))
+            .padding([3, 7])
+            .style(move |theme, status| match following_tail {
+                // resting: the word IS the status, so it wears no chrome
+                true => button::Style {
+                    background: None,
+                    text_color: DARK.palette.success,
+                    ..button::text(theme, status)
+                },
+                false => button::secondary(theme, status),
+            })
+            .on_press_maybe((!following_tail).then_some(LogTimelineEvent::ResumeTail))
+            .into();
     let header = row![
         text("NODE LOG")
             .size(10)
@@ -222,24 +236,18 @@ pub fn node_log_timeline<'a>(
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
-    let body: iced::Element<'_, NodeLogTimelineEvent> = if state.visible.is_empty() {
-        let message = if state.lines.is_empty() {
-            "Waiting for the node's log ring…"
-        } else {
-            "No lines match this filter."
-        };
-        container(
-            text(message)
-                .size(12)
-                .font(mono)
-                .color(DARK.palette.muted_foreground),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
-    } else {
-        log_timeline(
+    // THE LIST IS ALWAYS MOUNTED, and the empty note rides ON it rather than
+    // instead of it. `log_timeline` is a stateful virtual list and the note is
+    // a plain container: swapping one for the other at this position is the
+    // crash above, and this position swaps the FIRST time a line arrives —
+    // which is every visit to this tab. A stack keeps both children present
+    // with stable types; the note draws nothing when its text is empty.
+    let empty_note = match (state.visible.is_empty(), state.lines.is_empty()) {
+        (false, _) => "",
+        (true, true) => "Waiting for the node's log ring…",
+        (true, false) => "No lines match this filter.",
+    };
+    let timeline: iced::Element<'_, NodeLogTimelineEvent> = log_timeline(
             &state.timeline,
             &state.visible,
             node_log_timeline_config(),
@@ -279,8 +287,19 @@ pub fn node_log_timeline<'a>(
             },
             |event| event,
             &DARK,
+    );
+    let body = iced::widget::stack![
+        timeline,
+        container(
+            text(empty_note)
+                .size(12)
+                .font(mono)
+                .color(DARK.palette.muted_foreground),
         )
-    };
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_y(Length::Fill),
+    ];
     container(column![header, body].spacing(10))
         .width(Length::Fill)
         .height(Length::Fill)
@@ -1488,8 +1507,15 @@ async fn key_generation(client: &RpcClient, key: &[u8]) -> Result<u64, String> {
     }
 }
 
+/// How long a consent this app mints stays spendable, in blocks —
+/// `consensus_time` is a block height and a validator network heartbeats about
+/// once a second, so this is roughly a day. There is no revoke op: this window
+/// IS how a mis-issued ticket dies.
+const CONSENT_TTL: u64 = 86_400;
+
 /// The `AddKey` this device consents to for `new_key` (of `scheme`) at its
-/// current generation.
+/// current generation, into THIS device's account, spendable for
+/// [`CONSENT_TTL`] blocks.
 async fn consented_add_key(
     client: &RpcClient,
     password: String,
@@ -1499,12 +1525,27 @@ async fn consented_add_key(
     label: Option<String>,
 ) -> Result<identity::IdentityMsg, String> {
     let generation = key_generation(client, new_key).await?;
-    let authorizer = sign_add_key_consent(password, chain_id, scheme, new_key, generation).await?;
+    let account = own_account(client).await?.number;
+    let expires_at = consent_expiry(client).await?;
+    let authorizer = sign_add_key_consent(
+        password, chain_id, scheme, new_key, generation, account, expires_at,
+    )
+    .await?;
     Ok(identity::IdentityMsg::AddKey {
         scheme,
         label,
         authorizer,
     })
+}
+
+/// The `expires_at` a consent minted right now carries.
+async fn consent_expiry(client: &RpcClient) -> Result<u64, String> {
+    Ok(client
+        .status()
+        .await
+        .map_err(|error| error.to_string())?
+        .height
+        + CONSENT_TTL)
 }
 
 /// The account this device's key belongs to, by the canonical resolver.
@@ -1670,9 +1711,11 @@ pub async fn link_wallet(
     Ok(true)
 }
 
-/// Admit THIS device into an account by a passkey's consent: the assertion
-/// over this key's `AddKey` preimage IS the consent, its `userHandle` names
-/// the account, and this device signs the frame (the key being admitted).
+/// Admit THIS device into an account by a passkey's consent. TWO browser
+/// touches: a consent names the account it admits into, and only the passkey
+/// knows which that is — touch 1 asks (`userHandle`), touch 2 is the assertion
+/// over this key's `AddKey` preimage for that account. This device signs the
+/// frame (the key being admitted).
 pub async fn login_with_passkey(
     rpc: String,
     password: String,
@@ -1688,17 +1731,33 @@ pub async fn login_with_passkey(
         };
         let client = rpc_client(&rpc)?;
         let generation = key_generation(&client, &device_key).await?;
-        let consent =
-            browser_ceremony(authpage::login_request(&chain_id, &device_key, generation)).await?;
-        let (number, proof) = authpage::login_consent(&consent)?;
+        let number =
+            authpage::assertion_account(&browser_ceremony(authpage::account_request()).await?)?;
         let account = account_reply(
             client
                 .query("identity", &identity::IdentityQuery::Get { number })
                 .await?,
         )?
         .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
-        let msg =
-            authpage::login_add_key(&chain_id, &device_key, generation, &account, label, proof)?;
+        let expires_at = consent_expiry(&client).await?;
+        let consent = browser_ceremony(authpage::login_request(
+            &chain_id,
+            &device_key,
+            generation,
+            number,
+            expires_at,
+        ))
+        .await?;
+        let (_, proof) = authpage::login_consent(&consent)?;
+        let msg = authpage::login_add_key(
+            &chain_id,
+            &device_key,
+            generation,
+            &account,
+            label,
+            proof,
+            expires_at,
+        )?;
         signed_write(&client, "identity", identity::encode_msg(&msg), password).await
     }
     .await
@@ -1978,8 +2037,10 @@ async fn add_passkey_steps(
     Ok(())
 }
 
-/// Admit THIS device by a passkey's consent given on the phone: one QR. The
-/// phone half of `login_with_passkey`.
+/// Admit THIS device by a passkey's consent given on the phone: two QRs, one
+/// per touch — the first asks the passkey which account it speaks for, the
+/// second is the consent, bound to that account. The phone half of
+/// `login_with_passkey`.
 pub fn login_by_qr(
     rpc: String,
     password: String,
@@ -1993,23 +2054,40 @@ pub fn login_by_qr(
         };
         let client = rpc_client(&rpc)?;
         let generation = key_generation(&client, &device_key).await?;
-        let consent = qr_ceremony(
+        let named = qr_ceremony(
             authpage::AUTH_PAGE,
-            authpage::login_request(&chain_id, &device_key, generation),
+            authpage::account_request(),
             "Confirm with the passkey that belongs to your account.",
             &mut tx,
         )
         .await?;
-        let (number, proof) = authpage::login_consent(&consent)?;
-        step(&mut tx, CeremonyStep::working("Joining the account…")).await?;
+        let number = authpage::assertion_account(&named)?;
+        step(&mut tx, CeremonyStep::working("Reading the account…")).await?;
         let account = account_reply(
             client
                 .query("identity", &identity::IdentityQuery::Get { number })
                 .await?,
         )?
         .ok_or_else(|| format!("the passkey names account {number}, unknown to this node"))?;
-        let msg =
-            authpage::login_add_key(&chain_id, &device_key, generation, &account, None, proof)?;
+        let expires_at = consent_expiry(&client).await?;
+        let consent = qr_ceremony(
+            authpage::AUTH_PAGE,
+            authpage::login_request(&chain_id, &device_key, generation, number, expires_at),
+            "Confirm once more to admit this device to the account.",
+            &mut tx,
+        )
+        .await?;
+        let (_, proof) = authpage::login_consent(&consent)?;
+        step(&mut tx, CeremonyStep::working("Joining the account…")).await?;
+        let msg = authpage::login_add_key(
+            &chain_id,
+            &device_key,
+            generation,
+            &account,
+            None,
+            proof,
+            expires_at,
+        )?;
         signed_write(&client, "identity", identity::encode_msg(&msg), password).await?;
         Ok(())
     })
@@ -2097,6 +2175,8 @@ mod account_ticket_tests {
             identity::KeyScheme::Ed25519,
             &new_key,
             3,
+            11,
+            900,
         );
         let ticket = add_key_ticket(&identity::IdentityMsg::AddKey {
             scheme: identity::KeyScheme::Ed25519,
@@ -2115,24 +2195,30 @@ mod account_ticket_tests {
         assert_eq!(scheme, identity::KeyScheme::Ed25519);
         assert_eq!(label.as_deref(), Some("phone"));
         assert_eq!(authorizer.key, member().public_key().as_ref());
-        let preimage = |generation| {
+        assert_eq!(authorizer.account, 11);
+        assert_eq!(authorizer.expires_at, 900);
+        let preimage = |generation, account, expires_at| {
             identity::add_key_preimage(
                 "chain-a",
                 identity::KeyScheme::Ed25519,
                 &new_key,
                 generation,
+                account,
+                expires_at,
             )
         };
-        let verifies = |generation| {
+        let verifies = |generation, account, expires_at| {
             identity::KeyScheme::Ed25519.verify(
                 &authorizer.key,
                 identity::IDENTITY_ADD_KEY_NS,
-                &preimage(generation),
+                &preimage(generation, account, expires_at),
                 &authorizer.proof,
             )
         };
-        assert!(verifies(3), "the consent is over the minted generation");
-        assert!(!verifies(4), "and is single-use");
+        assert!(verifies(3, 11, 900), "the consent is over the minted terms");
+        assert!(!verifies(4, 11, 900), "and is single-use");
+        assert!(!verifies(3, 12, 900), "account-bound");
+        assert!(!verifies(3, 11, 901), "expiry-bound");
         assert_eq!(
             add_key_ticket_bytes(&format!("  {ticket}\n")).unwrap(),
             ticket.as_bytes(),

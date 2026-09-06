@@ -49,6 +49,13 @@ pub(crate) fn joiner_manifest_fetch_retry(
     }
 }
 
+/// a boundary is promotable with its finalization floor on the wire, or bare
+/// at (below) its own epoch base — the post-cutover window whose epoch has
+/// finalized nothing yet, which is exactly the shape a serving node is
+/// allowed to answer with (`validator::run::sync`) and the one this node may
+/// itself be needed to finalize out of. Same rule as
+/// [`crate::sync::serve::verify_manifest_floor`], which verifies the cert
+/// when there is one.
 pub(crate) fn latest_boundary_has_floor(latest: &statesync::Manifest) -> bool {
     latest.height <= latest.view_base || latest.floor_cert.is_some()
 }

@@ -390,8 +390,8 @@ on remove_channel_member_submit(key)
 //
 // It answers for the channel ON SCREEN only: `ChatData` carries the roster of
 // the active channel, and nothing on the wire says whether she is in a huddle
-// in some OTHER channel. So the docked titlebar pill and the "live elsewhere"
-// affordance stay dark rather than guess (see the report).
+// in some OTHER channel. So no "live elsewhere" affordance is drawn: the
+// pill stays dark rather than guess (see the report).
 on join_huddle_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || active_channel_archived
   hydration_generation = hydration_generation + 1
@@ -400,17 +400,43 @@ on join_huddle_submit
   error = ""
   run every join_huddle(connected_rpc, password, active_channel) -> huddle_joined_ack _ | mutation_failed _
 
-// THE JOIN OPENS THE HUDDLE, because the huddle window is where the huddle IS:
-// every face, every shared screen, the mic and camera controls and Leave live
-// in it, and the header pill it docks into can show none of them. Joining and
-// then being shown a pill is how someone sits in a call watching nothing
-// happen, which is exactly what "I joined and there was no video" is. The
-// guard is `pop_huddle`'s own: a window already up is not opened twice.
+// THE JOIN OPENS THE CALL'S WINDOW. That window is the only surface a huddle
+// has, so a join that opened none would be a call with nowhere to be seen.
+// It goes through `show_huddle` rather than opening outright: if a window is
+// somehow already up (the reconciler took the seat away and the reader joined
+// again before closing it), a second open would leak the first as an
+// untracked window, so the summon raises that one instead.
+//
+// AND THE ACK IS WHAT LANDS THE JOINED STATE, because nothing else was doing
+// it. `huddle_joined` has no local writer on the way IN — it is answered by
+// `huddle_after_load` off a chat load's roster — and the load that used to
+// answer it was the popped window's own read of the huddle channel. Take the
+// window away and the write committed, the chain roster listed you, and the
+// app sat there with the "Huddle" start button still up and no media session,
+// until some unrelated refresh of that room happened by. So: stamp the huddle
+// here, then ask that channel for its roster. `huddle_after_load` stays the
+// RECONCILER — it is what takes the huddle away again if the roster does not
+// have you on it — and it keeps the stamp below, because it reads the
+// `huddle_joined` this handler has already set.
 on huddle_joined_ack(_result)
   mutation_phase = MutationPhase.idle
   error = ""
-  return if huddle_win != none
-  task window open huddle -> huddle_opened _
+  huddle_joined = true
+  huddle_channel = active_channel
+  huddle_channel_name = active_channel_name
+  // The clock starts where THIS process saw the join land — see the header of
+  // handlers/huddle.ice for why it is never the roster row's `joined_at`.
+  huddle_joined_at = huddle_now
+  // The roster the tiles are drawn from, and the reconciler's own input. Same
+  // one-root-window read `choose_channel` issues, on the same lane.
+  chat_generation = chat_generation + 1
+  // A window task is terminal, so the summon runs beside the load rather than
+  // after it.
+  parallel
+    flow
+      from done true
+      done -> show_huddle()
+    run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
 // HUDDLE'S channel rather than the one on screen — the same button serves the

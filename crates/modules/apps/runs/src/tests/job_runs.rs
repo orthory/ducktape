@@ -177,6 +177,7 @@ fn a_job_result_finalizes_the_board_and_emits_actions() {
         vec![TaskMsg::CreateTask {
             task_id: "job-task".into(),
             title: "complete job".into(),
+            owner: None,
         }]
     );
     let finalize = ctx.job_msgs();

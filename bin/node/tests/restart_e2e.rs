@@ -35,6 +35,7 @@ fn task_create(task_id: &str, title: &str) -> Vec<u8> {
     encode_task_msg(&TaskMsg::CreateTask {
         task_id: task_id.into(),
         title: title.into(),
+        owner: None,
     })
 }
 

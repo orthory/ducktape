@@ -249,34 +249,42 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     };
     match outcome {
         CeremonyOutcome::AwaitingBallots => Ok(()),
-        CeremonyOutcome::Passed => {
-            confirm_scheduled(rpc_addr, &args.id, &code_hash, activation_height)
-        }
+        CeremonyOutcome::Passed => confirm_scheduled(rpc_addr, &args.id, &code_hash),
     }
 }
 
 /// a passed proposal only ASKED the registry; the CLI's success line is the
-/// registry's word, not governance's. read it back before saying "scheduled".
-fn confirm_scheduled(
-    rpc_addr: &str,
-    id: &str,
-    code_hash: &[u8; 32],
-    activation_height: u64,
-) -> CommandResult {
-    let scheduled = registry_holds(&read_module_status(rpc_addr)?, id, code_hash).is_some();
-    if !scheduled {
-        return Err(format!(
+/// registry's word, not governance's. read it back before saying "scheduled" —
+/// the HEIGHT too: a run that joined an open proposal decided the FIRST
+/// proposer's target, not the one it computed from its own height, so its own
+/// number would name a block the swap never lands on.
+fn confirm_scheduled(rpc_addr: &str, id: &str, code_hash: &[u8; 32]) -> CommandResult {
+    let held = registry_holds(&read_module_status(rpc_addr)?, id, code_hash);
+    match held {
+        Some(Held::Pending { activation_height }) => {
+            println!(
+                "scheduled {id} → {} at height {activation_height}; track with: ducktape module status",
+                hex_bytes(code_hash)
+            );
+            Ok(())
+        }
+        // the swap crossed its own activation between the execute and this
+        // read: the registry holds the bytes as ACTIVE and there is no pending
+        // height left to name.
+        Some(Held::Active) => {
+            println!(
+                "{id} → {} is active; track with: ducktape module status",
+                hex_bytes(code_hash)
+            );
+            Ok(())
+        }
+        None => Err(format!(
             "proposal passed but the modules registry holds no swap for {id} → {}. {}",
             hex_bytes(code_hash),
             registry_rules()
         )
-        .into());
+        .into()),
     }
-    println!(
-        "scheduled {id} → {} at height {activation_height}; track with: ducktape module status",
-        hex_bytes(code_hash)
-    );
-    Ok(())
 }
 
 /// the ceremony failed. the one failure the registry causes: governance's
@@ -328,7 +336,7 @@ enum Held {
     /// the module is RUNNING this code.
     Active,
     /// a scheduled swap will activate this code at its height.
-    Pending,
+    Pending { activation_height: u64 },
 }
 
 impl Held {
@@ -336,7 +344,7 @@ impl Held {
     fn word(self) -> &'static str {
         match self {
             Held::Active => "active",
-            Held::Pending => "scheduled",
+            Held::Pending { .. } => "scheduled",
         }
     }
 }
@@ -396,18 +404,13 @@ fn registry_rules() -> String {
 /// how the registry carries `code_hash` for `id`, if it carries it at all.
 /// pure: the one read behind both "nothing to do" and the post-`Passed`
 /// confirmation.
-fn registry_holds(
-    modules: &[modules::ModuleCode],
-    id: &str,
-    code_hash: &[u8; 32],
-) -> Option<Held> {
+fn registry_holds(modules: &[modules::ModuleCode], id: &str, code_hash: &[u8; 32]) -> Option<Held> {
     let entry = modules.iter().find(|m| m.module_id == id)?;
-    let pending_is_ours = entry
-        .pending
-        .as_ref()
-        .is_some_and(|p| p.code_hash == code_hash);
-    if pending_is_ours {
-        return Some(Held::Pending);
+    let our_pending_swap = entry.pending.as_ref().filter(|p| p.code_hash == code_hash);
+    if let Some(pending) = our_pending_swap {
+        return Some(Held::Pending {
+            activation_height: pending.activation_height,
+        });
     }
     let already_active = entry.active_code_hash == code_hash;
     already_active.then_some(Held::Active)
@@ -808,13 +811,23 @@ mod tests {
         let pending_ours = [entry(&[], Some(swap(ours)))];
         assert!(matches!(
             precheck(Verb::Register, &pending_ours),
-            Ok(Precheck::AlreadyHeld(Held::Pending))
+            // the height comes off the REGISTRY's pending swap — the only
+            // number the confirmation line may name.
+            Ok(Precheck::AlreadyHeld(Held::Pending {
+                activation_height: 9
+            }))
         ));
         assert!(matches!(
             precheck(Verb::Update, &[entry(&ours, None)]),
             Ok(Precheck::AlreadyHeld(Held::Active))
         ));
-        assert_eq!(Held::Pending.word(), "scheduled");
+        assert_eq!(
+            Held::Pending {
+                activation_height: 9
+            }
+            .word(),
+            "scheduled"
+        );
         assert_eq!(Held::Active.word(), "active");
         // a genesis id carries no registry entry when it is native, so only the
         // topology set catches it — the registry would refuse it in-kernel

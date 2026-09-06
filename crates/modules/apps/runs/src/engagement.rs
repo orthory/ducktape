@@ -1,6 +1,6 @@
 use super::{
-    Ctx, EngagementEvent, EntityRef, Error, RunsModule, SiblingReadBudget, TurnPolicy,
-    canonical_origin, dispatch_id_for, page_channel_id, page_run_id_for, run_id_for,
+    Author, Ctx, EngagementEvent, EntityRef, Error, RunsModule, SagaOrigin, SiblingReadBudget,
+    TurnPolicy, canonical_origin, dispatch_id_for, page_channel_id, page_run_id_for, run_id_for,
     tagging_decode_event,
 };
 
@@ -71,7 +71,7 @@ impl RunsModule {
             source,
             container,
             content_seq: seq,
-            author: _,
+            author,
             tags,
         } = event;
         let is_page = self.pages.as_deref() == Some(source.as_str());
@@ -98,7 +98,15 @@ impl RunsModule {
                 return Ok(());
             }
         };
-        let requester = canonical_origin(&ctx.env().origin);
+        // the ACCOUNT this run speaks for is the one that engaged the agent,
+        // not the tagging plane that routed the event: it is the standing an
+        // agent's own posts are held to, and the cancel capability. a
+        // module/system/entity author leaves the routing origin, which chat
+        // admits everywhere anyway.
+        let requester = match &author {
+            Author::User(key) if !key.is_empty() => SagaOrigin::External(key.clone()),
+            _ => canonical_origin(&ctx.env().origin),
+        };
         for agent_id in engaged {
             let run_id = if is_page {
                 page_run_id_for(&container, seq, &agent_id)

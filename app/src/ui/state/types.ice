@@ -73,7 +73,7 @@ enum PickGate
 // What the status item's "Open" has to do. Since closing a window no longer
 // ends the process, the daemon can be up with nothing tracked — and then there
 // is no window to raise, so the row has to open one.
-enum TrayOpen
+enum WindowSummon
   open
   raise
 
@@ -121,6 +121,19 @@ enum CeremonyPhase
 enum WelcomeDoor
   create
   login
+
+// SETTINGS' GROUPS, as the one thing the screen branches on. Settings was a
+// single reflowing grid of eight cards, so one topic (identity, its keys, the
+// seat that signs with them) landed in whichever column the width happened to
+// give it, and the destructive act sat at the bottom of the same list as the
+// theme switch. Each variant is one group of settings, and the danger zone is
+// a place you go rather than a card you scroll past.
+enum SettingsPane
+  general
+  network
+  account
+  security
+  danger
 
 enum NodeTab
   overview

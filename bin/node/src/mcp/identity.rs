@@ -59,7 +59,6 @@ struct ActionControl {
     client: reqwest::blocking::Client,
     url: String,
     token: String,
-    pub run_id: String,
 }
 
 /// this run, as the tool plane sees it.
@@ -70,6 +69,10 @@ pub struct Run {
     pub agent_id: Option<String>,
     pub workspace: Option<String>,
     pub skills: Option<String>,
+    /// the CONSENSUS run id this server is bound to, from `DUCKTAPE_RUN_ID`.
+    /// exported for every provisioned run, session or not: it is identity, not
+    /// a credential, and the read plane needs it to fetch the run's ceiling.
+    run_id: Option<String>,
     /// `None` when the node opened no session for this run (an older node, or a
     /// run whose `OpenAgentSession` was refused). every WRITE then refuses,
     /// loudly — there is no credential to prove the write came from this agent,
@@ -92,6 +95,7 @@ impl Run {
             agent_id: std::env::var(ENV_AGENT).ok().filter(|s| !s.is_empty()),
             workspace: std::env::var(ENV_WORKSPACE).ok().filter(|s| !s.is_empty()),
             skills: std::env::var(ENV_SKILLS).ok().filter(|s| !s.is_empty()),
+            run_id: std::env::var(ENV_RUN_ID).ok().filter(|s| !s.is_empty()),
             action: ActionControl::from_env(),
             provider_control: ProviderControl::from_env(),
             ids: AtomicU64::new(0),
@@ -101,7 +105,7 @@ impl Run {
     /// the run this MCP session is bound to. The signer stays private; callers
     /// that only need an evidence id never get access to the session key.
     pub fn run_id(&self) -> Option<&str> {
-        self.action.as_ref().map(|action| action.run_id.as_str())
+        self.run_id.as_deref()
     }
 
     /// Apply one action mid-run through this run's scoped host signer.
@@ -132,7 +136,7 @@ impl Run {
     pub fn delegations(&self) -> Result<serde_json::Value> {
         let run_id = self.run_id().ok_or_else(|| {
             NodeError::Rejected(format!(
-                "this run has no scoped action endpoint ({ENV_ACTION_URL} is unset)"
+                "this server is not bound to a run ({ENV_RUN_ID} is unset)"
             ))
         })?;
         self.node.query(
@@ -166,10 +170,20 @@ impl Run {
         control.request(request_id, requested_secs)
     }
 
-    /// the agent's COMMITTED record. fetched per call rather than cached at
-    /// startup: an owner can pause an agent or narrow its caps mid-run, and a
-    /// cached grant would keep honouring a permission that consensus has
-    /// already taken away.
+    /// the agent's COMMITTED record, NARROWED to this run's admission ceiling.
+    ///
+    /// fetched per call rather than cached at startup: an owner can pause an
+    /// agent or narrow its caps mid-run, and a cached grant would keep
+    /// honouring a permission that consensus has already taken away.
+    ///
+    /// the standing record is only half of it. a DELEGATED run carries the
+    /// caller's frozen grant as a ceiling, which consensus applies to every
+    /// write (`runs`' `agent_for_run`); gating reads on the standing record
+    /// alone would let a peer's agent read whatever ITS owner granted it, on
+    /// behalf of a caller who granted far less. so the ceiling is fetched with
+    /// the record and applied the same way — and FAIL CLOSED: a query this
+    /// server cannot complete, or a run the module no longer holds, refuses the
+    /// read. falling back to the standing record is exactly the escalation.
     pub fn record(&self) -> Result<AgentRecord> {
         let agent_id = self.agent_id.as_deref().ok_or_else(|| {
             NodeError::Rejected(format!(
@@ -193,8 +207,34 @@ impl Run {
                 "the agent registry holds no agent {agent_id:?}"
             )));
         }
-        serde_json::from_value(record.clone()).map_err(|e| {
+        let standing: AgentRecord = serde_json::from_value(record.clone()).map_err(|e| {
             NodeError::Transport(format!("the agent registry's record did not decode: {e}"))
+        })?;
+        let Some(run_id) = self.run_id.as_deref() else {
+            return Ok(standing);
+        };
+        let reply = self
+            .node
+            .query(TARGET_RUNS, json!({"run_authority": {"run_id": run_id}}))?;
+        // RunsReply::RunAuthority(Option<RunAuthorityView>) — externally
+        // tagged, so the view sits under "run_authority" and is null for a run
+        // the module is not holding.
+        let view = reply.get("run_authority").ok_or_else(|| {
+            NodeError::Transport(format!(
+                "the runs module answered a shape this server does not understand: {reply}"
+            ))
+        })?;
+        if view.is_null() {
+            return Err(NodeError::Rejected(format!(
+                "run {run_id:?} is not in flight, so its authority cannot be established"
+            )));
+        }
+        let view: runs::RunAuthorityView = serde_json::from_value(view.clone()).map_err(|e| {
+            NodeError::Transport(format!("the run's authority did not decode: {e}"))
+        })?;
+        Ok(match &view.authority {
+            Some(ceiling) => ceiling.apply(&standing),
+            None => standing,
         })
     }
 
@@ -250,7 +290,9 @@ impl ActionControl {
         let token = std::env::var(ENV_ACTION_TOKEN)
             .ok()
             .filter(|value| provider_control_token_allowed(value))?;
-        let run_id = std::env::var(ENV_RUN_ID)
+        // the signer is scoped to ONE run and every message it signs names it,
+        // so a session with no run id can sign nothing.
+        std::env::var(ENV_RUN_ID)
             .ok()
             .filter(|value| !value.is_empty())?;
         let client = reqwest::blocking::Client::builder()
@@ -259,12 +301,7 @@ impl ActionControl {
             .timeout(Duration::from_secs(60))
             .build()
             .expect("a loopback action client always builds");
-        Some(Self {
-            client,
-            url,
-            token,
-            run_id,
-        })
+        Some(Self { client, url, token })
     }
 
     fn submit(&self, message: runs::RunsMsg) -> Result<serde_json::Value> {
@@ -438,6 +475,131 @@ fn describe(cap: &CapRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// a node that answers `/v1/query` from a canned table: the agent registry
+    /// arm, then the runs `run_authority` arm. one thread, `n` requests, no
+    /// framework — the whole point is to watch `record()` make BOTH queries.
+    fn fake_node(replies: Vec<serde_json::Value>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                // drain enough of the request to unblock the client, then answer.
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let body = reply.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    fn standing_record() -> AgentRecord {
+        let mut record = agent::AgentRecord {
+            agent_id: "worker".into(),
+            owner: saga::SagaOrigin::External(vec![9; 32]),
+            display_name: "Worker".into(),
+            capability: "model-1".into(),
+            allowed_actions: vec![agent::ACTION_CHAT_POST.into()],
+            status: agent::AgentStatus::Active,
+            role: agent::AgentRole::General,
+            created_at: 0,
+            updated_at: 0,
+            recipe_hash: Vec::new(),
+            caps: agent::ResourceCaps::default(),
+            skills: Vec::new(),
+        };
+        record.caps.duckfs_read = vec!["/shared".into()];
+        record
+    }
+
+    fn bound_run(node: String, replies: Vec<serde_json::Value>) -> Run {
+        Run {
+            node: Node::new(Some(fake_node(replies))),
+            agent_id: Some("worker".into()),
+            workspace: None,
+            skills: None,
+            run_id: Some(node),
+            action: None,
+            provider_control: None,
+            ids: AtomicU64::new(0),
+        }
+    }
+
+    #[test]
+    fn a_delegated_runs_ceiling_narrows_the_record_the_read_plane_gates_on() {
+        let standing = standing_record();
+        // the caller granted LESS than the callee's owner did: no duckfs read.
+        let ceiling = json!({
+            "allowed_actions": [agent::ACTION_CHAT_POST],
+            "caps": agent::ResourceCaps::default(),
+        });
+        let run = bound_run(
+            "run-1".into(),
+            vec![
+                json!({"agent": standing}),
+                json!({"run_authority": {
+                    "run_id": "run-1", "agent_id": "worker", "authority": ceiling
+                }}),
+            ],
+        );
+        let record = run.record().expect("both queries answer");
+        assert!(
+            record.caps.duckfs_read.is_empty(),
+            "the ceiling, not the standing grant: {:?}",
+            record.caps.duckfs_read
+        );
+        assert!(
+            !record.permits(&CapRequest::DuckfsRead("/shared/notes")),
+            "a read the standing record allows is refused under the ceiling"
+        );
+        // and the standing record really did allow it.
+        assert!(standing.permits(&CapRequest::DuckfsRead("/shared/notes")));
+    }
+
+    #[test]
+    fn an_ordinary_run_keeps_its_standing_record() {
+        let run = bound_run(
+            "run-1".into(),
+            vec![
+                json!({"agent": standing_record()}),
+                json!({"run_authority": {
+                    "run_id": "run-1", "agent_id": "worker", "authority": null
+                }}),
+            ],
+        );
+        let record = run.record().expect("both queries answer");
+        assert!(record.permits(&CapRequest::DuckfsRead("/shared/notes")));
+    }
+
+    #[test]
+    fn a_ceiling_the_server_cannot_establish_refuses_the_read() {
+        // the authority query answers a shape this server does not understand
+        // (a node mid-restart, a wire drift) — FAIL CLOSED: never fall back to
+        // the standing record, which is exactly the escalation.
+        let run = bound_run(
+            "run-1".into(),
+            vec![json!({"agent": standing_record()}), json!({"nope": 1})],
+        );
+        assert!(run.record().is_err());
+
+        // a run the module is not holding proves no ceiling either.
+        let gone = bound_run(
+            "run-1".into(),
+            vec![
+                json!({"agent": standing_record()}),
+                json!({"run_authority": null}),
+            ],
+        );
+        assert!(gone.record().is_err());
+    }
 
     #[test]
     fn action_endpoint_is_strictly_host_local_and_path_scoped() {

@@ -105,9 +105,6 @@ pub const FOLD_TIP: &str = "fold/tip";
 /// mirroring the module query convention rather than erroring.
 pub const MAX_SCAN_LIMIT: usize = 1024;
 
-/// the key of one op row: fixed-width hex so lexicographic order IS numeric
-/// order. `seq` is the block-wide dispatch index (fits: the host drain budget
-/// is 1024 dispatches per block).
 /// render an external submitter identity for display in a read model.
 ///
 /// a `User` identity is a claimed display name on the embedded daemon
@@ -133,8 +130,20 @@ pub fn user_handle(bytes: &[u8]) -> String {
     out
 }
 
+/// the key of one op row. THE WIDTH IS THE INVARIANT: hex padded to the FULL
+/// width of each field, so lexicographic key order IS `(height, seq)` order —
+/// which is what `replay_op_feed` calls block-and-drain order and what every
+/// forward cursor (the `/v1/index/{module}/ops` pager, the ws catch-up, the
+/// joiner backfill's height ceiling) pages by.
+///
+/// `seq` is the BLOCK-WIDE dispatch index, and a block is a batch of member
+/// frames — the 1024-dispatch drain budget is per queue-run per FRAME, not
+/// per block — so it does not fit in four digits: at five digits `10000`
+/// sorts between `0ffff` and `2000`, i.e. into the MIDDLE of the range, and a
+/// cursor already past it skips those rows silently. Eight digits is the
+/// whole `u32`, so no seq can ever widen the field again.
 pub fn op_key(height: u64, seq: u32) -> String {
-    format!("{OP_PREFIX}{height:016x}/{seq:04x}")
+    format!("{OP_PREFIX}{height:016x}/{seq:08x}")
 }
 
 /// the `(height, seq)` an op-row key encodes — the inverse of [`op_key`],
@@ -410,15 +419,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn op_keys_order_numerically() {
-        let earlier = op_key(1, 2);
-        let later_seq = op_key(1, 10);
-        let later_height = op_key(0x1_0000, 0);
-        assert!(earlier < later_seq);
-        assert!(later_seq < later_height);
-    }
-
-    #[test]
     fn op_keys_parse_back_to_their_position() {
         assert_eq!(parse_op_key(op_key(7, 3).as_bytes()), Some((7, 3)));
         assert_eq!(
@@ -495,6 +495,25 @@ mod tests {
 
         assert_eq!(map.get(b"kept".as_slice()), Some(&b"fresh".to_vec()));
         assert!(!map.contains_key(b"dropped".as_slice()));
+    }
+
+    /// LEXICOGRAPHIC KEY ORDER IS `(height, seq)` ORDER, at every seq a `u32`
+    /// can hold. A field one digit too narrow does not error — it widens, and
+    /// the widened key sorts into the MIDDLE of the range, so a forward cursor
+    /// steps straight past those rows and a refold replays the block out of
+    /// drain order.
+    #[test]
+    fn op_keys_sort_by_seq_across_the_whole_u32() {
+        let ascending = [0u32, 1, 0x0fff, 0xffff, 0x10000, 0x10001, u32::MAX];
+        for pair in ascending.windows(2) {
+            let (lower, higher) = (pair[0], pair[1]);
+            assert!(
+                op_key(7, lower) < op_key(7, higher),
+                "seq {lower:#x} must sort before {higher:#x}"
+            );
+        }
+        // and the height field still dominates the seq field.
+        assert!(op_key(7, u32::MAX) < op_key(8, 0));
     }
 
     #[test]

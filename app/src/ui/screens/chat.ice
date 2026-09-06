@@ -204,7 +204,7 @@ component CopyRangeBar(count:i64)
           p=5.0
           @primary_action
 
-component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, huddle_popped:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
+component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   lifetime retained
   emits
     press_message(i64, CopySurface)
@@ -217,8 +217,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
     choose_channel(str)
     choose_dm(str)
     toggle_channel_settings()
-    pop_huddle()
-    focus_huddle()
+    show_huddle()
     leave_huddle_here()
     huddle_go_channel()
     join_huddle_submit()
@@ -597,23 +596,19 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                     Badge.Outline label="Archived"
                   if active_channel_members_only
                     Badge.Outline label="Members only"
-                  // The huddle control, in its three mutually exclusive
-                  // states — in it here, in it elsewhere, in none.
+                  // THE HUDDLE CONTROL, two states: start one, or the LIVE
+                  // pill that opens or raises the window a running one lives
+                  // in. The "call in progress elsewhere" chip is gone — the
+                  // huddle window itself rides every room and every screen,
+                  // with faces, a clock and a way in.
                   if huddle_joined && huddle_channel == active_channel
                     HuddleLivePill
                       with
-                        name=active_channel_name
                         elapsed=mmss(huddle_now - huddle_joined_at)
                         muted=call_muted
-                        popped=huddle_popped
                       forward
-                        pop_huddle
-                        focus_huddle
+                        show_huddle
                         leave_huddle_here
-                  if huddle_joined && huddle_channel != active_channel
-                    HuddleElsewhere name=huddle_channel_name
-                      forward
-                        huddle_go_channel
                   if !huddle_joined && !active_channel_archived
                     HuddleStart
                       forward

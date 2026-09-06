@@ -593,13 +593,22 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
     );
 }
 
-/// THE JOIN OPENS THE HUDDLE. Every face, every shared screen and every media
-/// control lives in the huddle window; the header pill it docks into shows
-/// none of them. A join routed back to the generic `chat_acked` leaves someone
-/// sitting in a live call watching a static pill, which is indistinguishable
-/// from a huddle that does not work — so the route is pinned here.
+/// THE JOIN OPENS THE CALL'S WINDOW, AND THE CONSOLE KEEPS SAYING SO.
+///
+/// A huddle has exactly one surface — its own window — so an ack that opened
+/// none would leave someone in a live call with nowhere to see it. The route is
+/// pinned here because a join routed back to the generic `chat_acked` would
+/// land the same silence.
+///
+/// THIS USED TO BE THE OPPOSITE ASSERTION, and the defect it guarded is worth
+/// restating because it is what the two lines below now answer: a second OS
+/// window fell behind the console the moment anything in the console was
+/// clicked, and the console said nothing about the call at all. So the window
+/// floats (`level always-on-top`, app.ice) and the channel's LIVE pill draws
+/// whenever that channel's call is live rather than only while the window is
+/// up — the pill is the way back to a window someone has closed.
 #[test]
-fn joining_a_huddle_opens_the_window_that_shows_it() {
+fn joining_a_huddle_opens_the_call_window() {
     let handler = inlined(include_str!("../ui/handlers/chat.ice"));
     assert!(
         handler
@@ -611,10 +620,114 @@ fn joining_a_huddle_opens_the_window_that_shows_it() {
         .expect("the join ack handler exists")
         .1;
     let ack = ack.split_once("\non ").map_or(ack, |split| split.0);
-    assert!(ack.contains("task window open huddle"));
+    // Through the summon, not an outright open: a window somehow still up (the
+    // reconciler took the seat away, the reader joined again before closing
+    // it) is raised rather than doubled and leaked.
     assert!(
-        ack.contains("return if huddle_win != none"),
-        "a window already up is not opened twice"
+        ack.contains("done -> show_huddle()"),
+        "a join that opens no window is a call with nowhere to be"
+    );
+    assert!(
+        !ack.contains("task window open huddle"),
+        "the ack opens a window outright, doubling one that is still up"
+    );
+    // AND THE ACK LANDS THE JOINED STATE ITSELF. `huddle_joined` has no other
+    // writer on the way in: it is answered off a chat load's roster, and an ack
+    // that only cleared the mutation left the write committed, the chain roster
+    // listing her, and the app showing the start button with no media session —
+    // `call_session` is gated on this very flag.
+    for landed in [
+        "huddle_joined = true",
+        "huddle_channel = active_channel",
+        "huddle_channel_name = active_channel_name",
+        "huddle_joined_at = huddle_now",
+    ] {
+        assert!(ack.contains(landed), "the join ack lands {landed}");
+    }
+    assert!(
+        ack.contains(
+            "run replace lane=chat_load load_channel_window(connected_rpc, active_channel, \
+             chat_generation) -> chat_updated"
+        ),
+        "and asks that channel for the roster the tiles and the reconciler need"
+    );
+    // THE WINDOW FLOATS, or it is behind the console the moment you click back
+    // into your work — the hole the docked card was dug to fill.
+    let app = include_str!("../ui/app.ice");
+    let huddle_window = app
+        .split_once("window huddle")
+        .expect("the huddle window is declared")
+        .1;
+    let huddle_window = huddle_window
+        .split_once("\n  window ")
+        .map_or(huddle_window, |split| split.0);
+    assert!(
+        huddle_window.contains("level always-on-top"),
+        "the call window stopped floating: {huddle_window}"
+    );
+    // AND THE CONSOLE SAYS THE CALL IS LIVE whether or not that window is up.
+    let chat = inlined(include_str!("../ui/screens/chat.ice"));
+    assert!(
+        chat.contains("if huddle_joined && huddle_channel == active_channel"),
+        "the LIVE pill stopped drawing for the channel's own call"
+    );
+    assert!(
+        !chat.contains("huddle_joined && huddle_channel == active_channel && huddle_popped"),
+        "the pill is gated on the window again, so a closed window has no way back"
+    );
+    // ONE VIDEO SURFACE, EVER. The `call_video_*` widgets each run a 4 ms
+    // repaint clock while a tile is live, so a second component drawing them
+    // would be two clocks for one call. Only the panel may.
+    let huddle = include_str!("../ui/components/huddle.ice");
+    for component in ["HuddleDock(", "HuddleDockedPill("] {
+        assert!(
+            !huddle.contains(&format!("component {component}")),
+            "{component} is back — the call has one surface, its window"
+        );
+    }
+}
+
+/// ONE HUDDLE SURFACE AT A TIME.
+///
+/// The chat header used to carry two of its own — a LIVE pill in the huddle's
+/// room and a "call in progress" chip in every other one — beside a dock that
+/// says both things on every screen, with faces, a clock and a way in. Both
+/// are gone. What is left in the header is the one state the dock cannot
+/// speak for: a huddle popped out into its own OS window, where the pill is
+/// how you raise it.
+#[test]
+fn the_chat_header_carries_no_second_huddle_surface() {
+    let screen = inlined(include_str!("../ui/screens/chat.ice"));
+    assert!(
+        !screen.contains("HuddleElsewhere"),
+        "the dock names the huddle's room on every screen — the header chip          was the same sentence twice"
+    );
+    let at = screen
+        .find("HuddleLivePill")
+        .expect("the header's live pill");
+    let pill = screen[..at]
+        .lines()
+        .rev()
+        .find(|line| line.trim().starts_with("if "))
+        .map(str::trim)
+        .expect("its guard");
+    // THE PILL IS THE WAY BACK, so it cannot be gated on the window being up.
+    // It used to carry `&& huddle_popped` because the in-window dock covered
+    // the other case; with the call in its own window and nothing else drawing
+    // it, that term made the pill vanish in exactly the state it is needed —
+    // the window closed and the call still running.
+    assert_eq!(
+        pill, "if huddle_joined && huddle_channel == active_channel",
+        "the pill is gated on the window again, so a closed window has no way back"
+    );
+    let components = inlined(include_str!("../ui/components/huddle.ice"));
+    assert!(
+        !components.contains("component HuddleElsewhere"),
+        "deleted, not deprecated"
+    );
+    assert!(
+        !components.contains("component HuddleLivePill(name:str"),
+        "the pill names no channel now: the header it sits in already says which room this is"
     );
 }
 

@@ -696,14 +696,32 @@ fn render_enable_summary(plan: &EnablePlan) -> String {
 /// the operator already consented to most of this, and what deserves their
 /// attention is the tag that was not there before. Rendered from the two
 /// records, so it says exactly what the file is about to become.
+///
+/// Covers BOTH persisted fields a re-mint can widen (`capabilities` AND
+/// `scopes` — see `remint_grant`/`mint_grant`, which persist `offered.scopes`
+/// verbatim): "unchanged" is said only when neither set moved, never when
+/// capabilities alone happen to match while scopes grew. A widened scope is
+/// rendered in the same `+`/`-`/` ` list as a capability, tagged so the two
+/// halves cannot be mistaken for each other.
 fn render_reconsent_diff(plan: &EnablePlan) -> String {
     let Some(previous) = &plan.previous else {
         return String::new();
     };
-    let had: std::collections::BTreeSet<&str> =
-        previous.capabilities.iter().map(String::as_str).collect();
-    let has: std::collections::BTreeSet<&str> =
-        plan.grant.capabilities.iter().map(String::as_str).collect();
+    let tagged = |prefix: &'static str, tags: &[String]| -> Vec<String> {
+        tags.iter().map(|t| format!("{prefix}:{t}")).collect()
+    };
+    let had_tags = [
+        tagged("cap", &previous.capabilities),
+        tagged("scope", &previous.scopes),
+    ]
+    .concat();
+    let has_tags = [
+        tagged("cap", &plan.grant.capabilities),
+        tagged("scope", &plan.grant.scopes),
+    ]
+    .concat();
+    let had: std::collections::BTreeSet<&str> = had_tags.iter().map(String::as_str).collect();
+    let has: std::collections::BTreeSet<&str> = has_tags.iter().map(String::as_str).collect();
     let mut out = format!(
         "\n  {} is already enabled as {}\n",
         paint(BOLD, &plan.kind),
@@ -2546,15 +2564,15 @@ mod tests {
         let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
         assert!(screen.contains("already enabled as"), "{screen}");
         assert!(
-            screen.contains("+ codex  (new)"),
+            screen.contains("+ cap:codex  (new)"),
             "the added tag is marked: {screen}"
         );
         assert!(
-            screen.contains("- aider  (no longer installed)"),
+            screen.contains("- cap:aider  (no longer installed)"),
             "the tag that went away is marked, and says why: {screen}"
         );
         assert!(
-            screen.contains("  claude\n"),
+            screen.contains("  cap:claude\n"),
             "an unchanged tag rides along unmarked: {screen}"
         );
     }
@@ -2575,6 +2593,44 @@ mod tests {
         let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
         assert!(screen.contains("unchanged"), "{screen}");
         assert!(!screen.contains("CHANGED"), "{screen}");
+    }
+
+    /// A widened GRANT SCOPE must render as a change even when capabilities
+    /// happen to match exactly — the ruling this pins is that the diff covers
+    /// every persisted field (`ServiceGrant::capabilities` AND `::scopes`),
+    /// never capabilities alone, so a daemon that widens what it asks for is
+    /// never re-consented under "unchanged".
+    #[test]
+    fn a_widened_scope_renders_as_a_change_even_when_capabilities_match() {
+        let (dir, service) = planning_workspace(&[]);
+        let mut services = Services::default();
+        services.grants.push(ServiceGrant {
+            kind: "compute".into(),
+            instance: "aa".repeat(32),
+            nonce: "bb".repeat(16),
+            granted_unix: 1,
+            capabilities: vec!["claude".into()],
+            scopes: vec!["cred:read".into()],
+        });
+        save(dir.path(), &services).expect("write grants");
+
+        let offered = noded::services::Signaling {
+            kind: "compute".into(),
+            version: "1".into(),
+            build: "b".into(),
+            capabilities: vec!["claude".into()],
+            scopes: vec!["cred:read".into(), "cred:write".into()],
+            needs: Vec::new(),
+        };
+        let plan = plan_enable_from(dir.path(), "compute", &service, NODE_A, vec![offered])
+            .expect("re-consent plans");
+        let screen = through_anstream(&render_enable_summary(&plan), anstream::ColorChoice::Never);
+        assert!(!screen.contains("unchanged"), "{screen}");
+        assert!(screen.contains("CHANGED"), "{screen}");
+        assert!(
+            screen.contains("+ scope:cred:write  (new)"),
+            "the widened scope is named: {screen}"
+        );
     }
 
     /// A file the registry would refuse must not LOAD, which means it fails the

@@ -75,7 +75,6 @@ fn page_query_replies_stop_before_the_rpc_client_limit() {
         assert!(block_page.next_after.is_some());
         assert!(block_page.blocks.len() < 11);
         assert_eq!(get_page(&p, "root").await.unwrap().len(), 11);
-
     });
 }
 
@@ -309,5 +308,199 @@ fn removing_page_block_removes_its_entire_nested_subtree() {
         // Nested Page blocks are part of the removed subtree too.
         assert!(get_page(&p, "child").await.is_none());
         assert!(get_block(&p, "child").await.is_none());
+    });
+}
+
+#[test]
+fn block_ops_are_gated_to_the_page_author() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        apply_commit_as(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "p1".into(),
+                title: "alice's page".into(),
+            },
+            user("alice"),
+        )
+        .await;
+        apply_commit_as(
+            &mut p,
+            &PageMsg::InsertBlock {
+                parent: "p1".into(),
+                after: None,
+                block: para("b1", "hello"),
+            },
+            user("alice"),
+        )
+        .await;
+
+        // a stranger may not touch the document body …
+        apply_err_as(
+            &mut p,
+            &PageMsg::UpdateText {
+                block_id: "b1".into(),
+                text: "hijacked".into(),
+                marks: None,
+            },
+            user("mallory"),
+            "not the page author",
+        )
+        .await;
+        apply_err_as(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "b1".into(),
+            },
+            user("mallory"),
+            "not the page author",
+        )
+        .await;
+        apply_err_as(
+            &mut p,
+            &PageMsg::InsertBlock {
+                parent: "p1".into(),
+                after: None,
+                block: para("intruder", "nope"),
+            },
+            user("mallory"),
+            "not the page author",
+        )
+        .await;
+
+        // … but the recorded author may.
+        apply_commit_as(
+            &mut p,
+            &PageMsg::UpdateText {
+                block_id: "b1".into(),
+                text: "edited by alice".into(),
+                marks: None,
+            },
+            user("alice"),
+        )
+        .await;
+        assert_eq!(get_block(&p, "b1").await.unwrap().text, "edited by alice");
+
+        apply_commit_as(
+            &mut p,
+            &PageMsg::RemoveBlock {
+                block_id: "b1".into(),
+            },
+            user("alice"),
+        )
+        .await;
+        assert!(get_block(&p, "b1").await.is_none());
+
+        // comment ops are unaffected: still gated on stored comment/thread
+        // authorship, not page authorship.
+        apply_commit_as(
+            &mut p,
+            &PageMsg::AddComment {
+                thread_id: "t1".into(),
+                comment_id: "c1".into(),
+                target: "p1".into(),
+                text: "a note".into(),
+                anchor: None,
+                mentions: Vec::new(),
+                as_agent: None,
+            },
+            user("mallory"),
+        )
+        .await;
+        assert!(query_thread(&p, "t1").await.is_some());
+    });
+}
+
+#[test]
+fn moving_a_page_under_another_authors_page_requires_that_authors_consent() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        apply_commit_as(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "alice-page".into(),
+                title: "alice".into(),
+            },
+            user("alice"),
+        )
+        .await;
+        apply_commit_as(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "mallory-page".into(),
+                title: "mallory".into(),
+            },
+            user("mallory"),
+        )
+        .await;
+
+        // mallory cannot graft her own page under alice's without alice's say.
+        apply_err_as(
+            &mut p,
+            &PageMsg::MoveBlock {
+                block_id: "mallory-page".into(),
+                parent: Some("alice-page".into()),
+                after: None,
+            },
+            user("mallory"),
+            "not the page author",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn oversized_page_id_is_rejected_before_staging() {
+    // #1685: nothing bounded a client-minted page id, so a handful of
+    // oversized ids could fill the whole enumeration index and brick page
+    // creation for every account. `MAX_PAGE_ID_BYTES` rejects it up front.
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        let long_id = "p".repeat(400);
+        apply_err_as(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: long_id,
+                title: "t".into(),
+            },
+            user("alice"),
+            "id or target too large",
+        )
+        .await;
+        assert!(p.load_index().await.unwrap().is_empty());
+    });
+}
+
+#[test]
+fn the_max_pages_plus_one_th_create_page_is_refused() {
+    // #1685: `index_add` re-serializes the WHOLE enumeration index on every
+    // insert, so nothing bounded how many pages could ever exist bounds the
+    // index's own size. `MAX_PAGES` refuses growth past the count the index
+    // can hold while staying under `MAX_BLOCK_LEN`.
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        for i in 0..MAX_PAGES {
+            apply_commit_as(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: format!("page-{i:06}"),
+                    title: String::new(),
+                },
+                user("alice"),
+            )
+            .await;
+        }
+        assert_eq!(p.load_index().await.unwrap().len(), MAX_PAGES);
+        apply_err_as(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "one-too-many".into(),
+                title: String::new(),
+            },
+            user("alice"),
+            "too many pages",
+        )
+        .await;
+        assert_eq!(p.load_index().await.unwrap().len(), MAX_PAGES);
     });
 }

@@ -1,6 +1,7 @@
-//! THE DAEMON'S LIFE, AND THE TWO WAYS OUT OF IT. Closing a window is not
-//! quitting: the process leaves only when someone says so, through the tray's
-//! Quit or ⌘Q. Every shape below is one a later edit can undo without failing a
+//! THE DAEMON'S LIFE, AND THE WAYS OUT OF IT. Closing a window is not
+//! quitting where a status item can hold the daemon (macOS): there the process
+//! leaves only when someone says so, through the tray's Quit or ⌘Q. Off macOS
+//! there is no status item, and the last close leaves. Every shape below is one a later edit can undo without failing a
 //! build, and the scenarios in `ui/tests/app.ice` cannot cover them — the test
 //! harness swallows `runtime::Action::Exit` (`ui-lang-runtime/src/testing.rs`),
 //! so "it exited" and "it did NOT exit" are both unassertable there. What a
@@ -21,13 +22,15 @@ fn handler(name: &str) -> String {
         .unwrap_or_else(|| panic!("lifecycle.ice routes `{name}`"))
 }
 
-/// A CLOSED WINDOW ENDS NOTHING. This is the whole of the user-visible rule:
-/// the handler unregisters the slot the window held and stops. An `exit` back
-/// in here turns the red button into a quit again — the exact regression this
-/// guards, and the one a scenario cannot catch because the harness ignores the
-/// exit it would have to observe.
+/// A CLOSED WINDOW ENDS NOTHING BY ITSELF. The handler unregisters the slot
+/// the window held and then asks ONE decide-fn whether this close leaves —
+/// true only off macOS, where no status item exists, once no window remains.
+/// A bare `exit` back in here, or a survivor guard spelled inline, turns the
+/// red button into a quit on a Mac again — the exact regression this guards,
+/// and the one a scenario cannot catch because the harness ignores the exit
+/// it would have to observe.
 #[test]
-fn closing_a_window_never_exits() {
+fn closing_a_window_exits_only_where_no_status_item_lives() {
     let body = handler("window_was_closed");
     for slot in ["onboarding_win", "console_win", "huddle_win"] {
         assert!(
@@ -36,14 +39,49 @@ fn closing_a_window_never_exits() {
         );
     }
     assert!(
-        !body.contains("exit"),
-        "closing a window exits the process again: {body}"
+        body.contains("let leaving = last_window_closed_exits(console_win, onboarding_win)"),
+        "window_was_closed stopped asking the decide-fn: {body}"
+    );
+    assert!(
+        body.contains("return if !leaving"),
+        "the exit is no longer gated on the decide-fn: {body}"
+    );
+    assert!(
+        !body.contains("!= none"),
+        "the survivor guard is spelled inline again: {body}"
+    );
+    assert!(
+        EXTERNS.contains("pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool"),
+        "backend.ice lost the close-exits discriminant"
     );
 }
 
-/// QUIT IS SAID OUT LOUD, IN EXACTLY TWO PLACES. The tray's row and the ⌘Q
-/// chord are the only handlers that may leave; a third one is a way out nobody
-/// asked for, and it would most likely be a window path.
+/// OFF MACOS THE LAST CLOSE LEAVES, ON A MAC IT NEVER DOES. The decide-fn is
+/// the platform rule in one place; this pins both halves on the platform the
+/// test runs on.
+#[test]
+fn the_last_close_leaves_exactly_where_there_is_no_status_item() {
+    use crate::backend::last_window_closed_exits;
+    let some = Some(iced::window::Id::unique());
+    assert!(
+        !last_window_closed_exits(some, None),
+        "a close with the console still up must never leave"
+    );
+    assert!(
+        !last_window_closed_exits(None, some),
+        "a close with the launch window still up must never leave"
+    );
+    let no_status_item = !cfg!(target_os = "macos");
+    assert_eq!(
+        last_window_closed_exits(None, None),
+        no_status_item,
+        "the last close leaves exactly where no status item can hold the daemon"
+    );
+}
+
+/// QUIT IS SAID OUT LOUD, IN EXACTLY THREE PLACES. The tray's row, the ⌘Q
+/// chord and the last close off macOS are the only handlers that may leave; a
+/// fourth one is a way out nobody asked for.
 #[test]
 fn only_the_tray_row_and_the_quit_chord_leave() {
     let leaving: Vec<String> = ice_handlers(LIFECYCLE)
@@ -53,7 +91,11 @@ fn only_the_tray_row_and_the_quit_chord_leave() {
         .collect();
     assert_eq!(
         leaving,
-        vec!["tray_quit".to_owned(), "command_chord_pressed".to_owned()],
+        vec![
+            "window_was_closed".to_owned(),
+            "tray_quit".to_owned(),
+            "command_chord_pressed".to_owned(),
+        ],
         "the set of handlers that exit changed"
     );
 }
@@ -74,14 +116,14 @@ fn the_tray_open_row_branches_once_on_a_discriminant() {
         .filter(|line| line.trim_start().starts_with("match "))
         .count();
     assert_eq!(branches, 1, "one branch, not a ladder: {body}");
-    assert!(body.contains("TrayOpen.open"), "no open arm: {body}");
-    assert!(body.contains("TrayOpen.raise"), "no raise arm: {body}");
+    assert!(body.contains("WindowSummon.open"), "no open arm: {body}");
+    assert!(body.contains("WindowSummon.raise"), "no raise arm: {body}");
     assert!(
         body.contains("task window open onboarding"),
         "the open arm no longer opens a window: {body}"
     );
     assert!(
-        EXTERNS.contains("pure tray_open_action(console:window-id?, onboarding:window-id?) -> TrayOpen"),
+        EXTERNS.contains("pure tray_open_action(console:window-id?, onboarding:window-id?) -> WindowSummon"),
         "backend.ice lost the tray-open discriminant"
     );
 }

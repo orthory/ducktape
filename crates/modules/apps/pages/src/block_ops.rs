@@ -1,4 +1,7 @@
-use super::{Block, BlockKind, MAX_PAGE_DEPTH, PageError, PageMsg, Pages, to_page_err};
+use super::{
+    Block, BlockKind, MAX_BLOCK_ID_BYTES, MAX_PAGE_DEPTH, Origin, PageError, PageMsg, Pages,
+    author_from_origin, id_is_index_safe, to_page_err,
+};
 use crate::text_ranges::{edit_between, rebase_marks, set_span_mark, utf16_len, validate_marks};
 
 /// resolve an `after` sibling anchor to the insert index within `children`:
@@ -16,13 +19,21 @@ fn idx_after(children: &[String], after: &Option<String>) -> Result<usize, PageE
 }
 
 impl Pages {
-    pub(super) async fn apply_block_op(&mut self, msg: PageMsg) -> Result<(), PageError> {
+    pub(super) async fn apply_block_op(
+        &mut self,
+        msg: PageMsg,
+        origin: &Origin,
+    ) -> Result<(), PageError> {
+        let actor = author_from_origin(origin)?;
         match msg {
             PageMsg::InsertBlock {
                 parent,
                 after,
                 block,
             } => {
+                if block.id.len() > MAX_BLOCK_ID_BYTES || !id_is_index_safe(&block.id) {
+                    return Err(PageError::IdTooLarge);
+                }
                 // global uniqueness: the id must be absent from the WHOLE
                 // store, not just this page — that is what makes a bare block
                 // id addressable (and referenceable) without page context.
@@ -38,6 +49,9 @@ impl Pages {
                 let mut parent_blk = self
                     .require_block(&parent, PageError::ParentNotFound)
                     .await?;
+                if !self.may_edit(&parent_blk.page, &actor).await? {
+                    return Err(PageError::NotPageAuthor);
+                }
                 let i = idx_after(&parent_blk.children, &after)?;
                 let parent_depth = self.page_depth(&parent_blk).await?;
                 if parent_depth >= MAX_PAGE_DEPTH {
@@ -53,6 +67,9 @@ impl Pages {
                 if creates_page {
                     self.index_add(&block.id, Some(parent_blk.page.clone()))
                         .await?;
+                    // a nested subpage records ITS OWN author — the inserting
+                    // actor — same as a top-level `CreatePage`.
+                    self.store_page_author(&block.id, &actor)?;
                 }
                 self.store_block(&Block {
                     id: block.id,
@@ -76,6 +93,9 @@ impl Pages {
                 let mut blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
+                if !self.may_edit(&blk.page, &actor).await? {
+                    return Err(PageError::NotPageAuthor);
+                }
                 // Validate the client-supplied atomic replacement before
                 // staging any rebased comment records.
                 let marks = marks
@@ -104,6 +124,9 @@ impl Pages {
                 let mut blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
+                if !self.may_edit(&blk.page, &actor).await? {
+                    return Err(PageError::NotPageAuthor);
+                }
                 set_span_mark(&mut blk.marks, &blk.text, start, end, kind, active)?;
                 self.store_block(&blk)
             }
@@ -117,6 +140,9 @@ impl Pages {
                 if blk.kind == BlockKind::Page {
                     return Err(PageError::PageKindImmutable);
                 }
+                if !self.may_edit(&blk.page, &actor).await? {
+                    return Err(PageError::NotPageAuthor);
+                }
                 blk.kind = kind;
                 self.store_block(&blk)
             }
@@ -126,6 +152,9 @@ impl Pages {
                     .await?;
                 if blk.kind != BlockKind::Todo {
                     return Err(PageError::NotTodo);
+                }
+                if !self.may_edit(&blk.page, &actor).await? {
+                    return Err(PageError::NotPageAuthor);
                 }
                 blk.checked = checked;
                 self.store_block(&blk)
@@ -144,6 +173,9 @@ impl Pages {
                 let mut blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
+                if !self.may_edit(&blk.page, &actor).await? {
+                    return Err(PageError::NotPageAuthor);
+                }
                 let moves_page = blk.kind == BlockKind::Page;
                 let old_parent_id = blk.parent.clone();
                 match parent {
@@ -177,6 +209,13 @@ impl Pages {
                             .await?;
                         if !moves_page && new_parent.page != blk.page {
                             return Err(PageError::CrossPageMove);
+                        }
+                        // grafting under `new_parent` mutates ITS page's tree
+                        // (its children list), so a page block moving under a
+                        // different page needs that page's authority too —
+                        // same-page moves recheck the source's own page.
+                        if !self.may_edit(&new_parent.page, &actor).await? {
+                            return Err(PageError::NotPageAuthor);
                         }
                         let new_parent_depth = if moves_page {
                             self.ancestry_excludes(&parent_id, &block_id).await?;
@@ -242,6 +281,9 @@ impl Pages {
                 let blk = self
                     .require_block(&block_id, PageError::BlockNotFound)
                     .await?;
+                if !self.may_edit(&blk.page, &actor).await? {
+                    return Err(PageError::NotPageAuthor);
+                }
                 let invalid_top_level = blk.parent.is_none() && blk.kind != BlockKind::Page;
                 if invalid_top_level {
                     return Err(PageError::Corrupt);
@@ -249,6 +291,13 @@ impl Pages {
                 let removal = self.preflight_subtree_removal(blk.clone()).await?;
                 if let Some(parent_id) = &blk.parent {
                     let mut parent = self.require_block(parent_id, PageError::Corrupt).await?;
+                    // a nested subpage's parent can belong to a DIFFERENT
+                    // page than the subpage itself; removing it also
+                    // mutates that page's children list, so it needs that
+                    // page's authority too.
+                    if parent.page != blk.page && !self.may_edit(&parent.page, &actor).await? {
+                        return Err(PageError::NotPageAuthor);
+                    }
                     let position = parent
                         .children
                         .iter()

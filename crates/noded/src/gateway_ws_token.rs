@@ -8,10 +8,13 @@
 //! socket; the door consumes the token, re-checking the `Origin`.
 //!
 //! Security properties (audit S3): a token is single-use, short-lived, and
-//! bound to the exact origin that minted it. A local process that guesses or
-//! steals a token still cannot use it without also presenting the bound origin,
-//! and a token is destroyed the instant it is consumed (or found expired), so a
-//! race between two upgrades cannot reuse one.
+//! bound to the exact origin the mint route derived from the request's own
+//! `Origin`/`x-duck-authority` headers (never from the request body — see
+//! `gateway_ws_token_mint` in `gateway_http.rs`). A local process that guesses
+//! or steals a token still cannot use it without also presenting that exact
+//! bound origin on the handshake, and a token is destroyed the instant it is
+//! consumed (or found expired), so a race between two upgrades cannot reuse
+//! one.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -27,6 +30,8 @@ struct Entry {
     origin: String,
     account_id: u64,
     name: gateway::RouteName,
+    path: String,
+    user_pop: Option<gateway::UserPop>,
     expires_at: Instant,
 }
 
@@ -35,6 +40,12 @@ struct Entry {
 pub struct WsGrant {
     pub account_id: u64,
     pub name: gateway::RouteName,
+    /// The origin-form socket path the page asked for at mint time — dialed
+    /// verbatim at the publisher instead of the door hardcoding `/`.
+    pub path: String,
+    /// The caller's proof-of-possession, forwarded unverified: only the
+    /// publisher (`caller_account`) ever resolves it to an account.
+    pub user_pop: Option<gateway::UserPop>,
 }
 
 #[derive(Default)]
@@ -47,9 +58,17 @@ impl WsTokenStore {
         Self::default()
     }
 
-    /// Mint a single-use token bound to `origin` and the resolved route,
-    /// valid for [`WS_TOKEN_TTL`].
-    pub fn mint(&self, origin: String, account_id: u64, name: gateway::RouteName) -> String {
+    /// Mint a single-use token bound to `origin`, the resolved route, the
+    /// socket `path` the page asked for, and the caller's proof (if the mint
+    /// request carried one) — valid for [`WS_TOKEN_TTL`].
+    pub fn mint(
+        &self,
+        origin: String,
+        account_id: u64,
+        name: gateway::RouteName,
+        path: String,
+        user_pop: Option<gateway::UserPop>,
+    ) -> String {
         let mut random = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut random);
         let token = random
@@ -64,6 +83,8 @@ impl WsTokenStore {
                 origin,
                 account_id,
                 name,
+                path,
+                user_pop,
                 expires_at: Instant::now() + WS_TOKEN_TTL,
             },
         );
@@ -79,17 +100,19 @@ impl WsTokenStore {
         if entry.expires_at <= Instant::now() {
             return None;
         }
-        // CEF serializes a custom-scheme page's origin as the literal "null"
-        // on WebSocket handshakes, so the exact pin cannot hold for the very
-        // browser this door serves. Accept that serialization: the mint is
-        // already same-origin-gated at the trusted duck:// scheme handler, and
-        // single-use + TTL + token secrecy remain the transport defense.
-        if entry.origin != origin && origin != "null" {
+        // Exact match only. "null" is a valid bound origin like any other
+        // (the mint pins whatever request.origin resolved to), but it is
+        // never a wildcard: a handshake sending literal "null" matches only a
+        // token minted for that literal string, which the mint never issues
+        // for a real caller.
+        if entry.origin != origin {
             return None;
         }
         Some(WsGrant {
             account_id: entry.account_id,
             name: entry.name,
+            path: entry.path,
+            user_pop: entry.user_pop,
         })
     }
 }
@@ -110,19 +133,34 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn round_trip_is_single_use_and_origin_bound() {
         let store = WsTokenStore::new();
-        let token = store.mint("duck://app.alice.duck".into(), 123, route());
+        let token = store.mint(
+            "duck://app.alice.duck".into(),
+            123,
+            route(),
+            "/socket".into(),
+            None,
+        );
 
         // Wrong origin never succeeds — and burns the token.
         assert!(store.consume(&token, "duck://evil.bob.duck").is_none());
         assert!(store.consume(&token, "duck://app.alice.duck").is_none());
 
-        // A fresh token is consumable exactly once.
-        let token = store.mint("duck://app.alice.duck".into(), 123, route());
+        // A fresh token is consumable exactly once, and dials the path it was
+        // minted for.
+        let token = store.mint(
+            "duck://app.alice.duck".into(),
+            123,
+            route(),
+            "/socket".into(),
+            None,
+        );
         assert_eq!(
             store.consume(&token, "duck://app.alice.duck"),
             Some(WsGrant {
                 account_id: 123,
                 name: route(),
+                path: "/socket".into(),
+                user_pop: None,
             })
         );
         assert!(store.consume(&token, "duck://app.alice.duck").is_none());
@@ -131,7 +169,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn expired_tokens_are_rejected() {
         let store = WsTokenStore::new();
-        let token = store.mint("duck://app.alice.duck".into(), 9, route());
+        let token = store.mint("duck://app.alice.duck".into(), 9, route(), "/".into(), None);
         tokio::time::advance(WS_TOKEN_TTL + Duration::from_secs(1)).await;
         assert!(store.consume(&token, "duck://app.alice.duck").is_none());
     }
@@ -139,10 +177,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn minting_prunes_expired_entries() {
         let store = WsTokenStore::new();
-        let stale = store.mint("duck://a.duck".into(), 1, route());
+        let stale = store.mint("duck://a.duck".into(), 1, route(), "/".into(), None);
         tokio::time::advance(WS_TOKEN_TTL + Duration::from_secs(1)).await;
         // Minting a new token prunes the stale one; the store never leaks.
-        let _fresh = store.mint("duck://b.duck".into(), 2, route());
+        let _fresh = store.mint("duck://b.duck".into(), 2, route(), "/".into(), None);
         assert!(store.consume(&stale, "duck://a.duck").is_none());
         assert_eq!(
             store.entries.lock().unwrap().len(),

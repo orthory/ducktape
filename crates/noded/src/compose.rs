@@ -33,15 +33,14 @@ pub type BoxFut<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> +
 
 /// the store source: a module id → its opened (or synced) authenticated store.
 /// the caller decides the lifecycle; a refused open is an `Err` naming why.
-pub type StoreSource<'a> =
-    dyn FnMut(&str) -> BoxFut<'a, Result<Box<dyn MerkleStore>, String>> + 'a;
+pub type StoreSource<'a> = dyn FnMut(&str) -> BoxFut<'a, Result<Box<dyn MerkleStore>, String>> + 'a;
 
 /// the snapshot source a [`Start::Resume`] installs from: a module id and its
 /// declared backing → the `(bytes, root)` to install, or `None` when the
 /// module's state at the boundary lives in its store or on its disk already.
 /// never asked for a store-backed module (its state IS its store).
-pub type SnapshotSource<'a> = dyn FnMut(&str, Backing) -> BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>>
-    + 'a;
+pub type SnapshotSource<'a> =
+    dyn FnMut(&str, Backing) -> BoxFut<'a, Result<Option<(Vec<u8>, StateRoot)>, String>> + 'a;
 
 /// the host-side disk substrates the odb-backed tenants open over.
 #[derive(Clone)]
@@ -103,7 +102,9 @@ pub enum Start<'a, 'b> {
     /// no state yet — a genesis tenant, a live admission, or a reopen before
     /// the module's first activation: its `__config` record seeds from the
     /// bindings (a store-backed module commits it into its merkle store, a
-    /// map-backed one installs it as its initial map).
+    /// map-backed one installs it as its initial map; an odb-backed one
+    /// carries it alongside the wrap in [`wasm_module`] regardless of `start`,
+    /// since it is never persisted — see [`wasm_host::CompiledModule::over_odb`]).
     Fresh,
     /// the module's state at a boundary: its store reopens or resyncs (the
     /// store source's business) and `snapshots(id, backing)` installs a
@@ -300,7 +301,7 @@ async fn native(
     };
     match id {
         "valset" => {
-            let mut valset = valset::Valset::new(id, store);
+            let mut valset = valset::Valset::new(id, store, "governance");
             if let Some((validators, _)) = founding {
                 for key in validators {
                     valset
@@ -316,7 +317,7 @@ async fn native(
             Ok(Box::new(valset))
         }
         "modules" => {
-            let mut registry = modules::Modules::new(id, store, "valset");
+            let mut registry = modules::Modules::new(id, store, "valset", "governance");
             if let Some((_, bundle)) = founding {
                 for (module_id, hash) in bundle {
                     registry
@@ -340,9 +341,11 @@ async fn native(
 
 /// the ONE wasm path: wrap `bytes` for `id` over the substrate its declared
 /// shape names. a store-backed module opens its store through the source; an
-/// odb-backed one opens the host substrate for its id; a map-backed one
-/// starts from an empty map. then the start: fresh seeds the `__config`
-/// record, a resume installs the boundary snapshot the source offers.
+/// odb-backed one opens the host substrate for its id and carries its
+/// `__config` alongside the wrapping call (never installed — see
+/// [`wasm_host::CompiledModule::over_odb`]); a map-backed one starts from an
+/// empty map. then the start: fresh seeds a MAP tenant's `__config` record, a
+/// resume installs the boundary snapshot the source offers.
 pub async fn wasm_module(
     id: &str,
     bytes: &[u8],
@@ -365,7 +368,11 @@ pub async fn wasm_module(
             }
             compiled.over_store(id, store)
         }
-        Backing::Odb => compiled.over_odb(id, open_odb(id, substrates)?),
+        Backing::Odb => {
+            let backing = open_odb(id, substrates)?;
+            let config = odb_genesis_config(id, &shape, bindings)?;
+            compiled.over_odb(id, backing, config)
+        }
     };
     let mut module = wrapped.map_err(|e| format!("{id} component loads: {e}"))?;
     match start {
@@ -391,7 +398,9 @@ pub async fn wasm_module(
         // `WasmModule::install` refuses), so the source is not even asked.
         Start::Resume { snapshots } => {
             let installs_snapshots = shape.backing != Backing::Store;
-            if installs_snapshots && let Some((snapshot, root)) = snapshots(id, shape.backing).await? {
+            if installs_snapshots
+                && let Some((snapshot, root)) = snapshots(id, shape.backing).await?
+            {
                 module
                     .install(&snapshot, root)
                     .map_err(|e| format!("{id} install: {e}"))?;
@@ -426,10 +435,7 @@ fn no_odb_substrate(id: &str) -> String {
 
 /// the odb-backed tenants' disk substrates, by id — `open` recovers each
 /// substrate's committed position (files' refs envelope, forge's branches).
-fn open_odb(
-    id: &str,
-    substrates: &Substrates,
-) -> Result<Box<dyn wasm_host::OdbBacking>, String> {
+fn open_odb(id: &str, substrates: &Substrates) -> Result<Box<dyn wasm_host::OdbBacking>, String> {
     match id {
         "files" => {
             let backing = files::FilesOdbBacking::open(id, substrates.duckfs_dir.clone())
@@ -473,6 +479,21 @@ async fn seed_store_config(
         .commit_batch(vec![(key, Some(config))])
         .await
         .map_err(|e| format!("{id} genesis config seeds: {e}"))
+}
+
+/// an ODB-BACKED module's `__config` bytes: `None` when the shape declares no
+/// config keys, else the same encoding a store-backed twin would seed —
+/// [`wasm_host::CompiledModule::over_odb`] carries it, not an install, since
+/// an odb backing has no key/value plane of its own to seed into.
+fn odb_genesis_config(
+    id: &str,
+    shape: &Shape,
+    bindings: &Bindings<'_>,
+) -> Result<Option<Vec<u8>>, String> {
+    if shape.config.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(encode_config(id, shape, bindings)?))
 }
 
 /// this module's `__config` bytes: every declared config key resolved against
@@ -556,8 +577,15 @@ impl host::ModuleFactory for Admissions {
             chain_id: &self.chain_id,
         };
         let mut stores = crate::bundle::qmdb_stores(&self.context);
-        let seated =
-            wasm_module(id, bytes, &mut stores, &self.substrates, &bindings, Start::Fresh).await;
+        let seated = wasm_module(
+            id,
+            bytes,
+            &mut stores,
+            &self.substrates,
+            &bindings,
+            Start::Fresh,
+        )
+        .await;
         let refusal = match seated {
             Ok(module) => return Ok(host::Admitted::Module(Box::new(module))),
             Err(refusal) => refusal,

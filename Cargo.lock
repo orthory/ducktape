@@ -1508,6 +1508,7 @@ dependencies = [
  "commonware-runtime",
  "guest-adapter",
  "host",
+ "identity",
  "index-guest",
  "sdk",
  "sdk-testkit",
@@ -2155,6 +2156,7 @@ dependencies = [
  "sdk",
  "statesync",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5501,6 +5503,7 @@ dependencies = [
  "ducktape-home",
  "rand 0.8.6",
  "tempfile",
+ "tracing",
  "zeroize",
 ]
 
@@ -5852,6 +5855,7 @@ version = "0.1.0"
 dependencies = [
  "data-plane",
  "opus-rs",
+ "rand 0.8.6",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6241,6 +6245,7 @@ dependencies = [
  "keyscheme",
  "kv",
  "libc",
+ "modules",
  "node",
  "saga",
  "sdk",
@@ -6357,6 +6362,7 @@ dependencies = [
  "blobstore",
  "borsh",
  "bytes",
+ "capability",
  "chat",
  "commonware-codec",
  "commonware-cryptography",
@@ -7195,6 +7201,8 @@ name = "overlay-net"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "blake2",
+ "chacha20poly1305",
  "commonware-runtime",
  "data-plane",
  "defguard_boringtun",
@@ -9335,6 +9343,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

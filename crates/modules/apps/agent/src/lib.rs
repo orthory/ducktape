@@ -127,6 +127,28 @@ pub fn validate_agent_id(agent_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// a skill's `source_prefix` must be a SCOPED duckfs subtree, never a
+/// namespace root: `resolve_skills` copies it verbatim into a run's
+/// dispatch payload, and the provisioner's checkout runs one full checkout
+/// per mount, so an unscoped prefix ("/", "/shared", "/home/<x>") makes every
+/// run of the agent check out the whole namespace once per curated skill.
+///
+/// this is a local, minimal stand-in for `files::paths::canonical` (absolute,
+/// `/`-separated, no empty/dot segments, at least 3 segments deep — the same
+/// depth `library_skills` requires for `/shared/skills/<name>`): the agent
+/// module is self-contained by design (see the crate doc), so it does not
+/// depend on another module's crate for this shape check.
+fn is_scoped_duckfs_prefix(prefix: &str) -> bool {
+    if !prefix.starts_with('/') || prefix.contains('\0') {
+        return false;
+    }
+    let segments: Vec<&str> = prefix.trim_start_matches('/').split('/').collect();
+    let all_named = segments
+        .iter()
+        .all(|s| !s.is_empty() && *s != "." && *s != "..");
+    all_named && segments.len() >= 3
+}
+
 // ---- the module -----------------------------------------------------------
 
 /// storage-backed agent registry.
@@ -235,6 +257,23 @@ impl AgentModule {
         Ok(self.load(ROSTER_KEY).await?.unwrap_or_default())
     }
 
+    /// how many roster entries `owner` already holds — the per-owner cap
+    /// check. no secondary index: the roster is already bounded by
+    /// [`MAX_REGISTERED_AGENTS`], so a full scan at registration time (the
+    /// only caller) stays cheap and needs no extra replicated state.
+    async fn count_owned(&self, roster: &[String], owner: &SagaOrigin) -> Result<usize, Error> {
+        let mut count = 0;
+        for agent_id in roster {
+            let Some(record) = self.agent(agent_id).await? else {
+                continue;
+            };
+            if &record.owner == owner {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     // ---- shared validation ----------------------------------------------------
 
     fn validate_non_empty(field: &str, value: &str) -> Result<(), Error> {
@@ -291,9 +330,13 @@ impl AgentModule {
         Ok(caps)
     }
 
-    /// a v4 skill ref must carry a non-empty name and source_prefix; a pinned
-    /// snapshot, when present, must be non-empty. order is preserved verbatim
-    /// (skills are an ordered override list).
+    /// a v4 skill ref must carry a name that is [`is_skill_mount_name`] (the
+    /// SAME predicate the noded provisioner's `mount_dir_name` calls — one
+    /// rule, not two that could drift), unique within the record, and a
+    /// source_prefix that is a scoped duckfs subtree ([`is_scoped_duckfs_prefix`]),
+    /// also unique within the record. a pinned snapshot, when present, must be
+    /// non-empty. order is preserved verbatim (skills are an ordered override
+    /// list).
     ///
     /// the COUNT is capped ([`MAX_SKILLS_PER_AGENT`]) for the same reason the
     /// record's bytes are: the list is replicated state, and it is also the run's
@@ -308,14 +351,35 @@ impl AgentModule {
                 skills.len()
             )));
         }
+        let mut names = BTreeSet::new();
+        let mut prefixes = BTreeSet::new();
         for skill in skills {
-            if skill.name.is_empty() {
-                return Err(Error::Module("skill name must not be empty".into()));
+            if !is_skill_mount_name(&skill.name) {
+                return Err(Error::Module(format!(
+                    "skill name {:?} is not a safe mount directory name (want \
+                     [a-zA-Z0-9._-]+, at most {MAX_SKILL_NAME_BYTES} bytes, not \".\" or \"..\")",
+                    skill.name
+                )));
             }
-            if skill.source_prefix.is_empty() {
-                return Err(Error::Module(
-                    "skill source_prefix must not be empty".into(),
-                ));
+            if !names.insert(skill.name.as_str()) {
+                return Err(Error::Module(format!(
+                    "duplicate skill name {:?}",
+                    skill.name
+                )));
+            }
+            if !is_scoped_duckfs_prefix(&skill.source_prefix) {
+                return Err(Error::Module(format!(
+                    "skill source_prefix {:?} is not a scoped duckfs subtree \
+                     (want an absolute path at least 3 segments deep, e.g. \
+                     /shared/skills/<name>)",
+                    skill.source_prefix
+                )));
+            }
+            if !prefixes.insert(skill.source_prefix.as_str()) {
+                return Err(Error::Module(format!(
+                    "duplicate skill source_prefix {:?}",
+                    skill.source_prefix
+                )));
             }
             if let Some(snapshot) = &skill.source_snapshot
                 && snapshot.is_empty()
@@ -350,6 +414,34 @@ impl AgentModule {
         if record.owner != canonical_origin(&ctx.env().origin) {
             return Err(Error::Module(format!(
                 "only the owner may modify agent {agent_id}"
+            )));
+        }
+        Ok(record)
+    }
+
+    /// the governance module's follow-up after a passing proposal — the ONE
+    /// non-owner actor allowed to reach into another account's registration,
+    /// the same escape hatch a squatted-roster incident needs to recover
+    /// without a hard fork.
+    fn is_governance(origin: &Origin) -> bool {
+        matches!(origin, Origin::Module(module) if module == "governance")
+    }
+
+    /// deregistration's authority check: the recorded owner, or governance —
+    /// [`Self::owned_agent`] with the governance escape hatch added.
+    async fn deregistrable_agent(
+        &self,
+        ctx: &dyn Ctx,
+        agent_id: &str,
+    ) -> Result<AgentRecord, Error> {
+        let origin = &ctx.env().origin;
+        let Some(record) = self.agent(agent_id).await? else {
+            return Err(Error::Module(format!("unknown agent: {agent_id}")));
+        };
+        let is_owner = record.owner == canonical_origin(origin);
+        if !is_owner && !Self::is_governance(origin) {
+            return Err(Error::Module(format!(
+                "only the owner or governance may deregister agent {agent_id}"
             )));
         }
         Ok(record)
@@ -414,6 +506,12 @@ impl AgentModule {
                 if roster.len() >= MAX_REGISTERED_AGENTS {
                     return Err(Error::Module(format!(
                         "agent registry is full: {MAX_REGISTERED_AGENTS} agents"
+                    )));
+                }
+                let owner_agents = self.count_owned(&roster, &owner).await?;
+                if owner_agents >= MAX_AGENTS_PER_OWNER {
+                    return Err(Error::Module(format!(
+                        "owner already registered {MAX_AGENTS_PER_OWNER} agents: the per-owner cap"
                     )));
                 }
                 roster.insert(position, agent_id.clone());
@@ -509,7 +607,29 @@ impl AgentModule {
             AgentMsg::ResumeAgent { agent_id } => {
                 self.stage_status(ctx, agent_id, AgentStatus::Active, now).await
             }
+            AgentMsg::DeregisterAgent { agent_id } => self.on_deregister(ctx, agent_id).await,
         }
+    }
+
+    /// remove `agent_id` from the registry: the record and its roster slot
+    /// commit or abort together, same as registration. notifies the hook so
+    /// the dispatch-plane recipe is retired in the same block — the recipe
+    /// owner is `Origin::Module("runs")` (the hook target itself emits
+    /// `RegisterRecipe`), so runs' own `RemoveRecipe` follow-up is always
+    /// authorized regardless of who deregistered the agent here.
+    async fn on_deregister(&mut self, ctx: &mut dyn Ctx, agent_id: String) -> Result<(), Error> {
+        self.deregistrable_agent(ctx, &agent_id).await?;
+        let mut roster = self.roster().await?;
+        let Ok(position) = roster.binary_search(&agent_id) else {
+            // the roster is the one existence authority (see RegisterAgent):
+            // an id with a record but no roster slot cannot happen.
+            return Err(Error::Module(format!("unknown agent: {agent_id}")));
+        };
+        roster.remove(position);
+        self.store(ROSTER_KEY.to_vec(), &roster);
+        self.staged.delete(agent_key(&agent_id));
+        self.emit_hook(ctx, &AgentEvent::Deregistered { agent_id });
+        Ok(())
     }
 
     async fn stage_status(
@@ -803,7 +923,7 @@ mod tests {
         let skills: Vec<SkillRef> = (0..=MAX_SKILLS_PER_AGENT)
             .map(|i| SkillRef {
                 name: format!("s{i}"),
-                source_prefix: "/p".into(),
+                source_prefix: format!("/shared/skills/s{i}"),
                 source_snapshot: None,
                 load: LoadMode::OnDemand,
             })
@@ -815,6 +935,91 @@ mod tests {
         );
         // one under is fine — the cap is a ceiling, not an off-by-one trap.
         assert!(AgentModule::validate_skills(&skills[..MAX_SKILLS_PER_AGENT]).is_ok());
+    }
+
+    /// the mount-name shape rule, exercised straight against the validator:
+    /// a name the provisioner's `mount_dir_name` would refuse (a space, a
+    /// slash, a non-ASCII byte) must never reach a committed record.
+    #[test]
+    fn a_skill_name_the_provisioner_would_refuse_is_refused_at_registration() {
+        let skill = |name: &str| SkillRef {
+            name: name.into(),
+            source_prefix: "/shared/skills/x".into(),
+            source_snapshot: None,
+            load: LoadMode::OnDemand,
+        };
+        for bad in ["code review", "a/b", "..", ".", "", "café"] {
+            let err = AgentModule::validate_skills(&[skill(bad)]).unwrap_err();
+            assert!(
+                matches!(&err, Error::Module(m) if m.contains("safe mount directory name")),
+                "{bad:?} must be refused as an unsafe mount name: {err:?}"
+            );
+        }
+        assert!(AgentModule::validate_skills(&[skill("code-review")]).is_ok());
+    }
+
+    /// two skills curated under the same name would collide at mount time —
+    /// refused before either reaches a run.
+    #[test]
+    fn duplicate_skill_names_are_refused() {
+        let skills = vec![
+            SkillRef {
+                name: "qa".into(),
+                source_prefix: "/shared/skills/qa-a".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+            SkillRef {
+                name: "qa".into(),
+                source_prefix: "/shared/skills/qa-b".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+        ];
+        let err = AgentModule::validate_skills(&skills).unwrap_err();
+        assert!(matches!(&err, Error::Module(m) if m.contains("duplicate skill name")));
+    }
+
+    /// a skill's source_prefix must be a scoped duckfs subtree — a namespace
+    /// root would make every run of the agent check out the whole namespace.
+    #[test]
+    fn an_unscoped_skill_source_prefix_is_refused() {
+        let skill = |prefix: &str| SkillRef {
+            name: "s".into(),
+            source_prefix: prefix.into(),
+            source_snapshot: None,
+            load: LoadMode::OnDemand,
+        };
+        for bad in ["/", "/shared", "/home/x", ""] {
+            let err = AgentModule::validate_skills(&[skill(bad)]).unwrap_err();
+            assert!(
+                matches!(&err, Error::Module(m) if m.contains("scoped duckfs subtree")),
+                "{bad:?} must be refused as unscoped: {err:?}"
+            );
+        }
+        assert!(AgentModule::validate_skills(&[skill("/shared/skills/x")]).is_ok());
+    }
+
+    /// two skills sharing a source_prefix would each drive a full checkout of
+    /// the same subtree — refused, even with distinct names.
+    #[test]
+    fn duplicate_skill_source_prefixes_are_refused() {
+        let skills = vec![
+            SkillRef {
+                name: "a".into(),
+                source_prefix: "/shared/skills/x".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+            SkillRef {
+                name: "b".into(),
+                source_prefix: "/shared/skills/x".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+        ];
+        let err = AgentModule::validate_skills(&skills).unwrap_err();
+        assert!(matches!(&err, Error::Module(m) if m.contains("duplicate skill source_prefix")));
     }
 
     #[test]
@@ -855,6 +1060,50 @@ mod tests {
                         source_snapshot: None,
                         load: LoadMode::Always,
                     }]),
+                },
+            ),
+            // a skill name the noded provisioner would refuse as a mount dir.
+            (
+                user(9),
+                AgentMsg::RegisterAgent {
+                    agent_id: "a".into(),
+                    display_name: "A".into(),
+                    capability: "m".into(),
+                    allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: Some(vec![SkillRef {
+                        name: "code review".into(),
+                        source_prefix: "/shared/skills/code-review".into(),
+                        source_snapshot: None,
+                        load: LoadMode::OnDemand,
+                    }]),
+                },
+            ),
+            // two skills curated under the same name.
+            (
+                user(9),
+                AgentMsg::RegisterAgent {
+                    agent_id: "a".into(),
+                    display_name: "A".into(),
+                    capability: "m".into(),
+                    allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: Some(vec![
+                        SkillRef {
+                            name: "qa".into(),
+                            source_prefix: "/shared/skills/qa-a".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                        SkillRef {
+                            name: "qa".into(),
+                            source_prefix: "/shared/skills/qa-b".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                    ]),
                 },
             ),
             // an action outside the known vocabulary.
@@ -1055,6 +1304,122 @@ mod tests {
         assert_eq!(get_agent(&m, "bot").unwrap().status, AgentStatus::Active);
     }
 
+    /// a stranger may not deregister someone else's agent; the owner may,
+    /// and doing so frees the roster slot and retires the dispatch recipe.
+    #[test]
+    fn deregister_is_owner_gated_and_frees_the_slot() {
+        let mut m = module();
+        let mut ctx = ctx_at(0, user(9));
+        exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
+        commit(&mut m);
+
+        let mut stranger_ctx = ctx_at(1, user(2));
+        let err = exec(
+            &mut m,
+            &mut stranger_ctx,
+            &admin(&AgentMsg::DeregisterAgent {
+                agent_id: "bot".into(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        abort(&mut m);
+        assert!(
+            get_agent(&m, "bot").is_some(),
+            "the refused op staged nothing"
+        );
+
+        let mut owner_ctx = ctx_at(2, user(9));
+        exec(
+            &mut m,
+            &mut owner_ctx,
+            &admin(&AgentMsg::DeregisterAgent {
+                agent_id: "bot".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            hook_events(&owner_ctx),
+            vec![AgentEvent::Deregistered {
+                agent_id: "bot".into(),
+            }]
+        );
+        commit(&mut m);
+        assert!(get_agent(&m, "bot").is_none());
+        assert!(list_agents(&m).is_empty(), "the roster slot is freed");
+
+        // the freed slot is reusable — a fresh registration under the same
+        // id lands cleanly.
+        let mut ctx = ctx_at(3, user(1));
+        exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get_agent(&m, "bot").unwrap().owner,
+            canonical_origin(&user(1))
+        );
+    }
+
+    /// governance may deregister an agent it does not own — the escape hatch
+    /// a squatted-roster incident needs.
+    #[test]
+    fn governance_may_deregister_any_agent() {
+        let mut m = module();
+        let mut ctx = ctx_at(0, user(9));
+        exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
+        commit(&mut m);
+
+        let mut governance_ctx = ctx_at(1, Origin::Module("governance".into()));
+        exec(
+            &mut m,
+            &mut governance_ctx,
+            &admin(&AgentMsg::DeregisterAgent {
+                agent_id: "bot".into(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert!(get_agent(&m, "bot").is_none());
+    }
+
+    /// the per-owner cap: one owner may not fill the registry alone, and the
+    /// refusal names the cap. deregistering one of the owner's agents frees
+    /// a slot the SAME owner can immediately reuse.
+    #[test]
+    fn the_per_owner_cap_refuses_the_next_registration_and_a_deregister_frees_it() {
+        let mut m = module();
+        for i in 0..MAX_AGENTS_PER_OWNER {
+            let mut ctx = ctx_at(0, user(9));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register(&format!("a{i:04}"), &[])),
+            )
+            .unwrap();
+        }
+        commit(&mut m);
+
+        let mut ctx = ctx_at(0, user(9));
+        let err = exec(&mut m, &mut ctx, &admin(&register("overflow", &[]))).unwrap_err();
+        assert!(
+            matches!(&err, Error::Module(msg) if msg.contains(&MAX_AGENTS_PER_OWNER.to_string())),
+            "the refusal must name the per-owner cap: {err:?}"
+        );
+        abort(&mut m);
+
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::DeregisterAgent {
+                agent_id: "a0000".into(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        exec(&mut m, &mut ctx, &admin(&register("overflow", &[]))).unwrap();
+        commit(&mut m);
+        assert_eq!(list_agents(&m).len(), MAX_AGENTS_PER_OWNER);
+    }
+
     #[test]
     fn a_direct_saga_callback_is_a_dead_letter() {
         let mut m = module();
@@ -1131,14 +1496,23 @@ mod tests {
 
     /// the registry COUNT cap: the roster is one replicated record and the
     /// `All` engagement domain, so registration `MAX_REGISTERED_AGENTS + 1`
-    /// is refused loudly — and the refusal names the cap.
+    /// is refused loudly — and the refusal names the cap. spread the fill
+    /// across `MAX_REGISTERED_AGENTS / MAX_AGENTS_PER_OWNER` distinct owners
+    /// so the per-owner cap (a separate test) never fires first.
     #[test]
     fn the_registry_count_cap_refuses_the_next_registration() {
         let mut m = module();
-        let mut ctx = ctx_at(0, user(9));
+        let owners = MAX_REGISTERED_AGENTS / MAX_AGENTS_PER_OWNER;
         for i in 0..MAX_REGISTERED_AGENTS {
-            exec(&mut m, &mut ctx, &admin(&register(&format!("a{i:04}"), &[]))).unwrap();
+            let mut ctx = ctx_at(0, user((i % owners) as u8));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register(&format!("a{i:04}"), &[])),
+            )
+            .unwrap();
         }
+        let mut ctx = ctx_at(0, user(owners as u8));
         let err = exec(&mut m, &mut ctx, &admin(&register("overflow", &[]))).unwrap_err();
         assert!(
             matches!(&err, Error::Module(msg) if msg.contains(&MAX_REGISTERED_AGENTS.to_string())),
@@ -1640,7 +2014,7 @@ mod tests {
         };
         let skills = vec![SkillRef {
             name: "s".into(),
-            source_prefix: "/p".into(),
+            source_prefix: "/shared/skills/s".into(),
             source_snapshot: Some("cc".repeat(32)),
             load: LoadMode::Always,
         }];

@@ -14,7 +14,6 @@
 //! these tests drive the SINGLE default repo (`repo: ""` is its canonical
 //! address); the multi-repo container is exercised end-to-end in `multi_repo.rs`.
 
-
 use std::path::{Path, PathBuf};
 
 use forge::Forge;
@@ -79,7 +78,8 @@ fn push(forge: &mut Forge, prev: Option<&[u8]>, new: &[u8], digest: &[u8]) {
 /// closure, not just the tip).
 fn source(tag: &str) -> (PathBuf, Forge) {
     let base = tmp_base(tag);
-    let commits = forge::testkit::history(tag, &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")]);
+    let commits =
+        forge::testkit::history(tag, &[(1, "a.txt", "one", "c1"), (2, "b.txt", "two", "c2")]);
     let blobs = blobstore::BlobHandle::default();
     let digests = commits
         .iter()
@@ -133,9 +133,10 @@ fn build_container(name: &str, oid: &[u8], pack: &[u8]) -> Vec<u8> {
 /// the TRK1 magic + a zero repo count.
 fn empty_tracker_section() -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&8u32.to_le_bytes());
+    out.extend_from_slice(&12u32.to_le_bytes());
     out.extend_from_slice(b"TRK\x01");
-    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // accepted_chain: empty = None
+    out.extend_from_slice(&0u32.to_le_bytes()); // repo count
     out
 }
 

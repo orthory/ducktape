@@ -39,17 +39,116 @@ pub(crate) fn reopen_preflight_synced_host(host: &Host, expected: StateRoot) -> 
     Ok(())
 }
 
+/// the participant set this node ALREADY trusts, and the epoch it belongs to.
+///
+/// a node that has never seated anchors on the genesis descriptor's founding
+/// validators at epoch 0 (`config::Resolved::validators`, covered by the
+/// genesis fingerprint that domain-separates the namespace, so it is the one
+/// set an attacker cannot rewrite); a node that HAS seated anchors on its own
+/// recovered checkpoint. Without an anchor a served `Manifest` is entirely
+/// self-describing: it names the very keys its floor certificate is checked
+/// against, so three keys plus the victim's are a "quorum" of a set the
+/// attacker chose.
+#[derive(Clone, Copy)]
+pub(crate) struct TrustAnchor<'a> {
+    pub(crate) epoch: u64,
+    /// raw ed25519 public-key bytes, order-independent.
+    pub(crate) participants: &'a [Vec<u8>],
+}
+
+/// bind a served participant set to what this node already trusts.
+///
+/// At the anchor's OWN epoch the sets must be identical — nothing about an
+/// epoch changes after its cutover. Past it there is no transition chain on
+/// the wire to verify (each epoch's set is read from app state frozen at the
+/// cutover, and no consensus artifact attests it), so the rule is the one a
+/// quorum argument still supports: every quorum of the served set must contain
+/// at least one anchor key, i.e. more than `f(served)` of the served keys are
+/// anchor keys. A source holding no key of the anchored set — a resident, the
+/// lowest admitted tier, or any outsider — then cannot assemble a floor over a
+/// set it invented, whatever it claims about epochs.
+pub(crate) fn verify_manifest_participants(
+    anchor: TrustAnchor<'_>,
+    boundary: &statesync::Manifest,
+) -> Result<(), String> {
+    use commonware_utils::{Faults as _, N3f1};
+    use std::collections::BTreeSet;
+
+    let served: BTreeSet<&[u8]> = boundary.participants.iter().map(Vec::as_slice).collect();
+    if served.is_empty() {
+        return Err("manifest_participants_empty: served boundary names no participants".into());
+    }
+    if served.len() != boundary.participants.len() {
+        return Err(
+            "manifest_participants_duplicated: served participant set repeats a key".into(),
+        );
+    }
+    let trusted: BTreeSet<&[u8]> = anchor.participants.iter().map(Vec::as_slice).collect();
+    if boundary.epoch < anchor.epoch {
+        return Err(format!(
+            "manifest_epoch_below_anchor: served epoch {} is below the epoch {} this node \
+             already trusts",
+            boundary.epoch, anchor.epoch
+        ));
+    }
+    if boundary.epoch == anchor.epoch {
+        if served != trusted {
+            return Err(format!(
+                "manifest_participants_differ_at_anchor_epoch: served epoch {} names {} keys, \
+                 not the {} this node trusts for it",
+                boundary.epoch,
+                served.len(),
+                trusted.len()
+            ));
+        }
+        return Ok(());
+    }
+    let anchored = served.intersection(&trusted).count();
+    let tolerated = N3f1::max_faults(served.len()) as usize;
+    if anchored <= tolerated {
+        return Err(format!(
+            "manifest_participants_unanchored: served epoch {} names {} keys of which only \
+             {anchored} are anchored at epoch {} (need more than {tolerated}, so every quorum \
+             holds an anchored key)",
+            boundary.epoch,
+            served.len(),
+            anchor.epoch
+        ));
+    }
+    Ok(())
+}
+
+/// verify a served boundary before ANY of it is adopted: its participant set
+/// against the local trust anchor, then its finalization floor against that
+/// set.
+///
+/// A served floor is ALWAYS verified, and a MISSING one is admissible in
+/// exactly the shape the serving node is allowed to produce it
+/// (`validator::run::sync`: a boundary is served bare only when
+/// `height <= view_base`) — a checkpoint captured before a cutover, whose
+/// epoch has finalized nothing yet. That window cannot be closed by demanding
+/// a certificate: the joiner is often IN the new epoch's participant set, so
+/// no finalization can exist until it seats, and requiring one deadlocks the
+/// promotion. What that boundary rests on instead is the participant check
+/// above; certifying it needs the PREVIOUS epoch's floor and its participants
+/// on the wire — the same epoch-chain the anchor rule works around.
 pub(crate) fn verify_manifest_floor(
     namespace: &[u8],
+    anchor: TrustAnchor<'_>,
     boundary: &statesync::Manifest,
 ) -> Result<Option<Vec<u8>>, String> {
-    if boundary.height <= boundary.view_base {
+    verify_manifest_participants(anchor, boundary)?;
+    let Some(cert) = boundary.floor_cert.clone() else {
+        let bare_boundary_is_servable = boundary.height <= boundary.view_base;
+        if !bare_boundary_is_servable {
+            return Err(format!(
+                "manifest_floor_missing: boundary at height {} is past its epoch base \
+                 (epoch {} base {}) and carries no finalization floor",
+                boundary.height, boundary.epoch, boundary.view_base
+            ));
+        }
         return Ok(None);
-    }
-    let cert = boundary
-        .floor_cert
-        .clone()
-        .ok_or_else(|| "boundary past its epoch base has no finalization floor".to_string())?;
+    };
     let mut keys = Vec::with_capacity(boundary.participants.len());
     for k in &boundary.participants {
         let pk = ed25519::PublicKey::decode(k.as_slice())
@@ -113,6 +212,85 @@ pub(crate) type ServedSeal = (
     Vec<(sdk::ModuleId, StateRoot)>,
 );
 
+/// the backfill lane's ONE trust check, as a decision:
+/// [`node::OrderedNode::admit_backfilled`] stores an unverified source's
+/// frame bytes with no certificate check, so what OUR fold produced must
+/// agree with the served seal on BOTH halves — the disposition and the
+/// root-hash — exactly as the post-reboot catch-up
+/// ([`crate::sync::catchup::apply_verified_suffix_frame`]) verifies them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealVerdict {
+    Agrees,
+    /// our fold sealed NOTHING at this height — every frame discarded. for a
+    /// backfilled height that is not an exemption from the check but the
+    /// loudest failure of it: a discard is never journaled, so no honest
+    /// source holds a seal to serve here at all.
+    NothingSealed,
+    Disposition {
+        ours: node::Disposition,
+        served: node::Disposition,
+    },
+    Root {
+        ours: StateRoot,
+        served: StateRoot,
+    },
+}
+
+/// compare one backfilled height's fold against its served seal. the fold is
+/// given in `project_block`'s own terms — `sealed_hash` is `None` when every
+/// frame at the height discarded, and `applied` is "any member applied",
+/// which is the batch-level disposition the served seal carries.
+pub(crate) fn check_served_seal(
+    sealed_hash: Option<StateRoot>,
+    applied: bool,
+    served: &ServedSeal,
+) -> SealVerdict {
+    let (served_disposition, served_hash, _) = served;
+    let Some(our_hash) = sealed_hash else {
+        return SealVerdict::NothingSealed;
+    };
+    let ours = if applied {
+        node::Disposition::Applied
+    } else {
+        node::Disposition::Rejected
+    };
+    if ours != *served_disposition {
+        return SealVerdict::Disposition {
+            ours,
+            served: *served_disposition,
+        };
+    }
+    if our_hash != *served_hash {
+        return SealVerdict::Root {
+            ours: our_hash,
+            served: *served_hash,
+        };
+    }
+    SealVerdict::Agrees
+}
+
+/// log the module(s) whose root disagrees with the served seal — the one lead
+/// an operator (or the next debugger) needs before the fatal.
+pub(crate) fn name_diverged_modules(
+    host: &Host,
+    label: &str,
+    served_roots: &[(sdk::ModuleId, StateRoot)],
+) {
+    for (module, served_root) in served_roots {
+        let ours = host.module_root(module);
+        if ours.as_ref() != Some(served_root) {
+            tracing::error!(
+                target: "ducktape::consensus",
+                node = %label,
+                module,
+                served = %hex(served_root),
+                ours = %ours.map(|r| hex(&r)).unwrap_or_else(|| "none".into()),
+                "replica module diverged"
+            );
+        }
+    }
+}
+
 /// a failed backfill, split by whether retrying the same range can ever
 /// succeed. `permanent` means the SOURCE no longer holds the frames — the
 /// range fell below its retention floor while this follower was suspended
@@ -162,8 +340,20 @@ where
         up_to_view,
         "replica backfill"
     );
+    let mut refused_past_ceiling = 0usize;
     for f in frames {
         let view = f.height.saturating_sub(view_base);
+        // THE CUTOVER CEILING IS AN ADMISSION RULE HERE TOO: a batch at or
+        // past the armed cutover view is discarded whole by every honest node
+        // and never journaled, so no honest source holds a seal to serve for
+        // it. refuse the bytes rather than admit them from an unverified
+        // source and discover the lie (or fail to, the fold sealing nothing)
+        // after the drain.
+        let past_ceiling = node_r.view_ceiling().is_some_and(|ceiling| view >= ceiling);
+        if past_ceiling {
+            refused_past_ceiling += 1;
+            continue;
+        }
         seal_checks.insert(
             f.height,
             (
@@ -175,6 +365,16 @@ where
         if node_r.orderer_mut().admit_backfilled(view, f.frame.clone()) {
             *watermark = Some(view);
         }
+    }
+    if refused_past_ceiling > 0 {
+        tracing::warn!(
+            target: "ducktape::statesync",
+            node = %label,
+            frames = refused_past_ceiling,
+            ceiling = node_r.view_ceiling(),
+            reason = "served_past_cutover_ceiling",
+            "refused backfilled frames a cutover discards"
+        );
     }
     Ok(())
 }
@@ -268,7 +468,10 @@ where
         pos,
         1,
     ) {
-        Ok(m) => m,
+        // this checkpoint IS the journal's genesis for a synced identity, so
+        // the boundary's replay window is the only thing a restart from it
+        // could restore — carry it rather than re-open replay at every reboot.
+        Ok(m) => m.with_replay_window(boundary.applied_frames.clone()),
         Err(e) => {
             fatal!(label, "{diag_tag} capture: {e}");
         }
@@ -821,6 +1024,153 @@ pub(crate) async fn drive_sync_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// the backfill lane's trust check: BOTH halves, and a fold that sealed
+    /// nothing is a refusal, not an exemption.
+    #[test]
+    fn a_served_seal_is_checked_on_disposition_and_root_and_never_skipped() {
+        let root = |b: u8| -> StateRoot { StateRoot([b; sdk::ROOT_LEN]) };
+        let seal = |d: node::Disposition, r: u8| -> ServedSeal { (d, root(r), Vec::new()) };
+
+        assert_eq!(
+            check_served_seal(Some(root(1)), true, &seal(node::Disposition::Applied, 1)),
+            SealVerdict::Agrees
+        );
+        // a batch every frame discarded — the served-past-the-ceiling shape:
+        // the old `is_some_and` check short-circuited to "fine" here.
+        assert_eq!(
+            check_served_seal(None, false, &seal(node::Disposition::Applied, 1)),
+            SealVerdict::NothingSealed
+        );
+        // an unchanged root with the WRONG disposition: the half that was
+        // bound to `_` and never compared.
+        assert_eq!(
+            check_served_seal(Some(root(1)), false, &seal(node::Disposition::Applied, 1)),
+            SealVerdict::Disposition {
+                ours: node::Disposition::Rejected,
+                served: node::Disposition::Applied,
+            }
+        );
+        assert_eq!(
+            check_served_seal(Some(root(2)), true, &seal(node::Disposition::Applied, 1)),
+            SealVerdict::Root {
+                ours: root(2),
+                served: root(1),
+            }
+        );
+    }
+
+    /// a served boundary, with every field the attacker gets to choose.
+    fn served(epoch: u64, height: u64, view_base: u64, participants: &[u8]) -> statesync::Manifest {
+        statesync::Manifest {
+            height,
+            root_hash: StateRoot([9; sdk::ROOT_LEN]),
+            epoch,
+            view_base,
+            participants: participants.iter().map(|k| vec![*k; 32]).collect(),
+            residents: Vec::new(),
+            floor_cert: Some(vec![7; 8]),
+            entries: Vec::new(),
+            applied_frames: Vec::new(),
+        }
+    }
+
+    fn founding(keys: &[u8]) -> Vec<Vec<u8>> {
+        keys.iter().map(|k| vec![*k; 32]).collect()
+    }
+
+    /// a boundary PAST its epoch base must carry its floor — and it is
+    /// refused for the participant set FIRST, so an unanchored source cannot
+    /// even get its certificate looked at. (a bare boundary at/below the base
+    /// is the post-cutover window a serving node is allowed to answer with;
+    /// `latest_boundary_has_floor` and this function agree on that shape.)
+    #[test]
+    fn a_boundary_past_its_base_without_a_floor_is_refused() {
+        let anchor_keys = founding(&[1, 2, 3]);
+        let anchor = TrustAnchor {
+            epoch: 0,
+            participants: &anchor_keys,
+        };
+        let mut m = served(0, 9_000, 8_000, &[1, 2, 3]);
+        m.floor_cert = None;
+        let e = verify_manifest_floor(b"ns", anchor, &m).expect_err("no floor, no boundary");
+        assert!(e.starts_with("manifest_floor_missing:"), "{e}");
+        // the bare post-cutover shape, with the set still anchored.
+        let mut base = served(0, 9_000, 9_000, &[1, 2, 3]);
+        base.floor_cert = None;
+        assert_eq!(
+            verify_manifest_floor(b"ns", anchor, &base).expect("the post-cutover window"),
+            None
+        );
+        // ...but never with a set nothing local vouches for.
+        let mut unanchored = served(7, 9_000, 9_000, &[20, 21, 22, 23]);
+        unanchored.floor_cert = None;
+        let e = verify_manifest_floor(b"ns", anchor, &unanchored)
+            .expect_err("a bare boundary is still anchored");
+        assert!(e.starts_with("manifest_participants_unanchored:"), "{e}");
+    }
+
+    /// the whole primitive: an attacker's own keys plus the victim's, served
+    /// as "the epoch's participants". the set is refused BEFORE the floor is
+    /// verified, so a certificate the attacker self-signed over that very set
+    /// never gets a chance to check out.
+    #[test]
+    fn a_participant_set_the_anchor_cannot_vouch_for_is_refused() {
+        let anchor_keys = founding(&[1, 2, 3]);
+        let anchor = TrustAnchor {
+            epoch: 0,
+            participants: &anchor_keys,
+        };
+        // same epoch as the anchor: the sets must be identical.
+        let e = verify_manifest_participants(anchor, &served(0, 9_000, 8_000, &[1, 20, 21, 22]))
+            .expect_err("a different set at the anchor's own epoch");
+        assert!(
+            e.starts_with("manifest_participants_differ_at_anchor_epoch:"),
+            "{e}"
+        );
+        // a LATER epoch, where no transition chain is on the wire: the served
+        // set must still be quorum-blocked by the anchor. 1 of 4 anchored is
+        // f(4) = 1, so a quorum of the three attacker keys exists.
+        let e = verify_manifest_participants(anchor, &served(7, 9_000, 8_000, &[1, 20, 21, 22]))
+            .expect_err("an unanchored later epoch");
+        assert!(e.starts_with("manifest_participants_unanchored:"), "{e}");
+        // and the same trick with the epoch dialled BACKWARDS.
+        let e = verify_manifest_participants(
+            TrustAnchor {
+                epoch: 7,
+                participants: &anchor_keys,
+            },
+            &served(0, 9_000, 8_000, &[20, 21, 22]),
+        )
+        .expect_err("an epoch below the anchor's");
+        assert!(e.starts_with("manifest_epoch_below_anchor:"), "{e}");
+        // an empty set has no quorum to speak of.
+        let e = verify_manifest_participants(anchor, &served(7, 9_000, 8_000, &[]))
+            .expect_err("no participants at all");
+        assert!(e.starts_with("manifest_participants_empty:"), "{e}");
+    }
+
+    /// what an honest network still does: the anchor's own epoch served
+    /// verbatim, and later epochs that GREW around the anchored keys — 3 of 4
+    /// and 3 of 5 anchored leave no quorum without an anchored key.
+    #[test]
+    fn an_honest_boundary_still_passes_its_anchor() {
+        let anchor_keys = founding(&[1, 2, 3]);
+        let anchor = TrustAnchor {
+            epoch: 0,
+            participants: &anchor_keys,
+        };
+        verify_manifest_participants(anchor, &served(0, 9_000, 8_000, &[3, 1, 2]))
+            .expect("the same set, any order");
+        verify_manifest_participants(anchor, &served(1, 9_000, 8_000, &[1, 2, 3, 4]))
+            .expect("one promotion");
+        verify_manifest_participants(anchor, &served(4, 9_000, 8_000, &[1, 2, 3, 4, 5]))
+            .expect("two promotions");
+        // a repeated key is a set that is not one.
+        let e = verify_manifest_participants(anchor, &served(1, 9_000, 8_000, &[1, 2, 3, 3]))
+            .expect_err("duplicates");
+        assert!(e.starts_with("manifest_participants_duplicated:"), "{e}");
+    }
 
     #[test]
     fn tip_coords_and_index_ops_do_not_renew_the_lease() {

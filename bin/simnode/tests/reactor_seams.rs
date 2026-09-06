@@ -42,6 +42,15 @@ fn sid(origin: &str, id: &str) -> String {
 /// only when the spec decodes as a dispatch `WorkSpec`, so A3 hands it a real
 /// one; A4/A5 reach the saga before the spec is ever inspected.
 fn saga_trigger(saga_id: &str, spec: &[u8]) -> Value {
+    saga_trigger_with_capability(saga_id, spec, None)
+}
+
+/// like [`saga_trigger`], but names a capability tag: A3 needs one so the
+/// UNASSIGNED announcement's pool draws from the capability registry, not
+/// the raw valset — `--with-valset` there registers the echo worker's key as
+/// a validator so `Accept` admits it, and an untagged trigger would let that
+/// same validator auto-assign at TRIGGER time, skipping the bid entirely.
+fn saga_trigger_with_capability(saga_id: &str, spec: &[u8], capability: Option<&str>) -> Value {
     json!({ "trigger": {
         "saga_id": saga_id,
         "spec": spec,
@@ -50,7 +59,7 @@ fn saga_trigger(saga_id: &str, spec: &[u8]) -> Value {
         "deadline": null,
         "max_attempts": 1,
         "lease_views": null,
-        "capability": null,
+        "capability": capability,
         "demands": {},
         "pinned_assignee": null,
     }})
@@ -169,20 +178,47 @@ fn a_rule_posting_into_its_own_hooked_channel_fires_once_not_forever() {
 #[test]
 fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let sim = Sim::spawn(storage.path(), &["--echo-oracle"]); // hold mode + echo worker
+    // the echo worker bids for the announcement via `Accept`, which gates on
+    // valset standing — `--with-valset` registers `noded::ORACLE_ORIGIN`
+    // (32 bytes of `o`) as a genesis validator so the bid is admitted.
+    let oracle_key = "6f".repeat(32);
+    let sim = Sim::spawn(
+        storage.path(),
+        &["--echo-oracle", "--with-valset", &oracle_key],
+    ); // hold mode + echo worker
     let spec = echo_work_spec();
+    let capability = "sim-echo";
 
     // two peer blocks commit two triggers; each enqueues the worker's bid.
-    let b1 = sim.peer_block("saga", saga_trigger(&sid("peer", "s1"), &spec), "peer");
+    // the capability's provider pool is EMPTY at trigger time (the announce
+    // below lands after), so both stay unassigned announcements.
+    let b1 = sim.peer_block(
+        "saga",
+        saga_trigger_with_capability(&sid("peer", "s1"), &spec, Some(capability)),
+        "peer",
+    );
     assert_eq!(b1["height"], 1, "first trigger committed: {b1}");
     assert_eq!(sim.sim_state()["oracle_queued"], 1, "one follow-up queued");
-    let b2 = sim.peer_block("saga", saga_trigger(&sid("peer", "s2"), &spec), "peer");
+    let b2 = sim.peer_block(
+        "saga",
+        saga_trigger_with_capability(&sid("peer", "s2"), &spec, Some(capability)),
+        "peer",
+    );
     assert_eq!(b2["height"], 2, "second trigger committed: {b2}");
     assert_eq!(
         sim.sim_state()["oracle_queued"],
         2,
         "follow-ups queue behind each other — they never coalesce"
     );
+
+    // the echo worker announces itself as a "sim-echo" provider — Accept's
+    // capability gate needs this on top of the valset standing seeded above.
+    let announce = sim.peer_block(
+        "capability",
+        json!({ "announce": { "capabilities": [capability], "resources": {} } }),
+        &format!("hex:{oracle_key}"),
+    );
+    assert_eq!(announce["height"], 3, "the announce committed: {announce}");
 
     // a step drains EXACTLY ONE follow-up as its own oracle block: s1's bid,
     // whose won order queues s1's result BEHIND s2's still-parked bid.
@@ -191,7 +227,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
         r["committed"]["kind"], "oracle",
         "step drained an oracle follow-up: {r}"
     );
-    assert_eq!(r["committed"]["height"], 3);
+    assert_eq!(r["committed"]["height"], 4);
     assert_eq!(
         sim.sim_state()["oracle_queued"],
         2,
@@ -202,7 +238,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
     // — and its order — untouched.
     let wedge = sim.peer_block("chat", create_channel("aside", "Aside"), "rival");
     assert_eq!(
-        wedge["height"], 4,
+        wedge["height"], 5,
         "the wedge committed ahead of the queue: {wedge}"
     );
     assert_eq!(
@@ -213,7 +249,7 @@ fn each_step_drains_exactly_one_queued_oracle_follow_up_in_order() {
 
     // the rest drain one-per-step, each its own block, in queue order: s2's bid
     // (queuing s2's result), then s1's result, then s2's.
-    for (height, left) in [(5, 2), (6, 1), (7, 0)] {
+    for (height, left) in [(6, 2), (7, 1), (8, 0)] {
         let r = sim.step();
         assert_eq!(r["committed"]["kind"], "oracle");
         assert_eq!(r["committed"]["height"], height, "drained in order: {r}");
@@ -342,10 +378,11 @@ fn sweep_script() -> Vec<(&'static str, Value, Option<String>)> {
             json!({ "task": { "create_task": { "task_id": "t1", "title": "sweep" } } }),
             Some("owner".into()),
         ),
-        // inbox
+        // inbox — delivers to the "courier" origin's OWN queue: inbox refuses
+        // an external `Deliver` anywhere else.
         (
             "inbox",
-            json!({ "deliver": { "member": "alice", "kind": "note", "body": "hi" } }),
+            json!({ "deliver": { "member": harness::ext_actor("courier"), "kind": "note", "body": "hi" } }),
             Some("courier".into()),
         ),
         // the job board (the merged tasks module's `job` arm)

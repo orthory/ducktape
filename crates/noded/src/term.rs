@@ -41,7 +41,6 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use agent_service::wire;
 use axum::Json;
@@ -54,6 +53,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::NodeHandle;
+use crate::stream::{SeqMemory, resume_within};
 
 /// how many commands may be in flight to the agent daemon before a sender
 /// waits. Deep enough that a burst of keystrokes never blocks the ws reader;
@@ -67,6 +67,13 @@ const TERM_RING_MAX_BYTES: usize = 256 * 1024;
 /// least-recently-touched — closed sessions age out here. Shared by the output
 /// ring and the command-log ring.
 const TERM_RING_MAX_SESSIONS: usize = 16;
+/// how many session rings ONE peer's mirrored (remote) grains may occupy,
+/// across both rings. Per peer, never node-wide — the same discipline as
+/// [`term_remote::MAX_OBSERVED_PER_PEER`], smaller because a ring row is
+/// heavier than a binding: a flooding peer can fill at most half the shared
+/// cap with rings nobody but it is mirroring, never all of it, and never at
+/// the cost of evicting a ring this node OWNS (see [`SessionRing::owner`]).
+const TERM_RING_MAX_REMOTE_PER_PEER: usize = TERM_RING_MAX_SESSIONS / 2;
 /// how many commands each session's ordered command log retains for catch-up.
 /// A command is a submitted line (a prompt), so the count — not a byte cap — is
 /// the natural bound; past it the oldest ages out and a resuming reader lags.
@@ -136,9 +143,11 @@ impl TermFeedEvent {
 /// one entry of a session's ordered, attributed command log, as its serial
 /// consumer stamped it — the wire grain `term_plane` forwards to peer nodes.
 /// Unlike [`TermChunkEvent`] it carries `seq`: that is the AUTHORITATIVE total
-/// order the origin node's single consumer assigned, and a peer replays it
-/// verbatim via [`TermCommandRing::append_remote`] (which never re-stamps),
-/// so every node shows the same order. `text` can carry secrets — never logged.
+/// order the origin node's single consumer assigned, and a mirror rings it under
+/// that same number via [`TermCommandRing::append_remote`] (which never
+/// re-stamps), so every node shows the same order. The mirror still CHECKS the
+/// number against its own cursor — it is a claim from the wire, not an
+/// instruction. `text` can carry secrets — never logged.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TermCommandEvent {
     pub session: String,
@@ -173,6 +182,29 @@ struct TermRingInner {
     version: u64,
     touch: u64,
     sessions: BTreeMap<String, SessionRing>,
+    /// the numbering of sessions whose whole ring the LRU shed — see
+    /// [`SeqMemory`]. A still-live session that prints again after its ring was
+    /// dropped resumes its seq instead of restarting at 1.
+    memory: SeqMemory<()>,
+}
+
+impl TermRingInner {
+    /// shed a session's ROWS, never its numbering.
+    fn evict(&mut self, session: &str) {
+        let Some(ring) = self.sessions.remove(session) else {
+            return;
+        };
+        self.memory.remember(session, ring.next_seq, ());
+    }
+
+    /// the head an entry being (re-)created continues from. With every row
+    /// gone, that head is also the new floor.
+    fn restored_head(&self, session: &str) -> Option<u64> {
+        if self.sessions.contains_key(session) {
+            return None;
+        }
+        self.memory.recall(session).map(|(head, ())| head)
+    }
 }
 
 #[derive(Default)]
@@ -187,6 +219,12 @@ struct SessionRing {
     /// is over from this and closes, rather than blocking forever on a topic
     /// that will never append again (the wedge that stranded `agent pty`).
     ended: bool,
+    /// `None` — this node's OWN session (via [`TermRing::append`] /
+    /// [`TermRing::append_local_only`]). `Some(peer)` — a session this node
+    /// only MIRRORS, bound to whichever peer's grains first created this ring.
+    /// The eviction loop reads this: pressure from a remote append may only
+    /// evict a `Some` ring, never a `None` one — see #1745.
+    owner: Option<[u8; 32]>,
 }
 
 impl Default for TermRing {
@@ -206,15 +244,19 @@ impl TermRing {
     /// node-local ws subscribers, AND publishes it on the forwarder feed so
     /// `bin/node`'s `term_plane` fans it out to peer nodes.
     pub fn append(&self, session: &str, chunk_b64: String) {
-        self.push(session, chunk_b64, true);
+        self.push(session, chunk_b64, true, None);
     }
 
     /// append one chunk received FROM a peer node without re-broadcasting it —
     /// the ring-only path that breaks the fan-out loop. Only bumps the ring's
     /// `watch` version, which wakes this node's `term:<session>` ws subscribers;
     /// the raw byte stream is opaque, so the local ring stamps its own cursor.
-    pub fn append_remote(&self, event: TermChunkEvent) {
-        self.push(&event.session, event.chunk_b64, false);
+    ///
+    /// `peer` is the sender the plane's `feed_refusal` already bound this id
+    /// to — carried through so the ring can tag a NEW ring `owner`-ed by that
+    /// peer and cap how many rings any one peer occupies. See #1745.
+    pub fn append_remote(&self, event: TermChunkEvent, peer: [u8; 32]) {
+        self.push(&event.session, event.chunk_b64, false, Some(peer));
     }
 
     /// append a chunk from THIS node's pump WITHOUT forwarding it to peers — the
@@ -223,7 +265,7 @@ impl TermRing {
     /// is never fanned out, so a private terminal's bytes never leave the host.
     /// Only a Shared session (the huddle-style path) forwards.
     pub fn append_local_only(&self, session: &str, chunk_b64: String) {
-        self.push(session, chunk_b64, false);
+        self.push(session, chunk_b64, false, None);
     }
 
     /// end a FORWARDED session: flag the ring, wake this node's subscribers, AND
@@ -254,8 +296,13 @@ impl TermRing {
         let mut inner = self.inner.lock().expect("term ring lock poisoned");
         let touch = inner.touch + 1;
         let version = inner.version + 1;
+        let restored = inner.restored_head(session);
         {
             let ring = inner.sessions.entry(session.to_string()).or_default();
+            if let Some(head) = restored {
+                ring.next_seq = head;
+                ring.floor_seq = head;
+            }
             if ring.ended {
                 return; // already ended — the double-close race is a no-op
             }
@@ -264,6 +311,9 @@ impl TermRing {
         }
         inner.touch = touch;
         inner.version = version;
+        if restored.is_some() {
+            inner.memory.forget(session);
+        }
         drop(inner);
         let _ = self.watch.send(version);
         // AFTER the local flag and the watch: a peer learning of the end before
@@ -282,13 +332,39 @@ impl TermRing {
         inner.sessions.get(session).is_some_and(|ring| ring.ended)
     }
 
-    fn push(&self, session: &str, chunk_b64: String, publish: bool) {
+    /// `origin` is `None` for this node's own append, `Some(peer)` for a grain
+    /// mirrored from that peer — see [`SessionRing::owner`] and #1745.
+    fn push(&self, session: &str, chunk_b64: String, publish: bool, origin: Option<[u8; 32]>) {
         let mut inner = self.inner.lock().expect("term ring lock poisoned");
+        let is_new_ring = !inner.sessions.contains_key(session);
+        // a peer may not keep minting new mirrored rings past its own budget —
+        // refused before anything is mutated, so its already-open rings, and
+        // every ring this node owns, are untouched.
+        let peer_over_ring_budget = is_new_ring
+            && origin.is_some_and(|peer| {
+                inner
+                    .sessions
+                    .values()
+                    .filter(|ring| ring.owner == Some(peer))
+                    .count()
+                    >= TERM_RING_MAX_REMOTE_PER_PEER
+            });
+        if peer_over_ring_budget {
+            return;
+        }
         inner.version += 1;
         inner.touch += 1;
         let version = inner.version;
         let touch = inner.touch;
+        let restored = inner.restored_head(session);
         let ring = inner.sessions.entry(session.to_string()).or_default();
+        if is_new_ring {
+            ring.owner = origin;
+        }
+        if let Some(head) = restored {
+            ring.next_seq = head;
+            ring.floor_seq = head;
+        }
         ring.touched = touch;
         ring.next_seq += 1;
         let seq = ring.next_seq;
@@ -303,18 +379,26 @@ impl TermRing {
                 ring.floor_seq = evicted;
             }
         }
-        // evict least-recently-touched WHOLE sessions (closed ones age out).
+        // evict least-recently-touched WHOLE sessions (closed ones age out) —
+        // but pressure from a REMOTE append (`origin.is_some()`) may only ever
+        // evict a ring this node merely MIRRORS, never one it OWNS: otherwise a
+        // peer flooding fabricated ids evicts the operator's own live rows. See
+        // #1745.
+        let remote_pressure = origin.is_some();
         while inner.sessions.len() > TERM_RING_MAX_SESSIONS {
             let Some(victim) = inner
                 .sessions
                 .iter()
-                .filter(|(id, _)| *id != session)
+                .filter(|(id, ring)| *id != session && (!remote_pressure || ring.owner.is_some()))
                 .min_by_key(|(_, ring)| ring.touched)
                 .map(|(id, _)| id.clone())
             else {
                 break;
             };
-            inner.sessions.remove(&victim);
+            inner.evict(&victim);
+        }
+        if restored.is_some() {
+            inner.memory.forget(session);
         }
         drop(inner);
         let _ = self.watch.send(version);
@@ -344,7 +428,9 @@ impl TermRing {
         inner.touch += 1;
         let touch = inner.touch;
         let Some(ring) = inner.sessions.get_mut(session) else {
-            return (Vec::new(), 0);
+            // no ring, but the numbering may have outlived it: the evicted head
+            // is the floor, every row up to it being gone.
+            return (Vec::new(), inner.memory.head_of(session));
         };
         ring.touched = touch;
         let rows = ring
@@ -355,6 +441,16 @@ impl TermRing {
             .cloned()
             .collect();
         (rows, ring.floor_seq)
+    }
+
+    /// where a subscriber's cursor lands on this session's ring — see
+    /// [`resume_within`]. The catch-up path `Lagged`s whenever it moves.
+    pub fn resume_cursor(&self, session: &str, after: u64) -> u64 {
+        let inner = self.inner.lock().expect("term ring lock poisoned");
+        let Some(ring) = inner.sessions.get(session) else {
+            return inner.memory.head_of(session);
+        };
+        resume_within(after, ring.floor_seq, ring.next_seq)
     }
 
     /// wake on any append (the version counter), like the run-output watch.
@@ -389,6 +485,29 @@ struct TermCommandRingInner {
     version: u64,
     touch: u64,
     sessions: BTreeMap<String, CommandRing>,
+    /// the cursor of sessions whose whole command log the LRU shed — see
+    /// [`SeqMemory`]. THE fix for a shared session going quiet, being evicted,
+    /// and then taking another command: without it the next command restarts at
+    /// seq 1, which every mirror peer refuses as out-of-order forever.
+    memory: SeqMemory<()>,
+}
+
+impl TermCommandRingInner {
+    /// shed a session's COMMANDS, never its cursor.
+    fn evict(&mut self, session: &str) {
+        let Some(ring) = self.sessions.remove(session) else {
+            return;
+        };
+        self.memory.remember(session, ring.next_seq, ());
+    }
+
+    /// the cursor this session's log is at, whether or not it still holds one.
+    fn cursor(&self, session: &str) -> u64 {
+        match self.sessions.get(session) {
+            Some(ring) => ring.next_seq,
+            None => self.memory.head_of(session),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -397,6 +516,9 @@ struct CommandRing {
     floor_seq: u64,
     touched: u64,
     commands: VecDeque<(u64, String, String)>,
+    /// twin of [`SessionRing::owner`]: `None` for this node's own Shared
+    /// session, `Some(peer)` for one this node only mirrors.
+    owner: Option<[u8; 32]>,
 }
 
 impl Default for TermCommandRing {
@@ -411,32 +533,77 @@ impl Default for TermCommandRing {
     }
 }
 
+/// the seq a session's command ring will stamp next, given its cursor and — for
+/// a grain from a peer — the seq that grain carries. The RING owns the cursor: a
+/// local append advances it by one, and a peer's number is CHECKED before it may
+/// move it, never taken as given.
+///
+/// A mirror must tolerate a GAP (the forwarder feed drops grains when a peer
+/// stream lags, and a stalled command log would never recover), so a peer's seq
+/// only has to move the cursor FORWARD — but it may not reach `u64::MAX`, which
+/// would leave the cursor nowhere to advance to. Adopting one unchecked is what
+/// let a single frame carrying `u64::MAX` park the cursor at the ceiling: the
+/// next locally stamped command then overflowed it, panicking inside the ring
+/// mutex in a debug build (poisoning it and killing the command path node-wide)
+/// and wrapping to 0 in release (hiding the command from every `read_after`).
+///
+/// Pure, so the rule is testable without a ring. `Err` is a stable `reason`.
+fn next_command_seq(cursor: u64, seq_override: Option<u64>) -> Result<u64, &'static str> {
+    // the local step. Unreachable at the ceiling while a wire seq can never
+    // park the cursor there, and stated as a refusal rather than a wrap anyway.
+    let Some(wire) = seq_override else {
+        return cursor.checked_add(1).ok_or("command_seq_overflow");
+    };
+    let moves_backward = wire <= cursor;
+    if moves_backward {
+        return Err("command_seq_out_of_order");
+    }
+    let leaves_no_room = wire == u64::MAX;
+    if leaves_no_room {
+        return Err("command_seq_overflow");
+    }
+    Ok(wire)
+}
+
 impl TermCommandRing {
     /// append one accepted command from THIS node's serial consumer: rings it,
     /// wakes the node-local ws subscribers, AND publishes it on the forwarder
     /// feed so `term_plane` fans it out. Returns the assigned monotonic `seq` —
     /// the total order (starting at 1). The single per-session consumer is the
-    /// only local appender, so this ring's `next_seq` IS that order.
-    pub fn append(&self, session: &str, origin: &str, text: &str) -> u64 {
-        self.push(session, None, origin, text, true)
+    /// only local appender, so this ring's `next_seq` IS that order. `None` when
+    /// the ring refused the command (see [`Self::push`]).
+    pub fn append(&self, session: &str, origin: &str, text: &str) -> Option<u64> {
+        self.push(session, None, origin, text, true, None)
     }
 
     /// append one command received FROM a peer node without re-broadcasting it —
-    /// the ring-only path that breaks the fan-out loop. Preserves the origin
-    /// node's `seq` VERBATIM (never re-stamps): that node's serial consumer owns
-    /// the authoritative total order, so a peer replaying it must show the same
-    /// order. Off-consensus and observational, so this stays honest to the
-    /// origin's numbering rather than inventing a local one.
-    pub fn append_remote(&self, event: TermCommandEvent) {
+    /// the ring-only path that breaks the fan-out loop. The origin node's serial
+    /// consumer owns the authoritative total order, so the grain carries its
+    /// `seq` and this ring never re-stamps one — but it CHECKS it: the number
+    /// must move this ring's cursor forward (a gap is fine; the feed drops
+    /// grains when a peer stream lags) and must leave room to advance. A replay,
+    /// a reorder, or `u64::MAX` is dropped, never adopted.
+    ///
+    /// `peer` is the sender the plane's `feed_refusal` already bound this id
+    /// to — see [`TermRing::append_remote`] and #1745.
+    pub fn append_remote(&self, event: TermCommandEvent, peer: [u8; 32]) {
         self.push(
             &event.session,
             Some(event.seq),
             &event.origin,
             &event.text,
             false,
+            Some(peer),
         );
     }
 
+    /// ring one command and return the seq it was stamped with, or `None` when
+    /// the ring refused it (a peer's seq that is not the one this ring will
+    /// stamp next, or a peer over its mirrored-ring budget). Every refusal
+    /// carries a stable `reason`.
+    ///
+    /// `origin` is `None` for this node's own append, `Some(peer)` for a grain
+    /// mirrored from that peer — see [`CommandRing::owner`] and #1745.
     fn push(
         &self,
         session: &str,
@@ -444,27 +611,63 @@ impl TermCommandRing {
         origin: &str,
         text: &str,
         publish: bool,
-    ) -> u64 {
+        peer_origin: Option<[u8; 32]>,
+    ) -> Option<u64> {
         let mut inner = self.inner.lock().expect("term command ring lock poisoned");
+        let cursor = inner.cursor(session);
+        // decided BEFORE anything is mutated, so a refusal leaves the ring — and
+        // its cursor — exactly as it was.
+        let seq = match next_command_seq(cursor, seq_override) {
+            Ok(seq) => seq,
+            Err(reason) => {
+                drop(inner);
+                if let Some(occurrences) = TERM_WARN.hit(reason) {
+                    tracing::warn!(
+                        target: "ducktape::term",
+                        session = %session,
+                        reason,
+                        occurrences,
+                        "term command dropped"
+                    );
+                }
+                return None;
+            }
+        };
+        let is_new_ring = !inner.sessions.contains_key(session);
+        // a peer may not keep minting new mirrored command logs past its own
+        // budget — refused before anything is mutated, so its already-open
+        // rings, and every ring this node owns, are untouched.
+        let peer_over_ring_budget = is_new_ring
+            && peer_origin.is_some_and(|peer| {
+                inner
+                    .sessions
+                    .values()
+                    .filter(|ring| ring.owner == Some(peer))
+                    .count()
+                    >= TERM_RING_MAX_REMOTE_PER_PEER
+            });
+        if peer_over_ring_budget {
+            return None;
+        }
         inner.version += 1;
         inner.touch += 1;
         let version = inner.version;
         let touch = inner.touch;
+        // a re-created log continues the evicted one's numbering; with every
+        // command gone, that cursor is also its floor.
+        let restored = (!inner.sessions.contains_key(session))
+            .then(|| inner.memory.recall(session))
+            .flatten()
+            .map(|(head, ())| head);
         let ring = inner.sessions.entry(session.to_string()).or_default();
+        if is_new_ring {
+            ring.owner = peer_origin;
+        }
+        if let Some(head) = restored {
+            ring.floor_seq = head;
+        }
         ring.touched = touch;
-        // a local append stamps the next serial seq; a remote one carries the
-        // origin's seq verbatim (bump `next_seq` past it only to keep the local
-        // cursor monotonic — a peer never appends locally, so it is bookkeeping).
-        let seq = match seq_override {
-            Some(seq) => {
-                ring.next_seq = ring.next_seq.max(seq);
-                seq
-            }
-            None => {
-                ring.next_seq += 1;
-                ring.next_seq
-            }
-        };
+        ring.next_seq = seq;
         ring.commands
             .push_back((seq, origin.to_string(), text.to_string()));
         // evict oldest commands until under the count cap, always keeping the last.
@@ -473,18 +676,23 @@ impl TermCommandRing {
                 ring.floor_seq = evicted;
             }
         }
-        // evict least-recently-touched WHOLE sessions (closed ones age out).
+        // evict least-recently-touched WHOLE sessions (closed ones age out) —
+        // same remote-may-only-evict-remote rule as `TermRing::push`. See #1745.
+        let remote_pressure = peer_origin.is_some();
         while inner.sessions.len() > TERM_RING_MAX_SESSIONS {
             let Some(victim) = inner
                 .sessions
                 .iter()
-                .filter(|(id, _)| *id != session)
+                .filter(|(id, ring)| *id != session && (!remote_pressure || ring.owner.is_some()))
                 .min_by_key(|(_, ring)| ring.touched)
                 .map(|(id, _)| id.clone())
             else {
                 break;
             };
-            inner.sessions.remove(&victim);
+            inner.evict(&victim);
+        }
+        if restored.is_some() {
+            inner.memory.forget(session);
         }
         drop(inner);
         let _ = self.watch.send(version);
@@ -496,7 +704,7 @@ impl TermCommandRing {
                 text: text.to_string(),
             });
         }
-        seq
+        Some(seq)
     }
 
     /// subscribe the peer-forwarder feed: every LOCAL append (never a remote
@@ -518,7 +726,9 @@ impl TermCommandRing {
         inner.touch += 1;
         let touch = inner.touch;
         let Some(ring) = inner.sessions.get_mut(session) else {
-            return (Vec::new(), 0);
+            // no log, but the cursor may have outlived it: the evicted head is
+            // the floor, every command up to it being gone.
+            return (Vec::new(), inner.memory.head_of(session));
         };
         ring.touched = touch;
         let rows = ring
@@ -529,6 +739,16 @@ impl TermCommandRing {
             .cloned()
             .collect();
         (rows, ring.floor_seq)
+    }
+
+    /// where a subscriber's cursor lands on this session's command log — see
+    /// [`resume_within`]. The catch-up path `Lagged`s whenever it moves.
+    pub fn resume_cursor(&self, session: &str, after: u64) -> u64 {
+        let inner = self.inner.lock().expect("term command ring lock poisoned");
+        let Some(ring) = inner.sessions.get(session) else {
+            return inner.memory.head_of(session);
+        };
+        resume_within(after, ring.floor_seq, ring.next_seq)
     }
 
     /// wake on any append (the version counter), like the output ring's watch.
@@ -671,7 +891,10 @@ impl TermError {
             ),
             TermError::AtCapacity => (
                 StatusCode::TOO_MANY_REQUESTS,
-                format!("terminal session cap ({}) reached", agent_service::MAX_TERM_SESSIONS),
+                format!(
+                    "terminal session cap ({}) reached",
+                    agent_service::MAX_TERM_SESSIONS
+                ),
             ),
             TermError::Resolve(detail) => (StatusCode::BAD_REQUEST, detail),
             TermError::Spawn(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail),
@@ -852,13 +1075,8 @@ impl TerminalSessions {
     /// drop the link and end every session it was serving. See [`AttachGuard`].
     fn detach(&self) {
         *self.0.link.lock().expect("term link lock poisoned") = None;
-        let live = std::mem::take(
-            &mut *self
-                .0
-                .sessions
-                .lock()
-                .expect("term sessions lock poisoned"),
-        );
+        let live =
+            std::mem::take(&mut *self.0.sessions.lock().expect("term sessions lock poisoned"));
         if !live.is_empty() {
             tracing::warn!(
                 target: "ducktape::term",
@@ -906,10 +1124,7 @@ impl TerminalSessions {
                 reason,
                 detail,
             } => self.refused(&session, reason, detail),
-            wire::Event::TermOutput {
-                session,
-                chunk_b64,
-            } => self.output(&session, chunk_b64),
+            wire::Event::TermOutput { session, chunk_b64 } => self.output(&session, chunk_b64),
             wire::Event::TermEnded { session } => self.ended(&session),
         }
     }
@@ -1007,7 +1222,10 @@ impl TerminalSessions {
         // a session that ends before its create was answered (the child exited
         // instantly) still owes that create a reply.
         if let Some(live) = removed {
-            answer(live.reply, TermError::Spawn("the session ended immediately".into()));
+            answer(
+                live.reply,
+                TermError::Spawn("the session ended immediately".into()),
+            );
         }
     }
 
@@ -1268,7 +1486,12 @@ impl TerminalSessions {
             while let Some(Command { origin, text }) = rx.recv().await {
                 // record + wake subscribers BEFORE the pty write. Never log the
                 // command text — it can carry secrets.
-                let seq = bridge.0.cmd_ring.append(&id, &origin, &text);
+                // a refused stamp (the ring warns with its reason) means the
+                // command is in no log; feeding the pty anyway would leave
+                // output no row accounts for.
+                let Some(seq) = bridge.0.cmd_ring.append(&id, &origin, &text) else {
+                    continue;
+                };
                 tracing::debug!(target: "ducktape::term", session = %id, seq, %origin, "term_command");
                 // one write, not two: a submitted line is `text` plus the
                 // carriage return that submits it.
@@ -1379,7 +1602,7 @@ pub enum CreateRoute {
 }
 
 /// decode a 64-hex node key to its 32 bytes.
-fn decode_node_key(hex: &str) -> Option<[u8; 32]> {
+pub(crate) fn decode_node_key(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 {
         return None;
     }
@@ -1416,10 +1639,15 @@ fn create_route(
         // a named host: a credential is mandatory, and the key must be 32-byte hex.
         Some(node) => {
             if cred.is_none() {
-                return Err((StatusCode::BAD_REQUEST, "a cross-node session requires --cred"));
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "a cross-node session requires --cred",
+                ));
             }
-            let host = decode_node_key(node)
-                .ok_or((StatusCode::BAD_REQUEST, "node must be a 32-byte hex node key"))?;
+            let host = decode_node_key(node).ok_or((
+                StatusCode::BAD_REQUEST,
+                "node must be a 32-byte hex node key",
+            ))?;
             Ok(CreateRoute::Remote { host })
         }
     }
@@ -1429,6 +1657,11 @@ fn create_route(
 /// ws topic. A local create spawns here; a directed (`node`/`cred`) create rides
 /// the guest lane to the host. Over the cap, missing sandbox, unknown agent, or a
 /// host refusal each return a clear error (never a panic, never a Direct spawn).
+///
+/// AUTH: node-level (`signed_req`, `Authority::Operator`). This spawns a pty /
+/// microVM ON THE HOST and reads no acting identity, so it takes the node's
+/// operator credential or a signature by its operator key — never a key the
+/// caller minted for itself.
 pub async fn create_session(
     State(handle): State<NodeHandle>,
     Json(body): Json<CreateSessionBody>,
@@ -1481,15 +1714,42 @@ async fn create_local(handle: &NodeHandle, body: CreateSessionBody) -> Response 
     if body.mode == SessionMode::Shared {
         let channel = crate::term_consensus::session_channel(&created.session_id);
         match crate::term_consensus::ensure_channel(handle, &channel).await {
-            Ok(()) => {
+            crate::term_consensus::EnsureChannelOutcome::Ready => {
                 crate::term_consensus::spawn_projector(handle.clone(), created.session_id.clone());
             }
-            Err(reason) => {
-                // keyed by a fixed class, not by `reason`: the error text is
-                // free-form (`ensure_channel` returns `String`), and a
-                // per-message key would let a systemic outage — every create
-                // hits the same failure — mint an unbounded run of "first
-                // occurrences".
+            // #1746: someone else's account already owns `term-<id>` — this
+            // node's own projector must never spawn (it would drive OUR pty
+            // from THEIR posts), and a Shared session with no consensus lane
+            // of its own is not the session the caller asked for, so it is
+            // closed rather than silently degraded.
+            crate::term_consensus::EnsureChannelOutcome::Squatted(reason) => {
+                if let Some(occurrences) = TERM_WARN.hit("channel_squatted") {
+                    tracing::warn!(
+                        target: "ducktape::term",
+                        session = %created.session_id,
+                        reason,
+                        occurrences,
+                        "term consensus channel squatted by another account; closing session"
+                    );
+                }
+                terminals.close(&created.session_id).await;
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "channel_squatted",
+                        "detail": "another account already owns this session's command channel",
+                    })),
+                )
+                    .into_response();
+            }
+            // keyed by a fixed class, not by `reason`: the error text is
+            // free-form (`ensure_channel` returns `String`), and a
+            // per-message key would let a systemic outage — every create
+            // hits the same failure — mint an unbounded run of "first
+            // occurrences". The session still works single-node over PR1's
+            // node-local ws `TermCommand` path — this is a transient failure,
+            // not an authorization outcome, so it degrades rather than closes.
+            crate::term_consensus::EnsureChannelOutcome::Failed(reason) => {
                 if let Some(occurrences) = TERM_WARN.hit("channel_create_failed") {
                     tracing::warn!(
                         target: "ducktape::term",
@@ -1516,7 +1776,9 @@ async fn create_remote(handle: &NodeHandle, host: [u8; 32], body: CreateSessionB
         )
             .into_response();
     };
-    let cred = body.cred.expect("create_route guarantees a cred on the remote path");
+    let cred = body
+        .cred
+        .expect("create_route guarantees a cred on the remote path");
     let (reply, rx) = oneshot::channel();
     let job = crate::term_remote::SessionJob::Create {
         host,
@@ -1533,7 +1795,7 @@ async fn create_remote(handle: &NodeHandle, host: [u8; 32], body: CreateSessionB
         )
             .into_response();
     }
-    let created = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+    let created = match tokio::time::timeout(crate::term_remote::CONTROL_DEADLINE, rx).await {
         Ok(Ok(Ok(created))) => created,
         Ok(Ok(Err(msg))) => {
             return (
@@ -1575,6 +1837,12 @@ pub async fn close_session(State(handle): State<NodeHandle>, Path(id): Path<Stri
                 })
                 .await;
         }
+        // end the mirror here rather than waiting for the host's `Ended` grain:
+        // forgetting the binding is what makes that grain unroutable (the feed
+        // gate binds every grain to the session's host), and a `term:<id>`
+        // subscriber blocked on a topic that will never append again is the
+        // wedge `TermEnded` exists to prevent.
+        handle.stream_hub().terminals().mark_ended_local_only(&id);
         handle.remote_sessions().forget(&id);
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -1621,7 +1889,10 @@ mod tests {
         // `agent pty` client waiting on the topic learns the session is over.
         assert!(!ring.is_ended("silent"), "no entry yet, so not ended");
         ring.mark_ended("silent");
-        assert!(ring.is_ended("silent"), "a no-output session still signals end");
+        assert!(
+            ring.is_ended("silent"),
+            "a no-output session still signals end"
+        );
     }
 
     /// THE CROSS-NODE WEDGE: a peer-attached session's `agent pty` client waits
@@ -1659,7 +1930,10 @@ mod tests {
 
         ring.append_local_only("00000000deadbeef", STANDARD.encode(b"hi"));
         ring.mark_ended_local_only("00000000deadbeef");
-        assert!(ring.is_ended("00000000deadbeef"), "the local ring still ends");
+        assert!(
+            ring.is_ended("00000000deadbeef"),
+            "the local ring still ends"
+        );
         assert!(
             feed.try_recv().is_err(),
             "a node-local session owes its peers nothing"
@@ -1688,8 +1962,8 @@ mod tests {
         assert!(ring.read_after("s0", 0, 8).0.is_empty());
         assert!(
             !ring
-            .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
-            .0
+                .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
+                .0
                 .is_empty()
         );
     }
@@ -1700,8 +1974,8 @@ mod tests {
     fn command_ring_assigns_monotonic_seq_and_catches_up() {
         let ring = TermCommandRing::default();
         // the consumer's seq is the ring's next_seq — monotonic, starting at 1.
-        assert_eq!(ring.append("s", "alice", "hello"), 1);
-        assert_eq!(ring.append("s", "bob", "world"), 2);
+        assert_eq!(ring.append("s", "alice", "hello"), Some(1));
+        assert_eq!(ring.append("s", "bob", "world"), Some(2));
         // a fresh subscriber (cursor 0) replays both commands in order.
         let (rows, floor) = ring.read_after("s", 0, 64);
         assert_eq!(floor, 0);
@@ -1721,10 +1995,10 @@ mod tests {
         for i in 0..TERM_CMD_RING_MAX_COMMANDS {
             assert_eq!(
                 ring.append("s", &format!("m{i}"), &format!("cmd-{i}")),
-                (i + 1) as u64
+                Some((i + 1) as u64)
             );
         }
-        ring.append("s", "over", "cmd-overflow"); // forces eviction of the first
+        let _ = ring.append("s", "over", "cmd-overflow"); // forces eviction of the first
         let (rows, floor) = ring.read_after("s", 0, TERM_CMD_RING_MAX_COMMANDS + 8);
         assert_eq!(floor, 1, "the evicted command's seq is the reported floor");
         assert_eq!(rows.len(), TERM_CMD_RING_MAX_COMMANDS);
@@ -1737,6 +2011,75 @@ mod tests {
         assert_eq!(last.0, (TERM_CMD_RING_MAX_COMMANDS + 1) as u64);
         assert_eq!(last.1, "over");
         assert_eq!(last.2, "cmd-overflow");
+    }
+
+    /// **#1745.** One peer floods 64 fabricated ids — 4x the ring's WHOLE
+    /// capacity — and the operator's own live local session must still be
+    /// readable afterwards: eviction pressure from a remote append may only
+    /// ever claim a ring this node merely mirrors, never one it owns.
+    #[test]
+    fn a_flooding_peer_never_evicts_a_local_ring() {
+        let ring = TermRing::default();
+        ring.append("local-session", STANDARD.encode(b"operator output"));
+
+        let flooding_peer = [9u8; 32];
+        for i in 0..64 {
+            ring.append_remote(
+                TermChunkEvent {
+                    session: format!("{i:016x}"),
+                    chunk_b64: STANDARD.encode(b"forged"),
+                },
+                flooding_peer,
+            );
+        }
+
+        let (rows, _) = ring.read_after("local-session", 0, 8);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the operator's own session survived the flood untouched"
+        );
+        // and the flooding peer never got more rings than its own budget, no
+        // matter how many distinct ids it tried.
+        let mirrored = ring
+            .inner
+            .lock()
+            .expect("lock")
+            .sessions
+            .keys()
+            .filter(|id| *id != "local-session")
+            .count();
+        assert!(
+            mirrored <= TERM_RING_MAX_REMOTE_PER_PEER,
+            "one peer is capped at its own ring budget: got {mirrored}"
+        );
+    }
+
+    /// the command-log ring's twin of the above.
+    #[test]
+    fn a_flooding_peer_never_evicts_a_local_command_log() {
+        let ring = TermCommandRing::default();
+        assert!(ring.append("local-session", "operator", "ls").is_some());
+
+        let flooding_peer = [9u8; 32];
+        for i in 0..64u64 {
+            ring.append_remote(
+                TermCommandEvent {
+                    session: format!("{i:016x}"),
+                    seq: 1,
+                    origin: "attacker".into(),
+                    text: "x".into(),
+                },
+                flooding_peer,
+            );
+        }
+
+        let (rows, _) = ring.read_after("local-session", 0, 8);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the operator's own command log survived the flood untouched"
+        );
     }
 
     // ----- the peer-forwarder feed: publish (local) vs append_remote -----
@@ -1754,10 +2097,13 @@ mod tests {
         };
         assert_eq!(STANDARD.decode(&chunk.chunk_b64).unwrap(), b"hi");
         // a peer's chunk enters the ring WITHOUT re-publishing — breaks the loop.
-        ring.append_remote(TermChunkEvent {
-            session: "00000000deadbeef".into(),
-            chunk_b64: STANDARD.encode(b"yo"),
-        });
+        ring.append_remote(
+            TermChunkEvent {
+                session: "00000000deadbeef".into(),
+                chunk_b64: STANDARD.encode(b"yo"),
+            },
+            [9u8; 32],
+        );
         assert!(
             matches!(
                 appends.try_recv(),
@@ -1788,20 +2134,24 @@ mod tests {
         let ring = TermCommandRing::default();
         let mut appends = ring.subscribe_appends();
         // a LOCAL append stamps seq 1 and publishes the grain.
-        assert_eq!(ring.append("00000000deadbeef", "alice", "ls"), 1);
+        assert_eq!(ring.append("00000000deadbeef", "alice", "ls"), Some(1));
         let event = appends.try_recv().expect("a local append publishes");
         assert_eq!(
             (event.seq, event.origin.as_str(), event.text.as_str()),
             (1, "alice", "ls")
         );
-        // a peer's command carries the ORIGIN's seq; append_remote preserves it
-        // verbatim (never renumbers to 2) and does not re-broadcast.
-        ring.append_remote(TermCommandEvent {
-            session: "00000000deadbeef".into(),
-            seq: 42,
-            origin: "bob".into(),
-            text: "pwd".into(),
-        });
+        // a peer's command carries the ORIGIN's seq and rings under it verbatim,
+        // without re-broadcasting — including across a gap, since the forwarder
+        // feed drops grains when a peer stream lags.
+        ring.append_remote(
+            TermCommandEvent {
+                session: "00000000deadbeef".into(),
+                seq: 42,
+                origin: "bob".into(),
+                text: "pwd".into(),
+            },
+            [9u8; 32],
+        );
         assert!(matches!(
             appends.try_recv(),
             Err(broadcast::error::TryRecvError::Empty)
@@ -1816,19 +2166,144 @@ mod tests {
     }
 
     #[test]
+    fn command_ring_takes_a_forward_peer_seq_and_refuses_the_rest() {
+        // the ring owns the cursor: a wire number may only move it FORWARD, and
+        // never to the ceiling. u64::MAX used to be adopted, and the next LOCAL
+        // append then overflowed the cursor.
+        assert_eq!(next_command_seq(0, None), Ok(1));
+        assert_eq!(next_command_seq(1, Some(2)), Ok(2));
+        assert_eq!(next_command_seq(1, Some(9)), Ok(9), "a gap is tolerated");
+        assert_eq!(
+            next_command_seq(1, Some(1)),
+            Err("command_seq_out_of_order"),
+            "a replay never moves the cursor"
+        );
+        assert_eq!(
+            next_command_seq(9, Some(2)),
+            Err("command_seq_out_of_order"),
+            "nor does a reorder"
+        );
+        assert_eq!(
+            next_command_seq(1, Some(u64::MAX)),
+            Err("command_seq_overflow")
+        );
+        assert_eq!(
+            next_command_seq(u64::MAX, None),
+            Err("command_seq_overflow")
+        );
+
+        let ring = TermCommandRing::default();
+        ring.append_remote(
+            TermCommandEvent {
+                session: "00000000deadbeef".into(),
+                seq: u64::MAX,
+                origin: "attacker".into(),
+                text: "x".into(),
+            },
+            [9u8; 32],
+        );
+        assert!(
+            ring.read_after("00000000deadbeef", 0, 8).0.is_empty(),
+            "a refused grain is not rung"
+        );
+        // and the cursor never moved: the next local command is still seq 1.
+        assert_eq!(ring.append("00000000deadbeef", "alice", "ls"), Some(1));
+    }
+
+    #[test]
     fn command_ring_evicts_least_recently_touched_sessions() {
         let ring = TermCommandRing::default();
         for i in 0..=TERM_RING_MAX_SESSIONS {
-            ring.append(&format!("s{i}"), "m", "x");
+            let _ = ring.append(&format!("s{i}"), "m", "x");
         }
         // the first-touched session aged out; the newest survives.
         assert!(ring.read_after("s0", 0, 8).0.is_empty());
         assert!(
             !ring
-            .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
-            .0
+                .read_after(&format!("s{TERM_RING_MAX_SESSIONS}"), 0, 8)
+                .0
                 .is_empty()
         );
+    }
+
+    /// the eviction that used to restart a live session's numbering. S has
+    /// taken five commands and gone quiet; sixteen other sessions push its
+    /// entry out of the map. The next command on S must be seq 6 — a mirror
+    /// peer sitting at cursor 5 accepts only a number that moves it forward, so
+    /// a re-stamped 1 would be dropped as out-of-order for the rest of the
+    /// session's life.
+    #[test]
+    fn an_evicted_command_log_keeps_numbering_where_it_left_off() {
+        let ring = TermCommandRing::default();
+        for _ in 0..5 {
+            assert!(ring.append("S", "alice", "ls").is_some());
+        }
+        for i in 0..TERM_RING_MAX_SESSIONS {
+            let _ = ring.append(&format!("s{i}"), "m", "x");
+        }
+        assert!(
+            ring.read_after("S", 0, 8).0.is_empty(),
+            "the rows are gone — that half of eviction is the point"
+        );
+        assert_eq!(
+            ring.read_after("S", 0, 8).1,
+            5,
+            "and the floor says so: everything up to 5 is unreachable"
+        );
+
+        let seq = ring.append("S", "bob", "pwd").expect("the command is rung");
+        assert_eq!(seq, 6, "the cursor outlived the rows");
+
+        // the mirror half: a peer node that has seen S's first five commands.
+        let mirror = TermCommandRing::default();
+        for i in 1..=5 {
+            mirror.append_remote(
+                TermCommandEvent {
+                    session: "S".into(),
+                    seq: i,
+                    origin: "alice".into(),
+                    text: "ls".into(),
+                },
+                [9u8; 32],
+            );
+        }
+        mirror.append_remote(
+            TermCommandEvent {
+                session: "S".into(),
+                seq,
+                origin: "bob".into(),
+                text: "pwd".into(),
+            },
+            [9u8; 32],
+        );
+        let (rows, _) = mirror.read_after("S", 5, 8);
+        assert_eq!(
+            rows,
+            vec![(6, "bob".to_string(), "pwd".to_string())],
+            "the mirror at cursor 5 accepts the host's next command"
+        );
+    }
+
+    /// the output ring's half of the same rule, plus what a subscriber sees: a
+    /// cursor that is now above the ring's head is rewound to it rather than
+    /// waiting forever on rows that were renumbered away.
+    #[test]
+    fn an_evicted_output_ring_keeps_numbering_and_rewinds_a_stale_cursor() {
+        let ring = TermRing::default();
+        for _ in 0..5 {
+            ring.append("S", STANDARD.encode(b"x"));
+        }
+        for i in 0..TERM_RING_MAX_SESSIONS {
+            ring.append(&format!("s{i}"), STANDARD.encode(b"x"));
+        }
+        assert_eq!(ring.resume_cursor("S", 3), 5, "a lagging cursor climbs");
+        assert_eq!(ring.resume_cursor("S", 9), 5, "a stale one is rewound");
+
+        ring.append("S", STANDARD.encode(b"more"));
+        let (rows, floor) = ring.read_after("S", 5, 8);
+        assert_eq!(floor, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 6, "the re-created ring continues at 6");
     }
 
     #[test]
@@ -1868,7 +2343,11 @@ mod tests {
     /// caller drives everything else (`on_event`) by hand, so each test names
     /// exactly the daemon behaviour it is about.
     fn with_daemon() -> (TerminalSessions, AttachGuard) {
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
         let (guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
         let daemon = terminals.clone();
         tokio::spawn(async move {
@@ -1950,7 +2429,11 @@ mod tests {
         // the input-gate accessor is pure: an unknown id (and, by construction,
         // any local session) has no creator node — so a forwarded input frame
         // naming it is refused.
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
         assert!(terminals.creator_node("nope").is_none());
     }
 
@@ -1958,7 +2441,11 @@ mod tests {
     fn enqueue_command_on_an_unknown_session_is_a_no_op() {
         // enqueue must warn + no-op, never panic (mirrors the input/resize
         // unknown-session discipline) and record nothing.
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
         terminals.enqueue_command("nope", "alice".into(), "ls".into());
         assert!(terminals.0.cmd_ring.read_after("nope", 0, 8).0.is_empty());
     }
@@ -1968,9 +2455,15 @@ mod tests {
         // the `no_sandbox` rung, in its new meaning: the plane is wired (the
         // manager exists, so the route does NOT return "not enabled") but no
         // daemon owns a pty for it.
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
         assert!(!terminals.has_sandbox());
-        let refused = terminals.create("claude", SessionMode::Single, SessionSize::default()).await;
+        let refused = terminals
+            .create("claude", SessionMode::Single, SessionSize::default())
+            .await;
         assert!(matches!(refused, Err(TermError::NoSandbox)));
     }
 
@@ -1979,7 +2472,11 @@ mod tests {
         // FIRST ATTACH WINS is a boundary: a local impersonator that could take
         // the link would receive the create commands — lent-credential records
         // included — meant for the real daemon.
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
         let first = terminals.attach(TEST_TOKEN);
         assert!(first.is_some());
         assert!(
@@ -1999,7 +2496,10 @@ mod tests {
             .await
             .expect("the daemon answered");
         assert_eq!(created.topic, topic(&created.session_id));
-        assert_eq!(terminals.mode(&created.session_id), Some(SessionMode::Single));
+        assert_eq!(
+            terminals.mode(&created.session_id),
+            Some(SessionMode::Single)
+        );
     }
 
     #[tokio::test]
@@ -2019,7 +2519,8 @@ mod tests {
 
         // no auto-answering daemon here: hold the create unanswered, exactly as
         // a slow pull would, and take the command off the link by hand.
-        let mut pending = Box::pin(terminals.create("claude", SessionMode::Single, SessionSize::default()));
+        let mut pending =
+            Box::pin(terminals.create("claude", SessionMode::Single, SessionSize::default()));
         let command = tokio::select! {
             _ = &mut pending => panic!("a create cannot complete while nothing answers it"),
             command = rx.recv() => command.expect("the create reached the link"),
@@ -2034,7 +2535,9 @@ mod tests {
             session: create.session.clone(),
         });
         assert_eq!(
-            rx.recv().await.expect("a close must follow an abandoned create"),
+            rx.recv()
+                .await
+                .expect("a close must follow an abandoned create"),
             wire::Command::TermClose {
                 session: create.session
             },
@@ -2050,9 +2553,14 @@ mod tests {
             TermCommandRing::default(),
             Some(TEST_TOKEN.into()),
         );
-        assert!(terminals.attach("").is_none(), "an empty token is not a token");
         assert!(
-            terminals.attach("0123456789abcdef0123456789abcdee").is_none(),
+            terminals.attach("").is_none(),
+            "an empty token is not a token"
+        );
+        assert!(
+            terminals
+                .attach("0123456789abcdef0123456789abcdee")
+                .is_none(),
             "a near miss is still a miss"
         );
         assert!(terminals.attach(TEST_TOKEN).is_some());
@@ -2124,7 +2632,9 @@ mod tests {
         assert!(terminals.0.ring.is_ended(&created.session_id));
         assert!(!terminals.has_sandbox());
         assert!(matches!(
-            terminals.create("claude", SessionMode::Single, SessionSize::default()).await,
+            terminals
+                .create("claude", SessionMode::Single, SessionSize::default())
+                .await,
             Err(TermError::NoSandbox)
         ));
     }
@@ -2150,7 +2660,14 @@ mod tests {
             "a solo session must not publish to the peer feed"
         );
         // but it IS in the local ring the ws catch-up serves.
-        assert!(!terminals.0.ring.read_after(&created.session_id, 0, 8).0.is_empty());
+        assert!(
+            !terminals
+                .0
+                .ring
+                .read_after(&created.session_id, 0, 8)
+                .0
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -2195,7 +2712,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_create_returns_the_daemon_reason_and_forgets_the_session() {
-        let terminals = TerminalSessions::new(TermRing::default(), TermCommandRing::default(), Some(TEST_TOKEN.into()));
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
         let (_guard, mut rx) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
         let daemon = terminals.clone();
         tokio::spawn(async move {
@@ -2209,7 +2730,9 @@ mod tests {
                 }
             }
         });
-        let refused = terminals.create("claude", SessionMode::Single, SessionSize::default()).await;
+        let refused = terminals
+            .create("claude", SessionMode::Single, SessionSize::default())
+            .await;
         let Err(TermError::Spawn(detail)) = refused else {
             panic!("a spawn failure must surface as Spawn, not another rung");
         };

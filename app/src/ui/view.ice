@@ -89,7 +89,7 @@ view
             disabled value=hint
     // THE HUDDLE WINDOW — the same panel, now the whole content of a real OS
     // window instead of a card wearing drawn traffic lights. Its close button
-    // docks (see `window_was_closed`); leaving the huddle closes it.
+    // only closes it (see `window_was_closed`); leaving the huddle closes it too.
     if huddle_win == some(window)
       HuddlePanel #huddle
         with
@@ -103,7 +103,6 @@ view
           stage=huddle_stage
           video_live=call_video_live
         events
-          dock_huddle -> dock_huddle
           huddle_go_channel -> huddle_go_channel
           leave_huddle_here -> leave_huddle_here
           toggle_call_mute -> toggle_call_mute
@@ -223,7 +222,6 @@ view
               huddle_joined_at
               huddle_now
               call_muted
-              huddle_popped
               messages
               has_older_history
               history_view
@@ -255,8 +253,7 @@ view
               choose_channel -> choose_channel _
               choose_dm -> choose_dm _
               toggle_channel_settings -> toggle_channel_settings
-              pop_huddle -> pop_huddle
-              focus_huddle -> focus_huddle
+              show_huddle -> show_huddle
               leave_huddle_here -> leave_huddle_here
               huddle_go_channel -> huddle_go_channel
               join_huddle_submit -> join_huddle_submit
@@ -630,29 +627,6 @@ view
             events
               refresh_explorer -> refresh_explorer
               copy_to_clipboard -> copy_to_clipboard _ _
-        huddle:
-          box
-            with
-              w=fill
-              h=fill
-              align-x=end
-              align-y=end
-              pr=16.0
-              pb=16.0
-            col
-              // The pill says "you are still in a call elsewhere". It hides while
-              // the huddle has its own window, and where the live pill in the
-              // channel header already says so — the Chat tab, looking at the
-              // huddle's own channel. On every OTHER screen it must show even
-              // when that channel is the selected one, which the missing
-              // `shell_tab` term used to suppress.
-              if huddle_joined && !huddle_popped && (shell_tab != ShellTab.chat || huddle_channel != active_channel)
-                HuddleDockedPill
-                  with
-                    channel=huddle_channel_name
-                    elapsed=mmss(huddle_now - huddle_joined_at)
-                  events
-                    pop_huddle -> pop_huddle
         palette:
           OverlayLayer draft<->channel_draft query<->palette_draft #overlays
             with

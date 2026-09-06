@@ -126,6 +126,9 @@ pub struct MicroVm {
     vsock_uds: PathBuf,
     /// the tunnel acceptors, aborted when the VM goes away.
     tunnels: Vec<tokio::task::JoinHandle<()>>,
+    /// when the VMM was spawned, which is where
+    /// [`firecracker_api::MAX_VM_LIFETIME`] is counted from.
+    booted_at: tokio::time::Instant,
 }
 
 impl Drop for MicroVm {
@@ -177,6 +180,12 @@ impl MicroVm {
     /// path is capped near 108 bytes (`SUN_LEN`); a scratch directory under a
     /// long home blows straight through it with `path must be shorter than
     /// SUN_LEN`. Put it under `XDG_RUNTIME_DIR`.
+    ///
+    /// The CALLER owns `run_dir` and the socket directory until this returns
+    /// `Ok`: create both as [`ScratchDir`]s and `disarm` them only once the
+    /// returned [`MicroVm`] exists, because from here on its `Drop` is what
+    /// removes them. Every error path below leaves both directories to the
+    /// caller's guards.
     pub async fn boot(
         run_dir: &Path,
         workdir: &Path,
@@ -185,19 +194,22 @@ impl MicroVm {
         manifest: &RunManifest,
     ) -> Result<(Self, MicroVmIo), String> {
         let started = std::time::Instant::now();
-        std::fs::create_dir_all(run_dir)
-            .map_err(|e| format!("create run dir {}: {e}", run_dir.display()))?;
-        // From here until the `MicroVm` below exists, nothing owns this
-        // directory: every `?` in the setup steps — an oversized workspace, a
-        // vsock path over SUN_LEN, a VMM that will not spawn — used to leave it
-        // behind, and a node that refuses runs leaks one per attempt.
-        let mut run_dir_guard = RunDirGuard(Some(run_dir));
 
         // 1. the run's per-run block devices: what it is supposed to run, its
         //    read-only inputs, and the workspace that will be read back.
         let blob = crate::guest_manifest::encode(manifest)?;
         std::fs::write(&cfg.manifest, &blob)
             .map_err(|e| format!("write {}: {e}", cfg.manifest.display()))?;
+        // 0600: the manifest's `env` carries this run's secrets (the run-action
+        // and broker bearer tokens). `run_dir` is already 0700 (`ScratchDir`),
+        // but this file is pinned directly too, the same defense in depth the
+        // seeded `.credentials.json` already gets.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&cfg.manifest, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("restrict {} permissions: {e}", cfg.manifest.display()))?;
+        }
         crate::workspace_image::build_assets(assets, &cfg.assets, &run_dir.join("assets"))?;
         let size = crate::workspace_image::sized_for(workdir)?;
         crate::workspace_image::build(workdir, &cfg.workspace, size)?;
@@ -280,9 +292,9 @@ impl MicroVm {
             "VMM spawned; waiting for the guest"
         );
 
-        // the VM owns the directory from here: its `Drop` removes it on every
-        // path out, including the boot failures below.
-        run_dir_guard.0 = None;
+        // the VM owns both directories from here: its `Drop` removes them on
+        // every path out, including the boot failures below. The caller's
+        // `ScratchDir`s are disarmed against this same `Ok`.
         let mut vm = MicroVm {
             vmm,
             run_dir: run_dir.to_path_buf(),
@@ -290,6 +302,7 @@ impl MicroVm {
             console: console.clone(),
             vsock_uds: cfg.vsock_uds.clone(),
             tunnels,
+            booted_at: tokio::time::Instant::now(),
         };
 
         // 4. the guest dials back
@@ -297,7 +310,10 @@ impl MicroVm {
             Ok(Ok((stream, _))) => stream,
             Ok(Err(e)) => {
                 return Err(vm
-                    .boot_failure("guest_vsock_accept_failed", &format!("accept the guest vsock: {e}"))
+                    .boot_failure(
+                        "guest_vsock_accept_failed",
+                        &format!("accept the guest vsock: {e}"),
+                    )
                     .await);
             }
             Err(_) => {
@@ -360,11 +376,33 @@ impl MicroVm {
     /// Ordered, not concurrent: the guest syncs and unmounts before it halts,
     /// so reading the image before the VMM is gone risks reading a filesystem
     /// with an open journal.
+    ///
+    /// BOUNDED by [`firecracker_api::MAX_VM_LIFETIME`], counted from the boot.
+    /// The invoke loop's timeouts bound the arrival of the guest's exit FRAME,
+    /// not the VM's exit — after that frame the guest still has to sync,
+    /// unmount and halt, and `duck-guest-init`'s halt ends in `pause()` when
+    /// `reboot(2)` fails. Unbounded, one such guest blocks this await forever:
+    /// the run's task never completes, and the VMM keeps its vcpus and its
+    /// whole memory footprint with no timer anywhere to reap it.
     pub async fn collect(mut self, workdir: &Path) -> Result<(), String> {
-        self.vmm
-            .wait()
+        let deadline = self.booted_at + firecracker_api::MAX_VM_LIFETIME;
+        let waited = tokio::time::timeout_at(deadline, self.vmm.wait())
             .await
-            .map_err(|e| format!("wait for the VMM: {e}"))?;
+            .ok()
+            .map(|exited| exited.map(|_| ()));
+        if waited.is_none() {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                reason = "vm_lifetime_exceeded",
+                slot = %slot_of(&self.run_dir),
+                lifetime_s = firecracker_api::MAX_VM_LIFETIME.as_secs(),
+                "the guest never halted inside the VM's lifetime; killing the VMM"
+            );
+            let _ = self.vmm.kill().await;
+        }
+        // either way `self` drops at the end of this fn, so the run's
+        // directories are reaped on the expiry path too.
+        vmm_exit_outcome(waited)?;
         let started = std::time::Instant::now();
         let read_back = crate::workspace_image::read_back(&self.workspace_image, workdir);
         // the workspace round trip is the run's longest non-model step (13.8 s
@@ -443,25 +481,88 @@ async fn serve_tunnel(listener: UnixListener, service_port: u16) {
     }
 }
 
-/// Owns a run directory for the window in which nothing else does — from
-/// `create_dir_all` until the [`MicroVm`] that will remove it exists. Disarmed
-/// by setting its field to `None`.
-struct RunDirGuard<'a>(Option<&'a Path>);
+/// One directory a run owns: created here, removed when this value drops,
+/// unless [`Self::disarm`] hands it on.
+///
+/// It closes the window between a directory's `create_dir_all` and the
+/// [`MicroVm`] whose `Drop` removes the run's scratch. A run has two of them —
+/// the run directory and the vsock socket directory — and every `?` in between
+/// (an oversized workspace, a foreign binary in the executors directory, a
+/// vsock path over `SUN_LEN`, a VMM that will not spawn) used to leave them
+/// behind with nothing to reap them: a node that refuses runs leaked one pair
+/// per attempt, and the socket directory sits on a tmpfs, i.e. the node's own
+/// RAM.
+pub struct ScratchDir {
+    path: PathBuf,
+    owned: bool,
+}
 
-impl Drop for RunDirGuard<'_> {
+impl ScratchDir {
+    /// create `path`, 0700, and own it from this moment.
+    ///
+    /// 0700 keeps it off every other local account on a shared box (#1693): a
+    /// bare `create_dir_all` lands 0755 under a normal umask, and everything
+    /// this directory ever holds — `manifest.bin`'s run env (the run-action and
+    /// broker bearer tokens), `workspace.ext4` (the seeded `.credentials.json`),
+    /// `assets.ext4` — is secret for the run's whole lifetime. Firecracker/vz
+    /// run as this same process's uid (no jailer, no setuid handoff), so 0700
+    /// costs the VMM nothing.
+    pub fn create(path: PathBuf) -> Result<Self, String> {
+        std::fs::create_dir_all(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("restrict {} permissions: {e}", path.display()))?;
+        }
+        Ok(Self { path, owned: true })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// stop owning it, because something whose own teardown removes it now
+    /// does — the booted [`MicroVm`].
+    pub fn disarm(mut self) {
+        self.owned = false;
+    }
+}
+
+impl Drop for ScratchDir {
     fn drop(&mut self) {
-        let Some(run_dir) = self.0 else { return };
-        if let Err(error) = std::fs::remove_dir_all(run_dir)
-            && run_dir.exists()
+        if !self.owned {
+            return;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&self.path)
+            && self.path.exists()
         {
             tracing::warn!(
                 target: "ducktape::sandbox",
                 reason = "run_dir_not_removed",
-                slot = %slot_of(run_dir),
+                slot = %slot_of(&self.path),
                 %error,
                 "a refused run left its directory behind"
             );
         }
+    }
+}
+
+/// what the bounded wait for the VMM means for the run. `None` is the wait
+/// hitting [`firecracker_api::MAX_VM_LIFETIME`].
+///
+/// A killed VM's workspace image is NOT read back: the guest never finished its
+/// unmount, so the filesystem on it has an open journal and whatever it holds is
+/// not the run's result. Losing the workspace is the honest outcome — reading a
+/// torn one silently would land it on the host as if the run had succeeded.
+fn vmm_exit_outcome(waited: Option<std::io::Result<()>>) -> Result<(), String> {
+    match waited {
+        Some(Ok(())) => Ok(()),
+        Some(Err(error)) => Err(format!("wait for the VMM: {error}")),
+        None => Err(format!(
+            "the guest did not halt within the microVM's {} s lifetime; the VMM was killed and the workspace was not read back",
+            firecracker_api::MAX_VM_LIFETIME.as_secs()
+        )),
     }
 }
 
@@ -569,6 +670,13 @@ async fn pump_frames(
         // close is also the guest's signal that its exit frame landed.
         std::future::pending::<()>().await
     });
+    // From here every exit path ends that task, including the three that return
+    // early below. Dropping a bare `JoinHandle` does NOT abort a tokio task, so
+    // one unparseable guest frame used to leave the feed parked forever holding
+    // the vsock write half — one task and one fd per affected run, for the
+    // daemon's life, until the node's fd limit made every later run's listener
+    // bind fail.
+    let mut feed = AbortOnDrop(feed);
 
     // guest -> host
     let mut pending: Vec<u8> = Vec::new();
@@ -628,15 +736,65 @@ async fn pump_frames(
         }
     }
     // Awaited, not just aborted: the write half lives in that task, and the
-    // guest is blocked on this socket closing. Dropping the handle without
-    // awaiting leaves the close to whenever the runtime gets round to it.
-    feed.abort();
-    let _ = feed.await;
+    // guest is blocked on this socket closing. Letting the guard's `Drop` do it
+    // leaves the close to whenever the runtime gets round to it, and this is
+    // the one path where the guest is waiting on it.
+    feed.abort_and_join().await;
+}
+
+/// A spawned task this scope owns: aborted when the value drops.
+///
+/// The plain `JoinHandle` does not do this — dropping one DETACHES the task —
+/// so a scope with more than one exit path leaks every task it spawned on all
+/// but the path that remembered to abort.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl AbortOnDrop {
+    /// end the task and WAIT for it, on the path where something is waiting on
+    /// what its teardown does.
+    async fn abort_and_join(&mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1693: a bare `create_dir_all` lands 0755 under a normal umask, making
+    /// the run directory — and everything staged into it (`manifest.bin`'s run
+    /// env, `workspace.ext4`'s seeded credentials, `assets.ext4`) — readable by
+    /// every other local account for the run's whole lifetime.
+    #[test]
+    fn scratch_dir_is_created_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "dt-scratch-dir-test-{}-{unique}",
+            std::process::id()
+        ));
+        let dir = ScratchDir::create(path.clone()).expect("create scratch dir");
+        let mode = std::fs::metadata(dir.path())
+            .expect("scratch dir metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "{} is readable by group/other: {mode:o}",
+            dir.path().display()
+        );
+    }
 
     /// Firecracker's guest-outbound convention. Getting this wrong means
     /// nothing is listening where the guest dials, and the run produces no
@@ -674,6 +832,91 @@ mod tests {
             feed.contains("std::future::pending::<()>().await"),
             "the feed task owns the write half and must park, never return:\n{feed}"
         );
+    }
+
+    /// The lifetime backstop is WIRED, and an expiry is an error rather than a
+    /// silently torn workspace.
+    ///
+    /// `collect` used to await the VMM unbounded on the success path, and
+    /// `MAX_VM_LIFETIME` was referenced nowhere in the tree: a guest that
+    /// reported its exit code and then wedged on halt (a `umount` blocked by a
+    /// lingering grandchild, a kernel whose power-off returns) blocked the run's
+    /// task forever with the VM's whole memory footprint still charged.
+    ///
+    /// The mapping only, because the timeout itself is the runtime's and there
+    /// is no seam for a fake VMM handle: `collect` owns a real
+    /// `tokio::process::Child`.
+    #[test]
+    fn a_vm_that_outlives_its_lifetime_fails_the_run() {
+        assert!(vmm_exit_outcome(Some(Ok(()))).is_ok());
+
+        let expired = vmm_exit_outcome(None).expect_err("an expired lifetime fails the run");
+        assert!(
+            expired.contains("lifetime") && expired.contains("not read back"),
+            "the operator must be told the workspace is gone, not just that it took long: {expired}"
+        );
+
+        let failed = vmm_exit_outcome(Some(Err(std::io::Error::other("no child"))))
+            .expect_err("a wait error fails the run");
+        assert!(failed.contains("no child"), "{failed}");
+    }
+
+    /// A guest frame this host cannot parse ends the feed task too.
+    ///
+    /// That arm is an early `return`, and dropping a `JoinHandle` DETACHES a
+    /// tokio task rather than aborting it — so the feed used to stay parked on
+    /// its `pending()` for the daemon's life, holding the run's vsock write
+    /// half. A compute daemon accumulated one task and one fd per affected run
+    /// until its fd limit made every later run's listener bind fail.
+    ///
+    /// The feed task owns the input receiver, so the sender closing IS that
+    /// task ending — no other observer of it exists.
+    #[tokio::test]
+    async fn a_decode_failure_ends_the_feed_task() {
+        let (host, guest) = UnixStream::pair().expect("socketpair");
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel(INPUT_QUEUE);
+        let (out_task, _stdout) = tokio::io::duplex(1024);
+        let (err_task, _stderr) = tokio::io::duplex(1024);
+        let (exit_tx, _exit_rx) = tokio::sync::oneshot::channel();
+        let pump = tokio::spawn(pump_frames(host, input_rx, out_task, err_task, exit_tx));
+
+        // a header claiming more than MAX_FRAME_BYTES: refused by `decode`
+        // before a byte of payload is read.
+        let (_guest_read, mut guest_write) = guest.into_split();
+        guest_write
+            .write_all(&[0u8, 0xff, 0xff, 0xff, 0xff])
+            .await
+            .expect("write a frame the host cannot parse");
+
+        pump.await.expect("the pump returns on a decode failure");
+        tokio::time::timeout(std::time::Duration::from_secs(5), input_tx.closed())
+            .await
+            .expect("the feed task is still parked, holding the vsock write half");
+    }
+
+    /// The two halves of the ownership contract `boot` documents: a directory
+    /// that was never handed on is removed, and one that was is left to the
+    /// [`MicroVm`] that will remove it.
+    #[test]
+    fn a_scratch_dir_outlives_its_guard_only_once_disarmed() {
+        let base = std::env::temp_dir().join(format!("dt-scratch-{}", std::process::id()));
+        let refused = base.join("refused");
+        let booted = base.join("booted");
+
+        ScratchDir::create(refused.clone()).expect("create");
+        assert!(
+            !refused.exists(),
+            "a refused run left {}",
+            refused.display()
+        );
+
+        ScratchDir::create(booted.clone()).expect("create").disarm();
+        assert!(
+            booted.exists(),
+            "a disarmed guard removed {}",
+            booted.display()
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A unix socket path is capped near 108 bytes. The run directory is

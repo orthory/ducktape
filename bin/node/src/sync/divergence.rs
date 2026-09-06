@@ -14,6 +14,7 @@
 //! wire change and its own arc), so this makes the fork nameable within a
 //! poll cycle rather than preventing it.
 
+use commonware_codec::DecodeExt as _;
 use commonware_cryptography::ed25519;
 use commonware_p2p::Sender as P2pSender;
 use sdk::StateRoot;
@@ -81,15 +82,44 @@ pub(crate) fn note_peer_root(
     Some(attempts)
 }
 
-/// the validator's forever watch: poll one co-peer per tick on the detection
-/// lane it already answers for others, and compare its root with ours.
+/// pick this round's poll target: the next entry after `cursor` in `members`
+/// that is not `me`, round-robin. `None` when there is nobody else to poll
+/// (a solo validator, or a member list this node reads as itself alone) —
+/// generic over the key type so the selection is exercisable with plain
+/// strings, no real keypair required.
+///
+/// re-deriving this from a fresh `members` slice every tick is what makes a
+/// promotion or a drain take effect immediately: there is no standing
+/// rotation state to fall out of sync with the valset, only a cursor into
+/// whatever list this round was handed.
+pub(crate) fn select_candidate<K: PartialEq + Clone>(
+    members: &[K],
+    me: &K,
+    cursor: usize,
+) -> Option<K> {
+    let len = members.len();
+    (0..len).find_map(|step| {
+        let candidate = &members[(cursor + step) % len];
+        (candidate != me).then(|| candidate.clone())
+    })
+}
+
+/// the validator's forever watch: poll one co-validator per tick on the
+/// detection lane it already answers for others, and compare its root with
+/// ours.
 ///
 /// a validator polls nobody otherwise — `fetch_tip_coords` has exactly one
 /// caller, the parked resident's loop — so on a validator-only network
-/// nothing ever read a peer's tip at all.
+/// nothing ever read a peer's tip at all. the candidate pool is the
+/// COMMITTED VALIDATOR SET, never the transport book: a resident carries no
+/// statesync server (`replica::park`'s dispatch loop only completes its own
+/// waiters), so a peer book that also holds residents burns the poll's one
+/// slot per tick on a structural dead end, stretching detection latency with
+/// the fleet's resident count instead of holding it flat.
 pub(crate) async fn watch_root_divergence<S>(
     client: crate::blob_fetch::ServeLaneBlobClient<S>,
     state_tx: futures::channel::mpsc::Sender<SyncStateRequest>,
+    me: ed25519::PublicKey,
     label: String,
 ) where
     S: P2pSender<PublicKey = ed25519::PublicKey>,
@@ -99,7 +129,7 @@ pub(crate) async fn watch_root_divergence<S>(
     let mut state_tx = state_tx;
     loop {
         tokio::time::sleep(ROOT_POLL_TICK).await;
-        watch_once(&client, &mut state_tx, &mut cursor, &mut seen, &label).await;
+        watch_once(&client, &mut state_tx, &mut cursor, &mut seen, &me, &label).await;
     }
 }
 
@@ -109,15 +139,22 @@ async fn watch_once<S>(
     state_tx: &mut futures::channel::mpsc::Sender<SyncStateRequest>,
     cursor: &mut usize,
     seen: &mut std::collections::BTreeMap<String, u64>,
+    me: &ed25519::PublicKey,
     label: &str,
 ) where
     S: P2pSender<PublicKey = ed25519::PublicKey>,
 {
-    let peers = client.other_peers();
-    if peers.is_empty() {
-        return; // a solo node has nobody to disagree with.
-    }
-    let peer = peers[*cursor % peers.len()].clone();
+    // one round trip serves both halves: our own tip (the compare's other
+    // side) and the committed member list this tick polls from — read FRESH
+    // every tick, off the same loop-owned state the Standing gate and the
+    // epoch cutover already read, so a promotion or a drain that just
+    // committed is honoured on the very next poll, never a stale rotation.
+    let Some((mine, members)) = local_state(state_tx).await else {
+        return;
+    };
+    let Some(peer) = select_candidate(&members, me, *cursor) else {
+        return; // no co-validator to poll (solo, or the only member is us).
+    };
     *cursor = cursor.wrapping_add(1);
     let asked = client
         .request_from(peer.clone(), SyncRequest::TipCoords)
@@ -132,11 +169,6 @@ async fn watch_once<S>(
             reason = "tip_coords_unanswered",
             "root divergence watch skipped this peer"
         );
-        return;
-    };
-    // our own side through the seam we answer for peers, so both halves of
-    // the compare are read the same way.
-    let Some(mine) = local_tip(state_tx).await else {
         return;
     };
     // the watch's only evidence that it RAN — the poll reached a co-peer, the
@@ -160,23 +192,31 @@ async fn watch_once<S>(
     );
 }
 
-/// this node's own finalized `(height, root)`, read through the consensus
-/// loop's [`SyncStateRequest::TipCoords`] seam. `None` while the loop is
+/// this node's own finalized `(height, root)` and the committed validator
+/// set, read together through the consensus loop's
+/// [`SyncStateRequest::TipCoords`] seam — the same fresh `participants` read
+/// the drain loop's own cutover and the Standing gate use, never the
+/// transport book that also carries residents. `None` while the loop is
 /// shutting down or has no finalized boundary yet.
-async fn local_tip(
+async fn local_state(
     state_tx: &mut futures::channel::mpsc::Sender<SyncStateRequest>,
-) -> Option<(u64, StateRoot)> {
+) -> Option<((u64, StateRoot), Vec<ed25519::PublicKey>)> {
     let (reply, answer) = tokio::sync::oneshot::channel();
     futures::SinkExt::send(state_tx, SyncStateRequest::TipCoords { reply })
         .await
         .ok()?;
     let coords = answer.await.ok()?.ok()?;
-    Some((coords.height, coords.root_hash))
+    let members = coords
+        .participants
+        .iter()
+        .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+        .collect();
+    Some(((coords.height, coords.root_hash), members))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{WARN_EVERY, note_peer_root};
+    use super::{WARN_EVERY, note_peer_root, select_candidate};
     use sdk::StateRoot;
 
     fn root(byte: u8) -> StateRoot {
@@ -234,5 +274,34 @@ mod tests {
             Some(1)
         );
         assert_eq!(seen.get("aa"), None, "an agreeing peer mints no entry");
+    }
+
+    /// the candidate pool round-robins over the members handed to it THIS
+    /// round, skipping only our own key — so a member list that dropped a
+    /// resident, gained a promotion, or shrank to a fresh valset between
+    /// ticks is honoured on the very next call, with no rotation state
+    /// surviving from the prior tick.
+    #[test]
+    fn candidate_selection_skips_self_and_round_robins_over_the_current_members() {
+        let members = ["a", "b", "c"];
+        let me = "a";
+
+        // cursor 0 lands on "a" — skip to the next entry, "b".
+        assert_eq!(select_candidate(&members, &me, 0), Some("b"));
+        // cursor 1 lands on "b" directly.
+        assert_eq!(select_candidate(&members, &me, 1), Some("b"));
+        // cursor 2 lands on "c" directly.
+        assert_eq!(select_candidate(&members, &me, 2), Some("c"));
+        // the cursor wraps: 3 % 3 == 0 lands on "a" again — skip to "b".
+        assert_eq!(select_candidate(&members, &me, 3), Some("b"));
+
+        // a solo member list of just ourselves has nobody to poll.
+        assert_eq!(select_candidate(&["a"], &me, 0), None);
+        // an empty member list (the loop shutting down mid-read) likewise.
+        assert_eq!(select_candidate::<&str>(&[], &me, 0), None);
+
+        // re-reading a SMALLER list (a drain took a member out) never panics
+        // and still finds the survivor.
+        assert_eq!(select_candidate(&["a", "c"], &me, 5), Some("c"));
     }
 }

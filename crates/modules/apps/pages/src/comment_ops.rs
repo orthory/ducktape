@@ -1,8 +1,8 @@
 use super::{
-    AuthorRef, Comment, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_AUTHOR_BYTES,
-    MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
-    MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError,
-    PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
+    AuthorRef, Comment, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES,
+    MAX_COMMENT_TEXT_BYTES, MAX_COMMENT_WORK_PER_TARGET, MAX_COMMENTS_PER_THREAD,
+    MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError, PageMsg, Pages, Thread,
+    ThreadView, author_from_origin, id_is_index_safe,
 };
 use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
@@ -21,22 +21,6 @@ fn comment_key(id: &str) -> String {
 }
 fn target_index_key(target: &str) -> String {
     format!("{TARGET_INDEX_PREFIX}{target}")
-}
-
-/// derive the comment author from the dispatch origin (mirrors chat). the
-/// pre-consensus default `Origin::External(vec![])` must never pass as a real
-/// user.
-fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
-    match origin {
-        Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
-        Origin::External(bytes) if bytes.len() > MAX_COMMENT_AUTHOR_BYTES => {
-            Err(PageError::AuthorTooLarge)
-        }
-        Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
-        Origin::Module(id) if id.len() > MAX_COMMENT_AUTHOR_BYTES => Err(PageError::AuthorTooLarge),
-        Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
-        Origin::System => Ok(AuthorRef::System),
-    }
 }
 
 impl Pages {
@@ -81,6 +65,22 @@ impl Pages {
         }
     }
 
+    /// the aggregate thread+comment work `preflight_subtree_removal` (store.rs)
+    /// would charge THIS target's owning block: one unit per thread plus one
+    /// per comment across every thread anchored here. `AddComment` caps this
+    /// at [`MAX_COMMENT_WORK_PER_TARGET`] before staging a new thread or reply,
+    /// so the removal budget can never be exhausted by comments alone.
+    async fn comment_work_for_target(&self, target: &str) -> Result<usize, PageError> {
+        let thread_ids = self.load_target_index(target).await?;
+        let mut work = thread_ids.len();
+        for thread_id in &thread_ids {
+            if let Some(thread) = self.load_thread(thread_id).await? {
+                work += thread.comment_ids.len();
+            }
+        }
+        Ok(work)
+    }
+
     fn stage_target_index(&mut self, target: &str, ids: &[String]) -> Result<(), PageError> {
         if ids.is_empty() {
             self.delete_block(&target_index_key(target));
@@ -118,13 +118,14 @@ impl Pages {
     /// to `target` — called when the target block/page is deleted so comment
     /// records never dangle in the reserved keyspace with no reachable target.
     ///
-    /// deliberately NOT author-gated, and that is the module's rule rather
-    /// than an omission: this is an IMPLICIT mutation, a consequence of
-    /// removing the block, and it rides that block op's own authority. A page
-    /// tree here has no owning principal — every block op admits any origin —
-    /// so a per-comment check would only make a block undeletable once anyone
-    /// else commented on it, while adding no authority the module has
-    /// anywhere. What bounds the purge is aim, not permission: it reaches
+    /// deliberately NOT author-gated on its own, and that is the module's
+    /// rule rather than an omission: this is an IMPLICIT mutation, a
+    /// consequence of removing the block, and it rides that `RemoveBlock`
+    /// op's OWN [`Pages::may_edit`] check, already passed by the time this
+    /// runs — a per-comment check on top would only make a block undeletable
+    /// once anyone else commented on it, while adding no authority the module
+    /// does not already have. What bounds the purge is aim, not permission: it
+    /// reaches
     /// exactly the threads anchored to the subtree being removed, which is why
     /// [`Pages::apply_comment_op`]'s `MoveCommentThread` must stay
     /// opener-gated — that op is the only way to aim it at a thread that was
@@ -241,6 +242,11 @@ impl Pages {
                         if thread.comment_ids.len() >= MAX_COMMENTS_PER_THREAD {
                             return Err(PageError::TooManyComments);
                         }
+                        if self.comment_work_for_target(&target).await? + 1
+                            > MAX_COMMENT_WORK_PER_TARGET
+                        {
+                            return Err(PageError::TooMuchCommentWork);
+                        }
                         let comment = Comment {
                             id: comment_id.clone(),
                             thread_id: thread_id.clone(),
@@ -255,19 +261,28 @@ impl Pages {
                         self.store_thread(&thread)
                     }
                     None => {
-                        if let Some(anchor) = &anchor {
-                            let block = self
-                                .load_block(&target)
-                                .await
-                                .map_err(|_| PageError::Corrupt)?
-                                .ok_or(PageError::BlockNotFound)?;
-                            if !valid_range(&block.text, anchor.start, anchor.end) {
-                                return Err(PageError::InvalidTextRange);
-                            }
+                        // the new-thread target must be a real block, anchor
+                        // or not — otherwise a thread can be squatted on an
+                        // id that never becomes a block, and no purge can
+                        // ever reach it (RemoveBlock needs the block to load).
+                        let block = self
+                            .load_block(&target)
+                            .await
+                            .map_err(|_| PageError::Corrupt)?
+                            .ok_or(PageError::BlockNotFound)?;
+                        if let Some(anchor) = &anchor
+                            && !valid_range(&block.text, anchor.start, anchor.end)
+                        {
+                            return Err(PageError::InvalidTextRange);
                         }
                         let mut ids = self.load_target_index(&target).await?;
                         if ids.len() >= MAX_THREADS_PER_TARGET {
                             return Err(PageError::TooManyThreads);
+                        }
+                        if self.comment_work_for_target(&target).await? + 2
+                            > MAX_COMMENT_WORK_PER_TARGET
+                        {
+                            return Err(PageError::TooMuchCommentWork);
                         }
                         let comment = Comment {
                             id: comment_id.clone(),

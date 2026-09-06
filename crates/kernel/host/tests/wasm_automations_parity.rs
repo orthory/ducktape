@@ -382,12 +382,12 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
                 "r-inbox",
                 on_general(None),
                 Action::DeliverInbox {
-                    // `{author}` is the member domain's whole point: an inbox
-                    // queue is named in `Origin::actor_string`, so the rendering
-                    // the GUEST computes has to be one the triggering author can
-                    // ack. rendered wrong, the delivered member differs from
-                    // native's and the inbox sibling root diverges below.
-                    member_template: "{author}".into(),
+                    // #1739: `DeliverInbox` may reach only the rule owner's
+                    // own inbox queue -- `ops`'s literal `ext:{hex}`. the
+                    // GUEST'S rendering of that literal (unaffected by
+                    // substitution) has to match native's byte for byte, or
+                    // the inbox sibling root diverges below.
+                    member_template: format!("ext:{}", "b2".repeat(32)),
                     kind: "note".into(),
                     body_template: "{author} said: {text}".into(),
                 },
@@ -436,16 +436,16 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
             inbox_genesis,
             "the hooked post delivered nothing to the inbox"
         );
-        // and it delivered into the ACKABLE queue: the member the COMPILED
-        // COMPONENT substituted for `{author}` is the triggering author's own
-        // actor string, derived here and never spelled. inbox refuses an ack
-        // from anyone but that origin, so any other rendering is mail nobody
-        // can ever mark read.
+        // and it delivered into the ACKABLE queue: #1739's gate binds in the
+        // COMPILED COMPONENT exactly as in native, so the member is `ops`'s
+        // (the rule OWNER's) own actor string, never the triggering author's
+        // (`user`, key 0xA1) -- a rule may only ever deliver to its own
+        // owner's queue.
         assert_eq!(
             run_details(&wasm, "r-inbox").await,
             vec![format!(
                 "delivered inbox note to {}",
-                Origin::External(key(0xA1)).actor_string()
+                Origin::External(key(0xB2)).actor_string()
             )],
             "the guest rendered the member outside the actor-string domain"
         );
@@ -502,6 +502,7 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
                     payload: tasks_encode_msg(&TaskMsg::CreateTask {
                         task_id: "job-general-6".into(),
                         title: "squatted".into(),
+                        owner: None,
                     }),
                 },
             )

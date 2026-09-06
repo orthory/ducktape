@@ -1335,8 +1335,8 @@ pub fn keep_members(
 /// for the five folds that used to spell it out in four lines each.
 ///
 /// A LOAD CARRIES THE ROSTER OF THE CHANNEL IT LOADED, AND THAT IS NOT ALWAYS
-/// THE HUDDLE'S. The docked pill and the popped panel follow you onto every
-/// other room and every other screen — that is what they are FOR — so reading
+/// THE HUDDLE'S. The huddle window follows you onto every other room and
+/// every other screen — that is what it is FOR — so reading
 /// "am I in a huddle" off the room you happen to be looking at answered no the
 /// moment you clicked a second channel. And that answer is not cosmetic:
 /// `huddle_joined` is the media leg's subscription gate, so a channel click cut

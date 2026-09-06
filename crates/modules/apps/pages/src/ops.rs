@@ -3,8 +3,11 @@ use super::{Origin, PageError, PageMsg, Pages};
 impl Pages {
     /// apply one decoded [`PageMsg`] to the staged overlay. pure tree surgery
     /// over per-block/-comment records, re-staged on success. errors abort the
-    /// block. `origin`/`now` are only consulted by the comment ops (author +
-    /// timestamp); block ops ignore them.
+    /// block. `origin` derives the actor for every op: the comment ops gate on
+    /// stored comment/thread authorship, `CreatePage` records the creating
+    /// origin as the page's author, and every other page/block op is gated by
+    /// [`Pages::may_edit`] against that recorded author. `now` is consulted
+    /// only by the comment ops (their stored timestamps).
     pub(super) async fn apply(
         &mut self,
         msg: PageMsg,
@@ -62,8 +65,8 @@ impl Pages {
             return self.apply_comment_op(msg, origin, now).await;
         }
         if matches!(&msg, PageMsg::CreatePage { .. }) {
-            return self.apply_page_op(msg).await;
+            return self.apply_page_op(msg, origin).await;
         }
-        self.apply_block_op(msg).await
+        self.apply_block_op(msg, origin).await
     }
 }

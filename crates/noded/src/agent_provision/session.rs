@@ -52,7 +52,6 @@ pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
 
 /// An opened, host-owned signer and its narrow child-facing endpoint.
 pub(super) struct RunSession {
-    pub(super) run_id: String,
     pub(super) action_url: String,
     pub(super) action_token: String,
     shutdown: Option<oneshot::Sender<()>>,
@@ -188,7 +187,6 @@ async fn start_action_server(
             .await;
     });
     Ok(RunSession {
-        run_id,
         action_url: format!("http://127.0.0.1:{}/v1/run-action", address.port()),
         action_token: token,
         shutdown: Some(shutdown),
@@ -201,10 +199,13 @@ async fn run_action(
     headers: HeaderMap,
     Json(request): Json<ActionRequest>,
 ) -> Response<Body> {
+    // the listener is not loopback-bound (a child in a private netns must reach
+    // it), so the token IS the boundary: compare it in constant time like every
+    // other secret in this crate, never with a short-circuiting `==`.
     let authorized = headers
         .get(ACTION_HEADER)
         .and_then(|value| value.to_str().ok())
-        == Some(state.token.as_str());
+        .is_some_and(|presented| crate::services::token_matches(presented, &state.token));
     if !authorized {
         return action_response(StatusCode::UNAUTHORIZED, "action token rejected");
     }
