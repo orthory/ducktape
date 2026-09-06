@@ -127,7 +127,7 @@ use agent::{
     encode_query as agent_encode_query,
 };
 use chat::{
-    Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
+    Block, ChannelAccess, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };

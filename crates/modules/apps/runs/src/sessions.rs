@@ -80,7 +80,7 @@ use super::{
     DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationState, DelegationStatus, DelegationView,
     DispatchQuery, DispatchReply, Error, Lane, MAX_ACTIONS_PER_SESSION,
     MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_BYTES,
-    MAX_DELEGATIONS_PER_RUN, Origin, RunAuthority, RunsModule, SESSION_KEY_LEN,
+    MAX_DELEGATIONS_PER_RUN, Origin, RunAuthority, RunsModule, SESSION_KEY_LEN, SagaOrigin,
     SiblingReadBudget, delegated_run_id_for, delegation_id_for, dispatch_decode_reply,
     dispatch_encode_query, dispatch_id_for, page_thread_id,
 };
@@ -424,6 +424,28 @@ impl RunsModule {
             .ok_or_else(|| {
                 Error::Module(format!("callee agent is unavailable: {}", request.agent_id))
             })?;
+        // the callee's dispatch payload EMBEDS the caller's channel transcript
+        // (`pin_context` pins up to CONTEXT_WINDOW messages of
+        // `entry.channel_id`) and is routed by the callee's capability tag to a
+        // provider the callee's OWNER runs. nothing else ties that owner to this
+        // channel, so without this a prompt-injected caller exfiltrates a
+        // private channel by delegating into a stranger's agent. the callee's
+        // owner is the account that will see the bytes, so its READ standing is
+        // the gate. a module/system owner is not narrowed — chat admits those
+        // origins everywhere already.
+        if let SagaOrigin::External(owner) = &callee.owner {
+            let may_read = !owner.is_empty()
+                && self
+                    .may_read(&*ctx, owner, &entry.channel_id)
+                    .await
+                    .map_err(Error::Module)?;
+            if !may_read {
+                return Err(Error::Module(format!(
+                    "the owner of callee agent {} may not read the caller's channel: {}",
+                    callee.agent_id, entry.channel_id
+                )));
+            }
+        }
         let scoped_callee = caller.scoped_for_call(&callee);
         let extra = crate::envelope::library_skills(&request.skills).map_err(Error::Module)?;
         if let Some(skill) = extra

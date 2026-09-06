@@ -1037,3 +1037,40 @@ fn a_moved_lease_stops_the_old_session_from_delegating() {
     assert!(ctx.dispatch_msgs().is_empty());
     assert!(delegations(&m, &run_id).is_empty());
 }
+
+#[test]
+fn a_callee_whose_owner_cannot_read_the_channel_is_refused() {
+    // the callee's dispatch carries the CALLER's transcript to a provider the
+    // callee's owner runs, so that owner's read standing is the gate.
+    let (mut m, mut registry, run_id) = with_open_delegating_session(2);
+    let private = |registry: &Registry| {
+        session_ctx(registry, &run_id, Origin::External(SESSION_KEY.to_vec()))
+            .with_members_only("general", vec![9; 32])
+    };
+
+    registry.get_mut("worker").unwrap().owner = SagaOrigin::External(vec![8; 32]);
+    let mut ctx = private(&registry);
+    let err = exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&run_id, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("may not read the caller's channel")),
+        "{err:?}"
+    );
+    assert!(ctx.dispatch_msgs().is_empty(), "no transcript leaves");
+    assert!(delegations(&m, &run_id).is_empty());
+
+    // an owner who can read the channel dispatches as before.
+    registry.get_mut("worker").unwrap().owner = SagaOrigin::External(vec![9; 32]);
+    let mut ctx = private(&registry);
+    exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&run_id, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap();
+    assert_eq!(ctx.dispatch_msgs().len(), 1);
+}
