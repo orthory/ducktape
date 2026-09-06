@@ -30,6 +30,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -1464,7 +1465,19 @@ pub struct Host {
     /// cannot change for a fixed pair) is paid, reported, and skipped from
     /// then on. Per-node bookkeeping, never part of `root()`.
     foreign_admissions: BTreeSet<(ModuleId, Vec<u8>)>,
+    /// the last [`Host::module_status`] answer and the registry identity it was
+    /// read at — see [`RegistryIdentity`]. Per-node bookkeeping, never part of
+    /// `root()`.
+    status_cache: Mutex<Option<(RegistryIdentity, Vec<modules::ModuleCode>)>>,
 }
+
+/// what the modules registry's `ModuleStatus` reply is a pure function of: the
+/// registry's COMMITTED state root and the code answering the query. Both move
+/// exactly when the reply can — a block applying a modules op (root), a swap of
+/// the registry's own component (code hash), an installed snapshot (root) — so
+/// an unchanged identity means an unchanged reply, with no invalidation hook to
+/// forget on some other path.
+type RegistryIdentity = (StateRoot, Option<Vec<u8>>);
 
 impl Host {
     pub fn new() -> Self {
@@ -1472,6 +1485,7 @@ impl Host {
             registry: BTreeMap::new(),
             module_factory: None,
             foreign_admissions: BTreeSet::new(),
+            status_cache: Mutex::new(None),
         }
     }
 
@@ -1771,7 +1785,24 @@ impl Host {
     /// failure as "no registry" would silently skip swaps and the `Advance`
     /// injection — the node then seals a different root than its peers instead
     /// of stalling and retrying.
+    ///
+    /// MEMOISED on the registry's [`RegistryIdentity`]: the roster read costs
+    /// one guest instantiation per module (the registry is store-backed, so
+    /// `ModuleStatus`'s N+1 committed reads are N+1 query rounds) and every
+    /// block does it at least twice — `pending_modules_advance` and
+    /// `realize_module_swaps`, both against PRE-batch committed state — plus
+    /// once per readiness tick. Only a failed read is ever repeated.
     pub async fn module_status(&self) -> Result<Option<Vec<modules::ModuleCode>>, Error> {
+        let Some(registry) = self.registry.get(MODULES_ID) else {
+            return Ok(None);
+        };
+        // the registry is store-backed, so ONE roster read costs one guest
+        // instantiation per module (N+1 rounds) and this runs at least twice per
+        // block. memoise on the identity the reply is a function of.
+        let identity: RegistryIdentity = (registry.root(), registry.code_hash());
+        if let Some(hit) = self.cached_status(&identity) {
+            return Ok(Some(hit));
+        }
         let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
         let bytes = match self.query(MODULES_ID, &req).await {
             Ok(bytes) => bytes,
@@ -1780,12 +1811,23 @@ impl Host {
         };
         let reply = modules::decode_reply(&bytes)
             .map_err(|e| Error::Module(format!("modules registry reply is unreadable: {e}")))?;
-        match reply {
-            modules::ModulesReply::ModuleStatus { modules } => Ok(Some(modules)),
-            other => Err(Error::Module(format!(
-                "modules registry answered ModuleStatus with {other:?}"
-            ))),
-        }
+        let modules = match reply {
+            modules::ModulesReply::ModuleStatus { modules } => modules,
+            other => {
+                return Err(Error::Module(format!(
+                    "modules registry answered ModuleStatus with {other:?}"
+                )));
+            }
+        };
+        *self.status_cache.lock().expect("status cache") = Some((identity, modules.clone()));
+        Ok(Some(modules))
+    }
+
+    /// the memoised `ModuleStatus` reply, iff it was read at `identity`.
+    fn cached_status(&self, identity: &RegistryIdentity) -> Option<Vec<modules::ModuleCode>> {
+        let guard = self.status_cache.lock().expect("status cache");
+        let (cached_at, modules) = guard.as_ref()?;
+        (cached_at == identity).then(|| modules.clone())
     }
 
     /// realize a verified code swap against a single registered module: route to
