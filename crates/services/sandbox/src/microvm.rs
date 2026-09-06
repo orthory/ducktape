@@ -20,9 +20,13 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpStream, UnixListener, UnixStream};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::firecracker_api::{self, VmConfig};
 use crate::guest_manifest::RunManifest;
@@ -36,6 +40,19 @@ use crate::guest_proto::{self, Frame};
 /// broken — a missing init, an unmountable workspace, a kernel panic — and the
 /// useful thing to do is fail with the VMM's console output rather than wait.
 const GUEST_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// a run's outstanding guest tunnel connections, past which an accepted
+/// socket is dropped rather than spliced.
+///
+/// Shared across every tunnel a run has, not per-port: the guest decides how
+/// many connections to hold and nothing on the guest side costs it anything
+/// to hold one open, so the ceiling has to be the host's. See #1873.
+const MAX_TUNNEL_CONNECTIONS: usize = 64;
+
+/// a spliced connection with no bytes in either direction for this long is
+/// closed. Without this, a guest that stops talking (or a service that stops
+/// answering) holds its two fds and its permit forever for free.
+const TUNNEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// a live run's stdio, shaped like the pipes an ordinary child would give, so
 /// the caller's output loop does not care which backend produced them.
@@ -126,6 +143,10 @@ pub struct MicroVm {
     vsock_uds: PathBuf,
     /// the tunnel acceptors, aborted when the VM goes away.
     tunnels: Vec<tokio::task::JoinHandle<()>>,
+    /// this run's connection cap and the splice tasks it is currently
+    /// spending it on, torn down with the run in `Drop` — aborting `tunnels`
+    /// above only stops NEW connections, this ends the ones already spliced.
+    tunnel_run: Arc<TunnelRun>,
     /// when the VMM was spawned, which is where
     /// [`firecracker_api::MAX_VM_LIFETIME`] is counted from.
     booted_at: tokio::time::Instant,
@@ -149,6 +170,7 @@ impl Drop for MicroVm {
         for tunnel in self.tunnels.drain(..) {
             tunnel.abort();
         }
+        self.tunnel_run.shutdown();
         // THE 21 GB LINE. A silent failure here is the leak this Drop exists to
         // prevent, and it is invisible until a node's disk is full — so a
         // removal that did not happen says so, once, with the directory that
@@ -237,13 +259,18 @@ impl MicroVm {
         // must declare each guest-outbound port to Virtualization.framework.
         let mut listen_ports = vec![guest_proto::VSOCK_PORT];
         let mut tunnels = Vec::with_capacity(manifest.tunnel_ports.len());
+        let tunnel_run = Arc::new(TunnelRun::new(MAX_TUNNEL_CONNECTIONS));
         for (index, port) in manifest.tunnel_ports.iter().enumerate() {
             let vsock_port = guest_proto::TUNNEL_PORT_BASE + index as u32;
             let path = vsock_port_path(&cfg.vsock_uds, vsock_port);
             let _ = std::fs::remove_file(&path);
             let tunnel_listener = UnixListener::bind(&path)
                 .map_err(|e| format!("listen on {}: {e}", path.display()))?;
-            tunnels.push(tokio::spawn(serve_tunnel(tunnel_listener, *port)));
+            tunnels.push(tokio::spawn(serve_tunnel(
+                tunnel_listener,
+                *port,
+                Arc::clone(&tunnel_run),
+            )));
             listen_ports.push(vsock_port);
         }
 
@@ -302,6 +329,7 @@ impl MicroVm {
             console: console.clone(),
             vsock_uds: cfg.vsock_uds.clone(),
             tunnels,
+            tunnel_run,
             booted_at: tokio::time::Instant::now(),
         };
 
@@ -441,43 +469,120 @@ impl MicroVm {
 /// the only address this function will ever dial. That property is what
 /// replaces the container backend's nft input chain, and it is stronger: there
 /// is no rule to get wrong, because there is no destination the guest can name.
-async fn serve_tunnel(listener: UnixListener, service_port: u16) {
+async fn serve_tunnel(listener: UnixListener, service_port: u16, run: Arc<TunnelRun>) {
     loop {
         let Ok((guest, _)) = listener.accept().await else {
             return;
         };
-        tokio::spawn(async move {
-            let service = match TcpStream::connect(("127.0.0.1", service_port)).await {
-                Ok(service) => service,
-                // The guest asked for the one address this tunnel can dial and
-                // nothing answered. Silent, this reaches the operator as a CLI
-                // that hangs and then times out with no cause anywhere — the
-                // broker being down looks exactly like a slow model.
-                Err(error) => {
-                    tracing::warn!(
-                        target: "ducktape::sandbox",
-                        reason = "tunnel_dial_failed",
-                        service_port,
-                        %error,
-                        "a guest tunnel had nothing to connect to on this host"
-                    );
-                    return;
-                }
-            };
-            let (mut guest_read, mut guest_write) = guest.into_split();
-            let (mut broker_read, mut broker_write) = service.into_split();
-            // both directions concurrently: splicing them in sequence would
-            // deadlock as soon as either side filled its buffer.
-            let up = async {
-                let _ = tokio::io::copy(&mut guest_read, &mut broker_write).await;
-                let _ = broker_write.shutdown().await;
-            };
-            let down = async {
-                let _ = tokio::io::copy(&mut broker_read, &mut guest_write).await;
-                let _ = guest_write.shutdown().await;
-            };
-            tokio::join!(up, down);
-        });
+        let Ok(permit) = Arc::clone(&run.permits).try_acquire_owned() else {
+            run.refuse();
+            continue; // `guest` drops here, closing the socket we just accepted.
+        };
+        let mut splices = run.splices.lock().unwrap();
+        // opportunistic reap: a long-lived run's tunnel sees far more
+        // connections than its cap, and nothing else ever drains a finished
+        // task out of the set.
+        while splices.try_join_next().is_some() {}
+        splices.spawn(splice(guest, service_port, permit));
+    }
+}
+
+/// splice one guest connection to `service_port` on this host's loopback
+/// until either direction hits EOF, an error, or goes idle — whichever comes
+/// first ends the whole connection, since a splice held open by only one live
+/// direction still spends its permit and two fds for nothing.
+async fn splice(guest: UnixStream, service_port: u16, _permit: tokio::sync::OwnedSemaphorePermit) {
+    let service = match TcpStream::connect(("127.0.0.1", service_port)).await {
+        Ok(service) => service,
+        // The guest asked for the one address this tunnel can dial and
+        // nothing answered. Silent, this reaches the operator as a CLI
+        // that hangs and then times out with no cause anywhere — the
+        // broker being down looks exactly like a slow model.
+        Err(error) => {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                reason = "tunnel_dial_failed",
+                service_port,
+                %error,
+                "a guest tunnel had nothing to connect to on this host"
+            );
+            return;
+        }
+    };
+    let (mut guest_read, mut guest_write) = guest.into_split();
+    let (mut broker_read, mut broker_write) = service.into_split();
+    let up = copy_until_idle(&mut guest_read, &mut broker_write, TUNNEL_IDLE_TIMEOUT);
+    let down = copy_until_idle(&mut broker_read, &mut guest_write, TUNNEL_IDLE_TIMEOUT);
+    // race, not join: both directions concurrently, and the first one to end
+    // (EOF, error, or idle) tears down the whole connection rather than
+    // leaving the other half parked on a peer that already left.
+    tokio::select! {
+        _ = up => {}
+        _ = down => {}
+    }
+}
+
+/// copy from `reader` to `writer` until EOF, a read/write error, or `idle`
+/// elapses with no bytes read — whichever comes first.
+async fn copy_until_idle<R, W>(reader: &mut R, writer: &mut W, idle: std::time::Duration)
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let read = match tokio::time::timeout(idle, reader.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => n,
+            _ => break, // EOF, a read error, or the idle timeout: all end the copy.
+        };
+        if writer.write_all(&buf[..read]).await.is_err() {
+            break;
+        }
+    }
+    let _ = writer.shutdown().await;
+}
+
+/// one run's guest-tunnel bookkeeping, shared across every tunnel the run has
+/// open: the guest picks how many connections to hold, not which port it
+/// holds them on, so the cap and the splice tasks it spends are per RUN.
+struct TunnelRun {
+    permits: Arc<Semaphore>,
+    refused: AtomicU64,
+    splices: Mutex<JoinSet<()>>,
+}
+
+impl TunnelRun {
+    fn new(max_connections: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_connections)),
+            refused: AtomicU64::new(0),
+            splices: Mutex::new(JoinSet::new()),
+        }
+    }
+
+    /// record one more refusal, warning on the first and then every Nth: an
+    /// unconditional `warn!` here is a guest-controlled log bomb, and the
+    /// `attempts` count is itself the diagnosis.
+    fn refuse(&self) {
+        const LOG_EVERY: u64 = 100;
+        let attempts = self.refused.fetch_add(1, Ordering::Relaxed) + 1;
+        if attempts == 1 || attempts.is_multiple_of(LOG_EVERY) {
+            tracing::warn!(
+                target: "ducktape::sandbox",
+                reason = "tunnel_connection_refused",
+                attempts,
+                max_connections = MAX_TUNNEL_CONNECTIONS,
+                "a guest tunnel connection was refused; the run's connection cap is full"
+            );
+        }
+    }
+
+    /// end every splice this run has open. Called from [`MicroVm`]'s own
+    /// `Drop` so a run's tunnels do not outlive the run — aborting the accept
+    /// loops alone stops new connections but leaves already-spliced ones
+    /// running, since they were spawned onto the runtime, not into `tunnels`.
+    fn shutdown(&self) {
+        self.splices.lock().unwrap().abort_all();
     }
 }
 
@@ -934,5 +1039,129 @@ mod tests {
             path.display(),
             path.as_os_str().len()
         );
+    }
+
+    /// a loopback TCP echo service: what a spliced tunnel connection talks to
+    /// in these tests, standing in for the real broker/http listener a tunnel
+    /// dials in production.
+    async fn spawn_echo_service() -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind echo service");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let n = match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn unique_socket_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "dt-tunnel-test-{name}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    /// round-trips one byte through `stream` and asserts the echo service
+    /// answered — proof the connection is actually spliced, not merely open.
+    async fn assert_spliced(stream: &mut UnixStream) {
+        stream
+            .write_all(b"x")
+            .await
+            .expect("write to a live tunnel");
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("the echo answers before the test timeout")
+            .expect("read the echo back");
+        assert_eq!(n, 1, "the tunnel closed instead of echoing");
+        assert_eq!(&buf, b"x");
+    }
+
+    /// #1873: a guest's tunnel connections are capped per run. The
+    /// (cap+1)th concurrent connection must be refused — closed with nothing
+    /// ever spliced to it — while the connections already under the cap keep
+    /// working.
+    #[tokio::test]
+    async fn a_connection_past_the_cap_is_refused_while_earlier_ones_stay_open() {
+        let service_port = spawn_echo_service().await;
+        let path = unique_socket_path("cap");
+        let listener = UnixListener::bind(&path).expect("bind tunnel socket");
+        let run = Arc::new(TunnelRun::new(2));
+        let accept = tokio::spawn(serve_tunnel(listener, service_port, Arc::clone(&run)));
+
+        let mut first = UnixStream::connect(&path).await.expect("connect 1");
+        assert_spliced(&mut first).await;
+        let mut second = UnixStream::connect(&path).await.expect("connect 2");
+        assert_spliced(&mut second).await;
+
+        // the cap is 2; a third concurrent connection must be refused.
+        let mut third = UnixStream::connect(&path).await.expect("connect 3");
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), third.read(&mut buf))
+            .await
+            .expect("the refused connection closes before the test timeout")
+            .expect("a closed socket reads Ok(0), not an error");
+        assert_eq!(n, 0, "the connection past the cap was not closed");
+        assert_eq!(
+            run.refused.load(Ordering::Relaxed),
+            1,
+            "the refusal was not counted"
+        );
+
+        // the connections under the cap were never touched by the refusal.
+        assert_spliced(&mut first).await;
+        assert_spliced(&mut second).await;
+
+        accept.abort();
+    }
+
+    /// #1873: tearing a run down (what [`MicroVm`]'s own `Drop` calls) closes
+    /// every splice it still has open, not just its accept loops.
+    #[tokio::test]
+    async fn shutdown_closes_every_spliced_connection() {
+        let service_port = spawn_echo_service().await;
+        let path = unique_socket_path("shutdown");
+        let listener = UnixListener::bind(&path).expect("bind tunnel socket");
+        let run = Arc::new(TunnelRun::new(4));
+        let accept = tokio::spawn(serve_tunnel(listener, service_port, Arc::clone(&run)));
+
+        let mut a = UnixStream::connect(&path).await.expect("connect a");
+        assert_spliced(&mut a).await;
+        let mut b = UnixStream::connect(&path).await.expect("connect b");
+        assert_spliced(&mut b).await;
+
+        run.shutdown();
+
+        for stream in [&mut a, &mut b] {
+            let mut buf = [0u8; 1];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("a torn-down splice closes before the test timeout")
+                .expect("a closed socket reads Ok(0), not an error");
+            assert_eq!(n, 0, "shutdown left a splice running");
+        }
+
+        accept.abort();
     }
 }
