@@ -6362,6 +6362,7 @@ dependencies = [
  "blobstore",
  "borsh",
  "bytes",
+ "capability",
  "chat",
  "commonware-codec",
  "commonware-cryptography",
@@ -9342,6 +9343,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

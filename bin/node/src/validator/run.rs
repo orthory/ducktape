@@ -72,10 +72,13 @@ pub(super) fn publish_boundary_status(
     metrics: &noded::NodeMetrics,
     status_public_key: &str,
 ) {
+    let height = node.finalized().map(|f| f.height).unwrap_or(0);
     status.publish(noded::NodeStatus {
         version: crate::build_version(),
         root_hash: crate::util::hex(&node.root_hash()),
-        height: node.finalized().map(|f| f.height).unwrap_or(0),
+        height,
+        consensus_time: node.stamp_consensus_time(height),
+        consensus_time_unit: node.consensus_time_policy().into(),
         modules: crate::util::module_statuses(node.host()),
         public_key: status_public_key.into(),
         // the cell overlays the boot-wired chain id on every read.

@@ -1838,6 +1838,73 @@ mod tests {
         assert!(refused(&mut forge, 9, &refused_stale).contains("non-fast-forward"));
     }
 
+    // #1761: consensus cannot learn its own chain id (the plumbing genesis
+    // config gives `identity`/`gateway`/`runs` is unreachable from an
+    // `Odb`-backed module — see `pushcert`'s module doc), so the strictest
+    // check forge can enforce is pinning the chain half of the FIRST
+    // cert-verified push it ever accepts and refusing every later one whose
+    // nonce carries a different chain — closing the replay against an
+    // ALREADY-ACTIVE forge even though the very first certified push can't be
+    // checked against anything yet.
+    #[test]
+    fn a_replayed_certificate_from_a_different_chain_is_refused_after_the_first_pin() {
+        use crate::pushcert;
+        use keyscheme::sshsig::GIT_SSH_NS;
+        use keyscheme::testkit::{ssh_key, sshsig};
+        let base = tmp_base("cross-chain-replay");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let signed = |chain: &str, repo: &str, seed: u8, updates: Vec<RefUpdate>| {
+            let cert = pushcert::certificate(&pushcert::nonce(chain, repo), &updates);
+            ForgeMsg::PushRefs {
+                repo: repo.into(),
+                pack_digest: Some(vec![9u8; 32]),
+                cert: Some(PushCert {
+                    sshsig: sshsig(&ssh_key(seed), GIT_SSH_NS, &cert),
+                    cert,
+                }),
+                updates,
+            }
+        };
+        let birth = |c: char| RefUpdate {
+            ref_name: "main".into(),
+            prev_oid: None,
+            new_oid: Some(oid(c).as_bytes().to_vec()),
+        };
+
+        // the network's own first certified push pins "home".
+        exec_commit(
+            &mut forge,
+            &mut ctx_at(1),
+            &signed("home", "demo", 1, vec![birth('a')]),
+        );
+
+        // a certificate minted on a DIFFERENT chain, harvested and replayed
+        // to squat an as-yet-unborn repo name on THIS network, is refused —
+        // even though its nonce names the (unborn) repo correctly and the
+        // signature verifies.
+        let err = exec(
+            &mut forge,
+            &mut ctx_at(2),
+            &signed("away", "stolen", 2, vec![birth('b')]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("chain"), "{err}");
+        futures::executor::block_on(forge.abort_block()).unwrap();
+        assert!(
+            forge.read_head("stolen").is_none(),
+            "the refused birth claimed nothing"
+        );
+
+        // the home chain keeps working normally, on a different repo too.
+        exec_commit(
+            &mut forge,
+            &mut ctx_at(3),
+            &signed("home", "other", 3, vec![birth('c')]),
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn successive_pushes_move_the_root() {
         let base = tmp_base("second");
@@ -2691,8 +2758,9 @@ mod tests {
 
     // an UNPROTECTED target used to accept a merge from anyone at all: a
     // stranger with no standing on the PR must not be able to force it into
-    // the terminal `Merged` state, but the PR's author, one of its reviewers,
-    // or the repo owner still can.
+    // the terminal `Merged` state, and — since `SubmitReview` has no standing
+    // gate of its own (#1760) — filing a review first grants no standing
+    // either. only the PR's author or the repo owner may merge it.
     #[test]
     fn merging_onto_an_unprotected_target_requires_standing() {
         let base = tmp_base("unprotected-merge");
@@ -2753,10 +2821,7 @@ mod tests {
         let mut stranger = ctx_with_origin(3, user_origin(9));
         let err = exec(&mut forge, &mut stranger, &merge_of("one"))
             .expect_err("a stranger may not merge");
-        assert!(
-            err.to_string().contains("author, a reviewer, or the owner"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("author or the owner"), "{err}");
         futures::executor::block_on(forge.abort_block()).unwrap();
 
         // the PR's own author merges it.
@@ -2764,8 +2829,11 @@ mod tests {
         exec_commit(&mut forge, &mut author, &merge_of("one"));
         assert_eq!(forge.state.repos["one"].refs["release"], oid('c'));
 
-        // a recorded reviewer (not the author, not the owner) merges a
-        // different PR after submitting a review on it.
+        // the INVERSION #1760 fixes: a stranger reviews first, then tries to
+        // merge on the strength of that review alone. the review is still
+        // accepted and stored (`SubmitReview` itself is unauthenticated by
+        // standing, on purpose — anyone may comment), but it grants no merge
+        // standing: the very next op from the same key is still refused.
         open_pr(&mut forge, "two", 2);
         let mut reviewer = ctx_with_origin(5, user_origin(3));
         exec_commit(
@@ -2780,7 +2848,14 @@ mod tests {
                 comments: vec![],
             },
         );
-        exec_commit(&mut forge, &mut reviewer, &merge_of("two"));
+        let err = exec(&mut forge, &mut reviewer, &merge_of("two"))
+            .expect_err("a stranger reviewing first must not authorize a merge");
+        assert!(err.to_string().contains("author or the owner"), "{err}");
+        futures::executor::block_on(forge.abort_block()).unwrap();
+
+        // the PR author still merges "two" normally.
+        let mut author2 = ctx_with_origin(6, user_origin(2));
+        exec_commit(&mut forge, &mut author2, &merge_of("two"));
         assert_eq!(forge.state.repos["two"].refs["release"], oid('c'));
 
         // the repo owner (neither author nor reviewer) may always merge.
@@ -3468,10 +3543,70 @@ mod tests {
         assert_eq!(norm_repo("").unwrap(), DEFAULT_REPO);
         assert_eq!(norm_repo("docs").unwrap(), "docs");
         assert_eq!(norm_repo("a.b_c-1").unwrap(), "a.b_c-1");
-        for bad in ["Docs", "a/b", "a b", ".", "..", "a\0b"] {
+        for bad in [
+            "Docs",
+            "a/b",
+            "a b",
+            ".",
+            "..",
+            "a\0b",
+            ".tracker.bin",
+            ".pending.bin",
+            ".stuck.txt",
+            ".snapshot-cache.bin",
+            ".hidden",
+        ] {
             assert!(norm_repo(bad).is_err(), "{bad:?} must be rejected");
         }
         assert!(norm_repo(&"a".repeat(65)).is_err(), "65 bytes too long");
         assert!(norm_repo(&"a".repeat(64)).is_ok(), "64 bytes ok");
+    }
+
+    // a repo named after forge's own dot-prefixed state file must never reach
+    // the stage: it would collide with `<base>/.tracker.bin` on disk and fail
+    // `commit_block` on every node forever (#1759). the birth of "demo" writes
+    // `.tracker.bin` to the base dir; birthing a repo literally called
+    // ".tracker.bin" must be refused AT THE PushRefs STAGE (by norm_repo), so
+    // commit_block/publish_block never even sees it and stays Ok.
+    #[test]
+    fn repo_named_like_forges_own_state_file_is_refused_at_stage() {
+        let base = tmp_base("dotfile-collision");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+
+        let mut owner = ctx_with_origin(1, user_origin(1));
+        push(&mut forge, &mut owner, "demo", "main", None, oid('a'))
+            .expect("birthing demo writes .tracker.bin to the base dir");
+        assert!(
+            base.join(".tracker.bin").is_file(),
+            "precondition: tracker persisted"
+        );
+
+        let mut attacker = ctx_with_origin(2, user_origin(2));
+        let err = push(
+            &mut forge,
+            &mut attacker,
+            ".tracker.bin",
+            "main",
+            None,
+            oid('b'),
+        )
+        .expect_err("a repo named after forge's own state file must be refused");
+        let _ = err;
+
+        // the node is NOT bricked: a normal publish_block still succeeds.
+        let mut owner2 = ctx_with_origin(3, user_origin(1));
+        push(&mut forge, &mut owner2, "demo", "dev", None, oid('c'))
+            .expect("publish_block stays Ok after the refused push");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // forge::norm_repo is shared with the git smart-HTTP bridge (git_http.rs)
+    // — the same reject must hold there, since that route never touches
+    // consensus's own PushRefs staging.
+    #[test]
+    fn bridge_shares_norm_repo_and_refuses_the_same_dotfile_name() {
+        assert!(norm_repo(".tracker.bin").is_err());
+        assert!(norm_repo(".pending.bin").is_err());
     }
 }

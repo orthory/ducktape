@@ -37,12 +37,18 @@ pub const MAX_BIO_LEN: usize = 280;
 pub const MAX_AVATAR_REF_LEN: usize = 512;
 /// query pagination ceiling -- [`IdentityQuery::All`] clamps `limit` to this.
 pub const MAX_QUERY_LIMIT: u64 = 256;
-/// how far past the block executing it a consent's `expires_at` may reach.
-/// `consensus_time` is a block height on a validator network heartbeating at
-/// about one block a second, so this is roughly seven days -- long enough for
-/// a device pairing that waits on a person, short enough that a mis-issued
-/// ticket is a mistake rather than a permanent bearer credential to the
-/// account. a consent naming a later expiry is refused at execution.
+/// how far past the block executing it a consent's `expires_at` may reach, IN
+/// WHATEVER UNIT THIS NETWORK'S `ConsensusTimePolicy` STAMPS `consensus_time`
+/// IN -- this module compares `expires_at - now` against it directly, with no
+/// unit conversion. On the validator/replica lanes `consensus_time` is the
+/// block height, heartbeating at about one block a second, so this is roughly
+/// seven days. On the sim lane's millisecond epoch clock the SAME NUMBER is
+/// roughly ten minutes -- a client minting a consent must scale its own TTL
+/// to that lane's unit (see `noded::ConsensusTimeUnit`), not assume this
+/// ceiling means seven days everywhere. Long enough for a device pairing that
+/// waits on a person, short enough that a mis-issued ticket is a mistake
+/// rather than a permanent bearer credential to the account. a consent naming
+/// a later expiry is refused at execution.
 pub const MAX_CONSENT_TTL: u64 = 604_800;
 
 /// one key of an association as queries expose it.

@@ -102,9 +102,10 @@ fn work_workspace(selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Er
         .to_path_buf())
 }
 
-/// `anyone` is the literal, everything else is an account (a number or a
-/// display name — the same resolution `user cred grant` takes). A number
-/// resolves offline; a display name needs the node to answer.
+/// `anyone` is the literal, everything else is an account NUMBER (the same
+/// authority resolution `cred grant` takes — a display name is refused, never
+/// matched: it is freely rewritable and not unique, and this decision is
+/// whose workload the node runs). A number resolves offline.
 fn resolve_work_target(
     workspace: &std::path::Path,
     input: &str,
@@ -113,9 +114,9 @@ fn resolve_work_target(
         return Ok(AdmitTarget::Anyone);
     }
     let base = config::http_base_in(workspace)?;
-    Ok(AdmitTarget::Account(crate::account_cli::resolve_account(
-        &base, input,
-    )?))
+    Ok(AdmitTarget::Account(
+        crate::account_cli::resolve_account_authority(&base, input)?,
+    ))
 }
 
 fn cmd_work_list(args: SelectorArgs) -> CommandResult {

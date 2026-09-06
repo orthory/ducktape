@@ -1355,10 +1355,13 @@ impl Sim {
                 id,
             })
             .collect();
+        let height = self.height();
         NodeStatus {
             version: env!("CARGO_PKG_VERSION").into(),
             root_hash: hex_root(&host.root_hash()),
-            height: self.height(),
+            height,
+            consensus_time: self.node.stamp_consensus_time(height),
+            consensus_time_unit: self.node.consensus_time_policy().into(),
             modules,
             // empty unless `--node-key` fabricated one: clients treat an empty
             // key as "no peer-routed features here" (no huddle voice). the

@@ -272,6 +272,11 @@ async fn publish_replica_status(
         version: crate::build_version(),
         root_hash,
         height,
+        // the replica lane never installs a `ConsensusTimePolicy` (that's a
+        // sim-only knob) — it stays on the default `HeightIsTime`, so the
+        // clock modules compare against IS the height.
+        consensus_time: height,
+        consensus_time_unit: noded::ConsensusTimeUnit::Height,
         modules,
         public_key: status_public_key.into(),
         chain_id: String::new(),
