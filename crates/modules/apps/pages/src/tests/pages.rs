@@ -448,3 +448,59 @@ fn moving_a_page_under_another_authors_page_requires_that_authors_consent() {
         .await;
     });
 }
+
+#[test]
+fn oversized_page_id_is_rejected_before_staging() {
+    // #1685: nothing bounded a client-minted page id, so a handful of
+    // oversized ids could fill the whole enumeration index and brick page
+    // creation for every account. `MAX_PAGE_ID_BYTES` rejects it up front.
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        let long_id = "p".repeat(400);
+        apply_err_as(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: long_id,
+                title: "t".into(),
+            },
+            user("alice"),
+            "id or target too large",
+        )
+        .await;
+        assert!(p.load_index().await.unwrap().is_empty());
+    });
+}
+
+#[test]
+fn the_max_pages_plus_one_th_create_page_is_refused() {
+    // #1685: `index_add` re-serializes the WHOLE enumeration index on every
+    // insert, so nothing bounded how many pages could ever exist bounds the
+    // index's own size. `MAX_PAGES` refuses growth past the count the index
+    // can hold while staying under `MAX_BLOCK_LEN`.
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        for i in 0..MAX_PAGES {
+            apply_commit_as(
+                &mut p,
+                &PageMsg::CreatePage {
+                    page_id: format!("page-{i:06}"),
+                    title: String::new(),
+                },
+                user("alice"),
+            )
+            .await;
+        }
+        assert_eq!(p.load_index().await.unwrap().len(), MAX_PAGES);
+        apply_err_as(
+            &mut p,
+            &PageMsg::CreatePage {
+                page_id: "one-too-many".into(),
+                title: String::new(),
+            },
+            user("alice"),
+            "too many pages",
+        )
+        .await;
+        assert_eq!(p.load_index().await.unwrap().len(), MAX_PAGES);
+    });
+}
