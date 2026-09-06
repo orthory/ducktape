@@ -1277,7 +1277,7 @@ fn agent_ws_url(rpc: &str) -> String {
     format!("{}/v1/ws", base.trim_end_matches('/'))
 }
 
-fn read_link_token(workspace: &Path) -> Result<String, String> {
+pub(crate) fn read_link_token(workspace: &Path) -> Result<String, String> {
     let path = workspace.join("service-link.token");
     let metadata = std::fs::metadata(&path).map_err(|_| {
         "The node's agent event token is not available in its workspace.".to_string()
