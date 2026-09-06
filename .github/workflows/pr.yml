@@ -119,11 +119,11 @@ jobs:
       - run: rustup show
       - run: cargo test --locked -p simnode
 
-  # The rendezvous/coordinator unit lane had no PR gate at all (#1804): three
+  # The rendezvous/coordinator unit lane had no PR gate at all: three
   # `reachability::rendezvous::tests` and coordinator-bin's
   # `probe_floods_invalid_signatures_then_recovers` went red on dev when the
   # advert book's readvertise-nonce and Lookup-source-binding guards
-  # (#1493/#1595) landed, and nothing ran them to notice. `--lib` only —
+  # landed, and nothing ran them to notice. `--lib` only —
   # `coordinator-bin`'s integration suites (deploy_smoke, policy_args, smoke)
   # bind real sockets and belong with the other integration jobs above, not
   # this fast unit lane.
