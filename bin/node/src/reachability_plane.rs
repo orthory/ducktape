@@ -38,6 +38,39 @@ pub(crate) struct GateOutcomeEntry {
     pub(crate) settled_at: std::time::SystemTime,
 }
 
+/// how often a still-unreachable peer re-warns, once latched — CLAUDE's rule
+/// for a forever-retry loop (attempt 1, then every Nth, carrying the count),
+/// same cadence as `noded::log::Latch`.
+const PEER_UNREACHABLE_WARN_EVERY: u64 = 100;
+
+/// per-peer latch for the "peer unreachable" warn in the `reachability_out`
+/// pump: `PeerFailed` re-fires on every retry of a hole-punch, so an
+/// unconditional `warn!` is the same log-bomb `noded::log::Latch` exists to
+/// stop — but that helper is keyed by a fixed `&'static str` reason, not a
+/// dynamic peer identity, and has no reset, so this mirrors its `hit` cadence
+/// with a per-peer key and a `clear` for when the peer is heard from again.
+#[derive(Default)]
+pub(crate) struct UnreachableLatch {
+    attempts: HashMap<Vec<u8>, u64>,
+}
+
+impl UnreachableLatch {
+    /// bump this peer's attempt count; `Some(occurrences)` on the first hit
+    /// and every Nth after, `None` otherwise (still counted, just silent).
+    pub(crate) fn hit(&mut self, peer: &[u8]) -> Option<u64> {
+        let count = self.attempts.entry(peer.to_vec()).or_insert(0);
+        *count += 1;
+        let n = *count;
+        (n == 1 || n.is_multiple_of(PEER_UNREACHABLE_WARN_EVERY)).then_some(n)
+    }
+
+    /// forget this peer: it is reachable again, so its next failure is a
+    /// fresh first-warn rather than a buried Nth.
+    pub(crate) fn clear(&mut self, peer: &[u8]) {
+        self.attempts.remove(peer);
+    }
+}
+
 /// cap on live gate outcomes. An invite is bearer (`join_gate.rs`: no target
 /// lock, the join proof binds only the announced key), so one unexpired
 /// token mints unlimited joiner keys and each verified intro settles an
@@ -456,6 +489,7 @@ where
                 // distinct endpoint: the refusal is a standing state, not an
                 // event, and a `warn!` per gossip round would evict the ring.
                 let mut pinned: HashMap<Vec<u8>, std::net::SocketAddr> = HashMap::new();
+                let mut unreachable = UnreachableLatch::default();
                 while let Some(event) = ev_rx.recv().await {
                     match event {
                         reachability::ReachabilityEvent::Send { to, bytes } => {
@@ -536,6 +570,9 @@ where
                             peer,
                             endpoint,
                         } => {
+                            // this peer is reachable again: its next failure
+                            // (if any) is a fresh first-warn, not a buried Nth.
+                            unreachable.clear(peer.as_ref());
                             tracing::info!(
                                 target: "ducktape::reachability",
                                 node = %pump_label,
@@ -572,22 +609,35 @@ where
                                 .lock()
                                 .is_ok_and(|carrying| carrying.contains(&ula));
                             match carrying {
-                                true => tracing::debug!(
-                                    target: "ducktape::reachability",
-                                    node = %pump_label,
-                                    peer = %hex_bytes(&peer.as_ref()[..4]),
-                                    %reason,
-                                    "peer endpoint resolution failed while its tunnel is \
-                                     carrying traffic — the live path stands"
-                                ),
-                                // the peer is DARK. media to it will silently go nowhere.
-                                false => tracing::warn!(
-                                    target: "ducktape::reachability",
-                                    node = %pump_label,
-                                    peer = %hex_bytes(&peer.as_ref()[..4]),
-                                    %reason,
-                                    "peer unreachable — traffic to it will go nowhere"
-                                ),
+                                true => {
+                                    // the tunnel is carrying: reachable, so
+                                    // forget any latched unreachable streak.
+                                    unreachable.clear(peer.as_ref());
+                                    tracing::debug!(
+                                        target: "ducktape::reachability",
+                                        node = %pump_label,
+                                        peer = %hex_bytes(&peer.as_ref()[..4]),
+                                        %reason,
+                                        "peer endpoint resolution failed while its tunnel is \
+                                         carrying traffic — the live path stands"
+                                    )
+                                }
+                                // the peer is DARK. media to it will silently go
+                                // nowhere — but this event re-fires on every
+                                // retry, so latch it: first occurrence, then
+                                // every Nth, carrying the attempt count.
+                                false => {
+                                    if let Some(attempts) = unreachable.hit(peer.as_ref()) {
+                                        tracing::warn!(
+                                            target: "ducktape::reachability",
+                                            node = %pump_label,
+                                            peer = %hex_bytes(&peer.as_ref()[..4]),
+                                            %reason,
+                                            attempts,
+                                            "peer unreachable — traffic to it will go nowhere"
+                                        );
+                                    }
+                                }
                             }
                         }
                         reachability::ReachabilityEvent::EpochFailed { epoch, reason } => {
