@@ -168,8 +168,8 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:8850";
 /// the logical clock: `consensus_time = SIM_EPOCH_MS + height * SIM_BLOCK_MS`.
 /// a fixed epoch keeps module timestamps (message sent_at, task created_at)
 /// plausible in the ui while staying identical across runs.
-const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
-const SIM_BLOCK_MS: u64 = 1_000;
+pub const SIM_EPOCH_MS: u64 = 1_750_000_000_000;
+pub const SIM_BLOCK_MS: u64 = 1_000;
 
 /// cap when buffering a /v1/submit response body to strip `op_hash` — receipts
 /// are ~200 bytes; anything past this is not a receipt.

@@ -6,7 +6,9 @@
 //! key for every op: [`IdentityMsg::Create`] founds an account for the origin,
 //! [`IdentityMsg::AddKey`] admits the origin into an existing member's account
 //! (that member proves consent over [`add_key_preimage`] at the origin's
-//! CURRENT generation, so the proof is single-use), and
+//! CURRENT generation, naming the ACCOUNT it admits into and the consensus
+//! time it dies at, so the proof is single-use, account-bound and short-lived),
+//! and
 //! `RemoveKey`/`SetName`/`SetProfile` need nothing but the origin's membership.
 //! no account is ever keyed by a key, and no node is ever bound to an account:
 //! attribution comes only from a user-signed origin, resolved through
@@ -35,6 +37,13 @@ pub const MAX_BIO_LEN: usize = 280;
 pub const MAX_AVATAR_REF_LEN: usize = 512;
 /// query pagination ceiling -- [`IdentityQuery::All`] clamps `limit` to this.
 pub const MAX_QUERY_LIMIT: u64 = 256;
+/// how far past the block executing it a consent's `expires_at` may reach.
+/// `consensus_time` is a block height on a validator network heartbeating at
+/// about one block a second, so this is roughly seven days -- long enough for
+/// a device pairing that waits on a person, short enough that a mis-issued
+/// ticket is a mistake rather than a permanent bearer credential to the
+/// account. a consent naming a later expiry is refused at execution.
+pub const MAX_CONSENT_TTL: u64 = 604_800;
 
 /// one key of an association as queries expose it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -61,14 +70,26 @@ pub struct AccountView {
     pub updated_at: u64,
 }
 
-/// an existing member's consent to admit the frame origin: which key, and its
-/// scheme-owned proof bytes over [`add_key_preimage`] at the origin's current
-/// generation. the account is resolved from this key's membership -- never a
-/// spoofable payload field.
+/// an existing member's consent to admit the frame origin: which key, which
+/// ACCOUNT it admits into, when the consent dies, and its scheme-owned proof
+/// bytes over [`add_key_preimage`] at the origin's current generation.
+///
+/// `account` and `expires_at` are not spoofable: both are under the
+/// authorizer's signature, and `account` is cross-checked against that key's
+/// membership at execution. that pairing is the point -- the signature alone
+/// would let a payload name an account nobody consented to, and the membership
+/// lookup alone would follow the authorizer onto whatever account it sits on
+/// when the consent is finally spent.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Authorizer {
     pub key: Vec<u8>,
+    /// the account this consent admits into -- the authorizer's own, at
+    /// signing time and at execution time both.
+    pub account: AccountNumber,
+    /// consensus time after which the consent is refused; at most
+    /// [`MAX_CONSENT_TTL`] past the block that executes it.
+    pub expires_at: u64,
     pub proof: Vec<u8>,
 }
 
@@ -78,19 +99,20 @@ pub enum IdentityMsg {
     /// found an account for the ORIGIN key (of `scheme`; the frame signature
     /// is the possession proof). the origin must belong to no account.
     Create { name: String, scheme: KeyScheme },
-    /// admit the ORIGIN key (of `scheme`) into the account `authorizer.key`
-    /// belongs to. `authorizer.proof` is that member's proof over
-    /// [`add_key_preimage`] at the origin's CURRENT generation; on success the
-    /// origin's generation advances, so the proof never verifies again. the
-    /// origin must belong to no account.
+    /// admit the ORIGIN key (of `scheme`) into `authorizer.account`, which the
+    /// authorizer key must still belong to. `authorizer.proof` is that
+    /// member's proof over [`add_key_preimage`] at the origin's CURRENT
+    /// generation; on success the origin's generation advances, so the proof
+    /// never verifies again. the origin must belong to no account.
     AddKey {
         scheme: KeyScheme,
         label: Option<String>,
         authorizer: Authorizer,
     },
-    /// drop `key` from the origin's account. any member removes any key
-    /// (including itself) EXCEPT the last one. writes nothing but the record:
-    /// a removed key may be re-admitted later, at its next generation.
+    /// drop `key` from the origin's account. a member removes ITSELF, or a key
+    /// admitted no earlier than it was -- never the last one, and never a key
+    /// senior to the remover. writes nothing but the record: a removed key may
+    /// be re-admitted later, at its next generation.
     RemoveKey { key: Vec<u8> },
     /// rename the origin's account. empty trims reject; over
     /// [`MAX_NAME_LEN`] bytes rejects.
@@ -128,20 +150,26 @@ pub enum IdentityReply {
 }
 
 /// the signed preimage of an add-key consent: chain id ‖ scheme tag ‖ new key
-/// ‖ generation. no account number and no account nonce ON PURPOSE: the
-/// account is resolved from the authorizer's membership, and the generation
-/// alone makes the consent single-use (see the module docs).
+/// ‖ generation ‖ account ‖ expiry. the generation makes it single-use, the
+/// account pins WHICH association it admits into (a consent minted on one
+/// account never follows its author onto another), and the expiry bounds how
+/// long an unspent one stays live -- there is no revoke op, so the clock is
+/// the revocation.
 pub fn add_key_preimage(
     chain_id: &str,
     scheme: KeyScheme,
     new_key: &[u8],
     generation: u64,
+    account: AccountNumber,
+    expires_at: u64,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     sdk::codec::push_bytes(&mut out, chain_id.as_bytes());
     out.push(scheme.tag());
     sdk::codec::push_bytes(&mut out, new_key);
     out.extend_from_slice(&generation.to_le_bytes());
+    out.extend_from_slice(&account.to_le_bytes());
+    out.extend_from_slice(&expires_at.to_le_bytes());
     out
 }
 
@@ -183,30 +211,40 @@ mod tests {
 
     #[test]
     fn add_key_preimage_is_deterministic_and_every_field_moves_it() {
-        let base = add_key_preimage("net-a", KeyScheme::Ed25519, &[2u8; 32], 0);
+        let base = add_key_preimage("net-a", KeyScheme::Ed25519, &[2u8; 32], 0, 1, 500);
         assert_eq!(
             base,
-            add_key_preimage("net-a", KeyScheme::Ed25519, &[2u8; 32], 0)
+            add_key_preimage("net-a", KeyScheme::Ed25519, &[2u8; 32], 0, 1, 500)
         );
         assert_ne!(
             base,
-            add_key_preimage("net-b", KeyScheme::Ed25519, &[2u8; 32], 0),
+            add_key_preimage("net-b", KeyScheme::Ed25519, &[2u8; 32], 0, 1, 500),
             "chain moves it"
         );
         assert_ne!(
-            add_key_preimage("n", KeyScheme::Secp256k1, &[2u8; 33], 0),
-            add_key_preimage("n", KeyScheme::Secp256r1, &[2u8; 33], 0),
+            add_key_preimage("n", KeyScheme::Secp256k1, &[2u8; 33], 0, 1, 500),
+            add_key_preimage("n", KeyScheme::Secp256r1, &[2u8; 33], 0, 1, 500),
             "scheme moves it"
         );
         assert_ne!(
             base,
-            add_key_preimage("net-a", KeyScheme::Ed25519, &[3u8; 32], 0),
+            add_key_preimage("net-a", KeyScheme::Ed25519, &[3u8; 32], 0, 1, 500),
             "key moves it"
         );
         assert_ne!(
             base,
-            add_key_preimage("net-a", KeyScheme::Ed25519, &[2u8; 32], 1),
+            add_key_preimage("net-a", KeyScheme::Ed25519, &[2u8; 32], 1, 1, 500),
             "generation moves it"
+        );
+        assert_ne!(
+            base,
+            add_key_preimage("net-a", KeyScheme::Ed25519, &[2u8; 32], 0, 2, 500),
+            "account moves it"
+        );
+        assert_ne!(
+            base,
+            add_key_preimage("net-a", KeyScheme::Ed25519, &[2u8; 32], 0, 1, 501),
+            "expiry moves it"
         );
     }
 
@@ -222,6 +260,8 @@ mod tests {
     fn msg_codec_roundtrips() {
         let authorizer = Authorizer {
             key: vec![7; 32],
+            account: 4,
+            expires_at: 900,
             proof: vec![9; 64],
         };
         for m in [
