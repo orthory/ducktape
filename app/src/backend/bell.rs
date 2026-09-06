@@ -101,7 +101,8 @@ pub fn bell_head(items: Vec<BellItem>) -> i64 {
 /// the INFO/WARN/ALERT chip and the badge tint.
 ///
 /// THE WIRE CARRIES NO SEVERITY. `Notification` is seq/member/kind/body/source/
-/// created_at/read (crates/modules/apps/inbox/src/interface.rs), so this is a
+/// created_at (crates/modules/apps/inbox/src/interface.rs; `read` is derived
+/// from the member's read watermark, not a per-item field), so this is a
 /// PROJECTION of the delivering module's `kind` token, not a field anything
 /// signed. A kind this mapping does not name reads `info`: an unclassified
 /// notice is a notice, never an alarm.

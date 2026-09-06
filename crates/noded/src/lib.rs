@@ -793,8 +793,11 @@ pub const DEFAULT_ORIGIN: &str = "noded";
 /// committed. the real node has a keypair for this and signs; the embedded
 /// daemon has only its trusted-client origin string, so it must be ONE string
 /// — the binary's actor loop, its oracle pool, and the provisioner all name it
-/// here rather than each inventing a spelling.
-pub const ORACLE_ORIGIN: &[u8] = b"oracle";
+/// here rather than each inventing a spelling. 32 bytes: `Accept` gates on
+/// valset standing (and, for a tagged saga, an announced capability), the
+/// same shape a real node's ed25519 key has — a scenario that needs this
+/// identity to actually claim a saga registers it via `--with-valset`.
+pub const ORACLE_ORIGIN: &[u8] = &[b'o'; 32];
 
 /// the network name BOTH single-writer daemons compose under: the composer
 /// binds it into the identity and gateway guests' genesis `__config`, and

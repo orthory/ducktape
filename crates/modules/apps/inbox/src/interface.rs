@@ -60,7 +60,6 @@ pub struct Notification {
     /// external keys from module ids that happen to be pure hex.
     pub source: String,
     pub created_at: u64,
-    pub read: bool,
 }
 
 /// the ack family (`MarkRead`, `Clear`) is MEMBER-BOUND: `member` must be the

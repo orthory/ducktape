@@ -80,19 +80,20 @@ async fn queue(inbox: &Inbox, member: &str) -> Option<(u64, Vec<Notification>)> 
 }
 
 /// the compact item shape assertions compare: `(seq, kind, body, source,
-/// created_at, read)`.
-fn item_tuple(n: &Notification) -> (u64, String, String, String, u64, bool) {
+/// created_at)`. `read` is not a per-item field any more (see
+/// `Inbox::read_watermark_view`) — a test that cares about read status
+/// checks the watermark directly.
+fn item_tuple(n: &Notification) -> (u64, String, String, String, u64) {
     (
         n.seq,
         n.kind.clone(),
         n.body.clone(),
         n.source.clone(),
         n.created_at,
-        n.read,
     )
 }
 
-fn tuples(items: &[Notification]) -> Vec<(u64, String, String, String, u64, bool)> {
+fn tuples(items: &[Notification]) -> Vec<(u64, String, String, String, u64)> {
     items.iter().map(item_tuple).collect()
 }
 
@@ -102,16 +103,8 @@ fn t(
     body: &str,
     source: &str,
     created_at: u64,
-    read: bool,
-) -> (u64, String, String, String, u64, bool) {
-    (
-        seq,
-        kind.into(),
-        body.into(),
-        source.into(),
-        created_at,
-        read,
-    )
+) -> (u64, String, String, String, u64) {
+    (seq, kind.into(), body.into(), source.into(), created_at)
 }
 
 #[test]
@@ -141,13 +134,13 @@ fn deliver_assigns_per_member_sequence() {
         assert_eq!(
             tuples(&items),
             vec![
-                t(1, "mention", "hi", "system", 10, false),
-                t(2, "reply", "yo", "system", 11, false),
+                t(1, "mention", "hi", "system", 10),
+                t(2, "reply", "yo", "system", 11),
             ]
         );
         let (next, items) = queue(&inbox, "bob").await.expect("bob exists");
         assert_eq!(next, 2);
-        assert_eq!(tuples(&items), vec![t(1, "mention", "sup", "system", 12, false)]);
+        assert_eq!(tuples(&items), vec![t(1, "mention", "sup", "system", 12)]);
     });
 }
 
@@ -177,8 +170,8 @@ fn source_is_derived_from_origin() {
         assert_eq!(
             tuples(&items),
             vec![
-                t(1, "k", "from module", "chat", 1, false),
-                t(2, "k", "from system", "system", 3, false),
+                t(1, "k", "from module", "chat", 1),
+                t(2, "k", "from system", "system", 3),
             ]
         );
 
@@ -199,7 +192,7 @@ fn source_is_derived_from_origin() {
         let (_, items) = queue(&inbox, &ext_member).await.expect("ext member exists");
         assert_eq!(
             tuples(&items),
-            vec![t(1, "k", "from external", "ext:deadbeef", 2, false)]
+            vec![t(1, "k", "from external", "ext:deadbeef", 2)]
         );
 
         // the pre-consensus anonymous-external default owns no queue at all,
@@ -327,15 +320,21 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
         }
         inbox.commit_block().await.expect("commit deliveries");
 
-        // MarkRead up to seq 2 flips exactly seqs 1 and 2 in committed state.
+        // MarkRead up to seq 2 raises the watermark to 2, so seqs 1 and 2
+        // read as read (derived from the watermark) and seq 3 does not.
         inbox
             .execute(&mut submitter(ALICE_KEY, 2), &mark_read(&alice, 2))
             .await
             .expect("mark read");
         inbox.commit_block().await.expect("commit mark read");
+        assert_eq!(inbox.read_watermark_view(&alice).await.unwrap(), 2);
         let (_, items) = queue(&inbox, &alice).await.expect("alice exists");
+        let mut derived_read = Vec::new();
+        for n in &items {
+            derived_read.push((n.seq, inbox.is_read(&alice, n.seq).await.unwrap()));
+        }
         assert_eq!(
-            items.iter().map(|n| (n.seq, n.read)).collect::<Vec<_>>(),
+            derived_read,
             vec![(1, true), (2, true), (3, false)],
             "only seqs 1,2 are read"
         );
@@ -384,8 +383,8 @@ fn mark_read_and_clear_are_idempotent_and_noop_tolerant() {
         assert_eq!(
             tuples(&items),
             vec![
-                t(3, "k", "b", "system", 1, false),
-                t(4, "k", "after clear", "system", 5, false),
+                t(3, "k", "b", "system", 1),
+                t(4, "k", "after clear", "system", 5),
             ],
             "seq 1,2 cleared; the new delivery took seq 4 — next_seq did not rewind"
         );
@@ -424,7 +423,11 @@ fn root_moves_only_on_commit_and_abort_leaves_no_trace() {
             "abort leaves the root byte-identical to pre-block"
         );
         let (next, items) = queue(&inbox, "alice").await.expect("alice exists");
-        assert_eq!((next, items.len()), (2, 1), "the aborted delivery left no trace");
+        assert_eq!(
+            (next, items.len()),
+            (2, 1),
+            "the aborted delivery left no trace"
+        );
     });
 }
 
@@ -469,8 +472,7 @@ async fn expected_root(source: &str, consensus_time: u64) -> StateRoot {
 #[test]
 fn module_follow_up_delivers_atomically_with_source_of_emitter() {
     block_on(async {
-        let mut host =
-            Host::genesis(vec![Box::new(fresh()), Box::new(Producer)]).expect("genesis");
+        let mut host = Host::genesis(vec![Box::new(fresh()), Box::new(Producer)]).expect("genesis");
         let app0 = host.root_hash();
 
         let out = host
@@ -487,7 +489,10 @@ fn module_follow_up_delivers_atomically_with_source_of_emitter() {
             )
             .await
             .expect("submit producer op");
-        assert_ne!(out.root_hash, app0, "the atomic delivery moves the root-hash");
+        assert_ne!(
+            out.root_hash, app0,
+            "the atomic delivery moves the root-hash"
+        );
 
         // root equality against the replayed twin proves the follow-up
         // delivered in THIS block, with the EMITTING module as source (not
@@ -592,7 +597,11 @@ fn only_the_queues_own_member_may_ack_it() {
         assert_eq!(inbox.root(), sealed, "a refused ack stages nothing");
         let (_, items) = queue(&inbox, &alice).await.expect("alice exists");
         assert_eq!(items.len(), 3, "nothing was cleared");
-        assert!(items.iter().all(|n| !n.read), "nothing was marked");
+        assert_eq!(
+            inbox.read_watermark_view(&alice).await.unwrap(),
+            0,
+            "nothing was marked"
+        );
 
         // alice performs both on her own queue.
         inbox
@@ -625,7 +634,11 @@ fn only_an_authenticated_external_submitter_owns_a_queue() {
                 "chat",
                 "a module origin owns no inbox queue",
             ),
-            (Origin::System, "system", "a system origin owns no inbox queue"),
+            (
+                Origin::System,
+                "system",
+                "a system origin owns no inbox queue",
+            ),
             (
                 Origin::External(Vec::new()),
                 "ext:",
@@ -847,6 +860,90 @@ fn seq_exhaustion_rejects_deterministically() {
             inbox.root(),
             root_installed,
             "the rejected delivery staged nothing"
+        );
+    });
+}
+
+// ---- MarkRead is O(1), never O(queue length) --------------------------------
+
+/// a queue at the cap marks read in ONE call: `stage_mark_read` reads and
+/// writes the member's META record exactly once, never one distinct read per
+/// item — the defect that made a full 4096-item queue unmarkable under the
+/// wasm host's 4096-distinct-store-read budget (issue #1742). This is a
+/// native test so the wasm host's budget is not itself in play; the property
+/// under test is that the fix touches meta only: the watermark lands and
+/// every item — including the newest, seq == cap — reads back as read.
+#[test]
+fn mark_read_on_a_full_queue_costs_one_meta_read_and_write() {
+    block_on(async {
+        let mut inbox = fresh();
+        let alice = queue_of(ALICE_KEY);
+        let cap = MAX_ITEMS_PER_MEMBER as u64;
+        for i in 0..cap {
+            inbox
+                .execute(&mut submitter(ALICE_KEY, i), &deliver(&alice, "k", "b"))
+                .await
+                .expect("deliver");
+        }
+        inbox.commit_block().await.expect("commit fill");
+        let (_, items) = queue(&inbox, &alice).await.expect("alice exists");
+        assert_eq!(items.len(), MAX_ITEMS_PER_MEMBER, "the queue holds the cap");
+
+        // ONE MarkRead call covers the whole queue.
+        inbox
+            .execute(&mut submitter(ALICE_KEY, cap), &mark_read(&alice, cap))
+            .await
+            .expect("mark read the full queue in one call");
+        inbox.commit_block().await.expect("commit mark read");
+
+        assert_eq!(
+            inbox.read_watermark_view(&alice).await.unwrap(),
+            cap,
+            "the watermark landed at the cap"
+        );
+        for seq in [1, cap / 2, cap] {
+            assert!(
+                inbox.is_read(&alice, seq).await.unwrap(),
+                "seq {seq} reads as read via the watermark"
+            );
+        }
+    });
+}
+
+/// `MarkRead { up_to_seq: u64::MAX }` must clamp to the last seq ever
+/// assigned, never store the raw value — otherwise every FUTURE delivery
+/// would be born pre-read, which the old per-item flag could never do (it
+/// only ever touched items that already existed).
+#[test]
+fn mark_read_beyond_the_last_seq_does_not_pre_read_future_deliveries() {
+    block_on(async {
+        let mut inbox = fresh();
+        let alice = queue_of(ALICE_KEY);
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 1), &deliver(&alice, "k", "b"))
+            .await
+            .expect("deliver seq 1");
+        inbox.commit_block().await.expect("commit deliver");
+
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 2), &mark_read(&alice, u64::MAX))
+            .await
+            .expect("mark read u64::MAX");
+        inbox.commit_block().await.expect("commit mark read");
+        assert_eq!(
+            inbox.read_watermark_view(&alice).await.unwrap(),
+            1,
+            "the watermark clamps to the last assigned seq, not u64::MAX"
+        );
+
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 3), &deliver(&alice, "k", "c"))
+            .await
+            .expect("deliver seq 2");
+        inbox.commit_block().await.expect("commit deliver 2");
+        assert!(
+            !inbox.is_read(&alice, 2).await.unwrap(),
+            "a delivery AFTER the mark-read must not be born pre-read"
         );
     });
 }
