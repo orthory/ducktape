@@ -202,6 +202,12 @@ pub(crate) async fn run_validator(
     )
     .await;
 
+    // the digests the modules registry currently names — shared between the
+    // code plane's push admission gate and the drain's readiness pump, which
+    // refreshes it from the registry read it already performs each tick
+    // (#1833). constructed unconditionally: the drain loop always carries
+    // one, whether or not this node hosts a code plane to admit pushes into.
+    let code_registry = crate::code_plane::CodeRegistry::default();
     if let Some(peers) = &media_peers {
         let me: [u8; 32] = signer
             .public_key()
@@ -248,6 +254,7 @@ pub(crate) async fn run_validator(
             planes.clone(),
             blobs.clone(),
             code_stage_requests,
+            code_registry.clone(),
         );
     }
 
@@ -398,6 +405,7 @@ pub(crate) async fn run_validator(
         media_peers,
         blob_peers,
         blob_client,
+        code_registry,
         reach_cmd,
         relay_tx,
         sync_state_rx,
@@ -595,6 +603,10 @@ pub(crate) async fn run_promoted(
     if let Some(book) = &media_peers {
         book.set_peers(transport.iter());
     }
+    // the digests the modules registry currently names — see the fresh-boot
+    // path's identical construction (#1833); constructed unconditionally so
+    // the drain loop always carries one.
+    let code_registry = crate::code_plane::CodeRegistry::default();
     // the module-code plane — the one overlay plane a parked node never
     // hosts. voice/agent/term planes carried over live.
     if let Some(book) = &media_peers {
@@ -612,6 +624,7 @@ pub(crate) async fn run_promoted(
             planes.clone(),
             blobs.clone(),
             code_stage_requests,
+            code_registry.clone(),
         );
     }
 
@@ -795,6 +808,7 @@ pub(crate) async fn run_promoted(
         media_peers,
         blob_peers,
         blob_client,
+        code_registry,
         reach_cmd,
         relay_tx,
         sync_state_rx,

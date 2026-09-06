@@ -1417,6 +1417,7 @@ impl ValidatorRuntime<'_> {
             code_signaller,
             blob_client,
             blobs,
+            code_registry,
             fetch_done_tx,
             fetch_done_rx,
             ..
@@ -1449,12 +1450,6 @@ impl ValidatorRuntime<'_> {
             );
         }
         code_signaller.tick_fetch_backoff();
-        if !orchestrator
-            .current_members()
-            .contains(&signer.public_key())
-        {
-            return;
-        }
         let req = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
         let Ok(bytes) = node.host().query(host::MODULES_ID, &req).await else {
             return; // registry absent: byte-identical drain on a baseline net.
@@ -1463,6 +1458,21 @@ impl ValidatorRuntime<'_> {
         else {
             return;
         };
+        // the code plane's push admission gate reads THIS set (#1833): a
+        // digest nothing here names any more is refused before any staging.
+        // reclaim rides the same registry-change point — whatever fell out
+        // (a cancelled/replaced swap, or a module's `code_hash` that moved
+        // on) is forgotten, so an unreferenced blob does not outlive the
+        // registry entry that once justified it.
+        for digest in code_registry.update(crate::code_plane::code_blobs_referenced(&modules)) {
+            blobs.forget(&digest);
+        }
+        if !orchestrator
+            .current_members()
+            .contains(&signer.public_key())
+        {
+            return;
+        }
         // residency is a VERIFYING read (content re-hashed on the disk path)
         // AND a LOADABILITY read: signing ready must mean sha256(local bytes)
         // == committed hash AND "this binary can instantiate them" AND "this
