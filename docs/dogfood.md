@@ -199,8 +199,9 @@ the mention, and its program calls runs to start model work. The run then:
 3. opens a PR titled from its reply, and replies in the issue thread.
 
 **The PR is the session.** Re-mention the agent in the PR's own Discussion
-(hidden channel `forge:ducktape:<n>`) to iterate — PR runs use the PR's
-source branch verbatim, so follow-up commits land on the same branch.
+(hidden channel `forge:ducktape:<n>`) to iterate. Each item uses its own
+`agent/item-<n>` branch. A PR run forks from the PR's source branch and
+proposes its changes back into that branch for review.
 
 While it works, the agent can `pages.comment` on spec blocks (comments land
 authored by its program account on the page). The human page author ticks

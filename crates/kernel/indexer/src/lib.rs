@@ -57,11 +57,14 @@
 //! [`IndexStore::get`] / [`IndexStore::view`]) — fluent31's `Db` is
 //! `Send + Sync`, so the http layer reads concurrently with both writers.
 //!
-//! failure policy: a host-write error POISONS the store (writes refuse, reads
+//! failure policy: a host-write error POISONS THE STORE (writes refuse, reads
 //! keep serving) rather than skipping a block — a silent gap would break the
-//! watermark's contiguity promise. A failed mapper replacement also poisons
-//! writes and refuses reads of that module until it is reconverged; readers
-//! must not see a partially replaced deployment. A guest-fold error never poisons: the
+//! watermark's contiguity promise. A rejected mapper (bad bytes, missing a
+//! required role or export) instead poisons ONLY ITS OWN MODULE — deployment
+//! goes `Failed`, its fold and views refuse until it is reconverged — because
+//! every other module's database went through convergence clean; the
+//! store-wide flag is reserved for the engine itself leaving a database in a
+//! state no caller declared. A guest-fold error never poisons either: the
 //! engine retains the events and retries, and the backlog is observable.
 //!
 //! when canonical state advances WITHOUT the op stream — state-sync installs
@@ -194,6 +197,21 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// whether a converge failure is the GUEST's fault — bad bytes, or missing
+/// the role/memory export readiness requires — rather than the engine's.
+/// [`Error::View`] is `converge_guest`'s own readiness rejection;
+/// `fluent31::Error::Wasm` is a compile or install-time rejection of the
+/// same candidate bytes. Everything else (`Io`, `Corruption`, `Conflict`,
+/// `Closed`, `Background`, `ProvenanceMismatch`, `Gone`, `JournalGap`) is the
+/// engine leaving the database in a state no caller declared, which is a
+/// store-wide concern.
+fn is_guest_rejection(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::View(_) | Error::Engine(fluent31::Error::Wasm(_))
+    )
+}
+
 // ============================================================================
 // the block-ops input — plain data, mapped by the node layer from its block
 // outcome. deliberately NOT sdk/host types: the derived tier consumes an op
@@ -286,8 +304,18 @@ pub struct FoldStatus {
 }
 
 enum DeploymentState {
-    Ready { code_hash: Option<Vec<u8>> },
-    Failed,
+    Ready {
+        code_hash: Option<Vec<u8>>,
+    },
+    /// `rejected_hash` is the sha256 of the guest bytes `converge_guest`
+    /// refused, when the refusal was the GUEST's fault (`is_guest_rejection`)
+    /// — `converge_module` short-circuits on a later attempt with the exact
+    /// same bytes instead of paying a cranelift compile for a mapper that
+    /// will fail for the identical reason every time. `None` for a module
+    /// with no guest, or a failure the engine caused rather than the bytes.
+    Failed {
+        rejected_hash: Option<[u8; 32]>,
+    },
 }
 
 /// one module's open database plus its guest's declared roles.
@@ -314,7 +342,7 @@ impl ModuleIndex {
             .unwrap_or_else(PoisonError::into_inner);
         match *guard {
             DeploymentState::Ready { .. } => Ok(guard),
-            DeploymentState::Failed => Err(Error::Poisoned),
+            DeploymentState::Failed { .. } => Err(Error::Poisoned),
         }
     }
 
@@ -509,11 +537,38 @@ impl IndexStore {
             .deployment
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        let candidate_hash = spec.guest.map(|bytes| sha2::Sha256::digest(bytes).into());
+        let unchanged_rejection = matches!(
+            &*deployment,
+            DeploymentState::Failed { rejected_hash } if *rejected_hash == candidate_hash
+        );
+        if unchanged_rejection {
+            // the exact bytes that failed last time, offered again (a stuck
+            // deployment reconverges every block until an operator ships
+            // different ones, per `converge_host_modules`): short-circuit
+            // rather than pay a cranelift compile that can only fail the
+            // same way again.
+            return Err(Error::View(
+                "index guest previously rejected; unchanged since".into(),
+            ));
+        }
         let (has_fold, has_view) = match converge_guest(&module.db, spec) {
             Ok(roles) => roles,
             Err(error) => {
-                *deployment = DeploymentState::Failed;
-                self.poisoned.store(true, Ordering::Release);
+                // a rejected GUEST (bad bytes, missing role/memory export)
+                // is this module's problem alone — `read_deployment` already
+                // refuses its own reads and writes until it reconverges. only
+                // the engine itself misbehaving (an io/corruption/background
+                // failure out of the db calls `converge_guest` makes) is
+                // store-wide: every OTHER database went through those same
+                // calls clean, so one that didn't may be in a state no other
+                // module's fold or view can be trusted to see through.
+                let is_guest_rejection = is_guest_rejection(&error);
+                let rejected_hash = is_guest_rejection.then_some(candidate_hash).flatten();
+                *deployment = DeploymentState::Failed { rejected_hash };
+                if !is_guest_rejection {
+                    self.poisoned.store(true, Ordering::Release);
+                }
                 return Err(error);
             }
         };
@@ -524,7 +579,11 @@ impl IndexStore {
         Ok(())
     }
 
-    /// Compile candidate mapper bytes without installing them or changing data.
+    /// Compile candidate mapper bytes without installing them or changing
+    /// data. Readiness must cover exactly what `converge`'s eventual
+    /// `install_module` will require — fluent31's own gate (pinned, cannot
+    /// expose the check itself) also requires a `memory` export, so a mapper
+    /// missing one must be refused HERE, not at activation.
     pub fn validate_guest(&self, bytes: &[u8]) -> Result<()> {
         let roles = self.blocks.wasm_entries(bytes)?;
         let maps_or_queries = roles
@@ -534,6 +593,9 @@ impl IndexStore {
             return Err(Error::View(
                 "index guest must export on_apply or query".into(),
             ));
+        }
+        if !exports_memory(bytes)? {
+            return Err(Error::View("index guest must export `memory`".into()));
         }
         Ok(())
     }
@@ -549,6 +611,21 @@ impl IndexStore {
 
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
+    }
+
+    /// whether `module`'s last converge left it `Failed` — its own reads and
+    /// writes refuse until it reconverges. lets a caller that reconverges
+    /// every block (a stuck deployment never becomes NOT-running) tell a
+    /// brand new rejection from the same one it already logged: `false` for
+    /// an unknown module id, since the actual converge call is what surfaces
+    /// `UnknownModule`.
+    pub fn is_module_failed(&self, module: &str) -> bool {
+        self.modules().get(module).is_some_and(|m| {
+            matches!(
+                *m.deployment.read().unwrap_or_else(PoisonError::into_inner),
+                DeploymentState::Failed { .. }
+            )
+        })
     }
 
     fn module(&self, module: &str) -> Result<Arc<ModuleIndex>> {
@@ -1031,6 +1108,23 @@ impl IndexStore {
     ) -> Result<fluent31::Subscription> {
         Ok(self.db(module)?.subscribe(lo, hi)?)
     }
+}
+
+/// whether candidate module bytes export a `memory` — the other half of
+/// fluent31's `install_module` gate (rev 76ba1867,
+/// `crates/fluent31/src/wasm/mod.rs:181-203`), which readiness must match:
+/// a mapper exporting a role entry point but no memory compiles fine here
+/// and then fails at activation, taking the module down at that block.
+/// fluent31 does not expose this check itself, so it is replicated against
+/// a throwaway engine — read-only export inspection, never executed.
+fn exports_memory(bytes: &[u8]) -> Result<bool> {
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, bytes)
+        .map_err(|error| Error::View(format!("compile: {error}")))?;
+    let exports_memory = module
+        .get_export("memory")
+        .is_some_and(|export| export.memory().is_some());
+    Ok(exports_memory)
 }
 
 /// map a view invocation's engine error onto the tier's surface: a guest

@@ -255,10 +255,11 @@ impl RunsModule {
                 ..call.clone()
             },
         };
-        ctx.set_output(sdk::wire::encode(&serde_json::json!({
+        let output = canonical_action_payload(serde_json::json!({
             "target": request.view.target, "payload": request.view.payload,
             "requester": call.requester, "invocation": call.invocation,
-        })));
+        }));
+        ctx.set_output(sdk::wire::encode(&output));
         self.stage_action_marker(&request).await?;
         Ok(())
     }

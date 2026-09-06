@@ -40,7 +40,10 @@ fn resident_rebootstraps_while_the_chain_stays_busy() {
     let mut cluster = NetworkShapeCluster::new();
 
     let chain_id = cluster.init_founder("busy-ascend");
-    assert!(!chain_id.is_empty(), "init should print the founded chain id");
+    assert!(
+        !chain_id.is_empty(),
+        "init should print the founded chain id"
+    );
     // the live failure shape checkpoints often relative to its block rate;
     // tighten the cadence so the founder's drain loop periodically carries a
     // full manifest capture while serving.
@@ -100,15 +103,21 @@ fn resident_rebootstraps_while_the_chain_stays_busy() {
     let token = noded::admin::read_operator_token(&cluster.workspace(0))
         .expect("founder minted an operator credential");
     let pumps: Vec<_> = (0..1)
-        .map(|lane| spawn_pump(lane, cluster.http_ports[0], token.clone(), Arc::clone(&stop)))
+        .map(|lane| {
+            spawn_pump(
+                lane,
+                cluster.http_ports[0],
+                token.clone(),
+                Arc::clone(&stop),
+            )
+        })
         .collect();
 
     // ---- THE POINT: a granted resident restarting with empty storage must
     // be SERVED a boundary by the busy founder and re-reach the head. a floor
     // certificate that only ever certifies a parked tip starves this forever.
     cluster.kill(1);
-    std::fs::remove_dir_all(cluster.friend_dir.join("storage"))
-        .expect("wipe the friend's storage");
+    std::fs::remove_dir_all(cluster.friend_dir.join("storage")).expect("wipe the friend's storage");
     cluster.spawn(1);
     cluster.wait_admitted(1, CONVERGE);
     cluster.wait_marker(1, "replica: bootstrapping at boundary", CONVERGE);

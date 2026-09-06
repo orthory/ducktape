@@ -311,7 +311,12 @@ fn a_forge_session_continues_from_the_born_work_branch_tip() {
 }
 
 #[test]
-fn a_pr_item_run_works_the_prs_own_source_branch() {
+fn a_pr_item_run_works_its_own_agent_branch_not_the_prs_source() {
+    // #1836: the PR's own source branch is attacker-chosen (whoever opened
+    // the PR), so it never becomes a push target. the run works its OWN
+    // `agent/item-<n>` branch, forked from the PR's source tip, and the
+    // sink opens a PR from that branch onto the PR's own source (so a
+    // human reviews the agent's change INTO their PR branch).
     let registry = forge_read_registry();
     let src_tip = "12".repeat(20);
     let m = forge_module();
@@ -322,21 +327,59 @@ fn a_pr_item_run_works_the_prs_own_source_branch() {
         .with_forge_tip("app", "dev", &"cd".repeat(20))
         .with_forge_tip("app", "feature/x", &src_tip);
     let v = compose_forge(&m, &ctx, &registry, "forge:app:8").unwrap();
-    // THE pr-item rule: the session pushes the PR's own branch, so the
-    // open PR updates in place.
     assert_eq!(v["workspace"]["item_title"], "Wire it");
-    assert_eq!(v["workspace"]["branch"], "feature/x");
-    assert_eq!(v["workspace"]["commit"], src_tip);
-    assert_eq!(v["workspace"]["branch_born"], true);
-    assert_eq!(v["result_contract"]["sink"]["source_branch"], "feature/x");
     assert_eq!(
-        v["result_contract"]["sink"]["target_branch"], "dev",
-        "a PR item's requested sink targets the PR's own target branch"
+        v["workspace"]["branch"], "agent/item-8",
+        "the run owns agent/item-8, never the PR's own feature/x"
+    );
+    assert_eq!(
+        v["workspace"]["commit"], src_tip,
+        "an unborn agent branch forks the PR's source tip"
+    );
+    assert_eq!(v["workspace"]["branch_born"], false);
+    assert_eq!(
+        v["result_contract"]["sink"]["source_branch"],
+        "agent/item-8"
+    );
+    assert_eq!(
+        v["result_contract"]["sink"]["target_branch"], "feature/x",
+        "the sink targets the PR's OWN source branch, never its target"
     );
     let context = v["context"].as_str().unwrap();
     assert!(context.contains("pr #8"), "{context}");
     assert!(context.contains("pr source branch: feature/x"), "{context}");
     assert!(context.contains("pr target branch: dev"), "{context}");
+}
+
+#[test]
+fn a_pr_whose_source_is_dev_yields_a_work_branch_the_run_owns() {
+    // #1836's exact repro: any account that can open a PR posts
+    // `OpenPr{source: dev, target: main}` and tags an agent — the run must
+    // NEVER push `dev` itself. it forks dev's tip into its OWN
+    // `agent/item-<n>` branch, and the sink proposes that branch back onto
+    // dev for review, never a direct move of dev.
+    let registry = forge_read_registry();
+    let dev_tip = "cd".repeat(20);
+    let m = forge_module();
+    let ctx = CaptureCtx::new()
+        .with_registry(&registry)
+        .with_transcript("forge:app:9", transcript(2))
+        .with_forge_item("app", forge_pr(9, "Sneaky", "", "dev", "main"))
+        .with_forge_tip("app", "dev", &dev_tip);
+    let v = compose_forge(&m, &ctx, &registry, "forge:app:9").unwrap();
+    assert_eq!(
+        v["workspace"]["branch"], "agent/item-9",
+        "the run never works dev itself"
+    );
+    assert_eq!(v["workspace"]["commit"], dev_tip);
+    assert_eq!(
+        v["result_contract"]["sink"]["source_branch"],
+        "agent/item-9"
+    );
+    assert_eq!(
+        v["result_contract"]["sink"]["target_branch"], "dev",
+        "the sink proposes the agent branch back onto dev, never moves it directly"
+    );
 }
 
 // ---- `[[page:<id>]]` page-spec injection (M2) ---------------------------------

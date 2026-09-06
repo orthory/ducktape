@@ -139,10 +139,14 @@ impl CaptureCtx {
     fn distinct_query_count(&self) -> usize {
         self.query_keys.borrow().len()
     }
-    /// register a born branch under `repo` (the sink's branch-born probe;
-    /// tip = a fixed zero oid where the tip does not matter).
+    /// register a born branch under `repo` (the sink's branch-born probe).
+    /// tip = the fixed oid facets.rs's forge-sink fixtures use as their
+    /// receipt `output_commit` (`"1a".repeat(20)`) — #1835 requires
+    /// `emit_sink` to see the receipt's oid AS the branch's committed tip,
+    /// so a caller after a fixed zero tip that never needs to match a
+    /// receipt wants [`Self::with_forge_tip`] instead.
     fn with_forge_ref(self, repo: &str, branch: &str) -> Self {
-        let tip = "00".repeat(20);
+        let tip = "1a".repeat(20);
         self.with_forge_tip(repo, branch, &tip)
     }
     /// register a born branch with an explicit tip (the compose lane's

@@ -489,7 +489,7 @@ fn wasm_registry_admits_a_mapper_removes_it_and_reopens_after_self_swap() {
                 .to_vec();
             let mut source = ArtifactSource(Default::default());
             let mut codes = std::collections::BTreeMap::new();
-            for id in ["modules", "valset"] {
+            for id in ["modules", "valset", "identity", "attribution"] {
                 let bytes = std::fs::read(fixtures().join(format!("{id}.component.wasm"))).unwrap();
                 codes.insert(id.to_string(), source.add(ModuleArtifact::component(bytes)));
             }

@@ -270,12 +270,17 @@ impl RunsModule {
                     );
                     return None;
                 }
-                match self
-                    .forge_branch_born(&*ctx, &forge, repo, source_branch)
+                // #1835: the receipt's output_commit must BE the branch's
+                // committed tip, not merely a well-formed oid — a receipt
+                // cannot name a commit the push lane never landed. reads the
+                // same `ListRefs` mirror `forge_branch_born` uses, so a
+                // deleted/renamed source branch degrades identically.
+                let source_tip = match self
+                    .forge_branch_tip(&*ctx, &forge, repo, source_branch)
                     .await
                 {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok(Some(tip)) => tip,
+                    Ok(None) => {
                         self.note(
                             ctx,
                             format!("run {run_id} pr sink skipped: source branch not present"),
@@ -286,6 +291,17 @@ impl RunsModule {
                         self.note(ctx, format!("run {run_id} pr sink skipped: {why}"));
                         return None;
                     }
+                };
+                let output_commit_is_source_tip =
+                    receipt.output_commit.as_deref() == Some(source_tip.as_str());
+                if !output_commit_is_source_tip {
+                    self.note(
+                        ctx,
+                        format!(
+                            "run {run_id} pr sink skipped: output_commit is not forge's committed tip of {source_branch}"
+                        ),
+                    );
+                    return None;
                 }
                 // A receipt can arrive after its anchor was closed or merged.
                 // Re-read committed tracker state at the publication boundary
@@ -410,6 +426,35 @@ impl RunsModule {
         Ok(refs
             .iter()
             .any(|r| r.get("name").and_then(|n| n.as_str()) == Some(branch)))
+    }
+
+    /// `branch`'s committed tip, or `None` when it is not a born ref of
+    /// `repo` — the SAME `ListRefs` mirror [`Self::forge_branch_born`] reads,
+    /// but returning the 40-hex tip a receipt's `output_commit` must equal
+    /// (#1835), not merely a born/unborn verdict.
+    async fn forge_branch_tip(
+        &self,
+        ctx: &dyn Ctx,
+        forge: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<String>, String> {
+        let reply = ctx
+            .query(
+                forge,
+                &serde_json::to_vec(&ForgeSinkQuery::ListRefs { repo }).expect("query serializes"),
+            )
+            .await
+            .map_err(|e| format!("forge refs lookup failed: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_slice(&reply).map_err(|e| format!("undecodable forge reply: {e}"))?;
+        let Some(refs) = value.get("refs").and_then(|r| r.as_array()) else {
+            return Err("unexpected forge reply for a refs listing".into());
+        };
+        Ok(refs
+            .iter()
+            .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(branch))
+            .and_then(|r| r.get("head").and_then(|h| h.as_str()).map(str::to_string)))
     }
 
     /// the duplicate-PR guard's read, plus the tracker's NEXT item number:

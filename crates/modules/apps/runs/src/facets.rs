@@ -80,7 +80,7 @@ pub(super) fn output_ref_of(receipt: &WorkspaceReceipt) -> Option<String> {
 /// carries empty title/body — the keys skip-serialize, and delivery derives
 /// them from the message facet — and `Chain` composes as an absent field
 /// (see [`WireSink::is_chain`]), matching the oracle's own skip.
-#[derive(Serialize, Deserialize, Default, Debug)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub(crate) enum WireSink {
     #[default]
@@ -91,7 +91,7 @@ pub(crate) enum WireSink {
         source_branch: String,
         #[serde(default)]
         target_branch: String,
-        #[serde(skip_serializing_if = "String::is_empty")]
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         title: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         body: String,
@@ -103,6 +103,33 @@ impl WireSink {
     /// — the serde skip mirroring compute-service's `is_chain`.
     pub(crate) fn is_chain(&self) -> bool {
         matches!(self, WireSink::Chain)
+    }
+
+    /// is `self` the SAME COMMITMENT as `committed` — the binding
+    /// [`crate::response`]'s delivery enforces (#1835): same mode, and for
+    /// `Pr` the same repo/source/target. `title`/`body` are provider-authored
+    /// prose delivery always derives fresh and never trusts from either side
+    /// (see `emit_sink`'s doc comment), so they never enter this comparison —
+    /// an echo that only embellishes the PR's title is not a redirect.
+    pub(crate) fn same_commitment(&self, committed: &WireSink) -> bool {
+        match (self, committed) {
+            (WireSink::Chain, WireSink::Chain) => true,
+            (
+                WireSink::Pr {
+                    repo: r1,
+                    source_branch: s1,
+                    target_branch: t1,
+                    ..
+                },
+                WireSink::Pr {
+                    repo: r2,
+                    source_branch: s2,
+                    target_branch: t2,
+                    ..
+                },
+            ) => r1 == r2 && s1 == s2 && t1 == t2,
+            _ => false,
+        }
     }
 }
 

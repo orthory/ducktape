@@ -162,7 +162,12 @@ fn the_host_synthesizes_a_module_origin_in_exactly_two_places() {
         .lines()
         .enumerate()
         .map(|(n, line)| (n + 1, line.trim()))
-        .filter(|(_, line)| line.contains("Origin::Module(") && !line.starts_with("//"))
+        .filter(|(_, line)| {
+            let names_module_origin = line.contains("Origin::Module(");
+            let only_matches_origin = line.contains("Origin::Module(_)");
+            let comment = line.starts_with("//");
+            names_module_origin && !only_matches_origin && !comment
+        })
         .collect();
 
     let listing = sites
@@ -179,14 +184,14 @@ fn the_host_synthesizes_a_module_origin_in_exactly_two_places() {
          module did not earn — that is what the deleted continuation lane was. \
          found:\n{listing}"
     );
-    let follow_up = "queue.push_back((Origin::Module(msg.target.clone()), cause.clone(), m))";
+    let follow_up = "queue.push_back((Origin::Module(module.clone()), cause.clone(), m))";
     let delivery = "origin: Origin::Module(delivery.item.source.clone()),";
     let has_follow_up = sites.iter().any(|(_, site)| site.contains(follow_up));
     let has_delivery = sites.iter().any(|(_, site)| site.contains(delivery));
     assert!(
         has_follow_up,
         "the follow-up push must build the origin from the module that just \
-         executed (`msg.target` after remove-execute-reinsert):\n{listing}"
+         executed (`module` from the executed or verified replay record):\n{listing}"
     );
     assert!(
         has_delivery,

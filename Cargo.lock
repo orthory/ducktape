@@ -5299,6 +5299,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "wasmtime",
 ]
 
 [[package]]
@@ -6537,10 +6538,11 @@ dependencies = [
 name = "noded-bin"
 version = "0.1.0"
 dependencies = [
+ "agent",
  "async-trait",
+ "attribution",
  "base64 0.22.1",
  "commonware-runtime",
- "dispatch 0.1.0",
  "duckfs-client",
  "futures",
  "git2",
@@ -6549,8 +6551,6 @@ dependencies = [
  "nettest",
  "node",
  "noded",
- "runs",
- "saga",
  "sdk",
  "serde_json",
  "sha2 0.10.9",

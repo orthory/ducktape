@@ -22,6 +22,29 @@ const TESTMAP: &[u8] = include_bytes!("../../index-guest/testmap/index.wasm");
 /// wait is event-driven, so healthy runs never sit it out.
 const RECV_DEADLINE: Duration = Duration::from_secs(60);
 
+/// a hand-assembled CORE module — `(module (func (export "on_apply")
+/// (result i32) i32.const 0))` — exporting a role entry point but no
+/// `memory`. Readiness (`role list contains on_apply or query`) alone would
+/// pass this; fluent31's own `install_module` (rev 76ba1867,
+/// `crates/fluent31/src/wasm/mod.rs:181-203`) additionally requires a
+/// `memory` export, so this is exactly the shape #1839 describes: loadable
+/// by readiness, refused by install. Assembled by hand rather than pulling
+/// in a `wat` dependency this crate doesn't otherwise need.
+#[rustfmt::skip]
+const NO_MEMORY_MAPPER: &[u8] = &[
+    0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // magic, version
+    // type section: one type, () -> i32
+    0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7F,
+    // function section: one function, type 0
+    0x03, 0x02, 0x01, 0x00,
+    // export section: "on_apply" -> func 0
+    0x07, 0x0C, 0x01, 0x08,
+    0x6F, 0x6E, 0x5F, 0x61, 0x70, 0x70, 0x6C, 0x79, // "on_apply"
+    0x00, 0x00,
+    // code section: one body, i32.const 0; end
+    0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x00, 0x0B,
+];
+
 fn bare_store(dir: &Path) -> IndexStore {
     let modules = [IndexModule::bare("chat"), IndexModule::bare("tasks")];
     IndexStore::open(dir, &modules).expect("open store")
@@ -460,11 +483,13 @@ fn a_new_mapper_folds_the_op_feed_the_database_already_held() {
         store
             .apply_block(&block(2, vec![chat_op(b"two"), chat_op(b"three")]))
             .unwrap();
-        assert!(store
-            .scan("chat", b"seen/", None, 10)
-            .unwrap()
-            .entries
-            .is_empty());
+        assert!(
+            store
+                .scan("chat", b"seen/", None, 10)
+                .unwrap()
+                .entries
+                .is_empty()
+        );
     }
     let store = mapped_store(dir.path());
     // NO BARRIER HERE, ON PURPOSE. `open` waits the refold out itself, and
@@ -1250,7 +1275,7 @@ fn a_live_mapper_replacement_refolds_before_reads_resume() {
 }
 
 #[test]
-fn a_failed_mapper_replacement_refuses_reads_and_poisoned_writes() {
+fn a_failed_mapper_replacement_refuses_only_its_own_module() {
     let dir = tempfile::tempdir().unwrap();
     let store = mapped_store(dir.path());
     assert!(
@@ -1261,11 +1286,122 @@ fn a_failed_mapper_replacement_refuses_reads_and_poisoned_writes() {
             }])
             .is_err()
     );
-    assert!(store.is_poisoned());
+    // bad GUEST BYTES are this module's problem alone: the store stays
+    // usable, and the op feed (chat's included) keeps advancing — a mapper
+    // change never affects what the feed saw, only what it means.
+    assert!(
+        !store.is_poisoned(),
+        "a rejected guest must not poison the whole store"
+    );
     assert!(store.view("chat", b"count").is_err());
     assert!(store.get("chat", b"count").is_err());
     assert!(store.scan("chat", b"seen/", None, 10).is_err());
-    assert!(store.apply_block(&block(1, vec![chat_op(b"one")])).is_err());
+    store
+        .apply_block(&block(1, vec![chat_op(b"one"), tasks_op()]))
+        .expect("the op feed is not this module's poison to hold");
+    assert_eq!(store.applied_height("chat").unwrap(), 1);
+    assert_eq!(store.applied_height("tasks").unwrap(), 1);
+}
+
+#[test]
+fn validate_guest_requires_memory_export_like_install_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    // readiness (role coverage alone) would pass this; pin it against the
+    // actual activation path so the two can never drift apart again.
+    assert!(
+        store.validate_guest(NO_MEMORY_MAPPER).is_err(),
+        "readiness must refuse a mapper with no `memory` export"
+    );
+    assert!(
+        store
+            .converge(&[IndexModule {
+                id: "chat",
+                guest: Some(NO_MEMORY_MAPPER),
+            }])
+            .is_err(),
+        "install would refuse the same bytes readiness now also refuses"
+    );
+}
+
+#[test]
+fn an_unchanged_rejection_short_circuits_without_recompiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    let spec = || IndexModule {
+        id: "chat",
+        guest: Some(NO_MEMORY_MAPPER),
+    };
+    let first = store.converge(&[spec()]).unwrap_err();
+    assert!(
+        first.to_string().contains("memory"),
+        "the first attempt reports the real reason: {first}"
+    );
+    // the identical candidate reconverged (`converge_host_modules` retries a
+    // stuck deployment every block): a second wasmtime compile of the same
+    // doomed bytes is wasted work, so this must be refused WITHOUT paying
+    // for it — proven by the distinct short-circuit message, since a real
+    // recompile would report "memory" again, not this one.
+    let second = store.converge(&[spec()]).unwrap_err();
+    assert!(
+        second.to_string().contains("previously rejected"),
+        "a repeat of the same rejected bytes must short-circuit: {second}"
+    );
+}
+
+#[test]
+fn a_changed_candidate_after_a_rejection_is_recompiled() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    store
+        .converge(&[IndexModule {
+            id: "chat",
+            guest: Some(NO_MEMORY_MAPPER),
+        }])
+        .unwrap_err();
+    // different bytes after a rejection must NOT hit the short-circuit —
+    // only an EXACT repeat of the doomed candidate skips recompiling.
+    let different = store.converge(&[IndexModule {
+        id: "chat",
+        guest: Some(TESTMAP),
+    }]);
+    assert!(
+        different.is_ok(),
+        "a real fix must still converge: {different:?}"
+    );
+}
+
+#[test]
+fn a_rejected_mapper_leaves_every_other_module_folding() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = IndexStore::open(
+        dir.path(),
+        &[
+            IndexModule::bare("chat"),
+            IndexModule {
+                id: "tasks",
+                guest: Some(TESTMAP),
+            },
+        ],
+    )
+    .unwrap();
+    assert!(
+        store
+            .converge(&[IndexModule {
+                id: "chat",
+                guest: Some(NO_MEMORY_MAPPER),
+            }])
+            .is_err()
+    );
+    assert!(!store.is_poisoned());
+    store
+        .apply_block(&block(1, vec![chat_op(b"one"), tasks_op()]))
+        .unwrap();
+    store.wait_folds_drained().unwrap();
+    assert_eq!(store.applied_height("chat").unwrap(), 1);
+    assert_eq!(store.applied_height("tasks").unwrap(), 1);
+    assert_eq!(store.view("tasks", b"count").unwrap(), 1u64.to_be_bytes());
+    assert!(store.view("chat", b"count").is_err());
 }
 
 /// The two engine reads take separate snapshots. Their order and shared
