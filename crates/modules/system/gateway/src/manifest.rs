@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::is_canonical_sha256;
 
 /// Serving-root name of the manifest file, relative to a route's gateway
-/// directory (`/home/ext:<publisher>/.duck/gateway/<label>/`).
+/// directory (`/home/ext:<publisher>/.duck/gateway/<account>/<label>/`, the
+/// account being the one that published the route — a node serves each
+/// account's content out of its own subtree).
 pub const MANIFEST_FILE: &str = ".manifest.json";
 
 pub const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;

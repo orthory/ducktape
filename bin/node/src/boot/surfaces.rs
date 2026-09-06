@@ -90,7 +90,7 @@ pub(crate) fn bind_listener(
 /// whose keystore cannot be read, boots operator-gated instead of refusing to
 /// boot. Not the user's node: the wallet is per operator, shared by the CLI
 /// and the app.
-fn operator_wallet_key() -> Option<Vec<u8>> {
+pub(crate) fn operator_wallet_key() -> Option<Vec<u8>> {
     let path = keystore::wallet::active_user_key().ok()?;
     let key = keystore::userkey::read_user_key_file(&path).ok()?;
     Some(key.pubkey)
