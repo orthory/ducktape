@@ -84,10 +84,8 @@ pub fn spawn_founders(mut cluster: Cluster) -> Cluster {
 pub fn run_on_each(cluster: &Cluster, verb: &[&str]) -> Vec<(bool, String)> {
     (0..3)
         .map(|idx| {
-            // the ceremony's own drift, named: the runs are spaced in wall
-            // clock and the matcher is bounded in blocks, so these three
-            // heights are the diagnosis when a run mints its own proposal
-            // instead of joining.
+            // Record the boundary each voter observed so a failed ceremony
+            // can be correlated with the node logs.
             let height = cluster.status(idx)["height"]
                 .as_u64()
                 .expect("node status carries a height");
