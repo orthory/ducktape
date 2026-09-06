@@ -45,6 +45,53 @@ pub(crate) struct JoinRequestRecord {
     pub(crate) last_seen_ms: u64,
 }
 
+/// Insert a freshly-forwarded join request, or refresh `last_seen_ms` on a
+/// retransmit — mirrors [`crate::reachability_plane::insert_gate_outcome`],
+/// capped at the same [`crate::reachability_plane::MAX_TRACKED_JOINERS`],
+/// oldest-by-`last_seen_ms` evicted first. The map is keyed on the
+/// attacker-chosen joiner key with no other size limit, so an unbounded
+/// stream of never-approved joiners must not grow it forever.
+pub(crate) fn insert_join_request(
+    map: &mut std::collections::BTreeMap<Vec<u8>, JoinRequestRecord>,
+    joiner: Vec<u8>,
+    issuer: Vec<u8>,
+    now_ms: u64,
+) {
+    if let Some(existing) = map.get_mut(&joiner) {
+        existing.last_seen_ms = now_ms;
+        return;
+    }
+    if map.len() >= crate::reachability_plane::MAX_TRACKED_JOINERS
+        && let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, r)| r.last_seen_ms)
+            .map(|(k, _)| k.clone())
+    {
+        map.remove(&oldest);
+    }
+    map.insert(
+        joiner,
+        JoinRequestRecord {
+            issuer,
+            first_seen_ms: now_ms,
+            last_seen_ms: now_ms,
+        },
+    );
+}
+
+/// Sweep every join request last seen more than `window_ms` ago — mirrors
+/// [`crate::reachability_plane::sweep_gate_outcomes`]. The only other prune
+/// is `on_rpc`'s read-time retain for a joiner that GAINED standing, so a
+/// joiner whose Redeem was rejected (and never retries) would otherwise sit
+/// here forever.
+pub(crate) fn sweep_join_requests(
+    map: &mut std::collections::BTreeMap<Vec<u8>, JoinRequestRecord>,
+    now_ms: u64,
+    window_ms: u64,
+) {
+    map.retain(|_, r| now_ms.saturating_sub(r.last_seen_ms) <= window_ms);
+}
+
 /// the rpc/console projection of one [`JoinRequestRecord`].
 #[derive(serde::Serialize)]
 pub(crate) struct JoinRequestView {

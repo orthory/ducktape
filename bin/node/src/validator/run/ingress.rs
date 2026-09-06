@@ -10,9 +10,7 @@ use super::{ValidatorRuntime, graceful_checkpoint};
 use crate::config::{hex_bytes, unhex};
 use crate::constants::{GATE_SETTLE_TIMEOUT, OPS_REFRESH_INTERVAL, SUBMIT_HOLD};
 use crate::host_reads::{read_redemption_from_host, read_valset_members, read_valset_residents};
-use crate::rpc::{
-    JoinRequestRecord, JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus,
-};
+use crate::rpc::{JoinRequestView, JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus};
 use crate::util::{hex, unix_ms};
 use crate::{config, join_gate, relay, relay_runtime};
 
@@ -354,14 +352,12 @@ impl ValidatorRuntime<'_> {
                      Admitted",
                     hex_bytes(&joiner_bytes[..4.min(joiner_bytes.len())])
                 );
-                let now = unix_ms();
-                join_requests
-                    .entry(joiner_bytes.clone())
-                    .or_insert(JoinRequestRecord {
-                        issuer: issuer_bytes,
-                        first_seen_ms: now,
-                        last_seen_ms: now,
-                    });
+                crate::rpc::insert_join_request(
+                    join_requests,
+                    joiner_bytes.clone(),
+                    issuer_bytes,
+                    unix_ms(),
+                );
                 gating.insert(joiner_bytes.clone(), frame_id);
                 pending_gates.insert(
                     frame_id,
@@ -699,6 +695,71 @@ mod tests {
         assert!(
             !include_str!("ingress.rs").contains(&hardcoded_empty_cap),
             "every Admitted arm must mint through mint_joiner_cap"
+        );
+    }
+
+    /// `on_gate_forward` calls [`crate::rpc::insert_join_request`] on EVERY
+    /// forward, including a retransmit of a joiner already tracked — that
+    /// must move `last_seen_ms` forward without touching `first_seen_ms` or
+    /// growing the map, or `ducktape node join requests` shows a last_seen
+    /// frozen at first contact for a joiner that has been retrying for 20 min.
+    #[test]
+    fn join_request_retransmit_moves_last_seen_forward() {
+        let mut requests = std::collections::BTreeMap::new();
+        let joiner = vec![7u8; 32];
+        let issuer = vec![9u8; 32];
+
+        crate::rpc::insert_join_request(&mut requests, joiner.clone(), issuer.clone(), 1_000);
+        crate::rpc::insert_join_request(&mut requests, joiner.clone(), issuer, 5_000);
+
+        assert_eq!(requests.len(), 1, "a retransmit never grows the map");
+        let record = requests.get(&joiner).expect("the joiner is tracked");
+        assert_eq!(
+            record.first_seen_ms, 1_000,
+            "first_seen_ms is set once, on the FIRST forward"
+        );
+        assert_eq!(
+            record.last_seen_ms, 5_000,
+            "a retransmit MUST move last_seen_ms forward"
+        );
+    }
+
+    /// The join-request map is keyed on the attacker-chosen joiner key with
+    /// no other size limit — it must cap at
+    /// [`crate::reachability_plane::MAX_TRACKED_JOINERS`], evicting the
+    /// OLDEST (smallest `last_seen_ms`) entry to make room for a new joiner
+    /// past the cap, mirroring [`crate::reachability_plane::insert_gate_outcome`].
+    #[test]
+    fn the_4097th_joiner_evicts_the_oldest() {
+        let cap = crate::reachability_plane::MAX_TRACKED_JOINERS;
+        let mut requests = std::collections::BTreeMap::new();
+        for i in 0..cap {
+            crate::rpc::insert_join_request(
+                &mut requests,
+                (i as u32).to_be_bytes().to_vec(),
+                vec![0],
+                i as u64,
+            );
+        }
+        assert_eq!(requests.len(), cap);
+        let oldest = 0u32.to_be_bytes().to_vec();
+        assert!(requests.contains_key(&oldest));
+
+        let newcomer = (cap as u32).to_be_bytes().to_vec();
+        crate::rpc::insert_join_request(&mut requests, newcomer.clone(), vec![0], cap as u64);
+
+        assert_eq!(
+            requests.len(),
+            cap,
+            "the map stays capped at MAX_TRACKED_JOINERS"
+        );
+        assert!(
+            !requests.contains_key(&oldest),
+            "the oldest entry must be evicted to make room"
+        );
+        assert!(
+            requests.contains_key(&newcomer),
+            "the new joiner past the cap must be tracked"
         );
     }
 }
