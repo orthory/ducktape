@@ -280,16 +280,15 @@ fn read_present_artifacts(
     Ok(artifacts)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+/// write `bytes` to `path` via tmp-file + rename: a reader never observes a
+/// truncated or partial file, only the old contents or the new ones. Shared
+/// with [`crate::NetworkDescriptor::save`] — the descriptor is as much a
+/// workspace identity file as the genesis is.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp, bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        format!(
-            "rename {} -> {}: {e}",
-            tmp.display(),
-            path.display()
-        )
-    })
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))
 }
 
 #[cfg(test)]
