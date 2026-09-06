@@ -111,6 +111,18 @@ impl ResolverTarget {
 /// max snapshot bytes per [`SyncResponse::Chunk`]. sized so a chunk plus
 /// framing stays far under the mesh's 1 MiB message cap.
 pub const CHUNK_LEN: usize = 256 * 1024;
+
+/// default cap on one module's ASSEMBLED snapshot payload
+/// ([`fetch_snapshot`]'s `max_bytes`). the serving peer chooses `total` and
+/// every chunk length on the wire, so without a ceiling here a byzantine
+/// peer drives an unbounded `Vec<u8>` allocation in a joining node — the
+/// bytes are only root-verified after the whole payload is resident. sized
+/// generously (hundreds of MiB): a legitimate module snapshot can be large,
+/// and this is a refusal floor, not a working-set budget. mirrors the blob
+/// lane's `MAX_MODULE_CODE_BYTES` (bin/node/src/constants.rs) without this
+/// crate depending on `node`.
+pub const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
+
 /// max recovery frames examined per [`SyncResponse::Frames`] batch. This is a
 /// work bound, not a byte guarantee: the node serve path separately budgets the
 /// exact encoded response against its configured mesh message cap.
@@ -176,6 +188,15 @@ pub enum SyncError {
     UnexpectedResponse(&'static str),
     #[error("module {module}: {reason}")]
     Module { module: ModuleId, reason: String },
+    #[error("module {module}: snapshot too large ({reason}, cap {cap} bytes)")]
+    TooLarge {
+        module: ModuleId,
+        /// stable snake_case token — never prose — so a caller (and the log
+        /// line it lands in) can tell which check refused without parsing
+        /// English.
+        reason: &'static str,
+        cap: u64,
+    },
     #[error("module {module}: pinned qmdb range pruned ({reason}); refetch manifest")]
     Pruned { module: ModuleId, reason: String },
     #[error("recovery frame range pruned after {requested_after}; retained from {retained_from}")]
@@ -1949,12 +1970,25 @@ pub async fn fetch_manifest<C: SyncClient>(client: &C) -> Result<Manifest, SyncE
     }
 }
 
-/// fetch a captured module's full snapshot payload, chunk by chunk.
+/// fetch a captured module's full snapshot payload, chunk by chunk, refusing
+/// to assemble more than `max_bytes` — see [`MAX_SNAPSHOT_BYTES`]. both
+/// `total` and each chunk's length are the SERVING peer's choice, so every
+/// bound here runs BEFORE the bytes it would refuse are appended: an
+/// oversized `total` refuses before the loop allocates anything, an
+/// oversized chunk refuses before it is appended, and a peer that keeps
+/// sending past its own declared `total` refuses too (it is lying, not
+/// generous).
 pub async fn fetch_snapshot<C: SyncClient>(
     client: &C,
     boundary: BoundaryId,
     module_id: &str,
+    max_bytes: u64,
 ) -> Result<Vec<u8>, SyncError> {
+    let too_large = |reason: &'static str| SyncError::TooLarge {
+        module: module_id.to_string(),
+        reason,
+        cap: max_bytes,
+    };
     let mut out: Vec<u8> = Vec::new();
     loop {
         let req = SyncRequest::Chunk {
@@ -1964,17 +1998,29 @@ pub async fn fetch_snapshot<C: SyncClient>(
         };
         match client.request(req).await? {
             SyncResponse::Chunk { total, bytes } => {
+                if total > max_bytes {
+                    return Err(too_large("declared_total_exceeds_cap"));
+                }
+                if bytes.len() > CHUNK_LEN {
+                    return Err(too_large("chunk_exceeds_chunk_len"));
+                }
                 if bytes.is_empty() && out.len() < total as usize {
                     return Err(SyncError::Module {
                         module: module_id.to_string(),
                         reason: "server returned an empty chunk mid-payload".into(),
                     });
                 }
+                let would_be = out.len() as u64 + bytes.len() as u64;
+                if would_be > max_bytes {
+                    return Err(too_large("accumulated_exceeds_cap"));
+                }
+                if would_be > total {
+                    // a peer that keeps sending past its own declared total
+                    // is lying about the total, the stream, or both.
+                    return Err(too_large("accumulated_exceeds_total"));
+                }
                 out.extend_from_slice(&bytes);
                 if out.len() as u64 >= total {
-                    // a lying `total` smaller than the stream is impossible:
-                    // the server slices from one captured Vec, and we stop at
-                    // exactly `total`.
                     out.truncate(total as usize);
                     return Ok(out);
                 }
@@ -2737,5 +2783,153 @@ mod tests {
                 "truncation at -{cut} must reject"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // fetch_snapshot: the served `total` and every chunk length are the
+    // PEER's choice, so the cap has to hold against a peer that lies in
+    // either. a scripted client stands in for the wire: it hands back a
+    // canned queue of responses with no server, no transport.
+    // ------------------------------------------------------------------
+
+    /// a `SyncClient` that plays back a fixed script of responses, one per
+    /// request, ignoring the request itself — enough to drive `fetch_snapshot`
+    /// without a real server.
+    #[derive(Clone)]
+    struct ScriptedClient {
+        responses: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<SyncResponse>>>,
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ScriptedClient {
+        fn new(responses: Vec<SyncResponse>) -> Self {
+            Self {
+                responses: std::sync::Arc::new(std::sync::Mutex::new(responses.into())),
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SyncClient for ScriptedClient {
+        fn request(
+            &self,
+            _req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let next = self.responses.lock().expect("script poisoned").pop_front();
+            async move { next.ok_or_else(|| SyncError::Transport("script exhausted".into())) }
+        }
+    }
+
+    fn test_boundary() -> BoundaryId {
+        BoundaryId {
+            height: 1,
+            root_hash: StateRoot([0u8; ROOT_LEN]),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_refuses_oversized_total_before_any_chunk() {
+        let cap = 1024u64;
+        let client = ScriptedClient::new(vec![SyncResponse::Chunk {
+            total: cap + 1,
+            bytes: vec![1, 2, 3],
+        }]);
+        let err = fetch_snapshot(&client, test_boundary(), "mod", cap)
+            .await
+            .expect_err("declared total over cap must refuse");
+        assert!(
+            matches!(
+                err,
+                SyncError::TooLarge {
+                    reason: "declared_total_exceeds_cap",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+        // refused on the very first reply — never asked for a second chunk.
+        assert_eq!(client.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_refuses_an_oversized_chunk() {
+        let cap = 1024u64;
+        let client = ScriptedClient::new(vec![SyncResponse::Chunk {
+            total: cap,
+            bytes: vec![0u8; CHUNK_LEN + 1],
+        }]);
+        let err = fetch_snapshot(&client, test_boundary(), "mod", cap)
+            .await
+            .expect_err("a chunk over CHUNK_LEN must refuse");
+        assert!(
+            matches!(
+                err,
+                SyncError::TooLarge {
+                    reason: "chunk_exceeds_chunk_len",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_refuses_a_stream_that_overruns_its_own_total() {
+        let cap = 1024u64;
+        // total says 10 bytes; the first chunk honestly delivers part of
+        // that, but the second keeps sending well past the declared total.
+        let client = ScriptedClient::new(vec![
+            SyncResponse::Chunk {
+                total: 10,
+                bytes: vec![1u8; 5],
+            },
+            SyncResponse::Chunk {
+                total: 10,
+                bytes: vec![2u8; 10],
+            },
+        ]);
+        let err = fetch_snapshot(&client, test_boundary(), "mod", cap)
+            .await
+            .expect_err("a peer that sends past its own total is lying");
+        assert!(
+            matches!(
+                err,
+                SyncError::TooLarge {
+                    reason: "accumulated_exceeds_total",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_assembles_an_honest_stream() {
+        let cap = 1024u64;
+        let total = 10u64;
+        let client = ScriptedClient::new(vec![
+            SyncResponse::Chunk {
+                total,
+                bytes: vec![1u8, 2, 3],
+            },
+            SyncResponse::Chunk {
+                total,
+                bytes: vec![4u8, 5, 6, 7],
+            },
+            SyncResponse::Chunk {
+                total,
+                bytes: vec![8u8, 9, 10],
+            },
+        ]);
+        let bytes = fetch_snapshot(&client, test_boundary(), "mod", cap)
+            .await
+            .expect("an honest, in-cap stream assembles");
+        assert_eq!(bytes, vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(client.call_count(), 3);
     }
 }

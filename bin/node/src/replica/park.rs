@@ -17,6 +17,7 @@ use commonware_runtime::{Clock, Metrics, Spawner, Supervisor};
 use futures::{FutureExt as _, StreamExt as _};
 use recovery::{Manifest, Recovery};
 
+use crate::blob_fetch::SourceRotate as _;
 use crate::config::{hex_bytes, unhex};
 use crate::constants::*;
 use crate::drain_actions::{CutoverTrigger, EpochActions};
@@ -2411,6 +2412,10 @@ pub(super) async fn park(
                                 error = %e,
                                 "replica bootstrap failed"
                             );
+                            // a source that failed the assembly (a lying
+                            // total/oversized chunk included) is rotated away
+                            // from rather than re-asked with the same manifest.
+                            client.rotate_source();
                         }
                     }
                 }
@@ -2602,6 +2607,9 @@ pub(super) async fn park(
                     error = %e,
                     "resident boundary sync failed"
                 );
+                // same rationale as the bootstrap arm above: don't re-ask the
+                // source that just failed the assembly.
+                client.rotate_source();
             }
         }
     };
