@@ -68,6 +68,24 @@ jobs:
       - run: rustup show
       - run: cargo test --locked -p node-bin host_state
 
+  # the wasm/native cutover-continuity proofs (crates/kernel/host/tests/wasm_*_parity.rs):
+  # each op sequence must commit the identical root, replies and rejection
+  # reasons on both a native module and its wasm guest, block by block. Had
+  # no PR gate (#1695) — a fixture written before a module's own admission
+  # rule shifted (#1650, #1046) slipped a stale-fixture failure onto dev
+  # unnoticed. Measured ~1 min for `--tests` warm-cache locally, plus the
+  # ~2-3 min host-crate compile; 30 min matches the other host-crate jobs.
+  host-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup show
+      - run: cargo test --locked -p host --tests
+
   # A separate job (not folded into genesis-pin) so it runs in parallel
   # rather than lengthening one job's critical path. `cargo test -p simnode`
   # cranelift-compiles the sim's module set per boot (25–29 min on the

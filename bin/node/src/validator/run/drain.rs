@@ -861,6 +861,11 @@ impl ValidatorRuntime<'_> {
                 orchestrator.pending_cutover().map(|c| c.cutover_view()),
                 pos,
                 *next_seq,
+                // the root `f.height` SEALED. the host can be AHEAD of it (a
+                // code-swap realization that stalls before applying a block
+                // still moved the registry), and a manifest labelled with this
+                // height but carrying that root is one recovery fatals on.
+                Some(f.root_hash),
                 || {
                     context
                         .current()

@@ -665,3 +665,48 @@ fn recovery_restores_the_checkpoint_window_and_extends_it_with_the_suffix() {
         assert_eq!(heights.last().copied(), Some(tip_height));
     });
 }
+
+/// A CAPTURE COMPUTES A ROOT, IT DOES NOT VERIFY ONE. The host can sit AHEAD of
+/// the last sealed boundary — a module realization that seated a component for a
+/// block the node then failed to apply moves the registry root off any block —
+/// and a manifest labelled with that height while carrying the live root is what
+/// recovery's final compare fatals on, permanently. A caller that knows the
+/// sealed root gets a refusal instead of a manifest.
+#[test]
+fn capture_refuses_a_root_no_block_sealed() {
+    let host = fresh_host();
+    let never_sealed = sdk::StateRoot([9u8; 32]);
+    let zero = || std::time::Duration::ZERO;
+    let err = Manifest::capture_timed(
+        &host,
+        Some(7),
+        0,
+        0,
+        vec![],
+        vec![],
+        None,
+        0,
+        1,
+        Some(never_sealed),
+        zero,
+    )
+    .expect_err("a live root that is not the sealed root writes nothing");
+    assert!(format!("{err}").contains("sealed root"));
+
+    // the same capture against the root the block actually sealed proceeds.
+    let (manifest, _) = Manifest::capture_timed(
+        &host,
+        Some(7),
+        0,
+        0,
+        vec![],
+        vec![],
+        None,
+        0,
+        1,
+        Some(host.root_hash()),
+        zero,
+    )
+    .expect("the sealed root captures");
+    assert_eq!(manifest.root_hash, host.root_hash());
+}

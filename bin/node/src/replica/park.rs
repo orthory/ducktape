@@ -1724,6 +1724,10 @@ pub(super) async fn park(
                     None,
                     pos,
                     1,
+                    // the root `f.height` SEALED: a manifest labelled with this
+                    // height must carry it, never whatever the live host has
+                    // moved to since (recovery fatals on the difference).
+                    Some(f.root_hash),
                     || {
                         context
                             .current()
