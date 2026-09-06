@@ -592,15 +592,12 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         "duckdns commits to content alone — its root is batch-invariant"
     );
 
-    // the plain modules that stamp consensus_time DIFFER too — the embedded block
-    // time, NOT the qmdb commit boundary. pinned so the distinction stays honest.
-    for id in ["tasks"] {
-        assert_ne!(
-            module_root(&a, id),
-            module_root(&b, id),
-            "{id} authenticates the block's consensus_time (orthogonal to qmdb)"
-        );
-    }
+    // Tasks stamps consensus_time, independently of the qmdb commit boundary.
+    assert_ne!(
+        module_root(&a, "tasks"),
+        module_root(&b, "tasks"),
+        "tasks authenticates the block's consensus_time (orthogonal to qmdb)"
+    );
 
     // LOGICAL STATE CONVERGES. the time-free modules converge fully — every key
     // resolves to the same value, the page list is byte-identical.

@@ -43,6 +43,14 @@ use crate::{
 /// `IDENTITY_MODULE_ID`; it is not a per-network choice, so it is not a knob.
 const IDENTITY_MODULE: &str = "identity";
 
+/// Call completions retain these exact bytes. A typed result fixes field order
+/// even when native and guest builds select different serde_json map features.
+#[derive(serde::Serialize)]
+struct CreatedItem<'a> {
+    number: u64,
+    repo: &'a str,
+}
+
 /// the domain tag folding the tracker's canonical-bytes hash into the root
 /// preimage — separates it from the branch material.
 const TRACKER_ROOT_DOMAIN: &[u8] = b"ducktape.forge.tracker.v1\x00";
@@ -357,9 +365,7 @@ impl ForgeState {
                 if let Some(chat) = chat_target {
                     ctx.emit_msg(tracker::create_channel_msg(chat, &name, number));
                 }
-                ctx.set_output(sdk::wire::encode(
-                    &serde_json::json!({"repo": name, "number": number}),
-                ));
+                ctx.set_output(sdk::wire::encode(&CreatedItem { number, repo: &name }));
                 Ok(())
             }
             ForgeMsg::OpenPr {
@@ -409,9 +415,7 @@ impl ForgeState {
                 if let Some(chat) = chat_target {
                     ctx.emit_msg(tracker::create_channel_msg(chat, &name, number));
                 }
-                ctx.set_output(sdk::wire::encode(
-                    &serde_json::json!({"repo": name, "number": number}),
-                ));
+                ctx.set_output(sdk::wire::encode(&CreatedItem { number, repo: &name }));
                 Ok(())
             }
             ForgeMsg::EditItem {
