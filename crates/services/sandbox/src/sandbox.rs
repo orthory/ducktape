@@ -4,9 +4,8 @@
 //!
 //! This module owns the [`SandboxBackend`] enum + its boot probe. The backend's
 //! execution — the VM configuration ([`crate::firecracker_api`]), the run
-//! lifecycle ([`crate::microvm`]), the block images
-//! ([`crate::workspace_image`]) and the egress firewall ([`crate::egress`]) —
-//! lives beside it.
+//! lifecycle ([`crate::microvm`]) and the block images
+//! ([`crate::workspace_image`]) — lives beside it.
 
 use std::path::{Path, PathBuf};
 
@@ -110,18 +109,10 @@ impl SandboxBackend {
     /// guard.
     fn required_tools(&self) -> &'static [(&'static str, &'static str)] {
         match self {
-            // no `nft` under vz: a macOS guest gets no tap device at all — it
-            // reaches the host over vsock only, so there is no interface to
-            // firewall and nothing nftables-shaped on the OS anyway.
-            SandboxBackend::MicroVm {
-                vmm: Vmm::Firecracker,
-                ..
-            } => &[
-                ("mke2fs", "builds each run's workspace block image"),
-                ("debugfs", "reads that image back after the guest exits"),
-                ("nft", "the egress firewall on the run's tap device"),
-            ],
-            SandboxBackend::MicroVm { vmm: Vmm::Vz, .. } => &[
+            // both VMMs give the guest no tap device — its whole reach is
+            // vsock — so there is no interface for an egress firewall to sit
+            // on and nothing here shells out to `nft`.
+            SandboxBackend::MicroVm { .. } => &[
                 ("mke2fs", "builds each run's workspace block image"),
                 ("debugfs", "reads that image back after the guest exits"),
             ],
