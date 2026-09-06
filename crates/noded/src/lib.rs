@@ -311,6 +311,16 @@ pub struct NodeStatus {
     pub version: String,
     pub root_hash: String,
     pub height: u64,
+    /// the `Env` clock every module compares `expires_at` against, stamped
+    /// from `height` under this node's `ConsensusTimePolicy` — a block height
+    /// on the validator/replica lanes, a millisecond epoch on the sim lane.
+    /// a client minting a TTL-bounded consent (identity's `AddKey`) MUST read
+    /// this, never `height`: the two units diverge on simnode.
+    pub consensus_time: u64,
+    /// which unit [`Self::consensus_time`] is expressed in, so a client can
+    /// scale a TTL window correctly regardless of which lane it is talking
+    /// to. defaults to `Height` (the validator/replica lanes' only policy).
+    pub consensus_time_unit: ConsensusTimeUnit,
     pub modules: Vec<ModuleStatus>,
     /// this node's mesh identity (hex ed25519 key) — what a client stamps
     /// into ops that route peer traffic to it (chat's `JoinHuddle.node`).
@@ -490,6 +500,31 @@ pub struct StoreOperationalStatus {
     /// blobstore is ONE FLAT DIRECTORY of op-payload blobs, so this is also
     /// the count an operator's `ls` has to survive.
     pub files: u64,
+}
+
+/// the unit a `NodeStatus::consensus_time` reading is in — mirrors
+/// [`node::ConsensusTimePolicy`]'s two arms, so a status client never needs
+/// the kernel crate just to scale a TTL correctly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsensusTimeUnit {
+    /// `consensus_time` IS the block height (the validator/replica lanes'
+    /// only policy); one unit is roughly one second at a one-block-per-second
+    /// heartbeat.
+    #[default]
+    Height,
+    /// `consensus_time` is a millisecond epoch clock (the sim lane); one unit
+    /// is one millisecond.
+    Millis,
+}
+
+impl From<node::ConsensusTimePolicy> for ConsensusTimeUnit {
+    fn from(policy: node::ConsensusTimePolicy) -> Self {
+        match policy {
+            node::ConsensusTimePolicy::HeightIsTime => Self::Height,
+            node::ConsensusTimePolicy::Epoch { .. } => Self::Millis,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
