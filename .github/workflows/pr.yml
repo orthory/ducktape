@@ -42,11 +42,20 @@ jobs:
 
   # Rebuild every component and index guest from the requested source
   # revision. Comparing committed copies alone cannot detect stale bytes.
+  #
+  # On the PR's own HEAD, not the merge commit actions/checkout builds by
+  # default: guest-builder compiles the module out of the repository at the
+  # checkout's HEAD, and a merge commit is a revision no committed artifact
+  # was ever built at — every PR whose base moved a compiled line would fail
+  # here on bytes that are correct. `refs/pull/N/head` is on this repository,
+  # a fork PR included, so the fetch resolves either way.
   wasm-rebuild-check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2

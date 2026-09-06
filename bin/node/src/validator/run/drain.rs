@@ -23,6 +23,15 @@ use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes};
 /// further checks (`WORKSPACE_CHECK_INTERVAL` apart) for a filesystem that
 /// never accepts the rewrite.
 const MARK_LOST_WARN_EVERY: u64 = 600;
+
+/// how long a validator may seal NOTHING before the halt detector calls it a
+/// stall: 30 idle beats. an idle chain beats one nop block per `block_time`,
+/// so a window this wide cannot fire on ordinary jitter (a checkpoint, a slow
+/// disk, a view or two nullified while a peer reconnects) and still names a
+/// wedge in seconds rather than minutes.
+fn stall_window(cadence: consensus::Cadence) -> std::time::Duration {
+    cadence.block_time * 30
+}
 use crate::validator::code_announce::CodeVerdict;
 use crate::{join_gate, relay};
 use noded::projection::{BlockProjection, project_block};
@@ -145,9 +154,14 @@ impl ValidatorRuntime<'_> {
             next_drain,
             delivery_wake_tx,
             real_work_parked,
+            last_seal,
+            stall_windows,
+            heartbeat_disabled,
+            cadence,
             ..
         } = self;
         let context = *context;
+        let cadence = *cadence;
         let checkpoint_blocks = *checkpoint_blocks;
 
         *next_drain = context.current() + DRAIN_TICK;
@@ -191,6 +205,46 @@ impl ValidatorRuntime<'_> {
             .collect::<std::collections::BTreeSet<u64>>()
             .len() as u64;
         *blocks_since_checkpoint += sealed_heights;
+        // THE HALT DETECTOR. every way this loop can stop producing blocks is
+        // silent by construction: a release gate awaiting bytes delivers
+        // nothing, a pending FIFO that never empties makes the idle beat
+        // restamp forever, and neither logs a thing. so the ABSENCE of blocks
+        // is the event — one warn per stall window, carrying the state that
+        // names which wedge it is (#1766). the heartbeat is what guarantees a
+        // block per beat, so a node with it disabled (`make dev`) has no floor
+        // to measure against and is not watched.
+        let sealed_something = sealed_heights > 0;
+        if sealed_something {
+            *last_seal = context.current();
+            *stall_windows = 0;
+        } else {
+            let stalled_for = context
+                .current()
+                .duration_since(*last_seal)
+                .unwrap_or_default();
+            let stall_due = !*heartbeat_disabled && stalled_for >= stall_window(cadence);
+            if stall_due {
+                *stall_windows += 1;
+                // re-arm: the next warn is one full window later, so a wedge
+                // that never clears narrates itself at a bounded rate.
+                *last_seal = context.current();
+                tracing::warn!(
+                    target: "ducktape::consensus",
+                    node = %label,
+                    reason = "block_beat_stalled",
+                    windows = *stall_windows,
+                    stalled_ms = stalled_for.as_millis() as u64,
+                    epoch = orchestrator.epoch(),
+                    validators = orchestrator.current_members().len(),
+                    height = node.finalized().map_or(0, |f| f.height),
+                    pending_ops = node.pending_batch_len(),
+                    orderer_pending = node.orderer().pending_len(),
+                    gate_awaiting = node.orderer().min_unreleased_view().is_some(),
+                    gate_min_view = node.orderer().min_unreleased_view().unwrap_or(0),
+                    "no block sealed for a full stall window — the chain is not beating"
+                );
+            }
+        }
         // The orderer-independent projection keeps member/System order,
         // explorer rows, and discard handling identical to the replica.
         let projections = project_block(&drained, node.take_system_dispatches(), blobs);
