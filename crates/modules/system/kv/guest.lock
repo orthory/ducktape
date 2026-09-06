@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/orthory/ducktape#b2e8b36ff317084c2b73512b23b410c24a8cb472"
+source = "git+https://github.com/orthory/ducktape#6ec55597f6469a95a0b1ef7c953122b7dec27bff"
 dependencies = [
  "async-trait",
  "sdk",
@@ -179,7 +179,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 [[package]]
 name = "kv"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#b2e8b36ff317084c2b73512b23b410c24a8cb472"
+source = "git+https://github.com/orthory/ducktape#6ec55597f6469a95a0b1ef7c953122b7dec27bff"
 dependencies = [
  "async-trait",
  "ducktape-module-sdk",
@@ -276,7 +276,7 @@ dependencies = [
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#b2e8b36ff317084c2b73512b23b410c24a8cb472"
+source = "git+https://github.com/orthory/ducktape#6ec55597f6469a95a0b1ef7c953122b7dec27bff"
 dependencies = [
  "async-trait",
  "borsh",
@@ -564,19 +564,19 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[patch.unused]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#b2e8b36ff317084c2b73512b23b410c24a8cb472"
+source = "git+https://github.com/orthory/ducktape#6ec55597f6469a95a0b1ef7c953122b7dec27bff"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#b2e8b36ff317084c2b73512b23b410c24a8cb472"
+source = "git+https://github.com/orthory/ducktape#6ec55597f6469a95a0b1ef7c953122b7dec27bff"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#b2e8b36ff317084c2b73512b23b410c24a8cb472"
+source = "git+https://github.com/orthory/ducktape#6ec55597f6469a95a0b1ef7c953122b7dec27bff"
 
 [[patch.unused]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#b2e8b36ff317084c2b73512b23b410c24a8cb472"
+source = "git+https://github.com/orthory/ducktape#6ec55597f6469a95a0b1ef7c953122b7dec27bff"
