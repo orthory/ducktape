@@ -537,7 +537,8 @@ fn airlock_single_node_self_serves_its_own_route() {
             .expect("sealed handshake through the gateway");
         let plaintext =
             br#"{"model":"claude-sonnet-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}"#;
-        let sealed_body = airlock::bodyseal::seal_request(&keys, plaintext);
+        let aad = airlock::bodyseal::request_aad("POST", "/v1/messages");
+        let sealed_body = airlock::bodyseal::seal_request(&keys, &aad, plaintext);
         let resp = gw
             .route(gw.http().post(gw.url("/v1/messages")))
             .bearer_auth(&token)
