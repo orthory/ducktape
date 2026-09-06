@@ -2192,13 +2192,17 @@ pub(super) async fn park(
         }
         if !member_in_tip {
             // the tip names the CURRENT members — better announce
-            // targets than the genesis descriptor's list.
+            // targets than the genesis descriptor's list, and the only
+            // peers that still SERVE statesync. the descriptor's list is
+            // frozen at genesis, so a founder rotated out of it is a dead
+            // source and a promoted member is one we would never ask.
             let current: Vec<ed25519::PublicKey> = tip
                 .participants
                 .iter()
                 .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
                 .collect();
             if !current.is_empty() {
+                client.set_sources(current.clone());
                 announce_targets = current;
             }
             if tip.residents.iter().any(|k| k == &me_bytes) {

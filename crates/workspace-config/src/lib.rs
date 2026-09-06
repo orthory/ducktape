@@ -1011,21 +1011,27 @@ impl ReachHint {
     }
 }
 
-/// EVERY candidate statesync source, ordered: bootstrap-hinted validators
-/// first (a dial path is already configured), then the remaining validators.
-/// the rotating client fails over down this list — any validator can serve,
-/// because every payload verifies against consensus-agreed roots.
+/// EVERY candidate statesync source, ordered: the invite's bootstrap hints
+/// first (a dial path is already configured for them), then the descriptor's
+/// validators. the rotating client fails over down this list — any peer that
+/// serves the channel will do, because every payload verifies against
+/// consensus-agreed roots.
+///
+/// a hint is NEVER filtered against the descriptor's validator list: that list
+/// is the GENESIS one, frozen for the process's life, so filtering by it drops
+/// exactly the peer a joiner needs once the founders have been rotated out.
+/// the live set replaces this seed as soon as the joiner reads a tip.
 pub fn sync_source_candidates<A>(
     bootstrappers: &[(ed25519::PublicKey, A)],
     validators: &[ed25519::PublicKey],
     me: &ed25519::PublicKey,
 ) -> Vec<ed25519::PublicKey> {
-    let mut out: Vec<ed25519::PublicKey> = bootstrappers
-        .iter()
-        .map(|(k, _)| k)
-        .filter(|k| *k != me && validators.contains(k))
-        .cloned()
-        .collect();
+    let mut out: Vec<ed25519::PublicKey> = Vec::new();
+    for (k, _) in bootstrappers {
+        if k != me && !out.contains(k) {
+            out.push(k.clone());
+        }
+    }
     for k in validators {
         if k != me && !out.contains(k) {
             out.push(k.clone());
@@ -2640,18 +2646,23 @@ mod tests {
     }
 
     #[test]
-    fn sync_source_candidates_prefer_validator_hints_and_never_self() {
+    fn sync_source_candidates_prefer_hints_and_never_self() {
         let me = ed25519::PrivateKey::from_seed(31).public_key();
-        let resident = ed25519::PrivateKey::from_seed(32).public_key();
+        let hinted = ed25519::PrivateKey::from_seed(32).public_key();
         let validator = ed25519::PrivateKey::from_seed(33).public_key();
         let addr: SocketAddr = "127.0.0.1:52200".parse().unwrap();
         let validators = vec![me.clone(), validator.clone()];
 
-        // a non-validator hint sorts first but can never serve — skipped.
-        let hints = vec![(resident.clone(), addr), (validator.clone(), addr)];
+        // a hint outside the GENESIS validator list SURVIVES — it is the
+        // promoted member a joiner reaches once the founders are rotated out.
+        let hints = vec![
+            (hinted.clone(), addr),
+            (validator.clone(), addr),
+            (me.clone(), addr),
+        ];
         assert_eq!(
             sync_source_candidates(&hints, &validators, &me),
-            vec![validator.clone()]
+            vec![hinted.clone(), validator.clone()]
         );
 
         // no usable hint: any validator that is not us.
