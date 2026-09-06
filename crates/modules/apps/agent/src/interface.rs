@@ -85,6 +85,30 @@ pub const MAX_AGENTS_PER_OWNER: usize = 32;
 /// told about and which costs a run nothing until it reads one.
 pub const MAX_SKILLS_PER_AGENT: usize = 64;
 
+/// hard cap on a skill's `name` length in bytes. the name is not a label — it
+/// becomes a run's host mount directory name verbatim — so it rides the same
+/// bound an ordinary filename would.
+pub const MAX_SKILL_NAME_BYTES: usize = 64;
+
+/// the ONE rule for a skill's `name`: a bounded charset, `.`/`..` refused
+/// outright (both pass the charset alone), and a byte cap. a `SkillRef::name`
+/// becomes a run's host directory name verbatim
+/// (`compute_service::envelope` copies it into `mount_subpath`), so this is
+/// the single predicate BOTH sides of that trust boundary must agree on:
+/// [`AgentModule::validate_skills`] calls it at consensus time, and
+/// `noded::agent_provision::mount_dir_name` calls this same function at
+/// provision time — one rule, never two that could drift into a record
+/// consensus accepts but no run can load.
+pub fn is_skill_mount_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SKILL_NAME_BYTES
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 /// the duckfs directory the GLOBAL SKILL LIBRARY lives under, one subdirectory
 /// per skill (`<name>/SKILL.md`). a CONVENTION, not a consensus-enforced
 /// namespace: the library is ordinary duckfs state, and an agent reaches it

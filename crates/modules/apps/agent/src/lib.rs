@@ -127,6 +127,28 @@ pub fn validate_agent_id(agent_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// a skill's `source_prefix` must be a SCOPED duckfs subtree, never a
+/// namespace root: `resolve_skills` copies it verbatim into a run's
+/// dispatch payload, and the provisioner's checkout runs one full checkout
+/// per mount, so an unscoped prefix ("/", "/shared", "/home/<x>") makes every
+/// run of the agent check out the whole namespace once per curated skill.
+///
+/// this is a local, minimal stand-in for `files::paths::canonical` (absolute,
+/// `/`-separated, no empty/dot segments, at least 3 segments deep — the same
+/// depth `library_skills` requires for `/shared/skills/<name>`): the agent
+/// module is self-contained by design (see the crate doc), so it does not
+/// depend on another module's crate for this shape check.
+fn is_scoped_duckfs_prefix(prefix: &str) -> bool {
+    if !prefix.starts_with('/') || prefix.contains('\0') {
+        return false;
+    }
+    let segments: Vec<&str> = prefix.trim_start_matches('/').split('/').collect();
+    let all_named = segments
+        .iter()
+        .all(|s| !s.is_empty() && *s != "." && *s != "..");
+    all_named && segments.len() >= 3
+}
+
 // ---- the module -----------------------------------------------------------
 
 /// storage-backed agent registry.
@@ -308,9 +330,13 @@ impl AgentModule {
         Ok(caps)
     }
 
-    /// a v4 skill ref must carry a non-empty name and source_prefix; a pinned
-    /// snapshot, when present, must be non-empty. order is preserved verbatim
-    /// (skills are an ordered override list).
+    /// a v4 skill ref must carry a name that is [`is_skill_mount_name`] (the
+    /// SAME predicate the noded provisioner's `mount_dir_name` calls — one
+    /// rule, not two that could drift), unique within the record, and a
+    /// source_prefix that is a scoped duckfs subtree ([`is_scoped_duckfs_prefix`]),
+    /// also unique within the record. a pinned snapshot, when present, must be
+    /// non-empty. order is preserved verbatim (skills are an ordered override
+    /// list).
     ///
     /// the COUNT is capped ([`MAX_SKILLS_PER_AGENT`]) for the same reason the
     /// record's bytes are: the list is replicated state, and it is also the run's
@@ -325,14 +351,35 @@ impl AgentModule {
                 skills.len()
             )));
         }
+        let mut names = BTreeSet::new();
+        let mut prefixes = BTreeSet::new();
         for skill in skills {
-            if skill.name.is_empty() {
-                return Err(Error::Module("skill name must not be empty".into()));
+            if !is_skill_mount_name(&skill.name) {
+                return Err(Error::Module(format!(
+                    "skill name {:?} is not a safe mount directory name (want \
+                     [a-zA-Z0-9._-]+, at most {MAX_SKILL_NAME_BYTES} bytes, not \".\" or \"..\")",
+                    skill.name
+                )));
             }
-            if skill.source_prefix.is_empty() {
-                return Err(Error::Module(
-                    "skill source_prefix must not be empty".into(),
-                ));
+            if !names.insert(skill.name.as_str()) {
+                return Err(Error::Module(format!(
+                    "duplicate skill name {:?}",
+                    skill.name
+                )));
+            }
+            if !is_scoped_duckfs_prefix(&skill.source_prefix) {
+                return Err(Error::Module(format!(
+                    "skill source_prefix {:?} is not a scoped duckfs subtree \
+                     (want an absolute path at least 3 segments deep, e.g. \
+                     /shared/skills/<name>)",
+                    skill.source_prefix
+                )));
+            }
+            if !prefixes.insert(skill.source_prefix.as_str()) {
+                return Err(Error::Module(format!(
+                    "duplicate skill source_prefix {:?}",
+                    skill.source_prefix
+                )));
             }
             if let Some(snapshot) = &skill.source_snapshot
                 && snapshot.is_empty()
@@ -876,7 +923,7 @@ mod tests {
         let skills: Vec<SkillRef> = (0..=MAX_SKILLS_PER_AGENT)
             .map(|i| SkillRef {
                 name: format!("s{i}"),
-                source_prefix: "/p".into(),
+                source_prefix: format!("/shared/skills/s{i}"),
                 source_snapshot: None,
                 load: LoadMode::OnDemand,
             })
@@ -888,6 +935,91 @@ mod tests {
         );
         // one under is fine — the cap is a ceiling, not an off-by-one trap.
         assert!(AgentModule::validate_skills(&skills[..MAX_SKILLS_PER_AGENT]).is_ok());
+    }
+
+    /// the mount-name shape rule, exercised straight against the validator:
+    /// a name the provisioner's `mount_dir_name` would refuse (a space, a
+    /// slash, a non-ASCII byte) must never reach a committed record.
+    #[test]
+    fn a_skill_name_the_provisioner_would_refuse_is_refused_at_registration() {
+        let skill = |name: &str| SkillRef {
+            name: name.into(),
+            source_prefix: "/shared/skills/x".into(),
+            source_snapshot: None,
+            load: LoadMode::OnDemand,
+        };
+        for bad in ["code review", "a/b", "..", ".", "", "café"] {
+            let err = AgentModule::validate_skills(&[skill(bad)]).unwrap_err();
+            assert!(
+                matches!(&err, Error::Module(m) if m.contains("safe mount directory name")),
+                "{bad:?} must be refused as an unsafe mount name: {err:?}"
+            );
+        }
+        assert!(AgentModule::validate_skills(&[skill("code-review")]).is_ok());
+    }
+
+    /// two skills curated under the same name would collide at mount time —
+    /// refused before either reaches a run.
+    #[test]
+    fn duplicate_skill_names_are_refused() {
+        let skills = vec![
+            SkillRef {
+                name: "qa".into(),
+                source_prefix: "/shared/skills/qa-a".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+            SkillRef {
+                name: "qa".into(),
+                source_prefix: "/shared/skills/qa-b".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+        ];
+        let err = AgentModule::validate_skills(&skills).unwrap_err();
+        assert!(matches!(&err, Error::Module(m) if m.contains("duplicate skill name")));
+    }
+
+    /// a skill's source_prefix must be a scoped duckfs subtree — a namespace
+    /// root would make every run of the agent check out the whole namespace.
+    #[test]
+    fn an_unscoped_skill_source_prefix_is_refused() {
+        let skill = |prefix: &str| SkillRef {
+            name: "s".into(),
+            source_prefix: prefix.into(),
+            source_snapshot: None,
+            load: LoadMode::OnDemand,
+        };
+        for bad in ["/", "/shared", "/home/x", ""] {
+            let err = AgentModule::validate_skills(&[skill(bad)]).unwrap_err();
+            assert!(
+                matches!(&err, Error::Module(m) if m.contains("scoped duckfs subtree")),
+                "{bad:?} must be refused as unscoped: {err:?}"
+            );
+        }
+        assert!(AgentModule::validate_skills(&[skill("/shared/skills/x")]).is_ok());
+    }
+
+    /// two skills sharing a source_prefix would each drive a full checkout of
+    /// the same subtree — refused, even with distinct names.
+    #[test]
+    fn duplicate_skill_source_prefixes_are_refused() {
+        let skills = vec![
+            SkillRef {
+                name: "a".into(),
+                source_prefix: "/shared/skills/x".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+            SkillRef {
+                name: "b".into(),
+                source_prefix: "/shared/skills/x".into(),
+                source_snapshot: None,
+                load: LoadMode::OnDemand,
+            },
+        ];
+        let err = AgentModule::validate_skills(&skills).unwrap_err();
+        assert!(matches!(&err, Error::Module(m) if m.contains("duplicate skill source_prefix")));
     }
 
     #[test]
@@ -928,6 +1060,50 @@ mod tests {
                         source_snapshot: None,
                         load: LoadMode::Always,
                     }]),
+                },
+            ),
+            // a skill name the noded provisioner would refuse as a mount dir.
+            (
+                user(9),
+                AgentMsg::RegisterAgent {
+                    agent_id: "a".into(),
+                    display_name: "A".into(),
+                    capability: "m".into(),
+                    allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: Some(vec![SkillRef {
+                        name: "code review".into(),
+                        source_prefix: "/shared/skills/code-review".into(),
+                        source_snapshot: None,
+                        load: LoadMode::OnDemand,
+                    }]),
+                },
+            ),
+            // two skills curated under the same name.
+            (
+                user(9),
+                AgentMsg::RegisterAgent {
+                    agent_id: "a".into(),
+                    display_name: "A".into(),
+                    capability: "m".into(),
+                    allowed_actions: Vec::new(),
+                    recipe_hash: None,
+                    caps: None,
+                    skills: Some(vec![
+                        SkillRef {
+                            name: "qa".into(),
+                            source_prefix: "/shared/skills/qa-a".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                        SkillRef {
+                            name: "qa".into(),
+                            source_prefix: "/shared/skills/qa-b".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                    ]),
                 },
             ),
             // an action outside the known vocabulary.
@@ -1838,7 +2014,7 @@ mod tests {
         };
         let skills = vec![SkillRef {
             name: "s".into(),
-            source_prefix: "/p".into(),
+            source_prefix: "/shared/skills/s".into(),
             source_snapshot: Some("cc".repeat(32)),
             load: LoadMode::Always,
         }];
