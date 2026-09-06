@@ -766,6 +766,24 @@ fn gateway_failure_response(failure: GatewayFailure) -> Response {
 #[serde(deny_unknown_fields)]
 struct WsTokenRequest {
     authority: String,
+    /// The origin-form socket path the page's `new WebSocket()` targets
+    /// (e.g. `/socket`) — dialed verbatim at the publisher, so it must name a
+    /// real upstream path rather than letting every route's socket resolve to
+    /// `/`. Validated by [`validate_ws_socket_path`].
+    path: String,
+}
+
+/// The mint request's requested socket path: origin-form (shares
+/// [`gateway::validate_origin_form`]'s start/length/charset rules) and, unlike
+/// a generic proxied path, never containing a `..` segment — this path is
+/// forwarded to the publisher's own dial, not resolved through DuckFS, but a
+/// traversal-shaped value has no legitimate reading here either.
+fn validate_ws_socket_path(path: &str) -> Result<(), String> {
+    gateway::validate_origin_form(path)?;
+    if path.contains("..") {
+        return Err("gateway ws token: path must not contain '..'".into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -815,13 +833,24 @@ async fn gateway_ws_token_mint(
             "cross-origin websocket token mint denied",
         );
     }
+    if let Err(error) = validate_ws_socket_path(&request.path) {
+        return error_response(StatusCode::BAD_REQUEST, &error);
+    }
+    // The mint request is an ordinary HTTP POST, so a caller proof rides it
+    // exactly as it would the proxy lane — read here and carried, unverified,
+    // to the publisher's own `caller_account` check at door time.
+    let user_pop = match user_pop_headers(&headers) {
+        Ok(pop) => pop,
+        Err(error) => return error_response(StatusCode::BAD_REQUEST, &error),
+    };
     let (account_id, name) = match resolve_duck_authority(&handle, &request.authority).await {
         Ok(resolved) => resolved,
         Err(failure) => return gateway_failure_response(failure),
     };
-    let token = browser_gateway
-        .ws_tokens
-        .mint(page_origin, account_id, name);
+    let token =
+        browser_gateway
+            .ws_tokens
+            .mint(page_origin, account_id, name, request.path, user_pop);
     Json(WsTokenReply { token }).into_response()
 }
 
@@ -870,11 +899,11 @@ async fn gateway_ws_door(
         name: grant.name,
         revision: record.statement.revision,
         method: gateway::RouteMethod::Get,
-        path_and_query: "/".into(),
+        path_and_query: grant.path,
         headers: vec![],
         body_len: 0,
         upgrade: true,
-        user_pop: None,
+        user_pop: grant.user_pop,
     };
     // Reserve the lane slot BEFORE answering 101: once the socket is upgraded
     // there is no status left to send, so a saturated lane has to be a 503 on

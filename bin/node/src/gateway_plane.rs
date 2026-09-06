@@ -535,9 +535,7 @@ async fn serve_current(
         ));
     }
     match &route.target {
-        gateway::RouteTarget::DuckFs { .. } => {
-            serve_duckfs(commands, scope.own_node, head, &record).await
-        }
+        gateway::RouteTarget::DuckFs { .. } => serve_duckfs(commands, head, &record).await,
         gateway::RouteTarget::LoopbackHttp => {
             proxy_loopback(scope, caller_node, caller, head, body, &record).await
         }
@@ -980,22 +978,24 @@ async fn proxy_loopback(
 /// (≤ 64 MiB) is assembled across windows.
 const READ_WINDOW: u64 = 1024 * 1024;
 
-/// Where a content route's bytes live in THIS node's home — keyed by
-/// `(account, label)`, the same pair `loopback_port` keys on and for the same
-/// reason: any account may publish a route naming this node as its publisher,
-/// so a label-only directory would serve one account's private site to a member
-/// who republished its label (the manifest hash is public in the `Get` query)
-/// under their own account.
-fn gateway_path(own_node: &[u8; 32], account: u64, label: &str, relative: &str) -> String {
+/// Where a content route's bytes live — in the route OWNER's own DuckFS home,
+/// keyed by `label`. The route's `MemberAuthorization.signer` is the exact
+/// member key of the statement's account that vouched for it, so its actor
+/// string (`sdk::Origin::External(signer).actor_string()`, i.e.
+/// `ext:<hex(signer)>`) is the one home tree `files`' `check_authority`
+/// already lets that same key write through an ordinary wallet-signed
+/// `ducktape fs` op — no other actor (in particular not this node's own
+/// consensus key) can ever write there. `label` scopes multiple routes signed
+/// by the same key.
+fn gateway_path(owner_signer: &[u8], label: &str, relative: &str) -> String {
     format!(
-        "/home/ext:{}/.duck/gateway/{account}/{label}/{relative}",
-        hex_bytes(own_node),
+        "/home/{}/.duck/gateway/{label}/{relative}",
+        sdk::Origin::External(owner_signer.to_vec()).actor_string(),
     )
 }
 
 async fn serve_duckfs(
     commands: &mpsc::Sender<NodeCommand>,
-    own_node: &[u8; 32],
     head: &gateway::ProxyRequestHead,
     record: &gateway::RouteRecord,
 ) -> Result<GatewayResponse, GatewayFailure> {
@@ -1019,7 +1019,7 @@ async fn serve_duckfs(
         ));
     }
     let label = head.name.local_key();
-    let account = record.statement.account_id;
+    let owner_signer = record.authorization.signer.as_slice();
     // Pin one DuckFS snapshot across the manifest read and the file read so a
     // publisher-local mutation cannot race them.
     let snapshot = duckfs_head(commands).await?;
@@ -1028,7 +1028,7 @@ async fn serve_duckfs(
     // verify the exact bytes, then trust its file table.
     let manifest_bytes = read_duckfs_file(
         commands,
-        &gateway_path(own_node, account, label, gateway::MANIFEST_FILE),
+        &gateway_path(owner_signer, label, gateway::MANIFEST_FILE),
         &snapshot,
         gateway::MAX_MANIFEST_BYTES,
     )
@@ -1057,7 +1057,7 @@ async fn serve_duckfs(
     // a same-sized local mutation cannot make a stale file look current.
     let mut bytes = read_duckfs_file(
         commands,
-        &gateway_path(own_node, account, label, &file.path),
+        &gateway_path(owner_signer, label, &file.path),
         &snapshot,
         file.size,
     )
@@ -2782,6 +2782,113 @@ mod tests {
         assert!(matches!(error, GatewayFailure::Forbidden(_)));
     }
 
+    /// The ws-door analog of `owner_only_route_denies_remote_account_before_loopback`
+    /// (#1754): with a real caller proof on the head, an Owner-audience upgrade
+    /// admits its own member; with `user_pop: None` (the door's old hardcoded
+    /// default) the exact same route is refused. `authorize_ws` alone is
+    /// enough — it resolves the loopback URL without dialing it.
+    #[tokio::test]
+    async fn owner_only_ws_upgrade_admits_its_owner_and_refuses_anonymous() {
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
+                name: gateway::RouteName::named("api"),
+                port: 9001,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+        let publisher = [2u8; 32];
+        let caller = [3u8; 32];
+        let member = ed25519::PrivateKey::from_seed(44);
+        let route = signed_route(&member, publisher, gateway::RouteAudience::Owner, true);
+        let pop = user_pop(
+            &member,
+            &route.statement,
+            gateway::RouteMethod::Get,
+            "/socket",
+        );
+        let scope = LoopbackScope {
+            workspace: workspace.path(),
+            node_api_ports: &[],
+            own_node: &publisher,
+        };
+        let owned_head = gateway::ProxyRequestHead {
+            account_id: 1,
+            name: gateway::RouteName::named("api"),
+            revision: 4,
+            method: gateway::RouteMethod::Get,
+            path_and_query: "/socket".into(),
+            headers: vec![],
+            body_len: 0,
+            upgrade: true,
+            user_pop: Some(pop),
+        };
+        let anonymous_head = gateway::ProxyRequestHead {
+            user_pop: None,
+            ..owned_head.clone()
+        };
+        let (commands, mut requests) = mpsc::channel(8);
+        let route_for_reply = route.clone();
+        let member_for_reply = member.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let NodeCommand::Query { target, reply, .. } = requests.next().await.unwrap()
+                else {
+                    panic!("expected a query")
+                };
+                let bytes = match target.as_str() {
+                    "gateway" => gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(
+                        Some(route_for_reply.clone()),
+                    ))),
+                    "identity" => identity::encode_reply(&identity::IdentityReply::Account(Some(
+                        account(1, &member_for_reply),
+                    ))),
+                    other => panic!("unexpected query target {other}"),
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+            // the owner leg resolves the caller's own key too.
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("expected the caller's identity query")
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member_for_reply))),
+            )));
+        });
+        authorize_ws(&commands, &scope, &caller, &owned_head)
+            .await
+            .expect("the route's own member admits its ws door");
+
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("expected the route query")
+            };
+            let _ = reply.send(Ok(gateway::encode_reply(&gateway::GatewayReply::Route(
+                Box::new(Some(route)),
+            ))));
+            let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                panic!("expected the publisher authority query")
+            };
+            let _ = reply.send(Ok(identity::encode_reply(
+                &identity::IdentityReply::Account(Some(account(1, &member))),
+            )));
+        });
+        let error = authorize_ws(&commands, &scope, &caller, &anonymous_head)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, GatewayFailure::Forbidden(_)),
+            "an anonymous caller (the door's old `user_pop: None` default) must not \
+             reach an Owner-audience ws door: {error:?}"
+        );
+    }
+
     /// Consensus lets ANY account publish a route naming ANY node as its
     /// publisher, so the label a node bound is not proof of consent: only the
     /// (account, label) pair the operator bound is. A second account's record
@@ -2863,6 +2970,27 @@ mod tests {
         );
     }
 
+    /// A manifest written by the route's own signer, under exactly the path
+    /// `gateway_path` reads from, must pass `files`' write authority for that
+    /// same signer — the mechanism #1753 fixed: the old path named this
+    /// node's consensus key, which no shipped write path can ever sign as.
+    #[test]
+    fn gateway_path_is_writable_by_its_own_owner() {
+        let member = ed25519::PrivateKey::from_seed(41);
+        let signer = member.public_key().as_ref().to_vec();
+        let actor = sdk::Origin::External(signer.clone()).actor_string();
+        let path = gateway_path(&signer, "_apex", gateway::MANIFEST_FILE);
+        let segments = duckfs_core::paths::canonical(&path).unwrap();
+        duckfs_core::paths::check_authority(&actor, &segments)
+            .expect("the route's own signer must be able to write its serving path");
+        // A different member's key must not reach the same tree.
+        let other = ed25519::PrivateKey::from_seed(42);
+        let other_actor =
+            sdk::Origin::External(other.public_key().as_ref().to_vec()).actor_string();
+        duckfs_core::paths::check_authority(&other_actor, &segments)
+            .expect_err("another key must not be able to write someone else's route content");
+    }
+
     fn stat_reply(path: String, size: u64) -> Vec<u8> {
         duckfs_core::encode_reply(&FilesReply::Stat(Some(duckfs_core::EntryInfo {
             path,
@@ -2927,8 +3055,9 @@ mod tests {
             statement,
         };
         let owner = account(1, &member);
-        let manifest_path = gateway_path(&publisher, 1, "_apex", gateway::MANIFEST_FILE);
-        let file_path = gateway_path(&publisher, 1, "_apex", "index.html");
+        let signer = member.public_key().as_ref().to_vec();
+        let manifest_path = gateway_path(&signer, "_apex", gateway::MANIFEST_FILE);
+        let file_path = gateway_path(&signer, "_apex", "index.html");
         let manifest_len = manifest_bytes.len() as u64;
         let manifest_b64 = STANDARD.encode(&manifest_bytes);
         let actual_b64 = STANDARD.encode(actual);
