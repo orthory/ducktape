@@ -349,6 +349,12 @@ pub struct NodeHandle {
     /// routes to 503. An entry confers no standing: `ducktape service enable`
     /// is the consent boundary.
     pub(crate) services: crate::services::ServiceCatalog,
+    /// how many `POST /v1/index/{module}/view` calls may run their wasm query
+    /// concurrently — see [`crate::index::MAX_CONCURRENT_INDEX_VIEWS`]. `Arc`
+    /// so every clone of this handle (one per accepted connection) shares the
+    /// same gate; always present, since the route itself already 503s a
+    /// handle with no index store wired.
+    pub(crate) index_view_gate: Arc<tokio::sync::Semaphore>,
 }
 
 impl NodeHandle {
@@ -383,6 +389,9 @@ impl NodeHandle {
             session_lane: None,
             remote_sessions: crate::term_remote::RemoteSessions::default(),
             services: crate::services::ServiceCatalog::default(),
+            index_view_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::index::MAX_CONCURRENT_INDEX_VIEWS,
+            )),
         };
         (handle, cmd_rx, hub)
     }
