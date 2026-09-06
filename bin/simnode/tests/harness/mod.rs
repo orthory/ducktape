@@ -420,13 +420,15 @@ pub fn create(name: &str) -> serde_json::Value {
     serde_json::to_value(identity::testkit::create(name)).expect("Create serializes")
 }
 
-/// the `AddKey` op admitting `new_key` (the op's ORIGIN) into ed25519
-/// `member`'s account, consented to at `generation` on the sim's chain. the
-/// consent is single-use: acceptance advances `new_key`'s generation.
+/// the `AddKey` op admitting `new_key` (the op's ORIGIN) into `account`,
+/// ed25519 `member`'s, consented to at `generation` on the sim's chain. the
+/// consent is single-use (acceptance advances `new_key`'s generation) and
+/// dies at [`CONSENT_EXPIRES`].
 pub fn add_ed25519_key(
     member: &commonware_cryptography::ed25519::PrivateKey,
     new_key: &[u8],
     generation: u64,
+    account: u64,
 ) -> serde_json::Value {
     serde_json::to_value(identity::testkit::add_ed25519_key(
         member,
@@ -434,6 +436,14 @@ pub fn add_ed25519_key(
         new_key,
         generation,
         None,
+        account,
+        CONSENT_EXPIRES,
     ))
     .expect("AddKey serializes")
 }
+
+/// the expiry every sim consent carries: the sim's logical clock is
+/// `SIM_EPOCH_MS + height * SIM_BLOCK_MS`, so this is 500 blocks past its
+/// epoch — past every height a sim test drives, inside
+/// `identity::MAX_CONSENT_TTL` of each.
+pub const CONSENT_EXPIRES: u64 = simnode::SIM_EPOCH_MS + 500 * simnode::SIM_BLOCK_MS;

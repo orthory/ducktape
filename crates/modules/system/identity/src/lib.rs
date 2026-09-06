@@ -13,7 +13,11 @@
 //!   CURRENT generation; acceptance advances that generation, so the consent
 //!   is single-use -- including after a compromised key is removed. a removed
 //!   key is never burned (a wallet or an SSH key cannot be re-minted): it can
-//!   be re-admitted anywhere by a consent signed at its next generation.
+//!   be re-admitted anywhere by a consent signed at its next generation. the
+//!   consent also NAMES the account it admits into and the consensus time it
+//!   dies at: an unspent one neither follows its author onto another account
+//!   nor outlives [`MAX_CONSENT_TTL`]. there is no revoke op -- the clock is
+//!   the revocation, and it is why the ceiling is days rather than months.
 //! - [`IdentityMsg::RemoveKey`] drops a key (any member may drop any, except
 //!   the last -- an account always keeps at least one live key).
 //! - [`IdentityMsg::SetName`] / [`IdentityMsg::SetProfile`] are member-gated
@@ -447,6 +451,27 @@ impl Identity {
             .owner_of_key(&authorizer.key)
             .await?
             .ok_or_else(|| Error::Module("authorizer belongs to no account".into()))?;
+        // the account is under the authorizer's signature AND is its account
+        // right now: a consent minted on one account never admits into another
+        // its author later joins.
+        if number != authorizer.account {
+            return Err(Error::Module(format!(
+                "consent names account {}, its authorizer is on account {number}",
+                authorizer.account
+            )));
+        }
+        let now = ctx.env().consensus_time;
+        if now > authorizer.expires_at {
+            return Err(Error::Module(format!(
+                "consent expired at {} (now {now})",
+                authorizer.expires_at
+            )));
+        }
+        if authorizer.expires_at - now > MAX_CONSENT_TTL {
+            return Err(Error::Module(format!(
+                "consent outlives the {MAX_CONSENT_TTL}-block ceiling"
+            )));
+        }
         let mut record = self.stored_account(number).await?;
         let authorizer_scheme = record
             .keys
@@ -454,9 +479,17 @@ impl Identity {
             .map(|meta| meta.scheme)
             .ok_or_else(|| Error::Module("key index disagrees with its account record".into()))?;
 
-        // the consent names THIS key at ITS current generation -- nothing else.
+        // the consent names THIS key at ITS current generation, that account,
+        // and that expiry -- nothing else.
         let generation = self.key_gen(&origin).await?;
-        let preimage = add_key_preimage(&self.chain_id, scheme, &origin, generation);
+        let preimage = add_key_preimage(
+            &self.chain_id,
+            scheme,
+            &origin,
+            generation,
+            authorizer.account,
+            authorizer.expires_at,
+        );
         if !authorizer_scheme.verify(
             &authorizer.key,
             IDENTITY_ADD_KEY_NS,
@@ -469,7 +502,6 @@ impl Identity {
         }
         let label = clean_label(label)?;
 
-        let now = ctx.env().consensus_time;
         record.keys.insert(
             origin.clone(),
             KeyMeta {

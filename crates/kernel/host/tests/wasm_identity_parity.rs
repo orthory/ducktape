@@ -102,11 +102,29 @@ fn ed(seed: u64) -> Ed {
 fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
+/// every consent in this file admits into account 1 (founder A's), and dies
+/// well past the handful of heights driven here — `consensus_time` is
+/// `1_000 + height`.
+const ACCOUNT_A: u64 = 1;
+const EXPIRES: u64 = 100_000;
+
 /// an ed25519 member's consent to admit `new_key` (of `scheme`) at `gen`.
 fn ed_consent(member: &Ed, scheme: KeyScheme, new_key: &[u8], generation: u64) -> Authorizer {
-    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation);
+    ed_consent_for(member, scheme, new_key, generation, ACCOUNT_A)
+}
+
+fn ed_consent_for(
+    member: &Ed,
+    scheme: KeyScheme,
+    new_key: &[u8],
+    generation: u64,
+    account: u64,
+) -> Authorizer {
+    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation, account, EXPIRES);
     Authorizer {
         key: ed_pub(member),
+        account,
+        expires_at: EXPIRES,
         proof: keyscheme::testkit::ed25519_proof(member, IDENTITY_ADD_KEY_NS, &preimage),
     }
 }
@@ -128,9 +146,11 @@ fn wa_consent(
     new_key: &[u8],
     generation: u64,
 ) -> Authorizer {
-    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation);
+    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation, ACCOUNT_A, EXPIRES);
     Authorizer {
         key: wa_pub(member),
+        account: ACCOUNT_A,
+        expires_at: EXPIRES,
         proof: keyscheme::testkit::passkey_proof(
             member,
             RP_ID,
@@ -549,6 +569,17 @@ async fn rejections_inner(context: &deterministic::Context) {
                 ed_consent(&w.founder_a, KeyScheme::Secp256r1, &ed_pub(&unfounded), 0),
             ),
             "consent does not verify",
+        ),
+        // a consent naming an account its author is not on: the account is
+        // signature-covered, so naming another one is not a shortcut either.
+        (
+            Origin::External(ed_pub(&unfounded)),
+            add_key(
+                KeyScheme::Ed25519,
+                None,
+                ed_consent_for(&w.founder_a, KeyScheme::Ed25519, &ed_pub(&unfounded), 0, 2),
+            ),
+            "consent names account 2",
         ),
         // an authorizer on no account has nothing to admit into.
         (

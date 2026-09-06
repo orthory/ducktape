@@ -75,20 +75,25 @@ pub fn load_identity(path: &Path) -> Result<ed25519::PrivateKey, String> {
 }
 
 /// an existing ed25519 member's consent to admit `new_key` (of `scheme`) into
-/// its account at the new key's CURRENT generation on `chain_id` -- the
-/// [`identity::Authorizer`] an `AddKey` carries. the CLI's own key is always
-/// ed25519, so this is the one authorizer shape it mints; the 64 signature
-/// bytes ARE the `KeyScheme::Ed25519` proof encoding.
+/// `account` at the new key's CURRENT generation on `chain_id`, dying at
+/// `expires_at` -- the [`identity::Authorizer`] an `AddKey` carries. the CLI's
+/// own key is always ed25519, so this is the one authorizer shape it mints;
+/// the 64 signature bytes ARE the `KeyScheme::Ed25519` proof encoding.
 pub fn ed25519_authorizer(
     user: &ed25519::PrivateKey,
     chain_id: &str,
     scheme: identity::KeyScheme,
     new_key: &[u8],
     generation: u64,
+    account: u64,
+    expires_at: u64,
 ) -> identity::Authorizer {
-    let preimage = identity::add_key_preimage(chain_id, scheme, new_key, generation);
+    let preimage =
+        identity::add_key_preimage(chain_id, scheme, new_key, generation, account, expires_at);
     identity::Authorizer {
         key: user.public_key().as_ref().to_vec(),
+        account,
+        expires_at,
         proof: user
             .sign(identity::IDENTITY_ADD_KEY_NS, &preimage)
             .as_ref()
@@ -147,6 +152,8 @@ mod tests {
 
     const CHAIN: &str = "chain-a";
     const NEW_KEY: [u8; 32] = [9u8; 32];
+    const ACCOUNT: u64 = 7;
+    const EXPIRES: u64 = 900;
 
     /// the module's own check, verbatim: scheme-dispatched verify over
     /// `add_key_preimage` under the add-key namespace.
@@ -155,6 +162,8 @@ mod tests {
         chain_id: &str,
         new_key: &[u8],
         generation: u64,
+        account: u64,
+        expires_at: u64,
     ) -> bool {
         identity::KeyScheme::Ed25519.verify(
             &authorizer.key,
@@ -164,37 +173,92 @@ mod tests {
                 identity::KeyScheme::Ed25519,
                 new_key,
                 generation,
+                account,
+                expires_at,
             ),
             &authorizer.proof,
+        )
+    }
+
+    fn consent(generation: u64) -> identity::Authorizer {
+        ed25519_authorizer(
+            &ed25519::PrivateKey::from_seed(1),
+            CHAIN,
+            identity::KeyScheme::Ed25519,
+            &NEW_KEY,
+            generation,
+            ACCOUNT,
+            EXPIRES,
         )
     }
 
     #[test]
     fn ed25519_consent_verifies_against_the_module_preimage() {
         let user = ed25519::PrivateKey::from_seed(1);
-        let authorizer =
-            ed25519_authorizer(&user, CHAIN, identity::KeyScheme::Ed25519, &NEW_KEY, 0);
+        let authorizer = consent(0);
         assert_eq!(authorizer.key, user.public_key().as_ref());
-        assert!(consent_verifies(&authorizer, CHAIN, &NEW_KEY, 0));
+        assert_eq!(authorizer.account, ACCOUNT);
+        assert_eq!(authorizer.expires_at, EXPIRES);
+        assert!(consent_verifies(
+            &authorizer,
+            CHAIN,
+            &NEW_KEY,
+            0,
+            ACCOUNT,
+            EXPIRES
+        ));
     }
 
     #[test]
     fn ed25519_consent_is_chain_scoped() {
-        let user = ed25519::PrivateKey::from_seed(1);
-        let authorizer =
-            ed25519_authorizer(&user, CHAIN, identity::KeyScheme::Ed25519, &NEW_KEY, 0);
-        assert!(!consent_verifies(&authorizer, "chain-b", &NEW_KEY, 0));
+        assert!(!consent_verifies(
+            &consent(0),
+            "chain-b",
+            &NEW_KEY,
+            0,
+            ACCOUNT,
+            EXPIRES
+        ));
     }
 
     #[test]
-    fn ed25519_consent_is_generation_scoped() {
-        let user = ed25519::PrivateKey::from_seed(1);
-        let authorizer =
-            ed25519_authorizer(&user, CHAIN, identity::KeyScheme::Ed25519, &NEW_KEY, 0);
+    fn ed25519_consent_is_scoped_to_its_generation_key_account_and_expiry() {
+        let authorizer = consent(0);
         // the module advances the key's generation on admission, so a consent
         // signed at gen 0 never verifies at gen 1: single-use by construction.
-        assert!(!consent_verifies(&authorizer, CHAIN, &NEW_KEY, 1));
-        assert!(!consent_verifies(&authorizer, CHAIN, &[10u8; 32], 0));
+        assert!(!consent_verifies(
+            &authorizer,
+            CHAIN,
+            &NEW_KEY,
+            1,
+            ACCOUNT,
+            EXPIRES
+        ));
+        assert!(!consent_verifies(
+            &authorizer,
+            CHAIN,
+            &[10u8; 32],
+            0,
+            ACCOUNT,
+            EXPIRES
+        ));
+        // and it admits into ONE account, until ONE time.
+        assert!(!consent_verifies(
+            &authorizer,
+            CHAIN,
+            &NEW_KEY,
+            0,
+            ACCOUNT + 1,
+            EXPIRES
+        ));
+        assert!(!consent_verifies(
+            &authorizer,
+            CHAIN,
+            &NEW_KEY,
+            0,
+            ACCOUNT,
+            EXPIRES + 1
+        ));
     }
 
     /// mirrors exactly what `ducktape account key add` mints: encode through
@@ -212,6 +276,8 @@ mod tests {
                 identity::KeyScheme::Ed25519,
                 &NEW_KEY,
                 2,
+                ACCOUNT,
+                EXPIRES,
             ),
         };
         let encoded = identity::encode_msg(&msg);
