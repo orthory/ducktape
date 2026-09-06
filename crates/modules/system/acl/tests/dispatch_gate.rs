@@ -47,7 +47,7 @@ async fn gate_host() -> Host {
     valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(valset),
-        Box::new(Acl::new("acl", Box::new(MemStore::new()))),
+        Box::new(Acl::new("acl", Box::new(MemStore::new()), "governance")),
         Box::new(Identity::new(
             "identity",
             Box::new(MemStore::new()),
