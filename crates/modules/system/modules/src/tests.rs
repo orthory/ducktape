@@ -549,6 +549,66 @@ fn a_stale_pending_swap_is_replaceable_and_cancellable() {
     assert!(run(&mut lc, &mut past, &cancel_swap("hello", "armed")).is_err());
 }
 
+/// #1676: a SwapReady arriving AFTER the pending already went stale (past its
+/// activation height, never latched) must not resurrect it. Before the fix,
+/// `handle_swap_ready` latched `ready_at` on any covering signal regardless of
+/// how late it was, which armed the swap at the next height with no fresh
+/// decision behind it and then froze it — `stale_at` becomes permanently
+/// false once latched, so neither CancelSwap nor a replacing ScheduleSwap
+/// could touch it again.
+#[test]
+fn a_late_swap_ready_after_activation_height_never_arms_the_stale_pending() {
+    let mut lc = fresh();
+    register_module(&mut lc, "hello", 1);
+    let mut sys = ctx(Origin::System, 0);
+    run(&mut lc, &mut sys, &schedule_swap("hello", "dead", 10, 2)).unwrap();
+    commit(&mut lc);
+
+    // the pending is stale well past its activation height, never latched.
+    assert!(
+        module_status(&lc)[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .ready_at
+            .is_none()
+    );
+    assert!(module_status(&lc)[0].pending.as_ref().unwrap().stale_at(30));
+
+    // a signal lands at height 100 — long after activation_height 10.
+    let mut late = ctx(Origin::External(member(1)), 100);
+    run(&mut lc, &mut late, &swap_ready("hello", "dead", 2)).unwrap();
+    commit(&mut lc);
+
+    // it must NOT arm: no latch, no activation at the next boundary.
+    let pending = module_status(&lc)[0].pending.clone().unwrap();
+    assert!(
+        pending.ready_at.is_none(),
+        "a late signal must not latch a stale pending"
+    );
+    assert!(armed_at(&lc, 101).is_empty());
+
+    // still evictable: CancelSwap succeeds on the stale pending.
+    let mut past = ctx(Origin::System, 100);
+    run(&mut lc, &mut past, &cancel_swap("hello", "dead")).unwrap();
+    commit(&mut lc);
+    assert!(module_status(&lc)[0].pending.is_none());
+
+    // ...and a fresh ScheduleSwap can (re)designate the module.
+    let mut fresh_sched = ctx(Origin::System, 100);
+    run(
+        &mut lc,
+        &mut fresh_sched,
+        &schedule_swap("hello", "retry", 200, 3),
+    )
+    .unwrap();
+    commit(&mut lc);
+    assert_eq!(
+        module_status(&lc)[0].pending.as_ref().unwrap().code_hash,
+        hash(3)
+    );
+}
+
 /// the netstack shape: an ADMISSION (never activated, so no readiness probe can
 /// ever latch it) is re-designated by a later schedule once it is past due.
 #[test]

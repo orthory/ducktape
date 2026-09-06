@@ -574,12 +574,18 @@ impl Modules {
         }
         // the FIRST covering signal LATCHES readiness at THIS block (R = n at
         // this instant); a later re-signal never moves it. a member admitted
-        // later heals through the fetch lane, never un-arms a swap.
+        // later heals through the fetch lane, never un-arms a swap. a signal
+        // that arrives after the swap already went `stale_at` this height is
+        // a no-op, same as a duplicate signal: the pending is a dead
+        // designation by now, and latching it would resurrect abandoned code
+        // with no fresh decision behind it and no way for governance to
+        // cancel it (`stale_at` is what makes it cancellable/replaceable).
         let covers_member_set = !members.is_empty()
             && members
                 .iter()
                 .all(|m| swap.readiness.binary_search(m).is_ok());
-        let first_cover = covers_member_set && swap.ready_at.is_none();
+        let first_cover =
+            covers_member_set && swap.ready_at.is_none() && !swap.stale_at(ctx.env().height);
         if first_cover {
             swap.ready_at = Some(ctx.env().height);
         }
