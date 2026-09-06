@@ -286,6 +286,392 @@ fn wasm_full_message_capacity_and_mixed_mention_index_match_native() {
     });
 }
 
+const FANOUT_FIRST_ACCOUNT: u64 = 1_000;
+const FANOUT_ACCOUNT_COUNT: u64 = 900;
+
+fn fanout_key(number: u64) -> Vec<u8> {
+    ed25519::PrivateKey::from_seed(number)
+        .public_key()
+        .as_ref()
+        .to_vec()
+}
+
+async fn fanout_identity_store(
+    context: &deterministic::Context,
+) -> QmdbStore<deterministic::Context> {
+    use sdk::MerkleStore as _;
+    let mut store = QmdbStore::init(context.child("fanout_identity"), "fanout_identity").await;
+    store
+        .commit_batch(vec![(
+            sdk::store_key(sdk::genesis_config::CONFIG_KEY),
+            Some(sdk::genesis_config::encode_config(&[(
+                "chain_id", b"fanout",
+            )])),
+        )])
+        .await
+        .unwrap();
+    let mut module = identity::Identity::new("identity", Box::new(store), "fanout".into());
+    for number in 1..FANOUT_FIRST_ACCOUNT + FANOUT_ACCOUNT_COUNT {
+        let mut ctx = sdk_testkit::TestCtx::with_env(sdk::Env {
+            height: 0,
+            consensus_time: 0,
+            origin: Origin::External(fanout_key(number)),
+            me: "identity".into(),
+            cause: sdk::Cause::Direct,
+        });
+        module
+            .execute(
+                &mut ctx,
+                &Msg {
+                    target: "identity".into(),
+                    payload: identity::encode_msg(&identity::IdentityMsg::Create {
+                        name: format!("person-{number}"),
+                        scheme: identity::KeyScheme::Ed25519,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    module.commit_block().await.unwrap();
+    drop(module);
+    QmdbStore::init(context.child("fanout_identity"), "fanout_identity").await
+}
+
+async fn fanout_native_host(context: &deterministic::Context) -> Host {
+    let mut host = native_host(context).await;
+    host.register(Box::new(identity::Identity::new(
+        "identity",
+        Box::new(fanout_identity_store(context).await),
+        "fanout".into(),
+    )));
+    host
+}
+
+async fn fanout_wasm_host(context: &deterministic::Context) -> Host {
+    let mut host = wasm_host_(context).await;
+    host.register(Box::new(
+        WasmModule::with_store(
+            "identity",
+            include_bytes!("fixtures/identity.component.wasm"),
+            Box::new(fanout_identity_store(context).await),
+        )
+        .unwrap(),
+    ));
+    host
+}
+
+fn fold_chat_dispatches(
+    indexed: &mut std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    dispatches: &[host::DispatchRecord],
+    height: u64,
+) {
+    for dispatch in dispatches
+        .iter()
+        .filter(|dispatch| dispatch.module == "chat")
+    {
+        let row = index_guest::OpRow {
+            height,
+            seq: 0,
+            time: 1_000 + height,
+            origin: index_guest::OriginTag::system(),
+            payload: dispatch.payload.clone(),
+            assigned: dispatch.assigned.clone(),
+        };
+        let writes = chat::index::fold_op(&row, indexed).unwrap();
+        index_guest::apply_to_map(indexed, writes);
+    }
+}
+
+enum FanoutWrite {
+    Post,
+    Edit,
+}
+
+enum FanoutReferences {
+    Keys,
+    Accounts,
+}
+
+async fn exercise_key_mention_fanout(
+    host: &mut Host,
+    write: FanoutWrite,
+    references: FanoutReferences,
+) {
+    let signer = fanout_key(1);
+    let created = host
+        .submit_at(
+            block(1, &signer),
+            op(&ChatMsg::CreateChannel {
+                channel_id: "fanout".into(),
+                name: "Fanout".into(),
+                post_policy: PostPolicy::Open,
+            }),
+        )
+        .await
+        .unwrap();
+    let mut indexed = std::collections::BTreeMap::new();
+    fold_chat_dispatches(&mut indexed, &created.dispatches, 1);
+    let accounts: Vec<_> = (FANOUT_FIRST_ACCOUNT..FANOUT_FIRST_ACCOUNT + FANOUT_ACCOUNT_COUNT)
+        .rev()
+        .collect();
+    let blocks = |parties: Vec<Party>| {
+        vec![Block::Paragraph(vec![Span {
+            text: "mention fanout".into(),
+            marks: parties.into_iter().map(Mark::Mention).collect(),
+        }])]
+    };
+    let normalized = blocks(accounts.iter().copied().map(Party::Account).collect());
+    let (input, key_mentions) = match references {
+        FanoutReferences::Keys => (
+            blocks(
+                accounts
+                    .iter()
+                    .map(|number| Party::Key(fanout_key(*number)))
+                    .collect(),
+            ),
+            accounts.clone(),
+        ),
+        FanoutReferences::Accounts => (normalized.clone(), Vec::new()),
+    };
+    let mut expected = MessageHead {
+        message_id: "fanout-message".into(),
+        author: Party::Account(1),
+        origin: Origin::External(signer.clone()),
+        content_origin: Origin::External(signer.clone()),
+        blocks: normalized,
+        created_at: 1_002,
+        rev: 0,
+        revision: 1,
+        edited_at: None,
+        base_rev: None,
+        deleted: false,
+        thread: None,
+        reply_count: 0,
+        last_reply_seq: None,
+    };
+    let (height, msg, assigned) = match write {
+        FanoutWrite::Post => (
+            2,
+            ChatMsg::PostMessage {
+                channel_id: "fanout".into(),
+                message_id: "fanout-message".into(),
+                blocks: input,
+                thread: None,
+            },
+            chat::ChatAssigned::Posted {
+                seq: 1,
+                actor: Party::Account(1),
+                key_mentions,
+            },
+        ),
+        FanoutWrite::Edit => {
+            let baseline = host
+                .submit_at(
+                    block(2, &signer),
+                    op(&post("fanout", "fanout-message", "before", None)),
+                )
+                .await
+                .unwrap();
+            fold_chat_dispatches(&mut indexed, &baseline.dispatches, 2);
+            expected.rev = 1;
+            expected.revision = 2;
+            expected.edited_at = Some(1_003);
+            expected.base_rev = Some(0);
+            (
+                3,
+                ChatMsg::EditMessage {
+                    channel_id: "fanout".into(),
+                    seq: 1,
+                    blocks: input,
+                    base_rev: Some(0),
+                },
+                chat::ChatAssigned::Edited {
+                    rev: 1,
+                    actor: Party::Account(1),
+                    key_mentions,
+                },
+            )
+        }
+    };
+    let head_bytes = sdk::wire::encode(&expected).len();
+    let payload_bytes = encode_msg(&msg).len();
+    let assigned_bytes = chat::encode_assigned(&assigned).len();
+    assert!(head_bytes <= chat::MAX_MESSAGE_HEAD_BYTES);
+    // Below 1 MiB, leaving the signed node frame's 16 KiB envelope reserve.
+    assert!(payload_bytes < 1 << 20);
+    match references {
+        FanoutReferences::Keys => assert!(assigned_bytes > 4 * 1024),
+        FanoutReferences::Accounts => assert!(assigned_bytes < 4 * 1024),
+    }
+    let result = host.submit_at(block(height, &signer), op(&msg)).await;
+    let outcome = result.unwrap_or_else(|error| {
+        panic!(
+            "{head_bytes}-byte valid head, {payload_bytes}-byte payload, \
+             {assigned_bytes}-byte metadata rejected: {error:?}"
+        )
+    });
+    let dispatch = outcome
+        .dispatches
+        .iter()
+        .find(|dispatch| dispatch.module == "chat")
+        .unwrap();
+    assert_eq!(dispatch.assigned, chat::encode_assigned(&assigned));
+    let bytes = host
+        .query(
+            "chat",
+            &encode_query(&ChatQuery::Message {
+                message_id: "fanout-message".into(),
+            }),
+        )
+        .await
+        .unwrap();
+    let ChatReply::Message(Some(canonical)) = decode_reply(&bytes).unwrap() else {
+        panic!("canonical fanout message")
+    };
+    assert_eq!(canonical.head, expected);
+    fold_chat_dispatches(&mut indexed, &outcome.dispatches, height);
+    let bytes = chat::index::serve_view(
+        &indexed,
+        &serde_json::to_vec(&chat::index::ChatViewQuery::Message {
+            message_id: "fanout-message".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let chat::index::ChatViewReply::Message(Some(projected)) =
+        serde_json::from_slice(&bytes).unwrap()
+    else {
+        panic!("indexed fanout message")
+    };
+    assert_eq!(projected.blocks, canonical.head.blocks);
+    let stamp = serde_json::to_value(&assigned).unwrap();
+    let delta = chat::client::delta_from_op(
+        &dispatch.payload,
+        Some(&stamp),
+        "system",
+        None,
+        chat::client::ChatReader::nobody(),
+        height,
+    )
+    .unwrap()
+    .unwrap();
+    let message = match delta {
+        chat::client::ChatDelta::Posted { message, .. }
+        | chat::client::ChatDelta::Edited { message, .. } => message,
+        other => panic!("unexpected delta {other:?}"),
+    };
+    let hydrated = chat::client::chat_message(projected, chat::client::ChatReader::nobody());
+    assert_eq!(message.blocks, hydrated.blocks);
+    assert_eq!(message.body, hydrated.body);
+
+    // A missing reference after one full batch still refuses the first
+    // missing party in payload order, before a later invalid party. A failed
+    // replacement leaves both source content and attribution unchanged.
+    let mut invalid = accounts
+        .iter()
+        .take(identity::MAX_QUERY_LIMIT as usize)
+        .copied()
+        .map(Party::Account)
+        .collect::<Vec<_>>();
+    invalid.extend([
+        Party::Account(9_999),
+        Party::Module("invalid-person".into()),
+    ]);
+    let settled = host.module_roots();
+    let error = host
+        .submit_at(
+            block(height + 1, &signer),
+            op(&ChatMsg::EditMessage {
+                channel_id: "fanout".into(),
+                seq: 1,
+                blocks: blocks(invalid),
+                base_rev: Some(expected.rev),
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("a mention names no account: 9999"),
+        "{error}"
+    );
+    assert_eq!(host.module_roots(), settled);
+}
+
+#[test]
+fn native_many_distinct_key_mentions_post_fit_message_capacity() {
+    deterministic::Runner::default().start(|context| async move {
+        exercise_key_mention_fanout(
+            &mut fanout_native_host(&context).await,
+            FanoutWrite::Post,
+            FanoutReferences::Keys,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn native_many_distinct_key_mentions_edit_fit_message_capacity() {
+    deterministic::Runner::default().start(|context| async move {
+        exercise_key_mention_fanout(
+            &mut fanout_native_host(&context).await,
+            FanoutWrite::Edit,
+            FanoutReferences::Keys,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn wasm_many_distinct_key_mentions_post_fit_message_capacity() {
+    deterministic::Runner::default().start(|context| async move {
+        exercise_key_mention_fanout(
+            &mut fanout_wasm_host(&context).await,
+            FanoutWrite::Post,
+            FanoutReferences::Keys,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn wasm_many_distinct_key_mentions_edit_fit_message_capacity() {
+    deterministic::Runner::default().start(|context| async move {
+        exercise_key_mention_fanout(
+            &mut fanout_wasm_host(&context).await,
+            FanoutWrite::Edit,
+            FanoutReferences::Keys,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn native_many_account_mentions_fit_message_capacity() {
+    deterministic::Runner::default().start(|context| async move {
+        exercise_key_mention_fanout(
+            &mut fanout_native_host(&context).await,
+            FanoutWrite::Post,
+            FanoutReferences::Accounts,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn wasm_many_account_mentions_fit_message_capacity() {
+    deterministic::Runner::default().start(|context| async move {
+        exercise_key_mention_fanout(
+            &mut fanout_wasm_host(&context).await,
+            FanoutWrite::Post,
+            FanoutReferences::Accounts,
+        )
+        .await;
+    });
+}
+
 /// a 32-byte submitter key (the ordered lane hands modules verified ed25519
 /// ids; the parity claim only needs them distinct and non-empty).
 fn key(tag: u8) -> Vec<u8> {
