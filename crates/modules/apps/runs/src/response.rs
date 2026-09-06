@@ -9,7 +9,7 @@ use super::facets::{WireStatus, decode_run_result, encode_delivery_receipt, outp
 use super::{
     ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, BTreeSet,
     Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus,
-    DispatchMsg, Error, FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply,
+    DispatchMsg, EntryInfo, Error, FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply,
     MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, Msg,
     Origin, PendingState, ReplyBlock, ResultEvent, RunsModule, SagaOrigin, TaskMsg, TaskQuery,
     TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg, chat_encode_query,
@@ -388,6 +388,8 @@ impl RunsModule {
         let reply_blocks = response.reply_blocks.clone();
         self.emit_pages_effects(ctx, run_id, entry, Lane::DelegatedSettle, &response.actions)
             .await;
+        self.emit_duckfs_effects(ctx, run_id, entry, &response.actions)
+            .await;
         self.emit_response(
             ctx,
             run_id,
@@ -557,8 +559,12 @@ impl RunsModule {
         let executing_node = self.executing_node(&*ctx, run_id).await;
         // the pages effects lane: applied here at the run boundary like every
         // other effect, but probe-guarded and cap-gated per action — a bad
-        // pages action degrades to a breadcrumb, the run still delivers.
+        // pages action degrades to a breadcrumb, the run still delivers. the
+        // duckfs write lane is the same shape: a stale per-path base degrades
+        // alone, it never costs the response its reply or its other actions.
         self.emit_pages_effects(ctx, run_id, entry, Lane::Settle, &response.actions)
+            .await;
+        self.emit_duckfs_effects(ctx, run_id, entry, &response.actions)
             .await;
         self.emit_response(ctx, run_id, entry, Lane::Settle, response)
             .await;
@@ -707,15 +713,18 @@ impl RunsModule {
         }
 
         // the strict all-or-nothing lane covers the CHAT-POST and TASK verbs.
-        // the two pages actions are deliberately NOT validated here: they gate
-        // and validate at apply (`emit_pages_effects`), where a bad one degrades
-        // ALONE with a breadcrumb instead of failing the whole run.
+        // the pages actions and the duckfs write are deliberately NOT validated
+        // here: they gate and validate at apply (`emit_pages_effects`,
+        // `emit_duckfs_effects`), where a bad one degrades ALONE with a
+        // breadcrumb instead of failing the whole run — a stale write base is a
+        // fact about a shared, concurrently-written filesystem, not a defect in
+        // this response, so it must never cost the response its reply.
         //
         // the tasks arms probe BY ID (`task_exists`), so a response carrying no
         // task action never touches the tasks module at all.
         let mut created: BTreeSet<&str> = BTreeSet::new();
         for (index, action) in response.actions.iter().enumerate() {
-            if super::pages_effects::is_pages_action(action) {
+            if super::pages_effects::is_pages_action(action) || is_duckfs_action(action) {
                 continue;
             }
             let name = action.vocabulary_name();
@@ -791,13 +800,8 @@ impl RunsModule {
                         return Err(format!("unknown task: {task_id}"));
                     }
                 }
-                AgentAction::DuckfsWriteText {
-                    path,
-                    text,
-                    base_snapshot,
-                } => {
-                    validate_duckfs_text_write(&agent, path, text)?;
-                    self.validate_duckfs_write_base(ctx, base_snapshot).await?;
+                AgentAction::DuckfsWriteText { .. } => {
+                    unreachable!("duckfs actions are skipped above")
                 }
                 AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => {
                     unreachable!("pages actions are skipped above")
@@ -1025,31 +1029,149 @@ impl RunsModule {
         }
     }
 
-    async fn validate_duckfs_write_base(
+    /// resolve the committed entry at `path` under one snapshot: `None` is
+    /// files' OWN meaning for "no snapshot" everywhere else it appears as a
+    /// query argument — the CURRENT head, not the empty tree (that inversion
+    /// is `FilesMsg::Commit`'s `base_snapshot`-only special case, handled by
+    /// the caller, never here).
+    async fn duckfs_stat(
         &self,
         ctx: &dyn Ctx,
+        files: &str,
+        path: &str,
+        snapshot: Option<String>,
+    ) -> Result<Option<EntryInfo>, String> {
+        let reply = ctx
+            .query(
+                files,
+                &files_encode_query(&FilesQuery::Stat {
+                    path: path.to_string(),
+                    snapshot,
+                }),
+            )
+            .await
+            .map_err(|e| format!("files stat query failed: {e}"))?;
+        match files_decode_reply(&reply) {
+            Ok(FilesReply::Stat(info)) => Ok(info),
+            Ok(_) => Err("unexpected files reply for a stat query".into()),
+            Err(e) => Err(format!("files stat reply failed to decode: {e}")),
+        }
+    }
+
+    /// predict whether files' own per-path CAS (`fs.rs` step 7: `entry_at(base)
+    /// != entry_at(head)` -> "changed since base") would accept this write —
+    /// the ONE base rule; there is no global-head check here on purpose, since
+    /// files never applies one and a global check refuses disjoint-path writes
+    /// files itself would take. `base_snapshot: None` is files' create-only
+    /// sense (the empty tree, matching `FilesMsg::Commit`'s own doc comment):
+    /// the path must not already exist. `Some(snapshot)` resolves that
+    /// snapshot's entry at `path` and requires it match the current one.
+    async fn probe_duckfs_write_base(
+        &self,
+        ctx: &dyn Ctx,
+        files: &str,
+        path: &str,
         base_snapshot: &Option<String>,
     ) -> Result<(), String> {
+        let base_entry = match base_snapshot {
+            None => None,
+            Some(snapshot) => {
+                self.duckfs_stat(ctx, files, path, Some(snapshot.clone()))
+                    .await?
+            }
+        };
+        let current_entry = self.duckfs_stat(ctx, files, path, None).await?;
+        if base_entry != current_entry {
+            return Err(format!(
+                "duckfs.write_text base snapshot is stale for {path}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// ONE duckfs.write_text action as an emit-ready follow-up, or the reason
+    /// it must not be emitted — the same shape as `pages_action_msg`: gate
+    /// order grant -> shape/cap/permission -> the per-path base probe. `Err`
+    /// degrades to a breadcrumb on the settle path and returns to the
+    /// submitter on the session lane; same verdict, two failure policies.
+    pub(super) async fn duckfs_write_msg(
+        &self,
+        ctx: &dyn Ctx,
+        agent: &AgentRecord,
+        action: &AgentAction,
+    ) -> Result<Msg, String> {
+        let AgentAction::DuckfsWriteText {
+            path,
+            text,
+            base_snapshot,
+        } = action
+        else {
+            unreachable!("only the duckfs action reaches this lane");
+        };
+        let name = action.vocabulary_name();
+        if !allows(agent, name) {
+            return Err(format!("agent {} is not allowed to {name}", agent.agent_id));
+        }
+        validate_duckfs_text_write(agent, path, text)?;
         let files = self
             .files
             .as_ref()
             .ok_or_else(|| "no files module is configured".to_string())?;
-        let reply = ctx
-            .query(files, &files_encode_query(&FilesQuery::Refs {}))
-            .await
-            .map_err(|e| format!("files refs query failed: {e}"))?;
-        let current = match files_decode_reply(&reply) {
-            Ok(FilesReply::Refs(info)) => info.head,
-            Ok(_) => return Err("unexpected files reply for a refs query".into()),
-            Err(e) => return Err(format!("files refs reply failed to decode: {e}")),
-        };
-        if base_snapshot != &current {
-            return Err(format!(
-                "duckfs.write_text base snapshot is stale: signed {:?}, current {:?}",
-                base_snapshot, current
-            ));
+        self.probe_duckfs_write_base(ctx, files, path, base_snapshot)
+            .await?;
+        Ok(Msg {
+            target: files.clone(),
+            payload: files_encode_msg(&FilesMsg::Commit {
+                base_snapshot: base_snapshot.clone(),
+                message: "agent duckfs.write_text".into(),
+                changes: vec![FilesChange::Put {
+                    path: path.clone(),
+                    exec: false,
+                    meta: BTreeMap::new(),
+                    content: FilesContent::Inline {
+                        b64: STANDARD.encode(text.as_bytes()),
+                    },
+                }],
+            }),
+        })
+    }
+
+    /// apply the duckfs.write_text actions of a validated response — its own
+    /// lane, mirroring `emit_pages_effects`: each action either emits its files
+    /// follow-up or degrades to a breadcrumb. never errors, never fails the
+    /// run — a base gone stale under a concurrent commit is expected traffic
+    /// on a shared filesystem, not a reason to discard the reply and every
+    /// other effect this response staged.
+    pub(super) async fn emit_duckfs_effects(
+        &self,
+        ctx: &mut dyn Ctx,
+        run_id: &str,
+        entry: &PendingState,
+        actions: &[AgentAction],
+    ) {
+        if !actions.iter().any(is_duckfs_action) {
+            return;
         }
-        Ok(())
+        let skip = |what: &str| format!("run {run_id} duckfs.write_text action skipped: {what}");
+        let agent = match self.agent_for_run(&*ctx, entry).await {
+            Ok(Some(a)) => a,
+            _ => {
+                self.note(ctx, skip("agent not registered"));
+                return;
+            }
+        };
+        for (index, action) in actions.iter().enumerate() {
+            if !is_duckfs_action(action) {
+                continue;
+            }
+            match self.duckfs_write_msg(&*ctx, &agent, action).await {
+                Ok(msg) => ctx.emit_msg(msg),
+                Err(why) => self.note(
+                    ctx,
+                    format!("run {run_id} duckfs.write_text action {index} skipped: {why}"),
+                ),
+            }
+        }
     }
 
     /// surface a failed CHAT run as a threaded reply authored by the agent —
@@ -1227,28 +1349,12 @@ impl RunsModule {
                         status: task_status(&status).expect("status was validated"),
                     }),
                 },
-                AgentAction::DuckfsWriteText {
-                    path,
-                    text,
-                    base_snapshot,
-                } => Msg {
-                    target: self.files_target(),
-                    payload: files_encode_msg(&FilesMsg::Commit {
-                        base_snapshot,
-                        message: "agent duckfs.write_text".into(),
-                        changes: vec![FilesChange::Put {
-                            path,
-                            exec: false,
-                            meta: BTreeMap::new(),
-                            content: FilesContent::Inline {
-                                b64: STANDARD.encode(text.as_bytes()),
-                            },
-                        }],
-                    }),
-                },
-                // pages actions were already applied by `emit_pages_effects`
-                // (its own lane: probes, cap gate, per-action degrade).
-                AgentAction::AddPageComment { .. } | AgentAction::SetPageChecked { .. } => continue,
+                // duckfs and pages actions were already applied by
+                // `emit_duckfs_effects` / `emit_pages_effects` (their own
+                // lanes: probes, cap gate, per-action degrade).
+                AgentAction::DuckfsWriteText { .. }
+                | AgentAction::AddPageComment { .. }
+                | AgentAction::SetPageChecked { .. } => continue,
             };
             ctx.emit_msg(msg);
         }
@@ -1259,12 +1365,13 @@ impl RunsModule {
             .clone()
             .expect("task actions were validated against a configured tasks module")
     }
+}
 
-    fn files_target(&self) -> super::ModuleId {
-        self.files
-            .clone()
-            .expect("duckfs writes were validated against a configured files module")
-    }
+/// whether an action belongs to the duckfs-write lane (and is therefore
+/// skipped by the strict task-action validator and the generic emitter) — the
+/// peer of `pages_effects::is_pages_action`.
+pub(super) fn is_duckfs_action(action: &AgentAction) -> bool {
+    matches!(action, AgentAction::DuckfsWriteText { .. })
 }
 
 fn validate_duckfs_text_write(agent: &AgentRecord, path: &str, text: &str) -> Result<(), String> {

@@ -71,6 +71,7 @@
 //! same-block counter and the settle path does.
 
 use super::pages_effects::is_pages_action;
+use super::response::is_duckfs_action;
 use super::{
     AgentAction, AgentResponse, AgentSession, AgentStatus, BTreeMap, Ctx, DELEGATED_CHILD_CORES,
     DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationState, DelegationStatus, DelegationView,
@@ -229,6 +230,22 @@ impl RunsModule {
             // op's follow-ups drain before the next op executes).
             let msg = self
                 .pages_action_msg(&*ctx, &pages, &agent, &run_id, &lane.slot(0), &action, 0)
+                .await
+                .map_err(Error::Module)?;
+            ctx.emit_msg(msg);
+        } else if is_duckfs_action(&action) {
+            let agent = self
+                .agent_for_run(&*ctx, &entry)
+                .await
+                .map_err(Error::Module)?
+                .ok_or_else(|| {
+                    Error::Module(format!("agent is not registered: {}", entry.agent_id))
+                })?;
+            // THE SAME duckfs gate the settle path applies — grant,
+            // shape/cap/permission, the per-path base probe — but its `Err` is
+            // returned to the submitter instead of degrading to a breadcrumb.
+            let msg = self
+                .duckfs_write_msg(&*ctx, &agent, &action)
                 .await
                 .map_err(Error::Module)?;
             ctx.emit_msg(msg);

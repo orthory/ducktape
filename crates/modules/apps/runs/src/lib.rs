@@ -137,7 +137,7 @@ use dispatch::{
     encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
 };
 use files::{
-    Change as FilesChange, Content as FilesContent, FilesMsg, FilesQuery, FilesReply,
+    Change as FilesChange, Content as FilesContent, EntryInfo, FilesMsg, FilesQuery, FilesReply,
     decode_reply as files_decode_reply, encode_msg as files_encode_msg,
     encode_query as files_encode_query,
 };

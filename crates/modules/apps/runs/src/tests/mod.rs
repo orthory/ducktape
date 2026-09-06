@@ -563,6 +563,22 @@ impl Ctx for CaptureCtx {
                     };
                     Ok(files_encode_reply(&reply))
                 }
+                // the per-path CAS probe (`response::probe_duckfs_write_base`)
+                // reads this. the mock has no real snapshot history, so it
+                // serves the SAME committed entry regardless of `snapshot` —
+                // enough to model "path exists" vs "path is new", which is all
+                // a duckfs write test needs.
+                FilesQuery::Stat { path, .. } => {
+                    let entry = self.files_content.get(&path).map(|bytes| files::EntryInfo {
+                        path: path.clone(),
+                        kind: files::EntryKindWire::File,
+                        size: bytes.len() as u64,
+                        exec: false,
+                        object: "00".repeat(32),
+                        meta: BTreeMap::new(),
+                    });
+                    Ok(files_encode_reply(&FilesReply::Stat(entry)))
+                }
                 _ => Err(Error::QueryUnsupported),
             },
             "forge" => match forge::decode_query(req).map_err(Error::Module)? {
