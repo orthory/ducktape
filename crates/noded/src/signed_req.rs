@@ -251,10 +251,12 @@ enum Authority {
 
 /// the exact mutating POST paths that mutate the NODE rather than module state:
 /// `/v1/log-filter` retunes this process's tracing filter (a `trace` fills the
-/// operator's disk through `daemon.log`) and `/v1/invite` mints a bearer right
-/// to join this mesh for up to a year. neither handler reads [`SignedBy`],
-/// which is exactly why neither may be admitted on possession alone.
-const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite"];
+/// operator's disk through `daemon.log`), `/v1/invite` mints a bearer right to
+/// join this mesh for up to a year, and `/v1/huddle/node-proof` signs with
+/// THIS node's own mesh-identity key — none of which is a module write any
+/// acting key should be able to ask for. neither handler reads [`SignedBy`],
+/// which is exactly why none may be admitted on possession alone.
+const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite", "/v1/huddle/node-proof"];
 
 /// the frameless op lane. an EXACT match, not a prefix: `/v1/submit/frame`
 /// carries its own signature inside the frame and stays open, and the other

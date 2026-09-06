@@ -227,6 +227,11 @@ struct ValidatorRuntime<'a> {
     /// `checkpoint_due`: an idle chain's nop blocks must not buy a full
     /// re-encode of the manifest already on disk (#1308).
     last_written_root: Option<sdk::StateRoot>,
+    /// consecutive checkpoints that deferred `prune_oplog` for a warm sync
+    /// lease. capped at [`drain::MAX_PRUNE_DEFERRALS`]: past the cap the
+    /// checkpoint prunes anyway (see `drain::drain_pass`) so a joiner that
+    /// never releases the lease cannot pin the retained journal forever.
+    prune_deferrals: u32,
     last_reach_view: Option<u64>,
     last_flush: std::time::SystemTime,
     /// when this loop last SEALED a block, and how many stall windows have
@@ -270,6 +275,11 @@ struct ValidatorRuntime<'a> {
     /// the directory itself was unchanged. Not a deletion — it paces the
     /// warning for a filesystem that will never accept the rewrite.
     workspace_mark_lost_checks: u64,
+    /// consecutive drain ticks whose committed valset read failed. Paces the
+    /// warning for a host query that keeps erroring (#1820) — a failed read
+    /// is not an observation, so the cutover step is skipped for that tick
+    /// rather than fed an empty set.
+    valset_read_failed_checks: u64,
 }
 
 pub(super) async fn run(state: ValidatorLoopState<'_>) {
@@ -368,6 +378,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         std::collections::BTreeMap::new();
     // recovery cadence: sealed blocks since the last checkpoint manifest.
     let blocks_since_checkpoint: u64 = 0;
+    // no lease-deferred prune owed yet at boot.
+    let prune_deferrals: u32 = 0;
     // no cooldown owed at boot: the first checkpoint's own cost is the
     // estimate every later one is held off by.
     let checkpoint_not_before = context.current();
@@ -546,6 +558,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         blocks_since_checkpoint,
         checkpoint_not_before,
         last_written_root: None,
+        prune_deferrals,
         last_reach_view,
         last_flush,
         last_seal: context.current(),
@@ -565,6 +578,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         workspace_mark,
         next_workspace_check: context.current() + WORKSPACE_CHECK_INTERVAL,
         workspace_mark_lost_checks: 0,
+        valset_read_failed_checks: 0,
     };
     // the startup snapshot: the RECOVERED boundary serves on /v1/status the
     // moment the loop exists, not after the first drain.

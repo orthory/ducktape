@@ -172,11 +172,30 @@ impl ValidatorRuntime<'_> {
                 up_to_height,
                 reply,
             } => {
-                let read = node
-                    .sink_mut()
-                    .read_finalized_frames(after_height, up_to_height)
-                    .await;
-                let _ = reply.send(read);
+                // the decode is a bounded seek-and-read since #1814, but it
+                // is still real journal I/O — spawned onto its own task so a
+                // slow disk stalls a joiner's reply, never this loop's next
+                // `select_biased!` arm (drain, `/v1/query`, ...). the handle
+                // is self-contained (its own `Arc`'d journal and a snapshot
+                // of the height index), so nothing here holds `node` past
+                // this match arm.
+                match node.sink_mut().frame_reader() {
+                    Ok(reader) => {
+                        tokio::spawn(async move {
+                            let read = reader
+                                .read_finalized_frames(
+                                    after_height,
+                                    up_to_height,
+                                    statesync::FRAME_BATCH_LEN,
+                                )
+                                .await;
+                            let _ = reply.send(read);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
             SyncStateRequest::IndexOps {
                 module,
@@ -237,7 +256,7 @@ impl ValidatorRuntime<'_> {
                 // own state — the same read point `read_valset_residents` uses
                 // elsewhere, between drains, no deadlock.
                 let host = node.host();
-                let members = read_valset_members(host).await;
+                let members = read_valset_members(host).await.unwrap_or_default();
                 let residents = read_valset_residents(host).await;
                 let standing = members
                     .iter()
