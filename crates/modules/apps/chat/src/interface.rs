@@ -34,6 +34,13 @@ pub const MAX_QUERY_LIMIT: u64 = 256;
 pub const MAX_HUDDLE_MEMBERS: usize = 32;
 /// a huddle member's node key: raw ed25519 public key bytes.
 pub const HUDDLE_NODE_KEY_BYTES: usize = 32;
+/// channels one creator (a user, or `CreateDmChannel`'s resolved account) may
+/// have open at once. there is no `DeleteChannel` op — every created channel
+/// is permanent — so this is the only thing bounding one account's share of
+/// the channel set. module/system origins are exempt (genesis-fixed trusted
+/// code). picked in the same spirit as forge's `MAX_OPEN_ITEMS_PER_ACTOR` /
+/// tasks' `MAX_OPEN_TASKS_PER_OWNER`.
+pub const MAX_CHANNELS_PER_CREATOR: usize = 256;
 
 /// who authored a message — derived from `Env.origin`, never from a payload.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -197,6 +204,14 @@ pub enum ChatMsg {
         name: String,
         post_policy: PostPolicy,
     },
+    /// open the two-party room with `counterpart`. the module derives the id
+    /// itself — `client::dm_channel_id(creator account, counterpart)`,
+    /// `creator` resolved from the signing key through `identity`'s `OfKey` —
+    /// so the id can never be spoofed to any other pair's DM. always seats
+    /// `PostPolicy::MembersOnly`, whatever `CreateChannel` might otherwise
+    /// allow. `dm-`-shaped ids are reserved: plain `CreateChannel` refuses one
+    /// from a user origin (see `Chat::stage_channel`).
+    CreateDmChannel { counterpart: u64, name: String },
     /// rename a channel, reusing `CreateChannel`'s name validation (non-empty +
     /// the reserved `:` namespace gate + the record byte cap). channel-admin
     /// authority: only the channel's `owner` may rename an owned channel, and
@@ -361,6 +376,9 @@ pub enum ChatAssigned {
     Posted { seq: u64 },
     /// `EditMessage`: the new head's assigned revision.
     Edited { rev: u32 },
+    /// `CreateDmChannel`: the derived id the module minted from (creator,
+    /// counterpart) — the payload never carries it.
+    DmChannel { channel_id: String },
 }
 
 pub fn encode_msg(m: &ChatMsg) -> Vec<u8> {
