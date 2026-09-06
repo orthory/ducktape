@@ -263,7 +263,9 @@ impl ForgeState {
                 cert,
             } => {
                 let name = norm_repo(&repo)?;
-                let principal = Self::push_principal(ctx, &name, cert.as_ref(), &updates).await?;
+                let principal = self
+                    .push_principal(ctx, &name, cert.as_ref(), &updates)
+                    .await?;
                 self.stage_push_refs(&name, principal, updates, pack_digest)
             }
             ForgeMsg::OpenIssue { repo, title, body } => {
@@ -514,7 +516,14 @@ impl ForgeState {
     /// that signed it (its account, when it has one) — `git push --signed`
     /// through any node, verified here by every validator; without one, the
     /// frame origin ([`Self::principal_of_origin`]).
+    ///
+    /// a certified push also gates on [`Tracker::accepted_chain`] (#1761,
+    /// `pushcert` module doc): the first cert-verified push this forge
+    /// instance ever accepts pins its nonce's chain half forever; every later
+    /// one must match, or a certificate harvested off a different ducktape
+    /// network is refused instead of replaying through here.
     async fn push_principal(
+        &mut self,
         ctx: &dyn Ctx,
         repo: &str,
         cert: Option<&PushCert>,
@@ -523,8 +532,18 @@ impl ForgeState {
         let Some(cert) = cert else {
             return Self::principal_of_origin(ctx).await;
         };
-        let signer = crate::pushcert::signer(cert, repo, updates)
+        let (signer, chain) = crate::pushcert::signer(cert, repo, updates)
             .map_err(|reason| Error::Module(format!("forge: {reason}")))?;
+        match &self.tracker_view().accepted_chain {
+            Some(pinned) if pinned != &chain => {
+                return Err(Error::Module(format!(
+                    "forge: push certificate nonce belongs to chain {chain:?}, not this \
+                     network's {pinned:?}"
+                )));
+            }
+            Some(_) => {}
+            None => self.staged_tracker_mut().accepted_chain = Some(chain),
+        }
         let account = Self::identity_account(ctx, &signer).await?;
         Ok(account.map_or(signer, identity::account_principal))
     }
@@ -621,10 +640,17 @@ impl ForgeState {
     /// `PushRefs` alone would close nothing.
     ///
     /// a PROTECTED target keeps the stricter, unchanged rule: the repo owner
-    /// only. every other target opens to whoever forge already vouches for on
-    /// this PR — its author, one of its reviewers, or the repo owner — so a
-    /// stranger with no standing on the PR cannot force a terminal `Merged`
-    /// onto someone else's branch.
+    /// only. every other target opens to whoever forge already vouches for
+    /// independently of `SubmitReview` — the PR's author, or the repo owner.
+    ///
+    /// `SubmitReview` has no standing gate (any account may review any PR)
+    /// and forge has no collaborator/member list to check a reviewer against,
+    /// so a review's author is NOT sound merge standing (#1760): admitting
+    /// `reviewers.contains(actor)` here let a stranger file one throwaway
+    /// review, then merge with the very next op. this is the smallest sound
+    /// rule available without inventing a membership list forge doesn't
+    /// have: reviews are still stored and shown, they just don't unlock a
+    /// merge.
     fn require_merge_authorized(
         &self,
         name: &str,
@@ -645,12 +671,12 @@ impl ForgeState {
                 )))
             };
         }
-        let (author, reviewers) = self.tracker_view().pr_participants(name, number)?;
-        let may_merge = actor == &author || reviewers.contains(actor) || is_owner;
+        let author = self.tracker_view().pr_author(name, number)?;
+        let may_merge = actor == &author || is_owner;
         if !may_merge {
             return Err(Error::Module(format!(
-                "forge: only pull request #{number}'s author, a reviewer, or the owner of repo \
-                 {name:?} may merge it"
+                "forge: only pull request #{number}'s author or the owner of repo {name:?} may \
+                 merge it"
             )));
         }
         Ok(())
