@@ -868,13 +868,20 @@ async fn proxy_inner(
             bodyseal::open_request(keys, &bodyseal::request_aad(method.as_str(), path_and_query), &body)
                 .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
         ),
-        (Some(_), false) if !body.is_empty() => {
+        // A sealed session requires a sealed body on EVERY request, bodyless
+        // ones included: `bodyseal::seal_request` seals an empty plaintext
+        // into a non-empty AEAD blob (the tag alone), so a bodyless request
+        // still costs the caller possession of the handshake keys. Without
+        // this arm, a stolen bearer with no key material could still spend
+        // the owner's credential on every bodyless request shape (GET/HEAD/
+        // DELETE across the whole proxied surface) for the rest of the
+        // token's TTL — the residual `bodyseal.rs` used to document.
+        (Some(_), false) => {
             return Err(AppErr(
                 StatusCode::BAD_REQUEST,
                 "airlock: sealed session requires a sealed body".into(),
             ));
         }
-        (Some(_), false) => body,
         (None, true) => {
             return Err(AppErr(
                 StatusCode::BAD_REQUEST,
