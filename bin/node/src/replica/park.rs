@@ -2260,6 +2260,9 @@ pub(super) async fn park(
                                 None,
                                 m.height,
                                 SUFFIX_CATCHUP_MAX_ITERS,
+                                &namespace,
+                                founding_anchor,
+                                &replica_store,
                             )
                             .await
                             {
@@ -2295,13 +2298,11 @@ pub(super) async fn park(
                             let tip = caught.to_height.max(m.height);
                             metrics.begin_sync(Some(client.current_source().to_string()), tip);
                             metrics.record_sync_progress(tip);
-                            // seed the shared store with the folded
-                            // suffix: peers' resolvers can fetch these
-                            // from us, and a re-reported cert for a
-                            // just-folded height resolves locally.
-                            for bytes in &caught.frame_bytes {
-                                replica_store.put(bytes.clone());
-                            }
+                            // the folded suffix's bytes already landed in
+                            // `replica_store` window-by-window inside
+                            // `catch_up_suffix_frames`: peers' resolvers can
+                            // fetch these from us, and a re-reported cert for
+                            // a just-folded height resolves locally.
                             let root = host.root_hash();
                             // the fold pipeline: the follower orderer
                             // in the engine's seat of the SAME

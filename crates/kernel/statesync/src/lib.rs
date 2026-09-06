@@ -123,6 +123,16 @@ pub const CHUNK_LEN: usize = 256 * 1024;
 /// crate depending on `node`.
 pub const MAX_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 
+/// default cap on one [`fetch_frames`] call's ASSEMBLED frame suffix. the
+/// serving peer chooses each `Frames` batch's contents, so without a ceiling
+/// here a source can stream an unbounded number of undecodable (but
+/// cost-free — `Disposition::Rejected` leaves roots unchanged) batches and
+/// drive the joiner's RSS up before a single frame is applied. mirrors
+/// [`MAX_SNAPSHOT_BYTES`]'s shape at a smaller size: a frame window is
+/// applied and discarded as it lands, so it never needs to hold hundreds of
+/// MiB at once — a caller that hits this refetches in a smaller window.
+pub const MAX_CATCHUP_BYTES: u64 = 64 * 1024 * 1024;
+
 /// max recovery frames examined per [`SyncResponse::Frames`] batch. This is a
 /// work bound, not a byte guarantee: the node serve path separately budgets the
 /// exact encoded response against its configured mesh message cap.
@@ -2205,18 +2215,51 @@ where
     }
 }
 
-/// fetch a finite, ordered recovery-frame suffix in bounded batches.
+/// fetch a finite, ordered recovery-frame suffix in bounded batches. `None`
+/// means the caller already trusts the range's size (the live-drain backfill
+/// lane, which walks the follower's own certified gap); [`fetch_frames_capped`]
+/// is the untrusted-source entry point.
 pub async fn fetch_frames<C: SyncClient>(
     client: &C,
     after_height: u64,
     up_to_height: u64,
+) -> Result<Vec<FinalizedFrame>, SyncError> {
+    fetch_frames_bounded(client, after_height, up_to_height, None).await
+}
+
+/// [`fetch_frames`], refusing to assemble more than `max_bytes` of frame
+/// payload — see [`MAX_CATCHUP_BYTES`]. mirrors [`fetch_snapshot`]'s cap
+/// shape: the check runs before a frame's bytes are added to the running
+/// total, never after. the joiner catch-up lane's entry point: the served
+/// tip is an UNVERIFIED peer number, so the range it names cannot be trusted
+/// to be small.
+pub async fn fetch_frames_capped<C: SyncClient>(
+    client: &C,
+    after_height: u64,
+    up_to_height: u64,
+    max_bytes: u64,
+) -> Result<Vec<FinalizedFrame>, SyncError> {
+    fetch_frames_bounded(client, after_height, up_to_height, Some(max_bytes)).await
+}
+
+async fn fetch_frames_bounded<C: SyncClient>(
+    client: &C,
+    after_height: u64,
+    up_to_height: u64,
+    max_bytes: Option<u64>,
 ) -> Result<Vec<FinalizedFrame>, SyncError> {
     if after_height > up_to_height {
         return Err(SyncError::Server(format!(
             "invalid frame range ({after_height}, {up_to_height}]"
         )));
     }
+    let too_large = |cap: u64| SyncError::TooLarge {
+        module: "recovery".to_string(),
+        reason: "catchup_frames_exceed_cap",
+        cap,
+    };
     let mut out = Vec::new();
+    let mut total_bytes = 0u64;
     let mut after = after_height;
     while after < up_to_height {
         let resp = client
@@ -2241,6 +2284,12 @@ pub async fn fetch_frames<C: SyncClient>(
                              ({after}, {up_to_height}]",
                             frame.height
                         )));
+                    }
+                    if let Some(cap) = max_bytes {
+                        total_bytes += frame.frame.len() as u64;
+                        if total_bytes > cap {
+                            return Err(too_large(cap));
+                        }
                     }
                     last = frame.height;
                     out.push(frame);
@@ -2960,5 +3009,55 @@ mod tests {
             .expect("an honest, in-cap stream assembles");
         assert_eq!(bytes, vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(client.call_count(), 3);
+    }
+
+    // ------------------------------------------------------------------
+    // fetch_frames_capped: the served frame batch is the PEER's choice too —
+    // a source can stream any number of oversized "recovery frames" (they
+    // cost it nothing: an undecodable batch lands as Rejected with roots
+    // unchanged) to drive the joiner's RSS up before a single frame applies.
+    // ------------------------------------------------------------------
+
+    fn test_frame(height: u64, len: usize) -> FinalizedFrame {
+        FinalizedFrame {
+            height,
+            frame: vec![0u8; len],
+            disposition: FrameDisposition::Applied,
+            roots: vec![],
+            root_hash: StateRoot([0u8; ROOT_LEN]),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_frames_capped_refuses_a_suffix_over_the_byte_cap() {
+        let cap = 16u64;
+        let client = ScriptedClient::new(vec![SyncResponse::Frames {
+            frames: vec![test_frame(1, 10), test_frame(2, 10)],
+        }]);
+        let err = fetch_frames_capped(&client, 0, 2, cap)
+            .await
+            .expect_err("a suffix whose frames exceed the cap must refuse");
+        assert!(
+            matches!(
+                err,
+                SyncError::TooLarge {
+                    reason: "catchup_frames_exceed_cap",
+                    ..
+                }
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_frames_capped_assembles_an_in_cap_suffix() {
+        let cap = 1024u64;
+        let client = ScriptedClient::new(vec![SyncResponse::Frames {
+            frames: vec![test_frame(1, 10), test_frame(2, 10)],
+        }]);
+        let frames = fetch_frames_capped(&client, 0, 2, cap)
+            .await
+            .expect("an in-cap suffix assembles");
+        assert_eq!(frames.len(), 2);
     }
 }

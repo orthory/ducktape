@@ -126,6 +126,25 @@ jobs:
       - run: rustup show
       - run: cargo test --locked -p simnode
 
+  # The rendezvous/coordinator unit lane had no PR gate at all: three
+  # `reachability::rendezvous::tests` and coordinator-bin's
+  # `probe_floods_invalid_signatures_then_recovers` went red on dev when the
+  # advert book's readvertise-nonce and Lookup-source-binding guards
+  # landed, and nothing ran them to notice. `--lib` only —
+  # `coordinator-bin`'s integration suites (deploy_smoke, policy_args, smoke)
+  # bind real sockets and belong with the other integration jobs above, not
+  # this fast unit lane.
+  net-unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: rustup show
+      - run: cargo test --locked -p reachability -p nat-traversal -p coordinator-bin --lib -j 4
+
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 30

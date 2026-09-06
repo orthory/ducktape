@@ -40,6 +40,9 @@ tagging = { workspace = true }
 # `Chat::resolve_dm_creator`).
 identity = { workspace = true }
 async-trait = { workspace = true }
+# the one verifier every signed artifact dispatches through — `JoinHuddle`'s
+# `node_proof` rides the same ed25519 path a member key's frame does.
+keyscheme = { workspace = true }
 # NFC label normalization for the derived tag index (src/index/tags.rs) —
 # unconditional like the index core it serves (pure, wasm32-clean).
 unicode-normalization = { workspace = true }
@@ -51,6 +54,8 @@ sha2 = { workspace = true }
 [dev-dependencies]
 host = { workspace = true }
 sdk-testkit = { workspace = true }
+# the ed25519 keypairs a `JoinHuddle.node_proof` test signs with.
+commonware-cryptography = { workspace = true }
 # the tests drive the module the way a host does: construct the concrete
 # QmdbStore and inject it as `Box<dyn MerkleStore>`.
 statesync = { workspace = true }

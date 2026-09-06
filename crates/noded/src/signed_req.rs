@@ -251,10 +251,12 @@ enum Authority {
 
 /// the exact mutating POST paths that mutate the NODE rather than module state:
 /// `/v1/log-filter` retunes this process's tracing filter (a `trace` fills the
-/// operator's disk through `daemon.log`) and `/v1/invite` mints a bearer right
-/// to join this mesh for up to a year. neither handler reads [`SignedBy`],
-/// which is exactly why neither may be admitted on possession alone.
-const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite"];
+/// operator's disk through `daemon.log`), `/v1/invite` mints a bearer right to
+/// join this mesh for up to a year, and `/v1/huddle/node-proof` signs with
+/// THIS node's own mesh-identity key — none of which is a module write any
+/// acting key should be able to ask for. neither handler reads [`SignedBy`],
+/// which is exactly why none may be admitted on possession alone.
+const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite", "/v1/huddle/node-proof"];
 
 /// the frameless op lane. an EXACT match, not a prefix: `/v1/submit/frame`
 /// carries its own signature inside the frame and stays open, and the other
@@ -309,7 +311,18 @@ impl Lane {
                 .then_some(Authority::Acting)
                 .or(removes.then_some(Authority::Operator)),
             Lane::Object => (replaces || removes).then_some(Authority::Acting),
-            Lane::Files | Lane::Submit => posts.then_some(Authority::Acting),
+            Lane::Files => posts.then_some(Authority::Acting),
+            // `/v1/submit` is the FRAMELESS lane: unlike Files/Workspace, the
+            // verified `SignedBy` key does NOT ride on as the op's origin — the
+            // validator re-signs the framed op with ITS OWN consensus key
+            // (`bin/node/src/validator/run/ingress.rs`, `node_link.rs`), the
+            // shape the node's own daemons need for an op that must carry the
+            // NODE's identity (a capability announce, a lease bid, a run bind).
+            // possession-of-any-key was therefore enough to mint an op under
+            // the VALIDATOR's own key (#1808) — so this lane is Operator-only,
+            // and a user submits through the self-authenticating
+            // `/v1/submit/frame` instead, whose signature IS the op's origin.
+            Lane::Submit => posts.then_some(Authority::Operator),
             // a pty/microVM on the HOST, and the two fixed node mutations.
             Lane::Term | Lane::NodeLevel => posts.then_some(Authority::Operator),
             Lane::Open => None,
@@ -774,7 +787,6 @@ mod tests {
         let gated: &[(Method, &str, Authority)] = &[
             // module-bound: the acting key rides on as `SignedBy` and the
             // module decides.
-            (Method::POST, "/v1/submit", Authority::Acting),
             (Method::POST, "/v1/fs/workspaces", Authority::Acting),
             (
                 Method::POST,
@@ -800,6 +812,9 @@ mod tests {
             // self-chosen key must not be enough.
             (Method::POST, "/v1/log-filter", Authority::Operator),
             (Method::POST, "/v1/invite", Authority::Operator),
+            // the frameless op lane: the framed op is re-signed as the NODE,
+            // never the caller (#1808), so it takes the same operator-only bar.
+            (Method::POST, "/v1/submit", Authority::Operator),
             (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Operator),
             (Method::POST, "/v1/term/sessions", Authority::Operator),
             (
