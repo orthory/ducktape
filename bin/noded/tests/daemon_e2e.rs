@@ -390,12 +390,11 @@ fn post_message(channel: &str, message_id: &str, text: &str) -> serde_json::Valu
             "message_id": message_id,
             "blocks": [{ "paragraph": [{ "text": text, "marks": [] }] }],
             "thread": null,
-            "as_agent": null,
         }
     })
 }
 
-fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::Value {
+fn post_mention(channel: &str, message_id: &str, account: u64) -> serde_json::Value {
     serde_json::json!({
         "post_message": {
             "channel_id": channel,
@@ -404,10 +403,10 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
                 "paragraph": [
                     { "text": "hey ", "marks": [] },
                     {
-                        "text": format!("@{agent_id}"),
+                        "text": format!("@{account}"),
                         "marks": [{
                             "mention": {
-                                "agent": { "module": "runs", "agent_id": agent_id }
+                                "account": account
                             }
                         }]
                     },
@@ -415,7 +414,6 @@ fn post_mention(channel: &str, message_id: &str, agent_id: &str) -> serde_json::
                 ]
             }],
             "thread": null,
-            "as_agent": null,
         }
     })
 }
@@ -589,9 +587,9 @@ fn full_surface_blocks_authorship_and_ws() {
     let head = &messages[0]["head"];
     assert_eq!(head["message_id"], "m1");
     assert_eq!(head["blocks"][0]["paragraph"][0]["text"], "hello from e2e");
-    let author_bytes: Vec<u8> = head["author"]["user"]
+    let author_bytes: Vec<u8> = head["author"]["key"]
         .as_array()
-        .expect("User author")
+        .expect("Key author")
         .iter()
         .map(|v| v.as_u64().expect("byte") as u8)
         .collect();
@@ -677,56 +675,50 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     );
     assert_eq!(code, 200, "create channel failed: {block}");
 
-    let (code, block) = daemon.submit(
-        "agent",
-        serde_json::json!({
-            "register_agent": {
-                "agent_id": "quackbot",
-                "display_name": "Quackbot",
-                "capability": "echo-model",
-                "allowed_actions": ["chat.post"]
-            }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "register agent failed: {block}");
+    let controller = "n".repeat(32);
+    for (target, operation) in [
+        (
+            "identity",
+            serde_json::json!({ "create": {
+                "name": "controller", "scheme": "ed25519",
+            }}),
+        ),
+        (
+            "agent",
+            serde_json::json!({ "provision": {
+                "name": "quackbot", "program": runs::model_program("quackbot"),
+            }}),
+        ),
+        (
+            "runs",
+            serde_json::json!({ "configure_model": { "operation": { "register_model": {
+                "account": 2, "agent_id": "quackbot", "display_name": "Quackbot",
+                "capability": "echo-model", "allowed_actions": ["chat.post"],
+            }}}}),
+        ),
+    ] {
+        let (code, reply) = daemon.submit(target, operation, Some(&controller));
+        assert_eq!(code, 200, "model setup {target}: {reply}");
+    }
 
-    let (code, block) = daemon.submit(
-        "runs",
-        serde_json::json!({
-            "watch_channel": {
-                "channel_id": "general",
-                "policy": "mention"
-            }
-        }),
-        Some("owner"),
-    );
-    assert_eq!(code, 200, "watch channel failed: {block}");
-
-    let (code, block) = daemon.submit(
-        "chat",
-        post_mention("general", "m1", "quackbot"),
-        Some("alice"),
-    );
+    let (code, block) = daemon.submit("chat", post_mention("general", "m1", 2), Some("alice"));
     assert_eq!(code, 200, "mention post failed: {block}");
-    // the receipt reports the block that INCLUDED the post, not the drain tail…
     assert_eq!(
-        block["height"], 4,
-        "the receipt should carry the post's inclusion block"
+        block["height"], 5,
+        "the receipt names the mention's inclusion block"
     );
-    // …while the drain tail runs behind it: the saga guest runs the STRICT
-    // lease policy, so the echo worker BIDS for the unassigned announcement
-    // (block 5), answers the re-emitted order that names it (block 6, the
-    // result into the dispatch mailbox), and the nudge block (7) carries the
-    // DeliverPending injection that posts the reply — the never-pop-stack rule
-    // made visible in the block arithmetic.
+    assert!(
+        daemon.status()["height"].as_u64().unwrap() > 5,
+        "the program, oracle and completion queues drain at later boundaries"
+    );
+    let recent = daemon.query("runs", serde_json::json!("recent_runs"));
+    let records = recent["recent_runs"].as_array().expect("recent runs");
     assert_eq!(
-        daemon.status()["height"],
-        7,
-        "post + oracle bid + oracle result + delivery nudge should all drain"
+        records.len(),
+        1,
+        "one mention starts one model run: {recent}"
     );
-
-    let run_id = "chat\u{1f}general\u{1f}1\u{1f}quackbot";
+    let run_id = records[0]["run_id"].as_str().expect("run id");
     // the run's lifecycle lives in the dispatch module; the runs module's
     // pending entry pruned when the delivery landed.
     let pending = daemon.query("runs", serde_json::json!("pending_runs"));
@@ -756,11 +748,8 @@ fn agent_run_drains_oracle_effect_and_posts_reply() {
     let messages = reply["messages"].as_array().expect("Messages reply");
     assert_eq!(messages.len(), 2, "user post plus agent reply should exist");
     let agent_reply = &messages[1]["head"];
-    assert_eq!(agent_reply["message_id"], format!("agent/{run_id}"));
-    assert_eq!(
-        agent_reply["author"],
-        serde_json::json!({ "agent": { "module": "runs", "agent_id": "quackbot" } })
-    );
+    assert_eq!(agent_reply["message_id"], runs::reply_message_id(run_id));
+    assert_eq!(agent_reply["author"], serde_json::json!({ "account": 2 }));
     let text = agent_reply["blocks"][0]["paragraph"][0]["text"]
         .as_str()
         .expect("reply text");

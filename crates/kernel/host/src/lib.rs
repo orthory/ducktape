@@ -427,7 +427,7 @@ pub struct Dispatched {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
 pub enum Trace {
     Read(Read),
-    Dispatch(Dispatched),
+    Dispatch(Box<Dispatched>),
 }
 
 /// the trace of one attempted unit, in order.
@@ -471,8 +471,8 @@ pub trait CommitWitness {
     async fn record(&mut self, height: u64, witness: &Witness) -> Result<(), String>;
 }
 
-/// the witness for drivers that keep no journal (single-op submits, tests,
-/// catch-up over verified frames): nothing to persist.
+/// the witness for drivers that keep no journal (single-op submits and tests):
+/// nothing to persist. Durable catch-up records through its recovery journal.
 pub struct NoWitness;
 
 #[async_trait::async_trait(?Send)]
@@ -849,7 +849,7 @@ enum Serve {
 /// record, or refused because the witness does not describe it.
 enum Plan {
     Execute,
-    Substitute(Dispatched),
+    Substitute(Box<Dispatched>),
     Diverged(String),
 }
 
@@ -1022,13 +1022,13 @@ impl Observer {
             if let Open::Unit { entry, .. } = o.open {
                 o.units[entry]
                     .trace
-                    .push(Trace::Dispatch(dispatched.clone()));
+                    .push(Trace::Dispatch(Box::new(dispatched.clone())));
             }
             return;
         }
         let ran = describe_dispatch(dispatched);
         let departure = match o.next_trace() {
-            Ok(Trace::Dispatch(recorded)) if recorded == *dispatched => return,
+            Ok(Trace::Dispatch(recorded)) if *recorded == *dispatched => return,
             Ok(Trace::Dispatch(recorded)) => format!(
                 "the witness recorded {}, the replay ran {ran}",
                 describe_dispatch(&recorded)
@@ -2514,7 +2514,13 @@ impl Host {
                     block.observer.begin_unit();
                     let authority = self.call_authority(&block.observer, call).await;
                     self.check_witness(&mut block).await?;
-                    Some(authority.map_err(authority_fault)?)
+                    match authority {
+                        Ok(verdict) => Some(verdict),
+                        Err(error) => {
+                            self.abort_all(&mut block.touched).await?;
+                            return Err(authority_fault(error));
+                        }
+                    }
                 }
             };
             if let Some(record) = self.run_call(&mut block, i, call, verdict).await? {
@@ -3366,7 +3372,7 @@ impl Host {
                     observer.record_dispatch(&dispatched);
                     dispatched
                 }
-                Plan::Substitute(recorded) => recorded,
+                Plan::Substitute(recorded) => *recorded,
                 Plan::Diverged(reason) => return Err(Error::Module(reason)),
             };
             // a replay that departed from the witness ends the drain here,
@@ -3549,7 +3555,7 @@ impl Host {
                 observer.record_dispatch(&dispatched);
                 dispatched
             }
-            Plan::Substitute(recorded) => recorded,
+            Plan::Substitute(recorded) => *recorded,
             Plan::Diverged(reason) => return Err(Error::Module(reason)),
         };
         if let Some(divergence) = observer.divergence() {
@@ -3704,9 +3710,9 @@ fn call_disposition(outcome: &dispatch::CallOutcome) -> CallDisposition {
         dispatch::CallOutcome::Rejected { reason } => CallDisposition::Rejected {
             reason: reason.clone(),
         },
-        dispatch::CallOutcome::Refused(refusal) => CallDisposition::Refused(refusal.clone()),
+        dispatch::CallOutcome::Refused(refusal) => CallDisposition::Refused(*refusal),
         dispatch::CallOutcome::Unrepresentable { attempted } => CallDisposition::Unrepresentable {
-            attempted: attempted.clone(),
+            attempted: *attempted,
         },
     }
 }

@@ -4,7 +4,7 @@
 //!
 //!   1. a repo is born by its first push; an issue opens (item #1, hidden
 //!      channel `forge:<repo>:1`); the agent is registered with forge caps
-//!      and the channel is watched.
+//!      and its programmable account is bound.
 //!   2. mentioning the agent runs the provider INSIDE a real git clone of the
 //!      repo, detached at the pinned dev tip; the host commits + pushes branch
 //!      `agent/item-1` through consensus and the PR sink opens a PR whose
@@ -53,11 +53,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
-use agent::{ACTION_CHAT_POST, AgentMsg, ResourceCaps};
 use capability::{CapabilityQuery, CapabilityReply};
-use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, Span};
+use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, Span};
 use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
-use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply, TurnPolicy};
+use runs::{ACTION_CHAT_POST, ModelMsg, ResourceCaps};
+use runs::{RunOutcome, RunRecord, RunsMsg, RunsQuery, RunsReply};
 
 const CONVERGE: Duration = Duration::from_secs(180);
 const FINALIZE: Duration = Duration::from_secs(60);
@@ -238,15 +238,13 @@ fn post_mention(cluster: &Cluster, idx: usize, channel: &str, message_id: &str) 
                 Span::plain("hey "),
                 Span {
                     text: format!("@{AGENT_ID}"),
-                    marks: vec![Mark::Mention(AuthorRef::Agent {
-                        module: "runs".into(),
-                        agent_id: AGENT_ID.into(),
-                    })],
+                    marks: vec![Mark::Mention(Party::Account(common::model_account(
+                        cluster, idx, AGENT_ID,
+                    )))],
                 },
                 Span::plain(" do the dogfood thing"),
             ])],
             thread: None,
-            as_agent: None,
         }),
     );
 }
@@ -526,50 +524,39 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
 
     // ---- the agent (no prompt pin — a persona is a curated `Always` skill now,
     //      and this leg needs none; forge caps naming the repo LITERALLY) and the
-    //      watch that arms the trigger (atomic tagging subscribe, P2).
+    //      program binding that receives source-owned attribution.
+    let program_account = common::provision_model_program(&cluster, 0, AGENT_ID);
     cluster.submit(
         0,
-        "agent",
-        &agent::encode_msg(&AgentMsg::RegisterAgent {
-            agent_id: AGENT_ID.into(),
-            display_name: AGENT_ID.into(),
-            capability: provider.tag.clone(),
-            allowed_actions: vec![ACTION_CHAT_POST.into()],
-            recipe_hash: None,
-            caps: Some(ResourceCaps {
-                forge_read: vec![REPO.into()],
-                forge_push: vec![REPO.into()],
-                ..Default::default()
-            }),
-            skills: None,
+        "runs",
+        &runs::encode_msg(&RunsMsg::ConfigureModel {
+            operation: ModelMsg::RegisterModel {
+                account: program_account,
+                agent_id: AGENT_ID.into(),
+                display_name: AGENT_ID.into(),
+                capability: provider.tag.clone(),
+                allowed_actions: vec![ACTION_CHAT_POST.into()],
+                recipe_hash: None,
+                caps: Some(ResourceCaps {
+                    forge_read: vec![REPO.into()],
+                    forge_push: vec![REPO.into()],
+                    ..Default::default()
+                }),
+                skills: None,
+            },
         }),
     );
-    let watch = |channel: &str| {
-        cluster.submit(
-            0,
-            "runs",
-            &runs::encode_msg(&RunsMsg::WatchChannel {
-                channel_id: channel.into(),
-                policy: TurnPolicy::Mention,
-            }),
-        );
-        let channel = channel.to_string();
-        cluster.await_committed(0, "the channel watch to commit", FINALIZE, || {
-            let reply = cluster.query(0, "runs", &runs::encode_query(&RunsQuery::Watches))?;
-            match runs::decode_reply(&reply) {
-                Ok(RunsReply::Watches(w)) => {
-                    w.iter().any(|v| v.channel_id == channel).then_some(())
-                }
-                _ => None,
-            }
-        });
-    };
-    watch(&issue_channel);
+    assert_eq!(
+        common::model_account(&cluster, 0, AGENT_ID),
+        program_account
+    );
 
     // ---- run 1: issue mention → worktree at the pinned dev tip → branch
     //      `agent/item-1` born → a PR titled by the bound Forge issue.
     post_mention(&cluster, 0, &issue_channel, "m1");
-    let run_1 = runs::run_id_for(
+    let run_1 = common::attributed_run_id(
+        &cluster,
+        0,
         &issue_channel,
         seq_of(&cluster, 0, &issue_channel, "m1"),
         AGENT_ID,
@@ -620,9 +607,10 @@ fn issue_mention_runs_a_workspace_opens_a_pr_and_the_pr_channel_is_a_session() {
 
     // ---- run 2: the PR channel IS the session — re-mention forks the branch
     //      TIP, lands a second commit on the SAME branch, opens NO second PR.
-    watch(&pr_channel);
     post_mention(&cluster, 0, &pr_channel, "m2");
-    let run_2 = runs::run_id_for(
+    let run_2 = common::attributed_run_id(
+        &cluster,
+        0,
         &pr_channel,
         seq_of(&cluster, 0, &pr_channel, "m2"),
         AGENT_ID,

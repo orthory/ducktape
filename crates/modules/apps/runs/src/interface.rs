@@ -33,8 +33,8 @@ pub struct PendingRun {
     pub job_id: Option<String>,
     /// the jobs claim height a job-backed run is bound to; chat runs use 0.
     pub job_claim_height: u64,
-    /// the run-creating origin (the tagging plane, or the explicit
-    /// `RequestRun` submitter) — a cancel capability alongside the owner.
+    /// The origin that called runs to create this work; it may cancel the
+    /// run alongside the program's current controller.
     pub requester: RunOrigin,
     pub created_at: u64,
 }
@@ -168,21 +168,11 @@ pub enum RunsMsg {
     EnableJobWorker {
         enabled: bool,
     },
-    /// explicitly run `agent_id` against `channel_id`/`anchor_seq` without an
-    /// engagement. the duplicate of a pending or already-dispatched turn is a
-    /// deterministic no-op — the turn claim: first in consensus order wins.
-    ///
-    /// an `Origin::External` submitter is admitted only when chat says the
-    /// submitter's own key `may_post` to `channel_id` — post standing covers
-    /// read, and it is the same gate chat itself would apply to a message
-    /// from that key. this run's transcript pin and its reply both act under
-    /// module authority, which chat admits unconditionally, so the
-    /// submitter's own standing is the only thing keeping a non-member from
-    /// reading and posting into a members-only channel through the agent. a
-    /// refused submitter gets a deterministic `Rejected`, never a dispatch.
-    /// `Origin::Module`/`Origin::System` submitters are not gated here —
-    /// chat's own post policy always admits them, so there is no narrower
-    /// standing to check.
+    /// Ask the configured program to run this model against a channel anchor.
+    /// The authenticated requester retains cancellation/reassignment authority.
+    /// Calls for an already dispatched model/anchor are deterministic no-ops.
+    /// External callers must have chat post standing; the eventual program
+    /// execution also passes the target's own account authorization.
     RequestRun {
         agent_id: String,
         channel_id: String,

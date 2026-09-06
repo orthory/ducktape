@@ -10,7 +10,7 @@
 //! stops it. the session gate is. a task appearing on the chain here would mean
 //! that gate can be walked straight past.
 //!
-//! (the positive case — a bound session's write landing as `AuthorRef::Agent` —
+//! (the positive case — a bound session's write landing as `Party::Account` —
 //! is proven in `runs`'s own collaboration_loop e2e, which is the only harness
 //! with a real dispatch and a real committed lease to bind against.)
 //!

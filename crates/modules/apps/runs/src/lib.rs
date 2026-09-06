@@ -1,3 +1,6 @@
+//! Callable model work for programmable users. Model grants and context are
+//! consensus state; workers return data or propose session actions. A user's
+//! program chooses each source write and receives its actual dispatch outcome.
 // the wire surface: this module's shared types, flattened at the crate root.
 mod model;
 pub use model::*;
@@ -123,18 +126,33 @@ pub fn run_id_for(channel_id: &str, anchor_seq: u64, agent_id: &str) -> String {
     )
 }
 
-/// Internal pending-state coordinate for a Pages comment thread. The `runs:`
+/// Internal pending-state coordinates for Pages sources. The `runs:`
 /// chat namespace is reserved to this module, and Runs never mints chat
 /// channels below this sub-prefix, so the existing snapshot shape can carry
 /// the source discriminator without colliding with a real chat run.
 const PAGE_CHANNEL_PREFIX: &str = "runs:pages:";
+const PAGE_BLOCK_CHANNEL_PREFIX: &str = "runs:page-block:";
+
+enum PageSource<'a> {
+    CommentThread(&'a str),
+    Block(&'a str),
+}
 
 fn page_channel_id(thread_id: &str) -> String {
     format!("{PAGE_CHANNEL_PREFIX}{thread_id}")
 }
 
-fn page_thread_id(channel_id: &str) -> Option<&str> {
-    channel_id.strip_prefix(PAGE_CHANNEL_PREFIX)
+fn page_block_channel_id(block_id: &str) -> String {
+    format!("{PAGE_BLOCK_CHANNEL_PREFIX}{block_id}")
+}
+
+fn page_source(channel_id: &str) -> Option<PageSource<'_>> {
+    match channel_id.strip_prefix(PAGE_CHANNEL_PREFIX) {
+        Some(thread) => Some(PageSource::CommentThread(thread)),
+        None => channel_id
+            .strip_prefix(PAGE_BLOCK_CHANNEL_PREFIX)
+            .map(PageSource::Block),
+    }
 }
 
 pub fn page_run_id_for(thread_id: &str, ordinal: u64, agent_id: &str) -> String {
@@ -421,7 +439,7 @@ pub struct RunsModule {
     delegations: BTreeMap<String, DelegationState>,
     /// this block's staged writes, read ahead of committed state
     /// (read-your-writes) but merged in — and reflected in `root()` — only at
-    /// `commit_block`. a watch stages `None` for removal (unwatch); a pending
+    /// `commit_block`. a pending
     /// entry stages `None` for its prune; a session stages `None` for its prune.
     pending_overlay: BTreeMap<String, Option<PendingState>>,
     pending_sessions: BTreeMap<String, Option<AgentSession>>,

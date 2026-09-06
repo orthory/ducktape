@@ -1,7 +1,7 @@
 # Dogfood ceremony: ducktape develops ducktape
 
 The operator's runbook for the agent dogfooding loop: host this repo in its
-own forge, register an agent over it, open an issue that references a Pages
+own forge, provision a model user over it, open an issue that references a Pages
 spec, mention the agent, and review the resulting PR, block-anchored spec
 commentary, and usage — all in the app.
 
@@ -77,76 +77,89 @@ git push ducktape-dev dev
 `GIT_CONFIG_*` rather than `git -c`: an argv is world-readable through
 `/proc`, and this is a secret.
 
-## 2. Register the dogfood agent
+## 2. Provision the dogfood model user
 
-An agent's persona is an **`always` skill**: a `SKILL.md` in the shared skill
-library (the files module, under `/shared/skills/<name>/`) whose body the host
-inlines into every run's context document. There is no prompt blob and no
-prompt hash. The in-app register form (Agents view → register) covers the
-common case; the API registration below is the complete one and is the shape
-`bin/node/tests/dogfood_loop_e2e.rs` and
-`bin/node/tests/portable_workspace_e2e.rs` use.
+The persona is an **always skill**: a SKILL.md under
+/shared/skills/<name>/ whose body the host includes in the run context.
+The model user is a keyless identity account running a program; runs stores
+its provider, action grants, resource caps and skill references.
 
-Both calls MUTATE, so they carry a credential. `/v1` takes either a
-per-request user signature or this node's own operator credential — the
-secret it mints 0600 into its workspace at every boot — and a curl can only
-present the second. `<workspace>` is the directory holding `node.toml` (on
-the dev shape, the storage dir).
+The commands below use curl, jq, Python 3 and the current ducktape binary.
+They act through the node's operator credential, so that node's identity
+account controls the new model user. Use that same controller for later
+configuration changes; an app wallet is a separate principal.
 
 ```sh
-OPERATOR="$(cat <workspace>/admin.token)"
+BASE="<base>"
+WORKSPACE="<workspace>"
+OPERATOR="$(cat "$WORKSPACE/admin.token")"
 
-# 1. the persona: one skill document in the shared library (PUT is a
-#    single-change duckfs commit)
-curl -s -X PUT "<base>/v1/files/object/shared/skills/dogfood/SKILL.md" \
+submit() {
+  jq -nc --arg target "$1" --argjson payload "$2" '{target:$target,payload:$payload}' |
+    curl -fsS "$BASE/v1/submit" -H 'content-type: application/json' \
+      -H "x-ducktape-admin-token: $OPERATOR" --data-binary @-
+}
+query() {
+  jq -nc --arg target "$1" --argjson query "$2" '{target:$target,query:$query}' |
+    curl -fsS "$BASE/v1/query" -H 'content-type: application/json' --data-binary @-
+}
+
+# Resolve the actual submitting key, founding its controller account if absent.
+NODE_KEY="$(ducktape node key --out "$WORKSPACE/identity.key" | tail -n 1)"
+KEY_BYTES="$(python3 -c 'import json,sys; print(json.dumps(list(bytes.fromhex(sys.argv[1]))))' "$NODE_KEY")"
+CONTROLLER="$(query identity "{\"of_key\":{\"key\":$KEY_BYTES}}" | jq -r '.account.number // empty')"
+if [ -z "$CONTROLLER" ]; then
+  submit identity '{"create":{"name":"Dogfood operator","scheme":"ed25519"}}'
+  CONTROLLER="$(query identity "{\"of_key\":{\"key\":$KEY_BYTES}}" | jq -er '.account.number')"
+fi
+
+curl -fsS -X PUT "$BASE/v1/files/object/shared/skills/dogfood/SKILL.md" \
   -H "x-ducktape-admin-token: $OPERATOR" \
   --data-binary 'You are the dogfooding duck. Work the referenced spec.'
 
-# 2. register, granting the full dogfood surface in ONE submit
-curl -s <base>/v1/submit -X POST -H 'content-type: application/json' \
-  -H "x-ducktape-admin-token: $OPERATOR" -d '{
-  "target": "agent",
-  "payload": { "register_agent": {
-    "agent_id": "dogfood",
-    "display_name": "Dogfood Duck",
-    "capability": "<your provider tag>",
-    "allowed_actions": ["chat.post", "tasks.create", "tasks.update_status",
-                        "pages.comment", "pages.set_checked"],
-    "caps": {
-      "forge_read":  ["ducktape"],
-      "forge_push":  ["ducktape"],
-      "pages_write": ["*"],
-      "duckfs_read": ["/shared/skills"]
-    },
-    "skills": [ { "name": "dogfood",
-                  "source_prefix": "/shared/skills/dogfood",
-                  "load": "always" } ]
-  } }
-}'
+# Serialize the current default script; do not maintain a separate recipe copy.
+PROGRAM="$(ducktape agent model-program dogfood)"
+submit agent "$(jq -nc --argjson program "$PROGRAM" \
+  '{provision:{name:"Dogfood Duck",program:$program}}')"
+MODEL_ACCOUNT="$(query identity "{\"controlled\":{\"by\":$CONTROLLER,\"from\":0,\"limit\":256}}" |
+  jq -er '.accounts | map(select(.name == "Dogfood Duck" and .control.program.executor == "agent")) |
+    if length == 1 then .[0].number else error("choose a unique dogfood program account") end')"
+
+submit runs "$(jq -nc --argjson account "$MODEL_ACCOUNT" '{
+  configure_model:{operation:{register_model:{
+    account:$account, agent_id:"dogfood", display_name:"Dogfood Duck",
+    capability:"<your provider tag>",
+    allowed_actions:["chat.post","chat.post_message","tasks.create","tasks.update_status",
+                     "pages.comment","pages.set_checked"],
+    caps:{forge_read:["ducktape"],forge_push:["ducktape"],pages_write:["*"],
+          duckfs_read:["/shared/skills"]},
+    skills:[{name:"dogfood",source_prefix:"/shared/skills/dogfood",load:"always"}]
+  }}}
+}')"
+
+query runs '{"model":{"query":{"agent":{"agent_id":"dogfood"}}}}'
 ```
 
-Notes on the shape (don't improvise past these):
+The final reply is model.agent; its account must equal MODEL_ACCOUNT.
+IdentityQuery::Controlled is paged; use its from cursor when the controller
+already owns more than 256 accounts. Names are display labels, so the
+selection above fails if the controller has several Dogfood Duck accounts.
 
-- `payload` is the agent module's `AgentMsg` enum as JSON (snake_case
-  externally tagged); the field set is
-  `crates/modules/apps/agent/src/interface.rs`.
-- Grant caps **at registration**. `UpdateAgent` is owner-gated to the
-  registering origin, so a form-registered agent (app origin) can't be
-  cap-patched later from a `curl` with a different origin.
-- Cap semantics: `forge_read`/`forge_push` name repos exactly (push implies
-  read); `pages_write` is page-id-scoped with `"*"` meaning every page — no
-  prefix matching; `duckfs_read` over `/shared/skills` is the library grant
-  every run reads its mounted skills through.
-- A skill ref without `source_snapshot` TRACKS the library's committed head;
-  pin it to a snapshot id to freeze the persona.
-
-Verify: the agent shows in the Agents view with its grants, caps and skills.
+ConfigureModel wraps runs::ModelMsg from
+crates/modules/apps/runs/src/model.rs. The current program account or its
+live identity controller can update the record. Forge caps name exact repos;
+pages_write names exact page ids, with "*" permitting all page ids at the
+runs validation layer. Source modules still enforce their own ownership.
+A skill without source_snapshot follows the committed library head; supply
+a snapshot id to pin it. The app's Agents view lists the resulting model,
+its grants and its controller.
 
 ## 3. Write the spec in Pages
 
 Create a page in the **Pages** view. Use **to-do blocks** for the task items
 — `pages.set_checked` only applies to todo-kind blocks, so a checklist gives
-the agent something to tick as it lands work.
+you a checklist to tick as the model reports completed work. A model can
+change todo blocks only on pages authored by its own program account.
 
 Note the **page id**: the app mints a UUID per page (the root block id). It
 isn't shown in the editor chrome; recover it from the pages view (the index
@@ -177,8 +190,8 @@ One limit: refs sitting past the 16 KiB item-body truncation point
 ## 5. Mention the agent — and iterate in the PR
 
 In the issue's **Discussion** tab, `@`-mention the agent (the composer's
-typeahead resolves it; the first mention in an unwatched channel creates the
-runs watch automatically). The run then:
+typeahead resolves its account). The message commits, attribution delivers
+the mention, and its program calls runs to start model work. The run then:
 
 1. provisions a **detached** worktree at the pinned base commit (never
    holding the branch), with its skills mounted read-only beside it,
@@ -190,8 +203,9 @@ runs watch automatically). The run then:
 source branch verbatim, so follow-up commits land on the same branch.
 
 While it works, the agent can `pages.comment` on spec blocks (comments land
-agent-authored on the page) and `pages.set_checked` the todo items — the
-block-anchored commentary layer. A pages action that fails its gate (cap
+authored by its program account on the page). The human page author ticks
+the spec todos; `pages.set_checked` is available only for pages the program
+account itself authored. A pages action that fails its gate (cap
 deny, bad target, squatted id) degrades **individually** — that one action is
 dropped and the run still delivers its reply and other effects, with the
 drop reason recorded as a `runs` breadcrumb on the run. If a comment didn't
@@ -203,7 +217,7 @@ block/page id is correct.
 - **Forge view**: the PR (files/diff, merge box), the `agent/item-<n>`
   branch, and the discussion trail.
 - **The spec page**: agent-authored comment threads anchored to the blocks
-  they discuss; ticked todos (unattributed — checking stores no author).
+  they discuss; todos checked by their page author.
 - **Agents → Activity**: the delivered-runs history (last-100 ring) with
   per-run duration **in blocks** and a `PR #<n>` chip linking run to
   artifact; above it the **UsageCard** — whose subscription carried how much,

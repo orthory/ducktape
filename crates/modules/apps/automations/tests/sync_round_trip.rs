@@ -30,10 +30,9 @@ use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
-/// drives `execute` with a controllable env. the only sibling read the ops
-/// below make is the fire path's owner-standing probe (the fired rule is an
-/// otherwise probe-free `DeliverInbox` with static templates), answered here
-/// as an open channel does — admitted.
+/// Drives `execute` with a controllable env. Identity resolves the operator
+/// account and chat admits the fire path's owner-standing probe. The fired
+/// report uses static templates and is published through attribution.
 fn ctx(height: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(Env {
         height,
@@ -156,8 +155,8 @@ fn synced_store_reconstructs_source_root_rules_and_history() {
                 "alpha",
                 None,
                 Action::Report {
-                    // #1739: `DeliverInbox` may reach only the rule owner's
-                    // own inbox queue -- `operator()`'s literal `ext:{hex}`.
+                    // Reports may attribute only the rule owner's account,
+                    // which the identity fixture resolves to account 1.
                     recipient: 1,
                     kind: "note".into(),
                     body_template: "a post landed".into(),

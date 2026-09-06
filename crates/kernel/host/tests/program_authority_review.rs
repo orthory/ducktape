@@ -8,6 +8,7 @@ use host::{BlockContext, CallDisposition, Host, MemberOutcome, SubmitError};
 use identity::{Identity, IdentityMsg, KeyScheme, ProgramStanding};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot};
 use sdk_testkit::MemStore;
+use std::{cell::Cell, rc::Rc};
 
 const PROGRAM: u64 = 3;
 
@@ -235,4 +236,79 @@ fn rejecting_sole_submit_commits_nothing_but_batch_can_run_pending_work() {
     assert_eq!(batch.calls[0].disposition, CallDisposition::Applied);
     assert_ne!(host.module_root("target"), Some(StateRoot::ZERO));
     assert_eq!(pending_calls(&host), 0);
+}
+
+struct UnreadableIdentity(StateRoot);
+
+#[async_trait::async_trait(?Send)]
+impl Module for UnreadableIdentity {
+    fn id(&self) -> ModuleId {
+        "identity".into()
+    }
+
+    fn root(&self) -> StateRoot {
+        self.0
+    }
+
+    async fn execute(&mut self, _: &mut dyn Ctx, _: &Msg) -> Result<(), Error> {
+        panic!("the failing identity is only queried");
+    }
+
+    async fn query(&self, _: &[u8]) -> Result<Vec<u8>, Error> {
+        Err(Error::Module("injected identity read failure".into()))
+    }
+}
+
+struct StageProbe(Rc<Cell<bool>>);
+
+#[async_trait::async_trait(?Send)]
+impl Module for StageProbe {
+    fn id(&self) -> ModuleId {
+        "stage-probe".into()
+    }
+
+    fn root(&self) -> StateRoot {
+        StateRoot::ZERO
+    }
+
+    async fn execute(&mut self, _: &mut dyn Ctx, _: &Msg) -> Result<(), Error> {
+        self.0.set(true);
+        Ok(())
+    }
+
+    async fn abort_block(&mut self) -> Result<(), Error> {
+        self.0.set(false);
+        Ok(())
+    }
+
+    async fn commit_block(&mut self) -> Result<(), Error> {
+        panic!("an authority read failure must never commit the preceding member");
+    }
+}
+
+#[test]
+fn authority_read_failure_aborts_preceding_member_writes() {
+    let mut host = with_pending_call();
+    let prepared = block_on(host.prepare_work(5)).unwrap();
+    let identity_root = host.module_root("identity").unwrap();
+    host.register(Box::new(UnreadableIdentity(identity_root)));
+    let staged = Rc::new(Cell::new(false));
+    host.register(Box::new(StageProbe(staged.clone())));
+    let before = host.root_hash();
+    let result = block_on(host.submit_block_prepared(
+        context(5, Origin::System),
+        vec![host::BlockOp::bare(
+            account_origin(1),
+            Msg {
+                target: "stage-probe".into(),
+                payload: Vec::new(),
+            },
+        )],
+        prepared,
+        &mut host::NoWitness,
+    ));
+    assert!(matches!(result, Err(SubmitError::Fatal(_))));
+    assert!(!staged.get(), "the earlier member's pending write leaked");
+    assert_eq!(host.root_hash(), before);
+    assert_eq!(pending_calls(&host), 1);
 }

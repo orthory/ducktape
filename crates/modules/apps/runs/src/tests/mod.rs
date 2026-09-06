@@ -1068,8 +1068,7 @@ fn page_with_block_count(total: usize, text: &str) -> Vec<pages::Block> {
     blocks
 }
 
-/// a committed module with one watch on "general" under `policy`. the
-/// registry itself lives in each ctx (`with_registry`), never here.
+/// A module whose current model configuration matches the query fixture.
 fn configured(registry: &Registry) -> RunsModule {
     let mut module = module();
     module.models = registry.clone();

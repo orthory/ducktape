@@ -376,6 +376,31 @@ pub(crate) fn render_page_comment_payload(
     )
 }
 
+/// Compose an inline mention of a page or block. A reply opens a comment
+/// thread on that exact source; it does not edit the source author's content.
+pub(crate) fn render_page_block_payload(
+    agent: &ModelRecord,
+    run_id: &str,
+    block: &pages::Block,
+    portable: PortableInputs,
+) -> String {
+    let author = match &block.author {
+        pages::Party::Key(key) => format!("user:{}", crate::hex(key)),
+        pages::Party::Account(account) => format!("account:{account}"),
+        pages::Party::Module(module) => format!("module:{module}"),
+        pages::Party::System => "system".into(),
+    };
+    envelope(
+        agent,
+        run_id,
+        format!(
+            "Pages inline mention on block {}, in page {}. Reply in a new comment thread on this block.\n\n{author}: {}",
+            block.id, block.page, block.text
+        ),
+        portable,
+    )
+}
+
 /// the transcript block, rendered exactly as the flat-payload era did — the
 /// host feeds it to the model verbatim, so the wording is part of the
 /// committed prompt input.

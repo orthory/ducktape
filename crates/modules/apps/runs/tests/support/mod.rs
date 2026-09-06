@@ -40,9 +40,14 @@ impl Network {
     pub async fn new() -> Self {
         let mut valset = valset::Valset::new("valset", store(), "governance");
         valset.seed(vec![8; 32]).await.unwrap();
+        valset.seed(vec![7; 32]).await.unwrap();
         valset.finish_seed().await.unwrap();
         let host = Host::genesis(vec![
-            Box::new(identity::Identity::new("identity", store(), "runs-test".into())),
+            Box::new(identity::Identity::new(
+                "identity",
+                store(),
+                "runs-test".into(),
+            )),
             Box::new(
                 attribution::AttributionModule::new("attribution", store())
                     .with_subscribers(["agent"]),
@@ -61,9 +66,24 @@ impl Network {
                     .with_identity("identity")
                     .with_attribution("attribution"),
             ),
+            Box::new(
+                pages::Pages::new("pages", store())
+                    .with_identity("identity")
+                    .with_attribution("attribution"),
+            ),
             Box::new(valset),
-            Box::new(capability::CapabilityRegistry::new("capability", store(), Some("valset".into()))),
-            Box::new(saga::SagaModule::with_assignment("saga", store(), "valset", "capability", saga::LeasePolicy::Open)),
+            Box::new(capability::CapabilityRegistry::new(
+                "capability",
+                store(),
+                Some("valset".into()),
+            )),
+            Box::new(saga::SagaModule::with_assignment(
+                "saga",
+                store(),
+                "valset",
+                "capability",
+                saga::LeasePolicy::Open,
+            )),
             Box::new(dispatch::DispatchModule::new(
                 "dispatch",
                 "saga",
@@ -76,28 +96,43 @@ impl Network {
                 "attribution",
                 store(),
             )),
-            Box::new(runs::RunsModule::new(
-                "runs",
-                "chat",
-                "saga",
-                "attribution",
-                "dispatch",
-                "agent",
-                Some("tasks".into()),
-                Some("tasks".into()),
-            )),
+            Box::new(
+                runs::RunsModule::new(
+                    "runs",
+                    "chat",
+                    "saga",
+                    "attribution",
+                    "dispatch",
+                    "agent",
+                    Some("tasks".into()),
+                    Some("tasks".into()),
+                )
+                .with_pages_module("pages"),
+            ),
         ])
         .unwrap();
-        Self { host, height: 0, events: Vec::new() }
+        Self {
+            host,
+            height: 0,
+            events: Vec::new(),
+        }
     }
     pub async fn submit(&mut self, origin: Origin, message: Msg) {
         self.height += 1;
-        let outcome = self.host.submit_at(context(self.height, origin), message).await.unwrap();
+        let outcome = self
+            .host
+            .submit_at(context(self.height, origin), message)
+            .await
+            .unwrap();
         self.events.extend(outcome.events);
     }
     pub async fn step(&mut self) {
         self.height += 1;
-        let outcome = self.host.submit_block(context(self.height, Origin::System), Vec::new()).await.unwrap();
+        let outcome = self
+            .host
+            .submit_block(context(self.height, Origin::System), Vec::new())
+            .await
+            .unwrap();
         self.events.extend(outcome.events);
     }
     pub async fn drain(&mut self) {
@@ -153,7 +188,17 @@ impl Network {
         self.provision_program(runs::model_program("builder")).await
     }
     pub async fn provision_program(&mut self, program: agent::Program) -> String {
-        self.submit(provider(), msg("capability", &capability::CapabilityMsg::Announce { capabilities: vec!["model-1".into()], resources: Default::default() })).await;
+        self.submit(
+            provider(),
+            msg(
+                "capability",
+                &capability::CapabilityMsg::Announce {
+                    capabilities: vec!["model-1".into()],
+                    resources: Default::default(),
+                },
+            ),
+        )
+        .await;
         self.submit(
             member(),
             msg(
@@ -254,7 +299,9 @@ impl Network {
         else {
             panic!("dispatch reply");
         };
-        let dispatch::DispatchStatus::AwaitingResult { saga_id } = dispatched.status else { panic!("work was not announced"); };
+        let dispatch::DispatchStatus::AwaitingResult { saga_id } = dispatched.status else {
+            panic!("work was not announced");
+        };
         self.submit(
             provider(),
             msg(
@@ -280,4 +327,3 @@ impl Network {
         run.run_id.clone()
     }
 }
-

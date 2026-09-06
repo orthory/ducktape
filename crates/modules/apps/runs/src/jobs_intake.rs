@@ -138,7 +138,7 @@ impl RunsModule {
                     relations: vec![attribution::Relation {
                         recipient: agent.account,
                         reason: attribution::Reason::Defined("model_run".into()),
-                        detail: super::encode_msg(&super::RunsMsg::RequestJobRun {
+                        detail: sdk::wire::encode(&super::engagement::RunRequest::Job {
                             agent_id: agent_id.into(),
                             job_id,
                         }),

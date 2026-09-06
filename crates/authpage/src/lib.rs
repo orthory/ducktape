@@ -1134,6 +1134,7 @@ mod tests {
             added_at: 0,
         };
         let account = identity::AccountView {
+            control: identity::Control::Keys,
             number: 11,
             name: "alice".into(),
             keys: vec![

@@ -11,6 +11,7 @@
 //! `module-root` read resolved by the runtime's memoized replay — are pinned
 //! against a shared sink module.
 
+use attribution::AttributionModule;
 use chat::{
     Block, Chat, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS, PostPolicy, decode_reply,
     encode_msg, encode_query, huddle_join_preimage,
@@ -21,7 +22,6 @@ use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::Digest as _;
 use statesync::qmdb::{QmdbStore, QmdbSyncReq, encode_qmdb_req};
-use tagging::TaggingModule;
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the module crate's guest port by
@@ -74,7 +74,6 @@ fn post(channel: &str, id: &str, text: &str, thread: Option<u64>) -> ChatMsg {
         message_id: id.into(),
         blocks: vec![Block::paragraph(text)],
         thread,
-        as_agent: None,
     }
 }
 
@@ -125,15 +124,20 @@ async fn native_host(context: &deterministic::Context) -> Host {
     Host::genesis(vec![
         Box::new(
             Chat::new("chat", Box::new(store))
-                .with_tagging("tagging")
+                .with_attribution("attribution")
                 .with_identity("identity"),
         ),
         // the production tag-report target, kept NATIVE in both hosts for
         // isolation: this proof is about the chat cutover, and an identical
-        // native tagging on both sides absorbs the emitted follow-ups
+        // native attribution on both sides absorbs the emitted follow-ups
         // identically.
-        Box::new(TaggingModule::new(
-            "tagging",
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "parity".into(),
+        )),
+        Box::new(AttributionModule::new(
+            "attribution",
             Box::new(sdk_testkit::MemStore::new()),
         )),
         Box::new(HookSink::new()),
@@ -145,13 +149,18 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
     let store = QmdbStore::init(context.child("wasm_chat"), "chat").await;
     Host::genesis(vec![
         Box::new(
-            // NOTE: no `.with_tagging`/`.with_identity` here — the guest
+            // NOTE: no `.with_attribution`/`.with_identity` here — the guest
             // compiles the exact production builder chain
-            // (`Chat::new(..).with_tagging(..).with_identity(..)`) in.
+            // (`Chat::new(..).with_attribution(..).with_identity(..)`) in.
             WasmModule::with_store("chat", CHAT_WASM, Box::new(store)).expect("load component"),
         ),
-        Box::new(TaggingModule::new(
-            "tagging",
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "parity".into(),
+        )),
+        Box::new(AttributionModule::new(
+            "attribution",
             Box::new(sdk_testkit::MemStore::new()),
         )),
         Box::new(HookSink::new()),
@@ -192,11 +201,12 @@ async fn replies(h: &Host, channel: &str, message_id: &str) -> Vec<Vec<u8>> {
     out
 }
 
-/// chat + tagging + sink: the whole observable state of one host.
+/// chat + attribution + sink: the whole observable state of one host.
 fn roots(h: &Host) -> (StateRoot, StateRoot, StateRoot) {
     (
         h.module_root("chat").expect("chat registered"),
-        h.module_root("tagging").expect("tagging registered"),
+        h.module_root("attribution")
+            .expect("attribution registered"),
         h.module_root("sink").expect("sink registered"),
     )
 }
@@ -309,7 +319,7 @@ fn same_ops_identical_roots_block_by_block() {
                 alice.clone(),
                 ChatMsg::SetMembership {
                     channel_id: "private".into(),
-                    user: bob.clone(),
+                    party: chat::Party::Key(bob.clone()),
                     member: true,
                 },
                 true,
@@ -331,7 +341,7 @@ fn same_ops_identical_roots_block_by_block() {
                 true,
             ),
             // this post fans out: a ChatEvent follow-up to the sink (pinned by
-            // the sink root) plus the tagging report, all in the same block.
+            // the sink root) plus the attribution report, all in the same block.
             (
                 alice.clone(),
                 post("general", "m4", "hook this", None),
@@ -361,7 +371,7 @@ fn same_ops_identical_roots_block_by_block() {
                 alice.clone(),
                 ChatMsg::SweepHuddle {
                     channel_id: "general".into(),
-                    user: bob.clone(),
+                    party: chat::Party::Key(bob.clone()),
                 },
                 true,
             ),
@@ -459,7 +469,7 @@ fn sync_handle_matches_native() {
             "chat",
             Box::new(QmdbStore::init(context.child("rev_native"), "chat").await),
         )
-        .with_tagging("tagging");
+        .with_attribution("attribution");
         let wasm = WasmModule::with_store(
             "chat",
             CHAT_WASM,
@@ -579,18 +589,6 @@ fn rejections_match_and_leave_no_trace() {
                 post("private", "m9", "let me in", None),
                 "members-only",
             ),
-            // `as_agent` demands a module origin.
-            (
-                alice.clone(),
-                ChatMsg::PostMessage {
-                    channel_id: "general".into(),
-                    message_id: "agent".into(),
-                    blocks: vec![Block::paragraph("i am an agent")],
-                    thread: None,
-                    as_agent: Some("impostor".into()),
-                },
-                "module origin",
-            ),
             // hooking an unregistered module fails the registry check — the
             // sibling module-root read answers `None` on both runtimes.
             (
@@ -615,7 +613,7 @@ fn rejections_match_and_leave_no_trace() {
                 carol.clone(),
                 ChatMsg::SetMembership {
                     channel_id: "general".into(),
-                    user: carol.clone(),
+                    party: chat::Party::Key(carol.clone()),
                     member: true,
                 },
                 "only the owner",
@@ -647,7 +645,7 @@ fn rejections_match_and_leave_no_trace() {
                 alice.clone(),
                 ChatMsg::SetMembership {
                     channel_id: "sink:room".into(),
-                    user: alice.clone(),
+                    party: chat::Party::Key(alice.clone()),
                     member: true,
                 },
                 "is unowned",

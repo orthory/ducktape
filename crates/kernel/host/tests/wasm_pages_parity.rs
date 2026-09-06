@@ -9,6 +9,7 @@
 //! this proof pins that explicitly, unlike whole-state adapter ports whose root
 //! representations differ.
 
+use attribution::AttributionModule;
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use pages::{
@@ -17,7 +18,6 @@ use pages::{
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::Digest as _;
 use statesync::qmdb::{QmdbStore, QmdbSyncReq, encode_qmdb_req};
-use tagging::TaggingModule;
 use wasm_host::WasmModule;
 
 /// GENERATED artifact — built from the `pages` module's guest port by
@@ -99,18 +99,27 @@ impl Module for QueryProbe {
 }
 
 /// a hook-style sink: accepts any payload, holds no state. registered in both
-/// hosts so pages' tagging follow-ups have somewhere realistic to land beside
-/// the REAL tagging module (see below) without shaping the claim.
+/// hosts so pages' attribution follow-ups have somewhere realistic to land beside
+/// the REAL attribution module (see below) without shaping the claim.
 async fn native_host(context: &deterministic::Context) -> Host {
     let store = QmdbStore::init(context.child("native_pages"), "pages").await;
     Host::genesis(vec![
-        Box::new(Pages::new("pages", Box::new(store)).with_tagging("tagging")),
+        Box::new(
+            Pages::new("pages", Box::new(store))
+                .with_attribution("attribution")
+                .with_identity("identity"),
+        ),
         // the production tag-report target, kept NATIVE in both hosts for
         // isolation: this proof is about the pages cutover, and an identical
-        // native tagging on both sides absorbs the emitted follow-ups
+        // native attribution on both sides absorbs the emitted follow-ups
         // identically.
-        Box::new(TaggingModule::new(
-            "tagging",
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "parity".into(),
+        )),
+        Box::new(AttributionModule::new(
+            "attribution",
             Box::new(sdk_testkit::MemStore::new()),
         )),
         Box::new(QueryProbe::new()),
@@ -122,12 +131,17 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
     let store = QmdbStore::init(context.child("wasm_pages"), "pages").await;
     Host::genesis(vec![
         Box::new(
-            // NOTE: no `.with_tagging` here — the guest compiles the exact
-            // production builder chain (`Pages::new(..).with_tagging`) in.
+            // NOTE: no `.with_attribution` here — the guest compiles the exact
+            // production builder chain (`Pages::new(..).with_attribution`) in.
             WasmModule::with_store("pages", PAGES_WASM, Box::new(store)).expect("load component"),
         ),
-        Box::new(TaggingModule::new(
-            "tagging",
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "parity".into(),
+        )),
+        Box::new(AttributionModule::new(
+            "attribution",
             Box::new(sdk_testkit::MemStore::new()),
         )),
         Box::new(QueryProbe::new()),
@@ -194,7 +208,8 @@ async fn replies(h: &Host) -> Vec<Vec<u8>> {
 fn roots(h: &Host) -> (StateRoot, StateRoot) {
     (
         h.module_root("pages").expect("pages registered"),
-        h.module_root("tagging").expect("tagging registered"),
+        h.module_root("attribution")
+            .expect("attribution registered"),
     )
 }
 
@@ -217,7 +232,7 @@ fn same_ops_identical_roots_block_by_block() {
         assert!(wasm.block_durable_ids().contains("pages"));
 
         // every op family, one block each: tree edits, page nesting, the
-        // comment plane (which also emits the tagging follow-up), and subtree
+        // comment plane (which also emits the attribution follow-up), and subtree
         // removal. `moves` marks blocks that must change the pages root.
         let ops: Vec<(Vec<u8>, PageMsg)> = vec![
             (
@@ -311,7 +326,7 @@ fn same_ops_identical_roots_block_by_block() {
             ),
             // the comment plane: authorship derives from origin, the staged
             // thread is re-read in the SAME dispatch, and the accepted comment
-            // emits the tagging follow-up (dispatched in the same block).
+            // emits the attribution follow-up (dispatched in the same block).
             (
                 alice.clone(),
                 PageMsg::AddComment {
@@ -320,7 +335,6 @@ fn same_ops_identical_roots_block_by_block() {
                     target: "b1".into(),
                     text: "looks good".into(),
                     mentions: vec![],
-                    as_agent: None,
                     anchor: None,
                 },
             ),
@@ -332,7 +346,6 @@ fn same_ops_identical_roots_block_by_block() {
                     target: "b1".into(),
                     text: "agreed".into(),
                     mentions: vec![],
-                    as_agent: None,
                     anchor: None,
                 },
             ),
@@ -445,7 +458,7 @@ fn revision_stays_one_and_the_sync_handle_matches_native() {
             "pages",
             Box::new(QmdbStore::init(context.child("rev_native"), "pages").await),
         )
-        .with_tagging("tagging");
+        .with_attribution("attribution").with_identity("identity");
         let mut wasm = WasmModule::with_store(
             "pages",
             PAGES_WASM,
@@ -520,7 +533,6 @@ fn rejections_match_and_leave_no_trace() {
                     target: "b1".into(),
                     text: "looks good".into(),
                     mentions: vec![],
-                    as_agent: None,
                     anchor: None,
                 }),
             )
@@ -704,7 +716,6 @@ fn multi_dispatch_block_reads_prior_writes_and_mid_block_queries_match() {
                     target: "b1".into(),
                     text: "mid-block".into(),
                     mentions: vec![],
-                    as_agent: None,
                     anchor: None,
                 }),
             ),

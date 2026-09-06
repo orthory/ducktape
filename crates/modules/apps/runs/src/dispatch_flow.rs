@@ -11,11 +11,9 @@ use super::{
 use crate::facets::WireSink;
 
 impl RunsModule {
-    // ---- registry reads --------------------------------------------------------
-    // the agent registry is another module's state; these queries see staged
-    // same-block registrations through the host's live query routing, so a
-    // register-watch-engage cascade works within one block — deterministically,
-    // on every validator.
+    // ---- model configuration reads ---------------------------------------------
+    // Reads include the current execute overlay, so an admitted configuration
+    // change is visible to later model work in consensus order.
 
     /// one registry record, or `None` when the agent isn't registered.
     pub(super) async fn agent_record(
@@ -96,7 +94,7 @@ impl RunsModule {
 
     /// chat's answer to "may `user` post to `channel_id`" — the standing an
     /// explicit `RequestRun` submitter must hold before this module pins that
-    /// channel's transcript and posts a reply into it under module authority.
+    /// channel's transcript for a model run whose program may reply there.
     /// post standing covers read (chat's [`ChatReply::may_post`] implies
     /// `may_read`), so this one query is the whole gate. an unexpected or
     /// failed reply answers `false` — the submission fails closed rather than
@@ -389,7 +387,7 @@ impl RunsModule {
     }
 
     /// Prepare a run triggered by one Pages comment. `ordinal` is 1-based in
-    /// the thread and comes from Pages' same-block tag event. `run_id` is the
+    /// the committed source thread. `run_id` is the
     /// caller's, exactly as in [`Self::prepare_dispatch`].
     pub(super) async fn prepare_page_dispatch(
         &self,
@@ -482,10 +480,52 @@ impl RunsModule {
         })
     }
 
-    /// stage a chat run's dispatch — one atomic unit with whatever op caused
-    /// it (P2). the recipe is the agent's own (`agent/{agent_id}`, registered
-    /// by the registry hook); the result lands as a next-block `ResultEvent`
-    /// keyed by the dispatch id, which prunes the entry staged here.
+    /// A page is also a block. Resolve the exact attributed block, then use
+    /// the same bounded page context as comment-triggered model work.
+    pub(super) async fn prepare_page_block_dispatch(
+        &self,
+        ctx: &dyn Ctx,
+        agent: &ModelRecord,
+        run_id: &str,
+        block_id: &str,
+        budget: &SiblingReadBudget,
+    ) -> Result<PreparedDispatch, String> {
+        let generation = self
+            .active_generation(ctx, agent.account)
+            .await
+            .map_err(|e| e.to_string())?;
+        let pages = self
+            .pages
+            .as_deref()
+            .ok_or_else(|| "pages module is not configured".to_string())?;
+        let block = self.page_block(ctx, pages, block_id).await?;
+        let mut portable = self.portable_inputs(ctx, agent, &[]).await?;
+        let blocks = self
+            .page_blocks_for_execute(ctx, pages, &block.page, budget)
+            .await;
+        portable.context = Some(inject::render_pages_section(
+            &[(block.page.clone(), blocks)],
+            &self.net_query(),
+        ));
+        let payload =
+            envelope::render_page_block_payload(agent, run_id, &block, portable).into_bytes();
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "composed payload is {} bytes; the dispatch cap is {MAX_PAYLOAD_BYTES}",
+                payload.len()
+            ));
+        }
+        Ok(PreparedDispatch {
+            account: agent.account,
+            generation,
+            thread_root: None,
+            payload,
+        })
+    }
+
+    /// Stage a source-backed run and its dispatch atomically. The model's
+    /// configured recipe returns a `ResultEvent` keyed by the dispatch id,
+    /// which prunes the pending entry staged here.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn stage_dispatch_run(
         &mut self,

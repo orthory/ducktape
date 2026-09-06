@@ -95,6 +95,42 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
     assert!(anchor.is_none());
 }
 
+#[test]
+fn inline_page_composer_keeps_the_exact_source_when_page_context_is_bounded() {
+    let registry = registry(&[("bot", &[ACTION_PAGES_COMMENT])]);
+    let model = registry.get("bot").unwrap();
+    let mut module = module().with_pages_module("pages");
+    module.models = registry.clone();
+    let mut blocks = page_with_block_count(1024, &"x".repeat(4096));
+    let target = blocks.last_mut().unwrap();
+    target.text = "Review this exact final block".into();
+    let target_id = target.id.clone();
+    let ctx = CaptureCtx::new()
+        .with_program_origin()
+        .with_registry(&registry)
+        .with_page("plan", blocks);
+    let prepared = block_on(module.prepare_page_block_dispatch(
+        &ctx,
+        model,
+        "inline-run",
+        &target_id,
+        &SiblingReadBudget::default(),
+    ))
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(&prepared.payload).unwrap();
+    let context = payload["context"].as_str().unwrap();
+    assert!(context.len() <= inject::PAGE_CONTEXT_BYTES);
+    assert!(context.contains("page context truncated at 64 KiB"));
+    let conversation = payload["conversation"].as_str().unwrap();
+    assert!(conversation.contains(&target_id));
+    assert!(conversation.contains("Review this exact final block"));
+    assert_eq!(
+        ctx.page_query_count(),
+        1,
+        "composition stops when its context is full"
+    );
+}
+
 // ---- the pages effects lane (M2) ---------------------------------------------
 // pages.comment / pages.set_checked applied at the run boundary: grant + cap
 // gated, probe-guarded, and — unlike the task lane — degrading PER ACTION.
@@ -319,7 +355,7 @@ fn set_checked_requires_a_todo_block_and_carries_no_attribution() {
     assert_eq!(msgs.len(), 1);
     assert!(
         matches!(&msgs[0], PageMsg::SetChecked { block_id, checked: true } if block_id == "b-t"),
-        "SetChecked carries no as_agent — origin-gated only: {:?}",
+        "SetChecked prepares the selected block operation: {:?}",
         msgs[0]
     );
     assert!(

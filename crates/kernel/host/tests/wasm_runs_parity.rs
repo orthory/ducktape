@@ -1,57 +1,13 @@
-//! the adapter-port equivalence proof for the runs cutover — the FINAL
-//! portable module: the `runs` guest component (the NATIVE `runs` crate
-//! compiled to wasm behind `ducktape-module-sdk`) and the native `RunsModule`
-//! answer the SAME op sequence with IDENTICAL query replies, emit IDENTICAL
-//! event traces (WorkerRequests included), land IDENTICAL follow-ups on every
-//! sibling, and their roots move in lockstep. the roots THEMSELVES differ:
-//! the port persists the native canonical snapshot as one host-KV value plus
-//! the delivered-runs ring under its own key. This proof pins that current v1
-//! layout from genesis (runs' empty canonical encoding carries THREE zero
-//! counts, the empty host-KV store ONE — different preimages).
-//!
-//! runs is the collaboration loop's actor, so this proof drives the REAL
-//! loop (the `crates/modules/apps/runs/tests/collaboration_loop.rs` shape) through
-//! both runtimes side by side: both hosts carry the REAL native siblings
-//! under the production ids (`bin/node/src/host_state.rs`) — chat and pages
-//! over their own qmdb stores, tagging, saga, DISPATCH (native in production
-//! too: its read facade serves COMMITTED-ONLY state by design, and runs'
-//! `turn_taken` / `lease_holder` reads depend on exactly that view), agent,
-//! tasks, jobs, and files over an on-disk odb. forge alone stays unwired
-//! (vendored libgit2 has no place in this proof); the runs module documents
-//! that degradation — the PR sink and forge-channel compose degrade to
-//! breadcrumbs — and the guest carries the production `.with_sink_forge`
-//! wiring regardless, identically to the native twin.
-//!
-//! surfaces this proof leans on beyond the usual reply/root matrix:
-//!
-//! * THE LOOP (P2/P4/P6): watch → mention → same-block pending entry +
-//!   dispatch + saga trigger (+ the WorkerRequest event the reactor feeds
-//!   workers from) → oracle result → next-block delivery: the validated
-//!   reply (authored as the AGENT), the task write, and the entry prune all
-//!   commit in the one delivery block — byte-identically on both runtimes.
-//! * READ-YOUR-WRITES: a watch and the mention post that engages it in ONE
-//!   block; a duplicate `RequestRun` no-opping against the SAME-BLOCK staged
-//!   turn claim — on the wasm side each later dispatch reloads the prior
-//!   dispatch's staged `__state`.
-//! * THE SESSION LANE: the real lease path (saga Accept → committed
-//!   assignee), the open/act authorizations, the budget counter, and the
-//!   prune-with-the-run close-out.
-//! * THE JOBS LANE: submit → same-block claim + dispatch, delivery-block
-//!   finalize.
-//! * THE DELIVERED-RUNS RING: derived per-node state outside the NATIVE
-//!   root/snapshot, but persisted by the guest under its own `__history` key
-//!   (the app's runs client and the dogfood receipt lane read it) — so
-//!   `RunsQuery::RecentRuns` answers IDENTICALLY on both runtimes, record
-//!   for record, and it sits in the equality matrix like every other reply.
-
-use agent::{
-    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentModule,
-    AgentMsg, AgentResponse, ReplyBlock, ResourceCaps, SkillRef, encode_msg as agent_encode_msg,
-    encode_response,
-};
-use capability::{CapabilityMsg, CapabilityRegistry, encode_msg as capability_encode_msg};
+//! Native/guest parity for programmable model users: real account mentions,
+//! deferred program calls, bounded context composition, isolated rejections,
+//! leased interactive sessions and job finalization. Both hosts run the same
+//! native siblings; only runs changes runtime. Every block compares events,
+//! decoded queries and sibling roots. Runs roots use different physical layouts.
+use agent::AgentModule;
+use attribution::AttributionModule;
+use capability::{CapabilityMsg, CapabilityRegistry};
 use chat::{
-    AuthorRef, Block, Chat, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span,
+    Block, Chat, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
@@ -64,9 +20,12 @@ use files::Files;
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use pages::Pages;
 use runs::{
-    RunsModule, RunsMsg, RunsQuery, RunsReply, TurnPolicy, decode_reply as runs_decode_reply,
-    dispatch_id_for, encode_msg as runs_encode_msg, encode_query as runs_encode_query,
-    job_run_id_for, reply_message_id, run_id_for,
+    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentResponse,
+    ReplyBlock, ResourceCaps, SkillRef, encode_response,
+};
+use runs::{
+    RunsModule, RunsMsg, RunsQuery, RunsReply, decode_reply as runs_decode_reply, dispatch_id_for,
+    encode_msg as runs_encode_msg, encode_query as runs_encode_query, reply_message_id,
 };
 use saga::{
     SagaMsg, SagaQuery, SagaReply, decode_reply as saga_decode_reply, decode_worker_request,
@@ -74,7 +33,6 @@ use saga::{
 };
 use sdk::{Error, Event, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
-use tagging::TaggingModule;
 use tasks::{JobsMsg, encode_job_msg as jobs_encode_msg};
 use tasks::{
     TaskQuery, TaskReply, Tasks, decode_task_reply as tasks_decode_reply,
@@ -111,7 +69,7 @@ fn native_runs() -> RunsModule {
         "runs",
         "chat",
         "saga",
-        "tagging",
+        "attribution",
         "dispatch",
         "agent",
         Some("tasks".into()),
@@ -140,25 +98,47 @@ async fn siblings(
     let pages_store = QmdbStore::init(context.child(pages_label), "pages").await;
     let agent_store = QmdbStore::init(context.child(agent_label), "agent").await;
     let mut modules: Vec<Box<dyn sdk::Module>> = vec![
-        Box::new(Chat::new("chat", Box::new(chat_store)).with_tagging("tagging")),
-        Box::new(Pages::new("pages", Box::new(pages_store)).with_tagging("tagging")),
-        Box::new(TaggingModule::new(
-            "tagging",
+        Box::new(
+            Chat::new("chat", Box::new(chat_store))
+                .with_identity("identity")
+                .with_attribution("attribution"),
+        ),
+        Box::new(
+            Pages::new("pages", Box::new(pages_store))
+                .with_identity("identity")
+                .with_attribution("attribution"),
+        ),
+        Box::new(
+            AttributionModule::new("attribution", Box::new(sdk_testkit::MemStore::new()))
+                .with_subscribers(["agent"]),
+        ),
+        Box::new(identity::Identity::new(
+            "identity",
             Box::new(sdk_testkit::MemStore::new()),
+            PARITY_CHAIN_ID.into(),
         )),
         Box::new(saga),
         Box::new(DispatchModule::new(
             "dispatch",
             "saga",
+            "identity",
             Box::new(sdk_testkit::MemStore::new()),
         )),
         Box::new(AgentModule::new(
             "agent",
             Box::new(agent_store),
-            "saga",
-            Some("runs".into()),
+            agent::Siblings {
+                identity: "identity".into(),
+                attribution: "attribution".into(),
+                dispatch: "dispatch".into(),
+            },
         )),
-        Box::new(Tasks::new("tasks", Box::new(sdk_testkit::MemStore::new()))),
+        Box::new(Tasks::new(
+            "tasks",
+            "identity",
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(Files::open("files", files_dir).expect("files open")),
     ];
     if let Some(members) = assignment_members {
@@ -181,11 +161,7 @@ async fn siblings(
     modules
 }
 
-async fn native_host(context: &deterministic::Context, files_dir: std::path::PathBuf) -> Host {
-    native_host_with_assignment(context, files_dir, None).await
-}
-
-/// like [`native_host`], but when `assignment_members` is given, saga is
+/// When assignment_members is given, saga is
 /// wired with `with_assignment` (a real valset + capability registry,
 /// seeded with those members) instead of the bare `new` — `Accept`'s
 /// standing/capability gate needs a real valset to admit a claim against.
@@ -221,11 +197,7 @@ async fn native_host_with_assignment(
     Host::genesis(modules).expect("genesis")
 }
 
-async fn wasm_host_(context: &deterministic::Context, files_dir: std::path::PathBuf) -> Host {
-    wasm_host_with_assignment(context, files_dir, None).await
-}
-
-/// like [`wasm_host_`], but see [`native_host_with_assignment`].
+/// The guest host carries the same assignment registry as its native twin.
 async fn wasm_host_with_assignment(
     context: &deterministic::Context,
     files_dir: std::path::PathBuf,
@@ -276,36 +248,29 @@ fn runs_op(m: &RunsMsg) -> Msg {
     }
 }
 
-fn quackbot_ref() -> AuthorRef {
-    AuthorRef::Agent {
-        module: "runs".into(),
-        agent_id: "quackbot".into(),
-    }
-}
-
-fn register_quackbot(actions: Vec<String>) -> Msg {
-    register_agent("quackbot", "Quackbot", actions, None, None)
+fn quackbot_ref() -> Party {
+    Party::Account(2)
 }
 
 fn register_agent(
+    account: u64,
     agent_id: &str,
-    display_name: &str,
     actions: Vec<String>,
     caps: Option<ResourceCaps>,
     skills: Option<Vec<SkillRef>>,
 ) -> Msg {
-    Msg {
-        target: "agent".into(),
-        payload: agent_encode_msg(&AgentMsg::RegisterAgent {
+    runs_op(&RunsMsg::ConfigureModel {
+        operation: runs::ModelMsg::RegisterModel {
+            account,
             agent_id: agent_id.into(),
-            display_name: display_name.into(),
+            display_name: agent_id.into(),
             capability: "mock-llm-1".into(),
             allowed_actions: actions,
             recipe_hash: None,
             caps,
             skills,
-        }),
-    }
+        },
+    })
 }
 
 fn create_channel(channel_id: &str) -> Msg {
@@ -317,13 +282,6 @@ fn create_channel(channel_id: &str) -> Msg {
             post_policy: PostPolicy::Open,
         }),
     }
-}
-
-fn watch_channel(channel_id: &str) -> Msg {
-    runs_op(&RunsMsg::WatchChannel {
-        channel_id: channel_id.into(),
-        policy: TurnPolicy::Mention,
-    })
 }
 
 /// a user post mentioning quackbot — what fires the engagement intake.
@@ -342,7 +300,6 @@ fn mention_post(channel_id: &str, message_id: &str) -> Msg {
                 Span::plain(" can you pick this up?"),
             ])],
             thread: None,
-            as_agent: None,
         }),
     }
 }
@@ -356,7 +313,6 @@ fn plain_post(channel_id: &str, message_id: &str) -> Msg {
             message_id: message_id.into(),
             blocks: vec![Block::paragraph("an anchor, nothing more")],
             thread: None,
-            as_agent: None,
         }),
     }
 }
@@ -364,7 +320,7 @@ fn plain_post(channel_id: &str, message_id: &str) -> Msg {
 /// One all-policy trigger whose reference set consumes most of Runs' shared
 /// sibling-read ledger on the first compose. Later composes may replay those
 /// exact reads for free; only their agent and turn lookups are new.
-fn reference_post(channel_id: &str, message_id: &str) -> Msg {
+fn reference_post(channel_id: &str, message_id: &str, accounts: std::ops::Range<u64>) -> Msg {
     let mut text = (0..50)
         .map(|index| format!("[page-{index}](duck://page/page-{index})"))
         .collect::<Vec<_>>()
@@ -375,17 +331,15 @@ fn reference_post(channel_id: &str, message_id: &str) -> Msg {
         payload: chat_encode_msg(&ChatMsg::PostMessage {
             channel_id: channel_id.into(),
             message_id: message_id.into(),
-            blocks: vec![Block::paragraph(text)],
+            blocks: vec![Block::Paragraph(vec![Span {
+                text,
+                marks: accounts
+                    .map(|account| Mark::Mention(Party::Account(account)))
+                    .collect(),
+            }])],
             thread: None,
-            as_agent: None,
         }),
     }
-}
-
-/// a benign op to advance one block — what triggers the hosts' committed
-/// delivery injection.
-fn noop_block(n: u64) -> Msg {
-    create_channel(&format!("noop-{n}"))
 }
 
 /// the minimal host-assembled runner-result wrapper the oracle ALWAYS
@@ -422,147 +376,6 @@ fn canned_response(run_id: &str) -> Vec<u8> {
     })
 }
 
-/// the read matrix: every runs query — the delivered-runs ring included,
-/// because the guest persists it under `__history` and must serve it
-/// record-for-record (the loop test additionally decodes it).
-async fn replies(h: &Host) -> Vec<Vec<u8>> {
-    let queries = [
-        runs_encode_query(&RunsQuery::PendingRuns),
-        runs_encode_query(&RunsQuery::Watches),
-        runs_encode_query(&RunsQuery::AgentSessions),
-        runs_encode_query(&RunsQuery::RecentRuns),
-    ];
-    let mut out = Vec::new();
-    for q in &queries {
-        out.push(h.query("runs", q).await.expect("query"));
-    }
-    out
-}
-
-fn root_of(h: &Host) -> StateRoot {
-    h.module_root("runs").expect("runs registered")
-}
-
-const SIBLING_IDS: [&str; 9] = [
-    "chat", "pages", "tagging", "saga", "dispatch", "agent", "tasks", "jobs", "files",
-];
-
-fn event_tuples(events: &[Event]) -> Vec<(String, Vec<u8>)> {
-    events
-        .iter()
-        .map(|e| (e.source.clone(), e.payload.clone()))
-        .collect()
-}
-
-/// the worker-claimable subset of a block's events — the exact surface the
-/// host-side reactor feeds executors from.
-fn worker_requests(events: &[Event]) -> Vec<saga::WorkerRequest> {
-    events
-        .iter()
-        .filter_map(|e| decode_worker_request(&e.payload).ok())
-        .collect()
-}
-
-/// submit one ACCEPTED op to both hosts and assert the full parity claim:
-/// identical event traces (decoded work orders included), identical replies,
-/// per-sibling cross-host agreement (the follow-up lanes — a diverging or
-/// missing dispatch/reply/task/claim diverges the sibling roots), and
-/// lockstep runs-root movement.
-async fn roundtrip(
-    native: &mut Host,
-    wasm: &mut Host,
-    height: u64,
-    origin: Origin,
-    m: Msg,
-    moves: bool,
-) -> Vec<saga::WorkerRequest> {
-    let (n_before, w_before) = (root_of(native), root_of(wasm));
-    let n_out = native
-        .submit_at(block(height, origin.clone()), m.clone())
-        .await
-        .expect("native submit");
-    let w_out = wasm
-        .submit_at(block(height, origin), m)
-        .await
-        .expect("wasm submit");
-    assert_eq!(
-        event_tuples(&n_out.events),
-        event_tuples(&w_out.events),
-        "event traces diverge at {height}"
-    );
-    let (n_reqs, w_reqs) = (
-        worker_requests(&n_out.events),
-        worker_requests(&w_out.events),
-    );
-    assert_eq!(
-        n_reqs, w_reqs,
-        "decoded work orders diverge at {height} — the reactor would feed workers differently"
-    );
-    assert_eq!(
-        replies(native).await,
-        replies(wasm).await,
-        "replies diverge after block {height}"
-    );
-    for sibling in SIBLING_IDS {
-        assert_eq!(
-            native.module_root(sibling),
-            wasm.module_root(sibling),
-            "the {sibling} sibling diverged at {height}"
-        );
-    }
-    if moves {
-        assert_ne!(root_of(native), n_before, "native root stuck at {height}");
-        assert_ne!(root_of(wasm), w_before, "wasm root stuck at {height}");
-    } else {
-        assert_eq!(root_of(native), n_before, "native root moved at {height}");
-        assert_eq!(root_of(wasm), w_before, "wasm root moved at {height}");
-    }
-    // the roots themselves always differ (the pinned schema break).
-    assert_ne!(root_of(native), root_of(wasm));
-    n_reqs
-}
-
-/// submit one REJECTED op to both hosts: reasons carry the same needle, and
-/// both runs roots (and every sibling) are byte-identical to pre-block — the
-/// abort lane leaves no trace.
-async fn reject_roundtrip(
-    native: &mut Host,
-    wasm: &mut Host,
-    height: u64,
-    origin: Origin,
-    m: Msg,
-    needle: &str,
-) {
-    let (n_before, w_before) = (root_of(native), root_of(wasm));
-    let n_err = native
-        .submit_at(block(height, origin.clone()), m.clone())
-        .await
-        .expect_err("native must reject");
-    let w_err = wasm
-        .submit_at(block(height, origin), m)
-        .await
-        .expect_err("wasm must reject");
-    let SubmitError::Rejected(Error::Module(n_msg)) = n_err else {
-        panic!("native rejection shape: {n_err:?}");
-    };
-    let SubmitError::Rejected(Error::Module(w_msg)) = w_err else {
-        panic!("wasm rejection shape: {w_err:?}");
-    };
-    assert!(n_msg.contains(needle), "native reason: {n_msg}");
-    assert!(
-        w_msg.contains(needle),
-        "wasm reason must carry the native reason: {w_msg}"
-    );
-    assert_eq!(root_of(native), n_before, "native root moved on reject");
-    assert_eq!(root_of(wasm), w_before, "wasm root moved on reject");
-    for sibling in SIBLING_IDS {
-        assert_eq!(native.module_root(sibling), wasm.module_root(sibling));
-    }
-    assert_eq!(replies(native).await, replies(wasm).await);
-}
-
-/// the saga id a still-awaiting run's work rides on — read off the dispatch
-/// module's COMMITTED-ONLY read facade (identical on both hosts).
 async fn dispatch_saga_id(h: &Host, run_id: &str) -> String {
     let reply = h
         .query(
@@ -676,293 +489,543 @@ async fn agent_sessions(h: &Host) -> Vec<runs::AgentSession> {
     }
 }
 
+const SIBLINGS: &[&str] = &[
+    "identity",
+    "chat",
+    "pages",
+    "attribution",
+    "saga",
+    "dispatch",
+    "agent",
+    "tasks",
+    "files",
+    "valset",
+    "capability",
+];
+const SESSION_KEY: [u8; 32] = [0x11; 32];
+const WORKER_NODE: [u8; 32] = [0x77; 32];
+
+macro_rules! op {
+    ($target:expr, $value:expr $(,)?) => {
+        Msg {
+            target: $target.into(),
+            payload: sdk::wire::encode($value),
+        }
+    };
+}
+
+fn request(agent_id: &str, channel_id: &str, anchor_seq: u64) -> Msg {
+    runs_op(&RunsMsg::RequestRun {
+        agent_id: agent_id.into(),
+        channel_id: channel_id.into(),
+        anchor_seq,
+        demands: Default::default(),
+        skills: Vec::new(),
+    })
+}
+
+fn event_tuples(events: &[Event]) -> Vec<(String, Vec<u8>)> {
+    events
+        .iter()
+        .map(|event| (event.source.clone(), event.payload.clone()))
+        .collect()
+}
+
+async fn replies(host: &Host) -> Vec<Vec<u8>> {
+    let mut replies = Vec::new();
+    for query in [
+        RunsQuery::PendingRuns,
+        RunsQuery::AgentSessions,
+        RunsQuery::RecentRuns,
+        RunsQuery::Model {
+            query: runs::ModelQuery::Agents,
+        },
+    ] {
+        replies.push(
+            host.query("runs", &runs_encode_query(&query))
+                .await
+                .unwrap(),
+        );
+    }
+    replies
+}
+
+#[test]
+fn inline_page_and_block_mentions_preserve_source_and_program_reply_parity() {
+    let directory = tempfile::tempdir().unwrap();
+    deterministic::Runner::default().start(|context| async move {
+        let mut pair = Pair::new(&context, directory.path()).await;
+        pair.provision(
+            2,
+            "quackbot",
+            &[runs::ACTION_PAGES_COMMENT, runs::ACTION_PAGES_SET_CHECKED],
+        )
+        .await;
+        pair.submit(
+            alice(),
+            runs_op(&RunsMsg::ConfigureModel {
+                operation: runs::ModelMsg::UpdateModel {
+                    agent_id: "quackbot".into(),
+                    display_name: None,
+                    capability: None,
+                    allowed_actions: None,
+                    recipe_hash: None,
+                    skills: None,
+                    caps: Some(ResourceCaps {
+                        pages_write: vec!["inline".into()],
+                        ..Default::default()
+                    }),
+                },
+            }),
+        )
+        .await;
+        pair.submit(
+            alice(),
+            op!(
+                "pages",
+                &pages::PageMsg::CreatePage {
+                    page_id: "inline".into(),
+                    title: "Quackbot review this".into(),
+                }
+            ),
+        )
+        .await;
+        pair.submit(
+            alice(),
+            op!(
+                "pages",
+                &pages::PageMsg::InsertBlock {
+                    parent: "inline".into(),
+                    after: None,
+                    block: pages::NewBlock {
+                        id: "inline-todo".into(),
+                        kind: pages::BlockKind::Todo,
+                        text: "Quackbot review the todo".into(),
+                        marks: Vec::new()
+                    },
+                }
+            ),
+        )
+        .await;
+        pair.drain().await;
+        for target in ["inline", "inline-todo"] {
+            pair.submit(
+                alice(),
+                op!(
+                    "pages",
+                    &pages::PageMsg::SetSpanMark {
+                        block_id: target.into(),
+                        start: 0,
+                        end: 8,
+                        kind: pages::InlineMark::Mention(2),
+                        active: true,
+                    }
+                ),
+            )
+            .await;
+            assert!(pending_run_ids(&pair.native).await.is_empty());
+            pair.drain().await;
+            let pending = pending_run_ids(&pair.native).await;
+            assert_eq!(pending.len(), 1);
+            let run = &pending[0];
+            pair.accept(run).await;
+            pair.submit(
+                Origin::External(WORKER_NODE.to_vec()),
+                runs_op(&RunsMsg::OpenAgentSession {
+                    run_id: run.clone(),
+                    session_key: SESSION_KEY.to_vec(),
+                }),
+            )
+            .await;
+            pair.submit(
+                Origin::External(SESSION_KEY.to_vec()),
+                runs_op(&RunsMsg::AgentAction {
+                    run_id: run.clone(),
+                    action: AgentAction::SetPageChecked {
+                        block: "inline-todo".into(),
+                        checked: true,
+                    },
+                }),
+            )
+            .await;
+            pair.drain().await;
+            assert!(matches!(
+                pair.action(&runs::action_request_id(run, 0)).await.status,
+                runs::ActionStatus::Completed {
+                    outcome: dispatch::CallOutcomeSummary::Rejected { .. },
+                    ..
+                }
+            ));
+            pair.settle(run, b"Reviewed this inline mention.".to_vec())
+                .await;
+            let query = pages::encode_query(&pages::PageQuery::CommentThread {
+                thread_id: format!("agent/{}/thread/reply", dispatch_id_for(run)),
+            });
+            let native = pair.native.query("pages", &query).await.unwrap();
+            let wasm = pair.wasm.query("pages", &query).await.unwrap();
+            assert_eq!(native, wasm);
+            let pages::PageReply::CommentThread(Some(thread)) = pages::decode_reply(&wasm).unwrap()
+            else {
+                panic!("actual program reply");
+            };
+            assert_eq!(thread.thread.target, target);
+            assert_eq!(thread.thread.opener, pages::Party::Account(2));
+            assert_eq!(thread.comments[0].author, pages::Party::Account(2));
+            assert_eq!(thread.comments[0].text, "Reviewed this inline mention.");
+            let query = pages::encode_query(&pages::PageQuery::GetBlock {
+                block_id: "inline-todo".into(),
+            });
+            let bytes = pair.wasm.query("pages", &query).await.unwrap();
+            let pages::PageReply::Block(Some(todo)) = pages::decode_reply(&bytes).unwrap() else {
+                panic!("source todo");
+            };
+            assert_eq!(todo.author, pages::Party::Account(1));
+            assert!(!todo.checked);
+            assert!(pending_run_ids(&pair.native).await.is_empty());
+        }
+    });
+}
+
+fn root_of(host: &Host) -> StateRoot {
+    host.module_root("runs").unwrap()
+}
+
+struct Pair {
+    native: Host,
+    wasm: Host,
+    height: u64,
+    requests: Vec<saga::WorkerRequest>,
+}
+impl Pair {
+    async fn new(context: &deterministic::Context, directory: &std::path::Path) -> Self {
+        let members = [WORKER_NODE.to_vec()];
+        let native =
+            native_host_with_assignment(context, directory.join("native"), Some(&members)).await;
+        let wasm = wasm_host_with_assignment(context, directory.join("wasm"), Some(&members)).await;
+        let mut pair = Self {
+            native,
+            wasm,
+            height: 0,
+            requests: Vec::new(),
+        };
+        pair.submit(
+            alice(),
+            op!(
+                "identity",
+                &identity::IdentityMsg::Create {
+                    name: "Alice".into(),
+                    scheme: identity::KeyScheme::Ed25519,
+                },
+            ),
+        )
+        .await;
+        pair.submit(
+            Origin::External(WORKER_NODE.to_vec()),
+            op!(
+                "capability",
+                &CapabilityMsg::Announce {
+                    capabilities: vec!["mock-llm-1".into()],
+                    resources: Default::default(),
+                },
+            ),
+        )
+        .await;
+        pair.submit(alice(), create_channel("general")).await;
+        pair
+    }
+    async fn parity(&self) {
+        assert_eq!(
+            replies(&self.native).await,
+            replies(&self.wasm).await,
+            "queries at {}",
+            self.height
+        );
+        for sibling in SIBLINGS {
+            assert_eq!(
+                self.native.module_root(sibling),
+                self.wasm.module_root(sibling),
+                "{sibling} at {}",
+                self.height
+            );
+        }
+        assert_ne!(
+            root_of(&self.native),
+            root_of(&self.wasm),
+            "physical storage differs"
+        );
+    }
+    async fn batch(&mut self, messages: Vec<(Origin, Msg)>) -> Vec<MemberOutcome> {
+        self.height += 1;
+        let native_before = root_of(&self.native);
+        let wasm_before = root_of(&self.wasm);
+        let native = self
+            .native
+            .submit_block(block(self.height, Origin::System), messages.clone())
+            .await
+            .unwrap();
+        let wasm = self
+            .wasm
+            .submit_block(block(self.height, Origin::System), messages)
+            .await
+            .unwrap();
+        assert_eq!(
+            event_tuples(&native.events),
+            event_tuples(&wasm.events),
+            "events at {}",
+            self.height
+        );
+        assert_eq!(
+            format!("{:?}", native.members),
+            format!("{:?}", wasm.members),
+            "members at {}",
+            self.height
+        );
+        self.requests.extend(
+            native
+                .events
+                .iter()
+                .filter_map(|event| decode_worker_request(&event.payload).ok()),
+        );
+        self.parity().await;
+        assert_eq!(
+            root_of(&self.native) != native_before,
+            root_of(&self.wasm) != wasm_before,
+            "root movement at {}",
+            self.height
+        );
+        native.members
+    }
+    async fn submit(&mut self, origin: Origin, message: Msg) {
+        let outcomes = self.batch(vec![(origin, message)]).await;
+        assert!(
+            matches!(outcomes[0], MemberOutcome::Applied { .. }),
+            "{outcomes:?}"
+        );
+    }
+    async fn drain(&mut self) {
+        // Advance only while committed work exists; every iteration consumes
+        // a real host queue batch, with no wall-clock polling.
+        while self.native.has_pending_work().await.unwrap() {
+            assert!(self.wasm.has_pending_work().await.unwrap());
+            self.batch(Vec::new()).await;
+        }
+        assert!(!self.wasm.has_pending_work().await.unwrap());
+    }
+    async fn provision(&mut self, account: u64, id: &str, actions: &[&str]) {
+        self.submit(
+            alice(),
+            op!(
+                "agent",
+                &agent::AgentMsg::Provision {
+                    name: id.into(),
+                    program: runs::model_program(id),
+                },
+            ),
+        )
+        .await;
+        self.submit(
+            alice(),
+            register_agent(
+                account,
+                id,
+                actions.iter().map(|action| (*action).into()).collect(),
+                None,
+                None,
+            ),
+        )
+        .await;
+    }
+    async fn mention_run(&mut self) -> String {
+        self.submit(alice(), mention_post("general", "mention"))
+            .await;
+        assert!(
+            pending_run_ids(&self.native).await.is_empty(),
+            "source commits before its reaction"
+        );
+        self.drain().await;
+        let runs = pending_run_ids(&self.native).await;
+        assert_eq!(runs.len(), 1);
+        runs[0].clone()
+    }
+    async fn accept(&mut self, run: &str) {
+        let saga_id = dispatch_saga_id(&self.native, run).await;
+        self.submit(
+            Origin::External(WORKER_NODE.to_vec()),
+            op!(
+                "saga",
+                &SagaMsg::Accept {
+                    saga_id,
+                    attempt: 0,
+                },
+            ),
+        )
+        .await;
+    }
+    async fn settle(&mut self, run: &str, response: Vec<u8>) {
+        let oracle = oracle_op(&self.native, run, wrap_runner(response)).await;
+        self.submit(Origin::External(WORKER_NODE.to_vec()), oracle)
+            .await;
+        self.drain().await;
+    }
+    async fn rejected(&mut self, origin: Origin, message: Msg, needle: &str) {
+        let before = (root_of(&self.native), root_of(&self.wasm));
+        self.height += 1;
+        let n = self
+            .native
+            .submit_at(block(self.height, origin.clone()), message.clone())
+            .await
+            .unwrap_err();
+        let w = self
+            .wasm
+            .submit_at(block(self.height, origin), message)
+            .await
+            .unwrap_err();
+        let SubmitError::Rejected(Error::Module(n)) = n else {
+            panic!("{n:?}");
+        };
+        let SubmitError::Rejected(Error::Module(w)) = w else {
+            panic!("{w:?}");
+        };
+        assert!(n.contains(needle), "{n}");
+        assert!(w.contains(needle), "{w}");
+        assert_eq!(before, (root_of(&self.native), root_of(&self.wasm)));
+        self.parity().await;
+    }
+    async fn action(&self, id: &str) -> runs::ActionRequestView {
+        let query = runs_encode_query(&RunsQuery::ActionRequest {
+            request_id: id.into(),
+        });
+        let native = self.native.query("runs", &query).await.unwrap();
+        let wasm = self.wasm.query("runs", &query).await.unwrap();
+        assert_eq!(native, wasm);
+        let RunsReply::ActionRequest(Some(view)) = runs_decode_reply(&native).unwrap() else {
+            panic!("action receipt");
+        };
+        view
+    }
+}
+
+async fn verify_receipt_snapshots(pair: &Pair, request_id: &str) {
+    use sdk::Module as _;
+    let capture = |host: &Host| {
+        let (snapshot, _) =
+            host.capture_current_snapshot(pair.height, host::CapturePayloads::All, || {
+                std::time::Duration::ZERO
+            });
+        let module = snapshot.module("runs").unwrap();
+        let sdk::StateSyncHandle::SnapshotBytes(bytes) = &module.state_sync else {
+            panic!("runs snapshot");
+        };
+        (bytes.clone(), module.root)
+    };
+    let (bytes, root) = capture(&pair.native);
+    let mut native = native_runs();
+    native.install(&bytes, root).unwrap();
+    let (bytes, root) = capture(&pair.wasm);
+    let mut wasm = wasm_runs();
+    wasm.install(&bytes, root).unwrap();
+    let query = runs_encode_query(&RunsQuery::ActionPlan {
+        request_id: request_id.into(),
+    });
+    assert_eq!(
+        native.query(&query).await.unwrap(),
+        pair.native.query("runs", &query).await.unwrap()
+    );
+    assert_eq!(
+        wasm.query(&query).await.unwrap(),
+        pair.wasm.query("runs", &query).await.unwrap()
+    );
+    assert_eq!(
+        native.pending_items().await.unwrap(),
+        wasm.pending_items().await.unwrap()
+    );
+}
+
 #[test]
 fn the_collaboration_loop_lands_identically_on_both_runtimes() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (native_files, wasm_files) = (dir.path().join("native"), dir.path().join("wasm"));
+    let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
-        let mut native = native_host(&context, native_files).await;
-        let mut wasm = wasm_host_(&context, wasm_files).await;
-        let run_id = run_id_for("general", 1, "quackbot");
-
-        // the SCHEMA-BREAK pin, from genesis: runs' empty canonical encoding
-        // is THREE zero counts (watches + pending + sessions), the wasm
-        // port's empty host-KV store is ONE — different preimages, different
-        // roots (contrast saga/agent, whose single-count empty encodings
-        // coincide with the empty store until the first write).
-        assert_ne!(
-            root_of(&native),
-            StateRoot::ZERO,
-            "runs has no ZERO sentinel"
+        let mut pair = Pair::new(&context, directory.path()).await;
+        pair.provision(2, "quackbot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])
+            .await;
+        let run = pair.mention_run().await;
+        assert_eq!(pair.requests.len(), 1, "one real work request");
+        pair.accept(&run).await;
+        let oracle = oracle_op(&pair.native, &run, wrap_runner(canned_response(&run))).await;
+        pair.submit(Origin::External(WORKER_NODE.to_vec()), oracle)
+            .await;
+        assert!(
+            chat_message(&pair.wasm, &reply_message_id(&run))
+                .await
+                .is_none()
         );
-        assert_ne!(
-            root_of(&native),
-            root_of(&wasm),
-            "genesis roots must differ — the port is a DECLARED schema break"
-        );
-
-        // ---- setup: channel (sibling-only — the runs roots hold), then the
-        // watch FIRST (+ the plane subscription, one atomic block): the watch
-        // is the port's first guest write, so it initializes the host-KV
-        // store (`__state`/`__root` land) in the same block that legitimately
-        // moves the native root — every later stage-nothing execute rewrites
-        // the identical snapshot and both roots hold. the registry block
-        // after it proves exactly that: the hook runs THROUGH runs (the
-        // recipe lives in dispatch), and neither root moves.
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            1,
-            alice(),
-            create_channel("general"),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            2,
-            alice(),
-            watch_channel("general"),
-            true,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            3,
-            alice(),
-            register_quackbot(vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()]),
-            false,
-        )
-        .await;
-
-        // ---- block 4: the user post. THE SAME BLOCK carries the message,
-        // the tag report, the engagement delivery, the pending entry, the
-        // dispatch, and its saga trigger (P2) — and emits exactly one
-        // WorkerRequest for the off-consensus seam, identically.
-        let reqs = roundtrip(
-            &mut native,
-            &mut wasm,
-            4,
-            alice(),
-            mention_post("general", "m1"),
-            true,
-        )
-        .await;
-        assert_eq!(reqs.len(), 1, "one WorkerRequest event");
-        assert_eq!(pending_run_ids(&wasm).await, vec![run_id.clone()]);
-
-        // ---- block 5: the worker's oracle op. the saga settles and the
-        // dispatch module commits the outcome into its mailbox — the runs
-        // module sees NOTHING this block (never pop-stack; its root holds).
-        let oracle = oracle_op(&native, &run_id, wrap_runner(canned_response(&run_id))).await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            5,
-            Origin::External(b"oracle".to_vec()),
-            oracle,
-            false,
-        )
-        .await;
-        assert_eq!(
-            chat_message(&wasm, &reply_message_id(&run_id)).await,
-            None,
-            "a result never reaches its receiver in the block that agreed on it"
-        );
-
-        // ---- block 6: ANY next block injects the delivery. the ResultEvent,
-        // the validated reply (authored as the AGENT), and the task action
-        // all commit in this one delivery block — and the entry prunes.
-        roundtrip(&mut native, &mut wasm, 6, alice(), noop_block(6), true).await;
-        assert_eq!(pending_run_ids(&wasm).await, Vec::<String>::new());
-        let reply = chat_message(&wasm, &reply_message_id(&run_id))
+        pair.drain().await;
+        assert!(pending_run_ids(&pair.wasm).await.is_empty());
+        let reply = chat_message(&pair.wasm, &reply_message_id(&run))
             .await
-            .expect("the agent's reply landed in chat through the wasm module");
+            .unwrap();
         assert_eq!(reply.head.author, quackbot_ref());
+        assert_eq!(reply.head.origin, Origin::Program(2));
         assert_eq!(
             reply.head.blocks,
-            vec![Block::paragraph(format!("quack: handling {run_id}"))]
+            vec![Block::paragraph(format!("quack: handling {run}"))]
         );
-        assert_eq!(task_ids(&wasm).await, vec!["task-1".to_string()]);
-
-        // ---- the DELIVERED-RUNS-RING pin: the native module recorded the
-        // delivery into its per-node ring, and the guest persisted the SAME
-        // record through its `__history` key — the receipt lane (run id,
-        // outcome, executing-node attribution) survives the whole-state fold
-        // record for record.
-        let native_ring = recent_runs(&native).await;
+        assert_eq!(task_ids(&pair.wasm).await, vec!["task-1"]);
         assert_eq!(
-            native_ring.len(),
-            1,
-            "the native ring recorded the delivery"
+            recent_runs(&pair.native).await,
+            recent_runs(&pair.wasm).await
         );
-        assert_eq!(native_ring[0].run_id, run_id);
-        assert_eq!(
-            native_ring,
-            recent_runs(&wasm).await,
-            "the ring survives the whole-state fold record for record"
-        );
-
-        // queries are read-only on the wasm side too.
-        let settled = root_of(&wasm);
-        let _ = replies(&wasm).await;
-        let _ = recent_runs(&wasm).await;
-        assert_eq!(root_of(&wasm), settled, "a query moved the wasm root");
+        assert_eq!(recent_runs(&pair.wasm).await[0].run_id, run);
+        let settled = root_of(&pair.wasm);
+        replies(&pair.wasm).await;
+        assert_eq!(root_of(&pair.wasm), settled, "queries do not write");
     });
 }
 
 #[test]
-fn multi_compose_exhaustion_degrades_before_the_real_wasm_host_budget() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (native_files, wasm_files) = (dir.path().join("native"), dir.path().join("wasm"));
+fn multiple_programs_compose_bounded_references_inside_the_real_wasm_budget() {
+    let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
-        let mut native = native_host(&context, native_files).await;
-        let mut wasm = wasm_host_(&context, wasm_files).await;
-
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            1,
-            alice(),
-            create_channel("general"),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            2,
-            alice(),
-            runs_op(&RunsMsg::WatchChannel {
-                channel_id: "general".into(),
-                policy: TurnPolicy::All,
-            }),
-            true,
-        )
-        .await;
+        let mut pair = Pair::new(&context, directory.path()).await;
         for index in 0..20 {
-            let agent_id = format!("bot-{index:02}");
-            roundtrip(
-                &mut native,
-                &mut wasm,
-                3 + index,
-                alice(),
-                register_agent(
-                    &agent_id,
-                    &agent_id,
-                    vec![ACTION_CHAT_POST.into()],
-                    None,
-                    None,
-                ),
-                false,
-            )
-            .await;
+            pair.provision(index + 2, &format!("bot-{index:02}"), &[ACTION_CHAT_POST])
+                .await;
         }
-
-        let requests = roundtrip(
-            &mut native,
-            &mut wasm,
-            23,
-            alice(),
-            reference_post("general", "bounded"),
-            true,
-        )
-        .await;
-        assert_eq!(requests.len(), 5, "five complete composes fit the ledger");
-        assert_eq!(pending_run_ids(&native).await.len(), 5);
-        assert_eq!(pending_run_ids(&wasm).await.len(), 5);
+        pair.submit(alice(), reference_post("general", "bounded", 2..22))
+            .await;
+        pair.drain().await;
+        // Each account runs its own bounded program invocation. The removed
+        // channel watch no longer shares one implicit compose across models.
+        assert_eq!(pair.requests.len(), 20);
+        assert_eq!(pending_run_ids(&pair.wasm).await.len(), 20);
+        assert_eq!(
+            pending_run_ids(&pair.native).await,
+            pending_run_ids(&pair.wasm).await
+        );
     });
 }
 
 #[test]
 fn rejections_match_and_leave_no_trace() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (native_files, wasm_files) = (dir.path().join("native"), dir.path().join("wasm"));
+    let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
-        let mut native = native_host(&context, native_files).await;
-        let mut wasm = wasm_host_(&context, wasm_files).await;
-
-        // an open "general" channel so alice's own chat standing admits the
-        // RequestRun rejection case below past the #1630 admission gate —
-        // it must fail on the UNKNOWN AGENT it names, not on access.
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            1,
-            alice(),
-            create_channel("general"),
-            false,
-        )
-        .await;
-
-        // every distinct refusal family the runs module implements on its
-        // root-op surface: admin-origin gates, field validation, the reserved
-        // separator, unknown agents/runs, the session lane's key/lease/ACL
-        // doors, and the decode seam.
-        let rejects: Vec<(Origin, Msg, &str)> = vec![
+        let mut pair = Pair::new(&context, directory.path()).await;
+        pair.provision(2, "quackbot", &[ACTION_TASKS_CREATE]).await;
+        let rejects = [
             (
                 alice(),
-                runs_op(&RunsMsg::WatchChannel {
-                    channel_id: String::new(),
-                    policy: TurnPolicy::Mention,
-                }),
-                "channel_id must not be empty",
-            ),
-            (
-                alice(),
-                runs_op(&RunsMsg::WatchChannel {
-                    channel_id: "bad\u{1f}channel".into(),
-                    policy: TurnPolicy::Mention,
-                }),
-                "must not contain the reserved unit separator",
-            ),
-            (
-                alice(),
-                runs_op(&RunsMsg::WatchChannel {
-                    channel_id: "general".into(),
-                    policy: TurnPolicy::Assigned("ghost".into()),
-                }),
-                "assigned agent is not registered: ghost",
-            ),
-            (
-                Origin::System,
-                runs_op(&RunsMsg::WatchChannel {
-                    channel_id: "general".into(),
-                    policy: TurnPolicy::Mention,
-                }),
-                "runs admin ops require an external or module origin",
-            ),
-            (
-                Origin::External(Vec::new()),
-                runs_op(&RunsMsg::WatchChannel {
-                    channel_id: "general".into(),
-                    policy: TurnPolicy::Mention,
-                }),
-                "runs admin ops require a non-empty submitter id",
-            ),
-            (
-                alice(),
-                runs_op(&RunsMsg::RequestRun {
-                    agent_id: "ghost".into(),
-                    channel_id: "general".into(),
-                    anchor_seq: 1,
-                    demands: Default::default(),
-                    skills: Vec::new(),
-                }),
+                request("ghost", "general", 1),
                 "unknown agent: ghost",
             ),
             (
+                alice(),
+                request("quackbot", "bad\u{1f}channel", 1),
+                "reserved unit separator",
+            ),
+            (
                 Origin::External(Vec::new()),
-                runs_op(&RunsMsg::RequestRun {
-                    agent_id: "ghost".into(),
-                    channel_id: "general".into(),
-                    anchor_seq: 1,
-                    demands: Default::default(),
-                    skills: Vec::new(),
-                }),
-                "run requests require a non-empty submitter id",
+                request("ghost", "general", 1),
+                "non-empty submitter",
             ),
             (
                 alice(),
@@ -977,7 +1040,7 @@ fn rejections_match_and_leave_no_trace() {
                     run_id: "nope".into(),
                     session_key: vec![7; 8],
                 }),
-                "a session key must be 32 bytes",
+                "32 bytes",
             ),
             (
                 Origin::System,
@@ -985,7 +1048,7 @@ fn rejections_match_and_leave_no_trace() {
                     run_id: "nope".into(),
                     session_key: vec![7; 32],
                 }),
-                "only the node executing a run may open its agent session",
+                "only the node",
             ),
             (
                 alice(),
@@ -993,7 +1056,7 @@ fn rejections_match_and_leave_no_trace() {
                     run_id: "nope".into(),
                     session_key: vec![7; 32],
                 }),
-                "run is not in flight: nope",
+                "not in flight",
             ),
             (
                 alice(),
@@ -1004,7 +1067,15 @@ fn rejections_match_and_leave_no_trace() {
                         title: "t".into(),
                     },
                 }),
-                "run has no open agent session: nope",
+                "run is not in flight",
+            ),
+            (
+                alice(),
+                runs_op(&RunsMsg::ClaimActionRequest {
+                    request_id: "unknown".into(),
+                    target_step: 1,
+                }),
+                "unknown action request",
             ),
             (
                 alice(),
@@ -1015,361 +1086,184 @@ fn rejections_match_and_leave_no_trace() {
                 "expected value",
             ),
         ];
-
-        for (height, (origin, m, needle)) in rejects.into_iter().enumerate() {
-            let height = height as u64 + 2;
-            reject_roundtrip(&mut native, &mut wasm, height, origin, m, needle).await;
+        for (origin, message, reason) in rejects {
+            pair.rejected(origin, message, reason).await;
         }
+        pair.rejected(
+            Origin::External(vec![3; 32]),
+            register_agent(2, "intruder", Vec::new(), None, None),
+            "requires an account",
+        )
+        .await;
     });
 }
 
 #[test]
-fn multi_dispatch_block_reads_prior_writes_and_isolates_rejections() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (native_files, wasm_files) = (dir.path().join("native"), dir.path().join("wasm"));
+fn multi_dispatch_reads_prior_writes_and_isolates_rejected_control_and_receipts() {
+    let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
-        let mut native = native_host(&context, native_files).await;
-        let mut wasm = wasm_host_(&context, wasm_files).await;
-
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            1,
-            alice(),
-            create_channel("general"),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            2,
-            alice(),
-            create_channel("side"),
-            false,
-        )
-        .await;
-        // the first guest write initializes the wasm store in a block that
-        // legitimately moves the native root too (see the loop test).
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            3,
-            alice(),
-            watch_channel("warmup"),
-            true,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            4,
-            alice(),
-            register_quackbot(vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()]),
-            false,
-        )
-        .await;
-
-        // ---- ONE block, two ops: the watch, then the mention post whose
-        // engagement must read the watch STAGED by the first dispatch — on
-        // the wasm side the second dispatch reloads the first's staged
-        // `__state` (the read-your-writes seam the adapter relies on). the
-        // pending entry lands in this same block.
-        let batch = vec![
-            (alice(), watch_channel("general")),
-            (alice(), mention_post("general", "m1")),
-        ];
-        let n_out = native
-            .submit_block(block(5, alice()), batch.clone())
-            .await
-            .expect("native block");
-        let w_out = wasm
-            .submit_block(block(5, alice()), batch)
-            .await
-            .expect("wasm block");
-        for out in [&n_out, &w_out] {
-            assert!(
-                out.members
-                    .iter()
-                    .all(|m| matches!(m, MemberOutcome::Applied { .. })),
-                "all members must apply: {:?}",
-                out.members
-            );
-        }
-        assert_eq!(event_tuples(&n_out.events), event_tuples(&w_out.events));
-        assert_eq!(replies(&native).await, replies(&wasm).await);
-        let run_id = run_id_for("general", 1, "quackbot");
-        assert_eq!(
-            pending_run_ids(&wasm).await,
-            vec![run_id.clone()],
-            "the same-block staged watch engaged the post"
+        let mut pair = Pair::new(&context, directory.path()).await;
+        pair.provision(2, "quackbot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])
+            .await;
+        // Program calls are authenticated by the host seam. Two identical
+        // calls in a block must observe the first call's staged turn claim.
+        pair.submit(alice(), plain_post("general", "anchor")).await;
+        let call = request("quackbot", "general", 1);
+        let outcomes = pair
+            .batch(vec![
+                (Origin::Program(2), call.clone()),
+                (Origin::Program(2), call),
+            ])
+            .await;
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, MemberOutcome::Applied { .. }))
         );
-
-        // ---- ONE block, two IDENTICAL explicit requests for an anchor in
-        // the UNWATCHED "side" channel: the second must no-op against the
-        // turn claim the first STAGED in this very block (staged pending
-        // entry, read-your-writes) — an accepted no-op, not a rejection, on
-        // both runtimes.
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            6,
-            alice(),
-            plain_post("side", "m2"),
-            false,
+        assert_eq!(pending_run_ids(&pair.wasm).await.len(), 1);
+        let run = pending_run_ids(&pair.wasm).await.pop().unwrap();
+        pair.accept(&run).await;
+        pair.submit(
+            Origin::External(WORKER_NODE.to_vec()),
+            runs_op(&RunsMsg::OpenAgentSession {
+                run_id: run.clone(),
+                session_key: SESSION_KEY.to_vec(),
+            }),
         )
         .await;
-        let request = runs_op(&RunsMsg::RequestRun {
-            agent_id: "quackbot".into(),
-            channel_id: "side".into(),
-            anchor_seq: 1,
-            demands: Default::default(),
-            skills: Vec::new(),
-        });
-        let batch = vec![(alice(), request.clone()), (alice(), request)];
-        let n_out = native
-            .submit_block(block(7, alice()), batch.clone())
-            .await
-            .expect("native block");
-        let w_out = wasm
-            .submit_block(block(7, alice()), batch)
-            .await
-            .expect("wasm block");
-        for out in [&n_out, &w_out] {
-            assert!(
-                out.members
-                    .iter()
-                    .all(|m| matches!(m, MemberOutcome::Applied { .. })),
-                "the duplicate turn claim is a silent no-op: {:?}",
-                out.members
-            );
-        }
-        assert_eq!(event_tuples(&n_out.events), event_tuples(&w_out.events));
-        assert_eq!(replies(&native).await, replies(&wasm).await);
-        assert_eq!(
-            pending_run_ids(&wasm).await.len(),
-            2,
-            "two anchors, two runs — the duplicate claimed nothing"
+        let action = |id: &str| {
+            runs_op(&RunsMsg::AgentAction {
+                run_id: run.clone(),
+                action: AgentAction::CreateTask {
+                    task_id: id.into(),
+                    title: id.into(),
+                },
+            })
+        };
+        let outcomes = pair
+            .batch(vec![
+                (Origin::External(SESSION_KEY.to_vec()), action("first")),
+                (alice(), action("forged")),
+                (Origin::External(SESSION_KEY.to_vec()), action("second")),
+            ])
+            .await;
+        assert!(matches!(outcomes[0], MemberOutcome::Applied { .. }));
+        assert!(matches!(outcomes[1], MemberOutcome::Rejected { .. }));
+        assert!(matches!(outcomes[2], MemberOutcome::Applied { .. }));
+        assert_eq!(agent_sessions(&pair.wasm).await[0].actions, 2);
+        assert!(
+            task_ids(&pair.wasm).await.is_empty(),
+            "admission precedes program writes"
         );
+        pair.drain().await;
+        assert_eq!(task_ids(&pair.wasm).await, vec!["first", "second"]);
+        for slot in 0..2 {
+            assert!(matches!(
+                pair.action(&runs::action_request_id(&run, slot))
+                    .await
+                    .status,
+                runs::ActionStatus::Completed {
+                    outcome: dispatch::CallOutcomeSummary::Applied { .. },
+                    ..
+                }
+            ));
+        }
 
-        // ---- ONE block where the MIDDLE member rejects: the runtime aborts
-        // its staged overlay and replays the accepted members — committed
-        // state equals the accepted subset alone, on both runtimes.
-        let batch = vec![
-            (alice(), watch_channel("iso-a")),
-            (
-                alice(),
-                runs_op(&RunsMsg::WatchChannel {
-                    channel_id: String::new(),
-                    policy: TurnPolicy::Mention,
-                }),
-            ),
-            (alice(), watch_channel("iso-b")),
-        ];
-        let n_out = native
-            .submit_block(block(8, alice()), batch.clone())
+        pair.submit(alice(), plain_post("general", "manual-anchor"))
+            .await;
+        let caller = Origin::External(vec![3; 32]);
+        let manual = request("quackbot", "general", 2);
+        let outcomes = pair
+            .batch(vec![
+                (caller.clone(), manual.clone()),
+                (caller.clone(), manual),
+            ])
+            .await;
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, MemberOutcome::Applied { .. }))
+        );
+        pair.drain().await;
+        let manual_id = runs::run_id_for("general", 2, "quackbot");
+        let bytes = pair
+            .wasm
+            .query("runs", &runs_encode_query(&RunsQuery::PendingRuns))
             .await
-            .expect("native block");
-        let w_out = wasm
-            .submit_block(block(8, alice()), batch)
-            .await
-            .expect("wasm block");
-        for out in [&n_out, &w_out] {
-            assert!(matches!(out.members[0], MemberOutcome::Applied { .. }));
-            assert!(
-                matches!(out.members[1], MemberOutcome::Rejected { .. }),
-                "the empty channel id must reject mid-block: {:?}",
-                out.members
-            );
-            assert!(matches!(out.members[2], MemberOutcome::Applied { .. }));
-        }
-        assert_eq!(replies(&native).await, replies(&wasm).await);
-        for sibling in SIBLING_IDS {
-            assert_eq!(native.module_root(sibling), wasm.module_root(sibling));
-        }
-        assert_ne!(root_of(&native), root_of(&wasm));
+            .unwrap();
+        let RunsReply::PendingRuns(pending) = runs_decode_reply(&bytes).unwrap() else {
+            panic!("pending");
+        };
+        let requested: Vec<_> = pending
+            .iter()
+            .filter(|run| run.run_id == manual_id)
+            .collect();
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].requester, caller);
+        pair.submit(
+            caller,
+            runs_op(&RunsMsg::CancelRun {
+                run_id: manual_id.clone(),
+            }),
+        )
+        .await;
+        pair.drain().await;
+        assert!(!pending_run_ids(&pair.wasm).await.contains(&manual_id));
     });
 }
-
-/// the ephemeral session keypair's public half (its private half never enters
-/// consensus) and the node that will hold the run's execution lease.
-const SESSION_KEY: [u8; 32] = [0x11; 32];
-/// 32 bytes: `Accept`'s standing gate requires a real valset-shaped key, and
-/// this is seeded into that valset (see `native_host_with_assignment`).
-const WORKER_NODE: &[u8] = &[0x77; 32];
 
 #[test]
 fn the_session_lane_matches_lease_acl_budget_and_close_out() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (native_files, wasm_files) = (dir.path().join("native"), dir.path().join("wasm"));
+    let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
-        let members = [WORKER_NODE.to_vec()];
-        let mut native = native_host_with_assignment(&context, native_files, Some(&members)).await;
-        let mut wasm = wasm_host_with_assignment(&context, wasm_files, Some(&members)).await;
-        let run_id = run_id_for("general", 1, "quackbot");
-
-        // an in-flight run, driven through both runtimes. the watch precedes
-        // the registry block so the port's first guest write rides a block
-        // that legitimately moves the native root (see the loop test).
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            1,
-            alice(),
-            create_channel("general"),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
+        let mut pair = Pair::new(&context, directory.path()).await;
+        pair.provision(
             2,
-            alice(),
-            watch_channel("general"),
-            true,
+            "quackbot",
+            &[
+                ACTION_CHAT_POST,
+                ACTION_CHAT_POST_MESSAGE,
+                ACTION_TASKS_CREATE,
+            ],
         )
         .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            3,
-            alice(),
-            register_quackbot(vec![
-                ACTION_CHAT_POST.into(),
-                ACTION_CHAT_POST_MESSAGE.into(),
-                ACTION_TASKS_CREATE.into(),
-            ]),
-            false,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            4,
-            alice(),
-            mention_post("general", "m1"),
-            true,
-        )
-        .await;
-
-        // WORKER_NODE announces itself as a "mock-llm-1" provider — after the
-        // trigger above, so the attempt's pool was still empty when it fired
-        // (a genuine announcement) and Accept's capability gate is satisfied
-        // by the time it claims. WORKER_NODE already holds valset standing
-        // (seeded into the host above), which the gate also requires.
-        let announce = Msg {
-            target: "capability".into(),
-            payload: capability_encode_msg(&CapabilityMsg::Announce {
-                capabilities: vec!["mock-llm-1".into()],
-                resources: Default::default(),
-            }),
-        };
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            5,
-            Origin::External(WORKER_NODE.to_vec()),
-            announce,
-            false,
-        )
-        .await;
-
-        // the REAL lease path: a capable node claims the announced attempt
-        // (saga Accept), and the dispatch facade resolves the committed
-        // assignee identically on both hosts.
-        let saga_id = dispatch_saga_id(&native, &run_id).await;
-        let accept = Msg {
-            target: "saga".into(),
-            payload: saga_encode_msg(&SagaMsg::Accept {
-                saga_id,
-                attempt: 0,
-            }),
-        };
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            6,
-            Origin::External(WORKER_NODE.to_vec()),
-            accept,
-            false,
-        )
-        .await;
+        let run = pair.mention_run().await;
+        pair.accept(&run).await;
         assert_eq!(
-            dispatch_assignee(&wasm, &run_id).await.as_deref(),
-            Some(WORKER_NODE),
-            "the accepting node holds the run's committed lease"
+            dispatch_assignee(&pair.wasm, &run).await,
+            Some(WORKER_NODE.to_vec())
         );
-
-        // a non-assignee cannot open the run's session — not even the owner.
-        reject_roundtrip(
-            &mut native,
-            &mut wasm,
-            7,
-            alice(),
-            runs_op(&RunsMsg::OpenAgentSession {
-                run_id: run_id.clone(),
-                session_key: SESSION_KEY.to_vec(),
-            }),
-            "lease",
-        )
-        .await;
-
-        // the lease-holder binds; the session is committed runs state (in
-        // the replies matrix and the root) on both runtimes.
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            8,
+        let open = runs_op(&RunsMsg::OpenAgentSession {
+            run_id: run.clone(),
+            session_key: SESSION_KEY.to_vec(),
+        });
+        pair.rejected(alice(), open.clone(), "lease").await;
+        pair.submit(Origin::External(WORKER_NODE.to_vec()), open.clone())
+            .await;
+        pair.rejected(
             Origin::External(WORKER_NODE.to_vec()),
-            runs_op(&RunsMsg::OpenAgentSession {
-                run_id: run_id.clone(),
-                session_key: SESSION_KEY.to_vec(),
-            }),
-            true,
+            open,
+            "already has an open",
         )
         .await;
-        // re-opening is REFUSED, not overwritten — the live key is the
-        // authority the agent is acting under.
-        reject_roundtrip(
-            &mut native,
-            &mut wasm,
-            9,
+        let post = runs_op(&RunsMsg::AgentAction {
+            run_id: run.clone(),
+            action: AgentAction::PostMessage {
+                channel_id: "general".into(),
+                text: "working".into(),
+                thread: None,
+            },
+        });
+        pair.rejected(
             Origin::External(WORKER_NODE.to_vec()),
-            runs_op(&RunsMsg::OpenAgentSession {
-                run_id: run_id.clone(),
-                session_key: vec![0x22; 32],
-            }),
-            "already has an open agent session",
+            post.clone(),
+            "only the bound session key",
         )
         .await;
-
-        // THE ACL: only the bound session key may act — the executing node's
-        // own key does not pass.
-        reject_roundtrip(
-            &mut native,
-            &mut wasm,
-            10,
-            Origin::External(WORKER_NODE.to_vec()),
-            runs_op(&RunsMsg::AgentAction {
-                run_id: run_id.clone(),
-                action: AgentAction::PostMessage {
-                    channel_id: "general".into(),
-                    text: "not from the agent".into(),
-                    thread: None,
-                },
-            }),
-            "only the bound session key may act",
-        )
-        .await;
-        // an action outside the committed grant is refused (the SAME
-        // validator the settle path runs).
-        reject_roundtrip(
-            &mut native,
-            &mut wasm,
-            11,
+        pair.rejected(
             Origin::External(SESSION_KEY.to_vec()),
             runs_op(&RunsMsg::AgentAction {
-                run_id: run_id.clone(),
+                run_id: run.clone(),
                 action: AgentAction::UpdateTaskStatus {
                     task_id: "task-1".into(),
                     status: "done".into(),
@@ -1378,64 +1272,40 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
             "not allowed to tasks.update_status",
         )
         .await;
-
-        // a GRANTED mid-run post lands as the AGENT, spends one action of the
-        // budget (the counter is committed state — the runs root moves), and
-        // the chat sibling roots agree.
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            12,
-            Origin::External(SESSION_KEY.to_vec()),
-            runs_op(&RunsMsg::AgentAction {
-                run_id: run_id.clone(),
-                action: AgentAction::PostMessage {
-                    channel_id: "general".into(),
-                    text: "still working — halfway there".into(),
-                    thread: None,
-                },
-            }),
-            true,
-        )
-        .await;
-        let sessions = agent_sessions(&wasm).await;
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].actions, 1, "one action spent");
-        let posted = chat_message(&wasm, &runs::post_message_id(&run_id, "s0"))
+        pair.submit(Origin::External(SESSION_KEY.to_vec()), post)
+            .await;
+        assert_eq!(agent_sessions(&pair.wasm).await[0].actions, 1);
+        assert!(matches!(
+            pair.action(&runs::action_request_id(&run, 0)).await.status,
+            runs::ActionStatus::AwaitingProgram
+        ));
+        pair.drain().await;
+        let receipt = pair.action(&runs::action_request_id(&run, 0)).await;
+        assert!(matches!(
+            receipt.status,
+            runs::ActionStatus::Completed {
+                outcome: dispatch::CallOutcomeSummary::Applied { .. },
+                ..
+            }
+        ));
+        let message = chat_message(&pair.wasm, &runs::post_message_id(&run, "s0"))
             .await
-            .expect("the mid-run post landed through the wasm module");
-        assert_eq!(posted.head.author, quackbot_ref());
-
-        // the run settles through the ordinary path; the session dies with it.
-        let oracle = oracle_op(&native, &run_id, wrap_runner(canned_response(&run_id))).await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            13,
-            Origin::External(b"oracle".to_vec()),
-            oracle,
-            false,
-        )
-        .await;
-        roundtrip(&mut native, &mut wasm, 14, alice(), noop_block(14), true).await;
-        assert_eq!(
-            agent_sessions(&wasm).await,
-            Vec::<runs::AgentSession>::new(),
-            "a session never outlives its run"
-        );
-        reject_roundtrip(
-            &mut native,
-            &mut wasm,
-            15,
+            .unwrap();
+        assert_eq!(message.head.author, Party::Account(2));
+        assert_eq!(message.head.origin, Origin::Program(2));
+        verify_receipt_snapshots(&pair, &runs::action_request_id(&run, 0)).await;
+        pair.settle(&run, canned_response(&run)).await;
+        assert!(agent_sessions(&pair.wasm).await.is_empty());
+        pair.rejected(
             Origin::External(SESSION_KEY.to_vec()),
             runs_op(&RunsMsg::AgentAction {
-                run_id: run_id.clone(),
+                run_id: run,
                 action: AgentAction::CreateTask {
-                    task_id: "after-the-fact".into(),
-                    title: "too late".into(),
+                    task_id: "late".into(),
+                    title: "late".into(),
                 },
             }),
-            "no open agent session",
+            "run is not in flight",
         )
         .await;
     });
@@ -1443,62 +1313,36 @@ fn the_session_lane_matches_lease_acl_budget_and_close_out() {
 
 #[test]
 fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let (native_files, wasm_files) = (dir.path().join("native"), dir.path().join("wasm"));
+    let directory = tempfile::tempdir().unwrap();
     deterministic::Runner::default().start(|context| async move {
-        let mut native = native_host(&context, native_files).await;
-        let mut wasm = wasm_host_(&context, wasm_files).await;
-
-        // the first guest write initializes the wasm store in a block that
-        // legitimately moves the native root (see the loop test); the two
-        // stage-nothing admin blocks after it hold both roots.
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            1,
-            alice(),
-            watch_channel("warmup"),
-            true,
-        )
-        .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            2,
+        let mut pair = Pair::new(&context, directory.path()).await;
+        pair.provision(2, "quackbot", &[ACTION_TASKS_CREATE]).await;
+        pair.submit(
             alice(),
             runs_op(&RunsMsg::EnableJobWorker { enabled: true }),
-            false,
         )
         .await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            3,
+        pair.submit(
             alice(),
-            register_quackbot(vec![ACTION_TASKS_CREATE.into()]),
-            false,
+            Msg {
+                target: "tasks".into(),
+                payload: jobs_encode_msg(&JobsMsg::Submit {
+                    job_id: "job-1".into(),
+                    kind: "agent/quackbot".into(),
+                    spec: "summarize this work item".into(),
+                }),
+            },
         )
         .await;
-
-        // the submit cascades — through the jobs intake running INSIDE the
-        // guest — into a same-block claim + dispatch + saga trigger, and the
-        // WorkerRequest carries the composed job payload identically.
-        let submit = Msg {
-            target: "tasks".into(),
-            payload: jobs_encode_msg(&JobsMsg::Submit {
-                job_id: "job-1".into(),
-                kind: "agent/quackbot".into(),
-                spec: "summarize this work item".into(),
-            }),
-        };
-        let reqs = roundtrip(&mut native, &mut wasm, 4, alice(), submit, true).await;
-        assert_eq!(reqs.len(), 1, "one WorkerRequest event for the job run");
-        let run_id = job_run_id_for("job-1", "quackbot", 4);
-        assert_eq!(pending_run_ids(&wasm).await, vec![run_id.clone()]);
-
-        // an actions-only response (job runs carry no reply blocks): the
-        // delivery block finalizes the board item and lands the task write.
-        let raw = encode_response(&AgentResponse {
+        assert!(
+            pending_run_ids(&pair.wasm).await.is_empty(),
+            "source job commits before reaction"
+        );
+        pair.drain().await;
+        let run = pending_run_ids(&pair.wasm).await.pop().unwrap();
+        assert_eq!(pair.requests.len(), 1);
+        pair.accept(&run).await;
+        let response = encode_response(&AgentResponse {
             reply_blocks: Vec::new(),
             actions: vec![AgentAction::CreateTask {
                 task_id: "job-task".into(),
@@ -1506,22 +1350,11 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
             }],
             commit_message: None,
         });
-        let oracle = oracle_op(&native, &run_id, wrap_runner(raw)).await;
-        roundtrip(
-            &mut native,
-            &mut wasm,
-            5,
-            Origin::External(b"oracle".to_vec()),
-            oracle,
-            false,
-        )
-        .await;
-        roundtrip(&mut native, &mut wasm, 6, alice(), noop_block(6), true).await;
-        assert_eq!(pending_run_ids(&wasm).await, Vec::<String>::new());
-        assert_eq!(task_ids(&wasm).await, vec!["job-task".to_string()]);
-        // the jobs sibling roots already agreed (roundtrip); a decoded spot
-        // check that the board item really finalized through the wasm module.
-        let reply = wasm
+        pair.settle(&run, response).await;
+        assert!(pending_run_ids(&pair.wasm).await.is_empty());
+        assert_eq!(task_ids(&pair.wasm).await, vec!["job-task"]);
+        let bytes = pair
+            .wasm
             .query(
                 "tasks",
                 &tasks::encode_job_query(&tasks::JobsQuery::Get {
@@ -1529,12 +1362,11 @@ fn the_jobs_lane_claims_dispatches_and_finalizes_identically() {
                 }),
             )
             .await
-            .expect("jobs query");
-        let tasks::JobsReply::Job(Some(job)) = tasks::decode_job_reply(&reply).expect("decode")
-        else {
-            panic!("job expected");
+            .unwrap();
+        let tasks::JobsReply::Job(Some(job)) = tasks::decode_job_reply(&bytes).unwrap() else {
+            panic!("job");
         };
         assert_eq!(job.status, tasks::JobStatus::Done);
-        assert!(job.result.expect("finalize result").ok);
+        assert!(job.result.unwrap().ok);
     });
 }

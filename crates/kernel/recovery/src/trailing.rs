@@ -211,6 +211,7 @@ mod tests {
         Record::Block {
             height,
             frame: vec![],
+            source: crate::BlockSource::Consensus,
         }
     }
 

@@ -158,15 +158,14 @@ fn a_files_commit_over_a_frame_is_authored_by_the_verified_key() {
     let key_author = ext(signer.public_key().as_ref());
     let string_author = ext(b"alice");
     assert!(
-        snaps
-            .iter()
-            .any(|s| s["author"] == serde_json::json!(key_author)),
+        snaps.iter().any(|s| s["author"]
+            == serde_json::json!(files::Actor::Key(signer.public_key().as_ref().to_vec()))),
         "the frame commit is authored by the VERIFIED key {key_author}: {history}"
     );
     assert!(
         snaps
             .iter()
-            .any(|s| s["author"] == serde_json::json!(string_author)),
+            .any(|s| s["author"] == serde_json::json!(files::Actor::Key(b"alice".to_vec()))),
         "the frameless commit is authored by the caller string {string_author}: {history}"
     );
     // and the two authorship kinds are genuinely different: a key is not a name.
@@ -457,9 +456,6 @@ fn create_page(id: &str) -> serde_json::Value {
 fn create_task(id: &str) -> serde_json::Value {
     serde_json::json!({ "task": { "create_task": { "task_id": id, "title": id } } })
 }
-fn deliver(member: &str, body: &str) -> serde_json::Value {
-    serde_json::json!({ "deliver": { "member": member, "kind": "note", "body": body } })
-}
 
 /// drop the block-dependent `keys` (created_at, updated_at) from each object of a
 /// reply array, leaving the block-invariant logical identity to compare.
@@ -533,17 +529,15 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         ("pages", create_page("p2"), "peer".into()),
         ("tasks", create_task("t1"), "peer".into()),
         ("tasks", create_task("t2"), "peer".into()),
-        // inbox delivers to the "courier" origin's OWN queue: inbox refuses
-        // an external `Deliver` anywhere else.
         (
             "inbox",
-            deliver(&harness::ext_actor("courier"), "hi"),
-            "courier".into(),
+            serde_json::json!({ "mark_read": { "account": 1, "up_to_seq": 0 } }),
+            key.clone(),
         ),
         (
             "inbox",
-            deliver(&harness::ext_actor("courier"), "yo"),
-            "courier".into(),
+            serde_json::json!({ "clear": { "account": 1, "up_to_seq": 0 } }),
+            key.clone(),
         ),
     ];
     let n = script.len() as u64;
@@ -600,7 +594,7 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
 
     // the plain modules that stamp consensus_time DIFFER too — the embedded block
     // time, NOT the qmdb commit boundary. pinned so the distinction stays honest.
-    for id in ["tasks", "inbox"] {
+    for id in ["tasks"] {
         assert_ne!(
             module_root(&a, id),
             module_root(&b, id),
@@ -634,20 +628,23 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
     // the timestamp-stamping modules converge once the block-dependent stamp is
     // stripped: the SAME entities exist in both runs, only their created_at differs.
     let tasks_a = strip(
-        &sim_a.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }))["task"]["tasks"],
+        &sim_a.query(
+            "tasks",
+            serde_json::json!({ "task": { "list": { "limit": 256 } } }),
+        )["task"]["tasks"],
         &["created_at", "updated_at"],
     );
     let tasks_b = strip(
-        &sim_b.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }))["task"]["tasks"],
+        &sim_b.query(
+            "tasks",
+            serde_json::json!({ "task": { "list": { "limit": 256 } } }),
+        )["task"]["tasks"],
         &["created_at", "updated_at"],
     );
     assert_eq!(
         tasks_a, tasks_b,
         "the same tasks exist in both runs (only the stamped time differs)"
     );
-    // inbox is deliberately absent from this logical sweep: the read-model
-    // cutover made it WRITE-ONLY in canonical state (its member feeds and
-    // unread counters live in the index guest), so there is no canonical value
-    // to converge. its contribution to this test is the root assertion above —
-    // that it stamps consensus_time — which is the property this file owns.
+    // Empty inbox maintenance is independent of block structure.
+    assert_eq!(module_root(&a, "inbox"), module_root(&b, "inbox"));
 }

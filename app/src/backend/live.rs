@@ -1177,10 +1177,8 @@ pub fn plane_live_hit(kind: crate::LiveKind, module: String, want: String) -> bo
     kind == crate::LiveKind::Plane && module == want
 }
 
-/// Did this live update touch the AGENTS projection — from either module?
-///
-/// The runs module owns both model configuration and run activity. Changes to
-/// the generic program definition do not replace a model's configuration.
+/// Model configuration/activity and current controller names feed the Agents
+/// projection through runs and identity respectively.
 pub fn agents_plane_hit(kind: crate::LiveKind, module: String) -> bool {
     kind == crate::LiveKind::Plane && matches!(module.as_str(), "runs" | "identity")
 }

@@ -77,7 +77,7 @@ impl RunsModule {
         Ok(set.into_iter().collect())
     }
 
-    /// a v4 recipe hash is empty (unset) or exactly [`RECIPE_HASH_LEN`] bytes.
+    /// a recipe hash is empty (unset) or exactly [`RECIPE_HASH_LEN`] bytes.
     fn validate_recipe_hash(recipe_hash: &[u8]) -> Result<(), Error> {
         if !recipe_hash.is_empty() && recipe_hash.len() != RECIPE_HASH_LEN {
             return Err(Error::Module(format!(
@@ -111,7 +111,7 @@ impl RunsModule {
         Ok(caps)
     }
 
-    /// a v4 skill ref must carry a name that is [`is_skill_mount_name`] (the
+    /// a skill ref must carry a name that is [`is_skill_mount_name`] (the
     /// SAME predicate the noded provisioner's `mount_dir_name` calls — one
     /// rule, not two that could drift), unique within the record, and a
     /// source_prefix that is a scoped duckfs subtree ([`is_scoped_duckfs_prefix`]),

@@ -20,6 +20,7 @@
 mod harness;
 
 use harness::{Sim, create_channel, post_message};
+use commonware_cryptography::Signer as _;
 use serde_json::{Value, json};
 
 /// the node we make the run's execution lease-holder (its Accept'd assignee).
@@ -55,16 +56,12 @@ fn as_refused(run_id: &str) -> String {
 /// (run_id, saga_id). the sim announces no provider pool, so the run's saga
 /// attempt stays UNASSIGNED — claimable by the first `Accept`.
 fn stage_run(sim: &Sim, allowed: Value) -> (String, String) {
-    sim.submit_ok(
-        "agent",
-        json!({ "register_agent": {
-            "agent_id": "scribe",
-            "display_name": "Scribe",
-            "capability": "text",
-            "allowed_actions": allowed,
-        }}),
-        Some("owner"),
+    let controller = harness::key_origin(
+        &commonware_cryptography::ed25519::PrivateKey::from_seed(41),
     );
+    for (target, operation) in harness::model_setup("scribe", "text", allowed) {
+        sim.submit_ok(target, operation, Some(&controller));
+    }
     sim.submit_ok("chat", create_channel("room", "Room"), None);
     sim.submit_ok("chat", post_message("room", "m-1", "please help"), None);
     sim.submit_ok(

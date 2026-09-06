@@ -2461,6 +2461,134 @@ pub fn add_key(
     )
 }
 
+/// Provision the real program user for one model, under this node's signed
+/// account. Read committed identity state instead of predicting an account id.
+pub fn provision_model_program(cluster: &Cluster, idx: usize, model: &str) -> u64 {
+    let key = Cluster::identity(cluster.peer_ids[idx]);
+    let query = identity::encode_query(&identity::IdentityQuery::OfKey { key });
+    let reply = cluster
+        .query(idx, "identity", &query)
+        .expect("identity query");
+    let identity::IdentityReply::Account(controller) =
+        identity::decode_reply(&reply).expect("identity reply")
+    else {
+        panic!("account reply");
+    };
+    let controller = match controller {
+        Some(account) => account.number,
+        None => {
+            cluster.submit(
+                idx,
+                "identity",
+                &identity::encode_msg(&identity::IdentityMsg::Create {
+                    name: format!("model-controller-{idx}"),
+                    scheme: identity::KeyScheme::Ed25519,
+                }),
+            );
+            cluster.await_committed(idx, "model controller account", USER_LANE_FINALIZE, || {
+                let reply = cluster.query(idx, "identity", &query)?;
+                let identity::IdentityReply::Account(Some(account)) =
+                    identity::decode_reply(&reply).ok()?
+                else {
+                    return None;
+                };
+                Some(account.number)
+            })
+        }
+    };
+    cluster.submit(
+        idx,
+        "agent",
+        &agent::encode_msg(&agent::AgentMsg::Provision {
+            name: model.into(),
+            program: runs::model_program(model),
+        }),
+    );
+    cluster.await_committed(idx, "model program account", USER_LANE_FINALIZE, || {
+        let reply = cluster.query(
+            idx,
+            "identity",
+            &identity::encode_query(&identity::IdentityQuery::All {
+                from: 0,
+                limit: identity::MAX_QUERY_LIMIT,
+            }),
+        )?;
+        let identity::IdentityReply::Accounts(accounts) = identity::decode_reply(&reply).ok()?
+        else {
+            return None;
+        };
+        accounts.into_iter().find_map(|account| {
+            let controlled_here = matches!(
+                &account.control,
+                identity::Control::Program { controller: owner, executor, .. }
+                    if *owner == controller && executor == "agent"
+            );
+            let mine = account.name == model && controlled_here;
+            mine.then_some(account.number)
+        })
+    })
+}
+
+pub fn model_account(cluster: &Cluster, idx: usize, model: &str) -> u64 {
+    cluster.await_committed(idx, "model configuration", USER_LANE_FINALIZE, || {
+        let reply = cluster.query(
+            idx,
+            "runs",
+            &runs::encode_query(&runs::RunsQuery::Model {
+                query: runs::ModelQuery::Agent {
+                    agent_id: model.into(),
+                },
+            }),
+        )?;
+        let runs::RunsReply::Model(runs::ModelReply::Agent(Some(record))) =
+            runs::decode_reply(&reply).ok()?
+        else {
+            return None;
+        };
+        Some(record.account)
+    })
+}
+
+/// A source mention's canonical attribution sequence determines its run id.
+/// The pending and recent records let fast and slow providers prove the same run.
+pub fn attributed_run_id(
+    cluster: &Cluster,
+    idx: usize,
+    channel: &str,
+    anchor: u64,
+    model: &str,
+) -> String {
+    cluster.await_committed(idx, "attributed model run", USER_LANE_FINALIZE, || {
+        let reply = cluster.query(
+            idx,
+            "runs",
+            &runs::encode_query(&runs::RunsQuery::PendingRuns),
+        )?;
+        let runs::RunsReply::PendingRuns(pending) = runs::decode_reply(&reply).ok()? else {
+            return None;
+        };
+        if let Some(run) = pending.into_iter().find(|run| {
+            run.agent_id == model && run.channel_id == channel && run.anchor_seq == anchor
+        }) {
+            return Some(run.run_id);
+        }
+        let reply = cluster.query(
+            idx,
+            "runs",
+            &runs::encode_query(&runs::RunsQuery::RecentRuns),
+        )?;
+        let runs::RunsReply::RecentRuns(recent) = runs::decode_reply(&reply).ok()? else {
+            return None;
+        };
+        recent
+            .into_iter()
+            .find(|run| {
+                run.agent_id == model && run.channel_id == channel && run.anchor_seq == anchor
+            })
+            .map(|run| run.run_id)
+    })
+}
+
 #[cfg(test)]
 mod marker_tests {
     use super::extract_markers;

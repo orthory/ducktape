@@ -408,7 +408,7 @@ fn agent_namespace_is_reserved_for_the_runs_module_origin() {
     let mut m = module();
 
     // an External account can never claim an `agent/` recipe id — squatting
-    // it would permanently block that agent's own RegisterAgent hook.
+    // it would block the model's ConfigureModel recipe registration.
     let mut mallory = mk_ctx(0, Origin::External(b"mallory".to_vec()));
     let err = exec(
         &mut m,
@@ -428,8 +428,7 @@ fn agent_namespace_is_reserved_for_the_runs_module_origin() {
     assert!(err.to_string().contains("reserved"), "got {err}");
 
     // the runs module's own module-origin registration succeeds — this is
-    // the exact RegisterRecipe the registry hook emits as a follow-up of
-    // agent_intake's RegisterAgent.
+    // the RegisterRecipe emitted by ConfigureModel.
     let mut runs = mk_ctx(0, Origin::Module("runs".into()));
     exec(
         &mut m,

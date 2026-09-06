@@ -137,7 +137,6 @@ fn spawn_pump(lane: u64, rpc_port: u16, stop: Arc<AtomicBool>) -> std::thread::J
                 message_id: format!("pump-{lane}-{i}"),
                 blocks: vec![Block::paragraph(&filler)],
                 thread: None,
-                as_agent: None,
             });
             let req = serde_json::json!({
                 "cmd": "submit",

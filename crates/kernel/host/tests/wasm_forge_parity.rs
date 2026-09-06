@@ -50,12 +50,12 @@ const REPO: &str = "demo";
 
 /// GENERATED artifact — built from the module crate's guest port by
 /// guest-builder (`make wasm-modules`); committed so this proof is
-/// self-contained (the same fixture the node embeds).
+/// self-contained; production loads its module artifact from the module set.
 const FORGE_WASM: &[u8] = include_bytes!("fixtures/forge.component.wasm");
 
 // ---- the two runtimes over their own git substrates ------------------------
 
-/// a native `Forge` over `dir`, beside the two siblings the parity matrix
+/// a native `Forge` over `dir`, beside the siblings the parity matrix
 /// needs: a [`Recorder`] registered as `chat` (the discussion-channel
 /// follow-up target) and a [`QueryProbe`] (the mid-block committed-read
 /// prober). genesis only REGISTERS, so a fresh dir starts at `StateRoot::ZERO`.
@@ -63,9 +63,12 @@ fn native_host(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> Host {
     let forge = Forge::with_blobs(FORGE, dir.path().join(FORGE), blobs)
         .expect("open native forge")
         .with_chat(CHAT)
+        .with_attribution("attribution")
         .with_chain_id(CHAIN_ID);
     Host::genesis(vec![
         Box::new(forge),
+        identity(),
+        attribution(),
         Box::new(Recorder::new(CHAT)),
         Box::new(QueryProbe::new()),
     ])
@@ -75,7 +78,7 @@ fn native_host(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> Host {
 /// the wasm `forge` tenant: the forge guest over a `ForgeOdbBacking` on `dir`
 /// — the exact `WasmModule::over_odb` composition `noded::compose` uses,
 /// carrying the SAME chain id `noded::compose`'s `odb_genesis_config` would
-/// resolve from the network's bindings — beside the SAME two native siblings.
+/// resolve from the network's bindings — beside the SAME native siblings.
 fn wasm_forge(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> WasmModule {
     let backing =
         ForgeOdbBacking::open(FORGE, dir.path().join(FORGE), blobs).expect("open odb backing");
@@ -89,10 +92,27 @@ fn wasm_forge(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> WasmModu
 fn wasm_host(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> Host {
     Host::genesis(vec![
         Box::new(wasm_forge(dir, blobs)),
+        identity(),
+        attribution(),
         Box::new(Recorder::new(CHAT)),
         Box::new(QueryProbe::new()),
     ])
     .expect("wasm genesis")
+}
+
+fn identity() -> Box<dyn Module> {
+    Box::new(identity::Identity::new(
+        "identity",
+        Box::new(sdk_testkit::MemStore::new()),
+        CHAIN_ID.into(),
+    ))
+}
+
+fn attribution() -> Box<dyn Module> {
+    Box::new(attribution::AttributionModule::new(
+        "attribution",
+        Box::new(sdk_testkit::MemStore::new()),
+    ))
 }
 
 /// the consensus context for one block: both runtimes must see the identical env.
@@ -815,7 +835,13 @@ fn a_push_certificate_checks_the_chain_id_identically_on_both_runtimes() {
 
     // a certificate minted for a DIFFERENT chain is refused on both runtimes.
     let rejected = certified("some-other-chain");
-    assert!(!submit_both(&mut native, &mut wasm, 1, stranger(), rejected));
+    assert!(!submit_both(
+        &mut native,
+        &mut wasm,
+        1,
+        stranger(),
+        rejected
+    ));
 
     // this network's own chain id is accepted on both.
     let accepted = certified(CHAIN_ID);

@@ -53,7 +53,10 @@ impl Module for Relay {
 /// return the resulting root-hash. asserts the cross-module follow-up landed.
 async fn run_block(context: deterministic::Context) -> StateRoot {
     let mut host = Host::new();
-    let kv = Kv::new(KV_ID, Box::new(QmdbStore::init(context.child(KV_ID), KV_ID).await));
+    let kv = Kv::new(
+        KV_ID,
+        Box::new(QmdbStore::init(context.child(KV_ID), KV_ID).await),
+    );
     host.register(Box::new(kv));
     host.register(Box::new(Relay));
 
@@ -122,7 +125,10 @@ fn root_hash_is_deterministic_across_runs() {
 fn unknown_target_is_rejected_without_corrupting_the_registry() {
     deterministic::Runner::default().start(|context| async move {
         let mut host = Host::new();
-        let kv = Kv::new(KV_ID, Box::new(QmdbStore::init(context.child(KV_ID), KV_ID).await));
+        let kv = Kv::new(
+            KV_ID,
+            Box::new(QmdbStore::init(context.child(KV_ID), KV_ID).await),
+        );
         host.register(Box::new(kv));
 
         let err = host
@@ -146,7 +152,10 @@ fn unknown_target_is_rejected_without_corrupting_the_registry() {
 fn dispatch_trace_records_every_dispatch_in_causal_order() {
     deterministic::Runner::default().start(|context| async move {
         let mut host = Host::new();
-        let kv = Kv::new(KV_ID, Box::new(QmdbStore::init(context.child(KV_ID), KV_ID).await));
+        let kv = Kv::new(
+            KV_ID,
+            Box::new(QmdbStore::init(context.child(KV_ID), KV_ID).await),
+        );
         host.register(Box::new(kv));
         host.register(Box::new(Relay));
 
@@ -172,6 +181,8 @@ fn dispatch_trace_records_every_dispatch_in_causal_order() {
                     emitted_msgs: 1,
                     emitted_events: 0,
                     assigned: Vec::new(),
+                    cause: sdk::Cause::Direct,
+                    output: None,
                 },
                 DispatchRecord {
                     module: KV_ID.to_string(),
@@ -183,6 +194,8 @@ fn dispatch_trace_records_every_dispatch_in_causal_order() {
                     emitted_msgs: 0,
                     emitted_events: 0,
                     assigned: Vec::new(),
+                    cause: sdk::Cause::Direct,
+                    output: None,
                 },
             ],
         );

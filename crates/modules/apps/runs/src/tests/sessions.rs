@@ -604,10 +604,9 @@ fn only_the_bound_session_key_may_act() {
 }
 
 #[test]
-fn a_granted_action_emits_a_module_origin_follow_up_carrying_as_agent() {
-    // the emitted op rides THIS module's origin, which is what lets pages (and
-    // chat) refine `as_agent` into Party::Agent { module: runs, agent_id } —
-    // the attribution the frameless lane could never produce.
+fn a_granted_action_prepares_one_program_comment_proposal() {
+    // This validator probe exposes the prepared payload; the real-host
+    // programmable_model tests prove the Program call and canonical author.
     let (mut m, registry, run_id) = with_open_session(&[ACTION_PAGES_COMMENT], &["p1"]);
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
     exec(&mut m, &mut ctx, &act(&run_id, comment("b-p"))).unwrap();
@@ -754,7 +753,7 @@ fn post_message_needs_its_own_grant_and_chat_post_does_not_widen_into_it() {
     );
     assert!(ctx.chat_msgs().is_empty());
 
-    // with the grant, the agent speaks — module origin + as_agent.
+    // With the grant, validation prepares a post for the program to execute.
     let (mut m, registry, run_id) = with_open_session(&[ACTION_CHAT_POST_MESSAGE], &[]);
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
     exec(&mut m, &mut ctx, &act(&run_id, post)).unwrap();

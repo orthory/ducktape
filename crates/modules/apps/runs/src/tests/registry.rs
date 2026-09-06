@@ -1,6 +1,6 @@
 use super::*;
 
-// ---- the registry hook ------------------------------------------------------
+// ---- model configuration and recipe updates --------------------------------
 
 #[test]
 fn a_model_registration_registers_the_dispatch_recipe() {

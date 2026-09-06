@@ -2,7 +2,7 @@ use super::*;
 
 // ---- faceted delivery -------------------------------------------------------
 
-/// a module wired with the forge sink, one watch on "general", one engaged
+/// a module wired with the forge sink and one engaged
 /// run for agent "bot" at seq 2.
 fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
     let mut m = module().with_sink_forge("forge");

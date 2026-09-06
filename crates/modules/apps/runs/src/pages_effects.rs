@@ -225,7 +225,7 @@ impl RunsModule {
 
     /// resolve a target/block id against committed pages state. `Err` == the
     /// id resolves to nothing (or the lookup failed) — degrade material.
-    async fn page_block(
+    pub(super) async fn page_block(
         &self,
         ctx: &dyn Ctx,
         pages: &str,

@@ -18,6 +18,7 @@ pub(crate) async fn apply_verified_suffix_frame(
     served: &statesync::FinalizedFrame,
     prepared: host::PreparedWork,
     code_source: &dyn host::CodeSource,
+    witness: &mut dyn host::CommitWitness,
 ) -> Result<Vec<host::DispatchRecord>, String> {
     let expected = to_node_disposition(served.disposition);
     // CODE-SWAP REALIZATION, mirroring the live drain and recovery replay: a
@@ -49,7 +50,10 @@ pub(crate) async fn apply_verified_suffix_frame(
             // this node's committed state is the network's at this height (its
             // roots verified), so the same units prepare here identically and
             // their authority decides live on all-pre state.
-            match host.submit_block_replaying(ctx, ops, prepared, None).await {
+            match host
+                .submit_block_prepared(ctx, ops, prepared, witness)
+                .await
+            {
                 Ok(batch) => {
                     let (ran, dispatches) = batch.into_trace();
                     let outcome = if ran {
@@ -108,11 +112,18 @@ where
         .prepare_work(frame.height)
         .await
         .map_err(|e| format!("catch-up prepare at height {}: {e}", frame.height))?;
-    node::BlockSink::pre_apply(recovery, frame.height, &frame.frame, &prepared)
+    let expected = node::BlockSeal {
+        height: frame.height,
+        disposition: to_node_disposition(frame.disposition),
+        roots: frame.roots.clone(),
+        root_hash: frame.root_hash,
+    };
+    recovery
+        .pre_apply_catchup(&frame.frame, &prepared, &expected)
         .await
         .map_err(|e| format!("catch-up WAL write: {e}"))?;
     let dispatches =
-        apply_verified_suffix_frame(host, frame, prepared, code_source.as_ref()).await?;
+        apply_verified_suffix_frame(host, frame, prepared, code_source.as_ref(), recovery).await?;
     let seal = node::BlockSeal {
         height: frame.height,
         disposition: to_node_disposition(frame.disposition),

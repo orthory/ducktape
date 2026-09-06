@@ -101,14 +101,9 @@ impl RunsModule {
                     other => canonical_origin(other)?,
                 };
                 reject_run_separator("channel_id", &channel_id)?;
-                // an external submitter is admitted only where its own key
-                // may post (post standing covers read): this op pins the
-                // channel's transcript and posts the reply under module
-                // authority, which chat admits unconditionally, so the
-                // submitter's own chat standing is the only thing keeping a
-                // non-member from reaching a members-only channel through the
-                // agent. module/system origins are not narrowed further —
-                // chat's own post policy always admits them too.
+                // The external requester must be able to post in the channel
+                // whose transcript it asks the model to read. The eventual
+                // program call also passes chat's own account authority gate.
                 if let Origin::External(key) = &ctx.env().origin {
                     let may_post = self
                         .may_post(&*ctx, key, &channel_id)
@@ -179,7 +174,8 @@ impl RunsModule {
                             relations: vec![attribution::Relation {
                                 recipient: agent.account,
                                 reason: attribution::Reason::Defined("model_run".into()),
-                                detail: super::encode_msg(&RunsMsg::RequestRun {
+                                detail: sdk::wire::encode(&super::engagement::RunRequest::Manual {
+                                    requester,
                                     agent_id,
                                     channel_id,
                                     anchor_seq,

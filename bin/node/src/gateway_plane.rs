@@ -2290,6 +2290,7 @@ mod tests {
 
     fn account(number: u64, member: &ed25519::PrivateKey) -> identity::AccountView {
         identity::AccountView {
+            control: identity::Control::Keys,
             number,
             name: "someone".into(),
             keys: vec![identity::KeyView {
@@ -2978,15 +2979,20 @@ mod tests {
     fn gateway_path_is_writable_by_its_own_owner() {
         let member = ed25519::PrivateKey::from_seed(41);
         let signer = member.public_key().as_ref().to_vec();
-        let actor = sdk::Origin::External(signer.clone()).actor_string();
+        let actor = duckfs_core::Authority::External {
+            key: signer.clone(),
+            account: None,
+        };
         let path = gateway_path(&signer, "_apex", gateway::MANIFEST_FILE);
         let segments = duckfs_core::paths::canonical(&path).unwrap();
         duckfs_core::paths::check_authority(&actor, &segments)
             .expect("the route's own signer must be able to write its serving path");
         // A different member's key must not reach the same tree.
         let other = ed25519::PrivateKey::from_seed(42);
-        let other_actor =
-            sdk::Origin::External(other.public_key().as_ref().to_vec()).actor_string();
+        let other_actor = duckfs_core::Authority::External {
+            key: other.public_key().as_ref().to_vec(),
+            account: None,
+        };
         duckfs_core::paths::check_authority(&other_actor, &segments)
             .expect_err("another key must not be able to write someone else's route content");
     }

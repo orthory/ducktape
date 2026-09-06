@@ -9,13 +9,14 @@
 //!
 //! automations is a chat-HOOK SUBSCRIBER: both hosts carry the REAL native
 //! siblings under the production ids (`bin/node/src/host_state.rs` —
-//! chat over its own qmdb store, tasks, inbox) and drive actual chat posts
+//! chat over its own qmdb store, tasks, identity, attribution, inbox) and drive actual chat posts
 //! through the hook fan-out, so on the wasm side the whole intake runs in the
 //! guest: the origin gate, the loop-prevention author check, the text fetch
 //! and the pre-emit PROBES (channel-exists / message-id-unused /
 //! task-id-unused — host-routed `query-module` reads resolved through
 //! memoized replay against the live siblings), and the follow-up emissions
-//! that land on chat/tasks/inbox IN THE SAME BLOCK as the triggering post.
+//! that land on chat/tasks/attribution in the triggering block. Inbox consumes
+//! the committed attribution changes in later units.
 //! the NO-FAIL contract crosses the seam unchanged: a probe rejection stages
 //! a RunRecord instead of aborting the posting user's block.
 
@@ -24,10 +25,11 @@ use automations::{
     MAX_ID_BYTES, MAX_TEMPLATE_BYTES, Trigger, decode_reply, encode_msg, encode_query,
 };
 use chat::{Block, Chat, ChatMsg, PostPolicy, encode_msg as chat_encode_msg};
+use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use inbox::Inbox;
-use sdk::{Error, Msg, Origin, StateRoot};
+use sdk::{Error, Module, Msg, Origin, StateRoot};
 use statesync::qmdb::QmdbStore;
 use tasks::{
     TaskMsg, TaskQuery, TaskReply, Tasks, decode_task_reply as tasks_decode_reply,
@@ -41,33 +43,97 @@ const AUTOMATIONS_WASM: &[u8] = include_bytes!("fixtures/automations.component.w
 
 fn wasm_automations(store: Box<dyn sdk::MerkleStore>) -> WasmModule {
     // NOTE: no sibling wiring here — the guest compiles the exact production
-    // builder chain (`Automations::new(.., "chat", "tasks", "inbox")`) in;
+    // builder chain (`Automations::new(.., "chat", "tasks", "identity", "attribution")`) in;
     // only the store arrives host-constructed.
     WasmModule::with_store("automations", AUTOMATIONS_WASM, store).expect("load component")
 }
 
 /// the production wiring, verbatim (`bin/node/src/host_state.rs`).
 fn native_automations(store: Box<dyn sdk::MerkleStore>) -> Automations {
-    Automations::new("automations", store, "chat", "tasks", "inbox")
+    Automations::new(
+        "automations",
+        store,
+        "chat",
+        "tasks",
+        "identity",
+        "attribution",
+    )
 }
 
 /// a 32-byte submitter key (the ordered lane hands modules verified ed25519
 /// ids; the parity claim only needs them distinct and non-empty).
 fn key(tag: u8) -> Vec<u8> {
-    vec![tag; 32]
+    PrivateKey::from_seed(u64::from(tag))
+        .public_key()
+        .as_ref()
+        .to_vec()
+}
+
+async fn identity_fixture() -> identity::Identity {
+    let mut identity = identity::Identity::new(
+        "identity",
+        Box::new(sdk_testkit::MemStore::new()),
+        "parity".into(),
+    );
+    for tag in [0xA1, 0xB2, 0xC3] {
+        let mut ctx = sdk_testkit::TestCtx::with_env(sdk::Env {
+            height: 0,
+            consensus_time: 0,
+            me: "identity".into(),
+            origin: Origin::External(key(tag)),
+            cause: sdk::Cause::Direct,
+        });
+        identity
+            .execute(
+                &mut ctx,
+                &Msg {
+                    target: "identity".into(),
+                    payload: identity::encode_msg(&identity::IdentityMsg::Create {
+                        name: format!("member-{tag}"),
+                        scheme: identity::KeyScheme::Ed25519,
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    identity.commit_block().await.unwrap();
+    identity
 }
 
 /// the shared native sibling set: chat over a REAL qmdb store (the module the
-/// hook events and probes run against), tasks, inbox.
+/// hook events and probes run against), tasks, identity, attribution, inbox.
 async fn siblings(
     context: &deterministic::Context,
     label: &'static str,
 ) -> Vec<Box<dyn sdk::Module>> {
     let store = QmdbStore::init(context.child(label), "chat").await;
     vec![
-        Box::new(Chat::new("chat", Box::new(store))),
-        Box::new(Tasks::new("tasks", Box::new(sdk_testkit::MemStore::new()))),
-        Box::new(Inbox::new("inbox", Box::new(sdk_testkit::MemStore::new()))),
+        Box::new(
+            Chat::new("chat", Box::new(store))
+                .with_identity("identity")
+                .with_attribution("attribution"),
+        ),
+        Box::new(identity_fixture().await),
+        Box::new(
+            attribution::AttributionModule::new(
+                "attribution",
+                Box::new(sdk_testkit::MemStore::new()),
+            )
+            .with_subscribers(["inbox"]),
+        ),
+        Box::new(Tasks::new(
+            "tasks",
+            "identity",
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
+        Box::new(Inbox::new(
+            "inbox",
+            Box::new(sdk_testkit::MemStore::new()),
+            "attribution",
+            "identity",
+        )),
     ]
 }
 
@@ -124,7 +190,6 @@ fn post(channel: &str, id: &str, text: &str) -> Msg {
             message_id: id.into(),
             blocks: vec![Block::paragraph(text)],
             thread: None,
-            as_agent: None,
         }),
     }
 }
@@ -164,7 +229,7 @@ const SIBLING_IDS: [&str; 3] = ["chat", "tasks", "inbox"];
 /// submit one ACCEPTED op to both hosts: IDENTICAL automations roots (both
 /// are the store's merkle root), identical replies, per-sibling cross-host
 /// agreement (the follow-up lanes — a diverging or missing
-/// PostMessage/CreateTask/Deliver diverges the sibling roots), lockstep
+/// PostMessage/CreateTask/report diverges the sibling roots), lockstep
 /// root movement.
 async fn roundtrip(
     native: &mut Host,
@@ -246,9 +311,7 @@ async fn reject_roundtrip(
     assert_eq!(replies(native).await, replies(wasm).await);
 }
 
-/// one rule's run-history details off one host — the seam a `DeliverInbox`
-/// action records the member string it ACTUALLY emitted into, which is
-/// otherwise only observable as an inbox root (inbox has no wire query).
+/// A rule's run history records the account its Report action addressed.
 async fn run_details(h: &Host, rule_id: &str) -> Vec<String> {
     let reply = h
         .query(
@@ -300,9 +363,7 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         assert_eq!(root_of(&native), root_of(&wasm), "genesis roots diverge");
         assert!(native.block_durable_ids().contains("automations"));
         assert!(wasm.block_durable_ids().contains("automations"));
-        // the inbox sibling's empty root, for the delivery-landed claims below
-        // (the inbox has no read surface — its module root is the whole
-        // observable committed state).
+        // The inbox sibling's empty root, for the later delivery checks.
         let inbox_genesis = native.module_root("inbox").expect("inbox registered");
 
         // ---- the shared world: a hooked channel. sibling-only blocks leave
@@ -381,13 +442,8 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
             create_rule(
                 "r-inbox",
                 on_general(None),
-                Action::DeliverInbox {
-                    // #1739: `DeliverInbox` may reach only the rule owner's
-                    // own inbox queue -- `ops`'s literal `ext:{hex}`. the
-                    // GUEST'S rendering of that literal (unaffected by
-                    // substitution) has to match native's byte for byte, or
-                    // the inbox sibling root diverges below.
-                    member_template: format!("ext:{}", "b2".repeat(32)),
+                Action::Report {
+                    recipient: 2,
                     kind: "note".into(),
                     body_template: "{author} said: {text}".into(),
                 },
@@ -428,26 +484,37 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
         )
         .await;
         assert_eq!(task_ids(&wasm).await, vec!["job-general-1".to_string()]);
-        // r-inbox's Deliver landed ATOMICALLY in the posting block: the inbox
-        // sibling root moved off empty (cross-host agreement on it is pinned
-        // inside `roundtrip` via SIBLING_IDS).
-        assert_ne!(
-            native.module_root("inbox").expect("inbox registered"),
-            inbox_genesis,
-            "the hooked post delivered nothing to the inbox"
+        // Reports are source-owned attribution changes in this block; inbox
+        // ingestion is a later unit. Its queue may already contain channel and
+        // rule ownership changes, so compare the report itself here.
+        let bytes = wasm
+            .query(
+                "attribution",
+                &attribution::encode_query(&attribution::AttributionQuery::ChangesFor {
+                    recipient: 2,
+                    after: 0,
+                    limit: 64,
+                }),
+            )
+            .await
+            .unwrap();
+        let attribution::AttributionReply::Changes(changes) =
+            attribution::decode_reply(&bytes).unwrap()
+        else {
+            panic!("change list");
+        };
+        assert!(
+            changes
+                .iter()
+                .any(|entry| entry.change.source.module == "automations"
+                    && entry.change.source.kind == "report"
+                    && entry.change.reason == attribution::Reason::Report
+                    && entry.change.height == 7)
         );
-        // and it delivered into the ACKABLE queue: #1739's gate binds in the
-        // COMPILED COMPONENT exactly as in native, so the member is `ops`'s
-        // (the rule OWNER's) own actor string, never the triggering author's
-        // (`user`, key 0xA1) -- a rule may only ever deliver to its own
-        // owner's queue.
         assert_eq!(
             run_details(&wasm, "r-inbox").await,
-            vec![format!(
-                "delivered inbox note to {}",
-                Origin::External(key(0xB2)).actor_string()
-            )],
-            "the guest rendered the member outside the actor-string domain"
+            vec!["reported note to account 2".to_string()],
+            "the report must name the rule owner account"
         );
 
         // ---- a post WITHOUT the text filter's needle: r-post skips (its
@@ -563,10 +630,7 @@ fn same_ops_same_replies_follow_ups_land_and_probes_downgrade() {
             AutomationsReply::Rule(None)
         );
 
-        // the inbox lane really landed, and landed IDENTICALLY: the sibling
-        // inbox roots moved off empty and agree across the hosts (the inbox
-        // has no read surface — its decoded views are the index guest's job;
-        // the module root IS its whole observable committed state).
+        // Deferred attribution delivery changed both inbox roots identically.
         assert_eq!(
             native.module_root("inbox"),
             wasm.module_root("inbox"),
@@ -701,8 +765,8 @@ fn rejections_match_and_leave_no_trace() {
                 create_rule(
                     "r1",
                     on_general(None),
-                    Action::DeliverInbox {
-                        member_template: "m".into(),
+                    Action::Report {
+                        recipient: 2,
                         kind: String::new(),
                         body_template: "b".into(),
                     },
@@ -763,8 +827,11 @@ fn rejections_match_and_leave_no_trace() {
             (Origin::External(Vec::new()), "non-empty submitter id"),
             // a NON-chat module id: the chat origin is the hook lane, which is
             // routed before the owner gate and never rejects by design.
-            (Origin::Module("governance".into()), "module origin"),
-            (Origin::System, "system origin"),
+            (
+                Origin::Module("governance".into()),
+                "automation rules require an account origin",
+            ),
+            (Origin::System, "automation rules require an account origin"),
         ];
         let mut height = 100;
         for op in [

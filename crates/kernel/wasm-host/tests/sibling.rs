@@ -190,7 +190,7 @@ async fn module_root_reaches_the_dispatch_snapshot() {
     let err = exec(&mut m, &mut ctx, b"rnowhere".to_vec())
         .await
         .expect_err("unknown module root is None");
-    assert!(matches!(err, Error::Module(_)));
+    assert!(matches!(err, Error::UnknownModule(id) if id == "nowhere"));
 }
 
 #[tokio::test]
@@ -230,5 +230,5 @@ async fn query_with_resolves_and_plain_query_stays_sealed() {
     // the ctx-less path answers the sealed stub surface: the guest sees
     // `unsupported` (a deterministic answer, not a pause) and propagates it.
     let err = m.query(b"qdirectory:ping").await.expect_err("sealed");
-    assert!(matches!(err, Error::Module(m) if m.contains("Unsupported")));
+    assert!(matches!(err, Error::QueryUnsupported));
 }

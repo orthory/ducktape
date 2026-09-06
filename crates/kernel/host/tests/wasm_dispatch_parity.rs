@@ -24,7 +24,7 @@
 //!
 //! dispatch is a SELF-CONTAINED plane: its `execute` reads only `ctx.env()` and
 //! EMITS follow-ups (a saga `Trigger`, event breadcrumbs); it makes no
-//! cross-module `query-module` reads, so — unlike tagging/runs — the guest needs
+//! cross-module `query-module` reads, so — unlike attribution/runs — the guest needs
 //! no memoized sibling replay.
 //!
 //! ## PART 2: the committed-only query lane
@@ -39,7 +39,7 @@
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use dispatch::{
     DispatchModule, DispatchMsg, DispatchQuery, DispatchReply, DispatchStatus, OutputContract,
-    Routing, decode_reply, decode_result_event, encode_msg, encode_query,
+    Routing, decode_reply, encode_msg, encode_query,
 };
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use saga::{SagaCallback, SagaOutcome, encode_callback};
@@ -59,6 +59,7 @@ async fn native_dispatch(context: &deterministic::Context, label: &'static str) 
     DispatchModule::new(
         "dispatch",
         "saga",
+        "identity",
         Box::new(QmdbStore::init(context.child(label), "dispatch").await),
     )
 }
@@ -613,26 +614,29 @@ async fn same_ops_inner(context: &deterministic::Context) {
         true,
     )
     .await;
+    assert_eq!(
+        deliveries(&wasm, "caller").await.len(),
+        1,
+        "the second result cannot deliver in its own callback block"
+    );
     // a callback for an UNKNOWN key is a deterministic no-op on both runtimes —
-    // and the mailbox is already drained, so no injection rides this block.
+    // while the second result is delivered from the previous committed boundary.
     accept(
         &mut native,
         &mut wasm,
         12,
         saga.clone(),
         callback_op(&key_of("caller", "ghost"), SagaOutcome::Done(b"x".to_vec())),
-        false,
+        true,
     )
     .await;
-    // an explicit sweep over the now-EMPTY mailbox stages nothing on either
-    // side: an idle `DeliverPending` must not move the root, or every block on
-    // a quiet chain would.
+    // An idle pump must leave the already-drained mailbox unchanged.
     accept(
         &mut native,
         &mut wasm,
         13,
         Origin::System,
-        op(&DispatchMsg::DeliverPending {}),
+        op(&DispatchMsg::Nudge {}),
         false,
     )
     .await;
@@ -664,23 +668,41 @@ async fn same_ops_inner(context: &deterministic::Context) {
     let d1 = dispatch_view(&wasm, "d1")
         .await
         .expect("the receipt survives");
-    assert_eq!(d1.status, DispatchStatus::Delivered);
+    assert_eq!(
+        d1.status,
+        DispatchStatus::Delivered {
+            delivery: sdk::DeliveryOutcome::Applied
+        }
+    );
     assert_eq!(d1.outcome, None, "delivery drops this module's copy");
     assert_eq!(d1.created_at, 1_005);
     assert_eq!(d1.updated_at, 1_011, "delivered by block 11's injection");
     let d2 = dispatch_view(&wasm, "d2")
         .await
         .expect("the receipt survives");
-    assert_eq!(d2.status, DispatchStatus::Delivered);
+    assert_eq!(
+        d2.status,
+        DispatchStatus::Delivered {
+            delivery: sdk::DeliveryOutcome::Applied
+        }
+    );
 
     // the receiver got BOTH results, in mailbox (FIFO) order, with every byte.
     let received = deliveries(&wasm, "caller").await;
     assert_eq!(received.len(), 2, "one ResultEvent per dispatch");
-    let first = decode_result_event(&received[0].1).expect("decode");
+    let dispatch::Delivery::Result(first) =
+        dispatch::decode_delivery(&received[0].1).expect("decode")
+    else {
+        panic!("result delivery")
+    };
     assert_eq!(first.dispatch_id, "d1");
     assert_eq!(first.recipe_id, "summarize");
     assert_eq!(first.outcome, Ok(br#"{"ok":1}"#.to_vec()));
-    let second = decode_result_event(&received[1].1).expect("decode");
+    let dispatch::Delivery::Result(second) =
+        dispatch::decode_delivery(&received[1].1).expect("decode")
+    else {
+        panic!("result delivery")
+    };
     assert_eq!(second.dispatch_id, "d2");
     assert_eq!(second.outcome, Err("cancelled".into()));
 
@@ -814,12 +836,6 @@ async fn rejections_inner(context: &deterministic::Context) {
                 admission: dispatch::AdmissionPolicy::Queue,
             }),
             "unknown recipe",
-        ),
-        (
-            // DeliverPending is host-injected: no ordinary origin may force it.
-            alice.clone(),
-            op(&DispatchMsg::DeliverPending {}),
-            "System-origin only",
         ),
         (
             // a payload that is not a dispatch op at all: both sides reject

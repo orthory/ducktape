@@ -49,7 +49,7 @@ fn expected() -> BTreeMap<String, Shape> {
         ("pages", shape(Backing::Store, NONE, false)),
         ("runs", shape(Backing::Map, CHAIN_ID, false)),
         ("saga", shape(Backing::Store, NONE, false)),
-        ("tagging", shape(Backing::Store, NONE, false)),
+        ("attribution", shape(Backing::Store, NONE, false)),
         ("tasks", shape(Backing::Store, NONE, false)),
     ]
     .into_iter()

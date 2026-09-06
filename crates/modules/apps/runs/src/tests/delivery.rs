@@ -583,7 +583,7 @@ fn a_fenced_job_response_still_yields_actions_only() {
 fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
     // the agent SPEAKING (its own channel, its own message) rather than
     // ANSWERING where it was engaged — one more action in the strict lane, and
-    // one more chat post carrying `as_agent`.
+    // one more proposed chat post for the program account.
     let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
     let mut ctx = CaptureCtx::new()
         .at(8)

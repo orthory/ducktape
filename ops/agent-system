@@ -159,9 +159,9 @@ const textArg = async (args, start) =>
   args.length > start ? args.slice(start).join(" ") : stdin();
 const author = (value) => {
   if (value === "system") return "system";
-  if (value.agent) return `${value.agent.agent_id}@agents.duck`;
+  if (value.account !== undefined) return `acct:${value.account}`;
   if (value.module) return value.module;
-  if (value.user) return `${Buffer.from(value.user).toString("hex").slice(0, 8)}…`;
+  if (value.key) return `${Buffer.from(value.key).toString("hex").slice(0, 8)}…`;
   return "unknown";
 };
 const blockText = (blocks) => {
@@ -292,7 +292,6 @@ switch (command) {
           message_id: args[1],
           blocks: [{ paragraph: [{ text, marks: [] }] }],
           thread: null,
-          as_agent: null,
         },
       }),
     );

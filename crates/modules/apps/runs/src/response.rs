@@ -14,7 +14,7 @@ use super::{
     ModelRecord, Msg, Origin, PendingState, ReplyBlock, ResultEvent, RunOrigin, RunsModule,
     TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg,
     chat_encode_query, dispatch_encode_msg, dispatch_id_for, files_decode_reply, files_encode_msg,
-    files_encode_query, page_thread_id, reply_message_id, tasks_decode_reply, tasks_encode_msg,
+    files_encode_query, page_source, reply_message_id, tasks_decode_reply, tasks_encode_msg,
     tasks_encode_query,
 };
 use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
@@ -212,9 +212,7 @@ pub(super) fn failure_excerpt(reason: &str) -> String {
     crate::truncate_on_boundary(&line, FAILURE_EXCERPT_BYTES, "…")
 }
 
-/// the canonical state form of a dispatch origin (see [`RunOrigin`]). a
-/// program account has no run standing of its own, so its origin is refused
-/// rather than mapped.
+/// Preserve the authenticated creating origin in the run record.
 pub(super) fn canonical_origin(origin: &Origin) -> Result<RunOrigin, Error> {
     match origin {
         Origin::External(key) => Ok(RunOrigin::External(key.clone())),
@@ -678,7 +676,7 @@ impl RunsModule {
                     ));
                 }
             } else {
-                let page_run = page_thread_id(&entry.channel_id).is_some();
+                let page_run = page_source(&entry.channel_id).is_some();
                 let action = if page_run {
                     ACTION_PAGES_COMMENT
                 } else {
@@ -942,8 +940,31 @@ impl RunsModule {
             .pages
             .as_deref()
             .ok_or_else(|| "pages module is not configured".to_string())?;
-        let thread_id = page_thread_id(&entry.channel_id)
-            .ok_or_else(|| "run is not a pages comment run".to_string())?;
+        let source =
+            page_source(&entry.channel_id).ok_or_else(|| "run is not a pages run".to_string())?;
+        let thread_id = match source {
+            super::PageSource::CommentThread(thread_id) => thread_id,
+            super::PageSource::Block(block_id) => {
+                let agent = self
+                    .agent_for_run(ctx, entry)
+                    .await?
+                    .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
+                return self
+                    .pages_action_msg(
+                        ctx,
+                        pages,
+                        &agent,
+                        run_id,
+                        "reply",
+                        &AgentAction::AddPageComment {
+                            target: block_id.to_string(),
+                            body: to_page_comment_text(blocks),
+                        },
+                        0,
+                    )
+                    .await;
+            }
+        };
         let reply = ctx
             .query(
                 pages,
@@ -1261,7 +1282,7 @@ impl RunsModule {
             .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        let page_run = page_thread_id(&entry.channel_id).is_some();
+        let page_run = page_source(&entry.channel_id).is_some();
         // posting the failure is a reply like any success — ungranted
         // agents keep the old silent-fail.
         let action = if page_run {
@@ -1348,7 +1369,7 @@ impl RunsModule {
         response: AgentResponse,
     ) {
         if !response.reply_blocks.is_empty() {
-            if page_thread_id(&entry.channel_id).is_some() {
+            if page_source(&entry.channel_id).is_some() {
                 match self
                     .page_reply_msg(&*ctx, run_id, entry, &response.reply_blocks)
                     .await

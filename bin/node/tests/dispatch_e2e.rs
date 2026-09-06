@@ -52,12 +52,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use agent::{ACTION_CHAT_POST, AgentMsg};
 use capability::{CapabilityQuery, CapabilityReply};
-use chat::{AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, Mark, PostPolicy, Span};
+use chat::{Block, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
 use common::{Cluster, sandbox_toml, skip_unless_sandboxed};
 use dispatch::{DispatchQuery, DispatchReply, DispatchStatus};
-use runs::{RunsMsg, RunsQuery, RunsReply, TurnPolicy};
+use runs::{ACTION_CHAT_POST, ModelMsg};
+use runs::{RunsMsg, RunsQuery, RunsReply};
 
 /// convergence budget: mesh formation + leader rotation are real-time on a
 /// possibly-loaded CI core; polls exit early, so generosity is free.
@@ -160,7 +160,6 @@ impl ScriptProvider {
             (self.env_var.clone(), self.bin.display().to_string()),
         ]
     }
-
 }
 
 /// env that keeps a node OUT of the provider business regardless of what the
@@ -173,7 +172,10 @@ fn hermetic_env(root: &std::path::Path, name: &str) -> Vec<(String, String)> {
     std::fs::create_dir_all(&empty).expect("empty spec dir");
     let missing = root.join(name).join("missing-executor");
     vec![
-        ("DUCKTAPE_CAPABILITY_DIR".into(), empty.display().to_string()),
+        (
+            "DUCKTAPE_CAPABILITY_DIR".into(),
+            empty.display().to_string(),
+        ),
         ("DUCKTAPE_CLAUDE_BIN".into(), missing.display().to_string()),
         ("DUCKTAPE_CODEX_BIN".into(), missing.display().to_string()),
     ]
@@ -302,7 +304,7 @@ fn providers(cluster: &Cluster, idx: usize, tag: &str) -> Option<Vec<Vec<u8>>> {
     }
 }
 
-/// register `agent_id` on `tag`, watch `channel` under Mention, and post the
+/// Provision the model program, register `agent_id` on `tag`, and post the
 /// mention that engages it — the whole client-side trigger, submitted through
 /// node `idx` (whose key becomes the owner/author). returns the mention's
 /// message id.
@@ -320,42 +322,27 @@ fn register_and_mention(
     tag: &str,
     message_id: &str,
 ) {
-    cluster.submit(
-        idx,
-        "agent",
-        &agent::encode_msg(&AgentMsg::RegisterAgent {
-            agent_id: agent_id.into(),
-            display_name: agent_id.into(),
-            capability: tag.into(),
-            allowed_actions: vec![ACTION_CHAT_POST.into()],
-            recipe_hash: None,
-            caps: None,
-            skills: None,
-        }),
-    );
+    let program_account = common::provision_model_program(cluster, idx, agent_id);
     cluster.submit(
         idx,
         "runs",
-        &runs::encode_msg(&RunsMsg::WatchChannel {
-            channel_id: channel.into(),
-            policy: TurnPolicy::Mention,
+        &runs::encode_msg(&RunsMsg::ConfigureModel {
+            operation: ModelMsg::RegisterModel {
+                account: program_account,
+                agent_id: agent_id.into(),
+                display_name: agent_id.into(),
+                capability: tag.into(),
+                allowed_actions: vec![ACTION_CHAT_POST.into()],
+                recipe_hash: None,
+                caps: None,
+                skills: None,
+            },
         }),
     );
-    // the watch must be committed before the mention posts, or the tagging
-    // plane has no subscriber to engage.
-    cluster.await_committed(idx, "the channel watch to commit", FINALIZE, || {
-        let reply = cluster.query(
-            idx,
-            "runs",
-            &runs::encode_query(&RunsQuery::Watches),
-        )?;
-        match runs::decode_reply(&reply) {
-            Ok(RunsReply::Watches(w)) => {
-                w.iter().any(|v| v.channel_id == channel).then_some(())
-            }
-            _ => None,
-        }
-    });
+    assert_eq!(
+        common::model_account(cluster, idx, agent_id),
+        program_account
+    );
     cluster.submit(
         idx,
         "chat",
@@ -366,22 +353,27 @@ fn register_and_mention(
                 Span::plain("hey "),
                 Span {
                     text: format!("@{agent_id}"),
-                    marks: vec![Mark::Mention(AuthorRef::Agent {
-                        module: "runs".into(),
-                        agent_id: agent_id.into(),
-                    })],
+                    marks: vec![Mark::Mention(Party::Account(common::model_account(
+                        cluster, idx, agent_id,
+                    )))],
                 },
                 Span::plain(" say the word"),
             ])],
             thread: None,
-            as_agent: None,
         }),
     );
 }
 
 /// poll `channel` on `idx` until the agent's reply to `run_id` exists, and
 /// return its plain text.
-fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) -> String {
+fn wait_for_reply(
+    cluster: &Cluster,
+    idx: usize,
+    channel: &str,
+    run_id: &str,
+    agent_id: &str,
+) -> String {
+    let account = common::model_account(cluster, idx, agent_id);
     cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
         let reply = cluster.query(
             idx,
@@ -399,10 +391,7 @@ fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) ->
             (v.head.message_id == format!("agent/{run_id}")).then(|| {
                 assert_eq!(
                     v.head.author,
-                    AuthorRef::Agent {
-                        module: "runs".into(),
-                        agent_id: run_id.rsplit('\u{1f}').next().expect("run id agent").into(),
-                    },
+                    Party::Account(account),
                     "the reply must be authored by the agent"
                 );
                 v.head
@@ -435,7 +424,7 @@ fn wait_for_delivered(cluster: &Cluster, idx: usize, run_id: &str) {
         )?;
         match dispatch::decode_reply(&reply) {
             Ok(DispatchReply::Dispatch(Some(view)))
-                if view.status == DispatchStatus::Delivered =>
+                if matches!(view.status, DispatchStatus::Delivered { .. }) =>
             {
                 Some(())
             }
@@ -446,7 +435,12 @@ fn wait_for_delivered(cluster: &Cluster, idx: usize, run_id: &str) {
 
 /// every op row of `module`'s derived op index on `idx`, oldest-first.
 fn index_ops(cluster: &Cluster, idx: usize, module: &str) -> Vec<serde_json::Value> {
-    let (status, body) = cluster.http(idx, "GET", &format!("/v1/index/{module}/ops?limit=500"), None);
+    let (status, body) = cluster.http(
+        idx,
+        "GET",
+        &format!("/v1/index/{module}/ops?limit=500"),
+        None,
+    );
     assert_eq!(status, 200, "index ops for {module} failed: {body}");
     body["ops"].as_array().cloned().unwrap_or_default()
 }
@@ -518,17 +512,31 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // beat 1: the text provider's agent. the mention is seq 1 in the fresh
     // channel; the run executes on node 1 (the tag's only announced
     // provider) and replies once.
-    register_and_mention(&cluster, 0, "dispatch", "quacker-text", &text_provider.tag, "m1");
-    let run_text = runs::run_id_for("dispatch", 1, "quacker-text");
-    let reply = wait_for_reply(&cluster, 0, "dispatch", &run_text);
+    register_and_mention(
+        &cluster,
+        0,
+        "dispatch",
+        "quacker-text",
+        &text_provider.tag,
+        "m1",
+    );
+    let run_text = common::attributed_run_id(&cluster, 0, "dispatch", 1, "quacker-text");
+    let reply = wait_for_reply(&cluster, 0, "dispatch", &run_text, "quacker-text");
     assert_eq!(reply, "the word is quack", "the text provider's raw answer");
     wait_for_delivered(&cluster, 0, &run_text);
 
     // beat 2: the json provider's agent, cross-checked from ANOTHER node.
     // the reply above was seq 2, so this mention anchors at seq 3.
-    register_and_mention(&cluster, 0, "dispatch", "quacker-json", &json_provider.tag, "m2");
-    let run_json = runs::run_id_for("dispatch", 3, "quacker-json");
-    let reply = wait_for_reply(&cluster, 2, "dispatch", &run_json);
+    register_and_mention(
+        &cluster,
+        0,
+        "dispatch",
+        "quacker-json",
+        &json_provider.tag,
+        "m2",
+    );
+    let run_json = common::attributed_run_id(&cluster, 0, "dispatch", 3, "quacker-json");
+    let reply = wait_for_reply(&cluster, 2, "dispatch", &run_json, "quacker-json");
     assert_eq!(
         reply, "the json word is quack",
         "the json-result provider's extracted answer"
@@ -586,18 +594,20 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
     // and its consumption. the derived op index applies block-by-block
     // BEHIND finalized state (the reply was already read from chat state
     // above), so both lookups poll instead of racing the indexer.
-    let result_height = cluster.await_committed(0, "the OracleResult op to index", FINALIZE, || {
-        op_height(&index_ops(&cluster, 0, "saga"), |p| {
-            p.get("oracle_result").is_some()
-        })
-    });
-    let reply_height = cluster.await_committed(0, "the agent reply post to index", FINALIZE, || {
-        op_height(&index_ops(&cluster, 0, "chat"), |p| {
-            p.get("post_message")
-                .and_then(|m| m["message_id"].as_str())
-                .is_some_and(|id| id == format!("agent/{run_text}"))
-        })
-    });
+    let result_height =
+        cluster.await_committed(0, "the OracleResult op to index", FINALIZE, || {
+            op_height(&index_ops(&cluster, 0, "saga"), |p| {
+                p.get("oracle_result").is_some()
+            })
+        });
+    let reply_height =
+        cluster.await_committed(0, "the agent reply post to index", FINALIZE, || {
+            op_height(&index_ops(&cluster, 0, "chat"), |p| {
+                p.get("post_message")
+                    .and_then(|m| m["message_id"].as_str())
+                    .is_some_and(|id| id == format!("agent/{run_text}"))
+            })
+        });
     assert!(
         reply_height > result_height,
         "next-block delivery: reply at {reply_height} must sit above the result at {result_height}"
@@ -605,11 +615,7 @@ fn mention_routes_to_the_announced_provider_across_nodes() {
 
     // no correlation entries left behind: delivery pruned the pending map.
     let reply = cluster
-        .query(
-            0,
-            "runs",
-            &runs::encode_query(&RunsQuery::PendingRuns),
-        )
+        .query(0, "runs", &runs::encode_query(&RunsQuery::PendingRuns))
         .expect("pending runs query");
     match runs::decode_reply(&reply) {
         Ok(RunsReply::PendingRuns(pending)) => {
@@ -674,7 +680,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
         }),
     );
     register_and_mention(&cluster, 0, "race", "racer", "quack-race", "m1");
-    let run_id = runs::run_id_for("race", 1, "racer");
+    let run_id = common::attributed_run_id(&cluster, 0, "race", 1, "racer");
 
     // ==================================================================
     // THE claim-lane assertion — the one that goes red on the regression this
@@ -713,7 +719,7 @@ fn unannounced_capable_nodes_race_accept_and_execute_once() {
     );
 
     // the winner then EXECUTES what it claimed, and one reply posts.
-    let reply = wait_for_reply(&cluster, 0, "race", &run_id);
+    let reply = wait_for_reply(&cluster, 0, "race", &run_id, "racer");
     assert!(
         reply == "claimed by node one" || reply == "claimed by node two",
         "the reply must be one racer's answer: {reply:?}"

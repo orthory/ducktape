@@ -1271,14 +1271,14 @@ fn report_to_a_foreign_account_is_refused_at_fire() {
             owner_report_action(OWNER, "mention", "you were posted at"),
         ),
     )
-    .expect("create: the literal owner queue is the one accepted member");
+    .expect("create: the owner account is the accepted recipient");
     block_on(m.commit_block()).expect("commit");
 
     let mut rule = block_on(m.rule("notify-owner"))
         .expect("load")
         .expect("notify-owner");
     let Action::Report { recipient, .. } = &mut rule.action else {
-        panic!("expected DeliverInbox");
+        panic!("expected Report");
     };
     *recipient = account_of(STRANGER);
     m.store(rule_key("notify-owner"), &rule);
@@ -1291,7 +1291,7 @@ fn report_to_a_foreign_account_is_refused_at_fire() {
         &posted("general", 1, user(1), Vec::new()),
     )
     .expect("fire records failure, never aborts the block");
-    assert!(chat_ctx.msgs.is_empty(), "no delivery reaches inbox");
+    assert!(chat_ctx.msgs.is_empty(), "no report reaches attribution");
     block_on(m.commit_block()).expect("commit fire");
     assert_eq!(get_rule(&m, "notify-owner").expect("rule").fire_count, 0);
     let recs = history(&m, "notify-owner", 4);
@@ -1740,7 +1740,7 @@ fn a_wildcard_rule_does_not_observe_a_channel_its_owner_cannot_read() {
     .expect("no-fail arm");
     assert!(
         chat_ctx.msgs.is_empty(),
-        "no inbox delivery of private text"
+        "no attribution report contains private text"
     );
     block_on(m.commit_block()).expect("commit");
     assert_eq!(get_rule(&m, "spy").expect("spy").fire_count, 0);

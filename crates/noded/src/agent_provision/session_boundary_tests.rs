@@ -203,9 +203,9 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
     .expect("genesis")
 }
 
-/// channel → agent → watch → the human's mention. the post block stages the
-/// pending entry, the dispatch, and its saga trigger, and emits the announcement
-/// event the pool claims.
+/// A human mention commits before the programmable user's reaction. Draining
+/// the actual queued attribution and calls creates the run and its announcement
+/// event for the compute pool.
 async fn mention_run(host: &mut Host) -> Event {
     let operations = [
         Msg {

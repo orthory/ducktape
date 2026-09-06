@@ -1260,6 +1260,7 @@ mod tests {
         let device_key = device.public_key().as_ref().to_vec();
         let mine = passkey(3);
         let account = AccountView {
+            control: identity::Control::Keys,
             number: 11,
             name: "alice".into(),
             keys: vec![identity::KeyView {
@@ -1441,6 +1442,7 @@ mod tests {
     #[test]
     fn authority_name_refusal_lists_current_holders_and_never_picks_one() {
         let account = |number: u64, name: &str| AccountView {
+            control: identity::Control::Keys,
             number,
             name: name.into(),
             keys: Vec::new(),

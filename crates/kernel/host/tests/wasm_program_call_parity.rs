@@ -65,6 +65,14 @@ impl Module for Native {
     fn root(&self) -> StateRoot {
         StateRoot(sha2::Sha256::digest(sdk::hash::encode_pairs(&self.committed)).into())
     }
+    fn code_hash(&self) -> Option<Vec<u8>> {
+        // Compare execution under the same deployed code commitment.
+        Some(
+            module_artifact::ModuleArtifact::component(HELLO.to_vec())
+                .hash()
+                .to_vec(),
+        )
+    }
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         assert_eq!(ctx.env().origin, Origin::Program(PROGRAM));
         match msg.payload.as_slice() {

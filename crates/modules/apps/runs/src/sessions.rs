@@ -1,78 +1,21 @@
-//! the agent session lane: an agent's MID-RUN writes, made unforgeable.
+//! Interactive model work authenticates the host-owned ephemeral session
+//! signer against the committed execution lease and model grant. The signer
+//! never becomes a key of the program account, and the child receives only a
+//! narrow endpoint token.
 //!
-//! the settle path validates what a run RETURNS. this lane validates what an
-//! agent does WHILE it runs — the same grant, the same caps, the same code
-//! ([`RunsModule::validate_response`] and [`RunsModule::pages_action_msg`]),
-//! reached through a different door. there is exactly ONE definition of what an
-//! agent may do; a second one would be the hole this lane exists to close.
+//! Admission validates one action and reserves its immutable proposal,
+//! completion marker and publication queue item. The account's program then
+//! claims and executes the prepared message through dispatch. The target
+//! receives the actual Program origin and applies its own authorization.
 //!
-//! ## why a session key at all
+//! The HTTP caller waits for the bound target's committed outcome. Admission
+//! errors reject immediately; later target failures remain queryable receipts.
+//! Result-returned actions use the same program route, while optional malformed
+//! page effects can be omitted with a recorded diagnostic before admission.
 //!
-//! the frameless `/v1/submit` lane lets a caller NAME an origin, and `bin/node`
-//! discards it — it signs every op with its own node key. so an agent's write
-//! was byte-indistinguishable from the human's at the same keyboard: no audit
-//! trail, the wrong account cross-node, and an ACL that only ever ran in a host
-//! binary, where consensus could not see it.
-//!
-//! a frame's origin, by contrast, IS its verified public key (`node::decode_frame`
-//! binds `(origin, seq, target, payload)`, and every honest validator rejects a
-//! forged frame identically). so the executing node mints an ephemeral keypair
-//! per run, binds the PUBLIC half here, and hands only the private half to the
-//! agent's tool server. an op signed by it provably came from that run — and
-//! consensus refuses it the moment it exceeds the owner's committed grant.
-//!
-//! the owner's authority is never asked for: `ModelRecord { owner,
-//! allowed_actions, caps }` IS the capability grant, already committed.
-//! registering an agent with `pages.comment` is the act of authorizing it. what
-//! this lane adds is not authority but PROOF of who is exercising it.
-//!
-//! ## the two authorizations (X2)
-//!
-//! - **open** — the origin must be the run's committed LEASE-HOLDER: the node
-//!   the dispatch plane actually handed the work to (the `assignee` on the saga
-//!   the dispatch names, read directly). self-authorizing,
-//!   so an automated issue-mention run works with nobody at a keyboard, and
-//!   correct cross-node, because the lease names the node really executing.
-//! - **act** — the origin must BE the bound session key, AND the lease must
-//!   still sit where it did when the session opened. no other origin, not even
-//!   the owner's or the assignee's, may act through a session; and a lease that
-//!   moves (reassignment, expiry) strands the old session on the spot instead
-//!   of handing an evicted node the agent's grant for the rest of the run.
-//!
-//! ## LOUD, not degraded (the deliberate divergence from the settle path)
-//!
-//! `emit_pages_effects` degrades a bad pages action to a breadcrumb: it runs
-//! inside the no-fail delivery block, and a page annotation is never worth
-//! failing a run over. an action HERE is the opposite: an explicit, synchronous
-//! op the agent submitted and is waiting on. a refusal it never sees is a lie,
-//! so every refusal is an `Err` the submitter reads.
-//!
-//! ## the no-fail rule does NOT bind this lane (and why that matters)
-//!
-//! the settle path runs inside the dispatch plane's DELIVERY injection: a
-//! follow-up its target rejects aborts that whole block, the committed mailbox
-//! re-injects the delivery next block, and it aborts again — forever. that is
-//! the no-fail rule, and it is why the settle path must prove every follow-up
-//! valid before emitting any of them.
-//!
-//! an `AgentAction` is a ROOT op — the agent's own frame, isolated by the host
-//! like any submitter's op. a follow-up the target rejects rolls THIS op back
-//! and returns the error to the agent that sent it. nothing re-injects it,
-//! nothing else in the block is touched, and the next op is unaffected: a
-//! rejection here is a rejection, not a wedge.
-//!
-//! the probes still run — an agent deserves the refusal SYNCHRONOUSLY, and the
-//! shared validator is the one definition of what it may do — but the failure
-//! POLICIES are what differ, and conflating them is a trap: the settle path
-//! emits the run's reply AND every action of one response into a SINGLE block,
-//! all probed up front against committed state, so its probes must also count
-//! what that same response already staged (chat's thread cap, the duplicate
-//! task ids) or a sibling silently moves the cap out from under them. here each
-//! op stages exactly ONE follow-up and drains it before the next op executes,
-//! and a module query reads its own pending overlay first — so a sibling's post
-//! is already visible to the next probe. that is why this lane needs no
-//! same-block counter and the settle path does.
-
+//! The lease holder opens the session. Only its bound signer may propose work,
+//! and a moved or expired lease fences subsequent proposals. Completed target
+//! outcomes remain reportable after the session or account authority changes.
 use super::pages_effects::is_pages_action;
 use super::response::is_duckfs_action;
 use super::{
@@ -82,7 +25,7 @@ use super::{
     MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_BYTES,
     MAX_DELEGATIONS_PER_RUN, ModelStatus, Origin, RunAuthority, RunOrigin, RunsModule,
     SESSION_KEY_LEN, SiblingReadBudget, delegated_run_id_for, delegation_id_for,
-    dispatch_decode_reply, dispatch_encode_query, dispatch_id_for, page_thread_id,
+    dispatch_decode_reply, dispatch_encode_query, dispatch_id_for, page_source,
 };
 use dispatch::DispatchStatus;
 use saga::{
@@ -428,7 +371,7 @@ impl RunsModule {
             .pending_entry(&dispatch_id_for(&run_id))
             .cloned()
             .ok_or_else(|| Error::Module(format!("run is not in flight: {run_id}")))?;
-        if entry.job_id.is_some() || page_thread_id(&entry.channel_id).is_some() {
+        if entry.job_id.is_some() || page_source(&entry.channel_id).is_some() {
             return Err(Error::Module(
                 "agent calls currently require a chat or Forge run".into(),
             ));

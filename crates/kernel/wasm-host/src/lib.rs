@@ -201,6 +201,9 @@ pub const MAX_OBJECT_READS: usize = 4096;
 /// until the boundary. 64 MiB is orders of magnitude above any real op (an op
 /// is a few hundred bytes and its writes a few KB) and far below what a
 /// validator can lose in a block.
+///
+/// Resolved read memos use the same ceiling independently: keys, answers and
+/// entry overhead accumulate across replay rounds, including bulk prefetch.
 pub const MAX_HOST_BYTES: usize = 64 * 1024 * 1024;
 
 /// what one guest-fed ENTRY costs against [`MAX_HOST_BYTES`] beside its own
@@ -435,6 +438,9 @@ enum PendingRead {
 /// the injected store only ever moves at `commit_block`, never mid-dispatch).
 #[derive(Default)]
 struct SiblingMemo {
+    /// All retained read keys and answers, including entry overhead. The
+    /// separate read-count ceilings never substitute for this byte ceiling.
+    bytes: usize,
     roots: BTreeMap<String, Option<Vec<u8>>>,
     queries: BTreeMap<(String, Vec<u8>), Result<Vec<u8>, WitError>>,
     /// committed-store answers for store-backed modules. staged writes shadow
@@ -448,6 +454,28 @@ struct SiblingMemo {
 }
 
 impl SiblingMemo {
+    fn check_capacity(&self, bytes: usize) -> Result<(), SdkError> {
+        let next = self
+            .bytes
+            .saturating_add(HOST_ENTRY_BYTES)
+            .saturating_add(bytes);
+        let over_budget = next > MAX_HOST_BYTES;
+        if over_budget {
+            return Err(SdkError::Module(format!(
+                "read-memo budget exceeded ({MAX_HOST_BYTES} bytes)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check before retaining an answer. A refusal keeps both the counter
+    /// and memo unchanged, and the driver drops the rejected answer.
+    fn charge(&mut self, bytes: usize) -> Result<(), SdkError> {
+        self.check_capacity(bytes)?;
+        self.bytes += HOST_ENTRY_BYTES + bytes;
+        Ok(())
+    }
+
     /// DISTINCT sibling reads so far (the [`MAX_SIBLING_READS`] budget); the
     /// store-read and object-read budgets are tracked separately.
     fn len(&self) -> usize {
@@ -486,14 +514,30 @@ impl SiblingMemo {
     /// module, unsupported query, cycle) memoizes as the wit error the guest
     /// will see. `State` reads never reach here — the drivers resolve them
     /// against the injected store (they need no ctx).
-    async fn resolve(&mut self, ctx: &dyn Ctx, read: PendingRead) {
+    async fn resolve(&mut self, ctx: &dyn Ctx, read: PendingRead) -> Result<(), SdkError> {
         match read {
             PendingRead::Root(target) => {
+                self.check_capacity(target.len())?;
                 let answer = ctx.module_root(&target).map(|r| r.as_bytes().to_vec());
+                self.charge(target.len() + answer.as_ref().map_or(0, Vec::len))?;
                 self.roots.insert(target, answer);
             }
             PendingRead::Query(target, req) => {
+                let key_bytes = target.len() + req.len();
+                self.check_capacity(key_bytes)?;
                 let answer = ctx.query(&target, &req).await.map_err(to_wit_error);
+                let answer_bytes = match &answer {
+                    Ok(bytes) => bytes.len(),
+                    Err(WitError::UnknownModule(text) | WitError::Rejected(text)) => text.len(),
+                    Err(
+                        WitError::SelfQuery
+                        | WitError::Unsupported
+                        | WitError::SyncUnsupported
+                        | WitError::SwapUnsupported
+                        | WitError::BudgetExceeded,
+                    ) => 0,
+                };
+                self.charge(key_bytes + answer_bytes)?;
                 self.queries.insert((target, req), answer);
             }
             PendingRead::States(_) => {
@@ -503,6 +547,7 @@ impl SiblingMemo {
                 unreachable!("object reads resolve against the odb backing, never the ctx")
             }
         }
+        Ok(())
     }
 }
 
@@ -1104,7 +1149,9 @@ impl WasmModule {
         memo: &mut SiblingMemo,
     ) -> Result<(), SdkError> {
         for key in keys {
+            memo.check_capacity(key.len())?;
             let answer = self.resolve_state_read(&key).await?;
+            memo.charge(key.len() + answer.as_ref().map_or(0, Vec::len))?;
             memo.states.insert(key, answer);
         }
         Ok(())
@@ -1117,24 +1164,34 @@ impl WasmModule {
     /// COMMITTED objects only — the same-block staged puts are shadowed earlier,
     /// by the [`HostData::object_puts`] overlay. synchronous (no ctx, no await),
     /// like a map-backed state read.
-    fn resolve_object_read(&self, read: PendingRead, memo: &mut SiblingMemo) {
+    fn resolve_object_read(
+        &self,
+        read: PendingRead,
+        memo: &mut SiblingMemo,
+    ) -> Result<(), SdkError> {
         let backing = match &self.backing {
             StateBacking::Odb { backing } => Some(backing),
             StateBacking::Map { .. } | StateBacking::Store { .. } => None,
         };
         match read {
             PendingRead::ObjectStat(id) => {
+                memo.check_capacity(id.len())?;
                 let answer = backing.and_then(|b| b.stat(&id));
+                // Metadata is the one-byte tag and eight-byte body length.
+                memo.charge(id.len() + answer.map_or(0, |_| 9))?;
                 memo.object_stats.insert(id, answer);
             }
             PendingRead::ObjectGet(id) => {
+                memo.check_capacity(id.len())?;
                 let answer = backing.and_then(|b| b.get(&id));
+                memo.charge(id.len() + answer.as_ref().map_or(0, Vec::len))?;
                 memo.object_gets.insert(id, answer);
             }
             PendingRead::Root(_) | PendingRead::Query(_, _) | PendingRead::States(_) => {
                 unreachable!("resolve_object_read only handles object-plane reads")
             }
         }
+        Ok(())
     }
 
     /// Canonical bytes of a store: count + length-prefixed sorted `(key, value)`
@@ -1316,29 +1373,23 @@ impl WasmModule {
             // a paused run: resolve the read (own store, odb backing, or host
             // ctx) and replay.
             if let Some(read) = data.pending {
-                match read {
-                    PendingRead::States(keys) => {
-                        match self.resolve_state_reads(keys, &mut memo).await {
-                            Ok(()) => {}
-                            // a refused store read (bad key shape, store error) is
-                            // a deterministic rejection of the whole op.
-                            Err(e) => {
-                                self.staged = staged0;
-                                self.staged_objects = staged_objects0;
-                                return Err(e);
-                            }
-                        }
-                    }
+                let resolved = match read {
+                    PendingRead::States(keys) => self.resolve_state_reads(keys, &mut memo).await,
                     read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_)) => {
-                        self.resolve_object_read(read, &mut memo);
+                        self.resolve_object_read(read, &mut memo)
                     }
                     read @ (PendingRead::Root(_) | PendingRead::Query(_, _)) => {
                         memo.resolve(
                             ctx.as_deref().expect("unsealed mutation has a context"),
                             read,
                         )
-                        .await;
+                        .await
                     }
+                };
+                if let Err(error) = resolved {
+                    self.staged = staged0;
+                    self.staged_objects = staged_objects0;
+                    return Err(error);
                 }
                 continue;
             }
@@ -2127,7 +2178,7 @@ impl Module for WasmModule {
                     self.resolve_state_reads(keys, &mut memo).await?;
                 }
                 Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
-                    self.resolve_object_read(read, &mut memo);
+                    self.resolve_object_read(read, &mut memo)?;
                 }
                 Some(PendingRead::Root(_) | PendingRead::Query(_, _)) => {
                     unreachable!("sealed runs never pause on sibling reads")
@@ -2173,7 +2224,7 @@ impl Module for WasmModule {
                 // object reads are the module's own state (not sibling reads),
                 // so they resolve against the backing even ctx-less, like State.
                 Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
-                    self.resolve_object_read(read, &mut memo);
+                    self.resolve_object_read(read, &mut memo)?;
                 }
                 Some(PendingRead::Root(_) | PendingRead::Query(_, _)) => {
                     unreachable!("sealed runs never pause on sibling reads")
@@ -2202,10 +2253,10 @@ impl Module for WasmModule {
                     self.resolve_state_reads(keys, &mut memo).await?;
                 }
                 Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
-                    self.resolve_object_read(read, &mut memo);
+                    self.resolve_object_read(read, &mut memo)?;
                 }
                 Some(read @ (PendingRead::Root(_) | PendingRead::Query(_, _))) => {
-                    memo.resolve(ctx, read).await;
+                    memo.resolve(ctx, read).await?;
                 }
             }
         }
@@ -2247,6 +2298,191 @@ impl Module for WasmModule {
 mod bounds {
     use super::*;
     use sdk_testkit::TestCtx;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct CountingReads {
+        reads: Rc<Cell<usize>>,
+        answer_bytes: usize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl MerkleStore for CountingReads {
+        async fn get(&self, _key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, SdkError> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(Some(vec![0; self.answer_bytes]))
+        }
+
+        async fn commit_batch(
+            &mut self,
+            _writes: Vec<([u8; ROOT_LEN], Option<Vec<u8>>)>,
+        ) -> Result<(), SdkError> {
+            panic!("the read-budget probe never commits")
+        }
+
+        fn root(&self) -> StateRoot {
+            StateRoot::ZERO
+        }
+
+        async fn sync_target(&self) -> Result<sdk::ResolverSyncTarget, SdkError> {
+            Err(SdkError::SyncUnsupported)
+        }
+
+        async fn serve_sync(&self, _req: &[u8]) -> Result<Vec<u8>, SdkError> {
+            Err(SdkError::SyncUnsupported)
+        }
+    }
+
+    fn counting_state_reads(answer_bytes: usize) -> (WasmModule, Rc<Cell<usize>>) {
+        let reads = Rc::new(Cell::new(0));
+        let mut module = WasmModule::from_bytes("sibling", SIBLING).expect("load");
+        // These probes invoke the host resolver directly, without executing
+        // the map-shaped guest, so only its injected store is under test.
+        module.backing = StateBacking::Store {
+            store: Box::new(CountingReads {
+                reads: Rc::clone(&reads),
+                answer_bytes,
+            }),
+        };
+        (module, reads)
+    }
+
+    fn state_read_key(number: usize) -> Vec<u8> {
+        let mut key = vec![0; ROOT_LEN];
+        key[..8].copy_from_slice(&(number as u64).to_le_bytes());
+        key
+    }
+
+    #[tokio::test]
+    async fn prefetch_stops_at_the_memo_byte_ceiling_and_other_reads_share_it() {
+        let entry_bytes = 1 << 20;
+        let accepted = MAX_HOST_BYTES / entry_bytes;
+        let (module, reads) = counting_state_reads(entry_bytes - HOST_ENTRY_BYTES - ROOT_LEN);
+        let mut data = HostData {
+            store_backed: true,
+            ..HostData::default()
+        };
+        let keys = (0..MAX_STORE_READS).map(state_read_key).collect();
+        assert!(host::Host::state_prefetch(&mut data, keys).is_err());
+        let Some(PendingRead::States(keys)) = data.pending.take() else {
+            panic!("prefetch frontier");
+        };
+        let error = module
+            .resolve_state_reads(keys, &mut data.memo)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("read-memo budget exceeded"));
+        assert_eq!(reads.get(), accepted, "no fetch after the memo is full");
+        assert_eq!(data.memo.states.len(), accepted);
+        assert_eq!(data.memo.bytes, MAX_HOST_BYTES);
+        assert!(
+            host::Host::state_get(&mut data, state_read_key(0))
+                .unwrap()
+                .is_some()
+        );
+
+        // A single state-get uses the same resolver and cannot bypass prefetch's cap.
+        assert!(host::Host::state_get(&mut data, state_read_key(MAX_STORE_READS)).is_err());
+        let Some(PendingRead::States(keys)) = data.pending.take() else {
+            panic!("single state read");
+        };
+        assert!(
+            module
+                .resolve_state_reads(keys, &mut data.memo)
+                .await
+                .is_err()
+        );
+        assert_eq!(reads.get(), accepted);
+
+        let ctx = TestCtx::at_height(1).on_query("noisy", |_| {
+            panic!("a full memo refuses before querying a sibling")
+        });
+        for read in [
+            PendingRead::Root("noisy".into()),
+            PendingRead::Query("noisy".into(), vec![1]),
+        ] {
+            assert!(data.memo.resolve(&ctx, read).await.is_err());
+        }
+        for read in [
+            PendingRead::ObjectStat(vec![1; ROOT_LEN]),
+            PendingRead::ObjectGet(vec![1; ROOT_LEN]),
+        ] {
+            assert!(module.resolve_object_read(read, &mut data.memo).is_err());
+        }
+        assert!(data.memo.roots.is_empty());
+        assert!(data.memo.queries.is_empty());
+        assert!(data.memo.object_stats.is_empty());
+        assert!(data.memo.object_gets.is_empty());
+        assert_eq!(data.memo.bytes, MAX_HOST_BYTES);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_prefetch_answer_is_dropped_and_stops_the_frontier() {
+        let (module, reads) = counting_state_reads(MAX_HOST_BYTES);
+        let mut memo = SiblingMemo::default();
+        let error = module
+            .resolve_state_reads(vec![state_read_key(0), state_read_key(1)], &mut memo)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("read-memo budget exceeded"));
+        assert_eq!(reads.get(), 1, "the rest of the frontier is never fetched");
+        assert!(memo.states.is_empty());
+        assert_eq!(memo.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn sibling_answer_byte_refusal_restores_both_mutation_overlays() {
+        let mut module = WasmModule::from_bytes("sibling", SIBLING).expect("load");
+        let msg = Msg {
+            target: "sibling".into(),
+            payload: b"qnoisy:read".to_vec(),
+        };
+        let mut small = TestCtx::at_height(1).on_query("noisy", |_| Ok(b"earlier".to_vec()));
+        module.execute(&mut small, &msg).await.expect("earlier op");
+        module
+            .staged_objects
+            .insert(vec![7; ROOT_LEN], vec![1, 2, 3]);
+        let staged = module.staged.clone();
+        let objects = module.staged_objects.clone();
+        let root = module.root();
+        let mut oversized =
+            TestCtx::at_height(1).on_query("noisy", |_| Ok(vec![0; MAX_HOST_BYTES]));
+        let error = module.execute(&mut oversized, &msg).await.unwrap_err();
+        assert!(error.to_string().contains("read-memo budget exceeded"));
+        assert_eq!(
+            module.staged, staged,
+            "the guest increment before its read is discarded"
+        );
+        assert_eq!(module.staged_objects, objects);
+        assert_eq!(module.root(), root);
+        assert!(oversized.msgs().is_empty());
+        assert!(oversized.events().is_empty());
+        assert!(oversized.output().is_none());
+        assert!(oversized.assigned().is_none());
+        module
+            .execute(&mut small, &msg)
+            .await
+            .expect("next op has a fresh memo");
+        assert_eq!(
+            module.staged[b"count".as_slice()],
+            Some(2u64.to_le_bytes().to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn sibling_error_text_is_subject_to_the_same_memo_byte_ceiling() {
+        let ctx = TestCtx::at_height(1).on_query("noisy", |_| {
+            Err(SdkError::Module("x".repeat(MAX_HOST_BYTES)))
+        });
+        let mut memo = SiblingMemo::default();
+        let error = memo
+            .resolve(&ctx, PendingRead::Query("noisy".into(), Vec::new()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("read-memo budget exceeded"));
+        assert!(memo.queries.is_empty());
+        assert_eq!(memo.bytes, 0);
+    }
 
     #[test]
     fn prefetch_collects_one_frontier_and_keeps_overlay_reads_distinct() {

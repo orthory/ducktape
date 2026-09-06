@@ -1,6 +1,25 @@
 //! Source context is read only after the user's program explicitly requests model work.
 use super::*;
 
+/// Only runs publishes this detail. Manual request ownership is stamped from
+/// its authenticated origin before the program chooses whether to execute.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum RunRequest {
+    Manual {
+        requester: RunOrigin,
+        agent_id: String,
+        channel_id: String,
+        anchor_seq: u64,
+        demands: BTreeMap<String, u64>,
+        skills: Vec<String>,
+    },
+    Job {
+        agent_id: String,
+        job_id: String,
+    },
+}
+
 impl RunsModule {
     pub(super) async fn request_attributed_run(
         &mut self,
@@ -51,19 +70,33 @@ impl RunsModule {
                 "attribution belongs to another account".into(),
             ));
         }
-        let run_request = change.source.module == self.id && change.source.kind == "run_request";
-        if run_request
-            && let RunsMsg::RequestJobRun {
-                agent_id: requested,
-                job_id,
-            } = decode_msg(&change.detail).map_err(Error::Module)?
-        {
-            if requested != agent_id {
-                return Err(Error::Module("job request names another model".into()));
+        let own_request = change.source.module == self.id && change.source.kind == "run_request";
+        let run_id = if own_request {
+            match sdk::wire::decode::<RunRequest>(&change.detail).map_err(Error::Module)? {
+                RunRequest::Job {
+                    agent_id: requested,
+                    job_id,
+                } => {
+                    if requested != agent_id {
+                        return Err(Error::Module("job request names another model".into()));
+                    }
+                    return self.request_job_run(ctx, agent_id, job_id).await;
+                }
+                RunRequest::Manual {
+                    agent_id: requested,
+                    channel_id,
+                    anchor_seq,
+                    ..
+                } => {
+                    if requested != agent_id {
+                        return Err(Error::Module("run request names another model".into()));
+                    }
+                    run_id_for(&channel_id, anchor_seq, &agent_id)
+                }
             }
-            return self.request_job_run(ctx, agent_id, job_id).await;
-        }
-        let run_id = format!("attributed/{change_seq}/{agent_id}");
+        } else {
+            format!("attributed/{change_seq}/{agent_id}")
+        };
         if self
             .turn_taken(&*ctx, &dispatch_id_for(&run_id))
             .await
@@ -71,7 +104,7 @@ impl RunsModule {
         {
             return Ok(());
         }
-        let (channel, anchor, prepared, demands) =
+        let (channel, anchor, prepared, demands, requester) =
             match (change.source.module.as_str(), change.source.kind.as_str()) {
                 (source, "message") if source == self.chat => {
                     let bytes = ctx
@@ -102,7 +135,32 @@ impl RunsModule {
                         )
                         .await
                         .map_err(Error::Module)?;
-                    (channel, message.seq, prepared, BTreeMap::new())
+                    (
+                        channel,
+                        message.seq,
+                        prepared,
+                        BTreeMap::new(),
+                        RunOrigin::Program(account),
+                    )
+                }
+                (source, "block") if Some(source) == self.pages.as_deref() => {
+                    let prepared = self
+                        .prepare_page_block_dispatch(
+                            &*ctx,
+                            &model,
+                            &run_id,
+                            &change.source.object,
+                            budget,
+                        )
+                        .await
+                        .map_err(Error::Module)?;
+                    (
+                        page_block_channel_id(&change.source.object),
+                        change.revision,
+                        prepared,
+                        BTreeMap::new(),
+                        RunOrigin::Program(account),
+                    )
                 }
                 (source, "comment") if Some(source) == self.pages.as_deref() => {
                     let bytes = ctx
@@ -159,16 +217,18 @@ impl RunsModule {
                         ordinal,
                         prepared,
                         BTreeMap::new(),
+                        RunOrigin::Program(account),
                     )
                 }
                 (source, "run_request") if source == self.id => {
-                    let RunsMsg::RequestRun {
+                    let RunRequest::Manual {
+                        requester,
                         agent_id: requested,
                         channel_id,
                         anchor_seq,
                         demands,
                         skills,
-                    } = decode_msg(&change.detail).map_err(Error::Module)?
+                    } = sdk::wire::decode(&change.detail).map_err(Error::Module)?
                     else {
                         return Err(Error::Module("unexpected run request detail".into()));
                     };
@@ -188,7 +248,7 @@ impl RunsModule {
                         )
                         .await
                         .map_err(Error::Module)?;
-                    (channel_id, anchor_seq, prepared, demands)
+                    (channel_id, anchor_seq, prepared, demands, requester)
                 }
                 _ => {
                     return Err(Error::Module(
@@ -197,14 +257,7 @@ impl RunsModule {
                 }
             };
         self.stage_dispatch_run(
-            ctx,
-            &run_id,
-            agent_id,
-            channel,
-            anchor,
-            RunOrigin::Program(account),
-            prepared,
-            demands,
+            ctx, &run_id, agent_id, channel, anchor, requester, prepared, demands,
         );
         ctx.set_output(sdk::wire::encode(&serde_json::json!({"run_id": run_id})));
         Ok(())
