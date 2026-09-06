@@ -1258,7 +1258,11 @@ mod tests {
             seal: true,
         };
         let token_a = token::issue(&st.sess_sk, &claims_a);
-        let blob_a = bodyseal::seal_request(&keys_a, b"request from A");
+        let blob_a = bodyseal::seal_request(
+            &keys_a,
+            &bodyseal::request_aad("POST", "/v1/messages"),
+            b"request from A",
+        );
         let status = post_sealed(&st, &token_a, blob_a.clone()).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "admitted, then the upstream is dead");
 
