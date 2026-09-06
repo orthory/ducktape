@@ -533,7 +533,8 @@ async fn forward_responses(
         );
     };
 
-    let (mut upstream, mut binding) = match send_codex(&state, &headers, &body).await {
+    let (mut upstream, mut binding, mut seal_keys) = match send_codex(&state, &headers, &body).await
+    {
         Ok(sent) => sent,
         Err(e) => {
             return response(
@@ -547,7 +548,7 @@ async fn forward_responses(
     // no-op and returns false).
     let token_expired = upstream.status() == StatusCode::UNAUTHORIZED;
     if token_expired && codex_airlock_reauth(&state).await {
-        (upstream, binding) = match send_codex(&state, &headers, &body).await {
+        (upstream, binding, seal_keys) = match send_codex(&state, &headers, &body).await {
             Ok(sent) => sent,
             Err(e) => {
                 return response(
@@ -599,13 +600,11 @@ async fn forward_responses(
     // A gateway ERROR body (minted before the proxy path) is plaintext and
     // relays as-is; a plaintext SUCCESS on a sealed session can only be a path
     // host forging one, so it is refused.
-    let seal_keys = {
-        let auth = state.auth.lock().await;
-        match &*auth {
-            CodexAuth::Airlock(session) => Some(session.keys.clone()),
-            CodexAuth::Host(_) => None,
-        }
-    };
+    //
+    // `seal_keys` is exactly what THIS request's `send_codex` sealed under, not
+    // a re-read of `state.auth` after the round trip (see `send_upstream`'s doc
+    // — the anthropic broker's actual race; codex's semaphore of 1 keeps this
+    // one unreachable today, same shape regardless).
     if let Some(keys) = seal_keys {
         let sealed_outer = content_type_str
             .as_deref()
@@ -679,14 +678,20 @@ fn upstream_content_type(headers: &reqwest::header::HeaderMap) -> Option<HeaderV
 
 /// Build the codex upstream request (target URL + forwarded headers + the
 /// current credential) and send it, WITHOUT consuming the body — so a gateway
-/// 401 can be retried after an airlock re-handshake. Returns the response plus
-/// the sealed request's BINDING (empty when unsealed) — the response is opened
-/// under it.
+/// 401 can be retried after an airlock re-handshake. Returns the response, the
+/// sealed request's BINDING (empty when unsealed), and — on the airlock arm —
+/// the exact keys sealed under (see `send_upstream`'s doc for why: codex's
+/// semaphore is 1 so this race is not currently reachable, but the two
+/// brokers share the shape rather than diverging).
 async fn send_codex(
     state: &BrokerState,
     headers: &HeaderMap,
     body: &Bytes,
-) -> reqwest::Result<(reqwest::Response, Vec<u8>)> {
+) -> reqwest::Result<(
+    reqwest::Response,
+    Vec<u8>,
+    Option<airlock::handshake::SessionKeys>,
+)> {
     let mut request = state.client.post(&state.responses_url);
     // Match the official Codex responses-api-proxy posture: preserve Codex's
     // protocol/version/session headers, but replace auth and hop-by-hop framing.
@@ -703,7 +708,7 @@ async fn send_codex(
             request = request.header(name, value);
         }
     }
-    let (request, binding) = {
+    let (request, binding, keys) = {
         let auth = state.auth.lock().await;
         match &*auth {
             CodexAuth::Host(host) => {
@@ -711,7 +716,7 @@ async fn send_codex(
                 if let Some(account_id) = &host.account_id {
                     request = request.header("ChatGPT-Account-ID", account_id);
                 }
-                (request, Vec::new())
+                (request, Vec::new(), None)
             }
             // Sealed-body airlock session: encrypt under the handshake body key
             // (fresh nonce per attempt, so the 401-retry re-seals safely) and
@@ -723,11 +728,15 @@ async fn send_codex(
                 let request = request
                     .body(sealed)
                     .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1);
-                (session.gateway.route(request.bearer_auth(&session.token)), binding)
+                (
+                    session.gateway.route(request.bearer_auth(&session.token)),
+                    binding,
+                    Some(session.keys.clone()),
+                )
             }
         }
     };
-    Ok((request.send().await?, binding))
+    Ok((request.send().await?, binding, keys))
 }
 
 /// Airlock only: re-mint the scoped session against the already-trusted seal key
@@ -1866,13 +1875,20 @@ async fn probe_ok() -> StatusCode {
 /// credential) and send it, WITHOUT consuming the body — factored out of
 /// [`forward_messages`] so a gateway 401 can be retried after an airlock
 /// re-handshake. The caller streams the returned response body.
-/// Returns the response plus the sealed request's BINDING (its blob nonce,
-/// empty when unsealed) — the response stream key is derived under it.
+/// Returns the response, the sealed request's BINDING (its blob nonce, empty
+/// when unsealed), and — on the airlock arm — the EXACT keys sealed under, so
+/// the caller opens the response under those keys rather than re-reading
+/// `session.keys` after the round trip, which a sibling request's concurrent
+/// re-handshake (`airlock_reauth`) may have swapped out from under it.
 async fn send_upstream(
     state: &AnthropicBrokerState,
     headers: &HeaderMap,
     body: &Bytes,
-) -> reqwest::Result<(reqwest::Response, Vec<u8>)> {
+) -> reqwest::Result<(
+    reqwest::Response,
+    Vec<u8>,
+    Option<airlock::handshake::SessionKeys>,
+)> {
     let mut request = state.client.post(&state.messages_url).body(body.clone());
     // Forward request headers VERBATIM — including `anthropic-version` and
     // `anthropic-beta` (the subscription OAuth capability rides beta; stripping
@@ -1890,13 +1906,13 @@ async fn send_upstream(
             request = request.header(name, value);
         }
     }
-    let (request, binding) = {
+    let (request, binding, keys) = {
         let auth = state.auth.lock().await;
         // Airlock sessions are sealed-body: encrypt the child's plaintext under
         // the handshake body key (fresh nonce per attempt, so the 401-retry
         // path re-seals safely) and mark the request. The enclave refuses
         // plaintext on this token, so the bearer alone grants nothing.
-        let (request, binding) = if let AnthropicAuth::Airlock(session) = &*auth {
+        let (request, binding, keys) = if let AnthropicAuth::Airlock(session) = &*auth {
             let aad = airlock::bodyseal::request_aad("POST", "/v1/messages");
             let sealed = airlock::bodyseal::seal_request(&session.keys, &aad, body);
             let binding = airlock::bodyseal::request_binding(&sealed);
@@ -1905,13 +1921,14 @@ async fn send_upstream(
                     .body(sealed)
                     .header(airlock::bodyseal::SEAL_HEADER, airlock::bodyseal::SEAL_V1),
                 binding,
+                Some(session.keys.clone()),
             )
         } else {
-            (request, Vec::new())
+            (request, Vec::new(), None)
         };
-        (auth.authorize(request), binding)
+        (auth.authorize(request), binding, keys)
     };
-    Ok((request.send().await?, binding))
+    Ok((request.send().await?, binding, keys))
 }
 
 async fn forward_messages(
@@ -1952,21 +1969,22 @@ async fn forward_messages(
     // never 502s the session.
     state.refresh_if_needed().await;
 
-    let (mut upstream, mut binding) = match send_upstream(&state, &headers, &body).await {
-        Ok(sent) => sent,
-        Err(e) => {
-            return response(
-                StatusCode::BAD_GATEWAY,
-                &format!("anthropic upstream failed: {e}"),
-            );
-        }
-    };
+    let (mut upstream, mut binding, mut seal_keys) =
+        match send_upstream(&state, &headers, &body).await {
+            Ok(sent) => sent,
+            Err(e) => {
+                return response(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("anthropic upstream failed: {e}"),
+                );
+            }
+        };
     // Airlock only: a gateway 401 means the scoped session token's TTL lapsed.
     // Re-handshake once and retry. Every other credential arm — and every other
     // status — passes straight through (`airlock_reauth` returns false).
     let token_expired = upstream.status() == StatusCode::UNAUTHORIZED;
     if token_expired && state.airlock_reauth().await {
-        (upstream, binding) = match send_upstream(&state, &headers, &body).await {
+        (upstream, binding, seal_keys) = match send_upstream(&state, &headers, &body).await {
             Ok(sent) => sent,
             Err(e) => {
                 return response(
@@ -1981,13 +1999,11 @@ async fn forward_messages(
     // error bodies (minted before the proxy path) are plaintext and relay as
     // errors below; a plaintext SUCCESS on a sealed session can only be a
     // forgery by a path host, so it is refused.
-    let seal_keys = {
-        let auth = state.auth.lock().await;
-        match &*auth {
-            AnthropicAuth::Airlock(session) => Some(session.keys.clone()),
-            _ => None,
-        }
-    };
+    //
+    // `seal_keys` is exactly what THIS request's `send_upstream` sealed under
+    // (the last attempt's, if it retried) — never a fresh re-read of
+    // `state.auth`, which a sibling request's concurrent `airlock_reauth` may
+    // have swapped in the meantime (see the fn doc on `send_upstream`).
     if let Some(keys) = seal_keys {
         let sealed_outer = upstream
             .headers()
@@ -2529,6 +2545,74 @@ mod tests {
         assert!(
             headers.get("accept-encoding").is_none(),
             "accept-encoding must not reach the anthropic upstream: {headers:?}"
+        );
+        upstream.abort();
+    }
+
+    /// #1667 regression: `send_upstream` seals under `session.keys` at call
+    /// time and MUST return exactly those keys, not whatever `state.auth`
+    /// holds later. Proven directly rather than via a live two-request race
+    /// (flaky under "tests wait on events, never on time"): seal under keys A,
+    /// have a "sibling's re-handshake" swap the session to keys B in place,
+    /// then show the keys `send_upstream` returned still open a stream sealed
+    /// under A — while the (buggy, old) behavior of re-reading `state.auth`
+    /// after the round trip would hand back B and fail chunk 0, exactly the
+    /// symptom in the issue.
+    #[tokio::test]
+    async fn send_upstream_returns_the_keys_it_actually_sealed_under() {
+        let (url, _seen, upstream) = mock_upstream(StatusCode::OK, "application/json", "{}").await;
+        let keys_a = airlock::handshake::SessionKeys { session: [1u8; 32], body: [2u8; 32] };
+        let keys_b = airlock::handshake::SessionKeys { session: [3u8; 32], body: [4u8; 32] };
+        let session = AirlockSession {
+            gateway: Gateway::local("http://127.0.0.1:1".into()),
+            seal_pk: [0u8; 32],
+            sub: "sub".into(),
+            work: WorkRef::Direct,
+            token: "tok".into(),
+            keys: keys_a.clone(),
+        };
+        let state = AnthropicBrokerState {
+            run_bearer: "bearer".into(),
+            auth: tokio::sync::Mutex::new(AnthropicAuth::Airlock(session)),
+            client: reqwest::Client::new(),
+            messages_url: url,
+            requests: AtomicU32::new(0),
+            bytes: AtomicU64::new(0),
+            concurrent: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+        };
+        let (_resp, binding, keys) = send_upstream(&state, &HeaderMap::new(), &Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+        let keys = keys.expect("airlock session seals every request");
+        assert_eq!(keys.body, keys_a.body, "must return what it sealed under, not a re-read");
+
+        // A sibling request's concurrent `airlock_reauth` swaps the session's
+        // keys in place — the exact race in the issue.
+        {
+            let mut auth = state.auth.lock().await;
+            let AnthropicAuth::Airlock(session) = &mut *auth else { unreachable!() };
+            session.keys = keys_b.clone();
+        }
+
+        // The enclave would have sealed its response under keys_a (what this
+        // request actually sealed its request under). Opening with the
+        // RETURNED keys succeeds; opening with whatever `state.auth` holds NOW
+        // (the old, buggy re-read) reproduces "chunk 0 failed to open".
+        let (mut sealer, salt) = airlock::bodyseal::StreamSealer::new(&keys_a, &binding);
+        let mut sealed = salt;
+        sealed.extend(sealer.seal_head("application/json"));
+        sealed.extend(sealer.seal_final());
+
+        let mut opener_correct = airlock::bodyseal::StreamOpener::new(&keys, &binding);
+        assert!(opener_correct.feed(&sealed).is_ok(), "the returned keys must open it");
+
+        let mut opener_stale_reread = airlock::bodyseal::StreamOpener::new(&keys_b, &binding);
+        let err = opener_stale_reread
+            .feed(&sealed)
+            .expect_err("re-reading state.auth's swapped keys must fail to open, per the issue");
+        assert!(
+            err.to_string().contains("chunk 0 failed to open"),
+            "unexpected error: {err}"
         );
         upstream.abort();
     }
