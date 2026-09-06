@@ -502,6 +502,10 @@ impl Ctx for CaptureCtx {
                         .collect();
                     Ok(tasks_encode_reply(&TaskReply::Tasks(page)))
                 }
+                TaskQuery::OwnerOpenCount { owner } => {
+                    let count = self.tasks.iter().filter(|t| t.owner == owner).count() as u64;
+                    Ok(tasks_encode_reply(&TaskReply::OwnerOpenCount(count)))
+                }
             },
             "jobs" => match tasks::decode_job_query(req).map_err(Error::Module)? {
                 JobsQuery::Get { job_id } => Ok(jobs_encode_reply(&JobsReply::Job(

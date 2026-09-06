@@ -28,6 +28,7 @@ fn create(task_id: &str, title: &str) -> Msg {
     msg(TaskMsg::CreateTask {
         task_id: task_id.into(),
         title: title.into(),
+        owner: None,
     })
 }
 

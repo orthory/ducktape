@@ -106,7 +106,7 @@ fn task_title(cluster: &Cluster, idx: usize, task_id: &str) -> Option<String> {
     let reply = cluster.query(idx, "tasks", &req)?;
     match decode_task_reply(&reply).ok()? {
         TaskReply::Task(task) => task.map(|t| t.title),
-        TaskReply::Tasks(_) => None,
+        TaskReply::Tasks(_) | TaskReply::OwnerOpenCount(_) => None,
     }
 }
 
@@ -233,6 +233,7 @@ fn oversized_op_rejects_cleanly_and_the_cluster_stays_live() {
         &encode_task_msg(&TaskMsg::CreateTask {
             task_id: "alive".into(),
             title: "yes".into(),
+            owner: None,
         }),
     );
     for idx in [0, 1] {

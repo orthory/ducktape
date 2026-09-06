@@ -95,6 +95,7 @@ fn synced_store_reconstructs_source_root_and_every_read() {
             encode_task_msg(&TaskMsg::CreateTask {
                 task_id: "zebra".into(),
                 title: "Z".into(),
+                owner: None,
             }),
         )
         .await;
@@ -105,6 +106,7 @@ fn synced_store_reconstructs_source_root_and_every_read() {
             encode_task_msg(&TaskMsg::CreateTask {
                 task_id: "alpha".into(),
                 title: "A".into(),
+                owner: None,
             }),
         )
         .await;

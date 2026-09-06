@@ -1328,7 +1328,9 @@ impl RunsModule {
             .map_err(|e| format!("tasks lookup failed: {e}"))?;
         match tasks_decode_reply(&reply) {
             Ok(TaskReply::Task(task)) => Ok(task.is_some()),
-            Ok(TaskReply::Tasks(_)) => Err("tasks answered a page, not a task".into()),
+            Ok(TaskReply::Tasks(_) | TaskReply::OwnerOpenCount(_)) => {
+                Err("tasks answered a page, not a task".into())
+            }
             Err(e) => Err(format!("undecodable tasks reply: {e}")),
         }
     }
@@ -1388,7 +1390,17 @@ impl RunsModule {
                 },
                 AgentAction::CreateTask { task_id, title } => Msg {
                     target: self.task_target(),
-                    payload: tasks_encode_msg(&TaskMsg::CreateTask { task_id, title }),
+                    // runs' own task creation stays owned by this module's
+                    // id ("runs"), unchanged — see #1740's scope note: the
+                    // requester identity plumbing would ripple through every
+                    // caller of `emit_response`'s test expectations, so it is
+                    // left alone here (only automations' rule-owner
+                    // attribution was in scope).
+                    payload: tasks_encode_msg(&TaskMsg::CreateTask {
+                        task_id,
+                        title,
+                        owner: None,
+                    }),
                 },
                 AgentAction::UpdateTaskStatus { task_id, status } => Msg {
                     target: self.task_target(),

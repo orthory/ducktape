@@ -236,7 +236,11 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
 fn fold_task(op: &OpRow, read: &impl StateRead, msg: TaskMsg) -> Result<Writes, Fail> {
     let mut out = Writes::new();
     match msg {
-        TaskMsg::CreateTask { task_id, title } => put_row(
+        TaskMsg::CreateTask {
+            task_id,
+            title,
+            owner: _,
+        } => put_row(
             &mut out,
             &TaskRow {
                 task_id,
@@ -531,6 +535,7 @@ mod tests {
             &TaskMsg::CreateTask {
                 task_id: "t1".into(),
                 title: "ship the indexer".into(),
+                owner: None,
             },
         );
         fold(
@@ -539,6 +544,7 @@ mod tests {
             &TaskMsg::CreateTask {
                 task_id: "t2".into(),
                 title: "write the spec".into(),
+                owner: None,
             },
         );
 
@@ -587,6 +593,7 @@ mod tests {
                 &TaskMsg::CreateTask {
                     task_id: format!("t{i}"),
                     title: format!("task {i}"),
+                    owner: None,
                 },
             );
         }

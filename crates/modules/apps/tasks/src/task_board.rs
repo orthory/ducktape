@@ -129,10 +129,34 @@ async fn load_index(staged: &StagedStore) -> Result<BTreeSet<String>, Error> {
     sdk::wire::decode(&bytes).map_err(|e| Error::Module(format!("task index decode: {e}")))
 }
 
+/// resolve the created task's owner. `override_owner` is [`TaskMsg::CreateTask::owner`]
+/// -- `None` keeps the original behavior (the dispatch origin's own actor
+/// string). `Some` is honored only from a module origin: a module vouching
+/// for a DIFFERENT principal's task on its own authority (automations
+/// attributing a rule's task to the rule's OWNER, see #1740). an external (or
+/// system) origin naming anyone but itself is refused outright -- an external
+/// caller may only ever own its own tasks.
+fn resolve_owner(origin: &Origin, override_owner: Option<Vec<u8>>) -> Result<String, Error> {
+    let Some(owner_key) = override_owner else {
+        return actor_from_origin(origin);
+    };
+    let is_module_origin = matches!(origin, Origin::Module(_));
+    if !is_module_origin {
+        let names_self = matches!(origin, Origin::External(bytes) if bytes == &owner_key);
+        if !names_self {
+            return Err(Error::Module(
+                "task owner override is honored only from a module origin".into(),
+            ));
+        }
+    }
+    Ok(Origin::External(owner_key).actor_string())
+}
+
 async fn create(
     staged: &mut StagedStore,
     task_id: String,
     title: String,
+    owner_override: Option<Vec<u8>>,
     origin: &Origin,
     consensus_time: u64,
 ) -> Result<(), Error> {
@@ -148,7 +172,7 @@ async fn create(
             "task board full: {MAX_TASKS} live tasks"
         )));
     }
-    let owner = actor_from_origin(origin)?;
+    let owner = resolve_owner(origin, owner_override)?;
     let owner_live = owner_count(staged, &owner).await?;
     if owner_live >= MAX_OPEN_TASKS_PER_OWNER as u64 {
         return Err(Error::Module(format!(
@@ -251,9 +275,11 @@ pub(crate) async fn execute(
     consensus_time: u64,
 ) -> Result<(), Error> {
     match msg {
-        TaskMsg::CreateTask { task_id, title } => {
-            create(staged, task_id, title, origin, consensus_time).await
-        }
+        TaskMsg::CreateTask {
+            task_id,
+            title,
+            owner,
+        } => create(staged, task_id, title, owner, origin, consensus_time).await,
         TaskMsg::UpdateStatus { task_id, status } => {
             update_status(staged, task_id, status, origin, consensus_time).await
         }
@@ -267,6 +293,9 @@ pub(crate) async fn query(staged: &StagedStore, q: TaskQuery) -> Result<TaskRepl
     match q {
         TaskQuery::Get { task_id } => get(staged, task_id).await,
         TaskQuery::List { limit, after } => list(staged, limit, after).await,
+        TaskQuery::OwnerOpenCount { owner } => Ok(TaskReply::OwnerOpenCount(
+            owner_count(staged, &owner).await?,
+        )),
     }
 }
 
@@ -323,7 +352,7 @@ mod tests {
         task_id: &str,
         title: &str,
     ) -> Result<(), Error> {
-        create(staged, task_id.into(), title.into(), origin, 1).await
+        create(staged, task_id.into(), title.into(), None, origin, 1).await
     }
 
     /// a board AT the cap refuses the next create BY NAME. the full index is
@@ -494,6 +523,65 @@ mod tests {
             create_as(&mut staged, &mallory(), "m1", "not alice's problem")
                 .await
                 .expect("another owner is still admitted");
+        });
+    }
+
+    /// a module origin may create a task attributed to a DIFFERENT owner --
+    /// automations' rule-owner plumbing (#1740) relies on exactly this.
+    #[test]
+    fn module_origin_may_override_the_owner() {
+        block_on(async {
+            let mut staged = staged();
+            create(
+                &mut staged,
+                "t1".into(),
+                "ship it".into(),
+                Some(b"alice".to_vec()),
+                &Origin::Module("automations".into()),
+                1,
+            )
+            .await
+            .expect("a module may vouch for another owner");
+            let task = load(&staged, "t1").await.unwrap().expect("task exists");
+            assert_eq!(task.owner, alice().actor_string(), "the override wins");
+        });
+    }
+
+    /// an external origin naming anyone but ITSELF as the owner is refused --
+    /// only a module may vouch for a different principal.
+    #[test]
+    fn external_origin_cannot_name_a_different_owner() {
+        block_on(async {
+            let mut staged = staged();
+            let refused = create(
+                &mut staged,
+                "t1".into(),
+                "ship it".into(),
+                Some(b"alice".to_vec()),
+                &mallory(),
+                1,
+            )
+            .await
+            .expect_err("mallory may not name alice as the owner");
+            assert!(
+                refused.to_string().contains("module origin"),
+                "unexpected error: {refused}"
+            );
+            assert!(load(&staged, "t1").await.unwrap().is_none());
+
+            // naming ITSELF is a no-op, accepted the same as `None`.
+            create(
+                &mut staged,
+                "t2".into(),
+                "ship it too".into(),
+                Some(b"mallory".to_vec()),
+                &mallory(),
+                1,
+            )
+            .await
+            .expect("naming yourself is always allowed");
+            let task = load(&staged, "t2").await.unwrap().expect("task exists");
+            assert_eq!(task.owner, mallory().actor_string());
         });
     }
 }
