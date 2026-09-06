@@ -14,6 +14,14 @@ use ducktape_module_sdk::{host, Guest};
 struct Component;
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// plain host-KV keys: the host wraps this component over a map it owns.
     fn shape() -> host::ModuleShape {
         ducktape_module_sdk::map_shape()

@@ -294,6 +294,14 @@ mod entry {
     struct Component;
 
     impl ducktape_module_sdk::Guest for Component {
+        fn initialize(_params: Vec<u8>) -> Result<(), ducktape_module_sdk::host::Error> {
+            Ok(())
+        }
+
+        fn finalize_block() -> Result<(), ducktape_module_sdk::host::Error> {
+            Ok(())
+        }
+
         /// an odb port: the host wraps this component over the duckfs
         /// substrate it provides for the module's id.
         fn shape() -> host::ModuleShape {

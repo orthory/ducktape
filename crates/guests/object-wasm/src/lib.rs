@@ -62,6 +62,14 @@ fn distinct_id(i: u64) -> Vec<u8> {
 }
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// the object plane is the odb backing's: this guest declares odb, so the
     /// host wraps it over an object store (the kernel tests' mock) and never
     /// over a plain map.

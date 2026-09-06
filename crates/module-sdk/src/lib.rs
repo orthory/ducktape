@@ -245,6 +245,10 @@ impl MerkleStore for WitStore {
         Ok(host::state_get(key))
     }
 
+    async fn get_committed(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
+        Ok(host::state_get_committed(key))
+    }
+
     async fn commit_batch(
         &mut self,
         writes: Vec<([u8; ROOT_LEN], Option<Vec<u8>>)>,
@@ -565,6 +569,25 @@ macro_rules! snapshot_guest {
                 $shape
             }
 
+            fn initialize(
+                params: ::std::vec::Vec<u8>,
+            ) -> ::core::result::Result<(), $crate::host::Error> {
+                use $crate::sdk::Module as _;
+                let mut module = loaded_module()?;
+                let before = module.root();
+                $crate::block_on(module.initialize(&params)).map_err(to_wit_error)?;
+                $crate::block_on(module.flush_operation()).map_err(to_wit_error)?;
+                let changed = module.root() != before;
+                if changed {
+                    $crate::save_state(&module.snapshot(), module.root().as_bytes());
+                }
+                ::core::result::Result::Ok(())
+            }
+
+            fn finalize_block() -> ::core::result::Result<(), $crate::host::Error> {
+                ::core::result::Result::Ok(())
+            }
+
             fn execute(
                 payload: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<(), $crate::host::Error> {
@@ -579,7 +602,7 @@ macro_rules! snapshot_guest {
                 // fully apply per dispatch: publish the inner per-op staging,
                 // then persist the canonical snapshot as OUTER staged writes —
                 // the host owns the real commit/abort boundary (see crate doc).
-                $crate::block_on(module.commit_block()).map_err(to_wit_error)?;
+                $crate::block_on(module.flush_operation()).map_err(to_wit_error)?;
                 $crate::save_state(&module.snapshot(), module.root().as_bytes());
                 ::core::result::Result::Ok(())
             }
@@ -593,7 +616,8 @@ macro_rules! snapshot_guest {
                 // staged-overlay projection this round is already folded into
                 // `__state`. these ports' queries are pure self reads.
                 let module = loaded_module()?;
-                $crate::block_on(module.query(&req)).map_err(to_wit_error)
+                $crate::block_on(module.query_with(&$crate::WitCtx::new(), &req))
+                    .map_err(to_wit_error)
             }
         }
 
@@ -636,6 +660,20 @@ macro_rules! store_guest {
                 $shape
             }
 
+            fn initialize(
+                params: ::std::vec::Vec<u8>,
+            ) -> ::core::result::Result<(), $crate::host::Error> {
+                use $crate::sdk::Module as _;
+                let mut module = module()?;
+                $crate::block_on(module.initialize(&params)).map_err(to_wit_error)?;
+                $crate::block_on(module.flush_operation()).map_err(to_wit_error)
+            }
+
+            fn finalize_block() -> ::core::result::Result<(), $crate::host::Error> {
+                use $crate::sdk::Module as _;
+                $crate::block_on(module()?.commit_block()).map_err(to_wit_error)
+            }
+
             fn execute(
                 payload: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<(), $crate::host::Error> {
@@ -649,7 +687,7 @@ macro_rules! store_guest {
                 .map_err(to_wit_error)?;
                 // flush the inner per-dispatch staging into the host's OUTER
                 // overlay; the host owns the real store commit/abort boundary.
-                $crate::block_on(module.commit_block()).map_err(to_wit_error)?;
+                $crate::block_on(module.flush_operation()).map_err(to_wit_error)?;
                 ::core::result::Result::Ok(())
             }
 
@@ -660,7 +698,8 @@ macro_rules! store_guest {
                 // a fresh module's `pending` is empty, so the native query reads
                 // straight through the staged-over-committed store view.
                 let module = module()?;
-                $crate::block_on(module.query(&req)).map_err(to_wit_error)
+                $crate::block_on(module.query_with(&$crate::WitCtx::new(), &req))
+                    .map_err(to_wit_error)
             }
         }
 

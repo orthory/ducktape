@@ -696,6 +696,19 @@ fn build(scratch: &Path, name: &str, kind: GuestKind, rustflags: &str) -> Result
 }
 
 fn componentize(cdylib: &Path, out: &Path) -> Result<(), String> {
+    let required = include_str!("../../../wasm-tools.version").trim();
+    let version = Command::new("wasm-tools")
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("running wasm-tools: {e}"))?;
+    let actual = String::from_utf8_lossy(&version.stdout);
+    let matches_pin = version.status.success() && actual.trim() == format!("wasm-tools {required}");
+    if !matches_pin {
+        return Err(format!(
+            "component builds require wasm-tools {required}; install with cargo install wasm-tools --locked --version {required}"
+        ));
+    }
+
     let status = Command::new("wasm-tools")
         .arg("component")
         .arg("new")

@@ -148,6 +148,14 @@ fn to_wit_error(e: Error) -> host::Error {
 }
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// a whole-state port over host-KV keys (`__state`/`__root`/`__history`),
     /// bound to the network's chain id through its genesis config.
     fn shape() -> host::ModuleShape {

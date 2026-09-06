@@ -64,6 +64,7 @@ mod bindings {
         // guest is replayed with the answer memoized. see `SiblingMemo`.
         imports: {
             "ducktape:module/host.state-get": trappable,
+            "ducktape:module/host.state-get-committed": trappable,
             "ducktape:module/host.module-root": trappable,
             "ducktape:module/host.query-module": trappable,
             // object reads pause on a memo miss exactly like the sibling reads:
@@ -583,6 +584,9 @@ impl host::Host for HostData {
         if let Some(overlay) = self.staged.get(&key) {
             return Ok(overlay.clone());
         }
+        self.state_get_committed(key)
+    }
+    fn state_get_committed(&mut self, key: Vec<u8>) -> wasmtime::Result<Option<Vec<u8>>> {
         if !self.store_backed {
             return Ok(self.committed.get(&key).cloned());
         }
@@ -1146,6 +1150,267 @@ impl WasmModule {
         }
     }
 
+    fn lifecycle_env(&self) -> WitEnv {
+        WitEnv {
+            height: self.block_height.unwrap_or(0),
+            consensus_time: 0,
+            me: self.id.clone(),
+            origin: WitOrigin::System,
+        }
+    }
+
+    async fn run_mutation(
+        &mut self,
+        call: Mutation<'_>,
+        env: WitEnv,
+        mut ctx: Option<&mut dyn Ctx>,
+    ) -> Result<(), SdkError> {
+        // capture the block height for the boundary: an Odb backing stamps it into
+        // its durable-height envelope at commit. every dispatch this block carries
+        // the same height, so re-setting it per dispatch is idempotent.
+        self.block_height = Some(env.height);
+        // every replay round re-runs the pure guest over the SAME pre-dispatch
+        // stage: an aborted round's writes must not leak into the next, or a
+        // replay could observe (e.g. double-apply) its own discarded effects.
+        let staged0 = std::mem::take(&mut self.staged);
+        // the object-plane twin of `staged0`: this block's staged puts so far.
+        // each round re-seeds its overlay from this and the pure guest re-issues
+        // its puts on top, so the overlay is identical across replay rounds.
+        let staged_objects0 = std::mem::take(&mut self.staged_objects);
+        let mut memo = SiblingMemo::default();
+        // ONE budget for the whole dispatch: each round starts with what the
+        // previous round left (see [`DEFAULT_FUEL`]). At zero the next round
+        // traps out of fuel immediately — the same deterministic rejection a
+        // single-round exhaustion produces.
+        let mut fuel_left = self.fuel;
+        while memo.within_budgets() {
+            // move map-backed committed + memo into owned per-round data;
+            // staged is a copy. store-backed rounds carry an empty map and
+            // resolve committed reads through the injected store instead.
+            let round_committed = match &mut self.backing {
+                StateBacking::Map { committed } => std::mem::take(committed),
+                StateBacking::Store { .. } => BTreeMap::new(),
+                // seed the round with the one refs entry; the guest reads it
+                // staged-over via the state lane. the backing keeps ownership of
+                // the committed refs (unlike Map's move-in/reclaim), so this
+                // round's copy is discarded after the call.
+                StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
+            };
+            let round_staged = staged0.clone();
+            let round_objects = staged_objects0.clone();
+            // charged for the block's stage + staged objects before the guest
+            // adds a byte (see `MAX_HOST_BYTES`).
+            let host_bytes = staged_bytes(&round_staged) + object_bytes(&round_objects);
+            let data = HostData {
+                env: Some(env.clone()),
+                committed: round_committed,
+                staged: round_staged,
+                memo: std::mem::take(&mut memo),
+                pending: None,
+                sealed: ctx.is_none(),
+                store_backed: self.is_store_backed(),
+                object_puts: round_objects,
+                out_msgs: Vec::new(),
+                out_events: Vec::new(),
+                out_assigned: Vec::new(),
+                limits: GuestLimits::default(),
+                host_bytes,
+            };
+            let mut store = Store::new(&self.engine, data);
+            store.limiter(|d| &mut d.limits.0);
+
+            let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(fuel_left) {
+                Err(e) => Err(module_err(e)),
+                Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
+                {
+                    Err(e) => Err(module_err(e)),
+                    Ok(inst) => call.invoke(&inst, &mut store).map_err(module_err),
+                },
+            };
+            // carry the unspent fuel into the next replay round.
+            fuel_left = store.get_fuel().unwrap_or(0);
+
+            // reclaim state regardless of outcome (a trap leaves the moved-in
+            // state in the store; take it back so the module is never left empty).
+            let data = store.into_data();
+            if let StateBacking::Map { committed } = &mut self.backing {
+                *committed = data.committed;
+            }
+            memo = data.memo;
+
+            // a paused run: resolve the read (own store, odb backing, or host
+            // ctx) and replay.
+            if let Some(read) = data.pending {
+                match read {
+                    PendingRead::State(key) => match self.resolve_state_read(&key).await {
+                        Ok(answer) => {
+                            memo.states.insert(key, answer);
+                        }
+                        // a refused store read (bad key shape, store error) is
+                        // a deterministic rejection of the whole op.
+                        Err(e) => {
+                            self.staged = staged0;
+                            self.staged_objects = staged_objects0;
+                            return Err(e);
+                        }
+                    },
+                    read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_)) => {
+                        self.resolve_object_read(read, &mut memo);
+                    }
+                    read @ (PendingRead::Root(_) | PendingRead::Query(_, _)) => {
+                        memo.resolve(
+                            ctx.as_deref().expect("unsealed mutation has a context"),
+                            read,
+                        )
+                        .await;
+                    }
+                }
+                continue;
+            }
+
+            return match call {
+                Ok(Ok(())) => {
+                    let has_dispatch_outputs = !data.out_msgs.is_empty()
+                        || !data.out_events.is_empty()
+                        || !data.out_assigned.is_empty();
+                    let lifecycle_emitted = ctx.is_none() && has_dispatch_outputs;
+                    if lifecycle_emitted {
+                        self.staged = staged0;
+                        self.staged_objects = staged_objects0;
+                        return Err(SdkError::Module(
+                            "module lifecycle cannot emit dispatch outputs".into(),
+                        ));
+                    }
+                    self.staged = data.staged;
+                    // a clean dispatch promotes its staged puts into the block
+                    // accumulator (this dispatch's puts on top of the block's).
+                    self.staged_objects = data.object_puts;
+                    let Some(ctx) = ctx.as_deref_mut() else {
+                        return Ok(());
+                    };
+                    // only a clean execute publishes its intents; a rejection leaks nothing.
+                    for (target, payload) in data.out_msgs {
+                        ctx.emit_msg(Msg { target, payload });
+                    }
+                    for (source, payload) in data.out_events {
+                        ctx.emit_event(Event { source, payload });
+                    }
+                    if !data.out_assigned.is_empty() {
+                        ctx.set_assigned(data.out_assigned);
+                    }
+                    Ok(())
+                }
+                // a rejected op stages nothing: the pre-dispatch overlays are
+                // restored (the host aborts the whole block on any execute
+                // error, so this only keeps the module-local invariant clean).
+                Ok(Err(e)) => {
+                    self.staged = staged0;
+                    self.staged_objects = staged_objects0;
+                    Err(wit_err(e))
+                }
+                Err(e) => {
+                    self.staged = staged0;
+                    self.staged_objects = staged_objects0;
+                    Err(e)
+                }
+            };
+        }
+        self.staged = staged0;
+        self.staged_objects = staged_objects0;
+        Err(memo.budget_error())
+    }
+
+    async fn publish_state(&mut self) -> Result<(), SdkError> {
+        // the committing block's height, captured during execute; consumed here.
+        // `0` only if no dispatch ran this block — impossible for a touched (=
+        // committing) module, and inert regardless (nothing staged → the Odb arm
+        // never reaches `adopt_refs`, so the height is never persisted).
+        let height = self.block_height.take().unwrap_or(0);
+        match &mut self.backing {
+            StateBacking::Map { committed } => {
+                // Map/Store guests never stage objects; drop any (there are none)
+                // alongside the state publish — a no-op that keeps the invariant.
+                self.staged_objects.clear();
+                for (key, overlay) in std::mem::take(&mut self.staged) {
+                    match overlay {
+                        Some(value) => {
+                            committed.insert(key, value);
+                        }
+                        None => {
+                            committed.remove(&key);
+                        }
+                    }
+                }
+            }
+            StateBacking::Odb { backing } => {
+                // the duckfs durability ordering (native `module.rs:368-427`), as
+                // an ORDER OF BACKING CALLS — the crash-safety contract Task 4
+                // realizes on disk (objects fsync'd BEFORE the refs commit point,
+                // refs adopted LAST so the root never advances ahead of durable
+                // objects). the staged objects live in-memory (`staged_objects`)
+                // and the new refs image in the state stage (`staged[REFS_KEY]`),
+                // exactly like a native pending block; publish both here or drop
+                // both on abort.
+                //
+                // 1. flush the block's staged objects into the backing (native
+                //    `store.put` per object). `staged_objects` is id → tagged
+                //    body (`kind ‖ body`); split the tag back off for the put.
+                for tagged in std::mem::take(&mut self.staged_objects).into_values() {
+                    let (&kind, body) = tagged
+                        .split_first()
+                        .expect("a staged object always carries its kind tag");
+                    backing.stage_put(kind, body);
+                }
+                // 2. objects-durable barrier (native `store.sync_dirs`) — BEFORE
+                //    the refs commit point below. threads the block height so the
+                //    backing can stamp its durable-height envelope at adopt.
+                backing.publish_block(height)?;
+                // 3. adopt the new refs image IFF the block staged one — the sole
+                //    place the root moves (native `refs_store.save` + `adopt_refs`).
+                //    an empty stage leaves refs, and the root, untouched.
+                if let Some(overlay) = self.staged.remove(REFS_KEY) {
+                    // the refs lane only ever stages a value (`state-set`); a
+                    // staged delete is a guest bug — reject deterministically
+                    // (identical on every validator) rather than panic.
+                    let refs = overlay.ok_or_else(|| {
+                        SdkError::Module("files: refs lane staged a delete, never valid".into())
+                    })?;
+                    backing.adopt_refs(&refs)?;
+                }
+                self.staged.clear();
+            }
+            StateBacking::Store { store } => {
+                self.staged_objects.clear();
+                // publish the whole block's staged writes in ONE store batch —
+                // exactly the native store-backed contract: no-op (and no root
+                // movement) when nothing staged, `None` ships as a delete. the
+                // staged map orders by hashed key while a native module orders
+                // by logical key, but the store's batch canonicalizes mutations
+                // by key before merkleizing, so the committed op log — and the
+                // root — is identical either way. keys were validated as
+                // digests when staged content arrived from the guest; a
+                // non-digest key here fails closed before any store touch.
+                if self.staged.is_empty() {
+                    return Ok(());
+                }
+                let mut writes: Vec<([u8; ROOT_LEN], Option<Vec<u8>>)> =
+                    Vec::with_capacity(self.staged.len());
+                for (key, value) in &self.staged {
+                    let digest: [u8; ROOT_LEN] = key.as_slice().try_into().map_err(|_| {
+                        SdkError::Module(format!(
+                            "store-backed state keys must be {ROOT_LEN}-byte digests, got {}",
+                            key.len()
+                        ))
+                    })?;
+                    writes.push((digest, value.clone()));
+                }
+                store.commit_batch(writes).await?;
+                self.staged.clear();
+            }
+        }
+        Ok(())
+    }
+
     /// one round of the guest's `query` export over LIVE state — the staged
     /// overlay on committed, the same read-your-writes surface a native module's
     /// query serves from its live struct (out of block the overlay is empty, so
@@ -1208,6 +1473,27 @@ impl WasmModule {
             memo: data.memo,
             pending: data.pending,
             fuel_left,
+        }
+    }
+}
+
+/// Every state-changing export runs under the same replay and resource limits.
+enum Mutation<'a> {
+    Execute(&'a [u8]),
+    Initialize(&'a [u8]),
+    Finalize,
+}
+
+impl Mutation<'_> {
+    fn invoke(
+        &self,
+        instance: &ModuleWorld,
+        store: &mut Store<HostData>,
+    ) -> wasmtime::Result<Result<(), WitError>> {
+        match self {
+            Self::Execute(payload) => instance.call_execute(store, payload),
+            Self::Initialize(params) => instance.call_initialize(store, params),
+            Self::Finalize => instance.call_finalize_block(store),
         }
     }
 }
@@ -1516,143 +1802,14 @@ impl Module for WasmModule {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), SdkError> {
         let env = to_wit_env(ctx.env());
-        // capture the block height for the boundary: an Odb backing stamps it into
-        // its durable-height envelope at commit. every dispatch this block carries
-        // the same height, so re-setting it per dispatch is idempotent.
-        self.block_height = Some(env.height);
-        // every replay round re-runs the pure guest over the SAME pre-dispatch
-        // stage: an aborted round's writes must not leak into the next, or a
-        // replay could observe (e.g. double-apply) its own discarded effects.
-        let staged0 = std::mem::take(&mut self.staged);
-        // the object-plane twin of `staged0`: this block's staged puts so far.
-        // each round re-seeds its overlay from this and the pure guest re-issues
-        // its puts on top, so the overlay is identical across replay rounds.
-        let staged_objects0 = std::mem::take(&mut self.staged_objects);
-        let mut memo = SiblingMemo::default();
-        // ONE budget for the whole dispatch: each round starts with what the
-        // previous round left (see [`DEFAULT_FUEL`]). At zero the next round
-        // traps out of fuel immediately — the same deterministic rejection a
-        // single-round exhaustion produces.
-        let mut fuel_left = self.fuel;
-        while memo.within_budgets() {
-            // move map-backed committed + memo into owned per-round data;
-            // staged is a copy. store-backed rounds carry an empty map and
-            // resolve committed reads through the injected store instead.
-            let round_committed = match &mut self.backing {
-                StateBacking::Map { committed } => std::mem::take(committed),
-                StateBacking::Store { .. } => BTreeMap::new(),
-                // seed the round with the one refs entry; the guest reads it
-                // staged-over via the state lane. the backing keeps ownership of
-                // the committed refs (unlike Map's move-in/reclaim), so this
-                // round's copy is discarded after the call.
-                StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
-            };
-            let round_staged = staged0.clone();
-            let round_objects = staged_objects0.clone();
-            // charged for the block's stage + staged objects before the guest
-            // adds a byte (see `MAX_HOST_BYTES`).
-            let host_bytes = staged_bytes(&round_staged) + object_bytes(&round_objects);
-            let data = HostData {
-                env: Some(env.clone()),
-                committed: round_committed,
-                staged: round_staged,
-                memo: std::mem::take(&mut memo),
-                pending: None,
-                sealed: false,
-                store_backed: self.is_store_backed(),
-                object_puts: round_objects,
-                out_msgs: Vec::new(),
-                out_events: Vec::new(),
-                out_assigned: Vec::new(),
-                limits: GuestLimits::default(),
-                host_bytes,
-            };
-            let mut store = Store::new(&self.engine, data);
-            store.limiter(|d| &mut d.limits.0);
+        self.run_mutation(Mutation::Execute(&msg.payload), env, Some(ctx))
+            .await
+    }
 
-            let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(fuel_left) {
-                Err(e) => Err(module_err(e)),
-                Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
-                {
-                    Err(e) => Err(module_err(e)),
-                    Ok(inst) => inst
-                        .call_execute(&mut store, &msg.payload)
-                        .map_err(module_err),
-                },
-            };
-            // carry the unspent fuel into the next replay round.
-            fuel_left = store.get_fuel().unwrap_or(0);
-
-            // reclaim state regardless of outcome (a trap leaves the moved-in
-            // state in the store; take it back so the module is never left empty).
-            let data = store.into_data();
-            if let StateBacking::Map { committed } = &mut self.backing {
-                *committed = data.committed;
-            }
-            memo = data.memo;
-
-            // a paused run: resolve the read (own store, odb backing, or host
-            // ctx) and replay.
-            if let Some(read) = data.pending {
-                match read {
-                    PendingRead::State(key) => match self.resolve_state_read(&key).await {
-                        Ok(answer) => {
-                            memo.states.insert(key, answer);
-                        }
-                        // a refused store read (bad key shape, store error) is
-                        // a deterministic rejection of the whole op.
-                        Err(e) => {
-                            self.staged = staged0;
-                            self.staged_objects = staged_objects0;
-                            return Err(e);
-                        }
-                    },
-                    read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_)) => {
-                        self.resolve_object_read(read, &mut memo);
-                    }
-                    read @ (PendingRead::Root(_) | PendingRead::Query(_, _)) => {
-                        memo.resolve(&*ctx, read).await;
-                    }
-                }
-                continue;
-            }
-
-            return match call {
-                Ok(Ok(())) => {
-                    self.staged = data.staged;
-                    // a clean dispatch promotes its staged puts into the block
-                    // accumulator (this dispatch's puts on top of the block's).
-                    self.staged_objects = data.object_puts;
-                    // only a clean execute publishes its intents; a rejection leaks nothing.
-                    for (target, payload) in data.out_msgs {
-                        ctx.emit_msg(Msg { target, payload });
-                    }
-                    for (source, payload) in data.out_events {
-                        ctx.emit_event(Event { source, payload });
-                    }
-                    if !data.out_assigned.is_empty() {
-                        ctx.set_assigned(data.out_assigned);
-                    }
-                    Ok(())
-                }
-                // a rejected op stages nothing: the pre-dispatch overlays are
-                // restored (the host aborts the whole block on any execute
-                // error, so this only keeps the module-local invariant clean).
-                Ok(Err(e)) => {
-                    self.staged = staged0;
-                    self.staged_objects = staged_objects0;
-                    Err(wit_err(e))
-                }
-                Err(e) => {
-                    self.staged = staged0;
-                    self.staged_objects = staged_objects0;
-                    Err(e)
-                }
-            };
-        }
-        self.staged = staged0;
-        self.staged_objects = staged_objects0;
-        Err(memo.budget_error())
+    async fn initialize(&mut self, params: &[u8]) -> Result<(), SdkError> {
+        self.run_mutation(Mutation::Initialize(params), self.lifecycle_env(), None)
+            .await?;
+        self.publish_state().await
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, SdkError> {
@@ -1731,94 +1888,9 @@ impl Module for WasmModule {
     }
 
     async fn commit_block(&mut self) -> Result<(), SdkError> {
-        // the committing block's height, captured during execute; consumed here.
-        // `0` only if no dispatch ran this block — impossible for a touched (=
-        // committing) module, and inert regardless (nothing staged → the Odb arm
-        // never reaches `adopt_refs`, so the height is never persisted).
-        let height = self.block_height.take().unwrap_or(0);
-        match &mut self.backing {
-            StateBacking::Map { committed } => {
-                // Map/Store guests never stage objects; drop any (there are none)
-                // alongside the state publish — a no-op that keeps the invariant.
-                self.staged_objects.clear();
-                for (key, overlay) in std::mem::take(&mut self.staged) {
-                    match overlay {
-                        Some(value) => {
-                            committed.insert(key, value);
-                        }
-                        None => {
-                            committed.remove(&key);
-                        }
-                    }
-                }
-            }
-            StateBacking::Odb { backing } => {
-                // the duckfs durability ordering (native `module.rs:368-427`), as
-                // an ORDER OF BACKING CALLS — the crash-safety contract Task 4
-                // realizes on disk (objects fsync'd BEFORE the refs commit point,
-                // refs adopted LAST so the root never advances ahead of durable
-                // objects). the staged objects live in-memory (`staged_objects`)
-                // and the new refs image in the state stage (`staged[REFS_KEY]`),
-                // exactly like a native pending block; publish both here or drop
-                // both on abort.
-                //
-                // 1. flush the block's staged objects into the backing (native
-                //    `store.put` per object). `staged_objects` is id → tagged
-                //    body (`kind ‖ body`); split the tag back off for the put.
-                for tagged in std::mem::take(&mut self.staged_objects).into_values() {
-                    let (&kind, body) = tagged
-                        .split_first()
-                        .expect("a staged object always carries its kind tag");
-                    backing.stage_put(kind, body);
-                }
-                // 2. objects-durable barrier (native `store.sync_dirs`) — BEFORE
-                //    the refs commit point below. threads the block height so the
-                //    backing can stamp its durable-height envelope at adopt.
-                backing.publish_block(height)?;
-                // 3. adopt the new refs image IFF the block staged one — the sole
-                //    place the root moves (native `refs_store.save` + `adopt_refs`).
-                //    an empty stage leaves refs, and the root, untouched.
-                if let Some(overlay) = self.staged.remove(REFS_KEY) {
-                    // the refs lane only ever stages a value (`state-set`); a
-                    // staged delete is a guest bug — reject deterministically
-                    // (identical on every validator) rather than panic.
-                    let refs = overlay.ok_or_else(|| {
-                        SdkError::Module("files: refs lane staged a delete, never valid".into())
-                    })?;
-                    backing.adopt_refs(&refs)?;
-                }
-                self.staged.clear();
-            }
-            StateBacking::Store { store } => {
-                self.staged_objects.clear();
-                // publish the whole block's staged writes in ONE store batch —
-                // exactly the native store-backed contract: no-op (and no root
-                // movement) when nothing staged, `None` ships as a delete. the
-                // staged map orders by hashed key while a native module orders
-                // by logical key, but the store's batch canonicalizes mutations
-                // by key before merkleizing, so the committed op log — and the
-                // root — is identical either way. keys were validated as
-                // digests when staged content arrived from the guest; a
-                // non-digest key here fails closed before any store touch.
-                if self.staged.is_empty() {
-                    return Ok(());
-                }
-                let mut writes: Vec<([u8; ROOT_LEN], Option<Vec<u8>>)> =
-                    Vec::with_capacity(self.staged.len());
-                for (key, value) in &self.staged {
-                    let digest: [u8; ROOT_LEN] = key.as_slice().try_into().map_err(|_| {
-                        SdkError::Module(format!(
-                            "store-backed state keys must be {ROOT_LEN}-byte digests, got {}",
-                            key.len()
-                        ))
-                    })?;
-                    writes.push((digest, value.clone()));
-                }
-                store.commit_batch(writes).await?;
-                self.staged.clear();
-            }
-        }
-        Ok(())
+        self.run_mutation(Mutation::Finalize, self.lifecycle_env(), None)
+            .await?;
+        self.publish_state().await
     }
 
     async fn abort_block(&mut self) -> Result<(), SdkError> {

@@ -111,6 +111,14 @@ fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
 struct Component;
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// an odb port: the host wraps this component over the git substrate it
     /// provides for the module's id.
     fn shape() -> host::ModuleShape {

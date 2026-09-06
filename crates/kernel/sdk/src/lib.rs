@@ -358,8 +358,15 @@ pub trait Ctx {
 /// commitment, and the byte-level sync serve surface.
 #[async_trait::async_trait(?Send)]
 pub trait MerkleStore {
-    /// read one hashed key from COMMITTED state.
+    /// Read one hashed key from this store's current view. A guest adapter
+    /// includes the host's block overlay; a durable store exposes committed state.
     async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error>;
+
+    /// Read the state frozen at the preceding block boundary, bypassing any
+    /// host overlay. Durable stores already expose this view through `get`.
+    async fn get_committed(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
+        self.get(key).await
+    }
 
     /// apply + durably commit ONE batch of hashed-key writes (`None` = delete)
     /// at a block boundary. after this returns, [`MerkleStore::root`] reflects
@@ -455,6 +462,20 @@ pub trait Module {
     /// the dispatch entry point. async, but every `.await` MUST be on a
     /// deterministic resource (own qmdb state, a query) — NEVER a network/effect.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error>;
+
+    /// Initialize a newly installed module from caller-supplied parameters.
+    /// The same hook runs for initial membership and later admission; reopen
+    /// and code replacement preserve state and do not initialize it again.
+    async fn initialize(&mut self, _params: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Flush an adapter's operation-local writes into the host's block overlay.
+    /// Modules with block-finalization logic override this to flush writes only:
+    /// the guest's finalization export invokes `commit_block` once per block.
+    async fn flush_operation(&mut self) -> Result<(), Error> {
+        self.commit_block().await
+    }
 
     /// read-only projection serving other modules' [`Ctx::query`]. async, so a
     /// qmdb-backed module can serve a real read (`self.db.get(..).await`). defaults

@@ -25,6 +25,14 @@ fn read_count() -> u64 {
 }
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// the declared shape: plain host-KV keys over a map the host owns, no
     /// network config, read-your-writes queries.
     fn shape() -> host::ModuleShape {

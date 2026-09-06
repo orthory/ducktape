@@ -29,6 +29,14 @@ fn read_count() -> u64 {
 }
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// the same shape as `hello-wasm`: a code swap keeps the store, so the
     /// replacement must declare the backing that store is.
     fn shape() -> host::ModuleShape {

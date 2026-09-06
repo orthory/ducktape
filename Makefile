@@ -283,7 +283,8 @@ BUILDER_MODULES := \
   crates/modules/system/tagging crates/modules/system/dispatch \
   crates/modules/system/capability crates/modules/system/identity \
   crates/modules/system/gateway crates/modules/system/governance \
-  crates/modules/system/saga crates/modules/system/acl crates/modules/system/kv
+  crates/modules/system/saga crates/modules/system/acl crates/modules/system/kv \
+  crates/modules/system/modules crates/modules/system/valset
 
 # Modules that additionally ship an INDEX guest (src/index_guest.rs behind the
 # `index-guest` feature): guest-builder --index writes the canonical
@@ -307,6 +308,8 @@ INDEX_MODULES := \
 NETSTACK_GUEST := crates/networking/netstack-machine
 
 wasm-modules:
+	@test "$$(wasm-tools --version)" = "wasm-tools $$(cat wasm-tools.version)" || \
+	  { echo "install wasm-tools at the version in wasm-tools.version" >&2; exit 1; }
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
 	  $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m && \
