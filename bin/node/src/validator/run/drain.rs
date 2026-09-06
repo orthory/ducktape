@@ -17,7 +17,7 @@ use crate::drain_actions::{
     CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
-use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes};
+use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes, unix_ms};
 
 /// One warning when the workspace mark goes missing, then one per this many
 /// further checks (`WORKSPACE_CHECK_INTERVAL` apart) for a filesystem that
@@ -172,6 +172,7 @@ impl ValidatorRuntime<'_> {
             reach_cmd,
             relay_tx,
             gate_outcomes,
+            join_requests,
             next_seq,
             prev_ckpt,
             signer,
@@ -590,6 +591,15 @@ impl ValidatorRuntime<'_> {
             &mut gate_outcomes.lock().expect("gate outcomes lock"),
             context.current(),
             std::time::Duration::from_millis(reachability::INVITE_JOIN_WINDOW_MS),
+        );
+        // same reasoning, same beat, for the join-request map: a joiner that
+        // stops retransmitting (a rejected Redeem, or it just gave up) would
+        // otherwise sit there forever — the only other prune is the read-time
+        // retain in `on_rpc` for a joiner that GAINED standing.
+        crate::rpc::sweep_join_requests(
+            join_requests,
+            unix_ms(),
+            reachability::INVITE_JOIN_WINDOW_MS,
         );
         // publish each newly-applied boundary to ws subscribers
         // (send only errs when nobody is subscribed — fine). the

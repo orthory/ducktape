@@ -16,7 +16,8 @@
 //! host leaves here wired: the admissions factory over the node's canonical
 //! substrates, and an index database for every module it runs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::{Mutex, OnceLock};
 
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
@@ -546,14 +547,35 @@ impl statesync::ObjectFetch for FilesOdb<'_> {
     }
 }
 
+/// intern a runtime-child / metric label as a process-wide `&'static str`: a
+/// repeat call with the same text returns the SAME leaked string instead of
+/// leaking a new one. `sync_all_modules` re-enters forever on a resident
+/// whose boundary sync keeps failing (`replica/park.rs`'s retry loop never
+/// bails while `resident_standing`), so a per-call label here must not leak —
+/// only a genuinely new label (a module id never seen before) costs a leak.
+fn intern_label(name: &str) -> &'static str {
+    static LABELS: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let cache = LABELS.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut cache = cache.lock().unwrap();
+    if let Some(existing) = cache.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    cache.insert(leaked);
+    leaked
+}
+
 /// rebuild EVERY module of the modules registry's roster from a peer's
 /// statesync service at `manifest`'s boundary and compose them into a
 /// [`Host`], verified against the manifest's root-hash. the disk substrates
 /// land under their canonical ids in this process's storage root — this IS
 /// the node's state afterwards, not a scratch copy. `attempt` disambiguates
-/// runtime child labels across retries (a busy source moves its qmdb targets
-/// past the captured boundary; the caller refetches the manifest and tries
-/// again, and metrics labels must not collide). every wasm tenant joins on
+/// scratch DIRECTORIES on disk across retries (a busy source moves its qmdb
+/// targets past the captured boundary; the caller refetches the manifest and
+/// tries again) — the runtime child / metric LABELS stay attempt-independent
+/// and interned (`intern_label`), since a resident retries this forever and a
+/// label per attempt would leak and grow `/metrics` without bound. every wasm
+/// tenant joins on
 /// the code the registry designates for the boundary, fetched off the blob
 /// plane (the mesh behind it) and hash-checked by the composer.
 pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetch::SourceRotate>(
@@ -585,14 +607,13 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
             .ok_or_else(|| format!("module {module} missing from the manifest"))?
             .root)
     };
-    let scratch_context = context.child(Box::leak(
-        format!("sync_scratch_a{attempt}").into_boxed_str(),
-    ));
+    let scratch_context = context.child(intern_label("sync_scratch"));
     // the runtime labels its children with static strings, and the resolver
     // lane names its module the same way; a module id comes off the registry
-    // as a `String`, so each is leaked once per attempt — a bounded handful.
-    let static_label =
-        |name: &str| -> &'static str { Box::leak(name.to_string().into_boxed_str()) };
+    // as a `String`, so this interns rather than leaking a fresh string on
+    // every call — `sync_all_modules` retries forever on a resident whose
+    // boundary sync keeps failing, and a leak per attempt is a leak forever.
+    let static_label = intern_label;
     let pinned_target = |module: &'static str| -> Result<statesync::qmdb::SyncTarget, String> {
         let entry = manifest
             .entry(module)
@@ -686,7 +707,7 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     );
     let mut stores = |module: &str| -> BoxFut<'_, Result<Box<dyn sdk::MerkleStore>, String>> {
         let module = static_label(module);
-        let child = scratch_context.child(static_label(&format!("{module}_scratch_a{attempt}")));
+        let child = scratch_context.child(static_label(&format!("{module}_scratch")));
         let target = fetch_target(module);
         Box::pin(async move {
             let (target, resolver) = target.await?;
@@ -1177,5 +1198,33 @@ mod tests {
              the source change was cosmetic:\n\
              \x20 git diff origin/dev --name-only crates/modules/ crates/guests/ crates/examples/"
         );
+    }
+
+    /// `sync_all_modules` re-enters forever on a resident whose boundary sync
+    /// keeps failing (`replica/park.rs`'s retry loop only bails when NOT
+    /// `resident_standing`), so a label leaked per attempt grows without
+    /// bound. Two lookups over the same module set must return the SAME
+    /// leaked string — i.e. add nothing new to the interner — not a fresh
+    /// leak each time.
+    #[test]
+    fn intern_label_reuses_existing_leak_for_repeat_module_ids() {
+        let module_set = ["directory", "governance", "modules", "files"];
+
+        let first_attempt: Vec<&'static str> = module_set
+            .iter()
+            .map(|module| intern_label(module))
+            .collect();
+        let second_attempt: Vec<&'static str> = module_set
+            .iter()
+            .map(|module| intern_label(module))
+            .collect();
+
+        for (a, b) in first_attempt.iter().zip(second_attempt.iter()) {
+            assert!(
+                std::ptr::eq(*a, *b),
+                "a repeat label lookup for the same module id leaked a new string \
+                 instead of returning the interned one"
+            );
+        }
     }
 }

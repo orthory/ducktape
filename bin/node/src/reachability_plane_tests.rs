@@ -457,7 +457,7 @@ fn a_v6_only_host_is_unreachable_for_the_v4_underlay() {
 // ---------------------------------------------------------------------------
 
 use crate::reachability_plane::{
-    GateOutcomeMap, MAX_GATE_OUTCOMES, insert_gate_outcome, sweep_gate_outcomes,
+    GateOutcomeMap, MAX_TRACKED_JOINERS, insert_gate_outcome, sweep_gate_outcomes,
 };
 
 fn admitted_at(height: u64) -> join_gate::IntroReply {
@@ -468,7 +468,7 @@ fn admitted_at(height: u64) -> join_gate::IntroReply {
 fn insert_past_the_cap_evicts_the_oldest_entry() {
     let mut map: GateOutcomeMap = GateOutcomeMap::new();
     let t0 = std::time::SystemTime::UNIX_EPOCH;
-    for i in 0..MAX_GATE_OUTCOMES {
+    for i in 0..MAX_TRACKED_JOINERS {
         insert_gate_outcome(
             &mut map,
             vec![i as u8, (i >> 8) as u8],
@@ -476,7 +476,7 @@ fn insert_past_the_cap_evicts_the_oldest_entry() {
             t0 + std::time::Duration::from_secs(i as u64),
         );
     }
-    assert_eq!(map.len(), MAX_GATE_OUTCOMES);
+    assert_eq!(map.len(), MAX_TRACKED_JOINERS);
     let oldest_key = vec![0u8, 0u8];
     assert!(map.contains_key(&oldest_key));
 
@@ -487,9 +487,9 @@ fn insert_past_the_cap_evicts_the_oldest_entry() {
         &mut map,
         newcomer.clone(),
         admitted_at(999),
-        t0 + std::time::Duration::from_secs(MAX_GATE_OUTCOMES as u64),
+        t0 + std::time::Duration::from_secs(MAX_TRACKED_JOINERS as u64),
     );
-    assert_eq!(map.len(), MAX_GATE_OUTCOMES);
+    assert_eq!(map.len(), MAX_TRACKED_JOINERS);
     assert!(
         !map.contains_key(&oldest_key),
         "the oldest entry made room for the newcomer"
@@ -504,9 +504,9 @@ fn insert_past_the_cap_evicts_the_oldest_entry() {
         &mut map,
         second_oldest.clone(),
         admitted_at(1000),
-        t0 + std::time::Duration::from_secs(MAX_GATE_OUTCOMES as u64 + 1),
+        t0 + std::time::Duration::from_secs(MAX_TRACKED_JOINERS as u64 + 1),
     );
-    assert_eq!(map.len(), MAX_GATE_OUTCOMES);
+    assert_eq!(map.len(), MAX_TRACKED_JOINERS);
     assert!(map.contains_key(&second_oldest));
 }
 
