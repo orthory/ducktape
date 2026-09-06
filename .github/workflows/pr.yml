@@ -36,7 +36,7 @@ jobs:
       # ubuntu-latest ships rustup; the checkout's rust-toolchain.toml pins
       # the exact channel + targets, so this just makes rustup install it.
       - run: rustup show
-      - run: cargo install wasm-tools --locked
+      - run: cargo install wasm-tools --locked --version 1.253.0
       - run: make wasm-modules-check
       - run: make wasm-embed-check
 
@@ -60,7 +60,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
-      - run: cargo install wasm-tools --locked
+      - run: cargo install wasm-tools --locked --version 1.253.0
       - run: cargo test --locked -p guest-builder
       - run: make wasm-rebuild-check
 

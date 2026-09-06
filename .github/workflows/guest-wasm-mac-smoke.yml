@@ -54,7 +54,7 @@ jobs:
           rustc -vV
 
       - name: install wasm-tools
-        run: cargo install wasm-tools --locked
+        run: cargo install wasm-tools --locked --version 1.253.0
 
       - name: build the identity guest via guest-builder (no C toolchain)
         run: |

@@ -255,9 +255,10 @@ test: wasm-modules-check wasm-embed-check
 ## rebuild every wasm guest into its artifact and refresh EVERY committed copy
 ## in one sweep (the canonical artifact in the module's own directory, which
 ## the build stages into the founding set, + the kernel test fixtures), so the
-## copies can never drift apart. requires wasm-tools (cargo install
-## wasm-tools); the wasm32-unknown-unknown target comes from the pinned
-## rust-toolchain.toml. every guest is built ALONE, out of the platform
+## copies can never drift apart. requires the PINNED wasm-tools (cargo install
+## wasm-tools --locked --version 1.253.0 — guest-builder refuses any other,
+## because a componentizer release moves every component's bytes); the
+## wasm32-unknown-unknown target comes from the pinned rust-toolchain.toml. every guest is built ALONE, out of the platform
 ## repository at this checkout's HEAD (bin/guest-builder), so HEAD must be
 ## pushed first; each module's guest.lock records the revision and the
 ## registry versions its artifact came from and seeds its next build, so a
