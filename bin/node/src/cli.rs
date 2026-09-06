@@ -500,7 +500,7 @@ fn detect_platform_sandbox() -> Option<config::SandboxToml> {
 /// — found a network: mint the chain-id, write the descriptor + node config,
 /// seed the genesis validator set with this identity, and PIN the genesis wasm
 /// set — every component and index guest in `--modules` is composed into
-/// `<workspace>/genesis`, whose hash (and every component's) is in the
+/// `<workspace>/genesis`, whose hash (and every deployment's) is in the
 /// descriptor. Every flag is optional:
 /// the generated config defaults to a WORKING node — overlay advertise, and
 /// every listener at its `config::DEFAULT_*_LISTEN` constant (mesh, HTTP,
@@ -525,17 +525,12 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(src) => src,
         None => config::modules_dir()?,
     };
-    let genesis = config::Genesis::compose(
-        &founding_set,
-        &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
-        &topology::TOPOLOGY.index_guest_ids(topology::PRODUCTION),
-    )
-    .map_err(|e| {
+    let genesis = config::Genesis::compose(&founding_set).map_err(|e| {
         format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")
     })?;
     let genesis_bytes = genesis.encode();
     let genesis_hash = config::sha256(&genesis_bytes);
-    let hashes = genesis.component_hashes();
+    let hashes = genesis.module_hashes();
     // the workspace dir: `--dir` is the explicit escape hatch; the default is
     // the registry — `~/.ducktape/workspaces/<chain-id>/` — so the network is
     // addressable by `-n <chain-id>` (run/invite/list) from the moment it is
@@ -633,8 +628,12 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("network {chain_id} initialized in {}", dir.display());
     eprintln!(
         "genesis: {} components and {} index guests from {} written to {}",
-        genesis.components.len(),
-        genesis.index_guests.len(),
+        genesis.modules.len(),
+        genesis
+            .modules
+            .iter()
+            .filter(|module| genesis.index_guest(&module.id).is_some())
+            .count(),
         founding_set.display(),
         config::genesis_path(&dir).display()
     );
@@ -669,8 +668,12 @@ fn install_joiner_genesis(
     )?;
     eprintln!(
         "genesis: {} components and {} index guests written to {}",
-        genesis.components.len(),
-        genesis.index_guests.len(),
+        genesis.modules.len(),
+        genesis
+            .modules
+            .iter()
+            .filter(|module| genesis.index_guest(&module.id).is_some())
+            .count(),
         config::genesis_path(dir).display()
     );
     Ok(())

@@ -88,8 +88,12 @@ warm boot free — a matching marker skips every wasm compile.
 
 Because the guest lives in the database's engine keyspace, no wipe this tier
 performs can touch it — `mark_backfilled`'s clear and `converge_guest`'s clear
-both sweep only user keys. Every node installs its own mapper from its bundled
-artifacts at open; nothing ships code over the wire.
+both sweep only user keys. Every node installs the mapper from the module's
+running deployment at open and activation. The component and optional mapper
+travel together through the blob plane under one deployment hash. A changed
+mapper refolds the retained feed; removing it clears its derived rows. Readers
+wait through the replacement, and a view's advisory watermark is read under
+the same deployment guard as its rows.
 
 ### 3.1 Authoring shape: decide pure, write thin
 
@@ -107,8 +111,8 @@ A mapper is two files in the module crate:
   decided writes, and exports the roles via `index_guest::fold!`/`view!`.
   The whole file is ~15 lines; `guest-builder --index` packages it into the
   committed `index.wasm` (`make wasm-modules` refreshes,
-  `wasm-modules-check` guards presence and `make wasm-index-check` guards the
-  bytes against a rebuild of the source).
+  `wasm-modules-check` guards presence and `make wasm-rebuild-check` guards
+  the bytes against a rebuild of the source).
 
 Within one op a read never sees that op's own writes (they apply after the
 decision); across ops in one feed batch it sees everything earlier — the

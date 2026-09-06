@@ -19,6 +19,7 @@ name = "ducktape"
 path = "src/main.rs"
 
 [dependencies]
+module-artifact = { workspace = true }
 async-trait = { workspace = true }
 clap = { workspace = true }
 # terminal styling for the operator verbs. Both already ride in on clap's own

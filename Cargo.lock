@@ -114,8 +114,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-cryptography",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "identity",
  "sdk",
@@ -168,8 +168,8 @@ dependencies = [
  "capability",
  "commonware-runtime",
  "duckdns",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -904,8 +904,8 @@ dependencies = [
  "borsh",
  "chat",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "inbox",
  "sdk",
@@ -1435,8 +1435,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -1560,7 +1560,7 @@ dependencies = [
  "async-trait",
  "commonware-cryptography",
  "commonware-runtime",
- "guest-adapter",
+ "ducktape-module-sdk",
  "host",
  "identity",
  "index-guest",
@@ -3180,8 +3180,8 @@ name = "directory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -3228,8 +3228,8 @@ dependencies = [
  "async-trait",
  "capability",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "saga",
  "sdk",
  "sdk-testkit",
@@ -3428,6 +3428,16 @@ dependencies = [
 [[package]]
 name = "ducktape-home"
 version = "0.1.0"
+
+[[package]]
+name = "ducktape-module-sdk"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "duckfs-core",
+ "sdk",
+ "wit-bindgen",
+]
 
 [[package]]
 name = "ducktape-rpc"
@@ -3711,8 +3721,8 @@ dependencies = [
  "base64 0.22.1",
  "duckfs-core",
  "duckfs-disk",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "sdk",
  "sdk-testkit",
@@ -3919,10 +3929,10 @@ dependencies = [
  "base64 0.22.1",
  "blobstore",
  "chat",
+ "ducktape-module-sdk",
  "forge",
  "futures",
  "git2",
- "guest-adapter",
  "host",
  "identity",
  "keyscheme",
@@ -4105,8 +4115,8 @@ dependencies = [
  "commonware-cryptography",
  "commonware-runtime",
  "duckdns",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "identity",
  "sdk",
  "sdk-testkit",
@@ -4301,8 +4311,8 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "identity",
  "modules",
@@ -4406,16 +4416,6 @@ dependencies = [
  "ff",
  "rand_core 0.6.4",
  "subtle",
-]
-
-[[package]]
-name = "guest-adapter"
-version = "0.0.0"
-dependencies = [
- "async-trait",
- "duckfs-core",
- "sdk",
- "wit-bindgen",
 ]
 
 [[package]]
@@ -4683,6 +4683,7 @@ dependencies = [
  "inbox",
  "keyscheme",
  "kv",
+ "module-artifact",
  "modules",
  "p256",
  "pages",
@@ -5144,8 +5145,8 @@ dependencies = [
  "borsh",
  "commonware-cryptography",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "k256",
  "keyscheme",
  "p256",
@@ -5229,8 +5230,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "inbox",
  "index-guest",
@@ -5637,7 +5638,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
- "guest-adapter",
+ "ducktape-module-sdk",
  "host",
  "sdk",
  "sdk-testkit",
@@ -6038,12 +6039,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "module-artifact"
+version = "0.1.0"
+dependencies = [
+ "borsh",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "modules"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
  "sdk",
  "sdk-testkit",
@@ -6384,6 +6394,7 @@ dependencies = [
  "kv",
  "libc",
  "media-service",
+ "module-artifact",
  "modules",
  "nat-traversal",
  "nettest",
@@ -6458,6 +6469,7 @@ dependencies = [
  "keyscheme",
  "kv",
  "media-service",
+ "module-artifact",
  "modules",
  "nettest",
  "node",
@@ -7327,7 +7339,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
- "guest-adapter",
+ "ducktape-module-sdk",
  "host",
  "index-guest",
  "sdk",
@@ -8563,10 +8575,10 @@ dependencies = [
  "chat",
  "commonware-runtime",
  "dispatch 0.1.0",
+ "ducktape-module-sdk",
  "files",
  "forge",
  "futures",
- "guest-adapter",
  "host",
  "pages",
  "saga",
@@ -8758,8 +8770,8 @@ dependencies = [
  "borsh",
  "capability",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "index-guest",
  "sdk",
@@ -9683,8 +9695,8 @@ dependencies = [
  "async-trait",
  "borsh",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -9716,8 +9728,8 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
- "guest-adapter",
  "host",
  "index-guest",
  "sdk",
@@ -10833,6 +10845,7 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-runtime",
+ "ducktape-module-sdk",
  "futures",
  "sdk",
  "sdk-testkit",
@@ -11013,6 +11026,7 @@ name = "wasm-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "module-artifact",
  "sdk",
  "sdk-testkit",
  "sha2 0.10.9",
@@ -12438,6 +12452,7 @@ dependencies = [
  "ducktape-home",
  "governance",
  "identity",
+ "module-artifact",
  "nat-traversal",
  "rand 0.8.6",
  "reachability",

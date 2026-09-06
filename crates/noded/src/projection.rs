@@ -208,7 +208,7 @@ pub fn apply_block_to_index(
     consensus_time: u64,
     record: Option<Vec<u8>>,
     dispatches: &[host::DispatchRecord],
-    roots: &[(sdk::ModuleId, sdk::StateRoot)],
+    host: &host::Host,
 ) {
     // a poisoned store refuses every write until an operator rebuilds it, and
     // the ONE error below named that remedy when it happened. re-logging it
@@ -222,7 +222,7 @@ pub fn apply_block_to_index(
         );
         return;
     }
-    if let Err(err) = crate::index_host_modules(index, roots.iter().map(|(id, _)| id.as_str())) {
+    if let Err(err) = crate::converge_host_modules(index, host) {
         tracing::error!(
             target: "ducktape::consensus",
             event = "node_index_poisoned",

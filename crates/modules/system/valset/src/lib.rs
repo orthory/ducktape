@@ -52,6 +52,9 @@
 //! serving peer, stays the trust anchor.
 
 // the wire surface: this module's shared types, flattened at the crate root.
+#[cfg(all(feature = "guest", target_arch = "wasm32"))]
+mod guest;
+
 mod interface;
 pub use interface::*;
 
@@ -502,6 +505,27 @@ impl Module for Valset {
 
     async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
         self.staged.sync_target().await
+    }
+
+    async fn initialize(&mut self, params: &[u8]) -> Result<(), Error> {
+        let config = sdk::genesis_config::decode_config(params)?;
+        let validators: Vec<Vec<u8>> = match sdk::genesis_config::find(&config, "validators") {
+            Some(bytes) => sdk::wire::decode(bytes).map_err(Error::Module)?,
+            None => Vec::new(),
+        };
+        for key in validators {
+            if key.len() != KEY_LEN {
+                return Err(Error::Module(
+                    "initial validator key must be 32 bytes".into(),
+                ));
+            }
+            self.seed(key).await?;
+        }
+        self.finish_seed().await
+    }
+
+    async fn flush_operation(&mut self) -> Result<(), Error> {
+        self.staged.commit().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

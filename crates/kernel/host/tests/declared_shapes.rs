@@ -43,6 +43,8 @@ fn expected() -> BTreeMap<String, Shape> {
         ("identity", shape(Backing::Store, CHAIN_ID, false)),
         ("inbox", shape(Backing::Store, NONE, false)),
         ("kv", shape(Backing::Store, NONE, false)),
+        ("modules", shape(Backing::Store, NONE, false)),
+        ("valset", shape(Backing::Store, NONE, false)),
         ("noop", shape(Backing::Map, NONE, false)),
         ("pages", shape(Backing::Store, NONE, false)),
         ("runs", shape(Backing::Map, CHAIN_ID, false)),

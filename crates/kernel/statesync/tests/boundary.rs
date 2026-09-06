@@ -289,6 +289,7 @@ fn manifest_roundtrip_carries_pinned_resolver_target() {
         residents: vec![],
         floor_cert: Some(vec![0xCC; 96]),
         entries: vec![ManifestEntry {
+            code_hash: None,
             module_id: "kv".into(),
             root: StateRoot([7u8; 32]),
             kind: PayloadKind::Resolver,

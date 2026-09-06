@@ -293,7 +293,7 @@ fn init_writes_module_hashes_and_the_genesis() {
         "the descriptor pins the whole file"
     );
     let genesis = workspace_config::Genesis::decode(&bytes).expect("decodes");
-    let hashes = genesis.component_hashes();
+    let hashes = genesis.module_hashes();
     for m in &d.modules {
         assert_eq!(
             workspace_config::hex_bytes(&hashes[&m.id]),
@@ -305,7 +305,12 @@ fn init_writes_module_hashes_and_the_genesis() {
     // the index guests are exactly the `<id>.index.wasm` files the founding
     // set holds for the genesis set: the build stages one iff the module's
     // crate declares a guest, so presence is the declaration.
-    let guests: Vec<&str> = genesis.index_guests.iter().map(|a| a.id.as_str()).collect();
+    let guests: Vec<&str> = genesis
+        .modules
+        .iter()
+        .filter(|a| genesis.index_guest(&a.id).is_some())
+        .map(|a| a.id.as_str())
+        .collect();
     let founding_set = std::path::Path::new(common::founding_set());
     let mut want: Vec<&str> = topology::TOPOLOGY
         .wasm_ids(topology::PRODUCTION)
@@ -318,6 +323,57 @@ fn init_writes_module_hashes_and_the_genesis() {
         "the founding set carries chat's index guest, or this pin proves nothing"
     );
     assert_eq!(guests, want, "every index guest the set holds rides in the genesis");
+}
+
+#[test]
+fn init_accepts_a_module_absent_from_the_binary_catalog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("supplied");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/examples/directory/component.wasm"),
+        workspace_config::component_path(&source, "directory"),
+    )
+    .unwrap();
+    let workspace = tmp.path().join("network");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args([
+            "node",
+            "init",
+            "--name",
+            "custom",
+            "--primary-coordinator",
+            "none",
+            "--dir",
+        ])
+        .arg(&workspace)
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--advertised",
+            "127.0.0.1:1",
+            "--modules",
+        ])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_ok(&output, "init with supplied directory module");
+    let genesis = workspace_config::Genesis::load(&workspace.join("genesis")).unwrap();
+    assert_eq!(
+        genesis
+            .modules
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect::<Vec<_>>(),
+        ["directory"]
+    );
+    assert!(
+        genesis
+            .modules
+            .iter()
+            .all(|a| genesis.index_guest(&a.id).is_none())
+    );
 }
 
 /// with no `--modules` and no `$DUCKTAPE_MODULES_DIR`, `init` founds from the
@@ -336,7 +392,7 @@ fn init_founds_from_the_set_the_build_staged_beside_the_binary() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let genesis = workspace_config::Genesis::load(&ws.join("genesis")).expect("the genesis file");
-    let ids: Vec<&str> = genesis.components.iter().map(|a| a.id.as_str()).collect();
+    let ids: Vec<&str> = genesis.modules.iter().map(|a| a.id.as_str()).collect();
     let mut want = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
     want.sort_unstable();
     assert_eq!(ids, want);
@@ -488,10 +544,10 @@ fn a_member_join_refuses_a_genesis_that_is_not_the_networks() {
     );
 }
 
-/// a bundle missing a component is named by the file the operator has to go
-/// look for — not by a hash mismatch three boots later.
+/// An empty founding directory cannot define a module set. The diagnostic
+/// names the supplied directory without inventing a required catalog entry.
 #[test]
-fn init_names_the_missing_component() {
+fn init_refuses_an_empty_module_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let empty = tmp.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
@@ -503,5 +559,7 @@ fn init_names_the_missing_component() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("acl.component.wasm"));
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("holds no module components"), "{error}");
+    assert!(error.contains(empty.to_str().unwrap()), "{error}");
 }

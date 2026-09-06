@@ -115,6 +115,7 @@ where
     if let Some(fold) = fold {
         use recovery::ReplaySink as _;
         fold.folded_block(&recovery::FoldedBlock {
+            host,
             height: frame.height,
             frame: &frame.frame,
             disposition: seal.disposition,
@@ -397,6 +398,7 @@ mod tests {
             // the change is already IN the checkpointed valset root: it is the
             // block at `height` that moved it.
             roots: vec![("valset".to_string(), VALSET_ROOT)],
+            codes: Vec::new(),
             snapshots: Vec::new(),
             oplog_pos: 0,
             next_seq: 0,

@@ -1,6 +1,6 @@
 //! the wasm port of this module, built the ADAPTER way:
 //! the NATIVE `runs` crate is compiled to wasm32 unmodified and adapted to
-//! the `ducktape:module` world through `guest-adapter`, so the module's logic
+//! the `ducktape:module` world through `ducktape-module-sdk`, so the module's logic
 //! is single-sourced (a behavior change in the native crate IS the wasm
 //! change).
 //!
@@ -63,7 +63,7 @@
 //! the host-KV encoding over the three reserved keys.
 
 use crate::RunsModule;
-use guest_adapter::{Guest, WitCtx, block_on, host, load_state, save_state};
+use ducktape_module_sdk::{Guest, WitCtx, block_on, host, load_state, save_state};
 use sdk::{Error, Module as _, Msg, StateRoot};
 
 /// the genesis-constant id this module registers under (the native twin's id:
@@ -120,7 +120,7 @@ fn loaded_module() -> Result<RunsModule, host::Error> {
     // `duck://` link the injector renders stamps its `?net=` half from it. a
     // missing or malformed record is host wiring corruption, refused
     // deterministically rather than silently producing network-less links.
-    .with_chain_id(guest_adapter::genesis_chain_id(MODULE_ID)?);
+    .with_chain_id(ducktape_module_sdk::genesis_chain_id(MODULE_ID)?);
     if let Some((bytes, root)) = load_state() {
         module
             .install(&bytes, StateRoot(root))
@@ -148,12 +148,20 @@ fn to_wit_error(e: Error) -> host::Error {
 }
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// a whole-state port over host-KV keys (`__state`/`__root`/`__history`),
     /// bound to the network's chain id through its genesis config.
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             config: vec![sdk::genesis_config::CHAIN_ID.into()],
-            ..guest_adapter::map_shape()
+            ..ducktape_module_sdk::map_shape()
         }
     }
 
@@ -192,4 +200,4 @@ impl Guest for Component {
     }
 }
 
-guest_adapter::export_module!(Component);
+ducktape_module_sdk::export_module!(Component);

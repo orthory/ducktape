@@ -1,0 +1,8 @@
+[package]
+name = "module-artifact"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+borsh = { workspace = true }
+sha2 = { workspace = true }
