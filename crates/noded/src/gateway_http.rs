@@ -766,7 +766,6 @@ fn gateway_failure_response(failure: GatewayFailure) -> Response {
 #[serde(deny_unknown_fields)]
 struct WsTokenRequest {
     authority: String,
-    origin: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -775,12 +774,16 @@ struct WsTokenReply {
 }
 
 /// Mint a single-use WS side-door token. Called by the duck:// scheme handler
-/// when the page fetches its synthetic same-origin `/.duck/ws`; the handler
-/// passes the page's origin and its authority, which the node resolves to the
-/// bound route just as the content path does. Native/console-guarded like the
-/// other browser-gateway control routes.
+/// when the page fetches its synthetic same-origin `/.duck/ws`, naming the
+/// authority it wants a socket for. The bound origin is derived from the
+/// REQUEST, never the body: like `gateway_browser_proxy` on this same router,
+/// the caller must carry an `x-duck-authority` header, that header must match
+/// the `authority` being minted for, and any `Origin` header must be exactly
+/// `duck://<authority>` — a missing `x-duck-authority`, a mismatched one, or a
+/// mismatched (including missing) `Origin` all refuse the mint.
 async fn gateway_ws_token_mint(
     State(handle): State<NodeHandle>,
+    headers: HeaderMap,
     Json(request): Json<WsTokenRequest>,
 ) -> Response {
     let Some(browser_gateway) = handle.browser_gateway.clone() else {
@@ -789,8 +792,28 @@ async fn gateway_ws_token_mint(
             "gateway browsing is disabled",
         );
     };
-    if request.origin.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "origin is required");
+    let Some(header_authority) = headers
+        .get("x-duck-authority")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return error_response(StatusCode::MISDIRECTED_REQUEST, "missing duck authority");
+    };
+    if header_authority != request.authority {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "duck authority header does not match the requested authority",
+        );
+    }
+    let page_origin = format!("duck://{header_authority}");
+    let origin_matches = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|origin| origin == page_origin);
+    if !origin_matches {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "cross-origin websocket token mint denied",
+        );
     }
     let (account_id, name) = match resolve_duck_authority(&handle, &request.authority).await {
         Ok(resolved) => resolved,
@@ -798,7 +821,7 @@ async fn gateway_ws_token_mint(
     };
     let token = browser_gateway
         .ws_tokens
-        .mint(request.origin, account_id, name);
+        .mint(page_origin, account_id, name);
     Json(WsTokenReply { token }).into_response()
 }
 
