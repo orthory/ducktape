@@ -160,6 +160,13 @@ extern crate::backend
   pure refreshed_hub_selection(networks:[HubNetwork], current:str, preselect:str) -> str
   pure password_problem(password:&str, confirm:&str) -> str
   pure without_window(current:window-id?, closed:window-id) -> window-id?
+  // Whether the close that just unregistered a slot ends the process: true
+  // only off macOS, where no status item exists to live in, once no window
+  // is left.
+  pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool
+  // "Open Ducktape" as a discriminant: nothing tracked means there is nothing
+  // to raise, so the row must open a window instead of focusing a fresh id.
+  pure tray_open_action(console:window-id?, onboarding:window-id?) -> TrayOpen
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
   // THE RECOVERY-PHRASE CEREMONY, in two calls. `create_device_key` picks a
@@ -195,6 +202,16 @@ extern crate::backend
   pure escape_target(logical:key, tab:ShellTab, palette_open:bool, bell_open:bool, channel_create_open:bool, thread_message_action:MessageAction, message_action:MessageAction, channel_settings_open:bool, page_delete_armed:bool, fs_delete_target:str, forge_repo_menu:bool) -> str
   pure close_message_action(close:bool, current:MessageAction) -> MessageAction
   pure content_scroll_step(logical:key, modifiers:key-modifiers, overlay:str) -> f64
+  // The command modifier held, off the modifier stream: the cheap half that
+  // arms the quit route. It asks `command()` — the SAME modifier the chord
+  // below asks for — because a route armed on one modifier and a chord judged
+  // on another is a chord that never fires off a Mac.
+  pure command_held(modifiers:key-modifiers) -> bool
+  // WHICH command chord this press is, if any — the one answer, so ⌘Q and ⌘W
+  // are defined in one place instead of re-spelled per handler. Both key
+  // readings, like every other chord here: the logical key follows the layout,
+  // the physical one is what a non-QWERTY layout still calls Q and W.
+  pure command_chord(logical:key, physical:physical-key, modifiers:key-modifiers) -> CommandChord
   NavItem(id:ShellTab, title:str, icon:str, badge:i64, active:bool, live:bool)
   FsEntry(key:i64, path:str, name:str, kind:str, size:i64, object:str)
   FsSnapshot(id:str, short_id:str, author:str, height:i64, message:str)

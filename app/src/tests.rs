@@ -17,6 +17,7 @@ mod settings;
 mod shell;
 mod stream;
 mod threads;
+mod window_lifecycle;
 
 /// EVERY SCREEN BODY, as one string. These are the slot bodies that used to
 /// sit inline in `view.ice`; the sweeps below read the console's authored

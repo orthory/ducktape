@@ -30,6 +30,8 @@ view
           restore_empty=empty(restore_words)
           join_empty=empty(join_invite)
         events
+          drag_launch_window -> drag_launch_window
+          close_launch_window -> close_launch_window
           pick_wallet -> pick_wallet _
           unlock_submit -> unlock_submit _
           login_skip -> login_skip
