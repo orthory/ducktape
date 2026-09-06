@@ -1148,7 +1148,13 @@ pub async fn serve(listener: tokio::net::TcpListener, handle: NodeHandle) -> std
 }
 
 async fn ws(State(handle): State<NodeHandle>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| stream::stream_session(socket, handle))
+    // unauthenticated surface: cap the frame/message tungstenite otherwise
+    // defaults to 64 MiB, so a single frame cannot force a large buffer before
+    // any handler gets to look at it (see `stream::MAX_WS_MESSAGE_BYTES`).
+    upgrade
+        .max_message_size(stream::MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(stream::MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| stream::stream_session(socket, handle))
 }
 
 #[cfg(test)]

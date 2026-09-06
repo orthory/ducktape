@@ -36,6 +36,12 @@ pub const STREAM_CATCHUP_BUDGET: usize = 256;
 /// few run-output panes; far below this. beyond it, subscribes refuse
 /// per-topic.
 pub const MAX_TOPICS_PER_CONNECTION: usize = 64;
+/// the ws frame/message ceiling for `/v1/ws` — this surface is unauthenticated
+/// like the rest of the file, so tungstenite's 64 MiB default is 1000x more
+/// than any legitimate client message: a `Subscribe` at the topic cap above
+/// (64 names + a same-sized `resume` map) or one run-output publish
+/// ([`MAX_RUN_OUTPUT_LINE`], 16 KiB) both fit many times over inside this.
+pub const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
 /// rows a files:watch catch-up may SCAN (not just emit) per wakeup — a
 /// stage-heavy history is mostly non-commit rows, and an unbounded back-scan
 /// would stall the session task; past this the topic lags to live instead.
@@ -1801,6 +1807,23 @@ fn subscribe_topics(
     resume: &BTreeMap<String, String>,
     token: Option<&str>,
 ) -> Vec<ServerFrame> {
+    // No caller ever legitimately needs more names in ONE message than the
+    // connection may ever hold: at most `MAX_TOPICS_PER_CONNECTION` states
+    // exist, so a request past it is either a mistake or a fan-out attempt
+    // (a 64 MiB frame naming millions of names, each turned into its own
+    // refusal `ServerFrame` before this used to look at the cap at all). Stop
+    // BEFORE the per-topic loop runs — one frame, sized by the request, not
+    // by `requested.len()`.
+    if requested.len() > MAX_TOPICS_PER_CONNECTION {
+        let requested_count = requested.len();
+        return vec![unavailable(
+            "",
+            format!(
+                "subscribe named {requested_count} topics, over the \
+                 {MAX_TOPICS_PER_CONNECTION}-topic connection cap; split the request"
+            ),
+        )];
+    }
     let store = handle.stream_index();
     // ONE constant-time compare per frame, not per topic: the secret is
     // connection-wide, so this is both the cheapest place to spend it and the
@@ -3851,38 +3874,53 @@ mod tests {
     }
 
     #[test]
-    fn subscription_cap_refuses_new_topics_but_allows_recursoring() {
+    fn a_subscribe_at_the_cap_admits_all_and_still_allows_recursoring() {
         let handle = handle_with_secret();
         let mut states = BTreeMap::new();
-        let requested: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION + 1)
+        let at_cap: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION)
             .map(|i| format!("run-output:r{i}"))
             .collect();
         let frames = subscribe_topics(
             &handle,
             &mut states,
-            requested,
+            at_cap.clone(),
             &BTreeMap::new(),
             Some(TEST_SECRET),
         );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
-        let refused = frames
-            .iter()
-            .filter(|f| {
-                matches!(
-                    f,
-                    ServerFrame::Error {
-                        code: StreamErrorCode::Unavailable,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(refused, 1, "exactly the over-cap topic refuses");
-        // re-subscribing an EXISTING topic at the cap re-cursors, never refuses.
+        assert!(
+            frames.iter().all(|f| !matches!(f, ServerFrame::Error { .. })),
+            "every topic at exactly the cap must admit: {frames:?}"
+        );
+
+        // one more NEW topic on top of an already-full connection refuses the
+        // WHOLE message as one frame — never a per-topic fan-out — and leaves
+        // the held state untouched.
+        let mut over = at_cap.clone();
+        over.push("run-output:extra".into());
+        let refused = subscribe_topics(
+            &handle,
+            &mut states,
+            over,
+            &BTreeMap::new(),
+            Some(TEST_SECRET),
+        );
+        assert_eq!(refused.len(), 1, "one summary refusal, not one per topic");
+        assert!(matches!(
+            refused[0],
+            ServerFrame::Error {
+                code: StreamErrorCode::Unavailable,
+                ..
+            }
+        ));
+        assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
+
+        // re-subscribing exactly the EXISTING topics (at, not over, the cap)
+        // re-cursors, never refuses.
         let again = subscribe_topics(
             &handle,
             &mut states,
-            vec!["run-output:r0".into()],
+            at_cap,
             &BTreeMap::new(),
             Some(TEST_SECRET),
         );
@@ -3893,6 +3931,32 @@ mod tests {
             "re-subscribe at the cap must stay allowed: {again:?}"
         );
         assert_eq!(states.len(), MAX_TOPICS_PER_CONNECTION);
+    }
+
+    /// The amplification this fixes: a `Subscribe` naming far more topics than
+    /// the connection could ever hold used to walk the ENTIRE vector, pushing
+    /// one heap-allocating refusal frame per name (`stream.rs`, pre-fix). It
+    /// must now cost one frame regardless of how many names were sent.
+    #[test]
+    fn a_subscribe_far_over_the_topic_cap_never_fans_out_one_frame_per_topic() {
+        let handle = handle_with_secret();
+        let mut states = BTreeMap::new();
+        let huge: Vec<String> = (0..MAX_TOPICS_PER_CONNECTION + 10_000)
+            .map(|i| format!("bogus:{i}"))
+            .collect();
+        let frames = subscribe_topics(
+            &handle,
+            &mut states,
+            huge,
+            &BTreeMap::new(),
+            Some(TEST_SECRET),
+        );
+        assert_eq!(
+            frames.len(),
+            1,
+            "one refusal for the whole message, not one per requested topic"
+        );
+        assert!(states.is_empty());
     }
 
     #[test]

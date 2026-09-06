@@ -431,6 +431,26 @@ pub(crate) async fn index_ops(
 /// and stay untouched, and a caller that does not care never sees it.
 pub const FOLDED_HEADER: &str = "x-ducktape-folded";
 
+/// how many `POST /v1/index/{module}/view` calls may run their wasm query
+/// concurrently. The route is `Lane::Open` — any caller that can dial the
+/// HTTP port reaches it, no PoP or workspace secret required — and each call
+/// runs fluent31's `Db::query` SYNCHRONOUSLY against ~1e9 fuel
+/// (`fluent31::Options::wasm_fuel`, the only per-call budget fluent31
+/// exposes: no separate wall-clock/epoch deadline exists to set alongside
+/// it). `index_view` now runs the fold-tip-then-view pair on
+/// [`tokio::task::spawn_blocking`]'s own pool so it can no longer pin an
+/// axum worker outright, but that pool is still this same process's CPU —
+/// unbounded fan-in there would let N unauthenticated callers burn every
+/// core the process has, including bin/node's consensus thread. Must stay
+/// small: a value near or above the runtime's worker-thread count buys
+/// nothing over no cap at all.
+pub(crate) const MAX_CONCURRENT_INDEX_VIEWS: usize = 4;
+
+/// the refusal body when the concurrency gate above is already full — a
+/// stable, greppable token, not prose, so an operator can tell "the node is
+/// out of index-view slots" apart from every other 429 on this surface.
+const INDEX_VIEW_AT_CAPACITY: &str = "index view refused: reason=index_view_at_capacity";
+
 /// POST /v1/index/{module}/view — the module's materialized view, served by
 /// its registered mapper. request body and reply are module-defined json
 /// (chat: `{"search": {…}}` → `{"hits": […]}`), exactly as opaque to the
@@ -447,9 +467,17 @@ pub(crate) async fn index_view(
     Path(module): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Response {
-    let Some(store) = index_store(&handle) else {
+    let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
+    // `try_acquire_owned` refuses immediately once the gate is full — an
+    // unauthenticated caller's Nth request never queues behind the first
+    // `MAX_CONCURRENT_INDEX_VIEWS`, it just 429s.
+    let Ok(_permit) = handle.index_view_gate.clone().try_acquire_owned() else {
+        return error_response(StatusCode::TOO_MANY_REQUESTS, INDEX_VIEW_AT_CAPACITY);
+    };
+    let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
+    let query_module = module.clone();
     // BEFORE the view, deliberately: the two reads take two MVCC snapshots, and
     // the order decides which way the mismatch falls. read first and the tip
     // can only be OLDER than the rows served — the caller waits one more round
@@ -463,9 +491,23 @@ pub(crate) async fn index_view(
     // stale but consistent. failing the whole read because one bookkeeping key
     // would not load empties the caller's sidebar over nothing. an unknown
     // module still 404s: `store.view` below answers that.
-    let folded = store.fold_tip(&module).ok().flatten();
-    let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
-    let mut response = match store.view(&module, &req_bytes) {
+    //
+    // both reads run off the axum worker on `spawn_blocking`'s pool: fluent31's
+    // `query` is synchronous wasm with no `.await` inside it, so awaiting it
+    // directly here would hold this task's worker thread for the whole call.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let folded = store.fold_tip(&query_module).ok().flatten();
+        let view = store.view(&query_module, &req_bytes);
+        (folded, view)
+    })
+    .await;
+    let (folded, view) = match outcome {
+        Ok(pair) => pair,
+        Err(_) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "index view task panicked");
+        }
+    };
+    let mut response = match view {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => Json(value).into_response(),
             Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
@@ -617,5 +659,49 @@ mod tests {
             !body[tip..view].contains("return"),
             "an unreadable fold watermark must not refuse the view"
         );
+    }
+
+    /// #1717: once `MAX_CONCURRENT_INDEX_VIEWS` callers are already "running"
+    /// (holding a permit, as the wasm query would while it runs), the NEXT
+    /// `index_view` call refuses with 429 rather than queuing behind them —
+    /// this is the whole point of `try_acquire_owned` over `acquire_owned`.
+    #[tokio::test]
+    async fn index_view_refuses_once_the_concurrency_gate_is_full() {
+        let dir = tempfile::TempDir::new().expect("temp index dir");
+        let modules = vec![indexer::IndexModule::bare("chat")];
+        let store = std::sync::Arc::new(
+            indexer::IndexStore::open(dir.path(), &modules).expect("open index"),
+        );
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_index_store(store);
+
+        // saturate the gate exactly as N concurrent in-flight views would.
+        let held: Vec<_> = (0..super::MAX_CONCURRENT_INDEX_VIEWS)
+            .map(|_| {
+                handle
+                    .index_view_gate
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate starts with MAX_CONCURRENT_INDEX_VIEWS permits")
+            })
+            .collect();
+
+        let refused = super::index_view(
+            axum::extract::State(handle.clone()),
+            axum::extract::Path("chat".to_string()),
+            axum::Json(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(refused.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+
+        // releasing a permit reopens the gate for the next caller.
+        drop(held);
+        let admitted = super::index_view(
+            axum::extract::State(handle),
+            axum::extract::Path("chat".to_string()),
+            axum::Json(serde_json::json!({})),
+        )
+        .await;
+        assert_ne!(admitted.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 }
