@@ -17,7 +17,12 @@ use crate::drain_actions::{
     CutoverTrigger, EpochActions, capture_breakdown, checkpoint_due, cooldown_until,
 };
 use crate::host_reads::{read_valset_members, read_valset_mesh_window, read_valset_residents};
-use crate::util::{fatal, hex, participant_bytes, resident_bytes};
+use crate::util::{Presence, fatal, hex, participant_bytes, resident_bytes};
+
+/// One warning when the workspace mark goes missing, then one per this many
+/// further checks (`WORKSPACE_CHECK_INTERVAL` apart) for a filesystem that
+/// never accepts the rewrite.
+const MARK_LOST_WARN_EVERY: u64 = 600;
 use crate::validator::code_announce::CodeVerdict;
 use crate::{join_gate, relay};
 use noded::projection::{BlockProjection, project_block};
@@ -56,13 +61,44 @@ impl ValidatorRuntime<'_> {
         let Some(mark) = self.workspace_mark else {
             return;
         };
-        if mark.still_at(&self.workspace) {
+        match mark.presence(&self.workspace) {
+            Presence::Intact => self.workspace_mark_lost_checks = 0,
+            Presence::MarkLost => self.report_lost_workspace_mark(),
+            Presence::Vanished => fatal!(
+                self.label,
+                reason = "storage_vanished",
+                "the workspace directory {} was deleted underneath this node — halting without a checkpoint",
+                self.workspace.display()
+            ),
+        }
+    }
+
+    /// The workspace is the one we booted on, but its mark file is gone or
+    /// short. Never fatal: put the token back, and say so — paced, because a
+    /// filesystem that refuses the write refuses it again every second, and an
+    /// unconditional warn in a forever-retry loop evicts the ring it is
+    /// supposed to explain.
+    fn report_lost_workspace_mark(&mut self) {
+        let Some(mark) = self.workspace_mark else {
+            return;
+        };
+        self.workspace_mark_lost_checks += 1;
+        let attempts = self.workspace_mark_lost_checks;
+        let restored = mark.restore(&self.workspace);
+        let speak = attempts == 1 || attempts.is_multiple_of(MARK_LOST_WARN_EVERY);
+        if !speak {
             return;
         }
-        fatal!(
-            self.label,
-            reason = "storage_vanished",
-            "the workspace directory {} was deleted underneath this node — halting without a checkpoint",
+        let reason = match restored {
+            true => "workspace_mark_restored",
+            false => "workspace_mark_unwritable",
+        };
+        tracing::warn!(
+            target: "ducktape::node",
+            node = %self.label,
+            reason,
+            attempts,
+            "the workspace mark under {} is missing — the directory is still the one this node booted on, so this is not a deletion",
             self.workspace.display()
         );
     }
@@ -122,6 +158,14 @@ impl ValidatorRuntime<'_> {
         // restarts the node, which then re-joins via state sync.
         let drained_count = match node.drain_delivered().await {
             Ok(n) => n,
+            // STALLED, not faulted: the block at that height designates module
+            // code this node cannot resolve yet. the frame is still at the
+            // front of the drain queue and the blocks ahead of it settled — so
+            // keep the tick, keep the state, and let the next drain retry
+            // (which is what re-runs the fetch). halting here would stop a
+            // chain that was only waiting for bytes; the node narrates the
+            // stall with its attempt count.
+            Err(node::Error::CodeStalled { applied, .. }) => applied,
             Err(e) => {
                 fatal!(label, "{e} — halting");
             }
@@ -160,6 +204,14 @@ impl ValidatorRuntime<'_> {
             false => noded::BlockWake::TipOnly,
         };
         for projection in projections {
+            // NOTHING SEALED AT THIS HEIGHT — every frame in the batch was
+            // discarded by the cutover ceiling. There is no block here to
+            // project, and folding one would advance every module's watermark
+            // onto a height the NEW epoch is about to use (see
+            // `BlockProjection::sealed`).
+            if !projection.sealed() {
+                continue;
+            }
             let BlockProjection {
                 height,
                 dispatches,
@@ -265,7 +317,7 @@ impl ValidatorRuntime<'_> {
                     let window = read_valset_mesh_window(node.host()).await;
                     mesh_window.track_new(mesh_oracle, mesh_book, &window);
                 }
-                super::settle_gate(gate_outcomes, gate.joiner, reply);
+                super::settle_gate(gate_outcomes, gate.joiner, reply, context.current());
                 continue;
             }
             // resolve a relayed hold FIRST: a relayed frame has no
@@ -421,10 +473,25 @@ impl ValidatorRuntime<'_> {
                                 .into(),
                             terminal: false,
                         },
+                        now,
                     );
                 }
             }
         }
+        // sweep gate outcomes settled more than a join window ago — on the
+        // SAME beat as the held-gate expiry just above, no new timer. keyed
+        // on `INVITE_JOIN_WINDOW_MS` (the same clock the invite-peer tunnel
+        // table itself ages uncovered entries out by, `merge_invite_layer` in
+        // netstack-machine): a joiner has that long to retransmit before its
+        // outcome — `Admitted` included — is dead weight. Expiring `Admitted`
+        // is safe: a joiner that reappears later just re-runs the gate, and
+        // `on_gate_forward`'s V9 arm answers Admitted again for free (a
+        // committed-state read, no consensus round).
+        crate::reachability_plane::sweep_gate_outcomes(
+            &mut gate_outcomes.lock().expect("gate outcomes lock"),
+            context.current(),
+            std::time::Duration::from_millis(reachability::INVITE_JOIN_WINDOW_MS),
+        );
         // publish each newly-applied boundary to ws subscribers
         // (send only errs when nobody is subscribed — fine). the
         // drain loop above already folded each block into the
@@ -479,140 +546,6 @@ impl ValidatorRuntime<'_> {
                     ),
                 }
             }
-        }
-
-        // periodic checkpoint: snapshot the in-memory cohort and
-        // prune the op journal below the PREVIOUS checkpoint once
-        // the persisted floor has passed it (pruned frames must
-        // never be needed to resolve a re-reported finalization).
-        // A BLOCK COUNT ALONE CANNOT EXPRESS WHAT A CHECKPOINT COSTS. 32 blocks
-        // is ~30 s of chain, and one capture measured 59–70 s on a real
-        // workspace (#1018) — so the trigger fired again before the previous
-        // one had finished paying for itself, and the node spent two thirds of
-        // its life in this branch, unable to poll any other arm of the loop.
-        // The cadence is therefore gated on BOTH: enough blocks, and enough
-        // recovery time since the last attempt to keep the loop's occupancy
-        // under one part in `CHECKPOINT_DUTY_LIMIT`.
-        // ...and on the state having MOVED. The sealed boundary's root-hash is
-        // free here (the drain already stamped it), so an idle chain's nop
-        // blocks no longer buy a full re-encode of the same manifest every 32
-        // blocks — see `checkpoint_due` and `IDLE_CHECKPOINT_BLOCKS`.
-        if let Some(f) = node.finalized()
-            && checkpoint_due(
-                *blocks_since_checkpoint,
-                checkpoint_blocks,
-                context.current(),
-                *checkpoint_not_before,
-                f.root_hash,
-                *last_written_root,
-            )
-        {
-            // EVERY STAGE BELOW RUNS ON THE SELECT LOOP, so its duration is
-            // time the `http_ingress` arm is not polled and `/v1/query` is
-            // unserviced (issue #1018). The stage timings ARE the diagnosis,
-            // so they ride the checkpoint event itself rather than needing a
-            // profiler on a box where the stall only shows under real state.
-            let pos = node.sink_mut().oplog_pos().await;
-            let checkpoint_started = context.current();
-            // the capture reads the LOOP's clock per module (the host and the
-            // recovery crate own none) so a slow capture names its module
-            // instead of leaving `capture_ms` to be attributed by guesswork.
-            let captured = Manifest::capture_timed(
-                node.host(),
-                Some(f.height),
-                orchestrator.epoch(),
-                orchestrator.epoch_base(),
-                participant_bytes(orchestrator),
-                resident_bytes(orchestrator),
-                orchestrator.pending_cutover().map(|c| c.cutover_view()),
-                pos,
-                *next_seq,
-                || {
-                    context
-                        .current()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                },
-            );
-            let captured_at = context.current();
-            match captured {
-                Ok((m, capture_cost)) => match node.sink_mut().write_manifest(&m).await {
-                    Ok(()) => {
-                        let written_at = context.current();
-                        *blocks_since_checkpoint = 0;
-                        *last_written_root = Some(m.root_hash);
-                        let floor_passed = matches!(
-                            node.sink_mut().floor_cert(),
-                            Ok(Some(fc))
-                                if prev_ckpt.0.is_none_or(|h| fc.height >= h)
-                        );
-                        let lease_active = crate::sync::serve::sync_lease_active(sync_lease);
-                        if floor_passed && lease_active {
-                            // a syncer is actively pulling from this node:
-                            // pruning now would yank its boundary away and put
-                            // it on the rebootstrap treadmill. defer — the
-                            // next checkpoint prunes once the lease lapses.
-                            tracing::debug!(
-                                target: "ducktape::statesync",
-                                node = %label,
-                                reason = "sync_lease_active",
-                                "oplog prune deferred"
-                            );
-                        } else if floor_passed
-                            && let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await
-                        {
-                            tracing::warn!(
-                                target: "ducktape::recovery",
-                                node = %label,
-                                error = %e,
-                                "oplog prune failed"
-                            );
-                        }
-                        *prev_ckpt = (m.height, pos);
-                        let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
-                            b.duration_since(a).unwrap_or_default().as_millis()
-                        };
-                        let done_at = context.current();
-                        tracing::info!(
-                            target: "ducktape::recovery",
-                            event = "node_checkpoint_written",
-                            node = %label,
-                            height = m.height.unwrap_or_default(),
-                            capture_ms = since(checkpoint_started, captured_at),
-                            write_ms = since(captured_at, written_at),
-                            prune_ms = since(written_at, done_at),
-                            capture_modules = %capture_breakdown(&capture_cost)
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            event = "node_checkpoint_failed",
-                            node = %label,
-                            stage = "write",
-                            error = %e
-                        );
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(
-                        target: "ducktape::recovery",
-                        event = "node_checkpoint_failed",
-                        node = %label,
-                        stage = "capture",
-                        error = %e
-                    );
-                }
-            }
-            // SET OUTSIDE THE MATCH, ON PURPOSE. A capture that FAILS costs the
-            // loop everything a successful one does, and the failure path does
-            // not reset `blocks_since_checkpoint` — so without this the retry
-            // is immediate and the node re-pays the full cost on every drain
-            // tick, forever. The cooldown is what makes the failure survivable.
-            let attempt = context
-                .current()
-                .duration_since(checkpoint_started)
-                .unwrap_or_default();
-            *checkpoint_not_before = cooldown_until(context.current(), attempt);
         }
 
         // the VALSET ORCHESTRATION step: observe the finalized
@@ -813,7 +746,10 @@ impl ValidatorRuntime<'_> {
                     None,
                     pos,
                     *next_seq,
-                );
+                )
+                // the replay guard rides every checkpoint (see
+                // `recovery::Manifest::applied_frames`).
+                .map(|m| m.with_replay_window(node.replay_window()));
                 let post_cutover_started = context.current();
                 match captured {
                     Ok(m) => match node.sink_mut().write_manifest(&m).await {
@@ -859,6 +795,166 @@ impl ValidatorRuntime<'_> {
                     members.len()
                 );
             }
+        }
+
+        // periodic checkpoint: AFTER the orchestration step, and that order is
+        // correctness, not tidiness. The manifest records
+        // `pending_cutover_view` off the orchestrator, and a valset change
+        // drained in THIS pass arms the cutover in `observe_members` above —
+        // so a checkpoint written before it lands on the changing block's own
+        // height carrying `None`. On restart `derive_pending_boot` then has
+        // nothing to re-arm from either (its fallback scans only blocks ABOVE
+        // the manifest height, seeded with the already-changed valset root),
+        // no view ceiling is set, and the node applies the very views its
+        // peers discarded and cuts over one view late — a silent fork. The
+        // observation barrier makes that alignment exact, not unlikely: the
+        // drain breaks right after the batch that moved the valset root.
+        //
+        // Nothing here is owed to the cutover pass: the respawn branch above
+        // writes its own unconditional post-cutover manifest and zeroes
+        // `blocks_since_checkpoint`, so this branch simply does not fire on
+        // that pass.
+        //
+        // It also snapshots the in-memory cohort and
+        // prunes the op journal below the PREVIOUS checkpoint once
+        // the persisted floor has passed it (pruned frames must
+        // never be needed to resolve a re-reported finalization).
+        // A BLOCK COUNT ALONE CANNOT EXPRESS WHAT A CHECKPOINT COSTS. 32 blocks
+        // is ~30 s of chain, and one capture measured 59–70 s on a real
+        // workspace (#1018) — so the trigger fired again before the previous
+        // one had finished paying for itself, and the node spent two thirds of
+        // its life in this branch, unable to poll any other arm of the loop.
+        // The cadence is therefore gated on BOTH: enough blocks, and enough
+        // recovery time since the last attempt to keep the loop's occupancy
+        // under one part in `CHECKPOINT_DUTY_LIMIT`.
+        // ...and on the state having MOVED. The sealed boundary's root-hash is
+        // free here (the drain already stamped it), so an idle chain's nop
+        // blocks no longer buy a full re-encode of the same manifest every 32
+        // blocks — see `checkpoint_due` and `IDLE_CHECKPOINT_BLOCKS`.
+        if let Some(f) = node.finalized()
+            && checkpoint_due(
+                *blocks_since_checkpoint,
+                checkpoint_blocks,
+                context.current(),
+                *checkpoint_not_before,
+                f.root_hash,
+                *last_written_root,
+            )
+        {
+            // EVERY STAGE BELOW RUNS ON THE SELECT LOOP, so its duration is
+            // time the `http_ingress` arm is not polled and `/v1/query` is
+            // unserviced (issue #1018). The stage timings ARE the diagnosis,
+            // so they ride the checkpoint event itself rather than needing a
+            // profiler on a box where the stall only shows under real state.
+            let pos = node.sink_mut().oplog_pos().await;
+            let checkpoint_started = context.current();
+            // the capture reads the LOOP's clock per module (the host and the
+            // recovery crate own none) so a slow capture names its module
+            // instead of leaving `capture_ms` to be attributed by guesswork.
+            let captured = Manifest::capture_timed(
+                node.host(),
+                Some(f.height),
+                orchestrator.epoch(),
+                orchestrator.epoch_base(),
+                participant_bytes(orchestrator),
+                resident_bytes(orchestrator),
+                orchestrator.pending_cutover().map(|c| c.cutover_view()),
+                pos,
+                *next_seq,
+                // the root `f.height` SEALED. the host can be AHEAD of it (a
+                // code-swap realization that stalls before applying a block
+                // still moved the registry), and a manifest labelled with this
+                // height but carrying that root is one recovery fatals on.
+                Some(f.root_hash),
+                || {
+                    context
+                        .current()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                },
+            )
+            // the replay guard rides every checkpoint (see
+            // `recovery::Manifest::applied_frames`).
+            .map(|(m, cost)| (m.with_replay_window(node.replay_window()), cost));
+            let captured_at = context.current();
+            match captured {
+                Ok((m, capture_cost)) => match node.sink_mut().write_manifest(&m).await {
+                    Ok(()) => {
+                        let written_at = context.current();
+                        *blocks_since_checkpoint = 0;
+                        *last_written_root = Some(m.root_hash);
+                        let floor_passed = matches!(
+                            node.sink_mut().floor_cert(),
+                            Ok(Some(fc))
+                                if prev_ckpt.0.is_none_or(|h| fc.height >= h)
+                        );
+                        let lease_active = crate::sync::serve::sync_lease_active(sync_lease);
+                        if floor_passed && lease_active {
+                            // a syncer is actively pulling from this node:
+                            // pruning now would yank its boundary away and put
+                            // it on the rebootstrap treadmill. defer — the
+                            // next checkpoint prunes once the lease lapses.
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                node = %label,
+                                reason = "sync_lease_active",
+                                "oplog prune deferred"
+                            );
+                        } else if floor_passed
+                            && let Err(e) = node.sink_mut().prune_oplog(prev_ckpt.1).await
+                        {
+                            tracing::warn!(
+                                target: "ducktape::recovery",
+                                node = %label,
+                                error = %e,
+                                "oplog prune failed"
+                            );
+                        }
+                        *prev_ckpt = (m.height, pos);
+                        let since = |a: std::time::SystemTime, b: std::time::SystemTime| {
+                            b.duration_since(a).unwrap_or_default().as_millis()
+                        };
+                        let done_at = context.current();
+                        tracing::info!(
+                            target: "ducktape::recovery",
+                            event = "node_checkpoint_written",
+                            node = %label,
+                            height = m.height.unwrap_or_default(),
+                            capture_ms = since(checkpoint_started, captured_at),
+                            write_ms = since(captured_at, written_at),
+                            prune_ms = since(written_at, done_at),
+                            capture_modules = %capture_breakdown(&capture_cost)
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            event = "node_checkpoint_failed",
+                            node = %label,
+                            stage = "write",
+                            error = %e
+                        );
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        target: "ducktape::recovery",
+                        event = "node_checkpoint_failed",
+                        node = %label,
+                        stage = "capture",
+                        error = %e
+                    );
+                }
+            }
+            // SET OUTSIDE THE MATCH, ON PURPOSE. A capture that FAILS costs the
+            // loop everything a successful one does, and the failure path does
+            // not reset `blocks_since_checkpoint` — so without this the retry
+            // is immediate and the node re-pays the full cost on every drain
+            // tick, forever. The cooldown is what makes the failure survivable.
+            let attempt = context
+                .current()
+                .duration_since(checkpoint_started)
+                .unwrap_or_default();
+            *checkpoint_not_before = cooldown_until(context.current(), attempt);
         }
 
         // the state-driven pumps, each its own method below: block
@@ -1193,10 +1289,34 @@ impl ValidatorRuntime<'_> {
             fetch_done_rx,
             ..
         } = self;
-        // reap finished fetch tasks first, so a failed fetch retries.
-        while let Ok(digest) = fetch_done_rx.try_recv() {
-            code_signaller.fetching.remove(&digest);
+        // reap finished fetch tasks first, so a failed fetch retries — on a
+        // BACKOFF, and speaking only on the first failure and every Nth after
+        // it. Nobody serving these bytes is the steady state, not a blip: the
+        // peer book may be empty (refused synchronously) and the module never
+        // clears a pending swap, so an unpaced retry+warn here is a permanent
+        // ~10/s log bomb that evicts the ring an operator restarted to read.
+        // The warn lives HERE rather than in the task because this is where
+        // the attempt counter — the actual diagnosis — is.
+        while let Ok((digest, failure)) = fetch_done_rx.try_recv() {
+            let Some(error) = failure else {
+                code_signaller.fetch_succeeded(&digest);
+                continue;
+            };
+            let attempt = code_signaller.fetch_failed(&digest);
+            if !attempt.speak {
+                continue;
+            }
+            tracing::warn!(
+                target: "ducktape::modules",
+                node = %label,
+                reason = "code_fetch_unserved",
+                digest = %crate::config::hex_bytes(&digest),
+                attempts = attempt.attempts,
+                error = %error,
+                "pending-swap code fetch failed"
+            );
         }
+        code_signaller.tick_fetch_backoff();
         if !orchestrator
             .current_members()
             .contains(&signer.public_key())
@@ -1207,8 +1327,7 @@ impl ValidatorRuntime<'_> {
         let Ok(bytes) = node.host().query(host::MODULES_ID, &req).await else {
             return; // registry absent: byte-identical drain on a baseline net.
         };
-        let Ok(modules::ModulesReply::ModuleStatus { modules }) =
-            modules::decode_reply(&bytes)
+        let Ok(modules::ModulesReply::ModuleStatus { modules }) = modules::decode_reply(&bytes)
         else {
             return;
         };
@@ -1229,7 +1348,8 @@ impl ValidatorRuntime<'_> {
         // per pending swap per boot — `decide` latches the verdict, loadable
         // and unloadable alike — and every validator pays it at the same
         // moment, right after the swap commits.
-        let actions = code_signaller.decide(&modules, |module_id, digest| {
+        let height = node.finalized().map_or(0, |f| f.height);
+        let actions = code_signaller.decide(height, &modules, |module_id, digest| {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
@@ -1250,8 +1370,8 @@ impl ValidatorRuntime<'_> {
             tracing::warn!(
                 target: "ducktape::modules",
                 node = %label,
-                module = %key.0,
-                swap = key.1,
+                module = %key.module_id,
+                swap = key.name,
                 reason = "code_not_loadable",
                 detail = %detail,
                 "pending-swap code refused: this binary cannot instantiate it, so \
@@ -1262,9 +1382,10 @@ impl ValidatorRuntime<'_> {
             let client = blob_client.clone();
             let blobs = blobs.clone();
             let done = fetch_done_tx.clone();
-            let label = label.clone();
             tokio::spawn(async move {
-                if let Err(e) = crate::blob_fetch::fetch_blob(
+                // the OUTCOME goes back to the pump, which owns the attempt
+                // counter, the backoff and the (latched) warning.
+                let failure = crate::blob_fetch::fetch_blob(
                     &client,
                     &blobs,
                     &digest,
@@ -1272,16 +1393,8 @@ impl ValidatorRuntime<'_> {
                     crate::constants::BLOB_FETCH_ATTEMPTS,
                 )
                 .await
-                {
-                    tracing::warn!(
-                        target: "ducktape::modules",
-                        node = %label,
-                        digest = %crate::config::hex_bytes(&digest),
-                        error = %e,
-                        "pending-swap code fetch failed"
-                    );
-                }
-                let _ = done.send(digest);
+                .err();
+                let _ = done.send((digest, failure));
             });
         }
         for (key, msg) in actions.signals {
@@ -1291,8 +1404,8 @@ impl ValidatorRuntime<'_> {
                 Ok(_) => tracing::info!(
                     target: "ducktape::modules",
                     node = %label,
-                    module = %key.0,
-                    swap = key.1,
+                    module = %key.module_id,
+                    swap = key.name,
                     "code-ready signaled"
                 ),
                 Err(e) => {
@@ -1721,5 +1834,36 @@ mod block_cadence_tests {
                 }
             }
         }
+    }
+}
+
+/// The one ordering in `drain_pass` that is correctness rather than taste,
+/// guarded at the source.
+#[cfg(test)]
+mod drain_order_lint {
+    /// A CHECKPOINT MUST NOT BE CAPTURED BEFORE THE PASS HAS OBSERVED THE
+    /// MEMBERSHIP IT IS RECORDING. `Manifest::capture_timed` writes
+    /// `pending_cutover_view` off the orchestrator, and a valset change drained
+    /// in this pass arms that cutover in `observe_members`. Captured first, a
+    /// checkpoint landing on the changing block's own height records `None`,
+    /// and the boot-time re-arm scan cannot see the change either (it reads
+    /// only blocks above the manifest height, seeded with the already-changed
+    /// valset root) — so the restart arms no ceiling, applies the views its
+    /// peers discarded, and cuts over one view late into a silent fork.
+    #[test]
+    fn the_periodic_checkpoint_is_captured_after_the_membership_observation() {
+        let src = include_str!("drain.rs");
+        let observed = src
+            .find("actions.observe_members()")
+            .expect("the drain observes membership");
+        let captured = src
+            .find("Manifest::capture_timed")
+            .expect("the drain captures a periodic checkpoint");
+        assert!(
+            observed < captured,
+            "the periodic checkpoint must be captured AFTER the valset \
+             orchestration step, or a checkpoint on a valset-changing block \
+             loses the cutover it armed"
+        );
     }
 }

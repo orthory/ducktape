@@ -102,11 +102,29 @@ fn ed(seed: u64) -> Ed {
 fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
+/// every consent in this file admits into account 1 (founder A's), and dies
+/// well past the handful of heights driven here — `consensus_time` is
+/// `1_000 + height`.
+const ACCOUNT_A: u64 = 1;
+const EXPIRES: u64 = 100_000;
+
 /// an ed25519 member's consent to admit `new_key` (of `scheme`) at `gen`.
 fn ed_consent(member: &Ed, scheme: KeyScheme, new_key: &[u8], generation: u64) -> Authorizer {
-    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation);
+    ed_consent_for(member, scheme, new_key, generation, ACCOUNT_A)
+}
+
+fn ed_consent_for(
+    member: &Ed,
+    scheme: KeyScheme,
+    new_key: &[u8],
+    generation: u64,
+    account: u64,
+) -> Authorizer {
+    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation, account, EXPIRES);
     Authorizer {
         key: ed_pub(member),
+        account,
+        expires_at: EXPIRES,
         proof: keyscheme::testkit::ed25519_proof(member, IDENTITY_ADD_KEY_NS, &preimage),
     }
 }
@@ -128,9 +146,11 @@ fn wa_consent(
     new_key: &[u8],
     generation: u64,
 ) -> Authorizer {
-    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation);
+    let preimage = add_key_preimage(CHAIN_ID, scheme, new_key, generation, ACCOUNT_A, EXPIRES);
     Authorizer {
         key: wa_pub(member),
+        account: ACCOUNT_A,
+        expires_at: EXPIRES,
         proof: keyscheme::testkit::passkey_proof(
             member,
             RP_ID,
@@ -395,15 +415,17 @@ async fn same_ops_inner(context: &deterministic::Context) {
     )
     .await;
 
-    // h6: a non-founding member (the device) evicts the joiner — membership,
-    // not founding, is the authority; the joiner's generation stays at 1.
+    // h6: a non-founding member (the passkey, admitted at h4) evicts the
+    // device it admitted at h5 — membership, not founding, is the authority,
+    // and a key only drops one admitted no earlier than itself. the device's
+    // generation stays at 1.
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         6,
-        Origin::External(ed_pub(&w.device)),
-        remove_key(&ed_pub(&w.joiner)),
+        Origin::External(wa_pub(&w.passkey)),
+        remove_key(&ed_pub(&w.device)),
         true,
     )
     .await;
@@ -422,7 +444,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
     .await;
 
     // decoded spot check on the wasm side: the surviving association is the
-    // founder + the passkey + the device, the name trimmed, the joiner
+    // founder + the passkey + the joiner, the name trimmed, the device
     // unlinked at generation 1.
     let reply = wasm
         .query("identity", &encode_query(&IdentityQuery::Get { number: 1 }))
@@ -435,7 +457,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
     };
     assert_eq!(acc.number, 1);
     assert_eq!(acc.name, "Kim");
-    let mut survivors = vec![ed_pub(&w.founder_a), ed_pub(&w.device), wa_pub(&w.passkey)];
+    let mut survivors = vec![ed_pub(&w.founder_a), ed_pub(&w.joiner), wa_pub(&w.passkey)];
     survivors.sort();
     let keys: Vec<Vec<u8>> = acc.keys.iter().map(|k| k.pubkey.clone()).collect();
     assert_eq!(keys, survivors, "ascending by public key");
@@ -443,11 +465,11 @@ async fn same_ops_inner(context: &deterministic::Context) {
         .query(
             "identity",
             &encode_query(&IdentityQuery::OfKey {
-                key: ed_pub(&w.joiner),
+                key: ed_pub(&w.device),
             }),
         )
         .await
-        .expect("of_key joiner");
+        .expect("of_key device");
     assert_eq!(
         identity::decode_reply(&reply).expect("decode"),
         identity::IdentityReply::Account(None)
@@ -456,11 +478,11 @@ async fn same_ops_inner(context: &deterministic::Context) {
         .query(
             "identity",
             &encode_query(&IdentityQuery::KeyGen {
-                key: ed_pub(&w.joiner),
+                key: ed_pub(&w.device),
             }),
         )
         .await
-        .expect("key_gen joiner");
+        .expect("key_gen device");
     assert_eq!(
         identity::decode_reply(&reply).expect("decode"),
         identity::IdentityReply::Gen(1),
@@ -549,6 +571,17 @@ async fn rejections_inner(context: &deterministic::Context) {
                 ed_consent(&w.founder_a, KeyScheme::Secp256r1, &ed_pub(&unfounded), 0),
             ),
             "consent does not verify",
+        ),
+        // a consent naming an account its author is not on: the account is
+        // signature-covered, so naming another one is not a shortcut either.
+        (
+            Origin::External(ed_pub(&unfounded)),
+            add_key(
+                KeyScheme::Ed25519,
+                None,
+                ed_consent_for(&w.founder_a, KeyScheme::Ed25519, &ed_pub(&unfounded), 0, 2),
+            ),
+            "consent names account 2",
         ),
         // an authorizer on no account has nothing to admit into.
         (

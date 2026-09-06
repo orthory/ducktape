@@ -89,6 +89,22 @@ mod text_ranges;
 
 use error::{PageError, to_page_err};
 
+/// derive an author from the dispatch origin — shared by the comment ops and
+/// the page/block ops (mirrors chat). the pre-consensus default
+/// `Origin::External(vec![])` must never pass as a real user.
+pub(crate) fn author_from_origin(origin: &Origin) -> Result<AuthorRef, PageError> {
+    match origin {
+        Origin::External(bytes) if bytes.is_empty() => Err(PageError::EmptyOrigin),
+        Origin::External(bytes) if bytes.len() > MAX_COMMENT_AUTHOR_BYTES => {
+            Err(PageError::AuthorTooLarge)
+        }
+        Origin::External(bytes) => Ok(AuthorRef::User(bytes.clone())),
+        Origin::Module(id) if id.len() > MAX_COMMENT_AUTHOR_BYTES => Err(PageError::AuthorTooLarge),
+        Origin::Module(id) => Ok(AuthorRef::Module(id.to_string())),
+        Origin::System => Ok(AuthorRef::System),
+    }
+}
+
 /// write-time cap on ONE serialized block record (and on the enumeration
 /// index value — both stage through the same guard). the concrete store's
 /// codec bounds a stored value at 1 MiB AT DECODE TIME only (see
@@ -112,6 +128,29 @@ pub const MAX_PAGE_TITLE_LEN: usize = 512;
 /// This keeps every valid preorder cursor page comfortably below the wasm
 /// host's store-read ceiling while leaving far more nesting than the UI uses.
 pub const MAX_PAGE_DEPTH: usize = 64;
+
+/// client-minted id length cap (consensus constant) for a page id
+/// (`CreatePage`) or any block id (`InsertBlock`) — the same wedge class the
+/// comment ids guard against (see `id_is_index_safe`, interface.rs), but for
+/// the page-enumeration index instead of a comment thread/target index. a
+/// page id ALSO becomes an index entry, so without this cap a handful of
+/// oversized ids reach [`MAX_BLOCK_LEN`] and abort `CreatePage`/`InsertBlock`
+/// for every account, forever (nothing else can shrink the index).
+pub const MAX_PAGE_ID_BYTES: usize = 128;
+/// same cap, applied to every `InsertBlock` id (page-creating or not): a
+/// non-page block id never enters the index, but it is still a client-minted
+/// key stored forever, so it gets the same bound as a page id.
+pub const MAX_BLOCK_ID_BYTES: usize = MAX_PAGE_ID_BYTES;
+
+/// hard cap on the number of pages the enumeration index may ever hold.
+/// `index_add` re-serializes the WHOLE index on every insert (store.rs), so
+/// this bounds its worst case: each entry serializes as `"id":"parent",`
+/// with both id and parent at most [`MAX_PAGE_ID_BYTES`] (128) bytes, i.e. at
+/// most 1+128+1 + 1 + 1+128+1 + 1 = 262 bytes; `MAX_PAGES` (2048) × 262 B ≈
+/// 524 KiB, comfortably under [`MAX_BLOCK_LEN`] (768 KiB). global rather than
+/// per-author: it is the smaller diff, and it is what actually bounds the
+/// shared index's size regardless of how many distinct accounts contribute.
+pub const MAX_PAGES: usize = 2048;
 
 /// the reserved logical key under which the page-enumeration INDEX rides in
 /// the same store. its value is a serialized sorted map from every page block

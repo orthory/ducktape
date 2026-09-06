@@ -64,6 +64,9 @@ mod compute;
 mod config;
 mod constants;
 mod cred_cli;
+// the enclave-operator verbs (`user cred inspect|seal`) — real TEE quote
+// verification behind the opt-in `verify` feature. The verbs and their flags
+// exist in every build; without the feature they refuse at dispatch.
 mod cred_seal;
 mod drain_actions;
 mod executors;
@@ -82,6 +85,7 @@ mod mcp;
 mod mesh_book;
 mod mesh_window;
 mod module_cli;
+mod netstack_governance;
 mod node_http;
 mod overlay_book;
 mod plane_metrics;
@@ -531,6 +535,7 @@ fn run_node(
         gateway_commands,
         terminals,
         session_requests,
+        remote_sessions,
         local_gateway_via,
         node_api_ports,
     } = boot::surfaces::bind(boot::surfaces::BindConfig {
@@ -664,20 +669,36 @@ fn run_node(
             status.wire_netstack_swapper(move |request| {
                 let metrics = swap_metrics.clone();
                 Box::pin(async move {
-                    let outcome = reachability_plane::swap_netstack(request).await;
-                    match &outcome {
-                        Ok(backend) => {
-                            metrics.set_netstack_backend(backend.clone());
-                            metrics.record_netstack_swap(noded::NetstackSwapOutcome::Swapped, None);
-                        }
-                        Err(reason) => metrics.record_netstack_swap(
-                            noded::NetstackSwapOutcome::Refused,
-                            Some(reason.clone()),
-                        ),
+                    use reachability_plane::SwapAnswer;
+                    let answer = reachability_plane::swap_netstack(request).await;
+                    reachability_plane::record_swap(&metrics, &answer);
+                    // the route answers 200 with the new backend, or 409 with
+                    // the reason — a swap no machine was ever asked for reads
+                    // to the operator exactly like one a machine refused.
+                    match answer {
+                        SwapAnswer::Swapped(backend) => Ok(backend),
+                        SwapAnswer::Refused(reason) | SwapAnswer::Unattempted(reason) => Err(reason),
                     }
-                    outcome
                 })
             });
+            // and the GOVERNANCE trigger for the same plane, on its own task:
+            // the module code registry carries the designated component as a
+            // commitment record, and this reconciler converges the plane onto
+            // it one block wake at a time. Deliberately not the module
+            // boundary — that one is fail-closed and rides the drain, and the
+            // reachability machine is per-node, root-hash-free, pre-genesis
+            // networking (`netstack_governance`).
+            //
+            // The command sender is the http surface's own (the gateway plane
+            // holds another clone): the reconciler READS committed state the
+            // same way `/v1/query` does.
+            tokio::spawn(netstack_governance::reconcile(
+                label.clone(),
+                metrics.clone(),
+                gateway_commands.clone(),
+                blobs.clone(),
+                stream_hub.subscribe_blocks(),
+            ));
         }
         status.publish(noded::NodeStatus {
             version: build_version(),
@@ -817,6 +838,7 @@ fn run_node(
                 gateway_commands.clone(),
                 terminals,
                 session_requests,
+                remote_sessions.clone(),
                 local_gateway_via,
                 node_api_ports,
                 &stream_hub,
@@ -912,6 +934,7 @@ fn run_node(
             gateway_commands,
             terminals,
             session_requests,
+            remote_sessions,
             local_gateway_via,
             node_api_ports,
             stream_hub,

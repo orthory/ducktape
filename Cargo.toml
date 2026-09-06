@@ -251,6 +251,11 @@ commonware-actor = "2026.5.0"
 # core used sans-io (`noise::Tunn`, no device layer) — WireGuard-compatible on
 # the wire by construction.
 defguard_boringtun = "0.6.5"
+# tests only: forging a WireGuard mac1 the way boringtun's rate limiter
+# computes it (blake2s keyed by HASH(LABEL_MAC1 || responder public)). the
+# helpers are `pub(crate)` in boringtun, and this is the same blake2 build its
+# own handshake code links.
+blake2 = "0.10"
 # the userspace backend's virtual host: a TUN-less TCP/UDP stack terminating
 # at the node's overlay ULA, entirely in-process. `medium-ip` because the
 # tunnel carries raw IP (WireGuard has no link layer), `async` for the

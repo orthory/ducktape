@@ -130,8 +130,16 @@ the module (its `guest` feature on) as a git source, pins the revision in the
 shell lock, builds for `wasm32-unknown-unknown`, componentizes with
 `wasm-tools`, and writes `component.wasm` and `guest.lock` into the module
 directory. The lock is the record of the build (the revision, every registry
-version) and the seed of the next one. A module edited but not committed is
-refused, since the build would compile HEAD instead.
+version) and the seed of the next one. Uncommitted inputs in the module,
+its resolved SDK and sibling packages, or workspace build configuration are
+refused, including staged and untracked sources. Artifacts and `guest.lock`
+are build outputs and may change during a rebuild.
+
+Dependency resolution uses an explicit revision, so a new module can build
+before it exists on the repository's default branch. Before compilation,
+the builder removes that selector from both manifests and lock source IDs;
+the lock keeps the precise commit, and `cargo build --locked` verifies it.
+A first build has no seed: an old scratch lock is discarded.
 
 ```
 make wasm-modules        # rebuild every guest + refresh ALL committed copies

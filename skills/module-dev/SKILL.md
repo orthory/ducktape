@@ -78,8 +78,8 @@ module from the `shape` export, never from a table: `store_shape()` /
 for a committed-only query lane. `#[cfg(feature = "guest")] mod guest;` in
 lib.rs. No packaging crate is checked in: `bin/guest-builder` builds the
 module ALONE, out of the platform repository at the checkout's HEAD (so
-push first — an uncommitted edit to the module is refused, an unpushed HEAD
-fails to fetch), through an ephemeral shell workspace under
+push first — uncommitted module, SDK, sibling, and workspace build inputs
+are refused, and an unpushed HEAD fails to fetch), through an ephemeral shell workspace under
 `target/guest-builder/<id>/`, and writes the canonical COMMITTED
 `component.wasm` and `guest.lock` (the revision and every registry version
 the artifact came from; the seed of the next build) into the module
@@ -124,6 +124,22 @@ register <id> <component.wasm>` admits the id on a live network and `ducktape
 module update <id> <component.wasm>` swaps its code later. The registry is
 consensus state, so nothing below needs editing — every node composes the
 admitted module from it.
+
+`module update` swaps the CODE, never the DATA: `WasmModule::swap_code`
+replaces the component and leaves the store untouched. The new component must
+therefore be schema-IDENTICAL to the old one — same key derivation, same value
+encodings — not merely schema-compatible. A store-backed module's logical keys
+are hashed before they touch the store (`staged_store::store_key`, `sha256`),
+so the store carries no order and no prefix a new component could scan; the
+`ducktape:module` WIT world exports three functions — `shape` (a pure
+constant of the code: the backing and committed-query mode `swap_code` reads
+to decide whether the replacement may keep the store), `execute`, and
+`query` — and there is no migrate/scan import: a new component cannot
+enumerate the records a key- or value-shape
+change would need to rewrite, because the keyspace it would scan is exactly
+the sha256 digests it can't invert. A key-layout or value-shape change is a
+new module id — a fresh `register`, decided at genesis if it must replace an
+existing one — never a `module update`.
 
 The table is the GENESIS path: the flag day that moves the root hash. There
 is ONE source: `crates/topology/src/lib.rs`. Every binary composes from it

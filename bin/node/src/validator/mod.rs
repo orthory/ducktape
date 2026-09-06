@@ -54,6 +54,7 @@ pub(crate) async fn run_validator(
     gateway_commands: futures::channel::mpsc::Sender<noded::NodeCommand>,
     session_manager: Option<noded::TerminalSessions>,
     session_requests: tokio::sync::mpsc::Receiver<noded::SessionJob>,
+    remote_sessions: noded::RemoteSessions,
     local_gateway_via: String,
     node_api_ports: Vec<u16>,
     stream_hub: noded::StreamHub,
@@ -164,6 +165,7 @@ pub(crate) async fn run_validator(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
         relay_ingress,
     } = wiring::finish(
@@ -233,6 +235,7 @@ pub(crate) async fn run_validator(
             local_gateway_via,
             gateway_workspace.clone(),
             session_requests,
+            remote_sessions,
         );
         // the module-code plane: serves push/pull transfers and drains the
         // admin RPC's stage fan-outs. same overlay book as the agent plane.
@@ -321,6 +324,16 @@ pub(crate) async fn run_validator(
         blob_client.clone(),
         blobs.clone(),
         forge_repo.clone(),
+        label.clone(),
+    ));
+    // the same lane again, for this validator's OWN state: poll a co-peer's
+    // finalized `(height, root)` and name a disagreement. a validator polls
+    // nobody otherwise, so a fold that silently diverged is invisible on a
+    // validator-only network — see `sync::divergence`.
+    tokio::spawn(crate::sync::divergence::watch_root_divergence(
+        blob_client.clone(),
+        sync_state_tx,
+        signer.public_key(),
         label.clone(),
     ));
 
@@ -492,6 +505,7 @@ pub(crate) async fn run_promoted(
         prev_ckpt,
         mesh_window,
         mesh_book,
+        replay_window,
     } = baton;
     metrics.set_role_phase(noded::NodeRole::Validator, noded::NodePhase::Recovering);
     tracing::info!(
@@ -549,6 +563,7 @@ pub(crate) async fn run_promoted(
         blob_peers,
         blob_client,
         sync_state_rx,
+        sync_state_tx,
         sync_lease,
     } = wiring::wire_serve_lanes(
         &context,
@@ -561,6 +576,16 @@ pub(crate) async fn run_promoted(
         sync_tx,
         sync_rx,
     );
+    // the seat's own root divergence watch, exactly the fresh boot's: the
+    // parked life's poll died with `park()`, and a promoted node — seated
+    // from a synced boundary — is the one most worth comparing against its
+    // co-validators. see `sync::divergence`.
+    tokio::spawn(crate::sync::divergence::watch_root_divergence(
+        blob_client.clone(),
+        sync_state_tx,
+        signer.public_key(),
+        label.clone(),
+    ));
 
     // the books the parked role already runs its planes over follow the
     // seat's transport union.
@@ -733,6 +758,8 @@ pub(crate) async fn run_promoted(
         view_base,
     );
     node.set_code_source(code_source);
+    // the replay guard crosses the promotion seam with the state it guards.
+    node.seed_replay_window(replay_window);
     // the observation barrier (see engine::resume): every drain batch ends
     // AT a valset-moving block, so cutovers arm at the same view on every
     // validator.
@@ -948,6 +975,11 @@ pub(crate) struct PromotionBaton {
     pub(crate) mesh_window: crate::mesh_window::MeshWindowTracker,
     /// the mesh address book, carried with the tracker for the same reason.
     pub(crate) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
+    /// the replica node's replay window at the promotion boundary. it must
+    /// cross the seam: the seat writes a checkpoint here, so the journal
+    /// suffix a restart would restore from is empty, and a seat that started
+    /// with an empty window would apply a replayed batch its peers refuse.
+    pub(crate) replay_window: Vec<(u64, node::FrameId)>,
 }
 
 /// one epoch's slot in the [`LaneBank`].

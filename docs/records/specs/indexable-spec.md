@@ -44,7 +44,7 @@ The tier is two loops, coupled only through each module's database:
 
 - **the host writer** (`IndexStore::apply_block`, called by the node's block
   loop): writes one borsh `OpRow` per applied dispatch under
-  `op/{height:016x}/{seq:04x}` plus the watermark (`meta/height`), one atomic
+  `op/{height:016x}/{seq:08x}` plus the watermark (`meta/height`), one atomic
   batch per module per block. No domain logic; this is the whole host side.
 - **the fold** (the module's index guest): a fluent31 **changes-mode
   trigger** (`"fold"`) on the `op/` range delivers every committed op row to
@@ -333,7 +333,7 @@ source floored no lower than this node ends the matter there.
 **Why no refold is needed, and why this window is the only one.** Pre-serving
 there are no live folds, no ws subscribers, and no view readers on this node.
 So ascending fetch-and-write makes COMMIT ORDER EQUAL KEY ORDER, which for
-`op/{height:016x}/{seq:04x}` is block-and-drain order: the changes-mode trigger
+`op/{height:016x}/{seq:08x}` is block-and-drain order: the changes-mode trigger
 folds every row correctly as it lands, and the fold tip advances monotonically
 to the last backfilled row. Doing this later — against a folding, serving node
 — would hand a guest history backwards, and is a defect rather than a slow path.
@@ -348,7 +348,7 @@ the lane trusts the serving node — accepted, because the read model is how a
 node renders at all, and the joiner already trusted this exact node enough to
 accept canonical state from it. What is still enforced, once, at the trust
 boundary (`statesync::fetch_index_ops`): every key is byte-exactly the
-canonical `op/{height:016x}/{seq:04x}` rendering of its own position,
+canonical `op/{height:016x}/{seq:08x}` rendering of its own position,
 `(height, seq)` ascends strictly across the whole walk, every height is at or
 below the boundary, every row borsh-decodes as an `OpRow` agreeing with its own
 key, the source's watermark covers the requested boundary (a source that folded
@@ -359,7 +359,7 @@ being asked for).
 The key check is byte equality, not a successful parse, and the difference is
 load-bearing. `parse_op_key` reads hex with `from_str_radix`, which accepts any
 width and a leading `+`: `op/2/0` parses to `(2, 0)` while sorting AFTER
-`op/0000000000000009/0000`. Such a key would satisfy every other check above
+`op/0000000000000009/00000000`. Such a key would satisfy every other check above
 and still break the one invariant this lane rests on — and the damage is
 durable and silent, because the next `converge_guest` refold replays `op/` in
 KEY order and would rebuild every derived view from history running backwards.

@@ -19,7 +19,8 @@
 //!
 //! * the guest rebuilds the module FRESH per dispatch over the exact
 //!   production builder chain (`Chat::new("chat", store).with_tagging
-//!   ("tagging")`); its inner `pending` overlay is per-dispatch, and
+//!   ("tagging").with_identity("identity")`); its inner `pending` overlay is
+//!   per-dispatch, and
 //!   cross-dispatch read-your-writes comes from the host's outer staged
 //!   overlay via `WitStore::get` (staged-over-committed).
 //! * each successful `execute` flushes the inner staging with the inner
@@ -48,6 +49,9 @@ const MODULE_ID: &str = "chat";
 /// genesis config compiled into the guest; drift here would be a consensus
 /// fork.
 const TAGGING_ID: &str = "tagging";
+/// the sibling `CreateDmChannel` resolves a creator's key through (`OfKey`).
+/// genesis config compiled into the guest, like `TAGGING_ID`.
+const IDENTITY_ID: &str = "identity";
 
 use ducktape_module_sdk::WitStore;
 
@@ -57,5 +61,7 @@ ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: Chat,
     shape: ducktape_module_sdk::store_shape(),
-    new: Chat::new(MODULE_ID, Box::new(WitStore)).with_tagging(TAGGING_ID),
+    new: Chat::new(MODULE_ID, Box::new(WitStore))
+        .with_tagging(TAGGING_ID)
+        .with_identity(IDENTITY_ID),
 }

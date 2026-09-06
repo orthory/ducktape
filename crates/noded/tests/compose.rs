@@ -314,9 +314,12 @@ fn admissions_build_through_the_one_wasm_path() {
             .unwrap();
             let substrates = substrates(&dir);
             let admissions = Admissions::new(&context, &substrates, &BINDINGS);
-            let module = host::ModuleFactory::instantiate(&admissions, "hello", &hello)
+            let admitted = host::ModuleFactory::instantiate(&admissions, "hello", &hello)
                 .await
                 .expect("a map-declared component admits over a fresh map");
+            let host::Admitted::Module(module) = admitted else {
+                panic!("the hello fixture is a `ducktape:module`");
+            };
             assert_eq!(module.id(), "hello");
             let err = host::ModuleFactory::instantiate(&admissions, "kanban", &object)
                 .await
@@ -325,6 +328,20 @@ fn admissions_build_through_the_one_wasm_path() {
             assert!(
                 err.to_string().contains("kanban"),
                 "the refusal names the module: {err}"
+            );
+            // and the ONE refusal that is not fail-closed: bytes that are no
+            // `ducktape:module` at all are another plane's commitment record.
+            let netstack = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../networking/netstack-machine/component.wasm"),
+            )
+            .unwrap();
+            let admitted = host::ModuleFactory::instantiate(&admissions, "netstack", &netstack)
+                .await
+                .expect("a foreign-world component is answered, not errored");
+            assert!(
+                matches!(admitted, host::Admitted::ForeignAbi),
+                "the netstack guest is no module admission"
             );
         })
     });

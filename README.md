@@ -143,9 +143,10 @@ cargo run -p guest-builder -- crates/modules/apps/tasks
 ```
 
 This builds the module ALONE, out of the platform repository at the checkout's
-HEAD — push first; the tool refuses a module with uncommitted edits, since it
-would compile HEAD instead — through a shell workspace under
-`target/guest-builder/tasks/`, componentizes, and writes the canonical
+HEAD — push first; the tool refuses uncommitted inputs in the module, its
+resolved SDK and sibling packages, and workspace build configuration. It uses
+a shell workspace under `target/guest-builder/tasks/`, componentizes, and
+writes the canonical
 committed artifact to `crates/modules/apps/tasks/component.wasm` (path printed
 on stdout) beside `guest.lock`, the record of the revision and registry
 versions it came from. If kernel tests pin a fixture copy, refresh it too —

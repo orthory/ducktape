@@ -27,7 +27,7 @@ pub(crate) const NOP_TARGET: &str = noded::projection::NOP_TARGET;
 // pending ops the moment nothing of ours is in flight (`pump_eager_flush`),
 // so the network's own agreement speed paces blocks and ops aggregate behind
 // the one batch in flight. IDLE is the only timed cadence: the heartbeat
-// beats one nop block per block time (node.toml `block_time_ms`) so an idle
+// beats one nop block per block time (network.toml `block_time_ms`) so an idle
 // chain still finalizes (its height keeps ticking) and any pending cutover
 // still crosses — paced to the same interval the leader's idle-propose holds
 // a view open, so the idle beat never outpaces the view hold.
@@ -57,6 +57,12 @@ const _: () = assert!(MAX_MESSAGE_SIZE as usize >= duckfs_core::MAX_SYNC_REPLY_B
 // (`sync::serve::encode_bounded_response`) — that is the last line; this pin
 // keeps the honest path from ever needing it.
 const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::qmdb::MAX_MODULE_REPLY_BYTES + 1024);
+// the replay window a manifest carries is the SAME window the drain enforces:
+// a joiner seating on a shallower one applies a re-proposed batch its peers
+// refuse. `statesync` does not link `node`, so the equality is pinned here,
+// where both are in scope. the window's wire cost rides under the cap above.
+const _: () = assert!(statesync::MAX_APPLIED_FRAMES == node::REPLAY_WINDOW_HEIGHTS);
+const _: () = assert!(MAX_MESSAGE_SIZE as usize >= statesync::MAX_APPLIED_FRAMES * 40 + (64 << 10));
 /// inbound backlog per channel. NOT backpressure: commonware's peer actor
 /// DROPS an inbound message when the application buffer is full (it never
 /// blocks a peer), so this is a drop boundary — `relay::MAX_RELAY_BLOB_BYTES`

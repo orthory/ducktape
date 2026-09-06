@@ -538,11 +538,11 @@ macro_rules! snapshot_guest {
         /// corruption surfaced as a deterministic rejection, never a silent
         /// re-genesis.
         fn loaded_module() -> ::core::result::Result<$module, $crate::host::Error> {
-            use ::sdk::Module as _;
+            use $crate::sdk::Module as _;
             let mut module = $new;
             if let ::core::option::Option::Some((bytes, root)) = $crate::load_state() {
                 module
-                    .install(&bytes, ::sdk::StateRoot(root))
+                    .install(&bytes, $crate::sdk::StateRoot(root))
                     .map_err(|e| {
                         $crate::host::Error::Rejected(::std::format!("{} state reload: {e}", $id))
                     })?;
@@ -553,9 +553,9 @@ macro_rules! snapshot_guest {
         /// map an inner sdk error onto the wit surface. `Module` is the native
         /// rejection verbatim; anything else the native module never surfaces
         /// from its own execute, so the debug rendering is purely diagnostic.
-        fn to_wit_error(e: ::sdk::Error) -> $crate::host::Error {
+        fn to_wit_error(e: $crate::sdk::Error) -> $crate::host::Error {
             match e {
-                ::sdk::Error::Module(m) => $crate::host::Error::Rejected(m),
+                $crate::sdk::Error::Module(m) => $crate::host::Error::Rejected(m),
                 other => $crate::host::Error::Rejected(other.to_string()),
             }
         }
@@ -568,12 +568,12 @@ macro_rules! snapshot_guest {
             fn execute(
                 payload: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<(), $crate::host::Error> {
-                use ::sdk::Module as _;
+                use $crate::sdk::Module as _;
                 let mut module = loaded_module()?;
                 let mut ctx = $crate::WitCtx::new();
                 $crate::block_on(module.execute(
                     &mut ctx,
-                    &::sdk::Msg { target: $id.into(), payload },
+                    &$crate::sdk::Msg { target: $id.into(), payload },
                 ))
                 .map_err(to_wit_error)?;
                 // fully apply per dispatch: publish the inner per-op staging,
@@ -587,7 +587,7 @@ macro_rules! snapshot_guest {
             fn query(
                 req: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::host::Error> {
-                use ::sdk::Module as _;
+                use $crate::sdk::Module as _;
                 // the loaded snapshot was saved post-inner-commit, so the native
                 // query's merged view serves it with an empty pending — the live
                 // staged-overlay projection this round is already folded into
@@ -624,9 +624,9 @@ macro_rules! store_guest {
         /// map an inner sdk error onto the wit surface. `Module` is the native
         /// rejection verbatim; anything else the native module never surfaces
         /// from its own execute, so the debug rendering is purely diagnostic.
-        fn to_wit_error(e: ::sdk::Error) -> $crate::host::Error {
+        fn to_wit_error(e: $crate::sdk::Error) -> $crate::host::Error {
             match e {
-                ::sdk::Error::Module(m) => $crate::host::Error::Rejected(m),
+                $crate::sdk::Error::Module(m) => $crate::host::Error::Rejected(m),
                 other => $crate::host::Error::Rejected(other.to_string()),
             }
         }
@@ -639,12 +639,12 @@ macro_rules! store_guest {
             fn execute(
                 payload: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<(), $crate::host::Error> {
-                use ::sdk::Module as _;
+                use $crate::sdk::Module as _;
                 let mut module = module()?;
                 let mut ctx = $crate::WitCtx::new();
                 $crate::block_on(module.execute(
                     &mut ctx,
-                    &::sdk::Msg { target: $id.into(), payload },
+                    &$crate::sdk::Msg { target: $id.into(), payload },
                 ))
                 .map_err(to_wit_error)?;
                 // flush the inner per-dispatch staging into the host's OUTER
@@ -656,7 +656,7 @@ macro_rules! store_guest {
             fn query(
                 req: ::std::vec::Vec<u8>,
             ) -> ::core::result::Result<::std::vec::Vec<u8>, $crate::host::Error> {
-                use ::sdk::Module as _;
+                use $crate::sdk::Module as _;
                 // a fresh module's `pending` is empty, so the native query reads
                 // straight through the staged-over-committed store view.
                 let module = module()?;

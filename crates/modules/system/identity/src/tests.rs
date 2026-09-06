@@ -10,16 +10,25 @@ use futures::executor::block_on;
 use sdk_testkit::{MemStore, TestCtx};
 
 const CHAIN: &str = "test-chain";
+/// the consensus time every op runs at unless a test names another.
+const NOW: u64 = 100;
+/// the expiry every consent carries unless a test names another -- inside
+/// [`MAX_CONSENT_TTL`] of [`NOW`].
+const EXPIRES: u64 = 1_000;
 
 // ---- a minimal Ctx (the shared sdk-testkit double) ----------------------
 
-fn ctx_external(key: &[u8]) -> TestCtx {
+fn ctx_at(key: &[u8], consensus_time: u64) -> TestCtx {
     TestCtx::with_env(sdk::Env {
         height: 0,
-        consensus_time: 100,
+        consensus_time,
         origin: sdk::Origin::External(key.to_vec()),
         me: "identity".into(),
     })
+}
+
+fn ctx_external(key: &[u8]) -> TestCtx {
+    ctx_at(key, NOW)
 }
 
 // ---- key builders (one per scheme) -----------------------------------------
@@ -32,11 +41,30 @@ fn ed(seed: u64) -> Ed {
 fn ed_pub(k: &Ed) -> Vec<u8> {
     k.public_key().as_ref().to_vec()
 }
-/// an ed25519 member's consent to admit `new_key` at `gen`.
-fn ed_consent(member: &Ed, scheme: KeyScheme, new_key: &[u8], generation: u64) -> Authorizer {
-    let preimage = add_key_preimage(CHAIN, scheme, new_key, generation);
+/// an ed25519 member's consent to admit `new_key` into `account` at `gen`.
+fn ed_consent(
+    member: &Ed,
+    scheme: KeyScheme,
+    new_key: &[u8],
+    generation: u64,
+    account: u64,
+) -> Authorizer {
+    ed_consent_until(member, scheme, new_key, generation, account, EXPIRES)
+}
+
+fn ed_consent_until(
+    member: &Ed,
+    scheme: KeyScheme,
+    new_key: &[u8],
+    generation: u64,
+    account: u64,
+    expires_at: u64,
+) -> Authorizer {
+    let preimage = add_key_preimage(CHAIN, scheme, new_key, generation, account, expires_at);
     Authorizer {
         key: ed_pub(member),
+        account,
+        expires_at,
         proof: keyscheme::testkit::ed25519_proof(member, IDENTITY_ADD_KEY_NS, &preimage),
     }
 }
@@ -52,10 +80,13 @@ fn wallet_consent(
     scheme: KeyScheme,
     new_key: &[u8],
     generation: u64,
+    account: u64,
 ) -> Authorizer {
-    let preimage = add_key_preimage(CHAIN, scheme, new_key, generation);
+    let preimage = add_key_preimage(CHAIN, scheme, new_key, generation, account, EXPIRES);
     Authorizer {
         key: wallet_pub(member),
+        account,
+        expires_at: EXPIRES,
         proof: keyscheme::testkit::eth_proof(member, IDENTITY_ADD_KEY_NS, &preimage),
     }
 }
@@ -71,10 +102,13 @@ fn passkey_consent(
     scheme: KeyScheme,
     new_key: &[u8],
     generation: u64,
+    account: u64,
 ) -> Authorizer {
-    let preimage = add_key_preimage(CHAIN, scheme, new_key, generation);
+    let preimage = add_key_preimage(CHAIN, scheme, new_key, generation, account, EXPIRES);
     Authorizer {
         key: passkey_pub(member),
+        account,
+        expires_at: EXPIRES,
         proof: keyscheme::testkit::passkey_proof(
             member,
             "ducktape",
@@ -93,7 +127,12 @@ fn new_identity() -> Identity {
 
 /// execute a message from `origin`, then commit (or abort) the block.
 fn apply(id: &mut Identity, origin: &[u8], msg: IdentityMsg) -> Result<(), Error> {
-    let mut ctx = ctx_external(origin);
+    apply_at(id, origin, msg, NOW)
+}
+
+/// [`apply`] at a chosen consensus time — how a test orders admissions.
+fn apply_at(id: &mut Identity, origin: &[u8], msg: IdentityMsg, at: u64) -> Result<(), Error> {
+    let mut ctx = ctx_at(origin, at);
     let m = Msg {
         target: "identity".into(),
         payload: encode_msg(&msg),
@@ -119,7 +158,17 @@ fn create(id: &mut Identity, origin: &[u8], name: &str, scheme: KeyScheme) -> Re
 }
 
 fn add_key(id: &mut Identity, origin: &[u8], scheme: KeyScheme, authorizer: Authorizer) -> Result<(), Error> {
-    apply(
+    add_key_at(id, origin, scheme, authorizer, NOW)
+}
+
+fn add_key_at(
+    id: &mut Identity,
+    origin: &[u8],
+    scheme: KeyScheme,
+    authorizer: Authorizer,
+    at: u64,
+) -> Result<(), Error> {
+    apply_at(
         id,
         origin,
         IdentityMsg::AddKey {
@@ -127,6 +176,7 @@ fn add_key(id: &mut Identity, origin: &[u8], scheme: KeyScheme, authorizer: Auth
             label: None,
             authorizer,
         },
+        at,
     )
 }
 
@@ -212,7 +262,7 @@ fn add_key_admits_with_member_consent_and_the_consent_is_single_use() {
     let (founder, joiner) = (ed(1), ed(2));
     create(&mut id, &ed_pub(&founder), "alice", KeyScheme::Ed25519).unwrap();
 
-    let consent = ed_consent(&founder, KeyScheme::Ed25519, &ed_pub(&joiner), 0);
+    let consent = ed_consent(&founder, KeyScheme::Ed25519, &ed_pub(&joiner), 0, 1);
     apply(
         &mut id,
         &ed_pub(&joiner),
@@ -251,18 +301,18 @@ fn a_removed_key_relinks_anywhere_at_its_next_generation() {
     create(&mut id, &ed_pub(&a), "alice", KeyScheme::Ed25519).unwrap();
     create(&mut id, &ed_pub(&b), "bob", KeyScheme::Ed25519).unwrap();
 
-    add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&k), 0)).unwrap();
+    add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&k), 0, 1)).unwrap();
     apply(&mut id, &ed_pub(&a), IdentityMsg::RemoveKey { key: ed_pub(&k) }).unwrap();
     assert!(of_key(&id, &ed_pub(&k)).is_none());
     assert_eq!(key_gen(&id, &ed_pub(&k)), 1, "removal keeps the counter");
 
     // bob's consent at the OLD generation is a forgery ...
     refused(
-        add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, ed_consent(&b, KeyScheme::Ed25519, &ed_pub(&k), 0)).unwrap_err(),
+        add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, ed_consent(&b, KeyScheme::Ed25519, &ed_pub(&k), 0, 2)).unwrap_err(),
         "consent does not verify",
     );
     // ... at the current one it relinks the key to bob's account.
-    add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, ed_consent(&b, KeyScheme::Ed25519, &ed_pub(&k), 1)).unwrap();
+    add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, ed_consent(&b, KeyScheme::Ed25519, &ed_pub(&k), 1, 2)).unwrap();
     assert_eq!(of_key(&id, &ed_pub(&k)).unwrap().number, 2);
     assert_eq!(key_gen(&id, &ed_pub(&k)), 2);
     assert_eq!(get(&id, 1).unwrap().keys.len(), 1);
@@ -273,14 +323,125 @@ fn a_removed_authorizer_cannot_consent() {
     let mut id = new_identity();
     let (a, b, k) = (ed(1), ed(2), ed(3));
     create(&mut id, &ed_pub(&a), "alice", KeyScheme::Ed25519).unwrap();
-    add_key(&mut id, &ed_pub(&b), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&b), 0)).unwrap();
+    add_key(&mut id, &ed_pub(&b), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&b), 0, 1)).unwrap();
     // b mints a consent for k, then a evicts b.
-    let stale = ed_consent(&b, KeyScheme::Ed25519, &ed_pub(&k), 0);
+    let stale = ed_consent(&b, KeyScheme::Ed25519, &ed_pub(&k), 0, 1);
     apply(&mut id, &ed_pub(&a), IdentityMsg::RemoveKey { key: ed_pub(&b) }).unwrap();
     refused(
         add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, stale).unwrap_err(),
         "authorizer belongs to no account",
     );
+}
+
+/// the consent NAMES its account, so it dies with the authorizer's membership
+/// of THAT account — it never follows the authorizer onto the next one.
+#[test]
+fn a_consent_never_follows_its_authorizer_to_another_account() {
+    let mut id = new_identity();
+    let (a, b, c, k) = (ed(1), ed(2), ed(3), ed(4));
+    create(&mut id, &ed_pub(&a), "alice", KeyScheme::Ed25519).unwrap();
+    create(&mut id, &ed_pub(&c), "carol", KeyScheme::Ed25519).unwrap();
+    add_key(&mut id, &ed_pub(&b), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&b), 0, 1)).unwrap();
+
+    // b mints a ticket for k on account 1 and k sits on it, unspent.
+    let stale = ed_consent(&b, KeyScheme::Ed25519, &ed_pub(&k), 0, 1);
+    // b leaves account 1 and relinks to carol's account 2.
+    apply(&mut id, &ed_pub(&a), IdentityMsg::RemoveKey { key: ed_pub(&b) }).unwrap();
+    add_key(&mut id, &ed_pub(&b), KeyScheme::Ed25519, ed_consent(&c, KeyScheme::Ed25519, &ed_pub(&b), 1, 2)).unwrap();
+    assert_eq!(of_key(&id, &ed_pub(&b)).unwrap().number, 2);
+
+    // the untouched ticket does NOT admit its holder into account 2 ...
+    refused(
+        add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, stale).unwrap_err(),
+        "consent names account 1, its authorizer is on account 2",
+    );
+    // ... and naming account 2 in the payload is not a shortcut either: the
+    // signature covers the account too.
+    let mut forged = ed_consent(&b, KeyScheme::Ed25519, &ed_pub(&k), 0, 1);
+    forged.account = 2;
+    refused(
+        add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, forged).unwrap_err(),
+        "consent does not verify",
+    );
+    assert!(of_key(&id, &ed_pub(&k)).is_none());
+}
+
+/// an unspent consent is not a permanent bearer credential: it dies on the
+/// clock, and one minted to outlive the ceiling never verifies at all.
+#[test]
+fn a_consent_expires_and_cannot_outlive_the_ceiling() {
+    let mut id = new_identity();
+    let (a, k) = (ed(1), ed(2));
+    create(&mut id, &ed_pub(&a), "alice", KeyScheme::Ed25519).unwrap();
+
+    let consent = ed_consent_until(&a, KeyScheme::Ed25519, &ed_pub(&k), 0, 1, NOW + 10);
+    refused(
+        add_key_at(&mut id, &ed_pub(&k), KeyScheme::Ed25519, consent.clone(), NOW + 11).unwrap_err(),
+        "consent expired at 110",
+    );
+    refused(
+        add_key(
+            &mut id,
+            &ed_pub(&k),
+            KeyScheme::Ed25519,
+            ed_consent_until(&a, KeyScheme::Ed25519, &ed_pub(&k), 0, 1, NOW + MAX_CONSENT_TTL + 1),
+        )
+        .unwrap_err(),
+        "outlives the",
+    );
+    // at its own consensus time it still admits.
+    add_key_at(&mut id, &ed_pub(&k), KeyScheme::Ed25519, consent, NOW + 10).unwrap();
+    assert_eq!(of_key(&id, &ed_pub(&k)).unwrap().number, 1);
+}
+
+/// SENIORITY: a key admitted later never evicts one admitted earlier, so a
+/// redeemed stale ticket cannot take the account over. self-removal is always
+/// allowed, and a senior drops a junior.
+#[test]
+fn a_junior_key_cannot_remove_a_senior_one() {
+    let mut id = new_identity();
+    let (a, b, c) = (ed(1), ed(2), ed(3));
+    create(&mut id, &ed_pub(&a), "alice", KeyScheme::Ed25519).unwrap();
+    add_key_at(&mut id, &ed_pub(&b), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&b), 0, 1), NOW + 1).unwrap();
+    add_key_at(&mut id, &ed_pub(&c), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&c), 0, 1), NOW + 2).unwrap();
+
+    refused(
+        apply(&mut id, &ed_pub(&c), IdentityMsg::RemoveKey { key: ed_pub(&a) }).unwrap_err(),
+        "admitted before your own",
+    );
+    refused(
+        apply(&mut id, &ed_pub(&c), IdentityMsg::RemoveKey { key: ed_pub(&b) }).unwrap_err(),
+        "admitted before your own",
+    );
+    // the junior may always leave ...
+    apply(&mut id, &ed_pub(&c), IdentityMsg::RemoveKey { key: ed_pub(&c) }).unwrap();
+    // ... and the founder drops the key it admitted.
+    apply(&mut id, &ed_pub(&a), IdentityMsg::RemoveKey { key: ed_pub(&b) }).unwrap();
+    assert_eq!(get(&id, 1).unwrap().keys.len(), 1);
+}
+
+#[test]
+fn the_key_cap_refuses_the_next_admission_until_one_leaves() {
+    let mut id = new_identity();
+    let a = ed(1);
+    create(&mut id, &ed_pub(&a), "alice", KeyScheme::Ed25519).unwrap();
+    let joiner = |n: u64| ed(100 + n);
+    for n in 1..MAX_KEYS_PER_ACCOUNT as u64 {
+        let k = joiner(n);
+        add_key(&mut id, &ed_pub(&k), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&k), 0, 1)).unwrap();
+    }
+    assert_eq!(get(&id, 1).unwrap().keys.len(), MAX_KEYS_PER_ACCOUNT);
+
+    let over = joiner(MAX_KEYS_PER_ACCOUNT as u64);
+    refused(
+        add_key(&mut id, &ed_pub(&over), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&over), 0, 1)).unwrap_err(),
+        "account key cap reached",
+    );
+    // a seat frees one.
+    let leaver = joiner(1);
+    apply(&mut id, &ed_pub(&leaver), IdentityMsg::RemoveKey { key: ed_pub(&leaver) }).unwrap();
+    add_key(&mut id, &ed_pub(&over), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&over), 0, 1)).unwrap();
+    assert_eq!(get(&id, 1).unwrap().keys.len(), MAX_KEYS_PER_ACCOUNT);
 }
 
 #[test]
@@ -311,10 +472,10 @@ fn a_wallet_founds_and_a_passkey_and_a_wallet_consent() {
 
     // the wallet admits a passkey ...
     let p = passkey(0x42);
-    add_key(&mut id, &passkey_pub(&p), KeyScheme::Secp256r1, wallet_consent(&w, KeyScheme::Secp256r1, &passkey_pub(&p), 0)).unwrap();
+    add_key(&mut id, &passkey_pub(&p), KeyScheme::Secp256r1, wallet_consent(&w, KeyScheme::Secp256r1, &passkey_pub(&p), 0, 1)).unwrap();
     // ... the passkey admits an ed25519 device key (WebAuthn assertion consent).
     let d = ed(7);
-    add_key(&mut id, &ed_pub(&d), KeyScheme::Ed25519, passkey_consent(&p, KeyScheme::Ed25519, &ed_pub(&d), 0)).unwrap();
+    add_key(&mut id, &ed_pub(&d), KeyScheme::Ed25519, passkey_consent(&p, KeyScheme::Ed25519, &ed_pub(&d), 0, 1)).unwrap();
     let acc = get(&id, 1).unwrap();
     assert_eq!(acc.keys.len(), 3);
     assert_eq!(of_key(&id, &ed_pub(&d)).unwrap().number, 1);
@@ -322,7 +483,7 @@ fn a_wallet_founds_and_a_passkey_and_a_wallet_consent() {
     // a consent minted for a different scheme of the same bytes is a forgery.
     let e = ed(8);
     refused(
-        add_key(&mut id, &ed_pub(&e), KeyScheme::Ed25519, passkey_consent(&p, KeyScheme::Secp256r1, &ed_pub(&e), 0)).unwrap_err(),
+        add_key(&mut id, &ed_pub(&e), KeyScheme::Ed25519, passkey_consent(&p, KeyScheme::Secp256r1, &ed_pub(&e), 0, 1)).unwrap_err(),
         "consent does not verify",
     );
 }
@@ -340,9 +501,34 @@ fn a_malformed_key_for_its_declared_scheme_is_refused() {
     );
     create(&mut id, &ed_pub(&ed(1)), "x", KeyScheme::Ed25519).unwrap();
     refused(
-        add_key(&mut id, &[7u8; 5], KeyScheme::Ed25519, ed_consent(&ed(1), KeyScheme::Ed25519, &[7u8; 5], 0)).unwrap_err(),
+        add_key(&mut id, &[7u8; 5], KeyScheme::Ed25519, ed_consent(&ed(1), KeyScheme::Ed25519, &[7u8; 5], 0, 1)).unwrap_err(),
         "malformed for its scheme",
     );
+}
+
+/// a secp key has ONE spelling here. the uncompressed SEC1 form of a wallet's
+/// key is the same curve point — every consent over it verifies — but the key
+/// index is raw bytes, so admitting it would found a second account for one
+/// private key, and let a member re-join under a spelling `RemoveKey` on the
+/// compressed form does not touch.
+#[test]
+fn the_uncompressed_spelling_of_a_secp_key_is_refused() {
+    let mut id = new_identity();
+    let w = wallet(3);
+    let uncompressed = w.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+    assert_eq!(uncompressed.len(), 65);
+    refused(
+        create(&mut id, &uncompressed, "wallet", KeyScheme::Secp256k1).unwrap_err(),
+        "malformed for its scheme",
+    );
+
+    // and it can never be consented INTO the account its compressed form owns.
+    create(&mut id, &wallet_pub(&w), "wallet", KeyScheme::Secp256k1).unwrap();
+    refused(
+        add_key(&mut id, &uncompressed, KeyScheme::Secp256k1, wallet_consent(&w, KeyScheme::Secp256k1, &uncompressed, 0, 1)).unwrap_err(),
+        "malformed for its scheme",
+    );
+    assert_eq!(get(&id, 1).unwrap().keys.len(), 1);
 }
 
 #[test]

@@ -196,6 +196,7 @@ mod tests {
             residents: vec![],
             floor_cert: None,
             entries: vec![],
+            applied_frames: vec![],
         }
     }
 

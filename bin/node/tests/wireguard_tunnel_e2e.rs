@@ -191,7 +191,12 @@ impl Underlay {
     ///
     /// `HOME` is the rig's own, so nothing here reaches the operator's real
     /// `~/.ducktape` (sudo resets the environment to root's otherwise).
-    fn ducktape(&self, ns: &str, home: &Path) -> Command {
+    ///
+    /// `extra_env` rides the same `env` invocation as `HOME` — `sudo`
+    /// resets the environment for the target user, so a var set via
+    /// `Command::env` on this outer process never reaches the node; the
+    /// inner coreutils `env` is the only seam that does.
+    fn ducktape(&self, ns: &str, home: &Path, extra_env: &[(&str, &str)]) -> Command {
         let mut cmd = Command::new("sudo");
         cmd.args(["-n", "ip", "netns", "exec", ns, "setpriv"])
             .arg("--pdeathsig=SIGKILL")
@@ -199,9 +204,11 @@ impl Underlay {
             .arg(format!("--regid={}", this_gid()))
             .arg("--clear-groups")
             .arg("env")
-            .arg(format!("HOME={}", home.display()))
-            .arg(env!("CARGO_BIN_EXE_ducktape"))
-            .arg("node");
+            .arg(format!("HOME={}", home.display()));
+        for (key, value) in extra_env {
+            cmd.arg(format!("{key}={value}"));
+        }
+        cmd.arg(env!("CARGO_BIN_EXE_ducktape")).arg("node");
         cmd
     }
 
@@ -209,7 +216,7 @@ impl Underlay {
     /// `node status` — which reads that node's rpc on ITS loopback, which is
     /// why this has to run inside the namespace.
     fn tip(&self, ns: &str, home: &Path, workspace: &Path) -> u64 {
-        let mut status = self.ducktape(ns, home);
+        let mut status = self.ducktape(ns, home, &[]);
         status
             .args(["status", "--json", "--config"])
             .arg(workspace.join("node.toml"));
@@ -377,7 +384,7 @@ fn tunnel_first_invite_carries_the_mesh_with_no_tcp_ingress() {
     // whole shape under test. `primary-coordinator none` is hermetic (the
     // namespace has no route out, and the default names the LIVE public
     // coordinator); the direct path this invite carries needs no coordinator.
-    let mut init = rig.ducktape(&rig.founder_ns, &home);
+    let mut init = rig.ducktape(&rig.founder_ns, &home, &[]);
     init.args(["init", "--name", "wg-tunnel-first"])
         .args(["--modules", common::founding_set()])
         .arg("--dir")
@@ -390,7 +397,7 @@ fn tunnel_first_invite_carries_the_mesh_with_no_tcp_ingress() {
         .args(["--block-time-ms", &block_time]);
     verb(init, "node init");
 
-    let mut founder_run = rig.ducktape(&rig.founder_ns, &home);
+    let mut founder_run = rig.ducktape(&rig.founder_ns, &home, &[]);
     founder_run.arg("run").arg("--config").arg(cfg(&founder_ws));
     let founder = NodeProc::spawn(
         0,
@@ -402,10 +409,10 @@ fn tunnel_first_invite_carries_the_mesh_with_no_tcp_ingress() {
 
     // the two members' derived identities, read back through the product's own
     // `node key` (which reuses the workspace's `identity.key`).
-    let mut founder_key = rig.ducktape(&rig.founder_ns, &home);
+    let mut founder_key = rig.ducktape(&rig.founder_ns, &home, &[]);
     founder_key.arg("key").arg("--dir").arg(&founder_ws);
     let founder_hex = verb(founder_key, "node key (founder)");
-    let mut joiner_key = rig.ducktape(&rig.joiner_ns, &home);
+    let mut joiner_key = rig.ducktape(&rig.joiner_ns, &home, &[]);
     joiner_key.arg("key").arg("--dir").arg(&joiner_ws);
     let joiner_hex = verb(joiner_key, "node key (joiner)");
 
@@ -425,11 +432,11 @@ fn tunnel_first_invite_carries_the_mesh_with_no_tcp_ingress() {
         .1;
 
     // ── the invite, and the join it materializes ────────
-    let mut mint = rig.ducktape(&rig.founder_ns, &home);
+    let mut mint = rig.ducktape(&rig.founder_ns, &home, &[]);
     mint.args(["invite", "--config"]).arg(cfg(&founder_ws));
     let blob = verb(mint, "node invite");
 
-    let mut join = rig.ducktape(&rig.joiner_ns, &home);
+    let mut join = rig.ducktape(&rig.joiner_ns, &home, &[]);
     join.args(["join", &blob])
         .arg("--dir")
         .arg(&joiner_ws)
@@ -437,8 +444,7 @@ fn tunnel_first_invite_carries_the_mesh_with_no_tcp_ingress() {
         .args([
             "--wireguard-listen",
             &format!("{JOINER_UNDERLAY}:{WG_PORT}"),
-        ])
-        .args(["--block-time-ms", &block_time]);
+        ]);
     verb(join, "node join");
 
     // the blob IS the VPN credential (§5): it must carry the inviter's
@@ -451,7 +457,17 @@ fn tunnel_first_invite_carries_the_mesh_with_no_tcp_ingress() {
         "the invite must carry the inviter's direct underlay endpoint:\n{bootstrap}"
     );
 
-    let mut joiner_run = rig.ducktape(&rig.joiner_ns, &home);
+    // leg 4 rides the joiner's per-block resident marker (`ducktape::consensus`
+    // debug), never the checkpoint cadence (`checkpoint_due` in
+    // `bin/node/src/drain_actions.rs` only fires when the root moved since the
+    // last manifest) — the rig's chain goes idle right after the cut, so a
+    // wait on `node_checkpoint_written` only passes by luck. RUST_LOG appends
+    // to the info floor, same as the compute-daemon marker above.
+    let mut joiner_run = rig.ducktape(
+        &rig.joiner_ns,
+        &home,
+        &[("RUST_LOG", "ducktape::consensus=debug")],
+    );
     joiner_run.arg("run").arg("--config").arg(cfg(&joiner_ws));
     let joiner = NodeProc::spawn(1, dir.path().join("joiner.log"), joiner_run, "the joiner");
 
@@ -538,26 +554,31 @@ fn tunnel_first_invite_carries_the_mesh_with_no_tcp_ingress() {
     // already in flight.
     //
     // The wait rides the joiner's own stderr, not its rpc: the app surface
-    // lives on loopback inside a namespace this process is not in. The
-    // resident's `node_checkpoint_written` line names the height it has
-    // folded, once per checkpoint interval, so the first one at or past the
-    // bar is the event.
+    // lives on loopback inside a namespace this process is not in. It rides
+    // the resident's per-block "resident folded block" marker (`ducktape::
+    // consensus` at debug, turned up via RUST_LOG above), not
+    // `node_checkpoint_written` — a checkpoint fires only when the folded
+    // root MOVED since the last manifest (`checkpoint_due` in
+    // `bin/node/src/drain_actions.rs`), and this rig's chain goes idle right
+    // after the cut, so waiting on a checkpoint only passes when the
+    // joiner's first post-boot checkpoint happens to land after the cut. The
+    // per-block marker fires every folded height regardless of cadence.
     const MARGIN: u64 = 20;
     rig.cut_underlay_tcp();
     rig.assert_underlay_tcp_is_dead();
     let bar = rig.tip(&rig.founder_ns, &home, &founder_ws) + MARGIN;
     joiner.expect_line_where(
-        &format!("a checkpoint at or past height {bar} with the underlay TCP path cut"),
+        &format!("a folded block at or past height {bar} with the underlay TCP path cut"),
         Duration::from_secs(60),
         |line| {
-            let checkpoint = line.contains("node_checkpoint_written");
-            checkpoint && checkpoint_height(line).is_some_and(|height| height >= bar)
+            let folded = line.contains("resident folded block");
+            folded && folded_height(line).is_some_and(|height| height >= bar)
         },
     );
 }
 
-/// the `height=N` field of a checkpoint line.
-fn checkpoint_height(line: &str) -> Option<u64> {
+/// the `height=N` field of a "resident folded block" line.
+fn folded_height(line: &str) -> Option<u64> {
     line.split_whitespace()
         .find_map(|field| field.strip_prefix("height="))
         .and_then(|height| height.parse().ok())

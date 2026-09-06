@@ -75,8 +75,13 @@ fn host_with_wasm() -> Host {
         MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
+        "governance",
     )));
-    let mut valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut valset = valset::Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     block_on(valset.seed(MEMBER.to_vec())).expect("seed valset");
     block_on(valset.finish_seed()).expect("seed valset");
     host.register(Box::new(valset));
@@ -126,6 +131,7 @@ fn signal_ready_msg() -> Msg {
     modules_msg(&ModulesMsg::SwapReady {
         name: "hello-replacement".into(),
         module_id: "hello".into(),
+        code_hash: sha(HELLO_REPLACEMENT),
     })
 }
 
@@ -306,16 +312,19 @@ fn statesync_joiner_reconciles_to_committed_active_hash() {
     // reconstructs the identical record set over the MemStore double, and
     // the roots must agree), wasm module freshly wired from GENESIS (v1)
     // code.
-    let modreg_root = source
-        .module_root(MODULES_ID)
-        .expect("modreg root");
+    let modreg_root = source.module_root(MODULES_ID).expect("modreg root");
     let mut joiner = Host::new();
     joiner.register(Box::new(Modules::new(
         MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
+        "governance",
     )));
-    let mut joiner_valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut joiner_valset = valset::Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     block_on(joiner_valset.seed(MEMBER.to_vec())).expect("seed valset");
     block_on(joiner_valset.finish_seed()).expect("seed valset");
     joiner.register(Box::new(joiner_valset));
@@ -632,4 +641,81 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+/// ALL-OR-NOTHING: two modules swap at the SAME height and this node has only
+/// the first one's bytes. The boundary must refuse having changed NOTHING —
+/// realizing the first would leave the node running `H`'s code over state still
+/// at `H - 1` (the drain turns the Err into a stall that never applies `H`) and
+/// answering queries from it.
+#[test]
+fn a_missing_second_module_realizes_neither() {
+    let mut host = host_with_wasm();
+    // a SECOND hot-swappable module, sorted AFTER `hello` in the roster — so the
+    // resolvable entry is reached first and, unguarded, would swap.
+    host.register(Box::new(
+        WasmModule::from_bytes("zz-hello", HELLO_V1).expect("load v1"),
+    ));
+    submit(
+        &mut host,
+        0,
+        Origin::System,
+        modules_msg(&ModulesMsg::RegisterModule {
+            module_id: "zz-hello".into(),
+            code_hash: sha(HELLO_V1),
+        }),
+    );
+    // hello -> the replacement (bytes present); zz-hello -> a hash whose bytes
+    // this node does not have. both arm at H.
+    let absent = sha(b"a component this node never received");
+    for (name, module_id, code_hash) in [
+        ("hello-replacement", "hello", sha(HELLO_REPLACEMENT)),
+        ("zz-replacement", "zz-hello", absent.clone()),
+    ] {
+        submit(
+            &mut host,
+            3,
+            Origin::System,
+            modules_msg(&ModulesMsg::ScheduleSwap {
+                name: name.into(),
+                module_id: module_id.into(),
+                activation_height: H,
+                code_hash: code_hash.clone(),
+            }),
+        );
+        submit(
+            &mut host,
+            4,
+            Origin::External(MEMBER.to_vec()),
+            modules_msg(&ModulesMsg::SwapReady {
+                name: name.into(),
+                module_id: module_id.into(),
+                code_hash,
+            }),
+        );
+    }
+
+    // the order the boundary walks: `hello` (resolvable) BEFORE `zz-hello`
+    // (absent) is what makes this a partial-realization test at all.
+    let req = modules::encode_query(&ModulesQuery::ModuleStatus);
+    let bytes = block_on(host.query(MODULES_ID, &req)).expect("status");
+    let ModulesReply::ModuleStatus { modules } = modules::decode_reply(&bytes).expect("decode")
+    else {
+        panic!("expected ModuleStatus");
+    };
+    let ids: Vec<&str> = modules.iter().map(|m| m.module_id.as_str()).collect();
+    assert_eq!(ids, vec!["hello", "zz-hello"], "roster order");
+
+    let root0 = host.root_hash();
+    let src = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
+    let err = realize(&mut host, H, &src).expect_err("the absent second entry fails closed");
+    assert!(matches!(err, Error::Module(m) if m.contains("absent")));
+
+    assert_eq!(
+        host.module_code_hash("hello"),
+        Some(sha(HELLO_V1)),
+        "the resolvable FIRST module must not have swapped — the boundary is all-or-nothing"
+    );
+    assert_eq!(host.module_code_hash("zz-hello"), Some(sha(HELLO_V1)));
+    assert_eq!(root0, host.root_hash(), "nothing moved the root-hash");
 }

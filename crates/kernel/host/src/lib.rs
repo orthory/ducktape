@@ -81,6 +81,15 @@ pub fn global_root_of(pairs: &[(ModuleId, StateRoot)]) -> StateRoot {
 /// loop is guaranteed to terminate regardless of module behavior.
 pub const MAX_DISPATCHES: u32 = 1024;
 
+/// hard cap on rollback+replay cycles per BLOCK — [`MAX_DISPATCHES`] is per
+/// `drain_queue` CALL and so bounds one member, never the batch. Per-op
+/// isolation replays every already-accepted member when a member that STAGED
+/// then fails, which is quadratic in the member count; this bounds the block's
+/// re-execution to `members * (1 + MAX_BLOCK_REPLAYS)`. Past the budget the
+/// remaining members are rejected unexecuted — a function of the block alone,
+/// so every validator produces the identical verdict set.
+pub const MAX_BLOCK_REPLAYS: u32 = 8;
+
 /// the genesis-constant module id the `modules` registry registers under. read
 /// by the boundary code-swap realization ([`Host::realize_module_swaps`]) and by
 /// the drain's [`Host::pending_modules_advance`] injection; absent on a host
@@ -157,12 +166,26 @@ impl CodeSource for NoCodeSource {
 #[async_trait::async_trait(?Send)]
 pub trait ModuleFactory: Send + Sync {
     /// a module instance for `id` from component bytes already verified
-    /// against the committed code hash.
-    async fn instantiate(
-        &self,
-        id: &str,
-        component_bytes: &[u8],
-    ) -> Result<Box<dyn Module>, Error>;
+    /// against the committed code hash — or [`Admitted::ForeignAbi`] for bytes
+    /// that are no module at all.
+    async fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Admitted, Error>;
+}
+
+/// what a [`ModuleFactory`] made of one admission's verified bytes.
+///
+/// The registry is id-generic bookkeeping: any id may carry a hash-pinned
+/// artifact, and the reachability plane's `ducktape:netstack` guest is
+/// delivered through exactly that record. Only the factory can tell the two
+/// apart, and only it may say so — a refusal that is really "this build cannot
+/// run a genuine module" MUST stay fail-closed, or a node seats a different
+/// registry set than its peers and forks in silence.
+pub enum Admitted {
+    /// a `ducktape:module` component, instantiated and ready to seat.
+    Module(Box<dyn Module>),
+    /// the bytes speak another world entirely: the registry entry is another
+    /// plane's commitment record, not an admission. The module boundary skips
+    /// it — see [`Host::realize_module_swaps`].
+    ForeignAbi,
 }
 
 /// sha256 content hash of component bytes — the verify side of a code swap.
@@ -552,6 +575,21 @@ impl core::fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+/// one roster entry's decided realization, resolved by
+/// [`Host::realize_module_swaps`]'s first phase and applied by its second — the
+/// staging that makes the boundary all-or-nothing.
+enum Realization {
+    /// a running module moves to already-fetched, hash-verified bytes.
+    Swap { module_id: ModuleId, bytes: Vec<u8> },
+    /// an ADMISSION: the instantiated module takes its registry seat.
+    Seat(Box<dyn Module>),
+    /// another plane's component — latch the decision, register nothing.
+    Foreign {
+        module_id: ModuleId,
+        code_hash: Vec<u8>,
+    },
+}
+
 /// the deterministic state machine: a module registry + dispatch + drain.
 #[derive(Default)]
 pub struct Host {
@@ -560,6 +598,12 @@ pub struct Host {
     /// instantiates post-genesis ADMISSIONS at the activation boundary.
     /// `None` fails closed the moment an admission arms — never before.
     module_factory: Option<Box<dyn ModuleFactory>>,
+    /// `(module id, code hash)` pairs this boundary has already decided are
+    /// [`Admitted::ForeignAbi`] — THE LATCH. Deciding costs a component
+    /// compile and this boundary runs before EVERY block, so the answer (which
+    /// cannot change for a fixed pair) is paid, reported, and skipped from
+    /// then on. Per-node bookkeeping, never part of `root()`.
+    foreign_admissions: BTreeSet<(ModuleId, Vec<u8>)>,
 }
 
 impl Host {
@@ -567,6 +611,7 @@ impl Host {
         Self {
             registry: BTreeMap::new(),
             module_factory: None,
+            foreign_admissions: BTreeSet::new(),
         }
     }
 
@@ -766,10 +811,23 @@ impl Host {
     /// activation is past `height` seats its first code; one registered but
     /// never activated is nothing to realize.
     ///
-    /// FAIL-CLOSED: a designated hash whose bytes this node lacks, or bytes whose
-    /// sha256 does not match the committed hash, is a hard error (the node cannot
-    /// honestly apply `height` without the agreed code) — it returns `Err` with no
-    /// partial swap applied. ABSENT registry → nothing to reconcile, `Ok(())`.
+    /// FAIL-CLOSED and ALL-OR-NOTHING: a designated hash whose bytes this node
+    /// lacks, or bytes whose sha256 does not match the committed hash, is a hard
+    /// error (the node cannot honestly apply `height` without the agreed code) —
+    /// it returns `Err` with no partial swap applied. That is why realization is
+    /// two phases: the whole roster RESOLVES first (fetch, verify, instantiate —
+    /// every fallible step, touching nothing), and only a fully-resolved roster
+    /// APPLIES. A half-applied roster would leave this node running code the
+    /// registry designates for `height` over state still at `height - 1` — and,
+    /// for an admission, publishing a root-hash no block ever sealed — while the
+    /// drain turns the `Err` into a retryable code stall that never applies
+    /// `height`. ABSENT registry → nothing to reconcile, `Ok(())`.
+    ///
+    /// The one thing that is NOT an admission is code that speaks another
+    /// world ([`Admitted::ForeignAbi`]): the registry is id-generic and other
+    /// planes commit their hash-pinned components through it, so such an entry
+    /// is skipped and latched ([`Host::skip_foreign_admission`]) rather than
+    /// halting every block on every node forever.
     pub async fn realize_module_swaps(
         &mut self,
         height: u64,
@@ -778,6 +836,9 @@ impl Host {
         let Some(modules) = self.module_status().await else {
             return Ok(());
         };
+        // PHASE 1 — RESOLVE. every fallible step happens here, against an
+        // untouched registry: a miss anywhere returns Err having mutated nothing.
+        let mut realizations: Vec<Realization> = Vec::new();
         for m in modules {
             let Some(target) = modules::code_at(&m, height) else {
                 continue; // registered, never activated — nothing to realize.
@@ -796,6 +857,12 @@ impl Host {
             };
             if current.as_deref() == Some(target) {
                 continue; // already on the designated code — idempotent no-op.
+            }
+            let decided_foreign = self
+                .foreign_admissions
+                .contains(&(m.module_id.clone(), target.to_vec()));
+            if decided_foreign {
+                continue; // another plane's record, already answered — see the latch.
             }
             let Some(bytes) = src.fetch(target).await else {
                 // the ONE line that precedes the fatal: a fail-closed miss is
@@ -824,7 +891,10 @@ impl Host {
                 )));
             }
             match current {
-                Some(_) => self.swap_module_code(&m.module_id, &bytes)?,
+                Some(_) => realizations.push(Realization::Swap {
+                    module_id: m.module_id.clone(),
+                    bytes,
+                }),
                 None => {
                     // the admission path: registration changes root-hash by
                     // construction (the registry set is what `root_hash`
@@ -837,7 +907,14 @@ impl Host {
                             m.module_id,
                         )));
                     };
-                    let module = factory.instantiate(&m.module_id, &bytes).await?;
+                    let Admitted::Module(module) = factory.instantiate(&m.module_id, &bytes).await?
+                    else {
+                        realizations.push(Realization::Foreign {
+                            module_id: m.module_id.clone(),
+                            code_hash: target.to_vec(),
+                        });
+                        continue;
+                    };
                     if module.id() != m.module_id {
                         return Err(Error::Module(format!(
                             "module factory instantiated `{}` for admission `{}` — fail-closed",
@@ -845,11 +922,54 @@ impl Host {
                             m.module_id,
                         )));
                     }
-                    self.registry.insert(module.id(), module);
+                    realizations.push(Realization::Seat(module));
                 }
             }
         }
+
+        // PHASE 2 — APPLY the resolved roster. `swap_code` is the one call left
+        // that can fail: it compiles bytes this phase already matched against the
+        // consensus-committed hash, so a failure here is code every honest node
+        // rejects identically, not a per-node byte miss.
+        for realization in realizations {
+            match realization {
+                Realization::Swap { module_id, bytes } => {
+                    self.swap_module_code(&module_id, &bytes)?
+                }
+                Realization::Seat(module) => {
+                    self.registry.insert(module.id(), module);
+                }
+                Realization::Foreign {
+                    module_id,
+                    code_hash,
+                } => self.skip_foreign_admission(&module_id, &code_hash),
+            }
+        }
         Ok(())
+    }
+
+    /// latch one `(id, code hash)` pair as another plane's record and say so
+    /// ONCE. The registry admits any id: the reachability plane's
+    /// `ducktape:netstack` guest is delivered through the very same record,
+    /// and a boundary that treated it as a module admission would fail closed
+    /// on every node, on every block, forever — a halted chain, not a refused
+    /// swap. The code it commits is realized by whatever plane owns that id
+    /// (netstack: its own non-blocking reconciler), never here.
+    fn skip_foreign_admission(&mut self, module_id: &str, code_hash: &[u8]) {
+        let newly_decided = self
+            .foreign_admissions
+            .insert((module_id.to_string(), code_hash.to_vec()));
+        if !newly_decided {
+            return;
+        }
+        tracing::warn!(
+            target: "ducktape::modules",
+            reason = "foreign_module_abi",
+            module = %module_id,
+            code_hash = %hex32(code_hash),
+            "the code this registry entry commits is not a `ducktape:module` — the module \
+             boundary skips it and keeps sealing"
+        );
     }
 
     /// the current root-hash: [`global_root`] over the registered modules.
@@ -1213,13 +1333,16 @@ impl Host {
             injections.push_back((Origin::System, deliver));
         }
 
-        // 2. per-op isolation: each input op is one unit. `touched` and the
-        // modules' own staging accumulate ACROSS units (never committed
-        // mid-batch); accepted units all replay on a later rejection — one
-        // shared stage.
+        // 2. per-op isolation: each input op is one unit, drained against its OWN
+        // touched set (merged into the block's on the way out). the modules'
+        // staging accumulates ACROSS units (never committed mid-batch), so a unit
+        // that STAGED and then failed is entangled with the accepted units and
+        // costs a rollback + replay; a unit whose own set is EMPTY reached no
+        // module at all and costs nothing. the replay budget bounds the rest.
         let mut touched: BTreeSet<ModuleId> = BTreeSet::new();
         let mut accepted: Vec<AcceptedUnit> = Vec::new();
         let mut results: Vec<Option<MemberOutcome>> = (0..ops.len()).map(|_| None).collect();
+        let mut replays: u32 = 0;
 
         for (i, op) in ops.into_iter().enumerate() {
             let BlockOp {
@@ -1230,18 +1353,23 @@ impl Host {
 
             let mut ev: Vec<Event> = Vec::new();
             let mut di: Vec<DispatchRecord> = Vec::new();
+            let mut unit_touched: BTreeSet<ModuleId> = BTreeSet::new();
             let queue: VecDeque<(Origin, Msg)> = VecDeque::from([(origin.clone(), msg.clone())]);
-            match self
+            let verdict = self
                 .drain_queue(
                     height,
                     consensus_time,
                     queue,
-                    &mut touched,
+                    &mut unit_touched,
                     &mut ev,
                     &mut di,
                 )
-                .await
-            {
+                .await;
+            // whatever this unit reached is part of the block's stage from here
+            // (aborted below on a rejection, committed at the boundary otherwise).
+            let unit_staged = !unit_touched.is_empty();
+            touched.append(&mut unit_touched);
+            match verdict {
                 Ok(()) => {
                     accepted.push(AcceptedUnit {
                         origin,
@@ -1257,6 +1385,16 @@ impl Host {
                     });
                 }
                 Err(reason) => {
+                    results[i] = Some(MemberOutcome::Rejected {
+                        reason: reason.to_string(),
+                    });
+                    // an unknown target or an acl refusal is rejected BEFORE any
+                    // module is reached, so it staged nothing and the accepted
+                    // units' stage already IS the state a rollback would rebuild
+                    // — the whole point of the per-unit set.
+                    if !unit_staged {
+                        continue;
+                    }
                     // ISOLATE: this unit's partial stage is entangled with the
                     // accepted units' stage (one shared per-module stage), so
                     // roll the WHOLE stage back, then replay only the accepted
@@ -1264,11 +1402,22 @@ impl Host {
                     self.abort_all(&mut touched).await?;
                     self.replay_accepted(height, consensus_time, &mut accepted, &mut touched)
                         .await?;
-                    results[i] = Some(MemberOutcome::Rejected {
-                        reason: reason.to_string(),
-                    });
+                    replays += 1;
+                    if replays > MAX_BLOCK_REPLAYS {
+                        break;
+                    }
                 }
             }
+        }
+
+        // the replay budget ran out: every member the loop did not reach is
+        // rejected UNEXECUTED. the budget is a function of the block alone
+        // (member order and their verdicts), so every validator rejects exactly
+        // the same suffix — deterministic, like any other rejection.
+        for slot in results.iter_mut().filter(|s| s.is_none()) {
+            *slot = Some(MemberOutcome::Rejected {
+                reason: format!("block replay budget exhausted ({MAX_BLOCK_REPLAYS})"),
+            });
         }
 
         // 3. write each accepted unit's authoritative trace into its slot and

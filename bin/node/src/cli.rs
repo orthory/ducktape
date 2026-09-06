@@ -102,9 +102,10 @@ fn work_workspace(selector: &Selector) -> Result<PathBuf, Box<dyn std::error::Er
         .to_path_buf())
 }
 
-/// `anyone` is the literal, everything else is an account (a number or a
-/// display name — the same resolution `user cred grant` takes). A number
-/// resolves offline; a display name needs the node to answer.
+/// `anyone` is the literal, everything else is an account NUMBER (the same
+/// authority resolution `cred grant` takes — a display name is refused, never
+/// matched: it is freely rewritable and not unique, and this decision is
+/// whose workload the node runs). A number resolves offline.
 fn resolve_work_target(
     workspace: &std::path::Path,
     input: &str,
@@ -113,9 +114,9 @@ fn resolve_work_target(
         return Ok(AdmitTarget::Anyone);
     }
     let base = config::http_base_in(workspace)?;
-    Ok(AdmitTarget::Account(crate::account_cli::resolve_account(
-        &base, input,
-    )?))
+    Ok(AdmitTarget::Account(
+        crate::account_cli::resolve_account_authority(&base, input)?,
+    ))
 }
 
 fn cmd_work_list(args: SelectorArgs) -> CommandResult {
@@ -527,6 +528,7 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
     let genesis = config::Genesis::compose(
         &founding_set,
         &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
+        &topology::TOPOLOGY.index_guest_ids(topology::PRODUCTION),
     )
     .map_err(|e| {
         format!("{e} — pass --modules <dir> holding every <id>.component.wasm and <id>.index.wasm")
@@ -611,6 +613,9 @@ fn cmd_init(args: InitArgs) -> Result<(), Box<dyn std::error::Error>> {
         coordination: None,
         modules,
         genesis: hex_bytes(&genesis_hash),
+        // the founding beat: stated once here, carried by the invite, and
+        // inherited by every joiner — it is a genesis fact, not plumbing.
+        block_time_ms: args.block_time_ms,
     };
     if let Some(addr) = config::dialable(Some(&plumbing.advertised), &plumbing.listen)? {
         descriptor.add_bootstrap(&me, &addr);
@@ -772,10 +777,13 @@ pub(crate) fn mint_invite_blob(
     let key = config::load_identity(&base.join(&raw.key_file))?;
     let dial_hint = config::dialable(Some(&raw.advertised), &raw.listen)?;
     let has_coordinated_reach = descriptor.has_coordinated_reach()?;
-    if let Some(addr) = &dial_hint {
-        descriptor.add_bootstrap(&key.public_key(), addr);
+    let descriptor_changed = match &dial_hint {
+        Some(addr) => descriptor.add_bootstrap(&key.public_key(), addr),
+        None => false,
+    };
+    if descriptor_changed {
+        descriptor.save(&descriptor_path)?;
     }
-    descriptor.save(&descriptor_path)?;
 
     // the WireGuard bootstrap: endpoints are minted from the advertised host
     // (the listen IP is usually unspecified) + the plane's UDP ports; the

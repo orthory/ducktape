@@ -60,6 +60,21 @@ impl ScheduledSwap {
         let floor_reached = self.activation_height <= height;
         latched_before && floor_reached
     }
+
+    /// STALE at `height`: the activation height is reached and `ready_at` was
+    /// never latched. nothing armed this swap and [`ScheduledSwap::armed_at`]
+    /// cannot fire for it here — it is a dead designation, not a swap in
+    /// flight, so governance may REPLACE it with a new schedule or cancel it.
+    ///
+    /// without this, a pending no validator can ever signal — a component that
+    /// is not a `ducktape:module`, so no readiness probe can load it — is the
+    /// network's designation for life: `ScheduleSwap` refuses while a pending
+    /// exists and `CancelSwap` refuses once the activation height is reached.
+    pub fn stale_at(&self, height: u64) -> bool {
+        let past_due = self.activation_height <= height;
+        let never_latched = self.ready_at.is_none();
+        past_due && never_latched
+    }
 }
 
 /// one activation: `code_hash` became the module's running code FOR block
@@ -159,7 +174,15 @@ pub enum ModulesMsg {
     /// a validator records that it HOLDS (verified locally) the pending swap's
     /// component bytes. `Origin::External(validator)` only, member-gated against
     /// the valset; the last covering signal latches the swap `ready`.
-    SwapReady { name: String, module_id: String },
+    /// `code_hash` names the BYTES this validator verified: a swap name is
+    /// reusable across schedules, so a signal that outlives the pending it was
+    /// written for must be refused rather than credited to whatever hash now
+    /// wears the name.
+    SwapReady {
+        name: String,
+        module_id: String,
+        code_hash: Vec<u8>,
+    },
 
     /// the system-injected boundary tick, keyed on `env.height`: activate every
     /// armed code swap. `Origin::System` only.
@@ -236,6 +259,7 @@ mod tests {
         rt_msg(ModulesMsg::SwapReady {
             name: "swap-hello".into(),
             module_id: "hello".into(),
+            code_hash: vec![2u8; CODE_HASH_LEN],
         });
         rt_msg(ModulesMsg::Advance);
 

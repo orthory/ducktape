@@ -77,7 +77,20 @@ fn stage_founding_set() {
             &module_dir.join("component.wasm"),
             &dest.join(format!("{}.component.wasm", spec.id)),
         );
-        if declares_index_guest(&module_dir) {
+        let ships_guest = declares_index_guest(&module_dir);
+        // topology::TOPOLOGY.has_index_guest is `workspace_config::genesis`'s
+        // OWN declaration of this same fact (it has no access to the source
+        // checkout, so it cannot read `src/index_guest.rs` itself) — a drift
+        // here would silently pass a founding set here while `node init`
+        // refuses it, or vice versa. Caught at build time, naming the module.
+        assert_eq!(
+            ships_guest, spec.has_index_guest,
+            "module {}: crates/noded/build.rs sees src/index_guest.rs = {ships_guest} but \
+             topology::TOPOLOGY says has_index_guest = {} — update crates/topology/src/lib.rs \
+             to match",
+            spec.id, spec.has_index_guest
+        );
+        if ships_guest {
             stage(
                 &module_dir.join("index.wasm"),
                 &dest.join(format!("{}.index.wasm", spec.id)),

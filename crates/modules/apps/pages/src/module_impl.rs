@@ -67,8 +67,10 @@ impl Module for Pages {
             } if !mentions.is_empty() => Some((comment_id.clone(), mentions.clone())),
             _ => None,
         };
-        // origin + consensus time feed the comment ops (author + timestamp);
-        // block ops ignore them. clone off `ctx` so `self` can borrow mutably.
+        // origin derives the actor for every op (comment authorship, page
+        // authorship, and the `may_edit` gate on every other page/block op);
+        // consensus time feeds only the comment ops' stored timestamps.
+        // clone off `ctx` so `self` can borrow mutably.
         let origin = ctx.env().origin.clone();
         let now = ctx.env().consensus_time;
         self.apply(m, &origin, now)

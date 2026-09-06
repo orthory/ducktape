@@ -63,6 +63,14 @@ pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 /// fleet, and each still costs [`MAX_AGENT_RECORD_BYTES`] of replicated state.
 pub const MAX_REGISTERED_AGENTS: usize = 1024;
 
+/// hard cap on the COUNT of agents ONE owner may register. without this, a
+/// single account (one external key, or one module) fills the whole registry
+/// (`MAX_REGISTERED_AGENTS`) alone and locks out every other account — the
+/// global cap bounds total state, this one bounds one account's SHARE of it.
+/// small on purpose: a legitimate fleet operator still needs dozens, not
+/// hundreds, of distinct agent identities.
+pub const MAX_AGENTS_PER_OWNER: usize = 32;
+
 /// hard cap on the COUNT of skills one agent curates. an unbounded skill list
 /// is unbounded replicated state (it rides the record, hence every snapshot)
 /// AND an unbounded run context — every one of them costs at least an index
@@ -76,6 +84,30 @@ pub const MAX_REGISTERED_AGENTS: usize = 1024;
 /// skill belongs in the global library at `/shared/skills/`, which every run is
 /// told about and which costs a run nothing until it reads one.
 pub const MAX_SKILLS_PER_AGENT: usize = 64;
+
+/// hard cap on a skill's `name` length in bytes. the name is not a label — it
+/// becomes a run's host mount directory name verbatim — so it rides the same
+/// bound an ordinary filename would.
+pub const MAX_SKILL_NAME_BYTES: usize = 64;
+
+/// the ONE rule for a skill's `name`: a bounded charset, `.`/`..` refused
+/// outright (both pass the charset alone), and a byte cap. a `SkillRef::name`
+/// becomes a run's host directory name verbatim
+/// (`compute_service::envelope` copies it into `mount_subpath`), so this is
+/// the single predicate BOTH sides of that trust boundary must agree on:
+/// [`AgentModule::validate_skills`] calls it at consensus time, and
+/// `noded::agent_provision::mount_dir_name` calls this same function at
+/// provision time — one rule, never two that could drift into a record
+/// consensus accepts but no run can load.
+pub fn is_skill_mount_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_SKILL_NAME_BYTES
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
 
 /// the duckfs directory the GLOBAL SKILL LIBRARY lives under, one subdirectory
 /// per skill (`<name>/SKILL.md`). a CONVENTION, not a consensus-enforced
@@ -603,9 +635,14 @@ pub enum AgentAction {
         checked: bool,
     },
     /// write a small UTF-8 text file through the files module's commit wire
-    /// ([`ACTION_DUCKFS_WRITE_TEXT`]). `base_snapshot` is the committed DuckFS
-    /// refs head observed by the tool before signing; `None` means the files
-    /// tree was empty.
+    /// ([`ACTION_DUCKFS_WRITE_TEXT`]). `base_snapshot` feeds files' own
+    /// per-path CAS (`FilesMsg::Commit`), never a global-head check: `Some`
+    /// names the snapshot the write was staged against, `None` is files' own
+    /// create-only sense (the empty tree) — the path must not already exist.
+    /// omitted by an action the model authors directly (not through the
+    /// `ducktape_duckfs_write_text` tool, which always fills it from a live
+    /// refs query), so `None` on a non-empty filesystem is ordinary, not an
+    /// error: it just means the write only succeeds if that path is new.
     DuckfsWriteText {
         path: String,
         text: String,
@@ -672,11 +709,16 @@ pub enum AgentMsg {
     PauseAgent { agent_id: String },
     /// owner-gated: resume engagement.
     ResumeAgent { agent_id: String },
+    /// owner- or governance-gated: remove the agent from the registry and
+    /// free its roster slot. notifies the hook target
+    /// ([`AgentEvent::Deregistered`]) in the same block, so the agent's
+    /// dispatch-plane recipe is retired atomically with the record.
+    DeregisterAgent { agent_id: String },
 }
 
 // ---- the registry hook ----------------------------------------------------------
 
-/// the registry's ONE follow-up shape, emitted to a genesis-configured hook
+/// the registry's follow-up shape, emitted to a genesis-configured hook
 /// target (the runs module) in the same block as the registry write that
 /// caused it. the hook keeps the agent's dispatch-plane recipe in lockstep:
 /// if the recipe registration is rejected (a squatted id), the whole block
@@ -696,6 +738,8 @@ pub enum AgentEvent {
         agent_id: String,
         capability: String,
     },
+    /// an agent left the registry; the hook retires its recipe.
+    Deregistered { agent_id: String },
 }
 
 // ---- queries ------------------------------------------------------------------

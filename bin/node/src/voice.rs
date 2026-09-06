@@ -50,12 +50,15 @@ use tokio::sync::{mpsc, watch};
 
 use crate::overlay_book::OverlayPeers;
 
-/// Inbound audio queue per flow: ~2.5 s of one speaker's frames. Overflow
-/// drops the oldest inside the flow (the plane's drop-oldest contract).
+/// Inbound audio queue per speaker: ~2.5 s of one speaker's frames. Overflow
+/// drops that speaker's oldest (the plane's per-sender drop-oldest contract).
 const FLOW_QUEUE: usize = 128;
-/// Inbound camera queue per flow: ~2 keyframe-burst frames of fragments.
+/// Inbound camera queue per sender: ~2 keyframe-burst frames of fragments
+/// (a frame is at most `media_service::video::MAX_FRAGS`). Per SENDER, not
+/// per flow: every huddle participant's camera rides one flow, and a shared
+/// budget would let one peer's keyframe burst evict the others' fragments.
 const VIDEO_FLOW_QUEUE: usize = 256;
-/// Inbound call-control queue per flow: tiny, one message per event.
+/// Inbound call-control queue per sender: tiny, one message per event.
 const CTL_FLOW_QUEUE: usize = 32;
 /// Webview↔hub pcm lanes: a small cushion (8 × 20 ms); late audio is dead
 /// audio, so both sides drop rather than backpressure when it fills.
@@ -669,8 +672,17 @@ async fn run_presence_session<T: DataPlaneTransport>(
     }
 }
 
+/// A peer restarting their media is a session-level fact, but the peer picks
+/// the field: latch it, first and every hundredth, so flipping it per
+/// datagram cannot evict the ring.
+const EPOCH_CHANGE_EVERY: u64 = 100;
+
 /// per-sending-peer receive state on the video/control flows.
 struct PeerLane {
+    /// which of the sender's engines this lane is following — see
+    /// `media_service::video::VideoHeader::epoch`.
+    epoch: u32,
+    epoch_changes: u64,
     reassembler: media_service::video::Reassembler,
     /// last time we asked THIS peer for a keyframe (≥1 s apart).
     last_keyframe_req: Option<Instant>,
@@ -685,8 +697,10 @@ struct PeerLane {
 }
 
 impl PeerLane {
-    fn new() -> Self {
+    fn new(epoch: u32) -> Self {
         PeerLane {
+            epoch,
+            epoch_changes: 0,
             reassembler: media_service::video::Reassembler::default(),
             last_keyframe_req: None,
             last_seen_dropped: 0,
@@ -694,6 +708,31 @@ impl PeerLane {
             clean_windows: 0,
             window_complete: 0,
             window_dropped_base: 0,
+        }
+    }
+
+    /// The peer restarted their media without leaving the roster, so their
+    /// `frame_no` went back to 0. A retained reassembler calls that stale
+    /// forever and never advances `dropped_frames`, so no keyframe request
+    /// ever self-heals it: start the stream over instead. The rate hint we
+    /// already give this peer and its keyframe limiter survive — the link
+    /// did not change, only the sender's stream did.
+    fn follow_new_epoch(&mut self, epoch: u32, peer: PeerId) {
+        self.epoch = epoch;
+        self.reassembler = media_service::video::Reassembler::default();
+        self.last_seen_dropped = 0;
+        self.window_complete = 0;
+        self.window_dropped_base = 0;
+        self.epoch_changes += 1;
+        let occurrences = self.epoch_changes;
+        if occurrences == 1 || occurrences.is_multiple_of(EPOCH_CHANGE_EVERY) {
+            tracing::info!(
+                target: "ducktape::voice",
+                reason = "media_epoch_changed",
+                peer = %crate::config::hex_bytes(&peer.0[..4]),
+                occurrences,
+                "peer's media restarted — video lane reopened"
+            );
         }
     }
 }
@@ -809,7 +848,7 @@ async fn run_session<T: DataPlaneTransport>(
                     recipients.borrow().iter().map(|raw| PeerId(*raw)).collect();
                 if recipients_now.is_empty() { continue; }
                 let Ok(fragments) = media_service::video::fragment_frame(
-                    frame_no, frame.keyframe, frame.ts_ms, &frame.data,
+                    engine.epoch(), frame_no, frame.keyframe, frame.ts_ms, &frame.data,
                 ) else { continue }; // oversize/empty: drop, stay alive
                 frame_no = frame_no.wrapping_add(1);
                 for fragment in &fragments {
@@ -822,7 +861,13 @@ async fn run_session<T: DataPlaneTransport>(
             inbound = video.recv() => {
                 let (peer, bytes) = inbound;
                 let Ok((header, payload)) = media_service::video::decode_fragment(&bytes) else { continue };
-                let lane = peer_lanes.entry(peer.0).or_insert_with(PeerLane::new);
+                let lane = peer_lanes.entry(peer.0).or_insert_with(|| PeerLane::new(header.epoch));
+                if lane.epoch != header.epoch {
+                    // their media restarted under the same roster entry: a
+                    // fresh stream, and a keyframe is the only way into it.
+                    lane.follow_new_epoch(header.epoch, peer);
+                    request_keyframe_if_due(&ctl, peer, lane).await;
+                }
                 match lane.reassembler.insert(header, payload) {
                     media_service::video::Assembly::Complete(done) => {
                         lane.window_complete += 1;
@@ -926,12 +971,23 @@ async fn run_session<T: DataPlaneTransport>(
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
                 inbound_hints.retain(|peer, _| live.contains(peer));
-                // a peer who left frees their receive lane too: a rejoiner's new
-                // session restarts frame_no at 0, which a retained reassembler
-                // (high last_emitted) would reject as Stale forever — and Stale
-                // doesn't advance dropped_frames, so no keyframe request self-heals
-                // it. Evicting the lane means the rejoiner's next frame builds a
-                // fresh reassembler and their tile lights up.
+                // a peer who left frees BOTH receive lanes, video and audio:
+                // their state is dead weight the moment they are out of the
+                // roster, and a lane per departed peer accumulates for the
+                // life of the call. A peer who comes BACK is re-anchored by
+                // the media epoch, not by this — they restart their stream
+                // whether or not they ever left the roster.
+                // the speakers are the engine's own set, not `peer_lanes`: a peer
+                // who talks with their camera off never opens a video lane.
+                let departed: Vec<PeerId> = engine
+                    .speaker_stats()
+                    .iter()
+                    .map(|speaker| speaker.peer)
+                    .filter(|peer| !live.contains(&peer.0))
+                    .collect();
+                for peer in departed {
+                    engine.forget_peer(peer);
+                }
                 peer_lanes.retain(|peer, _| live.contains(peer));
                 push_effective_rate(&recipients, &inbound_hints, &mut effective_kbps, &control_out);
                 window += 1;
@@ -1875,6 +1931,82 @@ mod tests {
         assert_eq!(
             got.data, rejoined,
             "B must emit A's post-rejoin frame, not reject it as stale"
+        );
+
+        drop((req_a_tx, req_b_tx));
+    }
+
+    /// The case eviction cannot reach: A replaces its own session — a webview
+    /// reload, a reconnect, the hub's own 'a new join replaces the current
+    /// call' path — while STAYING in B's roster. A's `frame_no` restarts at 0
+    /// against B's `last_emitted`, so without the media epoch every fragment
+    /// is Stale, `dropped_frames` never advances, no keyframe is asked for,
+    /// and A's tile stays black for the rest of B's session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_new_media_epoch_reopens_the_lane_without_a_roster_change() {
+        let key_a = [0xaa_u8; 32];
+        let key_b = [0xbb_u8; 32];
+        let (req_a_tx, req_b_tx) = two_hubs(key_a, key_b, |_| true);
+
+        let session_a = open(req_a_tx.clone()).await;
+        let mut session_b = open(req_b_tx.clone()).await;
+        session_a
+            .recipients
+            .send(vec![key_b])
+            .expect("session a alive");
+        session_b
+            .recipients
+            .send(vec![key_a])
+            .expect("session b alive");
+        // gate barrier: a roster reaches BOTH admission gates asynchronously,
+        // and the keyframes below are one-shot.
+        wait_audio_crosses(&session_a, &mut session_b).await;
+
+        // A's first stream: B emits it, so B's lane for A now carries
+        // last_emitted = 0 under A's first epoch.
+        let first: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+        session_a
+            .video_in
+            .send(media_service::call_wire::CapturedFrame {
+                keyframe: true,
+                ts_ms: 1,
+                data: first.clone(),
+            })
+            .await
+            .expect("session a alive");
+        let got = tokio::time::timeout(Duration::from_secs(10), session_b.video_out.recv())
+            .await
+            .expect("first frame must cross")
+            .expect("session b alive");
+        assert_eq!(got.data, first);
+
+        // A restarts its session on the same hub. B's roster is untouched
+        // throughout, so nothing evicts A's lane — only A's new epoch can
+        // re-anchor it.
+        let session_a2 = open(req_a_tx.clone()).await;
+        session_a2
+            .recipients
+            .send(vec![key_b])
+            .expect("session a2 alive");
+        wait_audio_crosses(&session_a2, &mut session_b).await;
+
+        let restarted: Vec<u8> = (0..5000).map(|i| ((i * 3 + 1) % 251) as u8).collect();
+        session_a2
+            .video_in
+            .send(media_service::call_wire::CapturedFrame {
+                keyframe: true,
+                ts_ms: 2,
+                data: restarted.clone(),
+            })
+            .await
+            .expect("session a2 alive");
+        let got = tokio::time::timeout(Duration::from_secs(10), session_b.video_out.recv())
+            .await
+            .expect("restarted frame must cross — the epoch must reopen A's lane")
+            .expect("session b alive");
+        assert_eq!(
+            got.data, restarted,
+            "B must emit A's post-restart frame, not reject it as stale"
         );
 
         drop((req_a_tx, req_b_tx));

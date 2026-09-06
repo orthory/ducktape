@@ -48,6 +48,11 @@ libc = "0.2"
 # on the backend goes non-exhaustive. the self dev-dependency below is what
 # keeps them in lockstep. no shipped build enables either.
 testkit = ["sandbox-host/testkit"]
+# forwards to `broker-host/verify` (real TEE quote verification, off by
+# default) so a consumer one hop above broker-host — this crate is the only
+# one between node-bin and it — has one flag to opt the whole airlock-attest
+# path in, not two.
+verify = ["broker-host/verify"]
 
 [dev-dependencies]
 # depending on ourselves with `testkit` on is how a test-only feature is turned

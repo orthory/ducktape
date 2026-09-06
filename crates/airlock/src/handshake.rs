@@ -53,11 +53,11 @@ pub fn enclave_session_keys(seal_kp: &SealKeypair, client_eph_pk: &[u8; 32]) -> 
 
 /// AEAD-wrap a token under the session key.
 pub fn seal_token(session_key: &[u8; 32], token: &[u8]) -> Vec<u8> {
-    aead::seal(session_key, token)
+    aead::seal(session_key, b"", token)
 }
 
 pub fn open_token(session_key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>> {
-    aead::open(session_key, blob)
+    aead::open(session_key, b"", blob)
 }
 
 #[cfg(test)]

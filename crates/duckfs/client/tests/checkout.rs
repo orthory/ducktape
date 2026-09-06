@@ -10,10 +10,123 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use duckfs_client::api::{ApiError, NodeApi};
 use duckfs_client::checkout::{CheckoutError, CheckoutOptions, checkout, checkout_with};
 use duckfs_client::index::Index;
-use duckfs_core::{CHUNK_SIZE, Change, Content};
+use duckfs_core::{CHUNK_SIZE, Change, Content, EntryInfo, EntryKindWire, RefsInfo, to_hex};
 use support::ModuleNode;
+
+/// a node that answers `find` with exactly the entries it was constructed
+/// with and `read` by serving `bytes` in full, no matter what path is asked
+/// for — standing in for a malicious or buggy server that publishes a
+/// self-consistent `(path, object, bytes)` triple whose `object` really does
+/// hash `bytes`, so client-side `verify()` cannot catch it. Only `refs`,
+/// `find`, and `read` are exercised by `checkout`; every other method is
+/// unreachable from this test and panics if called.
+struct MaliciousNode {
+    entries: Vec<EntryInfo>,
+    bytes: Vec<u8>,
+}
+
+impl NodeApi for MaliciousNode {
+    fn refs(&self) -> Result<RefsInfo, ApiError> {
+        Ok(RefsInfo {
+            head: Some("malicious-head".into()),
+            pins: BTreeMap::new(),
+            window_len: 1,
+        })
+    }
+
+    fn find(
+        &self,
+        _prefix: &str,
+        _snapshot: Option<&str>,
+        _after: Option<&str>,
+        _limit: u64,
+    ) -> Result<(Vec<EntryInfo>, Option<String>), ApiError> {
+        Ok((self.entries.clone(), None))
+    }
+
+    fn read(
+        &self,
+        _path: &str,
+        _snapshot: Option<&str>,
+        _offset: u64,
+        _len: u64,
+    ) -> Result<(Vec<u8>, bool), ApiError> {
+        Ok((self.bytes.clone(), true))
+    }
+
+    fn stat(&self, _path: &str, _snapshot: Option<&str>) -> Result<Option<EntryInfo>, ApiError> {
+        unimplemented!("not exercised by checkout")
+    }
+
+    fn ls(
+        &self,
+        _path: &str,
+        _snapshot: Option<&str>,
+        _after: Option<&str>,
+        _limit: u64,
+    ) -> Result<(Vec<EntryInfo>, Option<String>), ApiError> {
+        unimplemented!("not exercised by checkout")
+    }
+
+    fn history(&self, _limit: u64) -> Result<Vec<duckfs_core::SnapshotInfo>, ApiError> {
+        unimplemented!("not exercised by checkout")
+    }
+
+    fn diff(
+        &self,
+        _from: &str,
+        _to: &str,
+        _prefix: &str,
+    ) -> Result<Vec<duckfs_core::DiffEntry>, ApiError> {
+        unimplemented!("not exercised by checkout")
+    }
+
+    fn has_chunks(&self, _ids: &[String]) -> Result<Vec<bool>, ApiError> {
+        unimplemented!("not exercised by checkout")
+    }
+
+    fn stage_chunk(&self, _bytes: &[u8]) -> Result<duckfs_core::DigestHex, ApiError> {
+        unimplemented!("not exercised by checkout")
+    }
+
+    fn commit(
+        &self,
+        _base: Option<&str>,
+        _message: &str,
+        _changes: Vec<Change>,
+    ) -> Result<duckfs_client::api::CommitReceipt, ApiError> {
+        unimplemented!("not exercised by checkout")
+    }
+
+    fn pin(&self, _snapshot: &str, _name: &str) -> Result<(), ApiError> {
+        unimplemented!("not exercised by checkout")
+    }
+}
+
+/// build a `MaliciousNode` serving one File entry at `path` whose `object` is
+/// self-consistently computed over `bytes` — the same triple a lying node
+/// would hand back, so `verify()` alone cannot refuse it.
+fn malicious_file(path: &str, bytes: &[u8]) -> MaliciousNode {
+    let object = to_hex(&duckfs_client::chunk::file_object_id(
+        bytes.len() as u64,
+        &duckfs_client::chunk::chunk_ids(bytes),
+        &BTreeMap::new(),
+    ));
+    MaliciousNode {
+        entries: vec![EntryInfo {
+            path: path.into(),
+            kind: EntryKindWire::File,
+            size: bytes.len() as u64,
+            exec: false,
+            object,
+            meta: BTreeMap::new(),
+        }],
+        bytes: bytes.to_vec(),
+    }
+}
 
 const PREFIX: &str = "/shared/ws";
 
@@ -191,6 +304,114 @@ fn checkout_is_resumable_over_a_half_materialized_dir() {
         fs::read_link(root.join("link")).unwrap().to_str().unwrap(),
         "readme.txt"
     );
+    assert!(
+        duckfs_client::status::status(root).unwrap().clean,
+        "converged clean"
+    );
+}
+
+/// a published symlink's target is whatever the PUBLISHER wrote. Recreating
+/// `notes -> /home/<op>/.ducktape` verbatim hands whatever reads the checkout
+/// next — the sandbox asset stager, the agent run itself — a door out of the
+/// tree onto the checking-out machine's own files.
+#[test]
+fn a_symlink_leaving_the_checkout_root_is_refused() {
+    for target in ["/home/op/.ducktape", "../../escape"] {
+        let node = ModuleNode::new();
+        node.seed_commit(
+            None,
+            "seed",
+            vec![
+                put_inline(&format!("{PREFIX}/readme.txt"), b"hello duckfs", false),
+                Change::Symlink {
+                    path: format!("{PREFIX}/sub/notes"),
+                    target: target.into(),
+                },
+            ],
+        )
+        .expect("seed commit");
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = checkout(&node, dir.path(), PREFIX, None).expect_err("refused");
+        assert!(
+            matches!(err, CheckoutError::EscapingLink(_)),
+            "{target} must be refused, got {err}"
+        );
+        assert!(
+            dir.path().join("sub/notes").symlink_metadata().is_err(),
+            "{target} must not be materialized"
+        );
+    }
+}
+
+/// a node that answers `find` with an entry path escaping the checked-out
+/// prefix via `..` must be refused wholesale, and nothing lands outside the
+/// checkout root (issue #1609).
+#[test]
+fn a_find_reply_escaping_the_prefix_via_dotdot_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("authorized_keys");
+
+    // `/prefix/../../x` canonicalizes outside `/prefix` entirely.
+    let node = malicious_file(&format!("{PREFIX}/../../x"), b"pwned");
+    let err = checkout(&node, dir.path(), PREFIX, None).expect_err("refused");
+    assert!(
+        matches!(err, CheckoutError::EscapingPath(_)),
+        "expected EscapingPath, got {err}"
+    );
+    assert!(
+        !target.exists(),
+        "nothing must land outside the checkout root"
+    );
+    assert!(
+        fs::read_dir(dir.path()).unwrap().next().is_none() || !dir.path().join("x").exists(),
+        "nothing must land inside the checkout root either"
+    );
+}
+
+/// a checkout root swapped, between runs, from a real directory to a symlink
+/// pointing outside must be replaced by the committed directory, not written
+/// through (issue #1610).
+#[test]
+fn a_preexisting_symlink_in_place_of_a_dir_is_replaced_on_recheckout() {
+    let node = ModuleNode::new();
+    node.seed_commit(
+        None,
+        "seed",
+        vec![put_inline(
+            &format!("{PREFIX}/sub/inside.txt"),
+            b"committed body",
+            false,
+        )],
+    )
+    .expect("seed commit");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let outside = tempfile::tempdir().unwrap();
+
+    // the operator (or an earlier checkout) leaves `sub` as a symlink to a
+    // directory outside the checkout root.
+    fs::create_dir_all(root).unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+
+    checkout(&node, root, PREFIX, None).expect("checkout converges");
+
+    // `sub` is now the committed real directory, not the stale symlink.
+    let sub_meta = fs::symlink_metadata(root.join("sub")).unwrap();
+    assert!(sub_meta.is_dir(), "sub is a real dir, not a symlink");
+    assert_eq!(
+        fs::read(root.join("sub/inside.txt")).unwrap(),
+        b"committed body"
+    );
+
+    // and nothing was written through the old link into `outside`.
+    assert!(
+        !outside.path().join("inside.txt").exists(),
+        "nothing landed outside the checkout root"
+    );
+
     assert!(
         duckfs_client::status::status(root).unwrap().clean,
         "converged clean"

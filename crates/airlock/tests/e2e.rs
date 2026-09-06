@@ -230,7 +230,8 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
         .open_session_sealed(&seal_pk, "test-sub", &WorkRef::Direct)
         .await
         .unwrap();
-    let sealed_body = bodyseal::seal_request(&keys, br#"{"secret":"prompt"}"#);
+    let aad = bodyseal::request_aad("POST", "/v1/messages");
+    let sealed_body = bodyseal::seal_request(&keys, &aad, br#"{"secret":"prompt"}"#);
     assert!(
         !sealed_body.windows(6).any(|w| w == b"prompt"),
         "the wire body must not contain the plaintext"
@@ -537,6 +538,65 @@ async fn sessions_route_to_the_named_credential() {
     let seen_b = round_trip_via(&gw, &gateway_url, &seal_pk, "b").await;
     assert_eq!(seen_a, "Bearer tok-a");
     assert_eq!(seen_b, "Bearer tok-b");
+}
+
+/// `ducktape user cred remove` deletes the store dir and commits the tombstone,
+/// after which the store loader reports the name ABSENT. Every session already
+/// holding a token for it must stop drawing on the credential right then — the
+/// gateway used to keep the parsed entry (live access + refresh token) and go
+/// on proxying to the vendor for the rest of an hour's TTL and 4096 requests,
+/// so the operator watched the removal "work" while the credential was still
+/// being spent.
+#[tokio::test]
+async fn a_removed_credential_stops_serving_the_sessions_already_open_on_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let upstream = boot_echo_upstream().await;
+    let kp = SealKeypair::generate();
+    let seal_pk = kp.public_bytes();
+    // The store, as the gateway sees it: holding the credential until the
+    // operator removes it, and answering `Absent` from then on.
+    let removed = Arc::new(AtomicBool::new(false));
+    let store = removed.clone();
+    let reload: airlock::server::ReloadCredential = Arc::new(move |_name: &str| {
+        match store.load(Ordering::SeqCst) {
+            true => airlock::server::StoreLoad::Absent,
+            false => airlock::server::StoreLoad::Unchanged,
+        }
+    });
+    let (app, _) = server::build_self_host_reloadable(
+        self_host_cfg(Some(kp), upstream.clone(), String::new()),
+        vec![("a".into(), CredentialKind::Claude, CredentialPayload::Bearer {
+            access_token: "tok-a".into(),
+        })],
+        None,
+        reload,
+    )
+    .unwrap();
+    let gateway_url = spawn(app).await;
+    let gw = Gateway::local(gateway_url.clone());
+
+    let token = gw.open_session(&seal_pk, "a", &WorkRef::Direct).await.unwrap();
+    let proxied = || {
+        reqwest::Client::new()
+            .post(format!("{gateway_url}/v1/messages"))
+            .bearer_auth(&token)
+            .body("{}")
+            .send()
+    };
+    let before = proxied().await.unwrap();
+    assert_eq!(before.status(), reqwest::StatusCode::OK);
+    assert_eq!(before.text().await.unwrap(), "Bearer tok-a");
+
+    removed.store(true, Ordering::SeqCst);
+
+    // The same session token, unexpired and with budget left over.
+    let after = proxied().await.unwrap();
+    assert_eq!(
+        after.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a removed credential must not be spendable by an outstanding session"
+    );
 }
 
 #[tokio::test]
