@@ -909,3 +909,41 @@ fn mark_read_on_a_full_queue_costs_one_meta_read_and_write() {
         }
     });
 }
+
+/// `MarkRead { up_to_seq: u64::MAX }` must clamp to the last seq ever
+/// assigned, never store the raw value — otherwise every FUTURE delivery
+/// would be born pre-read, which the old per-item flag could never do (it
+/// only ever touched items that already existed).
+#[test]
+fn mark_read_beyond_the_last_seq_does_not_pre_read_future_deliveries() {
+    block_on(async {
+        let mut inbox = fresh();
+        let alice = queue_of(ALICE_KEY);
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 1), &deliver(&alice, "k", "b"))
+            .await
+            .expect("deliver seq 1");
+        inbox.commit_block().await.expect("commit deliver");
+
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 2), &mark_read(&alice, u64::MAX))
+            .await
+            .expect("mark read u64::MAX");
+        inbox.commit_block().await.expect("commit mark read");
+        assert_eq!(
+            inbox.read_watermark_view(&alice).await.unwrap(),
+            1,
+            "the watermark clamps to the last assigned seq, not u64::MAX"
+        );
+
+        inbox
+            .execute(&mut submitter(ALICE_KEY, 3), &deliver(&alice, "k", "c"))
+            .await
+            .expect("deliver seq 2");
+        inbox.commit_block().await.expect("commit deliver 2");
+        assert!(
+            !inbox.is_read(&alice, 2).await.unwrap(),
+            "a delivery AFTER the mark-read must not be born pre-read"
+        );
+    });
+}

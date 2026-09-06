@@ -88,7 +88,11 @@
 //! never complete. Nothing marks a single item read in isolation (`MarkRead`
 //! is always a range), so there is no per-item `read` field to keep in sync:
 //! every read path (the index guest's list/unread view) derives `read` as
-//! `seq <= read_watermark`.
+//! `seq <= read_watermark`. the watermark is CLAMPED to the last seq ever
+//! assigned (`next_seq - 1`): the old per-item flag could only ever touch
+//! items that already existed, so an unclamped `MarkRead { up_to_seq:
+//! u64::MAX }` would otherwise mark every FUTURE delivery pre-read on
+//! arrival — a regression, not a rewrite of the same behavior.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -388,10 +392,17 @@ impl Inbox {
         let Some(mut meta) = self.meta(&member).await? else {
             return Ok(());
         };
-        if up_to_seq <= meta.read_watermark {
+        // clamp to the last seq ever ASSIGNED (`next_seq - 1`), never the raw
+        // `up_to_seq`: the old per-item flag could only ever touch items that
+        // already existed, and an unclamped watermark would let `up_to_seq =
+        // u64::MAX` mark every FUTURE delivery pre-read on arrival — a real
+        // regression, not just a difference in mechanism.
+        let last_seq = meta.next_seq.saturating_sub(1);
+        let watermark = up_to_seq.min(last_seq);
+        if watermark <= meta.read_watermark {
             return Ok(());
         }
-        meta.read_watermark = up_to_seq;
+        meta.read_watermark = watermark;
         self.store(meta_key(&member), &meta);
         Ok(())
     }

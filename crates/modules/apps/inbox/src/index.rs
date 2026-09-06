@@ -26,7 +26,9 @@
 //!   reads as read. `read` on a [`NotificationRow`] is therefore DERIVED at
 //!   query/fold time from `seq <= watermark`, never stored authoritatively —
 //!   `MarkRead` costs one point read and one point write here too, never a
-//!   scan-and-rewrite of every row in range.
+//!   scan-and-rewrite of every row in range. CLAMPED to the highest seq ever
+//!   assigned (mirrored at `nseq/{hex(member)}`): an unclamped watermark
+//!   would mark a FUTURE delivery pre-read on arrival.
 //!
 //! this file is the DECISION core — pure functions over [`StateRead`],
 //! compiled natively and unit-tested against a plain map. the wasm shell
@@ -238,14 +240,23 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             // last_seq] (both eviction and Clear only ever remove the LOW
             // end), so the count of live items newly covered by raising the
             // watermark is a closed-form intersection, not a walk.
+            //
+            // CLAMPED to `last_seq` (the highest seq ever assigned, mirrored
+            // from `nseq`), same as the module: the old per-item flag could
+            // only ever touch items that already existed, so storing a raw
+            // `up_to_seq` (e.g. `u64::MAX`) would mark every FUTURE delivery
+            // pre-read on arrival.
             let old_watermark = read_u64(read, &watermark_key(&member));
-            let new_watermark = old_watermark.max(up_to_seq);
+            let last_seq = read_u64(read, &seq_key(&member));
+            let new_watermark = old_watermark.max(up_to_seq.min(last_seq));
             if new_watermark > old_watermark {
                 let count = read_u64(read, &count_key(&member));
                 if count > 0 {
-                    let last_seq = read_u64(read, &seq_key(&member));
                     let lowest_live = last_seq + 1 - count;
                     let lo = (old_watermark + 1).max(lowest_live);
+                    // `new_watermark <= last_seq` by construction, so this is
+                    // just `new_watermark` — spelled as a min to keep the
+                    // range-intersection shape visible.
                     let hi = new_watermark.min(last_seq);
                     if hi >= lo {
                         let newly_read = hi - lo + 1;
@@ -577,5 +588,30 @@ mod tests {
         let rows = items(&map, serde_json::json!({"list": {"member": "a/b"}}));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].body, "for a slash b");
+    }
+
+    /// mirrors the module's own clamp: `MarkRead { up_to_seq: u64::MAX }`
+    /// must not mark a FUTURE delivery pre-read in the derived view either.
+    #[test]
+    fn mark_read_beyond_the_last_seq_does_not_pre_read_future_deliveries() {
+        let mut map = Map::new();
+        fold(&mut map, 1, &deliver("alice", "k", "b"));
+        fold(
+            &mut map,
+            2,
+            &InboxMsg::MarkRead {
+                member: "alice".into(),
+                up_to_seq: u64::MAX,
+            },
+        );
+        fold(&mut map, 3, &deliver("alice", "k", "c"));
+
+        let rows = items(&map, serde_json::json!({"list": {"member": "alice"}}));
+        assert_eq!(
+            rows.iter().map(|r| (r.seq, r.read)).collect::<Vec<_>>(),
+            vec![(1, true), (2, false)],
+            "seq 2 was delivered AFTER the mark-read and must not be pre-read"
+        );
+        assert_eq!(unread(&map, "alice"), 1);
     }
 }
