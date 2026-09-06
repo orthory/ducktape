@@ -611,9 +611,14 @@ pub enum AgentAction {
         checked: bool,
     },
     /// write a small UTF-8 text file through the files module's commit wire
-    /// ([`ACTION_DUCKFS_WRITE_TEXT`]). `base_snapshot` is the committed DuckFS
-    /// refs head observed by the tool before signing; `None` means the files
-    /// tree was empty.
+    /// ([`ACTION_DUCKFS_WRITE_TEXT`]). `base_snapshot` feeds files' own
+    /// per-path CAS (`FilesMsg::Commit`), never a global-head check: `Some`
+    /// names the snapshot the write was staged against, `None` is files' own
+    /// create-only sense (the empty tree) — the path must not already exist.
+    /// omitted by an action the model authors directly (not through the
+    /// `ducktape_duckfs_write_text` tool, which always fills it from a live
+    /// refs query), so `None` on a non-empty filesystem is ordinary, not an
+    /// error: it just means the write only succeeds if that path is new.
     DuckfsWriteText {
         path: String,
         text: String,
