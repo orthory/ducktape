@@ -230,7 +230,7 @@ fn active_channel() -> String {
 /// arrival. Everything this reads is either in the op or in a warm cache — no
 /// query runs here, for the reason the decoder's other reads are cached
 /// (a `/v1/query` inside the fold freezes every subscriber).
-pub(crate) fn notify_chat_op(payload: &[u8], origin_id: Option<&str>, names: &AuthorNames) {
+pub(crate) fn notify_chat_op(payload: &[u8], origin_id: Option<&str>, names: &NameDirectory) {
     let Ok(::chat::ChatMsg::PostMessage {
         channel_id, blocks, ..
     }) = ::chat::decode_msg(payload)
@@ -249,7 +249,7 @@ pub(crate) fn notify_chat_op(payload: &[u8], origin_id: Option<&str>, names: &Au
         room: room_name(&channel_id),
         in_my_dm: in_my_dm(&channel_id),
         channel_id,
-        author: ::chat::client::author_name(&format!("user:{author_key}"), names),
+        author: ::chat::client::author_display(&format!("user:{author_key}"), names),
         body: ::chat::client::message_body(&blocks),
         mentions_me: ::chat::client::mentions_reach(&blocks, &my_keys),
         authored_by_me: me

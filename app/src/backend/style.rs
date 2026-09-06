@@ -130,8 +130,6 @@ pub fn raised_style(theme: &iced::Theme) -> iced::widget::container::Style {
     }
 }
 
-/// A shortened display label for an id string: its first 8 characters, with an
-/// ellipsis when more follow.
 pub(crate) const fn block_kind_name(kind: BlockKind) -> &'static str {
     match kind {
         BlockKind::Page => "Page",

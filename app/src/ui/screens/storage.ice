@@ -7,7 +7,7 @@
 // props, interaction-local state stays here, and only application effects leave
 // as named events.
 
-component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64)
+component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsEntry], connected:bool, loading:bool, bind new_name:str, preview_path:str, preview_entry:FsEntry, delete_target:str, diff_from:str, diff:[FsDiffEntry], history:[FsSnapshot], preview_truncated:bool, preview_binary:bool, editing:bool, bind draft:editor, preview_text:str, dark:bool, preview_picture:bool, preview_width:i64, preview_height:i64, write_refusal:str)
   lifetime retained
   emits
     open_message_link(str)
@@ -88,13 +88,13 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
           disabled bg=muted_bg/54 value=muted
         button "+ Folder" -> emit(fs_mkdir_submit)
           with
-            disabled=(loading || empty(trim(new_name)))
+            disabled=(loading || empty(trim(new_name)) || !empty(write_refusal))
             h=26.0
             p=5.0
             @secondary_action
         button "+ File" -> emit(fs_new_file_submit)
           with
-            disabled=(loading || empty(trim(new_name)))
+            disabled=(loading || empty(trim(new_name)) || !empty(write_refusal))
             h=26.0
             p=5.0
             @secondary_action
@@ -147,6 +147,23 @@ component FilesScreen(path:str, listed:bool, entries:[FsEntry], directories:[FsE
           active bg=surface text=muted border=card_line border-w=1.0 r=7.0
           hovered bg=elevated text=fg
           pressed bg=subtle
+    // THE MODULE'S OWN ANSWER, BEFORE THE ROUND TRIP: a root, or another
+    // member's home, says under the bar why nothing can be written here.
+    // Its words name whole keys, so the line wraps below the fixed-height
+    // bar instead of riding in it.
+    if !empty(write_refusal)
+      box
+        with
+          w=fill
+          pl=20.0
+          pr=20.0
+          pb=10.0
+        text write_refusal
+          with
+            size=12.5
+            w=fill
+            wrap=word
+            @text-caption
     box
       with
         w=fill

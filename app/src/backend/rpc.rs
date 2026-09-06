@@ -267,6 +267,31 @@ pub(crate) async fn sign_add_key_consent(
     ))
 }
 
+/// The person's proof for a raw-bytes write (a staged chunk, a forge pack):
+/// this device's key signs each request, bound to the node it is sent to,
+/// through the one message the daemon verifies (`node::signed_req`). The
+/// same seat [`sign_frame`] uses, so it costs no argon2 pass of its own.
+pub(crate) async fn data_plane_signer(
+    rpc: &RpcClient,
+    password: String,
+) -> Result<ducktape_rpc::WriteAuth, String> {
+    let node_key = hex_decode(&rpc.status().await?.public_key)?;
+    let key = {
+        let session = seated_signer(password).await?;
+        session
+            .as_ref()
+            .expect("the session was seated above")
+            .key
+            .clone()
+    };
+    Ok(std::sync::Arc::new(move |method: &str, path: &str, body: &[u8]| {
+        ::node::signed_req::request_headers(&key, method, path, &node_key, body)
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect()
+    }))
+}
+
 /// The session seat, opened under `password` if it is not already: the lock
 /// is what makes the seat singular — a burst of reactions opens the key once
 /// between them instead of racing five argon2 passes into it.

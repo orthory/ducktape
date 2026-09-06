@@ -71,6 +71,20 @@ pub(crate) async fn load_chat_data(
     rpc: &RpcClient,
     requested: Option<&str>,
 ) -> Result<ChatData, String> {
+    // The directory before any row: every author, member and huddle tile below
+    // is named through it, and this is the load that runs on boot and on every
+    // resync — including the one an identity op triggers.
+    //
+    // A directory that cannot be read yet — a resident whose identity index is
+    // still folding — is a room named by key hex, never a room that failed to
+    // open: this must not be the `?` that takes the whole chat load down.
+    if let Err(error) = refresh_names(rpc).await {
+        tracing::debug!(
+            target: "ducktape::chat",
+            %error,
+            "the name directory was not read; keys render as hex"
+        );
+    }
     let mut wire_channels = Vec::new();
     let mut after: Option<String> = None;
     loop {
@@ -133,10 +147,9 @@ pub(crate) async fn load_chat_data(
     let active_channel_archived = active_wire_channel.is_some_and(|info| info.channel.archived);
     let active_channel_members_only =
         active_wire_channel.is_some_and(|info| info.channel.post_policy == PostPolicy::MembersOnly);
-    let me = local_user_key().await;
-    let names = account_names(rpc).await;
+    let facts = ReaderFacts::current().await;
     let huddle_roster = active_wire_channel.map_or_else(Vec::new, |info| {
-        huddle_roster(&info.channel.huddle, me.as_deref(), &names)
+        huddle_roster(&info.channel.huddle, facts.reader())
     });
     // Both read only the active channel, which is decided above — the member
     // roll has no business sitting in front of the timeline. `local_user_key`
@@ -145,7 +158,7 @@ pub(crate) async fn load_chat_data(
     let (channel_members, message_page) = match active_channel.is_empty() {
         true => (Vec::new(), RootPage::default()),
         false => tokio::try_join!(
-            load_channel_members(rpc, &active_channel),
+            load_channel_members(rpc, &active_channel, facts.names()),
             load_messages(rpc, &active_channel)
         )?,
     };
@@ -191,7 +204,7 @@ pub(crate) enum MessageWindow {
 pub(crate) async fn load_channel_facts(
     rpc: &RpcClient,
     channel_id: &str,
-    me: Option<&[u8]>,
+    reader: ChatReader<'_>,
 ) -> Result<Option<(ChatChannel, Vec<HuddleParticipant>)>, String> {
     let reply: ChatViewReply = rpc
         .view(
@@ -207,10 +220,11 @@ pub(crate) async fn load_channel_facts(
     let Some(info) = record else {
         return Ok(None);
     };
-    // THE CACHED DIRECTORY, NEVER A FILLING READ: `load_channel_row` awaits this
-    // function inside the live stream's decoder fold, where a `/v1/query` would
-    // freeze every subscriber (issue #1018). The connect's chat load warms it.
-    let roster = huddle_roster(&info.channel.huddle, me, &cached_account_names());
+    // The roster is named through the reader handed in — the directory as
+    // last read, never a filling query: `load_channel_row` awaits this inside
+    // the live stream's decoder fold, where a `/v1/query` would freeze every
+    // subscriber for as long as the node's select loop is busy.
+    let roster = huddle_roster(&info.channel.huddle, reader);
     Ok(Some((
         ChatChannel {
             id: info.channel.id,
@@ -261,7 +275,7 @@ pub(crate) async fn load_channel_window_data(
     // Awaited before the fan-out so the cached identity is warm for every leg:
     // there is no single-flight, and three cold callers would each spawn the
     // CLI. Same reason `load_chat_data` awaits it above its own join.
-    let me = local_user_key().await;
+    let facts = ReaderFacts::current().await;
     let messages_leg = async {
         match window {
             MessageWindow::Tail => load_messages(rpc, channel_id).await,
@@ -273,12 +287,12 @@ pub(crate) async fn load_channel_window_data(
             }
         }
     };
-    let (facts, channel_members, message_page) = tokio::try_join!(
-        load_channel_facts(rpc, channel_id, me.as_deref()),
-        load_channel_members(rpc, channel_id),
+    let (room, channel_members, message_page) = tokio::try_join!(
+        load_channel_facts(rpc, channel_id, facts.reader()),
+        load_channel_members(rpc, channel_id, facts.names()),
         messages_leg
     )?;
-    let Some((channel, huddle_roster)) = facts else {
+    let Some((channel, huddle_roster)) = room else {
         return load_chat_data(rpc, None).await;
     };
     Ok(ChatData {
@@ -305,6 +319,7 @@ pub(crate) async fn load_channel_window_data(
 pub(crate) async fn load_channel_members(
     rpc: &RpcClient,
     channel_id: &str,
+    names: &NameDirectory,
 ) -> Result<Vec<ChatMember>, String> {
     let mut members = Vec::new();
     let mut after: Option<String> = None;
@@ -341,7 +356,7 @@ pub(crate) async fn load_channel_members(
         .map(|member| {
             let id = member_id(&member.user);
             ChatMember {
-                label: short_label(id),
+                label: names.member_label(id),
                 key: id.to_string(),
             }
         })
@@ -363,12 +378,11 @@ pub async fn load_older_messages(
         let rpc = rpc_client(&rpc)?;
         let before = u64::try_from(before_seq).unwrap_or(0);
         let page = query_roots(&rpc, &channel_id, Some(before)).await?;
-        let current_user = local_user_key().await;
-        let names = account_names(&rpc).await;
+        let facts = ReaderFacts::current().await;
         let messages: Vec<ChatMessage> = page
             .roots
             .into_iter()
-            .map(|row| chat_message(row, current_user.as_deref(), &names))
+            .map(|row| chat_message(row, facts.reader()))
             .collect();
         Ok((messages, page.has_more))
     }
@@ -400,12 +414,11 @@ pub(crate) async fn load_messages_around(
     let ChatViewReply::Messages(rows) = reply else {
         return Err("node returned an invalid message window".into());
     };
-    let current_user = local_user_key().await;
-    let names = account_names(rpc).await;
+    let facts = ReaderFacts::current().await;
     Ok(rows
         .into_iter()
         .filter(|row| row.thread.is_none())
-        .map(|row| chat_message(row, current_user.as_deref(), &names))
+        .map(|row| chat_message(row, facts.reader()))
         .collect())
 }
 
@@ -526,12 +539,11 @@ async fn query_roots(
 
 pub(crate) async fn load_messages(rpc: &RpcClient, channel_id: &str) -> Result<RootPage, String> {
     let page = query_roots(rpc, channel_id, None).await?;
-    let current_user = local_user_key().await;
-    let names = account_names(rpc).await;
+    let facts = ReaderFacts::current().await;
     let mut messages: Vec<ChatMessage> = page
         .roots
         .into_iter()
-        .map(|row| chat_message(row, current_user.as_deref(), &names))
+        .map(|row| chat_message(row, facts.reader()))
         .collect();
     mark_message_groups(&mut messages);
     Ok(RootPage {
@@ -682,14 +694,13 @@ pub(crate) async fn load_sparse_thread_data(
     if target.thread != Some(root_seq) {
         return Err("search result does not belong to the selected thread".into());
     }
-    let current_user = local_user_key().await;
-    let names = account_names(rpc).await;
+    let facts = ReaderFacts::current().await;
     Ok(ThreadData {
         root_seq: number_i64(root_seq),
         target_seq: number_i64(target_seq),
         messages: vec![
-            chat_message(root, current_user.as_deref(), &names),
-            chat_message(target, current_user.as_deref(), &names),
+            chat_message(root, facts.reader()),
+            chat_message(target, facts.reader()),
         ],
         next_reply_seq: 0,
         has_more: false,
@@ -712,13 +723,12 @@ pub(crate) async fn load_thread_data(
     }
 
     let thread = query_thread_page(rpc, channel_id, root_seq, None).await?;
-    let current_user = local_user_key().await;
-    let names = account_names(rpc).await;
-    let root = chat_message(thread.root, current_user.as_deref(), &names);
+    let facts = ReaderFacts::current().await;
+    let root = chat_message(thread.root, facts.reader());
     let mut replies: Vec<ChatMessage> = thread
         .replies
         .into_iter()
-        .map(|row| chat_message(row, current_user.as_deref(), &names))
+        .map(|row| chat_message(row, facts.reader()))
         .collect();
     // The rail draws the stream's run rhythm now, so replies group the same
     // way — but the ROOT renders as its own divided block, so the run starts
@@ -749,7 +759,7 @@ pub(crate) async fn query_block_comment_page(
             },
         )
         .await?;
-    let names = account_names(rpc).await;
+    let names = names();
     let PageReply::CommentThread(thread) = reply else {
         return Err("node returned an invalid comment page".into());
     };
@@ -780,7 +790,7 @@ pub(crate) async fn query_block_comment_page(
     }))
 }
 
-pub(crate) fn page_comment_thread(thread: ThreadRow, names: &AuthorNames) -> PageCommentThread {
+pub(crate) fn page_comment_thread(thread: ThreadRow, names: &NameDirectory) -> PageCommentThread {
     let comment_count = count_i64(thread.comments.iter().filter(|c| !c.deleted).count());
     let count_label = if comment_count == 1 {
         "1 comment".to_string()
@@ -790,7 +800,7 @@ pub(crate) fn page_comment_thread(thread: ThreadRow, names: &AuthorNames) -> Pag
     PageCommentThread {
         id: thread.id,
         target: thread.target,
-        author: author_name(&thread.opener, names),
+        author: author_display(&thread.opener, names),
         meta: if thread.resolved {
             format!("{count_label} · resolved")
         } else {
@@ -801,7 +811,7 @@ pub(crate) fn page_comment_thread(thread: ThreadRow, names: &AuthorNames) -> Pag
     }
 }
 
-fn page_comment(ordinal: usize, comment: pages::Comment, names: &AuthorNames) -> PageComment {
+fn page_comment(ordinal: usize, comment: pages::Comment, names: &NameDirectory) -> PageComment {
     let edited = comment.edited_at.is_some();
     let ordinal = count_i64(ordinal);
     PageComment {
@@ -817,12 +827,11 @@ fn page_comment(ordinal: usize, comment: pages::Comment, names: &AuthorNames) ->
     }
 }
 
-/// THE SAME DIRECTORY THE TIMELINE READS. A page comment's author is a member
-/// key like any other, and rendering it as raw hex here while the chat rows
-/// beside it say "orthory" is the same defect in a second surface.
-fn page_author_name(author: &pages::AuthorRef, names: &AuthorNames) -> String {
+/// A page comment's author, named the way every other surface names one: a
+/// person by the account the directory binds to their key, else by handle.
+fn page_author_name(author: &pages::AuthorRef, names: &NameDirectory) -> String {
     match author {
-        pages::AuthorRef::User(key) => author_name(&format!("user:{}", hex_encode(key)), names),
+        pages::AuthorRef::User(key) => author_display(&format!("user:{}", hex_encode(key)), names),
         pages::AuthorRef::Agent { agent_id, .. } => format!("@{agent_id}"),
         pages::AuthorRef::Module(module) => module.clone(),
         pages::AuthorRef::System => "system".into(),
