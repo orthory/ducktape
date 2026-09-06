@@ -261,6 +261,15 @@ fn fold_task(op: &OpRow, read: &impl StateRead, msg: TaskMsg) -> Result<Writes, 
             row.updated_at = op.time;
             put_row(&mut out, &row)?;
         }
+        TaskMsg::DeleteTask { task_id } => {
+            // absent row == the task predates this index; nothing to remove.
+            let Some(bytes) = read.get(task_key(&task_id).as_bytes()) else {
+                return Ok(out);
+            };
+            let row = decode_row(&bytes)?;
+            index_guest::delete(&mut out, by_status_key(&row.status, &task_id));
+            index_guest::delete(&mut out, task_key(&task_id));
+        }
     }
     Ok(out)
 }

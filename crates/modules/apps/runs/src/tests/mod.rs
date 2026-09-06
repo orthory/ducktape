@@ -233,6 +233,7 @@ impl CaptureCtx {
             id: id.into(),
             title: id.into(),
             status: TaskStatus::Open,
+            owner: "test".into(),
             created_at: 0,
             updated_at: 0,
         });
