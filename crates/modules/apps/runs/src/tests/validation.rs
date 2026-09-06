@@ -553,3 +553,60 @@ fn failure_excerpts_are_single_line_and_bounded() {
     assert!(bounded.len() <= FAILURE_EXCERPT_BYTES + '…'.len_utf8());
     assert!(bounded.ends_with('…'));
 }
+
+#[test]
+fn a_post_into_a_channel_the_requester_cannot_post_to_fails_the_run() {
+    // the request-time gate covers the run's OWN channel; the action names its
+    // own. chat admits a module/agent author everywhere, so the requester's
+    // standing in the TARGET channel is the only thing between an agent and
+    // every members-only channel on the network.
+    let post = |channel: &str| AgentAction::PostMessage {
+        channel_id: channel.into(),
+        text: "hello".into(),
+        thread: None,
+    };
+    // the run's requester is the engaging poster, user(1).
+    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    let board = |member: u8| {
+        CaptureCtx::new()
+            .at(8)
+            .with_dispatch_origin()
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2))
+            .with_transcript("board", transcript(1))
+            .with_members_only("board", vec![member; 32])
+    };
+
+    let mut ctx = board(7);
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run_id, Ok(response(&["done"], vec![post("board")]))),
+    )
+    .unwrap();
+    assert!(
+        ctx.notes()
+            .iter()
+            .any(|n| n.contains("requester may not post to channel")),
+        "{:?}",
+        ctx.notes()
+    );
+    // nothing reaches #board — only the run's own ⚠ failure reply.
+    let posts = ctx.chat_msgs();
+    assert_eq!(posts.len(), 1, "only the failure reply: {posts:?}");
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Failed);
+
+    // the same post, by a requester who IS a member, lands.
+    let (mut m, _registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
+    let mut ctx = board(1);
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(&run_id, Ok(response(&["done"], vec![post("board")]))),
+    )
+    .unwrap();
+    assert_eq!(ctx.chat_msgs().len(), 2, "the reply and the post");
+    commit(&mut m);
+    assert_eq!(recent_runs(&m)[0].outcome, RunOutcome::Delivered);
+}

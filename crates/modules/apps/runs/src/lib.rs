@@ -146,7 +146,7 @@ use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSync
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tagging::{
-    EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
+    Author, EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
     encode_msg as tagging_encode_msg,
 };
 use tasks::{
@@ -435,7 +435,10 @@ struct PendingState {
     job_id: Option<String>,
     /// the claim height this job-backed run is bound to; chat runs use 0.
     job_claim_height: u64,
-    /// the run-creating origin — a cancel capability alongside the owner.
+    /// the ACCOUNT the run speaks for: the explicit requester, or the author
+    /// whose post engaged the agent — never the plane that carried the event.
+    /// it is both a cancel capability alongside the owner and the chat standing
+    /// an agent's own posts are held to (`requester_may_post`).
     requester: SagaOrigin,
     created_at: u64,
 }
