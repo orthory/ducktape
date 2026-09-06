@@ -26,7 +26,7 @@ _ducktape() {
     local wallet_verbs=(new import list use help)
     local wallet_flags=(--json)
     local gateway_verbs=(bind unbind list help)
-    local gateway_flags=(--workspace -n --network --label --port)
+    local gateway_flags=(--workspace -n --network --label --port --account)
     local fs_verbs=(ls cat stat history diff checkout status commit pin help)
     local fs_flags=(-n --network --json --node --message --no-rebase --snapshot --limit --prefix --path --key)
     local service_verbs=(run list enable disable status help)
