@@ -1212,6 +1212,44 @@ mod tests {
         assert!(ssh_frame(Vec::new(), "not armored").is_err());
     }
 
+    /// every key this CLI mints a consent over is 33-byte compressed SEC1 —
+    /// the one spelling the chain admits. `--eth` derives it by RECOVERY from
+    /// the reveal touch, `--passkey` reads it off the page's registration
+    /// result, and `--pubkey <hex>` is gated on the same well-formedness the
+    /// decoder applies, so no path can put an uncompressed point on an account.
+    #[test]
+    fn every_pubkey_the_cli_derives_is_canonical_compressed_sec1() {
+        use keyscheme::testkit::{eth_key, eth_sign_message, passkey, passkey_pubkey};
+
+        let wallet = eth_key(5);
+        let reveal = authpage::reveal_message();
+        let revealed = authpage::wallet_pubkey(
+            &reveal,
+            &Outcome::Eth {
+                address: "0x0".into(),
+                signature: eth_sign_message(&wallet, &reveal),
+                message: reveal.clone(),
+            },
+        )
+        .expect("the reveal touch answers with the wallet's key");
+        assert_eq!(revealed.len(), 33);
+        assert!(KeyScheme::Secp256k1.pubkey_wellformed(&revealed));
+
+        let registered = passkey_pubkey(&passkey(4));
+        assert_eq!(registered.len(), 33);
+        assert!(KeyScheme::Secp256r1.pubkey_wellformed(&registered));
+
+        // and the hand-typed path: the uncompressed spelling of that very
+        // wallet key is not something `key add --pubkey` will mint a ticket for.
+        let uncompressed = wallet
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        assert_eq!(uncompressed.len(), 65);
+        assert!(!KeyScheme::Secp256k1.pubkey_wellformed(&uncompressed));
+    }
+
     /// a login's frame: the page's assertion (faked exactly as an
     /// authenticator signs it) becomes the `AddKey` this device submits AS
     /// ITS OWN ORIGIN — `key join`'s shape with a passkey's consent inside.
