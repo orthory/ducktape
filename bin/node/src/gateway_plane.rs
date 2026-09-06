@@ -717,14 +717,29 @@ async fn revalidate_route_authority(
 /// the reply detail and the log reason alike.
 const ROUTE_TARGETS_NODE_API: &str = "route_targets_node_api";
 
+/// the refusal a record earns when the label IS bound here — for someone
+/// else's account. A stable token, the reply detail and the log reason alike.
+const ROUTE_ACCOUNT_MISMATCH: &str = "route_account_mismatch";
+
 /// Resolve a loopback route's upstream port — the ONE seam both the HTTP
-/// proxy and the WebSocket upgrade dial through. A loopback route may name
-/// any local daemon EXCEPT this node's own surfaces: proxying the mesh into
-/// `/v1` (or upgrading into `/v1/ws/...`) hands every member this node's
-/// unauthenticated API (submit as this node, mint invites, log-filter).
+/// proxy and the WebSocket upgrade dial through.
+///
+/// Keyed on `(account, label)`, never the label alone: consensus lets ANY
+/// account publish a route naming ANY node as its publisher (the module says
+/// so outright), so a label-only lookup lets a member republish a label this
+/// operator bound, under their own account with an audience, method set and
+/// `allow_authorization` of their choosing, and reach the port bound for
+/// someone else. The bind IS the consent, and the account it was bound for is
+/// the half of the key that carries it.
+///
+/// A loopback route may name any local daemon EXCEPT this node's own surfaces:
+/// proxying the mesh into `/v1` (or upgrading into `/v1/ws/...`) hands every
+/// member this node's unauthenticated API (submit as this node, mint invites,
+/// log-filter).
 fn loopback_port(
     scope: &LoopbackScope<'_>,
     caller_node: &[u8; 32],
+    account: u64,
     head: &gateway::ProxyRequestHead,
 ) -> Result<u16, GatewayFailure> {
     // one process-wide latch keyed on the cause: a flood from one route hides
@@ -733,9 +748,26 @@ fn loopback_port(
     static REFUSED: noded::log::Latch = noded::log::Latch::new(100);
     let routes =
         crate::gateway_routes::load(scope.workspace).map_err(GatewayFailure::Unavailable)?;
-    let port = routes.port(&head.name).ok_or_else(|| {
-        GatewayFailure::NotFound("global gateway route has no local loopback upstream".into())
-    })?;
+    let Some(port) = routes.port(account, &head.name) else {
+        if !routes.bound_for_another_account(account, &head.name) {
+            return Err(GatewayFailure::NotFound(
+                "global gateway route has no local loopback upstream".into(),
+            ));
+        }
+        if let Some(attempts) = REFUSED.hit(ROUTE_ACCOUNT_MISMATCH) {
+            tracing::warn!(
+                target: "ducktape::gateway",
+                caller = %hex_bytes(caller_node),
+                route = %head.name.local_key(),
+                account,
+                upgrade = head.upgrade,
+                reason = ROUTE_ACCOUNT_MISMATCH,
+                attempts,
+                "gateway route REFUSED — this node bound that label for another account"
+            );
+        }
+        return Err(GatewayFailure::Forbidden(ROUTE_ACCOUNT_MISMATCH.into()));
+    };
     let targets_node_api = scope.node_api_ports.contains(&port);
     if !targets_node_api {
         return Ok(port);
@@ -767,7 +799,7 @@ async fn proxy_loopback(
         .route
         .as_ref()
         .expect("current route is live");
-    let port = loopback_port(scope, caller_node, head)?;
+    let port = loopback_port(scope, caller_node, record.statement.account_id, head)?;
     // Connect + per-read deadlines only: a TOTAL timeout would kill long
     // streamed (SSE) bodies, but a silent-forever upstream must not pin its
     // accept permit — the idle read timeout reclaims it. The head is still
@@ -948,12 +980,16 @@ async fn proxy_loopback(
 /// (≤ 64 MiB) is assembled across windows.
 const READ_WINDOW: u64 = 1024 * 1024;
 
-fn gateway_path(own_node: &[u8; 32], label: &str, relative: &str) -> String {
+/// Where a content route's bytes live in THIS node's home — keyed by
+/// `(account, label)`, the same pair `loopback_port` keys on and for the same
+/// reason: any account may publish a route naming this node as its publisher,
+/// so a label-only directory would serve one account's private site to a member
+/// who republished its label (the manifest hash is public in the `Get` query)
+/// under their own account.
+fn gateway_path(own_node: &[u8; 32], account: u64, label: &str, relative: &str) -> String {
     format!(
-        "/home/ext:{}/.duck/gateway/{}/{}",
+        "/home/ext:{}/.duck/gateway/{account}/{label}/{relative}",
         hex_bytes(own_node),
-        label,
-        relative
     )
 }
 
@@ -983,6 +1019,7 @@ async fn serve_duckfs(
         ));
     }
     let label = head.name.local_key();
+    let account = record.statement.account_id;
     // Pin one DuckFS snapshot across the manifest read and the file read so a
     // publisher-local mutation cannot race them.
     let snapshot = duckfs_head(commands).await?;
@@ -991,7 +1028,7 @@ async fn serve_duckfs(
     // verify the exact bytes, then trust its file table.
     let manifest_bytes = read_duckfs_file(
         commands,
-        &gateway_path(own_node, label, gateway::MANIFEST_FILE),
+        &gateway_path(own_node, account, label, gateway::MANIFEST_FILE),
         &snapshot,
         gateway::MAX_MANIFEST_BYTES,
     )
@@ -1020,7 +1057,7 @@ async fn serve_duckfs(
     // a same-sized local mutation cannot make a stale file look current.
     let mut bytes = read_duckfs_file(
         commands,
-        &gateway_path(own_node, label, &file.path),
+        &gateway_path(own_node, account, label, &file.path),
         &snapshot,
         file.size,
     )
@@ -1220,7 +1257,7 @@ async fn authorize_ws(
             "route does not permit a WebSocket upgrade".into(),
         ));
     }
-    let port = loopback_port(scope, caller_node, head)?;
+    let port = loopback_port(scope, caller_node, record.statement.account_id, head)?;
     Ok(format!("ws://127.0.0.1:{port}{}", head.path_and_query))
 }
 
@@ -1978,6 +2015,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port,
             }],
@@ -2133,6 +2171,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port,
             }],
@@ -2324,6 +2363,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port,
             }],
@@ -2437,6 +2477,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port,
             }],
@@ -2650,6 +2691,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let routes = crate::gateway_routes::LocalRoutes {
             routes: vec![crate::gateway_routes::LocalRoute {
+                account: 1,
                 name: gateway::RouteName::named("api"),
                 port: NODE_HTTP_PORT,
             }],
@@ -2740,6 +2782,87 @@ mod tests {
         assert!(matches!(error, GatewayFailure::Forbidden(_)));
     }
 
+    /// Consensus lets ANY account publish a route naming ANY node as its
+    /// publisher, so the label a node bound is not proof of consent: only the
+    /// (account, label) pair the operator bound is. A second account's record
+    /// with the same label, naming this node, must be refused BEFORE the
+    /// loopback dial — the refusal is `Forbidden(route_account_mismatch)`, and a
+    /// dial would have been `Unavailable` on a port nothing listens on.
+    #[tokio::test]
+    async fn a_second_accounts_route_cannot_ride_this_nodes_bind_for_that_label() {
+        let workspace = tempfile::tempdir().unwrap();
+        let routes = crate::gateway_routes::LocalRoutes {
+            routes: vec![crate::gateway_routes::LocalRoute {
+                // the operator bound `api` for account 1, and only account 1.
+                account: 1,
+                name: gateway::RouteName::named("api"),
+                port: 9000,
+            }],
+        };
+        std::fs::write(
+            workspace.path().join(crate::gateway_routes::FILE_NAME),
+            serde_json::to_vec_pretty(&routes).unwrap(),
+        )
+        .unwrap();
+
+        let publisher = [2u8; 32];
+        let mallory = ed25519::PrivateKey::from_seed(45);
+        // Mallory's OWN record: her account, her `Network` audience, this
+        // node named as publisher, the operator's label.
+        let mut route = signed_route(&mallory, publisher, gateway::RouteAudience::Network, false);
+        route.statement.account_id = 2;
+        route.authorization.signature = mallory
+            .sign(
+                gateway::GATEWAY_ROUTE_NS,
+                &gateway::route_signing_preimage(&route.statement).unwrap(),
+            )
+            .as_ref()
+            .to_vec();
+        let (commands, mut requests) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let replies: Vec<Vec<u8>> = vec![
+                gateway::encode_reply(&gateway::GatewayReply::Route(Box::new(Some(route)))),
+                identity::encode_reply(&identity::IdentityReply::Account(Some(account(
+                    2, &mallory,
+                )))),
+            ];
+            for bytes in replies {
+                let NodeCommand::Query { reply, .. } = requests.next().await.unwrap() else {
+                    panic!("expected a query")
+                };
+                let _ = reply.send(Ok(bytes));
+            }
+        });
+
+        let error = serve_current(
+            &commands,
+            &LoopbackScope {
+                workspace: workspace.path(),
+                node_api_ports: &[],
+                own_node: &publisher,
+            },
+            &[3u8; 32],
+            &gateway::ProxyRequestHead {
+                account_id: 2,
+                name: gateway::RouteName::named("api"),
+                revision: 4,
+                method: gateway::RouteMethod::Get,
+                path_and_query: "/".into(),
+                headers: vec![],
+                body_len: 0,
+                upgrade: false,
+                user_pop: None,
+            },
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, GatewayFailure::Forbidden(reason) if reason == ROUTE_ACCOUNT_MISMATCH),
+            "a second account's record must not reach the port bound for another: {error:?}"
+        );
+    }
+
     fn stat_reply(path: String, size: u64) -> Vec<u8> {
         duckfs_core::encode_reply(&FilesReply::Stat(Some(duckfs_core::EntryInfo {
             path,
@@ -2804,8 +2927,8 @@ mod tests {
             statement,
         };
         let owner = account(1, &member);
-        let manifest_path = gateway_path(&publisher, "_apex", gateway::MANIFEST_FILE);
-        let file_path = gateway_path(&publisher, "_apex", "index.html");
+        let manifest_path = gateway_path(&publisher, 1, "_apex", gateway::MANIFEST_FILE);
+        let file_path = gateway_path(&publisher, 1, "_apex", "index.html");
         let manifest_len = manifest_bytes.len() as u64;
         let manifest_b64 = STANDARD.encode(&manifest_bytes);
         let actual_b64 = STANDARD.encode(actual);
