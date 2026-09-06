@@ -717,7 +717,8 @@ async fn send_codex(
             // (fresh nonce per attempt, so the 401-retry re-seals safely) and
             // carry the scoped session token; the enclave refuses plaintext.
             CodexAuth::Airlock(session) => {
-                let sealed = airlock::bodyseal::seal_request(&session.keys, body);
+                let aad = airlock::bodyseal::request_aad("POST", "/v1/responses");
+                let sealed = airlock::bodyseal::seal_request(&session.keys, &aad, body);
                 let binding = airlock::bodyseal::request_binding(&sealed);
                 let request = request
                     .body(sealed)
@@ -1896,7 +1897,8 @@ async fn send_upstream(
         // path re-seals safely) and mark the request. The enclave refuses
         // plaintext on this token, so the bearer alone grants nothing.
         let (request, binding) = if let AnthropicAuth::Airlock(session) = &*auth {
-            let sealed = airlock::bodyseal::seal_request(&session.keys, body);
+            let aad = airlock::bodyseal::request_aad("POST", "/v1/messages");
+            let sealed = airlock::bodyseal::seal_request(&session.keys, &aad, body);
             let binding = airlock::bodyseal::request_binding(&sealed);
             (
                 request

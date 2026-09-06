@@ -855,7 +855,7 @@ async fn proxy_inner(
     let binding = bodyseal::request_binding(&body);
     let body = match (&seal_keys, sealed_request) {
         (Some(keys), true) => Bytes::from(
-            bodyseal::open_request(keys, &body)
+            bodyseal::open_request(keys, &bodyseal::request_aad(method.as_str(), path_and_query), &body)
                 .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
         ),
         (Some(_), false) if !body.is_empty() => {
@@ -1190,8 +1190,9 @@ mod tests {
         assert_eq!(st.budgets.lock().unwrap()["a"], 8, "and must cost nothing");
 
         // Authentic sealed bodies each record one nonce and spend one request.
+        let aad = bodyseal::request_aad("POST", "/v1/messages");
         let blobs: Vec<Vec<u8>> =
-            (0..3u8).map(|i| bodyseal::seal_request(&keys, &[i; 16])).collect();
+            (0..3u8).map(|i| bodyseal::seal_request(&keys, &aad, &[i; 16])).collect();
         for blob in &blobs {
             let status = post_sealed(&st, &token, blob.clone()).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY, "admitted, then the upstream is dead");

@@ -230,7 +230,8 @@ async fn sealed_session_carries_only_ciphertext_and_round_trips_plaintext() {
         .open_session_sealed(&seal_pk, "test-sub", &WorkRef::Direct)
         .await
         .unwrap();
-    let sealed_body = bodyseal::seal_request(&keys, br#"{"secret":"prompt"}"#);
+    let aad = bodyseal::request_aad("POST", "/v1/messages");
+    let sealed_body = bodyseal::seal_request(&keys, &aad, br#"{"secret":"prompt"}"#);
     assert!(
         !sealed_body.windows(6).any(|w| w == b"prompt"),
         "the wire body must not contain the plaintext"
