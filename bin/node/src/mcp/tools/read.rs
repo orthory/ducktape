@@ -351,12 +351,37 @@ fn files_read(run: &Run, args: &Value) -> Result<Value> {
     }
 }
 
+/// duckfs grep's own prefix rule is a raw string prefix (`/shared/team` also
+/// matches `/shared/team-secrets/...`), but the cap this tool gates on is
+/// segment-boundary (see `AgentRecord::permits`'s doc on `DuckfsRead`). Passing
+/// the gate on `prefix` does not make every hit `grep` returns covered by the
+/// cap, so each hit's own path is re-checked against the SAME predicate before
+/// it reaches the agent — closing the sibling-path leak without narrowing
+/// grep's textual-prefix search for callers that rely on it (the raw
+/// `/v1/files/grep` route has no cap at all).
 fn files_grep(run: &Run, args: &Value) -> Result<Value> {
     let prefix = arg_str(args, "prefix")?;
     let pattern = arg_str(args, "pattern")?;
-    gate_duckfs_read(run, &prefix)?;
-    run.node
-        .files("grep", &[("pattern", pattern), ("prefix", prefix)])
+    let record = run.record()?;
+    run.permits(&record, &CapRequest::DuckfsRead(&prefix))?;
+    let mut reply = run
+        .node
+        .files("grep", &[("pattern", pattern), ("prefix", prefix)])?;
+    retain_capped_hits(&record, &mut reply);
+    Ok(reply)
+}
+
+/// drop every grep hit whose own path the record's duckfs_read cap does not
+/// segment-boundary cover — a no-op if the reply carries no `hits` array.
+fn retain_capped_hits(record: &agent::AgentRecord, reply: &mut Value) {
+    let Some(hits) = reply.get_mut("hits").and_then(Value::as_array_mut) else {
+        return;
+    };
+    hits.retain(|hit| {
+        hit.get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| record.permits(&CapRequest::DuckfsRead(path)))
+    });
 }
 
 fn gate_forge_read(run: &Run, repo: &str) -> Result<()> {
@@ -683,5 +708,46 @@ mod tests {
             matches!(&err, NodeError::Rejected(m) if m.contains("channel_id")),
             "got {err:?}"
         );
+    }
+
+    /// #1663: grep's own matcher is a raw string prefix (`/shared/team` also
+    /// matches `/shared/team-secrets/...`), but the cap it is gated on is
+    /// segment-boundary. A hit from a sibling path that only shares a textual
+    /// prefix with the capped one must be dropped before the reply reaches the
+    /// agent, while a hit truly under the cap must survive.
+    #[test]
+    fn grep_hits_outside_the_segment_boundary_cap_are_dropped() {
+        let record = agent::AgentRecord {
+            agent_id: "bot".into(),
+            owner: saga::SagaOrigin::External(vec![9; 32]),
+            display_name: "BOT".into(),
+            capability: "model-1".into(),
+            allowed_actions: vec![],
+            status: agent::AgentStatus::Active,
+            role: agent::AgentRole::General,
+            created_at: 0,
+            updated_at: 0,
+            recipe_hash: vec![],
+            caps: agent::ResourceCaps {
+                duckfs_read: vec!["/shared/team".into()],
+                ..Default::default()
+            },
+            skills: vec![],
+        };
+        let mut reply = json!({
+            "hits": [
+                {"path": "/shared/team/notes.txt", "line": 1, "text": "ok", "locator": "l1"},
+                {"path": "/shared/team-secrets/creds.txt", "line": 1, "text": "aws_secret=x", "locator": "l2"},
+            ],
+            "next": null,
+        });
+        retain_capped_hits(&record, &mut reply);
+        let paths: Vec<&str> = reply["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| h["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(paths, vec!["/shared/team/notes.txt"]);
     }
 }
