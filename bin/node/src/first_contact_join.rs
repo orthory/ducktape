@@ -1424,6 +1424,7 @@ mod tests {
             MULE_BINDING,
             &token,
             keypair.public_key().0,
+            nat_traversal::now_secs(),
         ));
         (joiner, keypair, intro, token.nonce.to_vec())
     }
@@ -1518,8 +1519,9 @@ mod tests {
                 .open_sealed(&buf[..n])
                 .expect("the relayed intro is sealed to the member's WG key");
             let request = join_gate::decode_intro(&opened).expect("decodes");
-            let verified = join_gate::verify_intro(&request, MULE_BINDING)
-                .expect("verifies against the binding");
+            let verified =
+                join_gate::verify_intro(&request, MULE_BINDING, nat_traversal::now_secs())
+                    .expect("verifies against the binding");
             let ack = join_gate::encode_intro_ack(&join_gate::IntroAck {
                 nonce: verified.nonce.to_vec(),
                 reply: join_gate::IntroReply::Admitted {
