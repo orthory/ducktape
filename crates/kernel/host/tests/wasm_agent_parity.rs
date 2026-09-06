@@ -341,7 +341,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
                 }),
                 skills: Some(vec![SkillRef {
                     name: "persona".into(),
-                    source_prefix: "skills/persona".into(),
+                    source_prefix: "/shared/skills/persona".into(),
                     source_snapshot: Some("snap-1".into()),
                     load: LoadMode::Always,
                 }]),
@@ -384,13 +384,13 @@ async fn same_ops_inner(context: &deterministic::Context) {
             skills: Some(vec![
                 SkillRef {
                     name: "persona".into(),
-                    source_prefix: "skills/persona".into(),
+                    source_prefix: "/shared/skills/persona".into(),
                     source_snapshot: None,
                     load: LoadMode::Always,
                 },
                 SkillRef {
                     name: "reference".into(),
-                    source_prefix: "skills/reference".into(),
+                    source_prefix: "/shared/skills/reference".into(),
                     source_snapshot: None,
                     load: LoadMode::OnDemand,
                 },
@@ -761,7 +761,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 }
                 .into(),
             ),
-            "skill source_prefix must not be empty",
+            "not a scoped duckfs subtree",
         ),
         (
             owner.clone(),
@@ -769,7 +769,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 &Reg {
                     skills: Some(vec![SkillRef {
                         name: "s".into(),
-                        source_prefix: "p".into(),
+                        source_prefix: "/shared/skills/s".into(),
                         source_snapshot: Some(String::new()),
                         load: LoadMode::OnDemand,
                     }]),
@@ -818,6 +818,30 @@ async fn rejections_inner(context: &deterministic::Context) {
                 .into(),
             ),
             "duplicate skill name",
+        ),
+        (
+            owner.clone(),
+            agent_op(
+                &Reg {
+                    skills: Some(vec![
+                        SkillRef {
+                            name: "a".into(),
+                            source_prefix: "/shared/skills/shared".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                        SkillRef {
+                            name: "b".into(),
+                            source_prefix: "/shared/skills/shared".into(),
+                            source_snapshot: None,
+                            load: LoadMode::OnDemand,
+                        },
+                    ]),
+                    ..reg("r15")
+                }
+                .into(),
+            ),
+            "duplicate skill source_prefix",
         ),
         // the record size gate: a display name past MAX_AGENT_RECORD_BYTES.
         (
