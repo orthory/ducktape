@@ -135,7 +135,7 @@ impl Guest for Component {
             .map(|items| {
                 items
                     .into_iter()
-                    .map(guest_adapter::pending_item_to_wit)
+                    .map(ducktape_module_sdk::pending_item_to_wit)
                     .collect()
             })
             .map_err(to_wit_error)
@@ -144,7 +144,7 @@ impl Guest for Component {
     fn acknowledge(ack: host::Ack) -> Result<(), host::Error> {
         let mut module = loaded_module()?;
         let mut ctx = WitCtx::new();
-        block_on(module.acknowledge(&mut ctx, &guest_adapter::ack_from_wit(ack)))
+        block_on(module.acknowledge(&mut ctx, &ducktape_module_sdk::ack_from_wit(ack)))
             .map_err(to_wit_error)?;
         block_on(module.commit_block()).map_err(to_wit_error)?;
         save_state(&module.snapshot(), module.root().as_bytes());
