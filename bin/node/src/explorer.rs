@@ -1,6 +1,7 @@
 use noded::projection::project_root_op;
 use sdk::StateRoot;
 
+use crate::blob_fetch::SourceRotate;
 use crate::constants::NOP_TARGET;
 use crate::util::hex;
 
@@ -304,7 +305,7 @@ impl BackfillDebt {
 /// to re-issue the moment a source answers this node again. (Stamping on a
 /// refusal cost a live resident its channel rows: the stamp WIPES the feed and
 /// every view folded from it, at exactly the moment the node knew least.)
-pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient>(
+pub(crate) async fn heal_and_backfill_index<C: statesync::SyncClient + SourceRotate>(
     index: &indexer::IndexStore,
     client: &C,
     boundary: u64,
@@ -629,9 +630,10 @@ const AFTER_EVERY_SEQ: u32 = u32::MAX;
 /// contract for what it holds, its derived views were folded from exactly
 /// those rows, and the delta lands ascending on top — so the stamp's WIPE
 /// (feed and views, floored at the boundary) is the fallback, needed only
-/// when nothing below can be composed: an empty feed, or a source whose own
-/// history starts above the resume point.
-async fn heal_module<C: statesync::SyncClient>(
+/// when this node's OWN account is uncomposable: an empty feed, or a
+/// watermark this store cannot read. A source that cannot cover the gap is
+/// not that — see [`Resume::Refused`].
+async fn heal_module<C: statesync::SyncClient + SourceRotate>(
     index: &indexer::IndexStore,
     client: &C,
     module: &str,
@@ -640,10 +642,10 @@ async fn heal_module<C: statesync::SyncClient>(
 ) -> Walk {
     match resume_module(index, client, module, boundary, label).await {
         Resume::Filled(done) => Walk::Filled(done),
-        // A REFUSAL IS NOT A REASON TO WIPE. The source said nothing about
-        // what this module holds, and the stamp below would destroy the feed
-        // and every view folded from it to make room for rows nobody is
-        // sending.
+        // A REFUSAL IS NOT A REASON TO WIPE, whether the source said nothing
+        // at all or said something that does not cover this node's gap. The
+        // stamp below would destroy the feed and every view folded from it
+        // to make room for rows nobody can actually send.
         Resume::Refused(held) => Walk::Owed(OwedWalk {
             boundary,
             after: Some((held, AFTER_EVERY_SEQ)),
@@ -819,18 +821,31 @@ fn stamp_module(
 enum Resume {
     /// the delta landed on top of the feed this module already held.
     Filled(Backfilled),
-    /// the source did not answer, carrying the watermark a retry resumes from
-    /// — which the STORE will not remember, since live folds push every
-    /// watermark to the tip whether the rows arrived or not.
+    /// nothing was written: either the source did not answer, or it answered
+    /// with a floor that cannot cover the gap above this node's watermark.
+    /// Either way this is about the ONE SOURCE ASKED, not this node's own
+    /// feed, so it carries the watermark a retry — against this source
+    /// rotated past, or another one — resumes from. The STORE will not
+    /// remember it: live folds push every watermark to the tip whether the
+    /// rows arrived or not.
     Refused(u64),
-    /// the feed cannot compose with a delta: it is empty, unreadable, or the
-    /// source's own history starts inside the range this node is missing.
+    /// this node's OWN account cannot compose with a delta: its feed is
+    /// empty, or its watermark is unreadable. Never spent on a peer's floor
+    /// claim — see [`Resume::Refused`] for that.
     Uncomposable,
 }
 
 /// pull only what this module is MISSING: the rows above its own watermark,
 /// written onto the feed it already holds.
-async fn resume_module<C: statesync::SyncClient>(
+///
+/// THE SOURCE IS ASKED BEFORE ANYTHING IS WRITTEN. A source floor above this
+/// node's watermark means the source's own history starts inside the range
+/// this node is missing, so a delta from it would leave a HOLE between them
+/// — and a floor cannot express a hole. Deciding that AFTER the walk had
+/// already written past the hole was the bug (#1733): the verdict must be a
+/// decision made before any row crosses the wire, never a cleanup after one
+/// does.
+async fn resume_module<C: statesync::SyncClient + SourceRotate>(
     index: &indexer::IndexStore,
     client: &C,
     module: &str,
@@ -854,6 +869,30 @@ async fn resume_module<C: statesync::SyncClient>(
     if held == 0 {
         return Resume::Uncomposable; // an empty feed has nothing to resume from.
     }
+    let Some(source_floor) = ask_source_floor(client, module, boundary).await else {
+        return Resume::Refused(held);
+    };
+    let source_covers_the_gap = source_floor.is_none_or(|floor| floor <= held);
+    if !source_covers_the_gap {
+        // this source's own history starts inside the range this node is
+        // missing: a delta from it would punch a hole below the watermark it
+        // would advance to. that is a fact about THIS peer, not about
+        // whether this node's own feed can be resumed — so it is refused
+        // exactly like an unanswered ask, and the cursor rotates so the
+        // retry lands on a different source instead of re-asking this one.
+        client.rotate_source();
+        tracing::warn!(
+            target: "ducktape::statesync",
+            node = %label,
+            module,
+            held,
+            floor = source_floor.unwrap_or(0),
+            reason = "backfill_resume_uncovered",
+            "index backfill source cannot cover the gap above this node's watermark; \
+             the walk is owed again for another source"
+        );
+        return Resume::Refused(held);
+    }
     let done = match backfill_module(
         index,
         client,
@@ -870,23 +909,6 @@ async fn resume_module<C: statesync::SyncClient>(
             return Resume::Refused(held);
         }
     };
-    // THE SOURCE MUST REACH THE RESUME POINT. a source floor ABOVE this
-    // node's watermark means the source's own history starts inside the range
-    // this node is missing, so the delta would leave a HOLE between them —
-    // and a floor cannot express a hole. stamp instead, and inherit the
-    // source's truncation honestly.
-    if done.source_floor.is_some_and(|floor| floor > held) {
-        tracing::warn!(
-            target: "ducktape::statesync",
-            node = %label,
-            module,
-            held,
-            floor = done.source_floor.unwrap_or(0),
-            reason = "backfill_resume_uncovered",
-            "index backfill cannot resume from this source; stamping at the boundary"
-        );
-        return Resume::Uncomposable;
-    }
     // the feed now reaches the boundary, so the watermark says so. the FLOOR
     // does not move: this node kept every row it already had, and nothing
     // below it was ever claimed — [`vouched_floor`] holds that for this walk
@@ -1119,6 +1141,51 @@ mod tests {
         }
     }
 
+    // a bare SourceNode never rotates on its own — a single-source test has
+    // nowhere to rotate TO — but it still has to satisfy the bound
+    // `resume_module` now carries.
+    impl SourceRotate for SourceNode {}
+
+    /// two sources behind one cursor — the shape a real mesh client gives
+    /// `resume_module`: asking one candidate, rotating to the next on an
+    /// honest-but-uncovering answer, and a retry landing on whichever
+    /// candidate the rotation left current.
+    #[derive(Clone)]
+    struct TwoSources {
+        candidates: [SourceNode; 2],
+        cursor: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TwoSources {
+        fn new(first: SourceNode, second: SourceNode) -> Self {
+            Self {
+                candidates: [first, second],
+                cursor: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+        fn current(&self) -> SourceNode {
+            let at = self.cursor.load(std::sync::atomic::Ordering::Relaxed) % 2;
+            self.candidates[at].clone()
+        }
+    }
+
+    impl statesync::SyncClient for TwoSources {
+        fn request(
+            &self,
+            req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            let current = self.current();
+            async move { current.request(req).await }
+        }
+    }
+
+    impl SourceRotate for TwoSources {
+        fn rotate_source(&self) {
+            self.cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn store(dir: &std::path::Path) -> indexer::IndexStore {
         indexer::IndexStore::open(dir, &[indexer::IndexModule::bare("chat")]).expect("open index")
     }
@@ -1192,7 +1259,11 @@ mod tests {
             vec![(9, 0), (10, 0)],
             "only the rows above the joiner's watermark may cross the wire"
         );
-        assert_eq!(client.pages_asked(), 1, "one wire page carries the delta");
+        assert_eq!(
+            client.pages_asked(),
+            2,
+            "the floor probe asked BEFORE the walk (#1733), then one page carries the delta"
+        );
         assert_eq!(
             op_rows(&joiner),
             (1..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
@@ -1643,5 +1714,162 @@ mod tests {
             "and the feed is untouched by the asking"
         );
         assert_eq!(joiner.backfill_height("chat").expect("floor"), None);
+    }
+
+    /// A SOURCE WHOSE FLOOR SITS ABOVE THE WATERMARK IS NOT A REASON TO WIPE
+    /// (#1733). Before the fix this floor claim reached `resume_module` only
+    /// AFTER the delta had already been walked and written, and the verdict
+    /// then routed to a wipe: `mark_backfilled` deleted this node's whole
+    /// feed below the boundary — genesis-complete rows the source never
+    /// claimed to have — to make room for a refill truncated to the source's
+    /// own floor. Asking the floor FIRST means the walk never runs at all:
+    /// the feed, its rows, and its floor stand exactly where they were, and
+    /// the walk comes back owed instead.
+    #[tokio::test]
+    async fn a_source_floor_above_the_watermark_leaves_the_feed_and_floor_untouched() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = store(joiner_dir.path());
+        // the source joined late: its own floor is 5, above the watermark
+        // this node is trying to resume from.
+        source.mark_backfilled("chat", 5).expect("source stamp");
+        for height in 6..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        // this node folded genesis..3 itself and lagged — the ordinary stale
+        // case, no attacker required.
+        for height in 1..=3 {
+            joiner.apply_block(&block(height)).expect("joiner folds");
+        }
+        let client = SourceNode::new(source);
+
+        let debt = heal_and_backfill_index(&joiner, &client, 10, "joiner").await;
+
+        assert!(
+            client.rows_served().is_empty(),
+            "the floor probe alone must decide this; no delta ever crosses the wire"
+        );
+        assert_eq!(
+            client.pages_asked(),
+            1,
+            "one probe, and nothing else — the walk never starts"
+        );
+        assert_eq!(
+            op_rows(&joiner),
+            (1..=3).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "this node's genesis-complete history survives a source's truncation"
+        );
+        assert_eq!(
+            joiner.applied_height("chat").expect("watermark"),
+            3,
+            "the watermark never advances past the hole a truncated source would leave"
+        );
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            None,
+            "nothing stamped this module — it never lost its claim to genesis"
+        );
+        assert!(
+            !debt.is_empty(),
+            "the walk is owed again, not abandoned to the source's truncation"
+        );
+    }
+
+    /// AND THE CURSOR ACTUALLY ROTATES: a source that cannot cover the gap
+    /// gets no second ask before a different one does. The retry pump is the
+    /// same one a refusal drives — a source ANSWERING is the event — and it
+    /// lands wherever the rotation left the cursor, never back on the peer
+    /// that just said it could not help.
+    #[tokio::test]
+    async fn a_second_source_that_reaches_the_watermark_completes_the_resume() {
+        let truncated_dir = tempfile::tempdir().expect("truncated source dir");
+        let whole_dir = tempfile::tempdir().expect("whole source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let truncated = store(truncated_dir.path());
+        let whole = store(whole_dir.path());
+        let joiner = store(joiner_dir.path());
+        // the first candidate is floored above the watermark, exactly like
+        // the single-source case above.
+        truncated.mark_backfilled("chat", 5).expect("stamp");
+        for height in 6..=10 {
+            truncated.apply_block(&block(height)).expect("folds");
+        }
+        // the second holds the whole history from genesis.
+        for height in 1..=10 {
+            whole.apply_block(&block(height)).expect("folds");
+        }
+        for height in 1..=3 {
+            joiner.apply_block(&block(height)).expect("joiner folds");
+        }
+        let truncated_client = SourceNode::new(truncated);
+        let whole_client = SourceNode::new(whole);
+        let client = TwoSources::new(truncated_client.clone(), whole_client.clone());
+
+        let mut debt = heal_and_backfill_index(&joiner, &client, 10, "joiner").await;
+        assert!(!debt.is_empty(), "the truncated candidate leaves this owed");
+        assert_eq!(
+            truncated_client.pages_asked(),
+            1,
+            "the truncated source is asked its floor exactly once"
+        );
+
+        retry_owed_backfill(&mut debt, &joiner, &client, "joiner").await;
+
+        assert!(debt.is_empty(), "the second source settles the walk");
+        assert_eq!(
+            truncated_client.pages_asked(),
+            1,
+            "the rotation means the truncated source is never asked again"
+        );
+        assert_eq!(
+            whole_client.rows_served(),
+            (4..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "only the delta above the watermark crosses, from the source that covers it"
+        );
+        assert_eq!(
+            op_rows(&joiner),
+            (1..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "the feed now reaches the boundary"
+        );
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            None,
+            "a resume never claims a floor it did not walk"
+        );
+    }
+
+    /// A NODE HOLDING NOTHING OF ITS OWN STILL STAMPS. `held == 0` is this
+    /// node's OWN account being uncomposable — there is no watermark to
+    /// resume from, so it is never a fact about a source — and stays the one
+    /// case where inheriting a source's truncation is legitimate: nothing of
+    /// this node's own is destroyed to make room for it.
+    #[tokio::test]
+    async fn a_node_holding_nothing_of_its_own_still_stamps_and_fills() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let joiner_dir = tempfile::tempdir().expect("joiner dir");
+        let source = store(source_dir.path());
+        let joiner = store(joiner_dir.path());
+        // the source itself is truncated — the fresh joiner inherits exactly
+        // this, honestly, because it never held anything else.
+        source.mark_backfilled("chat", 5).expect("source stamp");
+        for height in 6..=10 {
+            source.apply_block(&block(height)).expect("source folds");
+        }
+        let client = SourceNode::new(source);
+
+        heal_and_backfill_index(&joiner, &client, 10, "joiner").await;
+
+        assert_eq!(
+            op_rows(&joiner),
+            (6..=10).map(|h| (h, 0)).collect::<Vec<_>>(),
+            "a joiner with nothing of its own inherits exactly what the source can serve"
+        );
+        assert_eq!(joiner.applied_height("chat").expect("watermark"), 10);
+        assert_eq!(
+            joiner.backfill_height("chat").expect("floor"),
+            Some(5),
+            "the stamp is the one seam that may inherit a source's truncation"
+        );
     }
 }
