@@ -226,6 +226,13 @@ struct ValidatorRuntime<'a> {
     last_written_root: Option<sdk::StateRoot>,
     last_reach_view: Option<u64>,
     last_flush: std::time::SystemTime,
+    /// when this loop last SEALED a block, and how many stall windows have
+    /// passed since — the halt detector (`drain_pass`). every way this loop
+    /// can stop producing blocks is silent by construction (a wedged release
+    /// gate delivers nothing, a non-idle orderer FIFO makes the beat restamp
+    /// forever), so the absence of blocks is itself the event to narrate.
+    last_seal: std::time::SystemTime,
+    stall_windows: u64,
     pending_retarget: Option<reachability::MeshEpochEvent>,
     heartbeat_disabled: bool,
     /// the sender half of the finalization delivery wake — re-installed on
@@ -538,6 +545,8 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         last_written_root: None,
         last_reach_view,
         last_flush,
+        last_seal: context.current(),
+        stall_windows: 0,
         pending_retarget,
         heartbeat_disabled,
         delivery_wake_tx,
