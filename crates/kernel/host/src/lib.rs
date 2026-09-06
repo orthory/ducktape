@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 pub mod worker;
 
 /// compute the global root-hash over `modules` — the composition consensus
-/// commits to: a deterministic hash over every module's `(id, root)`. because
+/// commits to: every module's id, state root, and deployment hash. Because
 /// a module's own [`StateRoot`] already commits to its children (a qmdb merkle
 /// root commits to its keys; a git HEAD oid commits to the whole repo tree),
 /// this one level on top yields the full two-level authentication tree.
@@ -54,11 +54,35 @@ pub mod worker;
 /// computes the same root. upgrade to a small merkle tree only when a light
 /// client needs log-n membership proofs.
 pub fn global_root(modules: &[&dyn Module]) -> StateRoot {
-    let pairs: Vec<(ModuleId, StateRoot)> = modules.iter().map(|m| (m.id(), m.root())).collect();
+    let pairs: Vec<(ModuleId, StateRoot)> = modules
+        .iter()
+        .map(|m| {
+            (
+                m.id(),
+                module_commitment(m.root(), m.code_hash().as_deref()),
+            )
+        })
+        .collect();
     global_root_of(&pairs)
 }
 
-/// [`global_root`] over roots the caller ALREADY has. `root()` is a full state
+/// Bind executable code to its state. A manifest can reconstruct every module,
+/// including the code registry itself, without trusting code chosen by a peer.
+/// Native modules occur only in library harnesses and have no deployable code.
+pub fn module_commitment(root: StateRoot, code_hash: Option<&[u8]>) -> StateRoot {
+    let Some(code_hash) = code_hash else {
+        return root;
+    };
+    let mut hash = Sha256::new();
+    hash.update(b"ducktape.module");
+    hash.update((code_hash.len() as u64).to_le_bytes());
+    hash.update(code_hash);
+    hash.update(root.as_bytes());
+    StateRoot(hash.finalize().into())
+}
+
+/// Hash already-bound module commitments (see [`module_commitment`]).
+/// `root()` is a full state
 /// serialization + hash for a map-backed module, so a caller holding every
 /// module's root must never pay for it twice — a checkpoint capture computed
 /// each root four times before this seam existed (#1018).
@@ -131,7 +155,7 @@ const IDENTITY_MODULE_ID: &str = "identity";
 /// lacks before answering, and only a still-missing digest is a `None`.
 #[async_trait::async_trait(?Send)]
 pub trait CodeSource: Send + Sync {
-    /// component bytes for a content hash, or `None` if absent on this node.
+    /// Encoded deployment bytes for a content hash, or `None` if absent.
     async fn fetch(&self, code_hash: &[u8]) -> Option<Vec<u8>>;
 
     /// a stable snake_case name for WHERE this source looks — logged with a
@@ -156,7 +180,7 @@ impl CodeSource for NoCodeSource {
     }
 }
 
-/// instantiates a freshly-ADMITTED module from its verified component bytes at
+/// instantiates a freshly-ADMITTED module from its verified deployment bytes at
 /// the activation boundary — the constructor twin of [`CodeSource`]. the node
 /// wires its module composer here (the one path every wasm module enters a
 /// host through); the host itself stays wasm-runtime-agnostic. a host without
@@ -165,7 +189,7 @@ impl CodeSource for NoCodeSource {
 /// store-backed admission opens its store, and stores open asynchronously.
 #[async_trait::async_trait(?Send)]
 pub trait ModuleFactory: Send + Sync {
-    /// a module instance for `id` from component bytes already verified
+    /// a module instance for `id` from encoded deployment bytes already verified
     /// against the committed code hash — or [`Admitted::ForeignAbi`] for bytes
     /// that are no module at all.
     async fn instantiate(&self, id: &str, component_bytes: &[u8]) -> Result<Admitted, Error>;
@@ -188,7 +212,7 @@ pub enum Admitted {
     ForeignAbi,
 }
 
-/// sha256 content hash of component bytes — the verify side of a code swap.
+/// sha256 content hash of deployment bytes — the verify side of a code swap.
 fn sha256(bytes: &[u8]) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).to_vec()
@@ -379,6 +403,7 @@ pub struct FinalizedBlock {
 pub struct ModuleSnapshot {
     pub id: ModuleId,
     pub root: StateRoot,
+    pub code_hash: Option<Vec<u8>>,
     pub state_sync: StateSyncHandle,
 }
 
@@ -411,6 +436,7 @@ pub enum CapturePayloads {
 pub struct DegradedModule {
     pub id: ModuleId,
     pub root: StateRoot,
+    pub code_hash: Option<Vec<u8>>,
     pub reason: Error,
 }
 
@@ -778,13 +804,24 @@ impl Host {
         }
     }
 
+    /// Check that an existing module can retain its state under a replacement.
+    /// Preparing and dropping the action leaves the running deployment intact.
+    /// An admission has no previous state shape to preserve.
+    pub fn check_module_replacement(&mut self, id: &str, bytes: &[u8]) -> Result<(), Error> {
+        let Some(module) = self.registry.get_mut(id) else {
+            return Ok(());
+        };
+        drop(module.prepare_swap(bytes)?);
+        Ok(())
+    }
+
     /// reconcile every hot-swappable module's RUNNING code against the code
     /// registry's committed decision for block `height`, realizing any swap that
     /// has armed. this is the per-node, NON-consensus half of a live code update;
     /// the consensus half is the in-block [`Host::pending_modules_advance`] tick
-    /// that flips the committed active hash into the root-hash. code is invisible
-    /// to `root()`, so a swap keeps the module's state and the root-hash is
-    /// byte-continuous across it.
+    /// that records the active hash. A swap preserves the module's state root;
+    /// the global root also binds its running deployment hash, so it changes at
+    /// activation even when the module's state is untouched.
     ///
     /// keyed PURELY on committed registry state + `height` — the code the
     /// registry designates FOR `height` ([`modules::code_at`]) — so it
@@ -844,14 +881,14 @@ impl Host {
                 continue; // registered, never activated — nothing to realize.
             };
             // only reconcile a module this node actually runs AS a hot-swappable
-            // component: a native module (no `code_hash`) is nothing to realize —
-            // its registry entry is a genesis concern. an id absent from the
+            // component: a native test module (no `code_hash`) cannot swap.
+            // An id absent from the
             // registry is a post-genesis ADMISSION this boundary must realize by
             // instantiating the module from its verified bytes.
             let current = match self.registry.get(&m.module_id) {
                 Some(module) => match module.code_hash() {
                     Some(current) => Some(current),
-                    None => continue, // native module — genesis concern.
+                    None => continue, // native test module.
                 },
                 None => None, // admission to realize below.
             };
@@ -927,22 +964,41 @@ impl Host {
             }
         }
 
-        // PHASE 2 — APPLY the resolved roster. `swap_code` is the one call left
-        // that can fail: it compiles bytes this phase already matched against the
-        // consensus-committed hash, so a failure here is code every honest node
-        // rejects identically, not a per-node byte miss.
+        // Prepare every replacement while the running roster is untouched.
+        // Holding each module borrow in its action makes installation infallible;
+        // a later compile failure simply drops all the prepared actions.
+        let mut swaps = BTreeMap::new();
+        let mut seats = Vec::new();
         for realization in realizations {
             match realization {
                 Realization::Swap { module_id, bytes } => {
-                    self.swap_module_code(&module_id, &bytes)?
+                    swaps.insert(module_id, bytes);
                 }
+                other => seats.push(other),
+            }
+        }
+        let mut prepared = Vec::new();
+        for (id, module) in &mut self.registry {
+            let Some(bytes) = swaps.remove(id) else {
+                continue;
+            };
+            prepared.push(module.prepare_swap(&bytes)?);
+        }
+        for apply in prepared {
+            apply();
+        }
+        for realization in seats {
+            match realization {
                 Realization::Seat(module) => {
                     self.registry.insert(module.id(), module);
                 }
                 Realization::Foreign {
                     module_id,
                     code_hash,
-                } => self.skip_foreign_admission(&module_id, &code_hash),
+                } => {
+                    self.skip_foreign_admission(&module_id, &code_hash);
+                }
+                Realization::Swap { .. } => unreachable!("swaps were prepared above"),
             }
         }
         Ok(())
@@ -988,6 +1044,14 @@ impl Host {
     /// per-node realization state, never part of `root()`.
     pub fn module_code_hash(&self, id: &str) -> Option<Vec<u8>> {
         self.registry.get(id).and_then(|m| m.code_hash())
+    }
+
+    /// Mappers belonging to the currently running deployments, including
+    /// explicit absence when a deployment removes its previous mapper.
+    pub fn module_index_guests(&self) -> impl Iterator<Item = (&str, Option<&[u8]>)> {
+        self.registry
+            .iter()
+            .map(|(id, module)| (id.as_str(), module.index_guest()))
     }
 
     /// every registered module's `(id, root)`, in registry (sorted-id) order —
@@ -1097,7 +1161,16 @@ impl Host {
             capture_cost.push((id.clone(), now().saturating_sub(started)));
         }
 
-        let actual = global_root_of(&roots);
+        let commitments = roots
+            .iter()
+            .map(|(id, root)| {
+                (
+                    id.clone(),
+                    module_commitment(*root, self.module_code_hash(id).as_deref()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let actual = global_root_of(&commitments);
         if let Some(expected) = expected
             && actual != expected
         {
@@ -1130,11 +1203,13 @@ impl Host {
                 Ok(state_sync) => modules.push(ModuleSnapshot {
                     id: id.clone(),
                     root: *root,
+                    code_hash: module.code_hash(),
                     state_sync,
                 }),
                 Err(reason) => degraded.push(DegradedModule {
                     id: id.clone(),
                     root: *root,
+                    code_hash: module.code_hash(),
                     reason,
                 }),
             }

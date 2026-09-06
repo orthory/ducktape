@@ -16,6 +16,8 @@
 //! host leaves here wired: the admissions factory over the node's canonical
 //! substrates, and an index database for every module it runs.
 
+use std::collections::BTreeMap;
+
 use commonware_cryptography::ed25519;
 use commonware_runtime::Supervisor as _;
 use duckfs_disk::SyncScratch;
@@ -32,10 +34,11 @@ use statesync::{
     fetch_snapshot,
     qmdb::{QmdbStore, RemoteQmdbResolver},
 };
+#[cfg(test)]
 use topology::PRODUCTION;
 use wasm_host::Backing;
 
-use noded::{IndexGuests, converge_index_guests, index_host_modules};
+use noded::{converge_host_modules, index_host_modules};
 
 use crate::config::{
     Genesis, GenesisModules, GenesisSource, component_path, hex_bytes, install_genesis,
@@ -95,7 +98,8 @@ impl host::CodeSource for BlobCodeSource {
 
 /// what [`hydrate_from_disk`] found on disk.
 enum Hydrated {
-    /// every component is in the blob store and every index guest converged.
+    /// Every genesis deployment is in the blob store; composition installs
+    /// mappers from the actual running deployments.
     Installed,
     /// the workspace genesis file is absent — a joiner before its first
     /// fetch — and nothing was installed. `hash` is the descriptor's pin the
@@ -117,10 +121,9 @@ fn hydrate_from_disk(
     index: &indexer::IndexStore,
     genesis: &GenesisModules,
 ) -> Result<Hydrated, String> {
-    let guests = match &genesis.source {
+    match &genesis.source {
         GenesisSource::FoundingSet(dir) => {
             seed_founding_set(blobs, dir, &genesis.hashes)?;
-            IndexGuests::from_dir(dir, PRODUCTION)?
         }
         GenesisSource::Workspace { file, hash } => {
             let Some(loaded) = seed_workspace_genesis(blobs, file, hash, &genesis.hashes)? else {
@@ -134,10 +137,9 @@ fn hydrate_from_disk(
                 .parent()
                 .ok_or_else(|| format!("{} has no workspace directory", file.display()))?;
             loaded.materialize(&modules_path(workspace))?;
-            IndexGuests::from_genesis(&loaded)
         }
     };
-    converge_index_guests(index, &guests)?;
+    index_host_modules(index, genesis.hashes.keys().map(String::as_str))?;
     Ok(Hydrated::Installed)
 }
 
@@ -249,7 +251,7 @@ fn seed_workspace_genesis(
         }
         // verified above: every id in `want` is a component hashing to `digest`.
         let component = genesis
-            .component(id)
+            .artifact(id)
             .expect("verified genesis carries every module");
         blobs.put_chunk(component.to_vec());
         seeded += 1;
@@ -289,8 +291,7 @@ fn seed_founding_set(
             continue;
         }
         let path = component_path(dir, id);
-        let bytes = std::fs::read(&path)
-            .map_err(|e| format!("module {id}: read {}: {e} — fail-closed", path.display()))?;
+        let bytes = workspace_config::read_module_artifact(dir, id)?.encode();
         let got: [u8; 32] = sha2::Sha256::digest(&bytes).into();
         let matches_descriptor = got == *digest;
         if !matches_descriptor {
@@ -359,13 +360,12 @@ fn wire(
         substrates,
         &net.compose(),
     )));
-    index_host_modules(index, host.module_roots().iter().map(|(id, _)| id.as_str()))
+    converge_host_modules(index, host)
 }
 
-/// the PRODUCTION module set at block zero — genesis state, identical on every
-/// node (a different set, or different component bytes, composes a different
-/// root-hash and the network forks at genesis): the topology's production
-/// selection over the bundle's components, valset seeded with the genesis
+/// The workspace's module set at block zero, authenticated by its genesis
+/// deployment hashes. Every component initializes through the same Wasm
+/// lifecycle, with valset consuming the genesis
 /// validators and the modules registry with the descriptor's code hashes.
 pub(super) async fn genesis_host(
     context: &commonware_runtime::tokio::Context,
@@ -389,7 +389,6 @@ pub(super) async fn genesis_host(
     let mut stores = qmdb_stores(context);
     let substrates = disk_substrates(forge_repo, duckfs_dir, blobs);
     let mut host = compose(
-        PRODUCTION,
         &code,
         &mut stores,
         &substrates,
@@ -403,6 +402,23 @@ pub(super) async fn genesis_host(
     .map_err(|e| format!("genesis compose: {e}"))?;
     wire(&mut host, context, &substrates, &net, index)?;
     Ok(host)
+}
+
+/// Validate the executable roster before opening any module state.
+fn module_codes<'a>(
+    entries: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<BTreeMap<String, [u8; 32]>, String> {
+    let mut codes = BTreeMap::new();
+    for (id, hash) in entries {
+        workspace_config::validate_module_id(id)?;
+        let hash = hash
+            .try_into()
+            .map_err(|_| format!("module {id} has no 32-byte executable commitment"))?;
+        if codes.insert(id.to_owned(), hash).is_some() {
+            return Err(format!("duplicate executable commitment for {id}"));
+        }
+    }
+    Ok(codes)
 }
 
 /// the RESTORE twin of [`genesis_host`]: the disk substrates (qmdb stores,
@@ -439,13 +455,18 @@ pub(super) async fn restore_host(
     let height = manifest.height.unwrap_or(0);
     let substrates = disk_substrates(forge_repo, duckfs_dir, blobs);
     let mut host = compose(
-        PRODUCTION,
         &code,
         &mut stores,
         &substrates,
         &net.compose(),
         Boot::Reopen {
             height,
+            codes: &module_codes(
+                manifest
+                    .codes
+                    .iter()
+                    .map(|(id, hash)| (id.as_str(), hash.as_slice())),
+            )?,
             snapshots: &mut snapshots,
         },
     )
@@ -688,13 +709,18 @@ pub(super) async fn sync_all_modules<C: statesync::SyncClient + crate::blob_fetc
     };
     let bindings = net.compose();
     let mut host = compose(
-        PRODUCTION,
         &code,
         &mut stores,
         &disk_substrates(forge_repo, files_scratch.dir(), blobs.clone()),
         &bindings,
         Boot::Reopen {
             height: manifest.height,
+            codes: &module_codes(manifest.entries.iter().map(|entry| {
+                (
+                    entry.module_id.as_str(),
+                    entry.code_hash.as_deref().unwrap_or_default(),
+                )
+            }))?,
             snapshots: &mut snapshots,
         },
     )
@@ -767,7 +793,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "b17fc7b55b0c8b5e21c7cfc40b6a91603fcc71af72421334f793ce312394571d";
+        "14c9192b272a3bf063c8f2ee453935c073a7904a0ad3ee7d2d125ff7decaf51b";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`
@@ -798,7 +824,7 @@ mod tests {
     /// never embedded.
     fn fixture_genesis() -> GenesisModules {
         let dir = workspace_config::modules_dir().expect("the build stages the founding set");
-        let hashes = crate::config::hash_bundle(&dir, &topology::TOPOLOGY.wasm_ids(PRODUCTION))
+        let hashes = noded::bundle::hash_bundle(&dir, &topology::TOPOLOGY.wasm_ids(PRODUCTION))
             .expect("founding set");
         GenesisModules {
             hashes,
@@ -993,26 +1019,13 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// the topology's `code` column is what the loader branches on; if it
-    /// disagrees with what the composed host actually runs, a native module is
-    /// sent to the wasm loader (or a wasm tenant is never reconciled).
     #[test]
-    fn topology_code_column_matches_the_composed_host() {
-        let in_production_and_native = |m: &topology::ModuleSpec| {
-            PRODUCTION.contains(&m.id) && m.code == topology::Code::Native
-        };
-        let mut native_by_topology: Vec<String> = topology::TOPOLOGY
-            .modules
-            .iter()
-            .filter(|m| in_production_and_native(m))
-            .map(|m| m.id.to_string())
-            .collect();
-        native_by_topology.sort_unstable();
-        let (_ids, _root, native_by_host) = genesis_facts();
-        assert_eq!(native_by_host, native_by_topology);
-        // both sides go empty together if the last native module ever leaves
-        // PRODUCTION, so anchor the pin on the ids themselves as well.
-        assert_eq!(native_by_host, ["modules", "valset"]);
+    fn every_default_module_runs_wasm_including_the_registries() {
+        let (_ids, _root, natives) = genesis_facts();
+        assert!(
+            natives.is_empty(),
+            "the binary must construct no native modules: {natives:?}"
+        );
     }
 
     /// a workspace genesis seeds every component into the blob store and
@@ -1025,15 +1038,14 @@ mod tests {
     fn a_workspace_genesis_seeds_and_serves_itself() {
         let dir = tempfile::tempdir().expect("tempdir");
         let genesis = Genesis {
-            components: vec![workspace_config::Artifact {
+            modules: vec![workspace_config::Artifact {
                 id: "pages".into(),
-                bytes: b"pages-bytes".to_vec(),
+                bytes: module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).encode(),
             }],
-            index_guests: vec![],
         };
         let bytes = genesis.encode();
         let hash = workspace_config::genesis::sha256(&bytes);
-        let want = genesis.component_hashes();
+        let want = genesis.module_hashes();
         let file = workspace_config::genesis_path(dir.path());
 
         let blobs = blobstore::BlobHandle::default();
@@ -1087,7 +1099,7 @@ mod tests {
         let mut want = std::collections::BTreeMap::new();
         want.insert(
             "pages".to_string(),
-            sha2::Sha256::digest(b"pages-bytes").into(),
+            module_artifact::ModuleArtifact::component(b"pages-bytes".to_vec()).hash(),
         );
         let blobs = blobstore::BlobHandle::default();
         seed_founding_set(&blobs, dir.path(), &want).expect("seed");
@@ -1124,7 +1136,7 @@ mod tests {
     /// ## the mechanism, because it surprises everyone once
     ///
     /// What this covers is wider than the module SET. The composer's modules registry
-    /// seed commits `sha256(component.wasm)` — the descriptor's hash — for
+    /// seed commits each deployment hash — the descriptor's commitment — for
     /// every wasm tenant into the modules registry's MerkleStore, so each
     /// guest's CODE DIGEST is consensus state itself. That means a module's
     /// SOURCE is consensus-relevant the moment its component is rebuilt — even

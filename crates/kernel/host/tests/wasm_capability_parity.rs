@@ -813,3 +813,66 @@ async fn class_multi_dispatch_inner(context: &deterministic::Context) {
         );
     }
 }
+
+#[test]
+fn an_empty_wasm_roster_without_valset_answers_queries_and_refuses_announcements() {
+    deterministic::Runner::default().start(|context| async move {
+        let native = native_capability(Box::new(cap_store(&context, "empty_native").await));
+        let wasm = wasm_capability(Box::new(cap_store(&context, "empty_wasm").await));
+        for module in [Box::new(native) as Box<dyn sdk::Module>, Box::new(wasm)] {
+            let mut host = Host::genesis(vec![module]).unwrap();
+            assert!(providers(&host, "codex").await.is_empty());
+            let query = encode_query(&CapabilityQuery::CapableProviders {
+                capability: "codex".into(),
+                demands: Default::default(),
+            });
+            assert_eq!(
+                decode_reply(&host.query("capability", &query).await.unwrap()).unwrap(),
+                CapabilityReply::Providers(vec![])
+            );
+            assert!(
+                host.submit_at(block(1, ext(&[7; 32])), announce(&["codex"]))
+                    .await
+                    .is_err()
+            );
+        }
+    });
+}
+
+#[test]
+fn wasm_provider_queries_exclude_a_member_who_left_after_announcing() {
+    deterministic::Runner::default().start(|context| async move {
+        let departing = key(1);
+        let validators = [departing.clone(), key(2)];
+        let native = native_host(&context, &validators).await;
+        let wasm = wasm_host_(&context, &validators).await;
+        for mut host in [native, wasm] {
+            host.submit_at(block(1, ext(&departing)), announce(&["codex"]))
+                .await
+                .unwrap();
+            assert_eq!(providers(&host, "codex").await, vec![departing.clone()]);
+            let root = root_of(&host);
+            host.submit_at(
+                block(2, Origin::System),
+                Msg {
+                    target: "valset".into(),
+                    payload: valset_encode_msg(&ValsetMsg::Leave {
+                        key: departing.clone(),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(root_of(&host), root, "the old announcement remains stored");
+            assert!(providers(&host, "codex").await.is_empty());
+            let query = encode_query(&CapabilityQuery::CapableProviders {
+                capability: "codex".into(),
+                demands: Default::default(),
+            });
+            assert_eq!(
+                decode_reply(&host.query("capability", &query).await.unwrap()).unwrap(),
+                CapabilityReply::Providers(vec![])
+            );
+        }
+    });
+}

@@ -18,10 +18,10 @@ use harness::Sim;
 /// `bin/node/src/host_state.rs`'s `GENESIS_ROOT_HASH`, over the production
 /// module set — moving THAT is the flag day that matters. This constant guards
 /// something narrower and still worth guarding: that composing the sim's
-/// genesis is a pure function of the topology selection, so a change in how the
+/// genesis is a pure function of deployment bytes and bindings, so a change in how the
 /// sim builds its host shows up here instead of silently under a scenario.
 const DEFAULT_GENESIS_ROOT_HASH: &str =
-    "2134e5430210ae57d1d70eb3645500969fe1fe8c2b84b0e5c20a4353f5d94826";
+    "1a6f0019d873fe4857eeaae61e10716a1f707f5e51f1a79f0ca18f285a23eb35";
 
 fn module_ids(status: &serde_json::Value) -> Vec<String> {
     status["modules"]

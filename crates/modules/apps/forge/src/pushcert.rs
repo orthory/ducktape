@@ -31,7 +31,7 @@
 //! must re-verify the same check consensus can compute unaided. that needs
 //! consensus to know ITS OWN chain id — the same genesis-config seam
 //! `identity`/`gateway`/`runs` bind their chain id through
-//! (`sdk::genesis_config`, `guest_adapter::genesis_chain_id`) — which now
+//! (`sdk::genesis_config`, `ducktape_module_sdk::genesis_chain_id`) — which now
 //! reaches an `Odb`-backed module too (`noded::compose`'s `odb_genesis_config`,
 //! #1773): forge's [`crate::guest`] shape declares the `chain_id` config key,
 //! so every dispatch reads it back and [`signer`] checks the FULL nonce

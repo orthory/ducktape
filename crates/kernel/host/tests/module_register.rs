@@ -22,22 +22,25 @@ use sha2::Digest;
 use host::{Admitted, BlockContext, CodeSource, Host, MODULES_ID, ModuleFactory};
 use modules::{Modules, ModulesMsg, ModulesQuery, ModulesReply};
 use sdk::{Error, Msg, Origin, StateRoot};
-use wasm_host::WasmModule;
 
 const COMPONENT: &[u8] = include_bytes!("fixtures/hello.component.wasm");
 
 /// the admission boundary: far enough past scheduling to clear MIN_SWAP_LEAD.
 const H: u64 = 10;
 
+fn deployment(bytes: &[u8]) -> Vec<u8> {
+    module_artifact::ModuleArtifact::component(bytes.to_vec()).encode()
+}
+
 fn sha(bytes: &[u8]) -> Vec<u8> {
-    sha2::Sha256::digest(bytes).to_vec()
+    sha2::Sha256::digest(deployment(bytes)).to_vec()
 }
 
 struct MapSource(BTreeMap<Vec<u8>, Vec<u8>>);
 
 impl MapSource {
     fn with(components: &[&[u8]]) -> Self {
-        Self(components.iter().map(|c| (sha(c), c.to_vec())).collect())
+        Self(components.iter().map(|c| (sha(c), deployment(c))).collect())
     }
 }
 
@@ -61,9 +64,12 @@ impl ModuleFactory for WasmFactory {
         // the node's own answer, in miniature: a module that will not load
         // HERE stays fail-closed; bytes that are no module at all are another
         // plane's record (see `noded::compose::Admissions`).
-        match WasmModule::from_bytes(id, bytes) {
+        let artifact = module_artifact::ModuleArtifactRef::decode(bytes).map_err(Error::Module)?;
+        match wasm_host::CompiledModule::compile_artifact(bytes)
+            .and_then(|compiled| compiled.over_map(id))
+        {
             Ok(module) => Ok(Admitted::Module(Box::new(module))),
-            Err(refusal) => match wasm_host::speaks_module_abi(bytes) {
+            Err(refusal) => match wasm_host::speaks_module_abi(artifact.component) {
                 true => Err(refusal),
                 false => Ok(Admitted::ForeignAbi),
             },

@@ -8,9 +8,8 @@
 use std::path::PathBuf;
 
 use commonware_cryptography::Signer as _;
-use topology::PRODUCTION;
 
-use crate::cli::{CeremonyOutcome, GovSigner, rpc_query};
+use crate::cli::{CeremonyOutcome, GovSigner, rpc_call, rpc_query};
 use crate::cli_args::{Selector, StatusArgs};
 use crate::config::{self, hex_bytes};
 
@@ -27,7 +26,7 @@ pub enum ModuleCmd {
     Status(StatusArgs),
 }
 
-/// `<id> <component.wasm> [--after N]` — shared by update and register.
+/// `<id> <component.wasm> [--index <index.wasm>] [--after N]` — shared by update and register.
 #[derive(Debug, clap::Args)]
 pub struct StageArgs {
     /// the module id the code belongs to
@@ -36,6 +35,9 @@ pub struct StageArgs {
     /// the component bytes to stage
     #[arg(value_name = "COMPONENT.WASM")]
     pub component: PathBuf,
+    /// Optional mapper deployed and activated with this component; omission removes it.
+    #[arg(long, value_name = "INDEX.WASM")]
+    pub index: Option<PathBuf>,
     /// blocks after the proposal's EXECUTE height (not this node's height
     /// right now) at which the swap activates — the same value for every
     /// member co-signing the same proposal, whatever height each one is at
@@ -144,10 +146,10 @@ fn matches_module_action<'a>(
     }
 }
 
-/// `module update|register <id> <component.wasm> [--after N]`: stage the bytes
+/// `module update|register <id> <component.wasm> [--index <index.wasm>] [--after N]`: stage the bytes
 /// at this node (fan-out to every validator), refuse unless every member holds
 /// them, then drive the governance proposal that schedules the swap at this
-/// node's height + N and read the registry back for its verdict.
+/// execution height + N and read the registry back for its verdict.
 fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     config::validate_module_id(&args.id)?;
     // the static half of the registry's lead rule, checked before anything is
@@ -164,8 +166,14 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         )
         .into());
     }
-    let bytes = std::fs::read(&args.component)
+    let component = std::fs::read(&args.component)
         .map_err(|e| format!("read {}: {e}", args.component.display()))?;
+    let index = args
+        .index
+        .as_ref()
+        .map(|path| std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display())))
+        .transpose()?;
+    let bytes = module_artifact::ModuleArtifact { component, index }.encode();
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, verb.name())?;
@@ -179,7 +187,14 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     // 1. the registry's static rules, before anything is staged or proposed:
     //    each would reject governance's execute in-kernel and leave a
     //    proposal open for its whole voting period.
-    let precheck = registry_precheck(verb, &read_module_status(rpc_addr)?, &args.id, &code_hash)?;
+    let live_modules = read_live_modules(rpc_addr)?;
+    let precheck = registry_precheck(
+        verb,
+        &read_module_status(rpc_addr)?,
+        &live_modules,
+        &args.id,
+        &code_hash,
+    )?;
     match precheck {
         Precheck::Proceed => {}
         // a member running the verb after the deciding ballot (or after the
@@ -346,22 +361,19 @@ impl Held {
 fn registry_precheck(
     verb: Verb,
     modules: &[modules::ModuleCode],
+    live_modules: &[String],
     id: &str,
     code_hash: &[u8; 32],
 ) -> Result<Precheck, String> {
-    // a genesis id is code this host already runs, so the registry's
-    // `handle_schedule_register` refuses to re-admit it (`ctx.module_root`) —
-    // and that refusal lands in-kernel, leaving the proposal open for its whole
-    // voting period. the registry read cannot see it: a NATIVE module carries no
-    // registry entry at all.
-    let registering_a_genesis_module = matches!(verb, Verb::Register) && PRODUCTION.contains(&id);
-    if registering_a_genesis_module {
-        return Err(format!(
-            "{id} is a genesis module — its code changes with `module update`, not `register`"
-        ));
-    }
     if let Some(held) = registry_holds(modules, id, code_hash) {
         return Ok(Precheck::AlreadyHeld(held));
+    }
+    let already_live = live_modules.iter().any(|live| live == id);
+    let registering_live_module = matches!(verb, Verb::Register) && already_live;
+    if registering_live_module {
+        return Err(format!(
+            "module {id} is already registered (code changes go through `module update`)"
+        ));
     }
     let entry = modules.iter().find(|m| m.module_id == id);
     let other_swap_pending = entry.map(|m| m.pending.is_some());
@@ -403,6 +415,20 @@ fn registry_holds(modules: &[modules::ModuleCode], id: &str, code_hash: &[u8; 32
     }
     let already_active = entry.active_code_hash == code_hash;
     already_active.then_some(Held::Active)
+}
+
+/// The running host determines which ids are occupied, including modules
+/// with no code-registry record. A default build catalog says nothing about
+/// the module set of this network.
+fn read_live_modules(rpc_addr: &str) -> Result<Vec<String>, String> {
+    let reply = rpc_call(rpc_addr, &serde_json::json!({ "cmd": "status" }))?;
+    if reply["ok"] != true {
+        return Err(format!("status: {}", reply["error"]));
+    }
+    let Some(modules) = reply["status"]["modules"].as_object() else {
+        return Err("node status carries no module roster".into());
+    };
+    Ok(modules.keys().cloned().collect())
 }
 
 /// the signer's public key as hex: the proposal-id seed the ceremony mints
@@ -594,7 +620,7 @@ fn digest_matches(reply: &StageReply, bytes: &[u8]) -> Result<[u8; 32], String> 
     let agree = theirs[..] == ours[..];
     if !agree {
         return Err(format!(
-            "stage digest {} is not the sha256 of the file we read ({})",
+            "stage digest {} is not the sha256 of the deployment we packaged ({})",
             reply.digest,
             hex_bytes(&ours)
         ));
@@ -762,7 +788,7 @@ mod tests {
             history: Vec::new(),
         };
         let precheck =
-            |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, "hello", &ours);
+            |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, &[], "hello", &ours);
 
         // register: a free id proceeds; any existing entry refuses
         assert!(matches!(
@@ -807,12 +833,15 @@ mod tests {
             "scheduled"
         );
         assert_eq!(Held::Active.word(), "active");
-        // a genesis id carries no registry entry when it is native, so only the
-        // topology set catches it — the registry would refuse it in-kernel
-        let err = registry_precheck(Verb::Register, &[], "identity", &ours).unwrap_err();
-        assert!(err.contains("genesis module"), "{err}");
-        // update is how a genesis module's code changes: no genesis refusal
-        let err = registry_precheck(Verb::Update, &[], "identity", &ours).unwrap_err();
+        // A familiar name is available when this network does not run it.
+        assert!(matches!(
+            registry_precheck(Verb::Register, &[], &[], "identity", &ours),
+            Ok(Precheck::Proceed)
+        ));
+        let live = vec!["identity".to_string()];
+        let err = registry_precheck(Verb::Register, &[], &live, "identity", &ours).unwrap_err();
+        assert!(err.contains("already registered"), "{err}");
+        let err = registry_precheck(Verb::Update, &[], &live, "identity", &ours).unwrap_err();
         assert!(err.contains("unregistered module identity"), "{err}");
     }
 
