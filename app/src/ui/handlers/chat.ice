@@ -100,6 +100,10 @@ on open_chat_search_hit(channel_id, root_seq, target_seq)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // The copy range ends with the room — see `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -177,6 +181,15 @@ on choose_channel(id)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // THE COPY RANGE ENDS WITH THE ROOM. Its two ends are seqs in THIS channel's
+  // sequence, so carried next door they would tint rows nobody picked — and
+  // the bar that holds the only Clear button is gated on a count the arriving
+  // list makes zero, which would leave the ⌘C route armed with no way to
+  // disarm it. Every navigation that changes which conversation is on screen
+  // ends the selection; the five other sites that do it point back here.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -265,6 +278,10 @@ on choose_dm(peer_key)
   channel_settings_open = false
   channel_name_draft = ""
   member_key_draft = ""
+  // The copy range ends with the room — see `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = 0
   thread_target_seq = 0
   thread_messages = []
@@ -761,6 +778,11 @@ on channel_created(next)
   selected_message_rev = next.selected_message_rev
   message_action = MessageAction.toolbar
   message_edit_draft = next.selected_message_body
+  // A create is a room switch, so the copy range ends here too — see
+  // `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   active_thread_seq = next.active_thread_seq
   // A create lands on seq 0 — no thread seated, and no composer line owed:
   // each thread's instance keeps its own words (ducktape-ui#697).
@@ -987,6 +1009,14 @@ on open_thread_for(seq)
   thread_selected_rev = 0
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
+  // AND WITH THE RAIL'S LIST, for the same reason as the room — see
+  // `choose_channel`. A reply's seq comes from the CHANNEL's sequence, so a
+  // range left standing tints replies in whichever thread opens next. This
+  // handler already drops the stream's own `selected_message_seq` two lines
+  // up; the selection goes with it.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
   thread_generation = thread_generation + 1
   invalidate lane=live_thread
   thread_loading = true
@@ -1146,6 +1176,11 @@ on close_thread
   thread_selected_rev = 0
   thread_message_action = MessageAction.toolbar
   thread_edit_draft = ""
+  // The rail's list goes with the rail, and so does the copy range — see
+  // `choose_channel`.
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
 
 on edit_message_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || selected_message_seq <= 0 || empty(trim(message_edit_draft))
@@ -1295,3 +1330,54 @@ on thread_reply_send_failed(cause)
 on thread_reply_sent(next)
   return if active_channel != next.channel_id
   error = ""
+
+// ============================================================================
+// THE COPY RANGE. Copying what someone said meant retyping it: the message
+// menu offers `Copy message link` and there is no way to lift the TEXT of even
+// one message, let alone a run of them.
+//
+// The unit is the message, not the character. iced has no selection that
+// crosses widgets, and this timeline's hover is draw-time on purpose (see
+// `MessageCard`) — a drag that followed the cursor from row to row would need
+// an enter route and a full rebuild per row crossed, which is the per-hover
+// round trip `DiffRow` refuses by name. So the gesture is the one every
+// desktop list already answers: click an end, shift-click the other.
+// ============================================================================
+
+// A press on a message's prose, in either surface. Plain, it starts a
+// one-message range here; with ⇧ held it keeps the anchor and moves the far
+// end. `shift_held` comes off the modifier stream because a press carries no
+// modifiers of its own, and the surface rides along so a shift-click in the
+// rail cannot draw a range that spans both lists.
+on press_message(seq, surface)
+  let range = copy_range_after_press(copy_anchor_seq, copy_surface, seq, surface, shift_held)
+  copy_anchor_seq = range.anchor
+  copy_head_seq = range.head
+  copy_surface = range.surface
+
+on clear_copy_range
+  copy_anchor_seq = 0
+  copy_head_seq = 0
+  copy_surface = CopySurface.nowhere
+
+// TWO DOORS, ONE ACT. An app handler cannot call another one and a keyboard
+// subscription cannot hand its event to a no-argument handler, so the bar's
+// button and ⌘C each spell the same four lines. That is thinner than it looks:
+// every decision — which list, whether there is a range, what the toast says,
+// what text comes out — is in the externs, and these bodies only apply them.
+// The surface picks the list, which is what makes the chord lift exactly the
+// rows the bar was counting.
+on copy_chord_pressed(event)
+  return if !is_copy_chord(event.key, event.physical_key, event.modifiers)
+  let rows = copy_range_rows(messages, thread_messages, copy_surface)
+  return if copy_range_count(rows, copy_anchor_seq, copy_head_seq) == 0
+  toast = copy_range_toast(rows, copy_anchor_seq, copy_head_seq)
+  toast_age = 0
+  task clipboard write copy_range_text(rows, copy_anchor_seq, copy_head_seq)
+
+on copy_selected_messages
+  let rows = copy_range_rows(messages, thread_messages, copy_surface)
+  return if copy_range_count(rows, copy_anchor_seq, copy_head_seq) == 0
+  toast = copy_range_toast(rows, copy_anchor_seq, copy_head_seq)
+  toast_age = 0
+  task clipboard write copy_range_text(rows, copy_anchor_seq, copy_head_seq)

@@ -394,7 +394,14 @@ fn the_message_timeline_virtualizes_under_an_end_anchored_scroll() {
     // level up, and `has_older_history` flips on every page.
     assert!(chat.contains("col w=fill gap=3.0 pr=6.0"));
     assert!(chat.contains("button \"Load older messages\""));
-    assert!(timeline.1.contains("lazy message as cached_message"));
+    // THE COPY RANGE JOINS THE PER-ROW KEY. A quiet row's memo has to notice
+    // the range's ends moving, or shift-clicking down a channel would tint the
+    // rows the reader is dragging over and leave every cached row behind it
+    // untinted. Everything else about the key is unchanged: the range is three
+    // scalars, not a list, so a cached row still reads nothing expensive.
+    assert!(timeline.1.contains(
+        "lazy message, copy_anchor_seq, copy_head_seq, copy_surface as cached_message"
+    ));
     // A key is only an identity if it is unique. The allocator gives every
     // concurrent pending row its own widget state and measurement.
     let mut pending = Vec::new();
