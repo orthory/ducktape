@@ -253,6 +253,7 @@ impl ForgeState {
         ctx: &mut dyn Ctx,
         payload: &[u8],
         chat_target: Option<&str>,
+        chain_id: &str,
     ) -> Result<(), Error> {
         let now = ctx.env().consensus_time;
         match decode_msg(payload).map_err(Error::Module)? {
@@ -264,7 +265,7 @@ impl ForgeState {
             } => {
                 let name = norm_repo(&repo)?;
                 let principal = self
-                    .push_principal(ctx, &name, cert.as_ref(), &updates)
+                    .push_principal(ctx, chain_id, &name, cert.as_ref(), &updates)
                     .await?;
                 self.stage_push_refs(&name, principal, updates, pack_digest)
             }
@@ -514,17 +515,13 @@ impl ForgeState {
 
     /// the principal a PUSH speaks for: with a push certificate, the SSH key
     /// that signed it (its account, when it has one) — `git push --signed`
-    /// through any node, verified here by every validator; without one, the
+    /// through any node, verified here by every validator against THIS
+    /// network's own chain id (`pushcert::signer`, #1773); without one, the
     /// frame origin ([`Self::principal_of_origin`]).
-    ///
-    /// a certified push also gates on [`Tracker::accepted_chain`] (#1761,
-    /// `pushcert` module doc): the first cert-verified push this forge
-    /// instance ever accepts pins its nonce's chain half forever; every later
-    /// one must match, or a certificate harvested off a different ducktape
-    /// network is refused instead of replaying through here.
     async fn push_principal(
         &mut self,
         ctx: &dyn Ctx,
+        chain_id: &str,
         repo: &str,
         cert: Option<&PushCert>,
         updates: &[RefUpdate],
@@ -532,18 +529,8 @@ impl ForgeState {
         let Some(cert) = cert else {
             return Self::principal_of_origin(ctx).await;
         };
-        let (signer, chain) = crate::pushcert::signer(cert, repo, updates)
+        let signer = crate::pushcert::signer(cert, chain_id, repo, updates)
             .map_err(|reason| Error::Module(format!("forge: {reason}")))?;
-        match &self.tracker_view().accepted_chain {
-            Some(pinned) if pinned != &chain => {
-                return Err(Error::Module(format!(
-                    "forge: push certificate nonce belongs to chain {chain:?}, not this \
-                     network's {pinned:?}"
-                )));
-            }
-            Some(_) => {}
-            None => self.staged_tracker_mut().accepted_chain = Some(chain),
-        }
         let account = Self::identity_account(ctx, &signer).await?;
         Ok(account.map_or(signer, identity::account_principal))
     }
