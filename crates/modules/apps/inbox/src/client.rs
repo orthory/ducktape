@@ -147,7 +147,6 @@ fn render_source(kind: &str, id: Option<&str>) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

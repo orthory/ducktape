@@ -35,8 +35,8 @@ use data_plane::{
 use futures::SinkExt as _;
 use futures::channel::{mpsc as fmpsc, oneshot};
 use noded::{
-    CreatedSession, NodeCommand, PeerAttach, SessionInputWire, SessionJob, TermCommandEvent,
-    TermCommandRing, TermError, TermFeedEvent, TermRing, TerminalSessions,
+    CreatedSession, NodeCommand, PeerAttach, RemoteSessions, SessionInputWire, SessionJob,
+    TermCommandEvent, TermCommandRing, TermError, TermFeedEvent, TermRing, TerminalSessions,
 };
 use provider_host::ResolvedCredential;
 use serde::Serialize;
@@ -167,6 +167,7 @@ pub(crate) fn spawn(
     local_gateway_via: String,
     workspace: std::path::PathBuf,
     jobs: tokio::sync::mpsc::Receiver<SessionJob>,
+    remote_sessions: RemoteSessions,
 ) {
     tokio::spawn(async move {
         let own = peers.own_ip(&me);
@@ -209,6 +210,7 @@ pub(crate) fn spawn(
             term_commands,
             control,
             jobs,
+            remote_sessions,
         )
         .await;
     });
@@ -224,6 +226,7 @@ async fn run_bound<T: DataPlaneTransport>(
     term_commands: TermCommandRing,
     control: Arc<ControlState>,
     jobs: tokio::sync::mpsc::Receiver<SessionJob>,
+    remote_sessions: RemoteSessions,
 ) {
     let _plane = plane;
     tokio::select! {
@@ -233,6 +236,7 @@ async fn run_bound<T: DataPlaneTransport>(
             terminals.clone(),
             term_commands.clone(),
             Arc::clone(&control),
+            remote_sessions,
         ) => {}
         _ = fanout_loop(Arc::clone(&service), Arc::clone(&peers), me, terminals, term_commands) => {}
         _ = client_loop(service, control, jobs) => {}
@@ -245,6 +249,7 @@ async fn accept_loop<T: DataPlaneTransport>(
     terminals: TermRing,
     term_commands: TermCommandRing,
     control: Arc<ControlState>,
+    remote_sessions: RemoteSessions,
 ) {
     // one live inbound stream per (peer, feed): the long-lived feeds (chunk /
     // command / input) hold one stream per (peer, intent), so the dedupe key
@@ -270,10 +275,15 @@ async fn accept_loop<T: DataPlaneTransport>(
         let term_commands = term_commands.clone();
         let control = Arc::clone(&control);
         let active = Arc::clone(&active);
+        let remote_sessions = remote_sessions.clone();
         tokio::spawn(async move {
             let _ = match intent {
-                CHUNK_INTENT => receive_chunks(stream, peer, peers, terminals).await,
-                COMMAND_INTENT => receive_commands(stream, peer, peers, term_commands).await,
+                CHUNK_INTENT => {
+                    receive_chunks(stream, peer, peers, terminals, remote_sessions).await
+                }
+                COMMAND_INTENT => {
+                    receive_commands(stream, peer, peers, term_commands, remote_sessions).await
+                }
                 INPUT_INTENT => receive_input(stream, peer, peers, control).await,
                 CONTROL_INTENT => serve_control(stream, peer, control).await,
                 _ => Ok(()),
@@ -285,11 +295,57 @@ async fn accept_loop<T: DataPlaneTransport>(
     }
 }
 
+/// per-frame refusals on the inbound feeds: a peer drives these — one frame per
+/// output chunk — so an unlatched line is a log bomb. Keyed per (reason, peer)
+/// like [`CREATE_REFUSED`], so one peer's flood never silences another's first
+/// refusal.
+static FEED_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
+
+/// the host gate on an inbound feed grain: a session's output and command rows
+/// are taken from ONE peer — the node that hosts it — and from nobody else.
+///
+/// A session id authorizes nothing on its own. Every forwarded session's grains
+/// fan out to EVERY peer (that is what makes a Shared session watchable from any
+/// node, like a huddle), so the ids are not secret. Without this bind, any member
+/// could end a session it does not host, inject bytes into its scrollback, or
+/// forge attributed command rows, on any id — including one this node hosts
+/// locally, where the ring is keyed in the same namespace.
+///
+/// [`RemoteSessions::feed_host`] answers who that peer is: the host of a session
+/// this node directed, else the first peer that ever delivered a grain for the
+/// id. The binding is dropped when its host says the session ended.
+///
+/// `None` when the grain is taken; otherwise the stable `reason` it was dropped
+/// for — the sender is not this session's host, or it has spent its whole
+/// budget of first-sender bindings on ids nobody else has ever named.
+fn feed_refusal(remote: &RemoteSessions, session: &str, peer: PeerId) -> Option<&'static str> {
+    let Some(host) = remote.feed_host(session, peer.0) else {
+        return Some("observed_bindings_capped");
+    };
+    (host != peer.0).then_some("feed_not_session_host")
+}
+
+/// log one refused feed grain, latched. The peer's NODE key is public routing
+/// metadata already logged at boot; without it the operator is told "something
+/// was dropped" with no way to find out who is sending it.
+fn feed_refused(reason: &'static str, peer: PeerId) {
+    if let Some(occurrences) = FEED_REFUSED.hit(reason, peer) {
+        tracing::warn!(
+            target: "ducktape::term",
+            reason,
+            node = %crate::config::hex_bytes(&peer.0[..4]),
+            occurrences,
+            "term feed grain dropped"
+        );
+    }
+}
+
 async fn receive_chunks<S: AsyncRead + Unpin>(
     mut stream: S,
     peer: PeerId,
     peers: Arc<OverlayPeers>,
     ring: TermRing,
+    remote_sessions: RemoteSessions,
 ) -> io::Result<()> {
     while peers.contains(peer) {
         let Some(event) = read_frame::<_, TermFeedEvent>(&mut stream).await? else {
@@ -303,14 +359,24 @@ async fn receive_chunks<S: AsyncRead + Unpin>(
         if !agent_service::wire::valid_session(event.session()) {
             continue;
         }
+        if let Some(reason) = feed_refusal(&remote_sessions, event.session(), peer) {
+            feed_refused(reason, peer);
+            continue;
+        }
         match event {
-            TermFeedEvent::Chunk(chunk) => ring.append_remote(chunk),
+            TermFeedEvent::Chunk(chunk) => ring.append_remote(chunk, peer.0),
             // the host says the pty is over. Flag it LOCAL-ONLY: this node is
             // mirroring someone else's session, so re-publishing would fan the
             // grain back out. Flagging it is what lets this node's `term:<id>`
             // catch-up emit `TermEnded` and release the `agent pty` client that
             // has been blocked on the topic since the child exited.
-            TermFeedEvent::Ended { session } => ring.mark_ended_local_only(&session),
+            TermFeedEvent::Ended { session } => {
+                ring.mark_ended_local_only(&session);
+                // the host says the session is over, so its id is free: the next
+                // grain naming it binds afresh rather than being refused forever
+                // by a binding nothing will ever end.
+                remote_sessions.forget(&session);
+            }
         }
     }
     Ok(())
@@ -321,6 +387,7 @@ async fn receive_commands<S: AsyncRead + Unpin>(
     peer: PeerId,
     peers: Arc<OverlayPeers>,
     ring: TermCommandRing,
+    remote_sessions: RemoteSessions,
 ) -> io::Result<()> {
     while peers.contains(peer) {
         let Some(event) = read_frame::<_, TermCommandEvent>(&mut stream).await? else {
@@ -329,11 +396,18 @@ async fn receive_commands<S: AsyncRead + Unpin>(
         if !peers.contains(peer) {
             return Ok(());
         }
-        if agent_service::wire::valid_session(&event.session) {
-            // append_remote replays the origin's seq verbatim — the peer shows
-            // the same total order and never re-stamps it.
-            ring.append_remote(event);
+        if !agent_service::wire::valid_session(&event.session) {
+            continue;
         }
+        // only the session's host may append attributed rows to its command log;
+        // a local command takes the `append` path, never this one.
+        if let Some(reason) = feed_refusal(&remote_sessions, &event.session, peer) {
+            feed_refused(reason, peer);
+            continue;
+        }
+        // the ring validates the seq against its own cursor — a peer's number is
+        // checked, never assigned.
+        ring.append_remote(event, peer.0);
     }
     Ok(())
 }
@@ -485,12 +559,20 @@ async fn read_frame<S: AsyncRead + Unpin, E: DeserializeOwned>(
 /// serve ONE guest→host control exchange: read the request, dispatch on its
 /// variant (one delegation each), write the single reply. No loop — CONTROL is a
 /// short stream per create/close.
+///
+/// A create is served while WATCHING the stream, and a reply that never reaches
+/// its guest closes the session it names. The host deliberately has no create
+/// timeout (a cold image pull takes minutes) while the guest gives up at
+/// [`noded::CONTROL_DEADLINE`], so a session spawned after that is one whose id
+/// reaches nobody: without this it would hold a session-cap slot until the
+/// wall-clock backstop hours later.
 async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
-    mut stream: S,
+    stream: S,
     peer: PeerId,
     control: Arc<ControlState>,
 ) -> io::Result<()> {
-    let Some(request) = read_frame::<_, SessionControlRequest>(&mut stream).await? else {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let Some(request) = read_frame::<_, SessionControlRequest>(&mut reader).await? else {
         return Ok(());
     };
     let reply = match request {
@@ -499,10 +581,77 @@ async fn serve_control<S: AsyncRead + AsyncWrite + Unpin>(
             cred,
             cpu,
             mem_gb,
-        } => serve_create(&control, peer, &provider, &cred, cpu, mem_gb).await,
-        SessionControlRequest::Close { session } => serve_close(&control, &session).await,
+        } => {
+            let creating = tokio::spawn({
+                let control = Arc::clone(&control);
+                async move { serve_create(&control, peer, &provider, &cred, cpu, mem_gb).await }
+            });
+            create_watching_the_caller(&mut reader, &control, creating).await
+        }
+        SessionControlRequest::Close { session } => serve_close(&control, peer, &session).await,
     };
-    write_frame(&mut stream, &reply).await
+    if let Err(error) = write_frame(&mut writer, &reply).await {
+        // the same orphan, found the other way: the reply never landed, so the
+        // guest has no id for the session this reply names.
+        close_abandoned(&control, &reply).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// await the host's create while watching the CONTROL stream for the guest
+/// hanging up, and close what the create spawned when it has.
+///
+/// `biased` on purpose: a caller already gone outranks a create that finished in
+/// the same poll, because that reply is going nowhere either way.
+async fn create_watching_the_caller<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    control: &ControlState,
+    mut creating: tokio::task::JoinHandle<SessionControlReply>,
+) -> SessionControlReply {
+    let mut byte = [0u8; 1];
+    tokio::select! {
+        biased;
+        // a guest sends nothing more on a CONTROL stream, so anything readable
+        // here is EOF or a transport error — either way the caller is gone.
+        _ = reader.read(&mut byte) => {}
+        finished = &mut creating => return joined(finished),
+    }
+    // the create is NOT cancelled: the daemon spawns the sandbox either way, and
+    // dropping the future here would lose the very id this exists to close.
+    let reply = joined(creating.await);
+    close_abandoned(control, &reply).await;
+    refused(
+        "creator_gone",
+        "the creator closed the control stream before the create completed",
+    )
+}
+
+fn joined(finished: Result<SessionControlReply, tokio::task::JoinError>) -> SessionControlReply {
+    match finished {
+        Ok(reply) => reply,
+        Err(error) => refused("create_failed", &error.to_string()),
+    }
+}
+
+/// close a session whose creator will never learn its id. A no-op for any reply
+/// that named no session.
+async fn close_abandoned(control: &ControlState, reply: &SessionControlReply) {
+    let SessionControlReply::Created { session, .. } = reply else {
+        return;
+    };
+    // once per abandoned create, and each one is a sandbox that would otherwise
+    // have run for hours unreachable — a lifecycle fact worth every line.
+    tracing::warn!(
+        target: "ducktape::term",
+        reason = "creator_gone",
+        session = %session,
+        "closing a session its creator abandoned"
+    );
+    let Some(sessions) = &control.sessions else {
+        return;
+    };
+    sessions.close(session).await;
 }
 
 /// the host's create path: resolve the named credential from committed gateway
@@ -539,13 +688,13 @@ static CREATE_REFUSED: PerPeerLatch = PerPeerLatch::new(100);
 /// Like [`noded::log::Latch`], but keyed on `(reason, peer)` instead of just
 /// `reason` — `Latch::hit` only takes a `&'static str`, and a peer id is not
 /// one. First occurrence per peer, then every `every`th, per peer.
-struct PerPeerLatch {
+pub(crate) struct PerPeerLatch {
     counts: std::sync::Mutex<std::collections::BTreeMap<(&'static str, PeerId), u64>>,
     every: u64,
 }
 
 impl PerPeerLatch {
-    const fn new(every: u64) -> Self {
+    pub(crate) const fn new(every: u64) -> Self {
         Self {
             counts: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             every,
@@ -554,7 +703,7 @@ impl PerPeerLatch {
 
     /// returns `Some(occurrences)` when this peer's occurrence of `reason`
     /// should be logged.
-    fn hit(&self, reason: &'static str, peer: PeerId) -> Option<u64> {
+    pub(crate) fn hit(&self, reason: &'static str, peer: PeerId) -> Option<u64> {
         let mut counts = self.counts.lock().expect("latch lock poisoned");
         let count = counts.entry((reason, peer)).or_insert(0);
         *count += 1;
@@ -690,14 +839,39 @@ async fn serve_create(
     }
 }
 
-/// close on the host: idempotent teardown. The host owns lifecycle; a close from
-/// a non-creator names a random id it would have to already know, and the
-/// wall-clock + kill-on-drop backstops hold — creator-binding close is a named
-/// follow-up.
-async fn serve_close(control: &ControlState, session: &str) -> SessionControlReply {
-    if let Some(sessions) = &control.sessions {
-        sessions.close(session).await;
+/// latch for close refusals — the same per-100 discipline as [`INPUT_WARN`]: a
+/// peer that keeps retrying a refused close can retry as fast as it opens
+/// CONTROL streams.
+static CLOSE_WARN: noded::log::Latch = noded::log::Latch::new(100);
+
+/// close on the host: idempotent teardown, but ONLY for the peer that created
+/// the session. Every forwarded session's chunks fan out to every mesh member
+/// (see [`feed_refusal`]'s doc), so a session id is never secret — the creator
+/// binding, not the id, is what makes a close legitimate. `None` (a local
+/// session, or an unknown id) is refused too: a mesh peer never owns either.
+/// The host's own local principal still closes its own sessions through the
+/// separate loopback HTTP path (`noded::term::close_session`), which never
+/// goes through this CONTROL codec at all.
+async fn serve_close(control: &ControlState, peer: PeerId, session: &str) -> SessionControlReply {
+    let Some(sessions) = &control.sessions else {
+        return SessionControlReply::Closed;
+    };
+    if !input_permitted(sessions.creator_node(session), peer) {
+        if let Some(occurrences) = CLOSE_WARN.hit("close_not_creator") {
+            tracing::warn!(
+                target: "ducktape::term",
+                reason = "close_not_creator",
+                node = %crate::config::hex_bytes(&peer.0[..4]),
+                occurrences,
+                "peer session close refused"
+            );
+        }
+        return refused(
+            "close_not_creator",
+            "only the node that created this session may close it",
+        );
     }
+    sessions.close(session).await;
     SessionControlReply::Closed
 }
 
@@ -939,36 +1113,112 @@ fn input_session(event: &SessionInputEvent) -> &str {
 // guest side: the client half draining the SessionJob lane
 // ---------------------------------------------------------------------------
 
-/// drain the guest's remote-session lane: a `Create`/`Close` is one CONTROL
-/// round-trip, an `Input` rides a persistent per-host INPUT stream. When the
-/// host is THIS node it short-circuits over a local duplex / straight to the
-/// manager, so a single node still exercises the real frame path.
+/// how many jobs may queue for ONE host before that host's lane refuses. Same
+/// depth as the node-wide lane feeding this router.
+const HOST_LANE_DEPTH: usize = 32;
+
+/// latch for the refusals the router hands out when a host's own lane backs up.
+static WEDGED_WARN: noded::log::Latch = noded::log::Latch::new(100);
+
+/// route the guest's remote-session lane onto ONE lane per host peer.
+///
+/// The router itself never awaits a peer: it only hands a job to that host's
+/// worker and moves on. Every await that can park on a remote node — the
+/// CONTROL round-trip, the INPUT stream open — lives in [`host_loop`], one task
+/// per host, so a host that accepts a stream and never answers wedges nothing
+/// but its own sessions. A host whose lane is already full is REFUSED with a
+/// reason instead of queuing behind it; the alternative is the router blocking,
+/// which is the wedge itself.
+///
+/// A worker is spawned on the first job for its host and lives for the node's
+/// lifetime — bounded by the peer set, and a host peer is contacted again the
+/// moment anyone types into one of its sessions.
 async fn client_loop<T: DataPlaneTransport>(
     service: Arc<StreamService<T>>,
     control: Arc<ControlState>,
     mut jobs: tokio::sync::mpsc::Receiver<SessionJob>,
 ) {
-    let mut input_streams: HashMap<[u8; 32], Box<dyn AsyncWrite + Unpin + Send>> = HashMap::new();
+    let mut hosts: HashMap<[u8; 32], tokio::sync::mpsc::Sender<SessionJob>> = HashMap::new();
+    while let Some(job) = jobs.recv().await {
+        let host = job.host();
+        let sent = hosts
+            .entry(host)
+            .or_insert_with(|| {
+                let (lane, rx) = tokio::sync::mpsc::channel(HOST_LANE_DEPTH);
+                tokio::spawn(host_loop(
+                    Arc::clone(&service),
+                    Arc::clone(&control),
+                    host,
+                    rx,
+                ));
+                lane
+            })
+            .try_send(job);
+        match sent {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(job)) => refuse_wedged(host, job),
+            // only a panicked worker closes its lane; drop the entry so the next
+            // job for this host starts a fresh one.
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(job)) => {
+                hosts.remove(&host);
+                refuse_wedged(host, job);
+            }
+        }
+    }
+}
+
+/// refuse one job for a host whose lane is backed up, with a stable reason.
+fn refuse_wedged(host: [u8; 32], job: SessionJob) {
+    if let Some(occurrences) = WEDGED_WARN.hit("host_lane_full") {
+        tracing::warn!(
+            target: "ducktape::term",
+            reason = "host_lane_full",
+            node = %crate::config::hex_bytes(&host[..4]),
+            occurrences,
+            "remote session job refused"
+        );
+    }
+    // a Close or an Input is dropped — the host's own lifecycle backstops hold,
+    // and a keystroke has no reply to carry a reason on. A Create has a caller
+    // waiting, and it is told why rather than left to its 30 s deadline.
+    if let SessionJob::Create { reply, .. } = job {
+        let _ = reply.send(Err(
+            "host_lane_full: this host peer is not answering; its session lane is backed up".into(),
+        ));
+    }
+}
+
+/// drain ONE host's lane: a `Create`/`Close` is one CONTROL round-trip, an
+/// `Input` rides this host's persistent INPUT stream. When the host is THIS node
+/// it short-circuits over a local duplex / straight to the manager, so a single
+/// node still exercises the real frame path.
+async fn host_loop<T: DataPlaneTransport>(
+    service: Arc<StreamService<T>>,
+    control: Arc<ControlState>,
+    host: [u8; 32],
+    mut jobs: tokio::sync::mpsc::Receiver<SessionJob>,
+) {
+    let mut input_stream: Option<Box<dyn AsyncWrite + Unpin + Send>> = None;
     while let Some(job) = jobs.recv().await {
         match job {
             SessionJob::Create {
-                host,
                 provider,
                 cred,
                 cpu,
                 mem_gb,
                 reply,
+                ..
             } => {
                 let result =
                     client_create(&service, &control, host, provider, cred, cpu, mem_gb).await;
                 let _ = reply.send(result);
             }
-            SessionJob::Close { host, session } => {
-                input_streams.remove(&host);
+            SessionJob::Close { session, .. } => {
+                input_stream = None;
                 client_close(&service, &control, host, session).await;
             }
-            SessionJob::Input { host, event } => {
-                client_input(&service, &control, &mut input_streams, host, event).await;
+            SessionJob::Input { event, .. } => {
+                client_input(&service, &control, &mut input_stream, host, event).await;
             }
         }
     }
@@ -1016,9 +1266,33 @@ async fn client_close<T: DataPlaneTransport>(
     .await;
 }
 
-/// one CONTROL round-trip: loopback over a local duplex when the host is this
-/// node (the creator is us), else open a CONTROL stream to the host peer.
+/// one CONTROL round-trip, bounded by [`noded::CONTROL_DEADLINE`] — the same
+/// number the HTTP route answers 504 on.
+///
+/// The bound is the point: the host side deliberately has NO timeout (a cold
+/// image pull legitimately takes minutes), so without one here the guest parks
+/// forever on a reply its caller stopped waiting for. On expiry the stream is
+/// dropped, which is also how the host learns the guest is gone and reaps what
+/// it spawned — see [`serve_control`].
 async fn client_control<T: DataPlaneTransport>(
+    service: &Arc<StreamService<T>>,
+    control: &Arc<ControlState>,
+    host: [u8; 32],
+    request: SessionControlRequest,
+) -> Result<SessionControlReply, String> {
+    tokio::time::timeout(
+        noded::CONTROL_DEADLINE,
+        control_round_trip(service, control, host, request),
+    )
+    .await
+    .map_err(|_| {
+        "control_timeout: the host did not reply within the control deadline".to_string()
+    })?
+}
+
+/// loopback over a local duplex when the host is this node (the creator is us),
+/// else one short CONTROL stream to the host peer.
+async fn control_round_trip<T: DataPlaneTransport>(
     service: &Arc<StreamService<T>>,
     control: &Arc<ControlState>,
     host: [u8; 32],
@@ -1053,12 +1327,12 @@ async fn client_control<T: DataPlaneTransport>(
 }
 
 /// forward one input event to the host: loopback straight to the local manager
-/// (same creator gate), else write it on the persistent per-host INPUT stream,
+/// (same creator gate), else write it on this host's persistent INPUT stream,
 /// reopening on error.
 async fn client_input<T: DataPlaneTransport>(
     service: &Arc<StreamService<T>>,
     control: &Arc<ControlState>,
-    input_streams: &mut HashMap<[u8; 32], Box<dyn AsyncWrite + Unpin + Send>>,
+    input_stream: &mut Option<Box<dyn AsyncWrite + Unpin + Send>>,
     host: [u8; 32],
     event: SessionInputWire,
 ) {
@@ -1069,15 +1343,14 @@ async fn client_input<T: DataPlaneTransport>(
         }
         return;
     }
-    // open lazily on the first frame for this host; the entry API can't span the
-    // async open, so this is a plain get-or-open, not a `contains_key`+`insert`.
-    if input_streams.get(&host).is_none() {
+    // open lazily on the first frame for this host.
+    if input_stream.is_none() {
         let opened = service
             .open(PeerId(host), term_flow(), INPUT_INTENT, Vec::new())
             .await;
         match opened {
             Ok(stream) => {
-                input_streams.insert(host, Box::new(stream));
+                *input_stream = Some(Box::new(stream));
             }
             Err(err) => {
                 if let Some(occurrences) = INPUT_WARN.hit("input_open_failed") {
@@ -1093,9 +1366,7 @@ async fn client_input<T: DataPlaneTransport>(
             }
         }
     }
-    let stream = input_streams
-        .get_mut(&host)
-        .expect("input stream just inserted");
+    let stream = input_stream.as_mut().expect("input stream just opened");
     if let Err(err) = write_frame(stream.as_mut(), &event).await {
         if let Some(occurrences) = INPUT_WARN.hit("input_write_failed") {
             tracing::warn!(
@@ -1106,7 +1377,7 @@ async fn client_input<T: DataPlaneTransport>(
                 "forwarded input dropped; reopening"
             );
         }
-        input_streams.remove(&host);
+        *input_stream = None;
     }
 }
 
@@ -1212,7 +1483,238 @@ async fn owner_airlock_authority(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_service::wire;
+    use commonware_cryptography::{Signer as _, ed25519};
+    use data_plane::PlaneConfig;
+    use data_plane::sim::{LinkModel, SimNet};
     use noded::TermChunkEvent;
+
+    const TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// `count` peers on one simulated net, all mutually linked and all in the
+    /// same overlay peer set.
+    fn term_net(count: u8) -> (Vec<PeerId>, Arc<OverlayPeers>, SimNet) {
+        let keys: Vec<_> = (1..=count)
+            .map(|seed| ed25519::PrivateKey::from_seed(seed as u64).public_key())
+            .collect();
+        let ids: Vec<_> = keys
+            .iter()
+            .map(|key| PeerId(key.as_ref().try_into().unwrap()))
+            .collect();
+        let peers = OverlayPeers::new("term-plane-test".into());
+        peers.set_peers(keys.iter());
+        let net = SimNet::new();
+        let link = LinkModel {
+            latency: Duration::from_millis(1),
+            bytes_per_sec: 50_000_000,
+            drop_every: None,
+            delay_every: None,
+        };
+        for a in &ids {
+            for b in &ids {
+                net.set_link(*a, *b, link);
+            }
+        }
+        (ids, peers, net)
+    }
+
+    fn term_service(
+        net: &SimNet,
+        peers: &Arc<OverlayPeers>,
+        id: PeerId,
+    ) -> Arc<StreamService<impl DataPlaneTransport>> {
+        let plane = DataPlane::new(
+            net.endpoint(id),
+            OverlayBook::<TermPlane>::new(Arc::clone(peers)),
+            PlaneConfig {
+                bulk_bytes_per_sec: 50_000_000,
+                bulk_burst_bytes: 256 * 1024,
+            },
+        );
+        let service = Arc::new(
+            plane
+                .stream_service(Service::TermSession, StreamPolicy { accept_backlog: 4 })
+                .expect("the term service binds once"),
+        );
+        // the plane must outlive the service; leak it for the test's lifetime.
+        std::mem::forget(plane);
+        service
+    }
+
+    fn test_control(me: [u8; 32], sessions: Option<TerminalSessions>) -> Arc<ControlState> {
+        let (commands, _no_reads) = fmpsc::channel(4);
+        Arc::new(ControlState {
+            sessions,
+            commands,
+            local_gateway_via: String::new(),
+            me,
+            workspace: std::path::PathBuf::from("/nonexistent-work-admission-workspace"),
+        })
+    }
+
+    fn create_job(host: [u8; 32]) -> (SessionJob, tokio::sync::oneshot::Receiver<CreateResult>) {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        (
+            SessionJob::Create {
+                host,
+                provider: "claude".into(),
+                cred: "c".into(),
+                cpu: None,
+                mem_gb: None,
+                reply,
+            },
+            rx,
+        )
+    }
+
+    type CreateResult = Result<CreatedSession, String>;
+
+    /// **The wedge, and the shape that ends it.**
+    ///
+    /// A host that accepts the CONTROL stream and never answers used to park the
+    /// ONE lane every remote terminal on this node shares: after it, no
+    /// keystroke, no close, and no create for any other host moved again. One
+    /// lane per host peer means the silent host holds up only itself.
+    #[tokio::test]
+    async fn a_silent_host_holds_up_only_its_own_sessions() {
+        let (ids, peers, net) = term_net(3);
+        let (guest, silent, live) = (ids[0], ids[1], ids[2]);
+        let service = term_service(&net, &peers, guest);
+
+        // the silent host: it takes the create and sits on it forever.
+        let silent_service = term_service(&net, &peers, silent);
+        let (parked, mut parked_rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let (_peer, _hello, mut stream) =
+                silent_service.accept().await.expect("a control stream");
+            let _ = read_frame::<_, SessionControlRequest>(&mut stream).await;
+            parked.send(()).await.expect("the test is watching");
+            std::future::pending::<()>().await;
+        });
+
+        // the live host: it answers every create with a refusal.
+        let live_service = term_service(&net, &peers, live);
+        tokio::spawn(async move {
+            while let Some((_peer, _hello, mut stream)) = live_service.accept().await {
+                if read_frame::<_, SessionControlRequest>(&mut stream)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    let _ = write_frame(&mut stream, &refused("no_sandbox", "not here")).await;
+                }
+            }
+        });
+
+        let (lane, jobs) = tokio::sync::mpsc::channel(HOST_LANE_DEPTH);
+        tokio::spawn(client_loop(service, test_control(guest.0, None), jobs));
+
+        let (job, mut wedged_rx) = create_job(silent.0);
+        lane.send(job).await.expect("the client half is up");
+        // wait on the host's own event, not on time: the silent host now HAS the
+        // create and the guest's client half is parked on its reply.
+        parked_rx
+            .recv()
+            .await
+            .expect("the silent host took a create");
+
+        let (job, answered_rx) = create_job(live.0);
+        lane.send(job).await.expect("the client half is up");
+        let Err(answered) = answered_rx.await.expect("the live host answered") else {
+            panic!("the live host refuses; a Created here means the test host changed");
+        };
+        assert_eq!(
+            answered, "no_sandbox: not here",
+            "a second host is served while the first is still silent"
+        );
+        assert!(
+            wedged_rx.try_recv().is_err(),
+            "the silent host's own create is still parked — that is the only thing it holds up"
+        );
+    }
+
+    #[test]
+    fn every_session_job_names_the_host_it_routes_to() {
+        // the router's whole discriminant: a variant that answered the wrong
+        // host would put two hosts on one lane and rebuild the wedge.
+        let (create, _rx) = create_job([1u8; 32]);
+        assert_eq!(create.host(), [1u8; 32]);
+        assert_eq!(
+            SessionJob::Close {
+                host: [2u8; 32],
+                session: "00000000deadbeef".into(),
+            }
+            .host(),
+            [2u8; 32]
+        );
+        assert_eq!(
+            SessionJob::Input {
+                host: [3u8; 32],
+                event: SessionInputWire::Resize {
+                    session: "00000000deadbeef".into(),
+                    cols: 80,
+                    rows: 24,
+                },
+            }
+            .host(),
+            [3u8; 32]
+        );
+    }
+
+    /// **The orphan, host-side.** The guest gave up at its 30 s deadline and
+    /// dropped the CONTROL stream; the host's create lands afterwards. Nobody
+    /// holds the id, so the host closes it here rather than leave a live sandbox
+    /// on a session-cap slot until the wall-clock backstop hours later.
+    #[tokio::test]
+    async fn a_create_whose_creator_gave_up_is_closed_on_the_host() {
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
+        let (_guard, mut daemon) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
+        let control = test_control([7u8; 32], Some(terminals));
+
+        // the CONTROL stream the guest already hung up on.
+        let (caller, server) = tokio::io::duplex(1024);
+        drop(caller);
+        let (mut reader, _writer) = tokio::io::split(server);
+
+        let (spawned, spawning) = tokio::sync::oneshot::channel();
+        let creating = tokio::spawn(async move {
+            let _ = spawning.await;
+            SessionControlReply::Created {
+                session: "00000000deadbeef".into(),
+                topic: "term:00000000deadbeef".into(),
+            }
+        });
+        let watching = tokio::spawn({
+            let control = Arc::clone(&control);
+            async move { create_watching_the_caller(&mut reader, &control, creating).await }
+        });
+        // the host finishes the cold spawn long after the guest is gone.
+        spawned.send(()).expect("the create task is waiting");
+
+        let reply = watching.await.expect("the watcher finished");
+        assert_eq!(
+            reply,
+            refused(
+                "creator_gone",
+                "the creator closed the control stream before the create completed"
+            )
+        );
+        let closed = loop {
+            let command = daemon.recv().await.expect("the daemon saw a command");
+            if let wire::Command::TermClose { session } = command {
+                break session;
+            }
+        };
+        assert_eq!(
+            closed, "00000000deadbeef",
+            "the host closes the session the guest will never name"
+        );
+    }
 
     #[test]
     fn per_peer_latch_logs_each_peers_first_refusal() {
@@ -1226,6 +1728,32 @@ mod tests {
         // ...but peer B's FIRST hit on the SAME reason still logs: the whole
         // point is that one peer's refusal never silences another's.
         assert_eq!(latch.hit("no_sandbox", b), Some(1));
+    }
+
+    #[test]
+    fn a_feed_grain_binds_to_the_session_host() {
+        let remote = RemoteSessions::default();
+        let host = PeerId([7u8; 32]);
+        let stranger = PeerId([9u8; 32]);
+        // a session this node directed: its known host is the only sender.
+        remote.remember("00000000deadbeef".into(), host.0);
+        assert_eq!(feed_refusal(&remote, "00000000deadbeef", host), None);
+        assert_eq!(
+            feed_refusal(&remote, "00000000deadbeef", stranger),
+            Some("feed_not_session_host")
+        );
+        // a session this node only mirrors: the first sender binds the id, and
+        // every other peer is refused from then on.
+        assert_eq!(feed_refusal(&remote, "00000000cafef00d", host), None);
+        assert_eq!(
+            feed_refusal(&remote, "00000000cafef00d", stranger),
+            Some("feed_not_session_host")
+        );
+        assert_eq!(
+            feed_refusal(&remote, "00000000cafef00d", host),
+            None,
+            "the bound host keeps streaming"
+        );
     }
 
     #[test]
@@ -1424,6 +1952,93 @@ mod tests {
         assert!(!input_permitted(Some([7u8; 32]), PeerId([9u8; 32])));
         // not an attached session (local, or unknown id) → refused.
         assert!(!input_permitted(None, PeerId([7u8; 32])));
+    }
+
+    /// **The close twin of the input gate (#1743).** A peer-attached session's
+    /// id is never secret — every forwarded chunk fans out to every mesh
+    /// member — so only the creator binding stands between "any admitted peer"
+    /// and "kills any session on any host". A non-creator peer's close is
+    /// refused and the session stays live; the creator's close still works.
+    #[tokio::test]
+    async fn close_is_accepted_only_from_the_creator_node() {
+        let terminals = TerminalSessions::new(
+            TermRing::default(),
+            TermCommandRing::default(),
+            Some(TEST_TOKEN.into()),
+        );
+        let (_guard, mut daemon) = terminals.attach(TEST_TOKEN).expect("the first attach wins");
+        let fake_daemon = terminals.clone();
+        tokio::spawn(async move {
+            while let Some(command) = daemon.recv().await {
+                if let wire::Command::TermCreate(create) = command {
+                    fake_daemon.on_event(wire::Event::TermCreated {
+                        session: create.session,
+                    });
+                }
+            }
+        });
+
+        let creator = PeerId([7u8; 32]);
+        let created = terminals
+            .create_for_peer(
+                "claude",
+                PeerAttach {
+                    creator_node: creator.0,
+                    credential: agent_service::wire::Credential {
+                        name: "c".into(),
+                        kind: agent_service::wire::CredentialKind::Claude,
+                        authority: String::new(),
+                        via: String::new(),
+                        seal_pk: [0u8; 32],
+                    },
+                    limits: Default::default(),
+                },
+            )
+            .await
+            .expect("the fake daemon answers every create");
+        let control = test_control([1u8; 32], Some(terminals.clone()));
+
+        // an attacker peer names the id it read off the mesh fanout — refused,
+        // and the session it named is still alive.
+        let (server, mut caller) = tokio::io::duplex(4096);
+        let attacker_control = Arc::clone(&control);
+        let attacker_session = created.session_id.clone();
+        tokio::spawn(async move {
+            let _ = serve_control(server, PeerId([9u8; 32]), attacker_control).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Close {
+                session: attacker_session,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        assert_eq!(
+            reply,
+            SessionControlReply::Refused {
+                reason: "close_not_creator".into(),
+                detail: "only the node that created this session may close it".into(),
+            }
+        );
+        assert!(terminals.mode(&created.session_id).is_some(), "not closed");
+
+        // the actual creator closes it fine.
+        let (server, mut caller) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let _ = serve_control(server, creator, control).await;
+        });
+        write_frame(
+            &mut caller,
+            &SessionControlRequest::Close {
+                session: created.session_id,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: SessionControlReply = read_frame(&mut caller).await.unwrap().unwrap();
+        assert_eq!(reply, SessionControlReply::Closed);
     }
 
     /// **The work-admission call site, behaviourally.**

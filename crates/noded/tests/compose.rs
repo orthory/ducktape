@@ -10,9 +10,10 @@ use commonware_runtime::Runner as _;
 use host::CapturePayloads;
 use noded::bundle::{DirCodeSource, qmdb_stores};
 use noded::compose::{
-    Admissions, Bindings, Boot, BoxFut, Substrates, check_realizable, compose,
+    Admissions, Bindings, Boot, BoxFut, Start, Substrates, check_realizable, compose, wasm_module,
 };
-use sdk::{StateRoot, StateSyncHandle};
+use sdk::{Module, StateRoot, StateSyncHandle};
+use sdk_testkit::TestCtx;
 use wasm_host::{Backing, Shape};
 
 fn fixtures() -> PathBuf {
@@ -108,7 +109,11 @@ fn composes_wasm_store_map_and_native_over_injected_stores() {
             // the modules registry, no store re-seeds, the map tenant installs
             // its snapshot, and the composed root-hash is the genesis one ----
             let mut snapshots = |id: &str, backing: Backing| -> SnapshotFut<'_> {
-                assert_ne!(backing, Backing::Store, "a store-backed module is never asked");
+                assert_ne!(
+                    backing,
+                    Backing::Store,
+                    "a store-backed module is never asked"
+                );
                 let bytes = runs_snapshot.clone();
                 let is_runs = id == "runs";
                 Box::pin(async move { Ok(is_runs.then_some((bytes, runs_root))) })
@@ -343,6 +348,59 @@ fn admissions_build_through_the_one_wasm_path() {
                 matches!(admitted, host::Admitted::ForeignAbi),
                 "the netstack guest is no module admission"
             );
+        })
+    });
+}
+
+/// an ODB-BACKED tenant reads its network's chain id through the same
+/// `sdk::genesis_config` seam a Map/Store tenant does — the kernel half of
+/// #1773: `compose::wasm_module` used to skip the `Backing::Odb` arm
+/// entirely, so a component like forge (or this fixture, wearing files' odb
+/// substrate) never saw a `__config` record and could not learn its chain id.
+#[test]
+fn an_odb_backed_module_reads_its_chain_id_from_genesis_config() {
+    run(|context, dir| {
+        Box::pin(async move {
+            let object = std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../kernel/wasm-host/tests/fixtures/object.component.wasm"),
+            )
+            .unwrap();
+            let substrates = substrates(&dir);
+            let mut stores = qmdb_stores(&context);
+            let bindings = Bindings {
+                invite: b"t",
+                chain_id: "net#odb-1773",
+            };
+            let mut module = wasm_module(
+                "files",
+                &object,
+                &mut stores,
+                &substrates,
+                &bindings,
+                Start::Fresh,
+            )
+            .await
+            .expect("an odb-declared component wraps over the files substrate");
+
+            let mut ctx = TestCtx::at_height(0);
+            let matching = sdk::Msg {
+                target: "files".into(),
+                payload: [b"c".as_slice(), bindings.chain_id.as_bytes()].concat(),
+            };
+            module
+                .execute(&mut ctx, &matching)
+                .await
+                .expect("the guest read chain_id straight out of __config");
+
+            let mismatched = sdk::Msg {
+                target: "files".into(),
+                payload: [b"c".as_slice(), b"some-other-chain".as_slice()].concat(),
+            };
+            module
+                .execute(&mut ctx, &mismatched)
+                .await
+                .expect_err("a wrong expectation against the same __config is rejected");
         })
     });
 }

@@ -109,7 +109,11 @@ impl Module for HookSink {
 async fn native_host(context: &deterministic::Context) -> Host {
     let store = QmdbStore::init(context.child("native_chat"), "chat").await;
     Host::genesis(vec![
-        Box::new(Chat::new("chat", Box::new(store)).with_tagging("tagging")),
+        Box::new(
+            Chat::new("chat", Box::new(store))
+                .with_tagging("tagging")
+                .with_identity("identity"),
+        ),
         // the production tag-report target, kept NATIVE in both hosts for
         // isolation: this proof is about the chat cutover, and an identical
         // native tagging on both sides absorbs the emitted follow-ups
@@ -127,8 +131,9 @@ async fn wasm_host_(context: &deterministic::Context) -> Host {
     let store = QmdbStore::init(context.child("wasm_chat"), "chat").await;
     Host::genesis(vec![
         Box::new(
-            // NOTE: no `.with_tagging` here — the guest compiles the exact
-            // production builder chain (`Chat::new(..).with_tagging`) in.
+            // NOTE: no `.with_tagging`/`.with_identity` here — the guest
+            // compiles the exact production builder chain
+            // (`Chat::new(..).with_tagging(..).with_identity(..)`) in.
             WasmModule::with_store("chat", CHAT_WASM, Box::new(store)).expect("load component"),
         ),
         Box::new(TaggingModule::new(

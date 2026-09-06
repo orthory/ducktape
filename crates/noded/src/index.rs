@@ -334,10 +334,43 @@ fn index_error(err: indexer::Error) -> Response {
 /// which this surface makes visible. boundary-stamped modules also report
 /// their backfill floor: content below it was never in the feed — the gap
 /// stays visible instead of papered over.
+///
+/// `fold_status` per module costs fluent31 an iteration over that trigger's
+/// whole pending-queue range (no cheap counter exists — see the "ASKING IS
+/// NOT FREE" note on `IndexStore::fold_status`), so a backlogged module makes
+/// this call as expensive as [`index_view`]'s wasm query. The route stays
+/// `Lane::Open`, so it gets the exact same treatment: the sampling loop runs
+/// off the axum worker on `spawn_blocking`, gated by the SAME
+/// [`NodeHandle::index_view_gate`] permit `index_view` uses (one pool for
+/// every unauthenticated read that can burn a worker thread, not a second
+/// cap to size) — the Nth concurrent caller past capacity 429s immediately
+/// rather than queuing behind the scan.
 pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
-    let Some(store) = index_store(&handle) else {
+    let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
+    let Ok(_permit) = handle.index_view_gate.clone().try_acquire_owned() else {
+        return error_response(StatusCode::TOO_MANY_REQUESTS, INDEX_VIEW_AT_CAPACITY);
+    };
+    let outcome = tokio::task::spawn_blocking(move || index_status_body(&store)).await;
+    match outcome {
+        Ok(Ok(body)) => Json(body).into_response(),
+        Ok(Err(response)) => *response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "index status task panicked",
+        ),
+    }
+}
+
+/// the synchronous per-module scan behind [`index_status`], split out so it
+/// can run on `spawn_blocking`'s pool: three `Result`-returning store reads
+/// per module, any of which can name the response outright as an early
+/// `Err`, so this returns a `Response` on the error path rather than
+/// threading `indexer::Error` back through a `?` the caller would have to
+/// re-translate. `Response` boxed on the error path — clippy's
+/// `result_large_err`, since a `Response` dwarfs the `Ok` payload.
+fn index_status_body(store: &indexer::IndexStore) -> Result<serde_json::Value, Box<Response>> {
     let mut modules = serde_json::Map::new();
     let mut backfilled = serde_json::Map::new();
     let mut fold = serde_json::Map::new();
@@ -346,14 +379,14 @@ pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
             Ok(height) => {
                 modules.insert(id.to_string(), height.into());
             }
-            Err(err) => return index_error(err),
+            Err(err) => return Err(Box::new(index_error(err))),
         }
         match store.backfill_height(&id) {
             Ok(Some(floor)) => {
                 backfilled.insert(id.to_string(), floor.into());
             }
             Ok(None) => {}
-            Err(err) => return index_error(err),
+            Err(err) => return Err(Box::new(index_error(err))),
         }
         match store.fold_status(&id) {
             Ok(Some(status)) => match serde_json::to_value(&status) {
@@ -361,23 +394,22 @@ pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
                     fold.insert(id.to_string(), value);
                 }
                 Err(_) => {
-                    return error_response(
+                    return Err(Box::new(error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "fold status did not serialize",
-                    );
+                    )));
                 }
             },
             Ok(None) => {}
-            Err(err) => return index_error(err),
+            Err(err) => return Err(Box::new(index_error(err))),
         }
     }
-    Json(serde_json::json!({
+    Ok(serde_json::json!({
         "poisoned": store.is_poisoned(),
         "modules": modules,
         "backfilled": backfilled,
         "fold": fold,
     }))
-    .into_response()
 }
 
 /// GET /v1/index/{module}/ops?after=&limit= — one page of the module's op
@@ -431,6 +463,30 @@ pub(crate) async fn index_ops(
 /// and stay untouched, and a caller that does not care never sees it.
 pub const FOLDED_HEADER: &str = "x-ducktape-folded";
 
+/// how many `POST /v1/index/{module}/view` or `GET /v1/index/status` calls
+/// may run concurrently, ONE shared pool across both routes. Both are
+/// `Lane::Open` — any caller that can dial the HTTP port reaches them, no PoP
+/// or workspace secret required — and each does real off-worker CPU: `view`
+/// runs fluent31's `Db::query` SYNCHRONOUSLY against ~1e9 fuel
+/// (`fluent31::Options::wasm_fuel`, the only per-call budget fluent31
+/// exposes: no separate wall-clock/epoch deadline exists to set alongside
+/// it); `status` iterates every module's fold-trigger pending-queue range
+/// (fluent31 exposes no cheaper counter). Both now run on
+/// [`tokio::task::spawn_blocking`]'s own pool so neither can pin an axum
+/// worker outright, but that pool is still this same process's CPU —
+/// unbounded fan-in there would let N unauthenticated callers burn every
+/// core the process has, including bin/node's consensus thread. Must stay
+/// small: a value near or above the runtime's worker-thread count buys
+/// nothing over no cap at all.
+pub(crate) const MAX_CONCURRENT_INDEX_VIEWS: usize = 4;
+
+/// the refusal body when the concurrency gate above is already full — a
+/// stable, greppable token, not prose, so an operator can tell "the node is
+/// out of index-read slots" apart from every other 429 on this surface.
+/// shared by `index_view` and `index_status`: they refuse into the same pool
+/// for the same reason, so they carry the same token.
+const INDEX_VIEW_AT_CAPACITY: &str = "index view refused: reason=index_view_at_capacity";
+
 /// POST /v1/index/{module}/view — the module's materialized view, served by
 /// its registered mapper. request body and reply are module-defined json
 /// (chat: `{"search": {…}}` → `{"hits": […]}`), exactly as opaque to the
@@ -447,9 +503,17 @@ pub(crate) async fn index_view(
     Path(module): Path<String>,
     Json(req): Json<serde_json::Value>,
 ) -> Response {
-    let Some(store) = index_store(&handle) else {
+    let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
+    // `try_acquire_owned` refuses immediately once the gate is full — an
+    // unauthenticated caller's Nth request never queues behind the first
+    // `MAX_CONCURRENT_INDEX_VIEWS`, it just 429s.
+    let Ok(_permit) = handle.index_view_gate.clone().try_acquire_owned() else {
+        return error_response(StatusCode::TOO_MANY_REQUESTS, INDEX_VIEW_AT_CAPACITY);
+    };
+    let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
+    let query_module = module.clone();
     // BEFORE the view, deliberately: the two reads take two MVCC snapshots, and
     // the order decides which way the mismatch falls. read first and the tip
     // can only be OLDER than the rows served — the caller waits one more round
@@ -463,9 +527,23 @@ pub(crate) async fn index_view(
     // stale but consistent. failing the whole read because one bookkeeping key
     // would not load empties the caller's sidebar over nothing. an unknown
     // module still 404s: `store.view` below answers that.
-    let folded = store.fold_tip(&module).ok().flatten();
-    let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
-    let mut response = match store.view(&module, &req_bytes) {
+    //
+    // both reads run off the axum worker on `spawn_blocking`'s pool: fluent31's
+    // `query` is synchronous wasm with no `.await` inside it, so awaiting it
+    // directly here would hold this task's worker thread for the whole call.
+    let outcome = tokio::task::spawn_blocking(move || {
+        let folded = store.fold_tip(&query_module).ok().flatten();
+        let view = store.view(&query_module, &req_bytes);
+        (folded, view)
+    })
+    .await;
+    let (folded, view) = match outcome {
+        Ok(pair) => pair,
+        Err(_) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "index view task panicked");
+        }
+    };
+    let mut response = match view {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(value) => Json(value).into_response(),
             Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "view reply was not json"),
@@ -617,5 +695,114 @@ mod tests {
             !body[tip..view].contains("return"),
             "an unreadable fold watermark must not refuse the view"
         );
+    }
+
+    /// #1717: once `MAX_CONCURRENT_INDEX_VIEWS` callers are already "running"
+    /// (holding a permit, as the wasm query would while it runs), the NEXT
+    /// `index_view` call refuses with 429 rather than queuing behind them —
+    /// this is the whole point of `try_acquire_owned` over `acquire_owned`.
+    #[tokio::test]
+    async fn index_view_refuses_once_the_concurrency_gate_is_full() {
+        let dir = tempfile::TempDir::new().expect("temp index dir");
+        let modules = vec![indexer::IndexModule::bare("chat")];
+        let store = std::sync::Arc::new(
+            indexer::IndexStore::open(dir.path(), &modules).expect("open index"),
+        );
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_index_store(store);
+
+        // saturate the gate exactly as N concurrent in-flight views would.
+        let held: Vec<_> = (0..super::MAX_CONCURRENT_INDEX_VIEWS)
+            .map(|_| {
+                handle
+                    .index_view_gate
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate starts with MAX_CONCURRENT_INDEX_VIEWS permits")
+            })
+            .collect();
+
+        let refused = super::index_view(
+            axum::extract::State(handle.clone()),
+            axum::extract::Path("chat".to_string()),
+            axum::Json(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(refused.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+
+        // releasing a permit reopens the gate for the next caller.
+        drop(held);
+        let admitted = super::index_view(
+            axum::extract::State(handle),
+            axum::extract::Path("chat".to_string()),
+            axum::Json(serde_json::json!({})),
+        )
+        .await;
+        assert_ne!(admitted.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// #1727: `index_status` refuses at capacity exactly like `index_view`
+    /// does, because it draws from the SAME gate — no second semaphore sized
+    /// separately for the same worker-thread budget.
+    #[tokio::test]
+    async fn index_status_refuses_once_the_concurrency_gate_is_full() {
+        let dir = tempfile::TempDir::new().expect("temp index dir");
+        let modules = vec![indexer::IndexModule::bare("chat")];
+        let store = std::sync::Arc::new(
+            indexer::IndexStore::open(dir.path(), &modules).expect("open index"),
+        );
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_index_store(store);
+
+        let held: Vec<_> = (0..super::MAX_CONCURRENT_INDEX_VIEWS)
+            .map(|_| {
+                handle
+                    .index_view_gate
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate starts with MAX_CONCURRENT_INDEX_VIEWS permits")
+            })
+            .collect();
+
+        let refused = super::index_status(axum::extract::State(handle.clone())).await;
+        assert_eq!(refused.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+
+        drop(held);
+        let admitted = super::index_status(axum::extract::State(handle)).await;
+        assert_ne!(admitted.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// the pool is shared, not merely identically-sized: permits held by
+    /// in-flight `index_view` calls also starve `index_status`, and vice
+    /// versa — the whole point of routing both through one semaphore instead
+    /// of two gates that happen to share a constant.
+    #[tokio::test]
+    async fn index_view_and_index_status_share_one_gate() {
+        let dir = tempfile::TempDir::new().expect("temp index dir");
+        let modules = vec![indexer::IndexModule::bare("chat")];
+        let store = std::sync::Arc::new(
+            indexer::IndexStore::open(dir.path(), &modules).expect("open index"),
+        );
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let handle = handle.with_index_store(store);
+
+        // saturate the gate via `index_view`'s side...
+        let held: Vec<_> = (0..super::MAX_CONCURRENT_INDEX_VIEWS)
+            .map(|_| {
+                handle
+                    .index_view_gate
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate starts with MAX_CONCURRENT_INDEX_VIEWS permits")
+            })
+            .collect();
+
+        // ...and confirm `index_status` sees the SAME exhausted pool.
+        let refused = super::index_status(axum::extract::State(handle.clone())).await;
+        assert_eq!(refused.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+
+        drop(held);
+        let admitted = super::index_status(axum::extract::State(handle)).await;
+        assert_ne!(admitted.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
     }
 }

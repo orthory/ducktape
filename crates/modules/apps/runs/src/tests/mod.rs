@@ -44,6 +44,13 @@ struct CaptureCtx {
     agents: Registry,
     /// channel -> messages with contiguous seqs starting at 1.
     transcripts: BTreeMap<String, Vec<MessageView>>,
+    /// channels the "chat" Access arm treats as members-only — every other
+    /// channel with a transcript answers open standing to any user, mirroring
+    /// chat's own `PostPolicy::Open` default in the "Channel" arm above.
+    members_only: BTreeSet<String>,
+    /// channel -> the users a members-only channel admits, served by the
+    /// "chat" Access arm (`ChatQuery::Access`/`may_post`/`may_read`).
+    members: BTreeMap<String, BTreeSet<Vec<u8>>>,
     tasks: Vec<Task>,
     /// dispatch ids the dispatch module already has a record for — the
     /// committed turn-claim layer the module probes.
@@ -103,6 +110,8 @@ impl CaptureCtx {
             query_keys: RefCell::new(BTreeSet::new()),
             agents: Registry::new(),
             transcripts: BTreeMap::new(),
+            members_only: BTreeSet::new(),
+            members: BTreeMap::new(),
             tasks: Vec::new(),
             taken_dispatches: BTreeSet::new(),
             dispatch_assignees: BTreeMap::new(),
@@ -228,11 +237,22 @@ impl CaptureCtx {
         self.transcripts.insert(channel.into(), messages);
         self
     }
+    /// mark `channel` members-only and admit `member` — the "chat" Access
+    /// arm then answers `may_post`/`may_read` for that user alone.
+    fn with_members_only(mut self, channel: &str, member: Vec<u8>) -> Self {
+        self.members_only.insert(channel.into());
+        self.members
+            .entry(channel.into())
+            .or_default()
+            .insert(member);
+        self
+    }
     fn with_task(mut self, id: &str) -> Self {
         self.tasks.push(Task {
             id: id.into(),
             title: id.into(),
             status: TaskStatus::Open,
+            owner: "test".into(),
             created_at: 0,
             updated_at: 0,
         });
@@ -446,6 +466,25 @@ impl Ctx for CaptureCtx {
                         archived: false,
                     }),
                 ))),
+                // an explicit RequestRun asks this before pinning a
+                // members-only channel's transcript; every other channel with
+                // a transcript answers open standing, mirroring the "Channel"
+                // arm's hardcoded `PostPolicy::Open`.
+                ChatQuery::Access { channel_id, user } => {
+                    let may_post = if self.members_only.contains(&channel_id) {
+                        self.members
+                            .get(&channel_id)
+                            .is_some_and(|m| m.contains(&user))
+                    } else {
+                        true
+                    };
+                    Ok(chat::encode_reply(&ChatReply::Access(
+                        chat::ChannelAccess {
+                            may_read: may_post,
+                            may_post,
+                        },
+                    )))
+                }
             },
             // the board answers the SAME two reads the real module does: the
             // by-id `Get` the validator probes with, and a bounded `List` page.
@@ -462,6 +501,10 @@ impl Ctx for CaptureCtx {
                         .cloned()
                         .collect();
                     Ok(tasks_encode_reply(&TaskReply::Tasks(page)))
+                }
+                TaskQuery::OwnerOpenCount { owner } => {
+                    let count = self.tasks.iter().filter(|t| t.owner == owner).count() as u64;
+                    Ok(tasks_encode_reply(&TaskReply::OwnerOpenCount(count)))
                 }
             },
             "jobs" => match tasks::decode_job_query(req).map_err(Error::Module)? {
@@ -523,6 +566,22 @@ impl Ctx for CaptureCtx {
                         None => return Err(Error::QueryUnsupported),
                     };
                     Ok(files_encode_reply(&reply))
+                }
+                // the per-path CAS probe (`response::probe_duckfs_write_base`)
+                // reads this. the mock has no real snapshot history, so it
+                // serves the SAME committed entry regardless of `snapshot` —
+                // enough to model "path exists" vs "path is new", which is all
+                // a duckfs write test needs.
+                FilesQuery::Stat { path, .. } => {
+                    let entry = self.files_content.get(&path).map(|bytes| files::EntryInfo {
+                        path: path.clone(),
+                        kind: files::EntryKindWire::File,
+                        size: bytes.len() as u64,
+                        exec: false,
+                        object: "00".repeat(32),
+                        meta: BTreeMap::new(),
+                    });
+                    Ok(files_encode_reply(&FilesReply::Stat(entry)))
                 }
                 _ => Err(Error::QueryUnsupported),
             },

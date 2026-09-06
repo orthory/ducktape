@@ -241,6 +241,77 @@ fn recipe_registration_validates_and_gates_mutation_by_owner() {
 }
 
 #[test]
+fn agent_namespace_is_reserved_for_the_runs_module_origin() {
+    let mut m = module();
+
+    // an External account can never claim an `agent/` recipe id — squatting
+    // it would permanently block that agent's own RegisterAgent hook.
+    let mut mallory = mk_ctx(0, Origin::External(b"mallory".to_vec()));
+    let err = exec(
+        &mut m,
+        &mut mallory,
+        &DispatchMsg::RegisterRecipe {
+            recipe_id: "agent/bot".into(),
+            description: String::new(),
+            capability: "alpha".into(),
+            routing: Routing::Rendezvous,
+            output_contract: OutputContract::Text,
+            max_attempts: 1,
+            deadline_views: None,
+            lease_views: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("reserved"), "got {err}");
+
+    // the runs module's own module-origin registration succeeds — this is
+    // the exact RegisterRecipe the registry hook emits as a follow-up of
+    // agent_intake's RegisterAgent.
+    let mut runs = mk_ctx(0, Origin::Module("runs".into()));
+    exec(
+        &mut m,
+        &mut runs,
+        &DispatchMsg::RegisterRecipe {
+            recipe_id: "agent/bot".into(),
+            description: "runs for agent bot".into(),
+            capability: "alpha".into(),
+            routing: Routing::Rendezvous,
+            output_contract: OutputContract::Text,
+            max_attempts: 1,
+            deadline_views: None,
+            lease_views: None,
+        },
+    )
+    .unwrap();
+    commit(&mut m);
+    assert!(recipe(&m, "agent/bot").is_some());
+
+    // a foreign module (never runs) still cannot remove it.
+    let mut other = mk_ctx(0, Origin::Module("other".into()));
+    let err = exec(
+        &mut m,
+        &mut other,
+        &DispatchMsg::RemoveRecipe {
+            recipe_id: "agent/bot".into(),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("not owned"), "got {err}");
+
+    // runs (the reserved owner) can remove its own reserved recipe.
+    exec(
+        &mut m,
+        &mut runs,
+        &DispatchMsg::RemoveRecipe {
+            recipe_id: "agent/bot".into(),
+        },
+    )
+    .unwrap();
+    commit(&mut m);
+    assert!(recipe(&m, "agent/bot").is_none());
+}
+
+#[test]
 fn removing_every_recipe_returns_the_root_to_its_never_registered_value() {
     // a recipe's whole footprint is its own `r/{id}` record, so removing every
     // recipe must leave the plane hashing exactly like one that never

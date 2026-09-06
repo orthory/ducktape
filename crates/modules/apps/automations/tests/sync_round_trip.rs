@@ -21,20 +21,31 @@ use automations::{
     Action, Automations, AutomationsMsg, AutomationsQuery, AutomationsReply, MAX_ID_BYTES, Trigger,
     decode_reply, encode_msg, encode_query,
 };
-use chat::{AuthorRef, ChatEvent, encode_event as chat_encode_event};
+use chat::{
+    AuthorRef, ChannelAccess, ChatEvent, ChatReply, encode_event as chat_encode_event,
+    encode_reply as chat_encode_reply,
+};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
-/// drives `execute` with a controllable env; the ops below query no siblings
-/// (the fired rule is a probe-free `DeliverInbox` with static templates).
+/// drives `execute` with a controllable env. the only sibling read the ops
+/// below make is the fire path's owner-standing probe (the fired rule is an
+/// otherwise probe-free `DeliverInbox` with static templates), answered here
+/// as an open channel does — admitted.
 fn ctx(height: u64, origin: Origin) -> TestCtx {
     TestCtx::with_env(Env {
         height,
         consensus_time: height,
         origin,
         me: "automations".into(),
+    })
+    .on_query("chat", |_req| {
+        Ok(chat_encode_reply(&ChatReply::Access(ChannelAccess {
+            may_read: true,
+            may_post: true,
+        })))
     })
 }
 
@@ -130,7 +141,9 @@ fn synced_store_reconstructs_source_root_rules_and_history() {
                 "alpha",
                 None,
                 Action::DeliverInbox {
-                    member_template: "ops".into(),
+                    // #1739: `DeliverInbox` may reach only the rule owner's
+                    // own inbox queue -- `operator()`'s literal `ext:{hex}`.
+                    member_template: format!("ext:{}", "09".repeat(32)),
                     kind: "note".into(),
                     body_template: "a post landed".into(),
                 },

@@ -20,8 +20,9 @@ use commonware_cryptography::{Signer as _, ed25519};
 
 use crate::{
     Invite, Plumbing, Reach, ReachHint, SandboxToml, decode_invite, default_workspace_dir,
-    guard_join_descriptor, hex_bytes, load_or_generate_identity, merged_plumbing,
-    save_invite_fronts, save_invite_token, save_invite_wireguard, write_node_toml,
+    guard_join_descriptor, hex_bytes, list_workspaces_in, load_or_generate_identity,
+    merged_plumbing, save_invite_fronts, save_invite_token, save_invite_wireguard,
+    validate_chain_id_shape, workspaces_root, write_node_toml,
 };
 
 /// Plumbing the joiner wants instead of the defaults. Every field is an
@@ -80,9 +81,16 @@ pub fn join_workspace(
 ) -> Result<JoinedWorkspace, String> {
     let invite = decode_invite(blob)?;
     let mut descriptor = invite.descriptor.clone();
+    // the chain id came straight out of an untrusted invite: constrain its
+    // shape to what `node init` actually mints before it is trusted to
+    // address a registry directory or a `-n <chain-id>` selector.
+    validate_chain_id_shape(&descriptor.chain_id)?;
     let dir = match dir {
         Some(dir) => dir,
-        None => default_workspace_dir(&descriptor.chain_id)?,
+        None => {
+            guard_no_chain_id_collision(&workspaces_root()?, &descriptor.chain_id)?;
+            default_workspace_dir(&descriptor.chain_id)?
+        }
     };
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
@@ -92,7 +100,11 @@ pub fn join_workspace(
     // a paste simply admits whoever runs it.
     let (key, generated) = load_or_generate_identity(&dir.join("identity.key"))?;
     let identity = hex_bytes(key.public_key().as_ref());
-    guard_join_descriptor(&dir, &descriptor)?;
+    // the issuer `decode_invite` already verified the envelope against — the
+    // one field of a pasted blob an attacker cannot choose freely, and what
+    // separates a real admit refresh from a descriptor that merely copied our
+    // validator list.
+    guard_join_descriptor(&dir, &descriptor, &invite.token.issuer)?;
 
     // Computed BEFORE anything lands on disk, so a corrupt existing node.toml
     // aborts the join instead of leaving a half-written directory.
@@ -136,6 +148,31 @@ pub fn join_workspace(
         generated,
         compute_runtime,
     })
+}
+
+/// refuse a chain id that would make `-n <chain-id>` prefix lookup ambiguous
+/// against an ALREADY-registered network: `find_workspace_config_in` answers
+/// an exact match before it ever looks at prefixes, so a chain id that equals
+/// a habitual short selector (or is a prefix/extension of an existing id)
+/// would silently steal that selector out from under an operator's existing
+/// network. The exact-same-id case is not a collision — it is the same
+/// network's own directory, and a re-join over it is legitimate.
+fn guard_no_chain_id_collision(root: &Path, chain_id: &str) -> Result<(), String> {
+    for (existing, _) in list_workspaces_in(root)? {
+        if existing == chain_id {
+            continue;
+        }
+        let shadows = existing.starts_with(chain_id) || chain_id.starts_with(&existing);
+        if shadows {
+            return Err(format!(
+                "chain id {chain_id:?} collides with the already-registered network \
+                 {existing:?} under `-n <chain-id>` prefix matching — refusing to create a \
+                 workspace whose id would shadow it (or be shadowed by it); pass --dir to join \
+                 outside the registry"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A WireGuard or Coordinated invite makes the reachability plane the dial
@@ -267,6 +304,46 @@ mod tests {
         assert_eq!(table.kernel, guest.join("vmlinux"));
         assert_eq!(table.rootfs, guest.join("rootfs.ext4"));
         assert_eq!((table.cores, table.mem_gb), (0, 0));
+    }
+
+    /// a chain id that is a strict prefix of an already-registered network's
+    /// id (or has one as its own prefix) is refused: `find_workspace_config_in`
+    /// answers an EXACT match before it ever considers a prefix, so letting
+    /// this land would silently steal an operator's habitual short `-n`
+    /// selector for the existing network out from under them.
+    #[test]
+    fn a_chain_id_that_would_shadow_an_existing_workspace_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let existing = root.path().join("dognet#a1b2c3d4");
+        std::fs::create_dir_all(&existing).unwrap();
+        crate::NetworkDescriptor {
+            chain_id: "dognet#a1b2c3d4".into(),
+            validators: vec![],
+            bootstrap: vec![],
+            reach: vec![],
+            coordination: None,
+            block_time_ms: crate::DEFAULT_BLOCK_TIME_MS,
+            genesis: String::new(),
+            modules: Vec::new(),
+        }
+        .save(&existing.join("network.toml"))
+        .unwrap();
+
+        // a strict prefix of the existing id.
+        let err = guard_no_chain_id_collision(root.path(), "dognet").unwrap_err();
+        assert!(err.contains("dognet#a1b2c3d4"), "{err}");
+
+        // the existing id is itself a strict prefix of the incoming one.
+        let err = guard_no_chain_id_collision(root.path(), "dognet#a1b2c3d4ff").unwrap_err();
+        assert!(err.contains("dognet#a1b2c3d4"), "{err}");
+
+        // the SAME id is not a collision — it is a re-join of the same network.
+        guard_no_chain_id_collision(root.path(), "dognet#a1b2c3d4")
+            .expect("re-joining the same network is not a collision");
+
+        // an unrelated id is fine.
+        guard_no_chain_id_collision(root.path(), "cathouse#deadbeef")
+            .expect("an unrelated chain id is not a collision");
     }
 
     /// A blob that is not an invite must fail BEFORE anything is written: the

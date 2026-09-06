@@ -94,6 +94,7 @@ pub(super) fn encode_committed(
         codec::push_bytes(&mut out, run_id.as_bytes());
         codec::push_bytes(&mut out, s.agent_id.as_bytes());
         codec::push_bytes(&mut out, &s.session_key);
+        codec::push_bytes(&mut out, &s.holder);
         out.extend_from_slice(&s.opened_at.to_le_bytes());
         out.extend_from_slice(&u64::from(s.actions).to_le_bytes());
     }
@@ -323,6 +324,9 @@ fn validate_decoded_session(
     if s.session_key.len() != SESSION_KEY_LEN {
         return Err("snapshot session key is not a 32-byte ed25519 key".into());
     }
+    if s.holder.is_empty() {
+        return Err("snapshot session names no lease holder".into());
+    }
     if contains_run_separator(&s.agent_id) {
         return Err("snapshot session agent_id contains reserved unit separator".into());
     }
@@ -349,10 +353,10 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
     // per-entry minimum sizes: a watch costs its id prefix and a policy
     // discriminant; a pending entry its three length prefixes, anchor, two
     // option tags, claim height, origin discriminant, and created_at; a session
-    // its three length prefixes, opened_at, and the action counter.
+    // its four length prefixes, opened_at, and the action counter.
     const MIN_WATCH_BYTES: u64 = 8 + 1;
     const MIN_PENDING_BYTES: u64 = 8 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 1 + 1 + 8 + 1 + 8;
-    const MIN_SESSION_BYTES: u64 = 8 + 8 + 8 + 8 + 8;
+    const MIN_SESSION_BYTES: u64 = 8 + 8 + 8 + 8 + 8 + 8;
     const MIN_DELEGATION_BYTES: u64 = 8 + 8;
 
     let mut cur = codec::Cursor::new(bytes);
@@ -413,6 +417,7 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
         let run_id = take_lp_string(&mut cur)?;
         let agent_id = take_lp_string(&mut cur)?;
         let session_key = take_lp_bytes(&mut cur)?;
+        let holder = take_lp_bytes(&mut cur)?;
         let opened_at = take_u64(&mut cur)?;
         let actions = u32::try_from(take_u64(&mut cur)?)
             .map_err(|_| "snapshot session action count exceeds u32".to_string())?;
@@ -420,6 +425,7 @@ pub(super) fn decode_committed(bytes: &[u8]) -> Result<Committed, String> {
             run_id: run_id.clone(),
             agent_id,
             session_key,
+            holder,
             opened_at,
             actions,
         };

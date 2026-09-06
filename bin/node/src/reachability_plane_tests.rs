@@ -345,12 +345,14 @@ async fn a_gated_intro_forwards_once_and_answers_settled_outcomes() {
 
     // the loop settles the gate: the retransmit reads the outcome — sealed —
     // and does NOT forward again.
-    outcomes.lock().unwrap().insert(
+    crate::reachability_plane::insert_gate_outcome(
+        &mut outcomes.lock().unwrap(),
         joiner_pk.as_ref().to_vec(),
         join_gate::IntroReply::Admitted {
             height: 12,
             cap: None,
         },
+        std::time::SystemTime::now(),
     );
     assert!(ring(acked.clone()).await);
     assert!(
@@ -394,7 +396,10 @@ fn an_idle_session_lapse_is_not_a_dark_peer() {
 
     // ...but one that never comes back is exactly what this watch is for.
     let dark = session_verdicts(&mut seen, t0 + Duration::from_secs(181), &[(peer, None)]);
-    assert!(!dark[0].live, "no session for a whole session generation is dark");
+    assert!(
+        !dark[0].live,
+        "no session for a whole session generation is dark"
+    );
 
     // a peer whose config applied and never handshaked at all is dark on sight.
     let unseen = session_verdicts(&mut seen, t0, &[(never, None)]);
@@ -421,10 +426,7 @@ fn addr(s: &str) -> std::net::SocketAddr {
 /// must be the V4.
 #[test]
 fn nat64_synthesised_v6_first_still_picks_the_v4() {
-    let picked = underlay_addr([
-        addr("[64:ff9b::334f:42b8]:3478"),
-        addr("51.79.66.184:3478"),
-    ]);
+    let picked = underlay_addr([addr("[64:ff9b::334f:42b8]:3478"), addr("51.79.66.184:3478")]);
     assert_eq!(picked, Some(addr("51.79.66.184:3478")));
 }
 
@@ -438,4 +440,123 @@ fn the_first_v4_wins_among_several() {
 fn a_v6_only_host_is_unreachable_for_the_v4_underlay() {
     assert_eq!(underlay_addr([addr("[2001:db8::1]:3478")]), None);
     assert_eq!(underlay_addr([]), None);
+}
+
+// ---------------------------------------------------------------------------
+// `GateOutcomes`: an attacker-chosen joiner key must not grow the map
+// unbounded (issue #1580) — capped insertion evicts oldest-first, and a
+// sweep ages entries out on the invite join window.
+// ---------------------------------------------------------------------------
+
+use crate::reachability_plane::{
+    GateOutcomeMap, MAX_GATE_OUTCOMES, insert_gate_outcome, sweep_gate_outcomes,
+};
+
+fn admitted_at(height: u64) -> join_gate::IntroReply {
+    join_gate::IntroReply::Admitted { height, cap: None }
+}
+
+#[test]
+fn insert_past_the_cap_evicts_the_oldest_entry() {
+    let mut map: GateOutcomeMap = GateOutcomeMap::new();
+    let t0 = std::time::SystemTime::UNIX_EPOCH;
+    for i in 0..MAX_GATE_OUTCOMES {
+        insert_gate_outcome(
+            &mut map,
+            vec![i as u8, (i >> 8) as u8],
+            admitted_at(i as u64),
+            t0 + std::time::Duration::from_secs(i as u64),
+        );
+    }
+    assert_eq!(map.len(), MAX_GATE_OUTCOMES);
+    let oldest_key = vec![0u8, 0u8];
+    assert!(map.contains_key(&oldest_key));
+
+    // one more distinct joiner past the cap evicts the OLDEST entry, not a
+    // random one, and the map never grows past the cap.
+    let newcomer = vec![0xff, 0xff];
+    insert_gate_outcome(
+        &mut map,
+        newcomer.clone(),
+        admitted_at(999),
+        t0 + std::time::Duration::from_secs(MAX_GATE_OUTCOMES as u64),
+    );
+    assert_eq!(map.len(), MAX_GATE_OUTCOMES);
+    assert!(
+        !map.contains_key(&oldest_key),
+        "the oldest entry made room for the newcomer"
+    );
+    assert!(map.contains_key(&newcomer));
+
+    // re-settling an ALREADY-tracked joiner never grows the map and never
+    // evicts anything — an attacker gains nothing by retransmitting.
+    let second_oldest = vec![1u8, 0u8];
+    assert!(map.contains_key(&second_oldest));
+    insert_gate_outcome(
+        &mut map,
+        second_oldest.clone(),
+        admitted_at(1000),
+        t0 + std::time::Duration::from_secs(MAX_GATE_OUTCOMES as u64 + 1),
+    );
+    assert_eq!(map.len(), MAX_GATE_OUTCOMES);
+    assert!(map.contains_key(&second_oldest));
+}
+
+#[test]
+fn sweep_removes_expired_entries_and_keeps_fresh_ones() {
+    let mut map: GateOutcomeMap = GateOutcomeMap::new();
+    let t0 = std::time::SystemTime::UNIX_EPOCH;
+    let window = std::time::Duration::from_millis(reachability::INVITE_JOIN_WINDOW_MS);
+
+    let stale = b"stale-joiner".to_vec();
+    let fresh = b"fresh-joiner".to_vec();
+    insert_gate_outcome(&mut map, stale.clone(), admitted_at(1), t0);
+    let now = t0 + window + std::time::Duration::from_millis(1);
+    insert_gate_outcome(&mut map, fresh.clone(), admitted_at(2), now);
+
+    sweep_gate_outcomes(&mut map, now, window);
+
+    assert!(
+        !map.contains_key(&stale),
+        "an entry older than the join window is swept, Admitted or not"
+    );
+    assert!(map.contains_key(&fresh), "a fresh entry survives the sweep");
+}
+
+// ---------------------------------------------------------------------------
+// `UnreachableLatch`: the "peer unreachable" warn (#1768) — a forever-retry
+// loop latched like `noded::log::Latch` (first hit, then every Nth, carrying
+// the count), but per-peer and reset on recovery.
+// ---------------------------------------------------------------------------
+
+use crate::reachability_plane::UnreachableLatch;
+
+#[test]
+fn a_peer_latches_first_then_every_nth_and_counts_the_rest() {
+    let mut latch = UnreachableLatch::default();
+    let peer = b"peer-a";
+    // the first failure must be visible immediately, not on the 100th retry.
+    assert_eq!(latch.hit(peer), Some(1));
+    for _ in 2..100 {
+        assert_eq!(latch.hit(peer), None, "no flood while still latched");
+    }
+    // ...and the count is what tells you it is WEDGED, not merely flaky.
+    assert_eq!(latch.hit(peer), Some(100));
+
+    // a distinct peer latches independently: one noisy peer must never mask
+    // another's first warn.
+    assert_eq!(latch.hit(b"peer-b"), Some(1));
+}
+
+#[test]
+fn a_recovered_peer_gets_a_fresh_first_warn() {
+    let mut latch = UnreachableLatch::default();
+    let peer = b"peer-a";
+    assert_eq!(latch.hit(peer), Some(1));
+    assert_eq!(latch.hit(peer), None);
+
+    // the peer is reachable again — its next failure is a fresh first-warn,
+    // not silently folded into the old streak's count.
+    latch.clear(peer);
+    assert_eq!(latch.hit(peer), Some(1));
 }

@@ -8,7 +8,11 @@
 //! compile).
 //!
 //! ops: 'p' put+same-dispatch-check · 'a' assert-absent · 'P' assert-present ·
-//! 'b' budget-probe · 'r' stage-refs-image.
+//! 'b' budget-probe · 'r' stage-refs-image · 'c' assert-genesis-config —
+//! decoded by hand rather than through `sdk::genesis_config` / `guest-adapter`
+//! (this guest is deliberately standalone, calling the raw host imports the
+//! `GuestOdb` wrapper and `load_config` are proven to sit over), so it proves
+//! the odb `__config` seam from a plain reader's point of view too.
 
 wit_bindgen::generate!({
     world: "module",
@@ -27,6 +31,29 @@ fn tagged(kind: u8, body: &[u8]) -> Vec<u8> {
     t
 }
 
+/// the [`sdk::genesis_config::encode_config`] frame, decoded by hand: a
+/// `u64-le` count, then per parameter a length-prefixed key and a
+/// length-prefixed value. returns the value for `key`, or `None` if the
+/// frame is short, malformed, or the key is absent — this guest is a probe,
+/// not the consensus decoder, so it fails closed rather than panicking.
+fn find_config_value<'a>(bytes: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let (count_bytes, mut rest) = bytes.split_at_checked(8)?;
+    let count = u64::from_le_bytes(count_bytes.try_into().ok()?);
+    for _ in 0..count {
+        let (klen_bytes, after_klen) = rest.split_at_checked(8)?;
+        let klen = u64::from_le_bytes(klen_bytes.try_into().ok()?) as usize;
+        let (k, after_k) = after_klen.split_at_checked(klen)?;
+        let (vlen_bytes, after_vlen) = after_k.split_at_checked(8)?;
+        let vlen = u64::from_le_bytes(vlen_bytes.try_into().ok()?) as usize;
+        let (v, after_v) = after_vlen.split_at_checked(vlen)?;
+        if k == key {
+            return Some(v);
+        }
+        rest = after_v;
+    }
+    None
+}
+
 /// a distinct 32-byte id for budget-probe read `i` (never put, so absent).
 fn distinct_id(i: u64) -> Vec<u8> {
     let mut id = vec![0u8; 32];
@@ -41,7 +68,7 @@ impl Guest for Component {
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             backing: host::Backing::Odb,
-            config: Vec::new(),
+            config: vec!["chain_id".into()],
             committed_queries: false,
         }
     }
@@ -57,22 +84,30 @@ impl Guest for Component {
                     .split_first()
                     .ok_or_else(|| host::Error::Rejected("put needs a kind byte".into()))?;
                 if rest.len() < 32 {
-                    return Err(host::Error::Rejected("put needs a 32-byte expected id".into()));
+                    return Err(host::Error::Rejected(
+                        "put needs a 32-byte expected id".into(),
+                    ));
                 }
                 let (expected, body) = rest.split_at(32);
                 let id = host::object_put(kind, body);
                 if id != expected {
-                    return Err(host::Error::Rejected("host id differs from sha256(kind ‖ body)".into()));
+                    return Err(host::Error::Rejected(
+                        "host id differs from sha256(kind ‖ body)".into(),
+                    ));
                 }
                 let want = tagged(kind, body);
 
                 let stat = host::object_stat(&id);
                 if stat != Some((kind, body.len() as u64)) {
-                    return Err(host::Error::Rejected("same-dispatch stat missed the put".into()));
+                    return Err(host::Error::Rejected(
+                        "same-dispatch stat missed the put".into(),
+                    ));
                 }
                 let got = host::object_get(&id);
                 if got.as_deref() != Some(want.as_slice()) {
-                    return Err(host::Error::Rejected("same-dispatch get missed the put".into()));
+                    return Err(host::Error::Rejected(
+                        "same-dispatch get missed the put".into(),
+                    ));
                 }
                 Ok(())
             }
@@ -81,13 +116,19 @@ impl Guest for Component {
             // rather than reach this Ok.
             Some((b'a', id)) => {
                 if id.len() != 32 {
-                    return Err(host::Error::Rejected("absent probe needs a 32-byte id".into()));
+                    return Err(host::Error::Rejected(
+                        "absent probe needs a 32-byte id".into(),
+                    ));
                 }
                 if host::object_stat(id).is_some() {
-                    return Err(host::Error::Rejected("expected-absent id had a stat".into()));
+                    return Err(host::Error::Rejected(
+                        "expected-absent id had a stat".into(),
+                    ));
                 }
                 if host::object_get(id).is_some() {
-                    return Err(host::Error::Rejected("expected-absent id had a body".into()));
+                    return Err(host::Error::Rejected(
+                        "expected-absent id had a body".into(),
+                    ));
                 }
                 Ok(())
             }
@@ -96,13 +137,19 @@ impl Guest for Component {
             // are the same op — the mirror of 'a', for the odb-backing proof.
             Some((b'P', id)) => {
                 if id.len() != 32 {
-                    return Err(host::Error::Rejected("present probe needs a 32-byte id".into()));
+                    return Err(host::Error::Rejected(
+                        "present probe needs a 32-byte id".into(),
+                    ));
                 }
                 if host::object_stat(id).is_none() {
-                    return Err(host::Error::Rejected("expected-present id had no stat".into()));
+                    return Err(host::Error::Rejected(
+                        "expected-present id had no stat".into(),
+                    ));
                 }
                 if host::object_get(id).is_none() {
-                    return Err(host::Error::Rejected("expected-present id had no body".into()));
+                    return Err(host::Error::Rejected(
+                        "expected-present id had no body".into(),
+                    ));
                 }
                 Ok(())
             }
@@ -127,6 +174,22 @@ impl Guest for Component {
                 };
                 for i in 0..n {
                     let _ = host::object_stat(&distinct_id(i));
+                }
+                Ok(())
+            }
+            // 'c' bytes.. — assert the host-installed `__config` record
+            // carries key "chain_id" with exactly `bytes` as its value. reads
+            // the same reserved key [`sdk::genesis_config::CONFIG_KEY`] names
+            // (`__config`) through the plain `state-get` import and decodes
+            // the frame by hand (count, then length-prefixed key/value pairs)
+            // — the odb twin of `guest_adapter::load_config`.
+            Some((b'c', want)) => {
+                let config = host::state_get(b"__config")
+                    .ok_or_else(|| host::Error::Rejected("__config absent".into()))?;
+                let got = find_config_value(&config, b"chain_id")
+                    .ok_or_else(|| host::Error::Rejected("chain_id absent from __config".into()))?;
+                if got != want {
+                    return Err(host::Error::Rejected("chain_id value mismatch".into()));
                 }
                 Ok(())
             }

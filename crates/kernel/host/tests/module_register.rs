@@ -81,8 +81,13 @@ fn bare_host(with_factory: bool) -> Host {
         MODULES_ID,
         Box::new(sdk_testkit::MemStore::new()),
         "valset",
+        "governance",
     )));
-    let mut valset = valset::Valset::new("valset", Box::new(sdk_testkit::MemStore::new()));
+    let mut valset = valset::Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
     block_on(valset.seed(MEMBER.to_vec())).expect("seed valset");
     block_on(valset.finish_seed()).expect("seed valset");
     host.register(Box::new(valset));

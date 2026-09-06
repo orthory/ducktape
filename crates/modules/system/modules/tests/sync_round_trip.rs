@@ -78,7 +78,7 @@ async fn replies(lc: &Modules) -> Vec<ModulesReply> {
 }
 
 fn modules_over(store: Box<dyn sdk::MerkleStore>) -> Modules {
-    Modules::new("modules", store, "valset")
+    Modules::new("modules", store, "valset", "governance")
 }
 
 #[test]

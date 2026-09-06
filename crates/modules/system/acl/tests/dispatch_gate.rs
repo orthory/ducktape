@@ -39,7 +39,7 @@ fn key_bytes(k: &PrivateKey) -> Vec<u8> {
 /// a host with an EMPTY acl table, a valset seeded with member 1, and a bare
 /// identity plane — the production system-module shape in miniature.
 async fn gate_host() -> Host {
-    let mut valset = Valset::new("valset", Box::new(MemStore::new()));
+    let mut valset = Valset::new("valset", Box::new(MemStore::new()), "governance");
     valset
         .seed(key_bytes(&keypair(1)))
         .await
@@ -47,7 +47,7 @@ async fn gate_host() -> Host {
     valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(valset),
-        Box::new(Acl::new("acl", Box::new(MemStore::new()))),
+        Box::new(Acl::new("acl", Box::new(MemStore::new()), "governance")),
         Box::new(Identity::new(
             "identity",
             Box::new(MemStore::new()),

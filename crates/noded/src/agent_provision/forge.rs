@@ -68,13 +68,6 @@ pub(super) struct ForgeLane {
     push_base: String,
     /// the committer identity on every run commit (the node, never the agent).
     committer_name: String,
-    /// the link the push credential is read from, per push and never latched
-    /// (the node re-mints `admin.token` every boot, and this lane outlives a
-    /// node restart): `git-receive-pack` refuses a push carrying neither git's
-    /// own certificate nor that credential (#1292), and a run has no SSH
-    /// signing key to make a certificate with — the NODE is the pusher here,
-    /// which is exactly what the credential says.
-    node: NodeLink,
 }
 
 impl ForgeLane {
@@ -108,7 +101,6 @@ impl ForgeLane {
             repo_base,
             push_base,
             committer_name,
-            node: node.clone(),
         })
     }
 }
@@ -334,7 +326,6 @@ pub(super) async fn provision(
     validate_coords(repo, commit, branch)?;
     let repo_dir = lane.repo_base.join(repo);
     let push_url = format!("{}/{repo}", lane.push_base);
-    let push_credential = lane.node.operator_token();
 
     let blocking = ProvisionArgs {
         repo_dir,
@@ -413,7 +404,7 @@ pub(super) async fn provision(
         run_dir: workspace_args.run_dir,
         ro_dir,
         push_url,
-        push_credential,
+        node,
         forge_push: *forge_push,
         source: spec.source.clone(),
         agent_id: spec.agent_id.clone(),
@@ -503,8 +494,13 @@ struct ForgeWorkspace {
     /// (it lives outside the worktree, so git cannot see it either).
     ro_dir: Option<PathBuf>,
     push_url: String,
-    /// the operator credential the push presents (see [`ForgeLane`]).
-    push_credential: Option<String>,
+    /// the link the push credential is read from, per push attempt and never
+    /// latched: the node re-mints `admin.token` every boot, and this
+    /// workspace outlives a node restart. `git-receive-pack` refuses a push
+    /// carrying neither git's own certificate nor that credential, and a run
+    /// has no SSH signing key to make a certificate with — the NODE is the
+    /// pusher here, which is exactly what the credential says.
+    node: NodeLink,
     /// compose-height `forge_push` verdict; false for old envelopes.
     forge_push: bool,
     source: WorkspaceSource,
@@ -831,7 +827,7 @@ fn commit_blocking(
     pinned_commit: &str,
     branch: &str,
     push_url: &str,
-    push_credential: Option<&str>,
+    node: &NodeLink,
     forge_push: bool,
     response_proposal: Option<&str>,
     item_title: &str,
@@ -895,25 +891,29 @@ fn commit_blocking(
     // the interloper's tip stays branch head.
     let refspec = format!("HEAD:refs/heads/{branch}");
     let fetchspec = format!("refs/heads/{branch}");
-    // the credential rides GIT_CONFIG_*, not `-c`: an argv is world-readable
-    // through /proc on Linux, and this is a secret.
-    let header = push_credential
-        .map(|token| format!("{}: {token}", crate::admin::ADMIN_TOKEN_HEADER))
-        .unwrap_or_default();
-    let push_env: Vec<(&str, &str)> = match header.is_empty() {
-        true => Vec::new(),
-        false => vec![
-            ("GIT_CONFIG_COUNT", "1"),
-            ("GIT_CONFIG_KEY_0", "http.extraHeader"),
-            ("GIT_CONFIG_VALUE_0", header.as_str()),
-        ],
-    };
     let committer_env = [
         ("GIT_COMMITTER_NAME", identity.committer_name.as_str()),
         ("GIT_COMMITTER_EMAIL", committer_email.as_str()),
     ];
     let mut rebased = false;
     for attempt in 1..=PUSH_ATTEMPTS {
+        // re-read the operator credential on EVERY attempt, never once before
+        // the loop: the node re-mints `admin.token` on a restart, and this
+        // workspace's clone predates any restart that happens mid-run. the
+        // credential rides GIT_CONFIG_*, not `-c` — an argv is world-readable
+        // through /proc on Linux, and this is a secret.
+        let header = node
+            .operator_token()
+            .map(|token| format!("{}: {token}", crate::admin::ADMIN_TOKEN_HEADER))
+            .unwrap_or_default();
+        let push_env: Vec<(&str, &str)> = match header.is_empty() {
+            true => Vec::new(),
+            false => vec![
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "http.extraHeader"),
+                ("GIT_CONFIG_VALUE_0", header.as_str()),
+            ],
+        };
         match run_git(run_dir, &["push", push_url, &refspec], &push_env) {
             Ok(_) => {
                 // re-read AFTER any rebase: the pushed head is the output_commit.
@@ -993,7 +993,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
         let (pinned_commit, branch, item_title) = self.coords();
         let run_dir = self.run_dir.clone();
         let push_url = self.push_url.clone();
-        let push_credential = self.push_credential.clone();
+        let node = self.node.clone();
         let forge_push = self.forge_push;
         let agent_id = self.agent_id.clone().unwrap_or_else(|| "agent".into());
         let agent_display_name = self
@@ -1013,7 +1013,7 @@ impl ProvisionedWorkspace for ForgeWorkspace {
                 &pinned_commit,
                 &branch,
                 &push_url,
-                push_credential.as_deref(),
+                &node,
                 forge_push,
                 proposal.as_deref(),
                 &item_title,

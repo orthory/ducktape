@@ -13,6 +13,7 @@ mod page_autosave_gate;
 mod pages;
 mod rooms;
 mod sends;
+mod settings;
 mod shell;
 mod stream;
 mod threads;

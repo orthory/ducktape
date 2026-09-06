@@ -241,9 +241,7 @@ fn an_undeclared_modules_ops_are_skipped_not_poisoned() {
         1,
         "quiet declared modules advance past the admitted module's block"
     );
-    store
-        .apply_block(&block(2, vec![chat_op(b"{}")]))
-        .unwrap();
+    store.apply_block(&block(2, vec![chat_op(b"{}")])).unwrap();
     assert_eq!(store.applied_height("chat").unwrap(), 2);
     // asked for BY NAME the undeclared id is still its own error.
     assert!(matches!(
@@ -520,27 +518,23 @@ fn a_mapper_swap_clears_and_refolds_the_read_model() {
     );
 }
 
-/// THE OPEN WAITS THE REFOLD OUT, AND SAYS SO WHEN IT CANNOT FINISH.
+/// THE OPEN WAITS THE REFOLD OUT — BUT A GUEST THAT CANNOT FOLD ITS OWN FEED
+/// NO LONGER TAKES THE WHOLE NODE DOWN WITH IT (#1725/#1726).
 ///
 /// `replay_op_feed` only STAGES its re-writes — the engine folds them on a
-/// background runner — so an `open` that returned at that point would publish
-/// a store whose read model is the keyspace `clear_derived` just emptied:
-/// every view answering "no such row" for the length of the whole feed, which
-/// reads as a workspace that lost its contents rather than one still starting.
-///
-/// This is the deterministic half of that wait. The two refold tests above
-/// assert what a DRAINED store holds, and a fast fixture drains before they
-/// can look, so they cannot fail when the wait is missing. A poisoned op can:
-/// the fold refuses it forever, and the only way `open` ever reports it is by
-/// having stopped for the runner. Both halves come out of the same
-/// `drain_fold` call — it returns on an empty queue or on a queue that will
-/// never empty, and on nothing else.
-///
-/// Refusing the open is deliberate, and matches what a broken artifact already
-/// gets one line earlier at `wasm_entries`: a guest that cannot fold its own
-/// feed has no read model to serve.
+/// background runner — so `open` still waits `drain_fold` out: an open that
+/// returned early would publish a store whose read model is the keyspace
+/// `clear_derived` just emptied, every view answering "no such row" for the
+/// length of the whole feed. But once that wait resolves to `FoldStuck` (a
+/// poisoned op the guest refuses forever, never draining), the derived tier
+/// is node-local and rebuildable, so ONE module's guest rejecting its own
+/// feed must not refuse the whole `open`: `converge_guest` warns and still
+/// writes the marker, leaving the module exactly as stuck as `drain_fold`
+/// found it — visible through `fold_status`, never through `is_poisoned`
+/// (that flag is for HOST-write failures, and a guest-fold error never sets
+/// it) — while `open` succeeds and every other module indexes normally.
 #[test]
-fn a_refold_that_cannot_finish_refuses_the_open() {
+fn a_guest_stuck_at_converge_does_not_refuse_the_open() {
     let dir = tempfile::tempdir().unwrap();
     {
         // no guest, so the feed takes the poison op with nothing folding: the
@@ -551,7 +545,7 @@ fn a_refold_that_cannot_finish_refuses_the_open() {
             .unwrap();
     }
 
-    let opened = IndexStore::open(
+    let store = IndexStore::open(
         dir.path(),
         &[
             IndexModule {
@@ -560,14 +554,59 @@ fn a_refold_that_cannot_finish_refuses_the_open() {
             },
             IndexModule::bare("tasks"),
         ],
+    )
+    .expect("a stuck guest fold must not refuse the open");
+
+    let status = store
+        .fold_status("chat")
+        .unwrap()
+        .expect("chat still folds — its guest just cannot clear its own backlog");
+    assert!(status.pending > 0, "the poison op is still queued");
+    assert!(
+        !store.is_poisoned(),
+        "a guest-fold failure must never poison the host-write path"
+    );
+    // "tasks" shares nothing with chat's stuck fold: its feed watermark still
+    // advances on every block, ops or not (every module's does).
+    assert_eq!(store.applied_height("tasks").unwrap(), 1);
+}
+
+/// #1725: A FAILED REFOLD MUST RESTORE ITS MARKER TOO, NOT ONLY ON SUCCESS.
+/// Before this fix `refold` dropped `meta/guest` first and put it back only
+/// after `refold_feed` returned `Ok`, so a live guest failure left the
+/// marker permanently absent — the next `open` would find none, replay the
+/// WHOLE feed from scratch to rebuild it, hit the identical failure, and
+/// (pre-#1726 too) refuse to open at all. Restoring the marker on the error
+/// path is what lets a warm boot recognize its own guest and skip that
+/// replay outright instead of re-triggering the same brick.
+#[test]
+fn a_failed_refold_restores_its_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    store.apply_block(&block(1, vec![chat_op(b"one")])).unwrap();
+    store.wait_folds_drained().unwrap();
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 0)));
+
+    // a poisoned row lands in the feed the same way a join-seam backfill's
+    // would (indexable spec §7) before `repair_read_model` calls `refold`.
+    store
+        .apply_block(&block(2, vec![chat_op(b"boom")]))
+        .unwrap();
+
+    let db = store.db("chat").unwrap();
+    let marker_before = db.get(META_GUEST.as_bytes()).unwrap();
+    assert!(marker_before.is_some(), "converge already wrote one");
+
+    let err = store.refold("chat").unwrap_err();
+    assert!(
+        matches!(err, Error::FoldStuck(_)),
+        "the guest's own Fail is what refold surfaces: {err}"
     );
 
-    let Err(Error::FoldStuck(cause)) = opened else {
-        panic!("a store whose refold cannot complete must refuse to open");
-    };
-    assert!(
-        cause.starts_with("chat: "),
-        "the refusal names the module that could not fold: {cause}"
+    let marker_after = db.get(META_GUEST.as_bytes()).unwrap();
+    assert_eq!(
+        marker_before, marker_after,
+        "the marker must come back even though the refold failed"
     );
 }
 
@@ -1067,4 +1106,48 @@ fn user_handle_renders_names_and_keys() {
     assert_eq!(user_handle(&[0xab, 0xcd]), "abcd");
     assert_eq!(user_handle(b""), "");
     assert_eq!(user_handle(b"line\nbreak"), "6c696e650a627265616b");
+}
+
+// ----------------------------------------------------------------------------
+// #1726: the drain's own progress/stall decision, pulled out of `drain_fold`
+// so it is testable without driving fluent31's real retry/backoff timing.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn drain_verdict_calls_a_shrinking_backlog_progress() {
+    assert_eq!(
+        drain_verdict(3, 5, Duration::from_secs(999), Duration::from_secs(60)),
+        DrainVerdict::Progress,
+        "pending below every count seen so far is progress, no matter how long it took"
+    );
+}
+
+#[test]
+fn drain_verdict_waits_out_a_flat_backlog_within_the_stall_budget() {
+    // this is the whole bug: a trigger that just recorded an error but has
+    // not yet had time to retry (fluent31's own 100ms-to-6.4s backoff) looks
+    // exactly like this — flat pending, short elapsed. it must NOT be Stuck.
+    assert_eq!(
+        drain_verdict(4, 4, Duration::from_millis(50), Duration::from_secs(60)),
+        DrainVerdict::Waiting
+    );
+}
+
+#[test]
+fn drain_verdict_is_stuck_only_once_the_stall_budget_elapses() {
+    assert_eq!(
+        drain_verdict(4, 4, Duration::from_secs(60), Duration::from_secs(60)),
+        DrainVerdict::Stuck,
+        "flat pending for the whole budget is stuck — a permanent guest Fail \
+         the engine retries forever must still surface, just not instantly"
+    );
+}
+
+#[test]
+fn drain_verdict_never_treats_equal_pending_as_progress() {
+    // a boundary check: `<`, not `<=` — an unchanged backlog is not shrinking.
+    assert_eq!(
+        drain_verdict(4, 4, Duration::from_millis(1), Duration::from_secs(60)),
+        DrainVerdict::Waiting
+    );
 }

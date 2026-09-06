@@ -284,8 +284,9 @@ impl Coordinator {
     }
 
     /// The pure ordered state step. `caller` is the authenticated requesting
-    /// identity, used for a `Lookup`'s peer-directed `PunchSync` so the passive
-    /// side learns the caller's real key even before the caller has registered.
+    /// identity, used both to bind a `Lookup` to the caller's own registered
+    /// source before answering it, and for the peer-directed `PunchSync` so
+    /// the passive side learns the caller's real key.
     fn handle_replies(
         &mut self,
         caller: NodeKey,
@@ -380,6 +381,40 @@ impl Coordinator {
                 CoordinatorReplies::new()
             }
             Msg::Lookup { key } => {
+                // `from` is the raw datagram source and `verify_request_using`
+                // never binds it to `caller` — it only proves possession of
+                // `caller`'s key. Answer a Lookup only when `caller` already
+                // has a LIVE advert observed at exactly this source: the same
+                // binding the Register/Readvertise `SourceMismatch` guard
+                // enforces on the write side, reused here instead of adding a
+                // second mechanism. Every legitimate caller registers before
+                // it looks up (the client always `register`s on the socket it
+                // then calls `lookup`/`send_lookup` from), so this costs
+                // nothing on the real join/rendezvous path. Without it, a
+                // spoofed `from` with a fresh, unregistered `caller` key turns
+                // this arm into a three-datagram reflector aimed at whatever
+                // address the attacker names.
+                let caller_bound_here = self.adverts.lock().current(caller, now) == Some(from);
+                if !caller_bound_here {
+                    // Unauthenticated by definition — any key can claim any
+                    // source until it has registered from one — so this is
+                    // latched like every other refusal in this crate; the
+                    // count is the diagnosis. Nothing is sent back: a reply to
+                    // an unbound source IS the defect this guard closes.
+                    static UNBOUND_LOOKUP: Latch = Latch::new();
+                    if let Some(occurrences) = UNBOUND_LOOKUP.hit("lookup_source_unbound") {
+                        tracing::warn!(
+                            target: "ducktape::reachability",
+                            event = "lookup_refused",
+                            reason = "source_unbound",
+                            caller = short_key(caller),
+                            occurrences,
+                            "lookup refused — caller has no live advert from this source"
+                        );
+                    }
+                    return CoordinatorReplies::new();
+                }
+
                 // Decide under the lock, then drop it before anything else —
                 // building the reply and the tracing call are both pure once
                 // `target` is known, and a stalled log write must never park
@@ -535,6 +570,7 @@ mod tests {
         // wire protocol, not only via the in-process `readvertise` API.
         let mut c = Coordinator::new();
         let a = NodeKey([0xaa; 32]);
+        let b = NodeKey([0xbb; 32]);
         let b_src = addr(2, 2222);
         let old = addr(1, 1111);
         let attacker_src = addr(9, 6666);
@@ -544,13 +580,19 @@ mod tests {
             c.handle_verified(a, old, Msg::Register { key: a })
                 .is_empty()
         );
+        // B registers from its own source too — a Lookup is only answered to a
+        // caller the coordinator has already bound to that source.
+        assert!(
+            c.handle_verified(b, b_src, Msg::Register { key: b })
+                .is_empty()
+        );
 
         // A keepalives from the SAME mapping over the wire under nonce 1.
         assert!(
             c.handle_verified(a, old, Msg::Readvertise { key: a, nonce: 1 })
                 .is_empty()
         );
-        let out = c.handle_verified(NodeKey([0xbb; 32]), b_src, Msg::Lookup { key: a });
+        let out = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(
             out.contains(&(
                 b_src,
@@ -568,7 +610,7 @@ mod tests {
             c.handle_verified(a, attacker_src, Msg::Readvertise { key: a, nonce: 2 })
                 .is_empty()
         );
-        let out_attacker = c.handle_verified(NodeKey([0xbb; 32]), b_src, Msg::Lookup { key: a });
+        let out_attacker = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(
             out_attacker.contains(&(
                 b_src,
@@ -586,7 +628,7 @@ mod tests {
             c.handle_verified(a, old, Msg::Register { key: a })
                 .is_empty()
         );
-        let out2 = c.handle_verified(NodeKey([0xbb; 32]), b_src, Msg::Lookup { key: a });
+        let out2 = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(
             out2.contains(&(
                 b_src,
@@ -603,7 +645,7 @@ mod tests {
             c.handle_verified(a, old, Msg::Readvertise { key: a, nonce: 1 })
                 .is_empty()
         );
-        let out3 = c.handle_verified(NodeKey([0xbb; 32]), b_src, Msg::Lookup { key: a });
+        let out3 = c.handle_verified(b, b_src, Msg::Lookup { key: a });
         assert!(out3.contains(&(
             b_src,
             Msg::LookupResponse {
@@ -668,8 +710,14 @@ mod tests {
     fn lookup_unknown_returns_none() {
         let mut c = Coordinator::new();
         let a_src = addr(1, 1111);
+        let a = NodeKey([0xaa; 32]);
         let missing = NodeKey([0xcc; 32]);
-        let out = c.handle_verified(NodeKey([0xaa; 32]), a_src, Msg::Lookup { key: missing });
+        // The caller must be bound to `a_src` before any Lookup is answered.
+        assert!(
+            c.handle_verified(a, a_src, Msg::Register { key: a })
+                .is_empty()
+        );
+        let out = c.handle_verified(a, a_src, Msg::Lookup { key: missing });
         assert_eq!(
             out,
             vec![(
@@ -761,19 +809,20 @@ mod tests {
         assert_eq!(c.rejects(), before + 1);
         // The outsider's key never entered the book: an AUTHORIZED lookup for it
         // resolves to None (the dropped register created no mapping). The
-        // outsider here holds a genesis cap, so it authenticates as the caller
-        // and looks up its own (unregistered) key.
+        // looker-up is `subject` — already bound to `src` by its own earlier
+        // Register — since an unregistered caller (the outsider itself) gets
+        // no reply to any Lookup at all, regardless of what it names.
         let lk = Msg::Lookup { key: osub };
         let lauth = sign_authenticator(
-            &outsider,
+            &node,
             &lk.encode(),
             now,
-            Some(mint_coord_cap(&g, osub, now + 3600)),
+            Some(mint_coord_cap(&g, subject, now + 3600)),
         );
         let out = c.handle_auth(
             src,
             AuthRequest {
-                caller: osub,
+                caller: subject,
                 inner: lk,
                 auth: lauth,
             },
@@ -1000,6 +1049,29 @@ mod tests {
             "self-op with mismatched caller is rejected"
         );
 
+        // The attacker legitimately registers its OWN key from `src` — needed
+        // only so the Lookup below is answered at all (a Lookup is refused
+        // outright from a caller the book has not bound to its source).
+        let self_reg = Msg::Register { key: attacker_key };
+        let self_auth = sign_authenticator(
+            &attacker,
+            &self_reg.encode(),
+            now,
+            Some(mint_coord_cap(&g, attacker_key, now + 3600)),
+        );
+        assert!(
+            c.handle_auth(
+                src,
+                AuthRequest {
+                    caller: attacker_key,
+                    inner: self_reg,
+                    auth: self_auth,
+                },
+                now,
+            )
+            .is_empty()
+        );
+
         // The victim's key never entered the book: an authenticated self-lookup
         // by the attacker for the victim's key resolves to None (no mapping was
         // poisoned into existence).
@@ -1035,8 +1107,18 @@ mod tests {
             c.handle_verified_at(a, a_src, Msg::Register { key: a }, 1_000)
                 .is_empty()
         );
+        assert!(
+            c.handle_verified_at(b, b_src, Msg::Register { key: b }, 1_000)
+                .is_empty()
+        );
 
-        // Within TTL: resolves and fans.
+        // Within TTL: resolves and fans. B refreshes its own registration
+        // (same source, own key) so its Lookup keeps being bound and answered
+        // — this test is about A's mapping expiring, not B's.
+        assert!(
+            c.handle_verified_at(b, b_src, Msg::Register { key: b }, 1_100)
+                .is_empty()
+        );
         let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: a }, 1_100);
         assert!(out.contains(&(
             b_src,
@@ -1051,6 +1133,10 @@ mod tests {
         );
 
         // Past TTL: honest None, and crucially NO PunchSync toward the dead pinhole.
+        assert!(
+            c.handle_verified_at(b, b_src, Msg::Register { key: b }, 1_121)
+                .is_empty()
+        );
         let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: a }, 1_121);
         assert_eq!(
             out,
@@ -1081,6 +1167,12 @@ mod tests {
         );
         assert!(
             c.handle_verified_at(a, a_src, Msg::Readvertise { key: a, nonce: 2 }, 1_200)
+                .is_empty()
+        );
+        // B registers right before its Lookup — a Lookup is only answered to
+        // a caller the book has bound to its source.
+        assert!(
+            c.handle_verified_at(b, b_src, Msg::Register { key: b }, 1_300)
                 .is_empty()
         );
         let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: a }, 1_300);
@@ -1132,10 +1224,18 @@ mod tests {
         // source. PoP re-verifies, but observe must refuse to repoint the mapping.
         assert!(c.handle_auth(attacker_src, authreq, now).is_empty());
 
+        // B registers from its own source too, so its Lookup is answered at
+        // all — a Lookup is refused outright from a caller the book has not
+        // bound to its source.
+        let b = NodeKey([0xbb; 32]);
+        assert!(
+            c.handle_verified_at(b, b_src, Msg::Register { key: b }, now)
+                .is_empty()
+        );
+
         // A lookup still resolves the victim's ORIGINAL reflexive, and the punch
         // fan-out targets it — never the attacker.
-        let out =
-            c.handle_verified_at(NodeKey([0xbb; 32]), b_src, Msg::Lookup { key: victim }, now);
+        let out = c.handle_verified_at(b, b_src, Msg::Lookup { key: victim }, now);
         assert!(
             out.contains(&(
                 b_src,
@@ -1154,6 +1254,83 @@ mod tests {
         assert!(
             !out.iter().any(|(dst, _)| *dst == attacker_src),
             "nothing is directed at the attacker's source"
+        );
+    }
+
+    #[test]
+    fn spoofed_source_lookup_gets_no_reply_and_no_punch_sync() {
+        // The reflection this guard closes: a fresh, never-registered caller
+        // key riding a datagram whose source is forged to a victim address.
+        // `verify_request_using` proves possession of the caller key but never
+        // binds it to the datagram source, so without the source-binding guard
+        // the coordinator would answer `victim_src` with a LookupResponse and a
+        // PunchSync, and tell the resolved member to punch `victim_src` too —
+        // three unsolicited datagrams from two legitimate IPs, aimed by the
+        // attacker at a target of its choosing.
+        let mut c = Coordinator::new();
+        let member = NodeKey([0xaa; 32]);
+        let member_src = addr(1, 1111);
+        let fresh_caller = NodeKey([0xee; 32]);
+        let victim_src = addr(9, 9999);
+
+        assert!(
+            c.handle_verified(member, member_src, Msg::Register { key: member })
+                .is_empty()
+        );
+
+        let out = c.handle_verified(fresh_caller, victim_src, Msg::Lookup { key: member });
+        assert!(
+            out.is_empty(),
+            "an unbound caller's Lookup must produce zero datagrams, not even a LookupResponse"
+        );
+    }
+
+    #[test]
+    fn registered_caller_lookup_from_registered_source_still_resolves() {
+        // The legitimate flow the guard must not cost anything: a caller that
+        // registered from a source, then looks up a peer FROM THAT SAME
+        // source, still gets its full three-datagram fan-out.
+        let mut c = Coordinator::new();
+        let caller = NodeKey([0xaa; 32]);
+        let caller_src = addr(1, 1111);
+        let peer = NodeKey([0xbb; 32]);
+        let peer_src = addr(2, 2222);
+
+        assert!(
+            c.handle_verified(caller, caller_src, Msg::Register { key: caller })
+                .is_empty()
+        );
+        assert!(
+            c.handle_verified(peer, peer_src, Msg::Register { key: peer })
+                .is_empty()
+        );
+
+        let out = c.handle_verified(caller, caller_src, Msg::Lookup { key: peer });
+        assert!(out.contains(&(
+            caller_src,
+            Msg::LookupResponse {
+                key: peer,
+                reflexive: Some(peer_src)
+            }
+        )));
+        assert!(out.contains(&(
+            caller_src,
+            Msg::PunchSync {
+                peer,
+                peer_reflexive: peer_src
+            }
+        )));
+        assert!(out.contains(&(
+            peer_src,
+            Msg::PunchSync {
+                peer: caller,
+                peer_reflexive: caller_src
+            }
+        )));
+        assert_eq!(
+            out.len(),
+            3,
+            "the full fan-out, unaffected by the source guard"
         );
     }
 }

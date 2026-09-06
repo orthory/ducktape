@@ -18,13 +18,17 @@
 //! `keyscheme` (`Secp256r1` = the assertion envelope, `Secp256k1` =
 //! `personal_sign` over [`keyscheme::personal_message`]).
 //!
-//! Two ceremony facts every caller sequences around:
+//! Three ceremony facts every caller sequences around:
 //! - a passkey REGISTRATION is two touches: `create` yields the public key,
 //!   then `get` over the `AddKey` frame preimage proves possession (a
 //!   `webauthn.create` attestation carries no signature we can verify);
 //! - a wallet is two touches: it reveals no public key on its own, so touch 1
 //!   signs [`reveal_message`] and the key is recovered from that signature,
-//!   touch 2 signs the real preimage.
+//!   touch 2 signs the real preimage;
+//! - a LOGIN is two touches for the same reason: an add-key consent names the
+//!   account it admits into, and a passkey only says which account it belongs
+//!   to by answering ([`account_request`] -> [`assertion_account`]). Touch 1
+//!   asks; touch 2 ([`login_request`]) is the consent, bound to that answer.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -172,10 +176,23 @@ pub fn parse_result(json: &str) -> Result<Outcome, String> {
         ));
     }
     match op.as_str() {
-        "create" => Ok(Outcome::Create {
-            credential_id: binary(&value, "credentialId")?,
-            public_key: binary(&value, "publicKey")?,
-        }),
+        "create" => {
+            // the browser is a trust boundary: the page compresses the SPKI
+            // point itself, and a key spelled any other way is one the chain
+            // would refuse as an origin AFTER a consent and a second touch had
+            // already been spent on it.
+            let public_key = binary(&value, "publicKey")?;
+            if !KeyScheme::Secp256r1.pubkey_wellformed(&public_key) {
+                return Err(format!(
+                    "the auth page returned {} bytes that are not a compressed SEC1 P-256 point",
+                    public_key.len()
+                ));
+            }
+            Ok(Outcome::Create {
+                credential_id: binary(&value, "credentialId")?,
+                public_key,
+            })
+        }
         "get" => Ok(Outcome::Get {
             authenticator_data: binary(&value, "authenticatorData")?,
             client_data_json: binary(&value, "clientDataJSON")?,
@@ -653,11 +670,49 @@ pub fn wallet_pubkey(reveal: &[u8], outcome: &Outcome) -> Result<Vec<u8>, String
         .ok_or_else(|| "the wallet signature does not recover to a key".to_string())
 }
 
-/// QR login: the `get` a passkey answers to CONSENT to admitting
-/// `device_key` (ed25519) at its `generation` on `chain_id` — the identity
-/// module's own `AddKey` preimage, hashed into the challenge.
-pub fn login_request(chain_id: &str, device_key: &[u8], generation: u64) -> Request {
-    let preimage = identity::add_key_preimage(chain_id, KeyScheme::Ed25519, device_key, generation);
+/// login, touch 1: a `get` that asks the passkey nothing but WHICH account it
+/// belongs to. Its challenge is random and authorizes nothing — no consent is
+/// minted from this answer; the account it reveals is what touch 2's consent
+/// is bound to.
+pub fn account_request() -> Request {
+    Request::Get {
+        challenge: create_challenge(),
+    }
+}
+
+/// the account a passkey assertion names in its `userHandle`. Unsigned, so it
+/// is a HINT: it picks which account to ask about, and [`login_add_key`] then
+/// accepts only a consent a key OF that account actually signed.
+pub fn assertion_account(outcome: &Outcome) -> Result<u64, String> {
+    let Outcome::Get { user_handle, .. } = outcome else {
+        return Err("expected a passkey assertion (op=get)".into());
+    };
+    user_handle.ok_or_else(|| {
+        "the passkey names no account (no userHandle) — register it with \
+         `ducktape account key add --passkey` from a member device"
+            .to_string()
+    })
+}
+
+/// login, touch 2: the `get` a passkey answers to CONSENT to admitting
+/// `device_key` (ed25519) into `account` at its `generation` on `chain_id`,
+/// until `expires_at` — the identity module's own `AddKey` preimage, hashed
+/// into the challenge.
+pub fn login_request(
+    chain_id: &str,
+    device_key: &[u8],
+    generation: u64,
+    account: u64,
+    expires_at: u64,
+) -> Request {
+    let preimage = identity::add_key_preimage(
+        chain_id,
+        KeyScheme::Ed25519,
+        device_key,
+        generation,
+        account,
+        expires_at,
+    );
     let challenge = keyscheme::webauthn_challenge(identity::IDENTITY_ADD_KEY_NS, &preimage);
     Request::Get { challenge }
 }
@@ -667,24 +722,18 @@ pub fn login_request(chain_id: &str, device_key: &[u8], generation: u64) -> Requ
 /// carries. Which of the account's `Secp256r1` keys signed is the caller's to
 /// find — by verifying the proof against each.
 pub fn login_consent(outcome: &Outcome) -> Result<(u64, Vec<u8>), String> {
+    let number = assertion_account(outcome)?;
     let Outcome::Get {
         authenticator_data,
         client_data_json,
         signature,
-        user_handle,
+        ..
     } = outcome
     else {
         return Err("expected a passkey assertion (op=get)".into());
     };
-    let Some(number) = user_handle else {
-        return Err(
-            "the passkey names no account (no userHandle) — register it with \
-             `ducktape account key add --passkey` from a member device"
-                .into(),
-        );
-    };
     Ok((
-        *number,
+        number,
         keyscheme::webauthn_proof(authenticator_data, client_data_json, signature),
     ))
 }
@@ -700,8 +749,16 @@ pub fn login_add_key(
     account: &identity::AccountView,
     label: Option<String>,
     proof: Vec<u8>,
+    expires_at: u64,
 ) -> Result<identity::IdentityMsg, String> {
-    let preimage = identity::add_key_preimage(chain_id, KeyScheme::Ed25519, device_key, generation);
+    let preimage = identity::add_key_preimage(
+        chain_id,
+        KeyScheme::Ed25519,
+        device_key,
+        generation,
+        account.number,
+        expires_at,
+    );
     let signer = account
         .keys
         .iter()
@@ -725,6 +782,8 @@ pub fn login_add_key(
         label,
         authorizer: identity::Authorizer {
             key: signer.pubkey.clone(),
+            account: account.number,
+            expires_at,
             proof,
         },
     })
@@ -785,16 +844,24 @@ mod tests {
 
     #[test]
     fn results_decode_and_a_failure_names_itself() {
-        let create = parse_result(
-            r#"{"op":"create","credentialId":"AQID","publicKey":"AgME","alg":-7,"attestationObject":"","clientDataJSON":""}"#,
-        )
+        let registered = passkey_pubkey(&passkey(0x51));
+        let create = parse_result(&format!(
+            r#"{{"op":"create","credentialId":"AQID","publicKey":"{}","alg":-7,"attestationObject":"","clientDataJSON":""}}"#,
+            B64.encode(&registered)
+        ))
         .unwrap();
         assert_eq!(
             create,
             Outcome::Create {
                 credential_id: vec![1, 2, 3],
-                public_key: vec![2, 3, 4]
+                public_key: registered
             }
+        );
+        // a key the page did not compress is refused right here, before a
+        // consent or a second touch is spent on it.
+        assert!(
+            parse_result(r#"{"op":"create","credentialId":"AQID","publicKey":"AgME","alg":-7}"#)
+                .is_err()
         );
         let get = parse_result(
             r#"{"op":"get","credentialId":"AQID","authenticatorData":"AQ","clientDataJSON":"Ag","signature":"Aw","userHandle":"KgAAAAAAAAA"}"#,
@@ -974,8 +1041,9 @@ mod tests {
     fn a_login_assertion_is_the_add_key_consent() {
         let sk = passkey(2);
         let device_key = [7u8; 32];
-        let request = login_request("chain-a", &device_key, 0);
-        let preimage = identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 0);
+        let request = login_request("chain-a", &device_key, 0, 11, 900);
+        let preimage =
+            identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 0, 11, 900);
         assert_eq!(
             request,
             Request::Get {
@@ -1035,7 +1103,8 @@ mod tests {
             bio: None,
             updated_at: 0,
         };
-        let preimage = identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 4);
+        let preimage =
+            identity::add_key_preimage("chain-a", KeyScheme::Ed25519, &device_key, 4, 11, 900);
         let (a, c, s) =
             passkey_assertion_parts(&mine, RP, identity::IDENTITY_ADD_KEY_NS, &preimage);
         let proof = keyscheme::webauthn_proof(&a, &c, &s);
@@ -1046,6 +1115,7 @@ mod tests {
             &account,
             Some("laptop".into()),
             proof.clone(),
+            900,
         )
         .unwrap();
         assert_eq!(
@@ -1055,17 +1125,19 @@ mod tests {
                 label: Some("laptop".into()),
                 authorizer: identity::Authorizer {
                     key: passkey_pubkey(&mine),
+                    account: 11,
+                    expires_at: 900,
                     proof: proof.clone(),
                 },
             },
             "the passkey that signed is the authorizer"
         );
         // another generation, or a passkey off the account: no signer.
-        assert!(login_add_key("chain-a", &device_key, 5, &account, None, proof).is_err());
+        assert!(login_add_key("chain-a", &device_key, 5, &account, None, proof, 900).is_err());
         let (a, c, s) =
             passkey_assertion_parts(&passkey(4), RP, identity::IDENTITY_ADD_KEY_NS, &preimage);
         let foreign = keyscheme::webauthn_proof(&a, &c, &s);
-        assert!(login_add_key("chain-a", &device_key, 4, &account, None, foreign).is_err());
+        assert!(login_add_key("chain-a", &device_key, 4, &account, None, foreign, 900).is_err());
     }
 
     /// abandoning delivers the page's error shape to the callback, so the

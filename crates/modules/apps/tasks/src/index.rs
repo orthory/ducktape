@@ -236,7 +236,11 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
 fn fold_task(op: &OpRow, read: &impl StateRead, msg: TaskMsg) -> Result<Writes, Fail> {
     let mut out = Writes::new();
     match msg {
-        TaskMsg::CreateTask { task_id, title } => put_row(
+        TaskMsg::CreateTask {
+            task_id,
+            title,
+            owner: _,
+        } => put_row(
             &mut out,
             &TaskRow {
                 task_id,
@@ -260,6 +264,15 @@ fn fold_task(op: &OpRow, read: &impl StateRead, msg: TaskMsg) -> Result<Writes, 
             row.updated_height = op.height;
             row.updated_at = op.time;
             put_row(&mut out, &row)?;
+        }
+        TaskMsg::DeleteTask { task_id } => {
+            // absent row == the task predates this index; nothing to remove.
+            let Some(bytes) = read.get(task_key(&task_id).as_bytes()) else {
+                return Ok(out);
+            };
+            let row = decode_row(&bytes)?;
+            index_guest::delete(&mut out, by_status_key(&row.status, &task_id));
+            index_guest::delete(&mut out, task_key(&task_id));
         }
     }
     Ok(out)
@@ -522,6 +535,7 @@ mod tests {
             &TaskMsg::CreateTask {
                 task_id: "t1".into(),
                 title: "ship the indexer".into(),
+                owner: None,
             },
         );
         fold(
@@ -530,6 +544,7 @@ mod tests {
             &TaskMsg::CreateTask {
                 task_id: "t2".into(),
                 title: "write the spec".into(),
+                owner: None,
             },
         );
 
@@ -578,6 +593,7 @@ mod tests {
                 &TaskMsg::CreateTask {
                     task_id: format!("t{i}"),
                     title: format!("task {i}"),
+                    owner: None,
                 },
             );
         }

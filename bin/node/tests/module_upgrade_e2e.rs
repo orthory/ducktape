@@ -209,6 +209,12 @@ fn a_registered_module_survives_a_live_swap_a_restart_and_statesync() {
         cluster.marker(2, "genesis root_hash=").is_none(),
         "a restart must not re-run genesis"
     );
+    // `recovered` is printed mid-boot: the engine still has the rest of the
+    // journal to resume, and the rpc listener binds after it. the node's own
+    // bind line is the readiness event — without it the first query races a
+    // node that is still replaying, and the race is won or lost by how many
+    // blocks the chain happened to seal.
+    cluster.wait_marker(2, "rpc listening on", Duration::from_secs(120));
     let seen = cluster.await_committed(2, "hello count == 101 after restart", FINALIZE, || {
         count(&cluster, 2).filter(|c| *c == 101)
     });

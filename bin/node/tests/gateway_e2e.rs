@@ -292,6 +292,11 @@ fn gateway_runs_over_inline_wireguard_and_fails_closed() {
         "api",
         "--port",
         &loopback_port.to_string(),
+        // whose signed route this node agrees to serve under that label —
+        // without a node dial for the active wallet's account, which a test
+        // harness has no business inheriting from the host keystore.
+        "--account",
+        &alice_account.to_string(),
     ]);
     assert!(ok, "local gateway bind failed: {output}");
 

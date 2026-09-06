@@ -81,9 +81,15 @@ pub fn passkey(seed: u8) -> p256::ecdsa::SigningKey {
     p256::ecdsa::SigningKey::from_slice(&[seed; 32]).expect("valid scalar")
 }
 
-/// the 33-byte compressed SEC1 point the transport lifts out of the COSE key.
+/// the 33-byte COMPRESSED SEC1 point the transport lifts out of the COSE key
+/// — what `spkiToSec1` in the auth page returns, and the only spelling a key
+/// is registered or admitted under. (`to_sec1_bytes()` would hand back the
+/// uncompressed 65-byte point: the same key, a different byte string.)
 pub fn passkey_pubkey(sk: &p256::ecdsa::SigningKey) -> Vec<u8> {
-    sk.verifying_key().to_sec1_bytes().to_vec()
+    sk.verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec()
 }
 
 /// a self-consistent `webauthn.get` assertion for `(ns, preimage)` under

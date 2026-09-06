@@ -18,7 +18,7 @@
 //!
 //! - **the host writer** (this crate, [`IndexStore::apply_block`], called by
 //!   the node's block loop): writes one borsh [`OpRow`] per dispatch under
-//!   `op/{height:016x}/{seq:04x}` plus the watermark, one atomic batch per
+//!   `op/{height:016x}/{seq:08x}` plus the watermark, one atomic batch per
 //!   module per block. NO domain logic lives host-side.
 //! - **the fold** (the module's index guest, installed IN the module's
 //!   database as fluentabi module `"index"`): a changes-mode trigger
@@ -132,8 +132,13 @@ const CLEAR_FLUSH_EVERY: usize = 1024;
 const REPLAY_FLUSH_BYTES: usize = 4 * 1024 * 1024;
 /// how long a fold drain may sit at the SAME pending count before it is called
 /// stuck. not a total budget — a long backlog drains as long as it needs, as
-/// long as it keeps shrinking (see [`drain_fold`]).
+/// long as it keeps shrinking (see [`drain_fold`]). shrunk under `cfg(test)`
+/// so a test that drives a genuinely wedged fold to its stall costs
+/// milliseconds, not a minute of every test run.
+#[cfg(not(test))]
 const FOLD_DRAIN_STALL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const FOLD_DRAIN_STALL: Duration = Duration::from_millis(200);
 /// ceiling on [`drain_fold`]'s poll backoff. every poll costs a queue count,
 /// so a long drain must not ask a thousand times a second.
 const FOLD_DRAIN_POLL_MAX: Duration = Duration::from_millis(50);
@@ -820,11 +825,21 @@ impl IndexStore {
             // AND WAIT FOR IT, for `converge_guest`'s reason: returning over a
             // cleared keyspace serves "no such page" for every page, which is
             // indistinguishable from a workspace that lost its documents.
-            refold_feed(&m.db, module)?;
+            //
+            // the marker goes back up EITHER WAY. #1725: a failed refold (the
+            // guest's own fold rejecting a row, surfaced as `FoldStuck`) used
+            // to leave `meta/guest` absent on the error path — so the NEXT
+            // open found no marker, replayed the whole feed from scratch, hit
+            // the identical failure, and refused to open at all. Restoring it
+            // here regardless of outcome leaves the module's own fold trigger
+            // — still registered, still holding its backlog — as the one
+            // place this failure is visible (`fold_status`), exactly like a
+            // guest stuck at converge.
+            let folded = refold_feed(&m.db, module);
             if let Some(marker) = marker {
                 m.db.put(META_GUEST, marker)?;
             }
-            Ok(())
+            folded
         })();
         self.poison_on_err("refold", out)
     }
@@ -1019,11 +1034,33 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         // answer is worse than a slow boot: it is indistinguishable from a
         // workspace that lost its documents.
         //
-        // `Err` here refuses the OPEN, matching what a broken artifact already
-        // does at `wasm_entries` above: a guest that cannot fold its own feed
-        // has no read model to serve, and saying so beats serving nothing
-        // quietly.
-        refold_feed(db, spec.id)?;
+        // a `FoldStuck` here does NOT refuse the open: the derived tier is
+        // node-local and rebuildable (module docs at the top of this file),
+        // so one module's guest rejecting its own feed must not take the
+        // whole node down with it — #1725 was exactly that, a step further
+        // (the marker left absent so the NEXT boot replayed the identical
+        // failure into a boot abort). The module is left exactly as stuck as
+        // `drain_fold` found it: its fold trigger stays registered, still
+        // holding its backlog, and `IndexStore::fold_status` reports the
+        // pending count and the recorded error — the same surface a stuck
+        // live fold already uses. Anything else here IS the engine itself
+        // failing and still refuses the open, exactly as a broken artifact
+        // does at `wasm_entries` above.
+        match refold_feed(db, spec.id) {
+            Ok(()) => {}
+            Err(err @ Error::FoldStuck(_)) => {
+                tracing::warn!(
+                    target: "ducktape::index",
+                    reason = "converge_refold_stuck",
+                    module = spec.id,
+                    error = %err,
+                    "index guest could not fold its own feed at converge; its fold trigger \
+                     stays registered with the backlog as the honest state — see fold_status \
+                     — while the node boots and every other module indexes normally"
+                );
+            }
+            Err(err) => return Err(err),
+        }
     }
     // written LAST, so an interrupted refold re-runs whole at the next open
     // instead of leaving a marker that vouches for a half-derived read model.
@@ -1034,6 +1071,60 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     };
     db.put(META_GUEST, borsh::to_vec(&marker)?)?;
     Ok((has_fold, has_view))
+}
+
+/// one drain poll's verdict against the progress/stall rule, pulled out of
+/// [`drain_fold`]'s loop so it is testable without driving the engine:
+/// pending strictly below every count seen so far is [`DrainVerdict::Progress`]
+/// (resets the stall clock); anything else is [`DrainVerdict::Stuck`] only
+/// once the clock has run past `stall_budget`, and merely
+/// [`DrainVerdict::Waiting`] before that.
+///
+/// #1726: a recorded `last_error` plays NO part in this decision. fluent31
+/// sets it on the FIRST failed attempt and clears it only on the next
+/// SUCCESSFUL drain (100ms→6.4s backoff between attempts), so an error that
+/// is about to be retried into success is not evidence of anything by
+/// itself — only a backlog that has genuinely stopped shrinking is. a guest
+/// `Fail` the engine will retry forever still surfaces as `Stuck`, just not
+/// before the stall budget has had its say.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainVerdict {
+    Progress,
+    Stuck,
+    Waiting,
+}
+
+fn drain_verdict(
+    pending: u64,
+    fewest_pending: u64,
+    since_progress: Duration,
+    stall_budget: Duration,
+) -> DrainVerdict {
+    if pending < fewest_pending {
+        DrainVerdict::Progress
+    } else if since_progress >= stall_budget {
+        DrainVerdict::Stuck
+    } else {
+        DrainVerdict::Waiting
+    }
+}
+
+/// the message a stuck drain gives up with: the module, how much is still
+/// queued, and — when the engine ever recorded one — the last error it saw.
+/// that error need not be WHY the queue stopped shrinking (fluent31 only
+/// clears it on the next successful drain, so a since-resolved transient
+/// error can still be sitting there when a different jam is the real cause),
+/// so it rides along as context, never as the verdict.
+fn fold_stuck_message(module: &str, pending: u64, last_error: Option<&str>) -> String {
+    let stall_secs = FOLD_DRAIN_STALL.as_secs();
+    match last_error {
+        Some(err) => {
+            format!(
+                "{module}: {pending} events pending, no progress for {stall_secs}s (last error: {err})"
+            )
+        }
+        None => format!("{module}: {pending} events pending, no progress for {stall_secs}s"),
+    }
 }
 
 /// block until one module's fold trigger has nothing queued: fluent31 drains
@@ -1070,18 +1161,25 @@ fn drain_fold(db: &Db, module: &str) -> Result<()> {
         if trigger.pending == 0 {
             return Ok(());
         }
-        if let Some(err) = trigger.last_error {
-            return Err(Error::FoldStuck(format!("{module}: {err}")));
-        }
-        if trigger.pending < fewest_pending {
-            fewest_pending = trigger.pending;
-            since_progress = std::time::Instant::now();
-        } else if since_progress.elapsed() >= FOLD_DRAIN_STALL {
-            return Err(Error::FoldStuck(format!(
-                "{module}: {} events pending, no progress for {}s",
-                trigger.pending,
-                FOLD_DRAIN_STALL.as_secs()
-            )));
+        let verdict = drain_verdict(
+            trigger.pending,
+            fewest_pending,
+            since_progress.elapsed(),
+            FOLD_DRAIN_STALL,
+        );
+        match verdict {
+            DrainVerdict::Progress => {
+                fewest_pending = trigger.pending;
+                since_progress = std::time::Instant::now();
+            }
+            DrainVerdict::Stuck => {
+                return Err(Error::FoldStuck(fold_stuck_message(
+                    module,
+                    trigger.pending,
+                    trigger.last_error.as_deref(),
+                )));
+            }
+            DrainVerdict::Waiting => {}
         }
         std::thread::sleep(poll);
         poll = (poll * 2).min(FOLD_DRAIN_POLL_MAX);
@@ -1153,7 +1251,7 @@ fn refold_feed(db: &Db, module: &str) -> Result<()> {
 /// re-registering one over a populated range replays nothing. re-writing each
 /// row does: an identical put is still a committed change, and capture happens
 /// inside the commit critical section, so the guest receives the feed in key
-/// order — which for `op/{height:016x}/{seq:04x}` IS block-and-drain order.
+/// order — which for `op/{height:016x}/{seq:08x}` IS block-and-drain order.
 fn replay_op_feed(db: &Db) -> Result<u64> {
     let lo = OP_PREFIX.as_bytes();
     let hi = prefix_successor(lo);
