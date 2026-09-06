@@ -71,6 +71,8 @@ interface host {
   /// module's root() from it; writes are staged and only published at the
   /// block-commit boundary (discarded on abort).
   state-get: func(key: list<u8>) -> option<list<u8>>;
+  /// Read the preceding block's committed state, bypassing staged writes.
+  state-get-committed: func(key: list<u8>) -> option<list<u8>>;
   state-set: func(key: list<u8>, value: list<u8>);
   state-delete: func(key: list<u8>);
 
@@ -135,6 +137,12 @@ world module {
   /// constant of the code — it touches no import (the host reads it outside
   /// any dispatch, with no env set) and never changes between two calls.
   export shape: func() -> module-shape;
+  /// Initialize fresh state from caller-supplied parameters. State writes are
+  /// staged atomically; initialization cannot emit follow-up operations.
+  export initialize: func(params: list<u8>) -> result<_, error>;
+  /// Complete this block's state changes before the host publishes its store.
+  /// Called once for each dispatched module, never on an aborted block.
+  export finalize-block: func() -> result<_, error>;
   /// dispatch entry: apply an incoming op payload addressed to this module.
   export execute: func(payload: list<u8>) -> result<_, error>;
   /// read-only projection of this module's state.

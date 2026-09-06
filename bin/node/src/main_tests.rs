@@ -816,6 +816,7 @@ fn boot_fold_rebuilds_a_batch_block_ops() {
     let fold_row = sealed_frame_block_row(
         &fold_blobs,
         &recovery::FoldedBlock {
+            host: &host::Host::new(),
             height: 7,
             frame: &batch,
             disposition: node::Disposition::Applied,
@@ -867,6 +868,7 @@ fn boot_fold_skips_nop_and_undecodable_frames() {
             sealed_frame_block_row(
                 &blobs,
                 &recovery::FoldedBlock {
+                    host: &host::Host::new(),
                     height: 3,
                     frame,
                     disposition: node::Disposition::Applied,
@@ -898,6 +900,7 @@ fn boot_fold_rebuilds_rejected_rows_with_empty_trace() {
     let row = sealed_frame_block_row(
         &blobs,
         &recovery::FoldedBlock {
+            host: &host::Host::new(),
             height: 5,
             frame: &batch,
             disposition: node::Disposition::Rejected,

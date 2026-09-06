@@ -101,6 +101,10 @@ pub struct LogFilterArgs {
     /// the user key that signs the request (default: the active wallet)
     #[arg(long, value_name = "PATH")]
     pub key: Option<PathBuf>,
+    /// re-pin this node's identity to whatever it answers with now — the
+    /// only way an already-trusted key changes (see `known_nodes`)
+    #[arg(long)]
+    pub trust_node: bool,
 }
 
 /// `ducktape node sandbox` — reconcile "can this HOST isolate a run" with
@@ -393,6 +397,15 @@ fn source_workspace(source: WorkspaceSource) -> Result<PathBuf, String> {
 /// workspace that answers on it. Kept beside the forward lookup so both spell
 /// the base the same way through [`trim_base`]: a normalization that drifted
 /// apart would silently match nothing.
+/// public door onto [`workspace_serving`] for a caller that already has the
+/// resolved http base in hand (a signing verb pinning the node's identity —
+/// see `bin/node/src/node_http.rs::pinned_node_key`) and needs to ask "is this
+/// address one of MY OWN registered nodes", independent of which rung of the
+/// ladder produced it.
+pub fn workspace_for_base(base: &str) -> Result<PathBuf, String> {
+    workspace_serving(base)
+}
+
 fn workspace_serving(base: &str) -> Result<PathBuf, String> {
     let matches = config::list_workspaces()?
         .into_iter()

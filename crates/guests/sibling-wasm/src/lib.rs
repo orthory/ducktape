@@ -5,7 +5,7 @@
 
 wit_bindgen::generate!({
     world: "module",
-    path: "../../kernel/module-guest/wit",
+    path: "../../module-sdk/wit",
 });
 
 use ducktape::module::host;
@@ -39,6 +39,14 @@ fn split_target(rest: &[u8]) -> Result<(String, &[u8]), host::Error> {
 }
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             backing: host::Backing::Map,

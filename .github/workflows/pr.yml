@@ -36,26 +36,33 @@ jobs:
       # ubuntu-latest ships rustup; the checkout's rust-toolchain.toml pins
       # the exact channel + targets, so this just makes rustup install it.
       - run: rustup show
-      - run: cargo install wasm-tools --locked
+      - run: cargo install wasm-tools --locked --version "$(cat wasm-tools.version)"
       - run: make wasm-modules-check
       - run: make wasm-embed-check
 
-  # `wasm-modules-check` only cmps committed copies against each other, so a
-  # committed index guest can drift from the source beside it and stay green
-  # (it did: a module PR refreshed component.wasm and forgot `--index`). This
-  # rebuilds every index.wasm from source on the pinned toolchain and refuses
-  # a PR whose committed bytes differ. Its own job: the rebuild needs the
-  # wasm32 target and a cargo build, which the cmp-only job above does not.
-  wasm-index-check:
+  # Rebuild every component and index guest from the requested source
+  # revision. Comparing committed copies alone cannot detect stale bytes.
+  #
+  # On the PR's own HEAD, not the merge commit actions/checkout builds by
+  # default: guest-builder compiles the module out of the repository at the
+  # checkout's HEAD, and a merge commit is a revision no committed artifact
+  # was ever built at — every PR whose base moved a compiled line would fail
+  # here on bytes that are correct. `refs/pull/N/head` is on this repository,
+  # a fork PR included, so the fetch resolves either way.
+  wasm-rebuild-check:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       - name: apt deps (bindgen/alsa-sys need libclang + alsa headers)
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libasound2-dev
       - uses: Swatinem/rust-cache@v2
       - run: rustup show
-      - run: make wasm-index-check
+      - run: cargo install wasm-tools --locked --version "$(cat wasm-tools.version)"
+      - run: cargo test --locked -p guest-builder
+      - run: make wasm-rebuild-check
 
   genesis-pin:
     runs-on: ubuntu-latest

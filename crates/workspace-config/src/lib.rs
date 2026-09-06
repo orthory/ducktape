@@ -102,6 +102,16 @@ pub fn modules_dir() -> Result<PathBuf, String> {
     })
 }
 
+/// The simulator's packaged preset also includes its small KV test module.
+/// An explicit modules directory remains the caller's complete artifact set.
+pub fn sim_modules_dir() -> Result<PathBuf, String> {
+    let configured = std::env::var_os("DUCKTAPE_MODULES_DIR");
+    if let Some(dir) = configured {
+        return Ok(PathBuf::from(dir));
+    }
+    Ok(modules_dir()?.with_file_name("sim-modules"))
+}
+
 /// the founding set the build staged beside `exe`: `<exe dir>/modules` (a
 /// `cargo build` binary in `target/<profile>/`, or an installed one), else
 /// `<exe dir>/../modules` (a test executable cargo runs from
@@ -140,20 +150,22 @@ pub use duckfs_core::{to_hex as hex_bytes, unhex};
 pub struct ModuleCode {
     /// the consensus-visible module id, the host registry key.
     pub id: String,
-    /// sha256 of the component bytes, 64 hex chars; IN the genesis fingerprint.
+    /// sha256 of the complete deployment, 64 hex chars; IN the genesis fingerprint.
     pub code_hash: String,
 }
 
-/// a module id is a bare identifier: non-empty, no `=`, no newline — the two
-/// bytes the genesis fingerprint uses as delimiters, so no two module sets can
-/// fold to one namespace. checked at every boundary a descriptor enters
-/// through (`from_toml`, the invite decoder, `module_hashes`).
+/// A module id is one filesystem name and contains none of the genesis
+/// fingerprint's delimiters. The same id addresses a module in consensus
+/// state, a descriptor, and the workspace's artifact directory.
 pub fn validate_module_id(id: &str) -> Result<(), String> {
     let is_empty = id.is_empty();
     let has_delimiter = id.contains('=') || id.contains('\n');
-    if is_empty || has_delimiter {
+    let has_path_separator = id.contains('/') || id.contains('\\') || id.contains('\0');
+    let is_relative_directory = matches!(id, "." | "..");
+    let invalid = is_empty || has_delimiter || has_path_separator || is_relative_directory;
+    if invalid {
         return Err(format!(
-            "module id {id:?} is not a bare identifier (empty, or contains '=' / newline)"
+            "module id {id:?} is not a bare identifier (empty, a path, or contains '=' / newline)"
         ));
     }
     Ok(())

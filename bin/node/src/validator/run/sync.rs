@@ -263,7 +263,7 @@ impl ValidatorRuntime<'_> {
                 // own state — the same read point `read_valset_residents` uses
                 // elsewhere, between drains, no deadlock.
                 let host = node.host();
-                let members = read_valset_members(host).await;
+                let members = read_valset_members(host).await.unwrap_or_default();
                 let residents = read_valset_residents(host).await;
                 let standing = members
                     .iter()

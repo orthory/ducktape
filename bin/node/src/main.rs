@@ -79,6 +79,7 @@ mod host_reads;
 mod host_resources;
 mod host_state;
 mod join_gate;
+mod known_nodes;
 #[cfg(test)]
 mod main_tests;
 mod mcp;

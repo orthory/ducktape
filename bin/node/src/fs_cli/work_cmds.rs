@@ -37,9 +37,14 @@ fn url_for_dir(addr: &NodeAddr, dir: &Path) -> Result<String, CliError> {
 /// re-signs an unframed submit with the NODE's key. Carrying it into consensus
 /// needs the client to sign the FRAME (`/v1/submit/frame`), which is a wire
 /// decision, not this seam's.
-fn signing_node(addr: &NodeAddr, dir: &Path, key: Option<PathBuf>) -> Result<HttpNode, CliError> {
+fn signing_node(
+    addr: &NodeAddr,
+    dir: &Path,
+    key: Option<PathBuf>,
+    trust_node: bool,
+) -> Result<HttpNode, CliError> {
     let url = url_for_dir(addr, dir)?;
-    let node_key = crate::node_http::node_public_key(&url)
+    let node_key = crate::node_http::pinned_node_key(&url, trust_node)
         .map_err(|error| CliError::failed(error.to_string()))?;
     let ctx = crate::cred_cli::VerbCtx {
         addr: addr.clone(),
@@ -124,7 +129,7 @@ pub fn status(args: StatusArgs) -> Result<(), CliError> {
 pub fn commit(args: CommitArgs) -> Result<(), CliError> {
     let dir = args.dir.as_deref().unwrap_or(".");
     let dirp = Path::new(dir);
-    let node = signing_node(&args.addr, dirp, args.key)?;
+    let node = signing_node(&args.addr, dirp, args.key, args.trust_node)?;
     let opts = CommitOptions {
         auto_rebase: !args.no_rebase,
         paths: args.paths,
@@ -163,7 +168,7 @@ pub fn pin(args: PinArgs) -> Result<(), CliError> {
 
     // pin runs against a node directly (default `.` so a checkout's index can
     // supply the node, but `--node`/env win).
-    let node = signing_node(&args.addr, Path::new("."), args.key)?;
+    let node = signing_node(&args.addr, Path::new("."), args.key, args.trust_node)?;
     node.pin(&args.snapshot, &args.name).map_err(|e| match e {
         ApiError::NotFound => CliError::failed("snapshot not found"),
         ApiError::Rejected(m) => CliError::failed(m),
