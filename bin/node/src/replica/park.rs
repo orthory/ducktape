@@ -30,7 +30,7 @@ use crate::relay;
 use crate::relay_runtime;
 use crate::replica;
 use crate::rpc::{JoinStateView, RpcJob, RpcReply, RpcRequest, RpcStatus, spawn_rpc_listener};
-use crate::sync::catchup::{SuffixCatchupError, catch_up_suffix_frames};
+use crate::sync::catchup::{SuffixCatchupError, catch_up_suffix_frames, derive_pending_boot};
 use crate::sync::serve::{
     SealVerdict, ServedSeal, check_served_seal, name_diverged_modules,
     reopen_preflight_synced_host, reopen_recovery, replica_backfill, replica_orchestrator_at,
@@ -757,12 +757,21 @@ pub(super) async fn park(
         // ceiling (and, on promotion, a `view_base`) no validator agrees on.
         node_r.watch_module("valset");
         replica_scheme = Some(replica_verifier(&namespace, &rec.participants));
+        let pending_boot = derive_pending_boot(ckpt, &rec);
         replica_orchestrator = Some(replica_orchestrator_at(
             rec.epoch,
             rec.view_base,
             &rec.participants,
             &rec.residents,
+            pending_boot,
         ));
+        // the orchestrator's own re-armed ceiling (#1821): the node's fold
+        // must stop at the SAME view the orchestrator schedules a cutover
+        // at, or a certificate above it would get admitted before the
+        // cutover the orchestrator is waiting on ever fires.
+        if let Some(ceiling) = pending_boot {
+            node_r.set_view_ceiling(ceiling);
+        }
         replica_prev_ckpt = (ckpt.height, ckpt.oplog_pos);
         replica_epoch = rec.epoch;
         replica_view_base = rec.view_base;
@@ -2006,6 +2015,10 @@ pub(super) async fn park(
                 mesh_window,
                 mesh_book: mesh_book.clone(),
                 replay_window,
+                // the seat boundary IS the fresh epoch's base — the cutover
+                // that seated it just consumed the only cutover this
+                // orchestrator had armed, so the new epoch starts clean.
+                pending_cutover_view: None,
             };
         }
         resident_relay.expire(std::time::Instant::now());
@@ -2385,7 +2398,14 @@ pub(super) async fn park(
                                 m.view_base,
                                 &m.participants,
                                 &m.residents,
+                                m.pending_cutover_view,
                             ));
+                            // the served boundary's own armed cutover
+                            // (#1821): the same ceiling the orchestrator
+                            // above just resumed with.
+                            if let Some(ceiling) = m.pending_cutover_view {
+                                node_r.set_view_ceiling(ceiling);
+                            }
                             replica_epoch = m.epoch;
                             replica_view_base = m.view_base;
                             replica_watermark = Some(tip.saturating_sub(m.view_base));
@@ -2793,6 +2813,10 @@ pub(super) async fn park(
         // off the BOUNDARY it synced — an empty window would have it apply a
         // re-proposed batch its peers refuse, and one such batch is two roots.
         replay_window: boundary.applied_frames.clone(),
+        // the boundary's OWN armed cutover, if any (#1821): a cold seat
+        // must stop at the same ceiling the serving validator did, not
+        // observe the already-changed valset itself and arm a later one.
+        pending_cutover_view: boundary.pending_cutover_view,
     }
 }
 

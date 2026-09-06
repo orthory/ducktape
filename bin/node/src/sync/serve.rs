@@ -6,7 +6,7 @@ use commonware_utils::ordered::Set;
 use host::Host;
 use recovery::{Manifest, Recovery};
 use sdk::StateRoot;
-use statesync::{SyncError, SyncServer, fetch_frames};
+use statesync::{SyncError, SyncServer, fetch_frames_capped};
 
 use crate::constants::{CUTOVER_DELAY, MAX_MESSAGE_SIZE};
 use crate::util::{fatal, hex};
@@ -326,12 +326,17 @@ where
     C: statesync::SyncClient,
 {
     let (after_view, up_to_view) = views;
-    let frames = fetch_frames(client, view_base + after_view, view_base + up_to_view)
-        .await
-        .map_err(|e| BackfillUnavailable {
-            permanent: matches!(e, SyncError::RangePruned { .. }),
-            detail: e.to_string(),
-        })?;
+    let frames = fetch_frames_capped(
+        client,
+        view_base + after_view,
+        view_base + up_to_view,
+        statesync::MAX_CATCHUP_BYTES,
+    )
+    .await
+    .map_err(|e| BackfillUnavailable {
+        permanent: matches!(e, SyncError::RangePruned { .. }),
+        detail: e.to_string(),
+    })?;
     tracing::debug!(
         target: "ducktape::statesync",
         node = %label,
@@ -401,14 +406,16 @@ pub(crate) fn replica_verifier(
 
 /// the replica's valset orchestrator at (epoch, base): the same
 /// deterministic observe → ceiling → cutover state machine the validator
-/// drain runs. the pending-cutover slot resumes empty — the manifest-epoch
-/// descend stays as the safety net for a cutover armed before this handle
-/// existed (a restart into a pending window).
+/// drain runs. `pending_cutover_view` re-arms a cutover the served boundary
+/// (or the local checkpoint's own manifest) already carried — the seat's own
+/// ceiling has to match the network's, not a later one this handle would
+/// arm itself by observing the already-changed valset (#1821).
 pub(crate) fn replica_orchestrator_at(
     epoch: u64,
     view_base: u64,
     participants: &[Vec<u8>],
     residents: &[Vec<u8>],
+    pending_cutover_view: Option<u64>,
 ) -> consensus::ValsetOrchestrator<ed25519::PublicKey> {
     let decode = |keys: &[Vec<u8>]| -> Vec<ed25519::PublicKey> {
         keys.iter()
@@ -421,7 +428,7 @@ pub(crate) fn replica_orchestrator_at(
         decode(residents),
         epoch,
         view_base,
-        None,
+        pending_cutover_view,
     )
 }
 
@@ -1074,6 +1081,7 @@ mod tests {
             floor_cert: Some(vec![7; 8]),
             entries: Vec::new(),
             applied_frames: Vec::new(),
+            pending_cutover_view: None,
         }
     }
 

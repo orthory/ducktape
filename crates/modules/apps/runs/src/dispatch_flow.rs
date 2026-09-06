@@ -380,6 +380,7 @@ impl RunsModule {
                 None => extra.to_string(),
             });
         }
+        let sink = portable.sink.clone();
         let payload =
             envelope::render_payload(&self.id, agent, run_id, &transcript, portable).into_bytes();
         if payload.len() > MAX_PAYLOAD_BYTES {
@@ -391,6 +392,7 @@ impl RunsModule {
         Ok(PreparedDispatch {
             thread_root,
             payload,
+            sink,
         })
     }
 
@@ -459,6 +461,7 @@ impl RunsModule {
             &[(page_id, blocks)],
             &self.net_query(),
         ));
+        let sink = portable.sink.clone();
         let payload = envelope::render_page_comment_payload(
             agent,
             run_id,
@@ -478,6 +481,7 @@ impl RunsModule {
         Ok(PreparedDispatch {
             thread_root: None,
             payload,
+            sink,
         })
     }
 
@@ -554,6 +558,7 @@ impl RunsModule {
                 job_id: None,
                 job_claim_height: 0,
                 requester,
+                sink: prepared.sink,
                 created_at: now,
             }),
         );

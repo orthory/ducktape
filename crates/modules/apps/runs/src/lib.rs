@@ -378,6 +378,7 @@ mod agent_intake;
 mod dispatch_flow;
 mod engagement;
 mod facets;
+use facets::WireSink;
 // the forge compose lane (M1): forge:<repo>:<n> channel detection, committed
 // tracker/refs mirrors, and the item-session workspace/sink composition.
 mod forge_source;
@@ -440,6 +441,10 @@ struct PendingState {
     /// it is both a cancel capability alongside the owner and the chat standing
     /// an agent's own posts are held to (`requester_may_post`).
     requester: SagaOrigin,
+    /// the sink COMMITTED at dispatch — the binding delivery enforces (#1835).
+    /// an executing node's echoed result sink is compared against this, never
+    /// trusted on its own: a mismatch degrades delivery to `Chain`.
+    sink: WireSink,
     created_at: u64,
 }
 
@@ -461,6 +466,9 @@ struct DelegationState {
 struct PreparedDispatch {
     thread_root: Option<u64>,
     payload: Vec<u8>,
+    /// the requested sink composed into `payload`'s `result_contract` —
+    /// captured here so the caller can commit it into `PendingState` (#1835).
+    sink: WireSink,
 }
 
 // ---- the module -----------------------------------------------------------

@@ -25,6 +25,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -100,6 +101,55 @@ fn kind_cap(kind: u8) -> Option<u64> {
     (kind == KIND_MODULE_CODE).then_some(MAX_MODULE_CODE_BYTES)
 }
 
+/// the digests the modules registry currently NAMES: an active `code_hash`
+/// or a pending `ScheduledSwap`'s hash, for any module. `receive_push` admits
+/// a digest only when this set names it — the count of published artifacts
+/// was otherwise unbounded (only their concurrency was bounded), letting any
+/// mesh peer with standing publish distinct 1 GiB blobs forever.
+///
+/// the validator drain refreshes this from the SAME registry read its own
+/// readiness pump already performs each tick (`pump_code_readiness`) — no
+/// second query, and no direct access to the host from this plane's tasks.
+#[derive(Clone, Default)]
+pub(crate) struct CodeRegistry(Arc<RwLock<HashSet<[u8; 32]>>>);
+
+impl CodeRegistry {
+    fn is_referenced(&self, digest: &[u8; 32]) -> bool {
+        self.0.read().expect("code registry lock").contains(digest)
+    }
+
+    /// replace the tracked set with a fresh registry read; returns the
+    /// digests that fell out — a cancelled/replaced swap, or a module's
+    /// `code_hash` that moved on — nothing else names them any more, so the
+    /// caller may `forget` their blobs.
+    pub(crate) fn update(&self, fresh: HashSet<[u8; 32]>) -> Vec<[u8; 32]> {
+        let mut live = self.0.write().expect("code registry lock");
+        let dropped: Vec<[u8; 32]> = live.difference(&fresh).copied().collect();
+        *live = fresh;
+        dropped
+    }
+}
+
+/// the digests a [`modules::ModuleCode`] snapshot NAMES: every module's active
+/// `code_hash` plus any pending `ScheduledSwap`'s hash. the one walk the
+/// drain's readiness pump and [`CodeRegistry::update`] share — a module
+/// registered but never activated contributes nothing (`active_code_hash` is
+/// empty), and a malformed hash (never CODE_HASH_LEN bytes, which the
+/// registry itself enforces on write) is simply not a match for anything.
+pub(crate) fn code_blobs_referenced(modules: &[modules::ModuleCode]) -> HashSet<[u8; 32]> {
+    modules
+        .iter()
+        .flat_map(|m| {
+            let active: Option<[u8; 32]> = m.active_code_hash.as_slice().try_into().ok();
+            let pending: Option<[u8; 32]> = m
+                .pending
+                .as_ref()
+                .and_then(|p| p.code_hash.as_slice().try_into().ok());
+            [active, pending].into_iter().flatten()
+        })
+        .collect()
+}
+
 // ---- ack / result wire frames (BE, fixed width) -------------------------------
 
 const ACK_SEND_FROM: u8 = 0;
@@ -126,6 +176,7 @@ pub(crate) fn spawn(
     planes: data_plane::PlaneMonitor,
     blobs: blobstore::BlobHandle,
     stage_rx: tokio::sync::mpsc::Receiver<noded::CodeStageRequest>,
+    registry: CodeRegistry,
 ) {
     tokio::spawn(async move {
         let own = peers.own_ip(&me);
@@ -158,7 +209,7 @@ pub(crate) fn spawn(
         planes.register("module-code", Service::ModuleCode, plane.watch());
         let _plane = plane;
         tokio::select! {
-            _ = accept_loop(Arc::clone(&service), blobs.clone()) => {}
+            _ = accept_loop(Arc::clone(&service), blobs.clone(), registry) => {}
             _ = sweep_loop(blobs.clone()) => {}
             _ = stage_loop(service, peers, PeerId(me), blobs, stage_rx) => {}
         }
@@ -170,6 +221,7 @@ pub(crate) fn spawn(
 async fn accept_loop<T: DataPlaneTransport>(
     service: Arc<StreamService<T>>,
     blobs: blobstore::BlobHandle,
+    registry: CodeRegistry,
 ) {
     // one live transfer per digest (the staging slot is single-writer), plus
     // the process-wide staging byte budget.
@@ -197,9 +249,12 @@ async fn accept_loop<T: DataPlaneTransport>(
                 let blobs = blobs.clone();
                 let inflight = Arc::clone(&inflight);
                 let budget = Arc::clone(&budget);
+                let registry = registry.clone();
                 tokio::spawn(async move {
                     let _seat = seat;
-                    let _ = receive_push(stream, kind, digest, len, blobs, inflight, budget).await;
+                    let _ =
+                        receive_push(stream, kind, digest, len, blobs, inflight, budget, registry)
+                            .await;
                 });
             }
             INTENT_PULL => {
@@ -263,6 +318,7 @@ impl Drop for PeerPushSeat {
 /// answer one result frame. a transport drop mid-stream KEEPS the staging —
 /// the custodian's retry resumes at the high-water, for as long as
 /// [`blobstore::STAGING_RESUME_WINDOW`]; past that the partial is reclaimed.
+#[allow(clippy::too_many_arguments)]
 async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     kind: u8,
@@ -271,6 +327,7 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     blobs: blobstore::BlobHandle,
     inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>>,
     budget: Arc<AtomicU64>,
+    registry: CodeRegistry,
 ) -> io::Result<()> {
     // every refusal below was a SILENT drop through this one closure. a member
     // that refuses every push never signals code-ready, so the upgrade never arms
@@ -292,6 +349,18 @@ async fn receive_push<S: AsyncRead + AsyncWrite + Unpin>(
     };
     if len > cap {
         return refuse(stream, "over_kind_cap").await;
+    }
+    // the registry is the only thing that gets to name a digest worth
+    // holding: without this, the plane admitted anything a member peer
+    // named, and the count of published artifacts was unbounded — only
+    // their CONCURRENCY was bounded ([`MAX_INBOUND_PUSHES_PER_PEER`],
+    // [`STAGING_BUDGET`]). a peer with mesh standing could stream distinct
+    // artifacts forever and every blob store on the mesh would grow without
+    // bound. checked before any staging: refusing here costs nothing but a
+    // lookup, where admitting first and reclaiming later would have already
+    // paid the disk.
+    if !registry.is_referenced(&digest) {
+        return refuse(stream, "code_push_unreferenced").await;
     }
     // ADMISSION FIRST, and only then the already-have check. the admission is a
     // GUARD, not a closure the exit paths must remember to call: the two ack
@@ -690,8 +759,10 @@ mod tests {
         let src = blobstore::BlobHandle::default();
         let dst = blobstore::BlobHandle::default();
         let digest = src.put_chunk(payload());
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([digest]));
 
-        let _accept = tokio::spawn(accept_loop(sb, dst.clone()));
+        let _accept = tokio::spawn(accept_loop(sb, dst.clone(), registry));
         tokio::task::yield_now().await;
         let status = push_peer(sa, b, KIND_MODULE_CODE, digest, src)
             .await
@@ -708,8 +779,10 @@ mod tests {
         let dst = blobstore::BlobHandle::default();
         let digest = src.put_chunk(b"tiny".to_vec());
         dst.put_chunk(b"tiny".to_vec());
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([digest]));
 
-        let _accept = tokio::spawn(accept_loop(sb.clone(), dst.clone()));
+        let _accept = tokio::spawn(accept_loop(sb.clone(), dst.clone(), registry));
         tokio::task::yield_now().await;
         let status = push_peer(Arc::clone(&sa), b, KIND_MODULE_CODE, digest, src.clone())
             .await
@@ -762,6 +835,8 @@ mod tests {
         let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
         let budget = Arc::new(AtomicU64::new(0));
         let digest = [9u8; 32];
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([digest]));
 
         let outcome = receive_push(
             DeadStream,
@@ -771,6 +846,7 @@ mod tests {
             blobstore::BlobHandle::default(),
             Arc::clone(&inflight),
             Arc::clone(&budget),
+            registry,
         )
         .await;
 
@@ -829,6 +905,8 @@ mod tests {
         let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
         inflight.lock().expect("inflight lock").insert(digest);
 
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([digest]));
         let wire = Recorder::default();
         receive_push(
             wire.clone(),
@@ -838,6 +916,7 @@ mod tests {
             blobs,
             Arc::clone(&inflight),
             Arc::new(AtomicU64::new(0)),
+            registry,
         )
         .await
         .expect("the refusal ack writes");
@@ -846,6 +925,84 @@ mod tests {
             wire.0.lock().expect("recorder")[0],
             ACK_REFUSED,
             "a digest already inflight answered from the already-have path"
+        );
+    }
+
+    /// a digest the modules registry names nothing about is refused before
+    /// any staging happens — no inflight entry, no budget charge, no disk
+    /// write. This is #1833: without it any mesh peer with standing could
+    /// publish unbounded, unreferenced blobs that nothing ever reclaims.
+    #[tokio::test]
+    async fn an_unreferenced_digest_is_refused_before_staging() {
+        let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
+        let budget = Arc::new(AtomicU64::new(0));
+        let blobs = blobstore::BlobHandle::default();
+        let digest = [3u8; 32];
+        // the registry names some OTHER digest — this one is a stranger to it.
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([[9u8; 32]]));
+
+        let wire = Recorder::default();
+        receive_push(
+            wire.clone(),
+            KIND_MODULE_CODE,
+            digest,
+            4096,
+            blobs.clone(),
+            Arc::clone(&inflight),
+            Arc::clone(&budget),
+            registry,
+        )
+        .await
+        .expect("the refusal ack writes");
+
+        assert_eq!(
+            wire.0.lock().expect("recorder")[0],
+            ACK_REFUSED,
+            "an unreferenced digest was admitted"
+        );
+        assert!(
+            inflight.lock().expect("inflight lock").is_empty(),
+            "an unreferenced digest never reaches admission"
+        );
+        assert_eq!(
+            budget.load(Ordering::Relaxed),
+            0,
+            "no staging budget was charged"
+        );
+        assert!(
+            !blobs.has_chunk(&digest),
+            "an unreferenced digest must never be staged, let alone published"
+        );
+    }
+
+    /// a digest the registry drops (a cancelled/replaced swap, or code that
+    /// moved on) is reported by `update` so the caller can `forget` it — and
+    /// once forgotten it is no longer resident, exactly as an unreferenced
+    /// push would find it.
+    #[test]
+    fn updating_the_registry_reports_the_digests_it_drops() {
+        let blobs = blobstore::BlobHandle::default();
+        let cancelled = blobs.put_chunk(b"a cancelled swap's bytes".to_vec());
+        let kept = blobs.put_chunk(b"still active".to_vec());
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([cancelled, kept]));
+
+        // the swap for `cancelled` is cancelled/replaced; `kept` stays active.
+        let dropped = registry.update(HashSet::from([kept]));
+
+        assert_eq!(dropped, vec![cancelled]);
+        assert!(registry.is_referenced(&kept));
+        assert!(!registry.is_referenced(&cancelled));
+
+        blobs.forget(&cancelled);
+        assert!(
+            !blobs.has_chunk(&cancelled),
+            "the reclaim must actually forget the dropped blob"
+        );
+        assert!(
+            blobs.has_chunk(&kept),
+            "a still-referenced blob must survive"
         );
     }
 
@@ -966,15 +1123,19 @@ mod tests {
     async fn a_silent_sender_is_reaped_and_returns_its_admission() {
         let inflight: Arc<std::sync::Mutex<HashSet<[u8; 32]>>> = Default::default();
         let budget = Arc::new(AtomicU64::new(0));
+        let digest = [5u8; 32];
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([digest]));
 
         receive_push(
             SilentStream,
             KIND_MODULE_CODE,
-            [5u8; 32],
+            digest,
             4096,
             blobstore::BlobHandle::default(),
             Arc::clone(&inflight),
             Arc::clone(&budget),
+            registry,
         )
         .await
         .expect("a reaped push is not an error");
@@ -1008,6 +1169,8 @@ mod tests {
             .expect("backdate");
 
         let digest = [7u8; 32];
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([digest]));
         receive_push(
             DropsMidStream {
                 head: b"half of it".to_vec(),
@@ -1018,6 +1181,7 @@ mod tests {
             blobs.clone(),
             Default::default(),
             Arc::new(AtomicU64::new(0)),
+            registry,
         )
         .await
         .expect("a mid-stream drop is not an error");
@@ -1039,7 +1203,7 @@ mod tests {
         let holder = blobstore::BlobHandle::default();
         let digest = holder.put_chunk(payload());
 
-        let _accept = tokio::spawn(accept_loop(sb, holder.clone()));
+        let _accept = tokio::spawn(accept_loop(sb, holder.clone(), CodeRegistry::default()));
         tokio::task::yield_now().await;
 
         // pull the tail from a mid-blob offset.

@@ -7,8 +7,10 @@ use std::time::Duration;
 /// wasm component today, a quack capsule tomorrow) this node will pull over
 /// the ranged blob lane or accept on the code plane. a policy bound, not a
 /// frame size — transfers are ranged/streamed, so no single message ever
-/// approaches it.
-pub(crate) const MAX_MODULE_CODE_BYTES: u64 = 1024 * 1024 * 1024;
+/// approaches it. ONE shared cap with the operator-facing stage route
+/// (`noded::MAX_MODULE_ARTIFACT_BYTES`) — a peer-facing artifact was 64x
+/// larger than what an operator could ever stage locally.
+pub(crate) const MAX_MODULE_CODE_BYTES: u64 = noded::MAX_MODULE_ARTIFACT_BYTES as u64;
 /// one warning when the committed valset read first fails, then one per this
 /// many further drain passes, for a host query that keeps erroring (#1820).
 /// shared by the validator drain and the replica park loop.

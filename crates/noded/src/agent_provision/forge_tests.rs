@@ -336,6 +336,22 @@ fn the_push_base_rewrites_wildcard_binds_to_loopback() {
     assert_eq!(forge_push_base(None), None);
 }
 
+#[test]
+fn validate_coords_refuses_any_push_target_outside_agent_namespace() {
+    // #1836's second wall: even if the composer ever named a branch it does
+    // not own (a bug, or a corrupt envelope), the provisioner refuses it
+    // before a single git command runs.
+    let ok_commit = "a".repeat(40);
+    validate_coords("app", &ok_commit, "agent/item-7").expect("an agent-scoped branch is fine");
+    for outside in ["dev", "main", "feature/x", "agent", "agent-item-7", "/agent/x"] {
+        let err = validate_coords("app", &ok_commit, outside).unwrap_err();
+        assert!(
+            err.contains("agent/") || err.contains("not a safe branch name"),
+            "{outside:?} must be refused: {err}"
+        );
+    }
+}
+
 // ---- provision ------------------------------------------------------------
 
 #[tokio::test]
