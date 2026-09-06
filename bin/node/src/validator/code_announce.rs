@@ -139,6 +139,7 @@ impl CodeReadinessSignaller {
     /// swap's `ready_at` has latched.
     pub(crate) fn decide(
         &mut self,
+        height: u64,
         modules: &[modules::ModuleCode],
         verdict: impl Fn(&str, &[u8; 32]) -> CodeVerdict,
     ) -> CodeActions {
@@ -148,6 +149,13 @@ impl CodeReadinessSignaller {
             // coverage complete: nothing left for anyone to say.
             let coverage_complete = pending.ready_at.is_some();
             if coverage_complete {
+                continue;
+            }
+            // past its activation height with no latch: the module itself
+            // now refuses to arm this pending on a late signal (it is
+            // evictable by governance instead), so fetching or signalling for
+            // it is wasted work that never stops on its own.
+            if pending.stale_at(height) {
                 continue;
             }
             // the module already recorded our (committed) signal.
@@ -307,20 +315,20 @@ mod tests {
             pending("held", "replacement", 1, false, &[]),
             pending("missing", "replacement", 2, false, &[]),
         ];
-        let acts = s.decide(&modules, |_, d| loadable(d, 1));
+        let acts = s.decide(1, &modules, |_, d| loadable(d, 1));
         assert_eq!(acts.signals.len(), 1);
         assert_eq!(acts.signals[0].0, key("held", "replacement", 1));
         assert_eq!(acts.fetches, vec![[2u8; 32]]);
 
         // second tick: the signal is latched, the fetch deduped.
-        let acts = s.decide(&modules, |_, d| loadable(d, 1));
+        let acts = s.decide(1, &modules, |_, d| loadable(d, 1));
         assert!(acts.signals.is_empty());
         assert!(acts.fetches.is_empty());
 
         // the fetch completes (pump clears the latch) and the bytes are now
         // resident: the swap gets its signal on the next tick.
         s.fetching.clear();
-        let acts = s.decide(&modules, |_, _| CodeVerdict::Loadable);
+        let acts = s.decide(1, &modules, |_, _| CodeVerdict::Loadable);
         assert_eq!(acts.signals.len(), 1);
         assert_eq!(acts.signals[0].0, key("missing", "replacement", 2));
     }
@@ -337,7 +345,7 @@ mod tests {
             detail: "unknown import `ducktape:module/host@0.2.0`".into(),
         };
 
-        let acts = s.decide(&modules, refuse);
+        let acts = s.decide(1, &modules, refuse);
         assert!(
             acts.signals.is_empty(),
             "holding bytes this binary cannot run is not readiness"
@@ -351,7 +359,7 @@ mod tests {
 
         // LATCHED: loading compiles the component and the answer cannot change
         // while this process lives, so neither the work nor the log repeats.
-        let acts = s.decide(&modules, |_, _| {
+        let acts = s.decide(1, &modules, |_, _| {
             panic!("a refused digest must not be re-probed")
         });
         assert!(acts.signals.is_empty());
@@ -364,13 +372,13 @@ mod tests {
         // our signal already committed: silent.
         let ours = vec![pending("a", "replacement", 1, false, &[me()])];
         assert!(
-            s.decide(&ours, |_, _| CodeVerdict::Loadable)
+            s.decide(1, &ours, |_, _| CodeVerdict::Loadable)
                 .signals
                 .is_empty()
         );
         // swap already ready: silent, even though we never signed.
         let armed = vec![pending("b", "replacement", 1, true, &[])];
-        let acts = s.decide(&armed, |_, _| CodeVerdict::Loadable);
+        let acts = s.decide(1, &armed, |_, _| CodeVerdict::Loadable);
         assert!(acts.signals.is_empty() && acts.fetches.is_empty());
         // no pending at all: silent.
         let idle = vec![modules::ModuleCode {
@@ -379,7 +387,7 @@ mod tests {
             pending: None,
             history: Vec::new(),
         }];
-        let acts = s.decide(&idle, |_, _| CodeVerdict::Loadable);
+        let acts = s.decide(1, &idle, |_, _| CodeVerdict::Loadable);
         assert!(acts.signals.is_empty() && acts.fetches.is_empty());
     }
 
@@ -393,19 +401,21 @@ mod tests {
         let mut s = CodeReadinessSignaller::new(me());
         let first = vec![pending("chat", "chat@ab12", 1, false, &[])];
         assert_eq!(
-            s.decide(&first, |_, _| CodeVerdict::Loadable).signals.len(),
+            s.decide(1, &first, |_, _| CodeVerdict::Loadable)
+                .signals
+                .len(),
             1
         );
 
         // the pending goes stale and the SAME bytes are re-scheduled later.
         let mut replaced = first.clone();
         replaced[0].pending.as_mut().unwrap().activation_height = 200;
-        let acts = s.decide(&replaced, |_, _| CodeVerdict::Loadable);
+        let acts = s.decide(1, &replaced, |_, _| CodeVerdict::Loadable);
         assert_eq!(acts.signals.len(), 1, "the replacement is a new swap");
         assert_eq!(acts.signals[0].0.activation_height, 200);
         // ...and that one is latched in its own right.
         assert!(
-            s.decide(&replaced, |_, _| CodeVerdict::Loadable)
+            s.decide(1, &replaced, |_, _| CodeVerdict::Loadable)
                 .signals
                 .is_empty()
         );
@@ -436,7 +446,10 @@ mod tests {
                 warns += u32::from(failure.speak);
             }
             s.tick_fetch_backoff();
-            fetches += s.decide(&modules, |_, _| CodeVerdict::Absent).fetches.len();
+            fetches += s
+                .decide(1, &modules, |_, _| CodeVerdict::Absent)
+                .fetches
+                .len();
         }
 
         assert!(
@@ -456,13 +469,13 @@ mod tests {
             s.tick_fetch_backoff();
         }
         assert_eq!(
-            s.decide(&modules, |_, _| CodeVerdict::Absent).fetches,
+            s.decide(1, &modules, |_, _| CodeVerdict::Absent).fetches,
             vec![digest],
             "a cooled-off digest is fetched again"
         );
         s.fetch_succeeded(&digest);
         assert_eq!(
-            s.decide(&modules, |_, _| CodeVerdict::Loadable)
+            s.decide(1, &modules, |_, _| CodeVerdict::Loadable)
                 .signals
                 .len(),
             1
@@ -474,13 +487,13 @@ mod tests {
         let mut s = CodeReadinessSignaller::new(me());
         let modules = vec![pending("a", "replacement", 1, false, &[])];
         assert_eq!(
-            s.decide(&modules, |_, _| CodeVerdict::Loadable)
+            s.decide(1, &modules, |_, _| CodeVerdict::Loadable)
                 .signals
                 .len(),
             1
         );
         assert!(
-            s.decide(&modules, |_, _| CodeVerdict::Loadable)
+            s.decide(1, &modules, |_, _| CodeVerdict::Loadable)
                 .signals
                 .is_empty(),
             "latched"
@@ -490,7 +503,7 @@ mod tests {
         // once, so the probe is paid once per pending swap however many
         // submits fail.
         assert_eq!(
-            s.decide(&modules, |_, _| panic!(
+            s.decide(1, &modules, |_, _| panic!(
                 "a digest that already loaded must not be re-probed"
             ))
             .signals
@@ -498,5 +511,21 @@ mod tests {
             1,
             "retries"
         );
+    }
+
+    /// a pending past its activation_height with no latch is DEAD (#1676): a
+    /// signaller given that height must neither keep fetching nor keep
+    /// signalling for it — the forever-loop `decide` was stuck in when it had
+    /// no height to judge staleness against.
+    #[test]
+    fn a_stale_pending_is_never_fetched_or_signalled() {
+        let mut s = CodeReadinessSignaller::new(me());
+        let modules = vec![pending("missing", "replacement", 2, false, &[])];
+        // height 11 > activation_height 10, never latched: stale.
+        let acts = s.decide(11, &modules, |_, _| {
+            panic!("a stale pending must not be probed at all")
+        });
+        assert!(acts.signals.is_empty());
+        assert!(acts.fetches.is_empty());
     }
 }

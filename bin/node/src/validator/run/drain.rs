@@ -1343,7 +1343,8 @@ impl ValidatorRuntime<'_> {
         // per pending swap per boot — `decide` latches the verdict, loadable
         // and unloadable alike — and every validator pays it at the same
         // moment, right after the swap commits.
-        let actions = code_signaller.decide(&modules, |module_id, digest| {
+        let height = node.finalized().map_or(0, |f| f.height);
+        let actions = code_signaller.decide(height, &modules, |module_id, digest| {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
