@@ -66,6 +66,17 @@ impl StagedStore {
         self.store.get(&store_key(key)).await
     }
 
+    /// Warm a known frontier before reading its records. Overlay entries already
+    /// have their answers; the backing may fetch the remaining keys together.
+    pub async fn prefetch(&self, keys: &[Vec<u8>]) -> Result<(), Error> {
+        let digests: Vec<_> = keys
+            .iter()
+            .filter(|key| !self.pending.contains_key(key.as_slice()))
+            .map(|key| store_key(key))
+            .collect();
+        self.store.prefetch(&digests).await
+    }
+
     /// read `key` from COMMITTED state only, bypassing the overlay — the
     /// boundary-decider read: a kernel coordinator whose activation decides
     /// over the frozen end-of-(H-1) state (the modules registry's `Advance`, dispatch's

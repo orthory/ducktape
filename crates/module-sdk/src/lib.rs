@@ -362,6 +362,12 @@ pub struct WitStore;
 
 #[async_trait::async_trait(?Send)]
 impl MerkleStore for WitStore {
+    async fn prefetch(&self, keys: &[[u8; ROOT_LEN]]) -> Result<(), Error> {
+        let keys: Vec<_> = keys.iter().map(|key| key.to_vec()).collect();
+        host::state_prefetch(&keys);
+        Ok(())
+    }
+
     async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
         Ok(host::state_get(key))
     }

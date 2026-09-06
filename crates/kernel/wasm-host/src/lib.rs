@@ -40,7 +40,7 @@
 //!     machinery as sibling reads (bounded by [`MAX_STORE_READS`]); the staged
 //!     overlay and the commit/abort boundary are identical in both backings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -69,6 +69,7 @@ mod bindings {
         imports: {
             "ducktape:module/host.state-get": trappable,
             "ducktape:module/host.state-get-committed": trappable,
+            "ducktape:module/host.state-prefetch": trappable,
             "ducktape:module/host.module-root": trappable,
             "ducktape:module/host.query-module": trappable,
             // object reads pause on a memo miss exactly like the sibling reads:
@@ -417,7 +418,7 @@ enum PendingRead {
     /// a committed-store `state-get` miss ([`StateBacking::Store`] mode only):
     /// the driver resolves it against the injected [`MerkleStore`] — no ctx
     /// needed, so even the ctx-less [`Module::query`] path replays these.
-    State(Vec<u8>),
+    States(Vec<Vec<u8>>),
     /// an `object-stat` miss of the same-dispatch put overlay: the driver
     /// resolves it against the odb backing (`None` until Task 2 wires one) and
     /// replays. own-state-shaped, so it resolves without a ctx like `State`.
@@ -430,8 +431,7 @@ enum PendingRead {
 /// resolved read answers, accumulated across the replay rounds of ONE
 /// dispatch/query. the guest is pure and its inputs are fixed for the whole
 /// dispatch, so each round re-treads the identical prefix; a memo hit returns
-/// exactly what the earlier round saw, and each round discovers at most one new
-/// read. answers are stable within a dispatch (nothing else runs in between —
+/// exactly what the earlier round saw, and a prefetch discovers a frontier in one round. answers are stable within a dispatch (nothing else runs in between —
 /// the injected store only ever moves at `commit_block`, never mid-dispatch).
 #[derive(Default)]
 struct SiblingMemo {
@@ -496,7 +496,7 @@ impl SiblingMemo {
                 let answer = ctx.query(&target, &req).await.map_err(to_wit_error);
                 self.queries.insert((target, req), answer);
             }
-            PendingRead::State(_) => {
+            PendingRead::States(_) => {
                 unreachable!("state reads resolve against the injected store, never the ctx")
             }
             PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_) => {
@@ -603,7 +603,34 @@ impl host::Host for HostData {
         if let Some(answer) = self.memo.states.get(&key) {
             return Ok(answer.clone());
         }
-        self.pending = Some(PendingRead::State(key));
+        self.pending = Some(PendingRead::States(vec![key]));
+        Err(wasmtime::Error::msg(PENDING_READ_TRAP))
+    }
+    fn state_prefetch(&mut self, keys: Vec<Vec<u8>>) -> wasmtime::Result<()> {
+        self.charge(keys.iter().map(|key| HOST_ENTRY_BYTES + key.len()).sum())?;
+        if !self.store_backed {
+            return Ok(());
+        }
+        let malformed = keys.iter().any(|key| key.len() != ROOT_LEN);
+        if malformed {
+            return Err(wasmtime::Error::msg(format!(
+                "store-backed state keys must be {ROOT_LEN}-byte digests"
+            )));
+        }
+        let missing: BTreeSet<_> = keys
+            .into_iter()
+            .filter(|key| !self.memo.states.contains_key(key))
+            .collect();
+        let over_budget = self.memo.states.len() + missing.len() > MAX_STORE_READS;
+        if over_budget {
+            return Err(wasmtime::Error::msg(format!(
+                "store-read budget exceeded ({MAX_STORE_READS})"
+            )));
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.pending = Some(PendingRead::States(missing.into_iter().collect()));
         Err(wasmtime::Error::msg(PENDING_READ_TRAP))
     }
     /// the meter charges every call, not the map's net growth: re-setting one
@@ -1071,6 +1098,18 @@ impl WasmModule {
         store.get(digest).await
     }
 
+    async fn resolve_state_reads(
+        &self,
+        keys: Vec<Vec<u8>>,
+        memo: &mut SiblingMemo,
+    ) -> Result<(), SdkError> {
+        for key in keys {
+            let answer = self.resolve_state_read(&key).await?;
+            memo.states.insert(key, answer);
+        }
+        Ok(())
+    }
+
     /// resolve one paused object-plane read against the odb backing and memoize
     /// the answer. only an [`StateBacking::Odb`] tenant has a backing; Map/Store
     /// tenants never call the object imports, so they never pause here and their
@@ -1092,7 +1131,7 @@ impl WasmModule {
                 let answer = backing.and_then(|b| b.get(&id));
                 memo.object_gets.insert(id, answer);
             }
-            PendingRead::Root(_) | PendingRead::Query(_, _) | PendingRead::State(_) => {
+            PendingRead::Root(_) | PendingRead::Query(_, _) | PendingRead::States(_) => {
                 unreachable!("resolve_object_read only handles object-plane reads")
             }
         }
@@ -1278,18 +1317,18 @@ impl WasmModule {
             // ctx) and replay.
             if let Some(read) = data.pending {
                 match read {
-                    PendingRead::State(key) => match self.resolve_state_read(&key).await {
-                        Ok(answer) => {
-                            memo.states.insert(key, answer);
+                    PendingRead::States(keys) => {
+                        match self.resolve_state_reads(keys, &mut memo).await {
+                            Ok(()) => {}
+                            // a refused store read (bad key shape, store error) is
+                            // a deterministic rejection of the whole op.
+                            Err(e) => {
+                                self.staged = staged0;
+                                self.staged_objects = staged_objects0;
+                                return Err(e);
+                            }
                         }
-                        // a refused store read (bad key shape, store error) is
-                        // a deterministic rejection of the whole op.
-                        Err(e) => {
-                            self.staged = staged0;
-                            self.staged_objects = staged_objects0;
-                            return Err(e);
-                        }
-                    },
+                    }
                     read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_)) => {
                         self.resolve_object_read(read, &mut memo);
                     }
@@ -2084,9 +2123,8 @@ impl Module for WasmModule {
                         .outcome
                         .map(|items| items.into_iter().map(pending_item_from_wit).collect());
                 }
-                Some(PendingRead::State(key)) => {
-                    let answer = self.resolve_state_read(&key).await?;
-                    memo.states.insert(key, answer);
+                Some(PendingRead::States(keys)) => {
+                    self.resolve_state_reads(keys, &mut memo).await?;
                 }
                 Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
                     self.resolve_object_read(read, &mut memo);
@@ -2129,9 +2167,8 @@ impl Module for WasmModule {
             fuel_left = round.fuel_left;
             match round.pending {
                 None => return round.outcome,
-                Some(PendingRead::State(key)) => {
-                    let answer = self.resolve_state_read(&key).await?;
-                    memo.states.insert(key, answer);
+                Some(PendingRead::States(keys)) => {
+                    self.resolve_state_reads(keys, &mut memo).await?;
                 }
                 // object reads are the module's own state (not sibling reads),
                 // so they resolve against the backing even ctx-less, like State.
@@ -2161,9 +2198,8 @@ impl Module for WasmModule {
             fuel_left = round.fuel_left;
             match round.pending {
                 None => return round.outcome,
-                Some(PendingRead::State(key)) => {
-                    let answer = self.resolve_state_read(&key).await?;
-                    memo.states.insert(key, answer);
+                Some(PendingRead::States(keys)) => {
+                    self.resolve_state_reads(keys, &mut memo).await?;
                 }
                 Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
                     self.resolve_object_read(read, &mut memo);
@@ -2211,6 +2247,61 @@ impl Module for WasmModule {
 mod bounds {
     use super::*;
     use sdk_testkit::TestCtx;
+
+    #[test]
+    fn prefetch_collects_one_frontier_and_keeps_overlay_reads_distinct() {
+        let mut data = HostData {
+            store_backed: true,
+            ..HostData::default()
+        };
+        let a = vec![1; ROOT_LEN];
+        let b = vec![2; ROOT_LEN];
+        let c = vec![3; ROOT_LEN];
+        data.memo.states.insert(a.clone(), Some(vec![7]));
+        data.staged.insert(b.clone(), Some(vec![9]));
+        assert!(
+            host::Host::state_prefetch(&mut data, vec![a.clone(), b.clone(), c.clone(), b.clone()])
+                .is_err()
+        );
+        let Some(PendingRead::States(keys)) = data.pending.take() else {
+            panic!("one frontier");
+        };
+        assert_eq!(keys, vec![b.clone(), c.clone()]);
+        data.memo.states.insert(b.clone(), Some(vec![8]));
+        data.memo.states.insert(c.clone(), None);
+        host::Host::state_prefetch(&mut data, vec![a, b.clone(), c.clone()]).unwrap();
+        assert!(data.pending.is_none());
+        assert_eq!(
+            host::Host::state_get(&mut data, b.clone()).unwrap(),
+            Some(vec![9])
+        );
+        assert_eq!(
+            host::Host::state_get_committed(&mut data, b).unwrap(),
+            Some(vec![8])
+        );
+        assert_eq!(host::Host::state_get(&mut data, c).unwrap(), None);
+    }
+
+    #[test]
+    fn prefetch_refuses_invalid_or_excess_keys_before_loading_any() {
+        let mut data = HostData {
+            store_backed: true,
+            ..HostData::default()
+        };
+        assert!(host::Host::state_prefetch(&mut data, vec![vec![1; ROOT_LEN], vec![2]]).is_err());
+        assert!(data.pending.is_none());
+        let keys = (0..=MAX_STORE_READS)
+            .map(|i| {
+                let mut key = vec![0; ROOT_LEN];
+                key[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                key
+            })
+            .collect();
+        let error = host::Host::state_prefetch(&mut data, keys).unwrap_err();
+        assert!(error.to_string().contains("store-read budget exceeded"));
+        assert!(data.pending.is_none());
+        assert!(data.memo.states.is_empty());
+    }
 
     const SIBLING: &[u8] = include_bytes!("../tests/fixtures/sibling.component.wasm");
 

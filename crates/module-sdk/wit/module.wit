@@ -152,6 +152,9 @@ interface host {
   state-get: func(key: list<u8>) -> option<list<u8>>;
   /// Read the preceding block's committed state, bypassing staged writes.
   state-get-committed: func(key: list<u8>) -> option<list<u8>>;
+  /// Warm committed reads together; ordinary reads still honor their overlay.
+  /// Missing records remain absent, and distinct keys share the read budget.
+  state-prefetch: func(keys: list<list<u8>>);
   state-set: func(key: list<u8>, value: list<u8>);
   state-delete: func(key: list<u8>);
 

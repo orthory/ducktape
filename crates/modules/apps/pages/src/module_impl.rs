@@ -203,11 +203,14 @@ impl Pages {
         if changed.is_empty() {
             return Ok(Vec::new());
         }
-        // Reading the pre-op view reuses the canonical keys already read by
-        // the mutation/purge. Restore the successful view even on read failure.
+        // Prefetch canonical pre-op records before replacing their relation
+        // sets. Restore the successful view even on a prefetch/read failure.
         let after = self.staged.checkpoint();
         self.staged.restore(before.clone());
         let prior = async {
+            let mut keys: Vec<_> = changed.iter().map(|(key, _)| key.clone()).collect();
+            keys.push(SOURCE_REVISION_KEY.to_vec());
+            self.staged.prefetch(&keys).await?;
             let mut prior = Vec::with_capacity(changed.len());
             for (key, value) in changed {
                 let previous = self.staged.get(&key).await?;

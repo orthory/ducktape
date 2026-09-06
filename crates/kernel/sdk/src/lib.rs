@@ -620,6 +620,13 @@ pub trait MerkleStore {
     /// includes the host's block overlay; a durable store exposes committed state.
     async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error>;
 
+    /// Warm reads of these keys without changing the view or returning values.
+    /// Native stores may ignore this hint. Guest stores resolve the keys together
+    /// so traversing a known frontier does not replay the guest once per record.
+    async fn prefetch(&self, _keys: &[[u8; ROOT_LEN]]) -> Result<(), Error> {
+        Ok(())
+    }
+
     /// Read the state frozen at the preceding block boundary, bypassing any
     /// host overlay. Durable stores already expose this view through `get`.
     async fn get_committed(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {

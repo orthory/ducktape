@@ -12,13 +12,13 @@ const THREAD_PREFIX: &str = "\u{0}ct:";
 const COMMENT_PREFIX: &str = "\u{0}cc:";
 const TARGET_INDEX_PREFIX: &str = "\u{0}ci:";
 
-fn thread_key(id: &str) -> String {
+pub(super) fn thread_key(id: &str) -> String {
     format!("{THREAD_PREFIX}{id}")
 }
-fn comment_key(id: &str) -> String {
+pub(super) fn comment_key(id: &str) -> String {
     format!("{COMMENT_PREFIX}{id}")
 }
-fn target_index_key(target: &str) -> String {
+pub(super) fn target_index_key(target: &str) -> String {
     format!("{TARGET_INDEX_PREFIX}{target}")
 }
 
