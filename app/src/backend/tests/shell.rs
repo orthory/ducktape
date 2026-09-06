@@ -330,6 +330,7 @@ fn huddle_recipient_nodes_drops_any_row_naming_this_devices_own_node() {
     // not "mine"), and fanning media to your own node is a loopback echo.
     let me = [0xaau8; 32];
     let peer = [0xbbu8; 32];
+    let names = NameDirectory::new(BTreeMap::new());
     let roster = huddle_roster(
         &[
             chat::index::HuddleEntry {
@@ -343,8 +344,7 @@ fn huddle_recipient_nodes_drops_any_row_naming_this_devices_own_node() {
                 joined_at: 20,
             },
         ],
-        Some(&me),
-        &AuthorNames::default(),
+        ChatReader::new(Some(&me), &names),
     );
     assert_eq!(
         huddle_recipient_nodes(roster, Some("0a0a")),
