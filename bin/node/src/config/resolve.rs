@@ -876,8 +876,13 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // LAST, because it is the only check that touches the disk — a config with
     // a typo'd `listen` must be told about the typo, not about the bundle.
     let founding_set = PathBuf::from(&raw.modules);
+    let composed = workspace_config::Genesis::compose(&founding_set)?;
+    // same compile-level check `node init` runs before founding (#1840): a
+    // zero-byte or truncated artifact must refuse the dev shape, not boot a
+    // node that can never run a block.
+    super::validate_founding_set(&founding_set, &composed)?;
     let genesis = GenesisModules {
-        hashes: workspace_config::Genesis::compose(&founding_set)?.module_hashes(),
+        hashes: composed.module_hashes(),
         source: GenesisSource::FoundingSet(founding_set),
     };
     Ok(Resolved {
@@ -943,16 +948,29 @@ mod tests {
         }]
     }
 
-    /// a dev-shape genesis bundle under `dir`: one stub `<id>.component.wasm`
-    /// per production wasm tenant, returned as the `modules = ...` line a
-    /// dev-seed config must carry (its code set is derived from these files).
-    /// Append it BEFORE any `[sandbox]` table — a scalar after a table header
-    /// belongs to the table.
+    /// a real, generic component `resolve_dev_shape` can actually compile
+    /// (#1840: resolve now runs the same `validate_deployment` a founder
+    /// does, so a stub's bare id bytes no longer pass).
+    fn real_component_bytes() -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../crates/examples/directory/component.wasm"),
+        )
+        .expect("read the directory example component")
+    }
+
+    /// a dev-shape genesis bundle under `dir`: one `<id>.component.wasm` per
+    /// production wasm tenant (the same real component, reused under every
+    /// id — resolve only compiles it, it never runs), returned as the
+    /// `modules = ...` line a dev-seed config must carry (its code set is
+    /// derived from these files). Append it BEFORE any `[sandbox]` table — a
+    /// scalar after a table header belongs to the table.
     fn fake_bundle(dir: &Path) -> String {
         let modules = dir.join("modules");
         std::fs::create_dir_all(&modules).expect("modules dir");
+        let component = real_component_bytes();
         for id in topology::TOPOLOGY.wasm_ids(topology::PRODUCTION) {
-            std::fs::write(component_path(&modules, id), id.as_bytes()).expect("write component");
+            std::fs::write(component_path(&modules, id), &component).expect("write component");
         }
         format!("modules = {:?}\n", modules.to_str().expect("utf8 path"))
     }
@@ -1373,8 +1391,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let modules = dir.path().join("modules");
         std::fs::create_dir_all(&modules).expect("modules dir");
+        let component = real_component_bytes();
         for id in topology::TOPOLOGY.wasm_ids(topology::PRODUCTION) {
-            std::fs::write(component_path(&modules, id), id.as_bytes()).expect("write component");
+            std::fs::write(component_path(&modules, id), &component).expect("write component");
         }
         let cfg = dir.path().join("node.toml");
         std::fs::write(
@@ -1395,7 +1414,7 @@ mod tests {
         );
         assert_eq!(
             r.genesis.hashes["pages"],
-            module_artifact::ModuleArtifact::component(b"pages".to_vec()).hash(),
+            module_artifact::ModuleArtifact::component(component).hash(),
             "each hash commits the whole deployment from disk"
         );
     }

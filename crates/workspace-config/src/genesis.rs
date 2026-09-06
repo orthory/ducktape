@@ -331,6 +331,9 @@ fn discover_artifacts(source: &Path, suffix: &str) -> Result<Vec<Artifact>, Stri
         .map(|(id, path)| {
             let bytes =
                 std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+            if bytes.is_empty() {
+                return Err(format!("{} is empty", path.display()));
+            }
             Ok(Artifact { id, bytes })
         })
         .collect()
@@ -475,6 +478,26 @@ mod tests {
             }],
         };
         assert!(Genesis::decode(&invalid.encode()).is_err());
+    }
+
+    #[test]
+    fn compose_refuses_a_zero_byte_artifact_at_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        founding_set(dir.path(), &[("pages", b""), ("chat", b"C")], &[]);
+        let err = Genesis::compose(dir.path()).unwrap_err();
+        assert!(
+            err.contains("pages.component.wasm") && err.contains("empty"),
+            "{err}"
+        );
+
+        // the same check for a zero-byte mapper.
+        let dir = tempfile::tempdir().unwrap();
+        founding_set(dir.path(), &[("pages", b"P")], &[("pages", b"")]);
+        let err = Genesis::compose(dir.path()).unwrap_err();
+        assert!(
+            err.contains("pages.index.wasm") && err.contains("empty"),
+            "{err}"
+        );
     }
 
     #[test]

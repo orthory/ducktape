@@ -544,6 +544,41 @@ fn a_member_join_refuses_a_genesis_that_is_not_the_networks() {
     );
 }
 
+/// #1840: discovery alone (filenames, ids, Borsh/mapper framing) never loads
+/// the bytes as wasm, so a zero-byte or truncated component used to compose
+/// and hash fine and mint a network that could never run a block. `init` must
+/// compile every artifact before writing anything.
+#[test]
+fn init_refuses_a_zero_byte_component_and_writes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("supplied");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/examples/directory/component.wasm"),
+        workspace_config::component_path(&source, "directory"),
+    )
+    .unwrap();
+    // a stray, truncated, or aborted-build artifact: decodes fine, compiles
+    // to nothing.
+    std::fs::write(workspace_config::component_path(&source, "oops"), b"").unwrap();
+    let workspace = tmp.path().join("network");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ducktape"))
+        .args(["node", "init", "--name", "zero-byte", "--primary-coordinator", "none", "--dir"])
+        .arg(&workspace)
+        .args(["--listen", "127.0.0.1:0", "--advertised", "127.0.0.1:1", "--modules"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "a zero-byte artifact must refuse init");
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains(workspace_config::component_path(&source, "oops").to_str().unwrap()),
+        "names the artifact path: {error}"
+    );
+    assert!(!workspace.exists(), "nothing is written on refusal: {}", workspace.display());
+}
+
 /// An empty founding directory cannot define a module set. The diagnostic
 /// names the supplied directory without inventing a required catalog entry.
 #[test]
