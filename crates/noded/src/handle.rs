@@ -349,11 +349,15 @@ pub struct NodeHandle {
     /// routes to 503. An entry confers no standing: `ducktape service enable`
     /// is the consent boundary.
     pub(crate) services: crate::services::ServiceCatalog,
-    /// how many `POST /v1/index/{module}/view` calls may run their wasm query
-    /// concurrently — see [`crate::index::MAX_CONCURRENT_INDEX_VIEWS`]. `Arc`
-    /// so every clone of this handle (one per accepted connection) shares the
-    /// same gate; always present, since the route itself already 503s a
-    /// handle with no index store wired.
+    /// how many `POST /v1/index/{module}/view` calls (each a wasm query) or
+    /// `GET /v1/index/status` calls (each a fold-trigger queue scan) may run
+    /// concurrently off an axum worker — see
+    /// [`crate::index::MAX_CONCURRENT_INDEX_VIEWS`]. one shared pool, not one
+    /// per route: both are unauthenticated reads that can burn a worker
+    /// thread's worth of CPU, so they compete for the same budget. `Arc` so
+    /// every clone of this handle (one per accepted connection) shares the
+    /// same gate; always present, since each route already 503s a handle
+    /// with no index store wired.
     pub(crate) index_view_gate: Arc<tokio::sync::Semaphore>,
 }
 
