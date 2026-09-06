@@ -44,6 +44,14 @@ pub const MAX_OPEN_ITEMS_PER_REPO: usize = 4096;
 /// hold more than this many OPEN items in one repo, so the repo cap cannot be
 /// filled by one account crowding out everyone else.
 pub const MAX_OPEN_ITEMS_PER_ACTOR: usize = 256;
+/// repos ONE principal may own. a push to an unknown slug births a repo and
+/// pins its owner, and nothing releases an owner — so without this ceiling one
+/// account grows every validator's tracker, root preimage and on-disk repo
+/// count without bound.
+pub const MAX_REPOS_PER_OWNER: usize = 64;
+/// branches one repo may hold at once. deletes are always allowed, so this is
+/// a ceiling on live branches, not on a repo's history.
+pub const MAX_BRANCHES_PER_REPO: usize = 1024;
 
 /// an item's lifecycle state. `Merged` is PR-only and terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

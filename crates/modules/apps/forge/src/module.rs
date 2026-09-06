@@ -48,6 +48,17 @@ const TRACKER_FILE: &str = ".tracker.bin";
 /// rewritten atomically at every commit, removed once nothing is outstanding.
 const PENDING_FILE: &str = ".pending.bin";
 
+/// the node-local, ADVISORY list of pending branches this node is stuck on
+/// (see [`refs::RepoState::stuck_branches`]) — one `<repo>\t<branch>` line
+/// each, rewritten with [`PENDING_FILE`].
+///
+/// it carries no consensus state, so unlike the pending map a missing or
+/// unreadable file is not fail-stop: it only leaves [`compact_repos`] as
+/// conservative as it was before. ponytail: a plain line list, because that
+/// is all a hint needs; give it a section in `.pending.bin` if it ever has to
+/// carry more than two names.
+const STUCK_FILE: &str = ".stuck.txt";
+
 /// the node-local snapshot memo. recovery checkpoints already persist the
 /// same bytes elsewhere; this copy exists only so reopening the git substrate
 /// does not re-pack an unchanged object closure on the validator's command
@@ -106,6 +117,24 @@ fn read_pending(base: &std::path::Path) -> Result<BTreeMap<String, refs::Pending
 /// [`git::compact`] for the measured cost of letting them pile up).
 pub const COMPACT_PACK_LIMIT: usize = 50;
 
+/// the advisory stuck list as `repo -> branches`. an absent or unreadable file
+/// is an empty map — the hint is never authority.
+fn read_stuck(base: &std::path::Path) -> BTreeMap<String, BTreeSet<String>> {
+    let Ok(text) = std::fs::read_to_string(base.join(STUCK_FILE)) else {
+        return BTreeMap::new();
+    };
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((repo, branch)) = line.split_once('\t') else {
+            continue;
+        };
+        out.entry(repo.to_string())
+            .or_default()
+            .insert(branch.to_string());
+    }
+    out
+}
+
 /// collapse the packfiles every repo under `base` has accumulated, and return
 /// how many packs that reclaimed. the node's maintenance handle, with the same
 /// out-of-band standing as [`pending_digests`]: it never opens the module,
@@ -115,8 +144,14 @@ pub const COMPACT_PACK_LIMIT: usize = 50;
 /// on-disk refs run behind the committed heads, so the closure kept here is
 /// not the closure the repo is about to need. it compacts on a later tick,
 /// once the node's blob sweep has caught it up.
+///
+/// a STUCK branch (its pack is installed and the ref move was still refused —
+/// a push naming a head no pack closes) is not waiting for anything, and
+/// letting one disable a repo's compaction forever is how a single bad push
+/// costs that repo 1001 packs. those branches do not hold compaction back.
 pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, Error> {
     let pending = read_pending(base)?;
+    let stuck = read_stuck(base);
     let entries = match std::fs::read_dir(base) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -131,9 +166,11 @@ pub fn compact_repos(base: &std::path::Path, min_packs: usize) -> Result<usize, 
             continue;
         };
         let is_repo = dir.join(".git").exists();
+        let no_branch_stuck = BTreeSet::new();
+        let stuck_here = stuck.get(name).unwrap_or(&no_branch_stuck);
         let waiting = pending
             .get(name)
-            .is_some_and(|branches| !branches.is_empty());
+            .is_some_and(|branches| branches.keys().any(|branch| !stuck_here.contains(branch)));
         if !is_repo || waiting {
             continue;
         }
@@ -456,10 +493,39 @@ impl Forge {
         Ok(())
     }
 
+    /// atomically publish the advisory [`STUCK_FILE`], or remove it once no
+    /// branch is stuck. read only by [`compact_repos`].
+    fn persist_stuck(&self) -> Result<(), Error> {
+        let path = self.base.join(STUCK_FILE);
+        let mut out = String::new();
+        for (name, state) in &self.state.repos {
+            for branch in state.stuck_branches() {
+                out.push_str(name);
+                out.push('\t');
+                out.push_str(branch);
+                out.push('\n');
+            }
+        }
+        if out.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(Error::Module(format!("forge: clear stuck file: {e}"))),
+            };
+        }
+        let tmp = self.base.join(".stuck.txt.tmp");
+        std::fs::write(&tmp, &out)
+            .map_err(|e| Error::Module(format!("forge: write stuck file: {e}")))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| Error::Module(format!("forge: publish stuck file: {e}")))?;
+        Ok(())
+    }
+
     /// atomically persist the per-repo catch-up map to [`PENDING_FILE`], or
     /// remove the file once every branch has caught up — a stale file would
     /// re-adopt heads the ref cache has since overtaken.
     pub(crate) fn persist_pending(&self) -> Result<(), Error> {
+        self.persist_stuck()?;
         let path = self.base.join(PENDING_FILE);
         let outstanding: Vec<(&str, &refs::PendingMap)> = self
             .state
