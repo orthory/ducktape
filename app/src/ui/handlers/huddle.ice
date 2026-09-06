@@ -89,17 +89,17 @@ on huddle_opened(id)
 // `window_target_unless(huddle_joined, huddle_win)` close — a no-op while
 // she is still in, the window's end the moment she is not.
 
-// The panel and the huddle's channel are the same conversation, so opening one
-// docks the other. `choose_channel` owns the whole channel-switch reset; this
-// hands it the huddle's channel through a native `Task::done` rather than
-// copying twenty lines of that reset into a second place.
+// The panel's channel link puts the console on the huddle's channel.
+// `choose_channel` owns the whole channel-switch reset; this hands it the
+// huddle's channel through a native `Task::done` rather than copying twenty
+// lines of that reset into a second place.
 //
-// BOTH routes into here are cross-screen — the docked pill rides every screen
-// and the panel floats over Forge/Files/Settings — so this is a screen jump,
-// not just a channel switch, and it sets `shell_tab` exactly like
-// `open_chat_search_hit`. It also carries `choose_channel`'s OWN busy guard: on
-// a loading or mid-mutation app that handler early-returns, and docking the
-// panel for a switch that will not happen is the worse half of the failure.
+// The route in is cross-screen — the huddle window floats over
+// Forge/Files/Settings — so this is a screen jump, not just a channel switch,
+// and it sets `shell_tab` exactly like `open_chat_search_hit`. It also
+// carries `choose_channel`'s OWN busy guard: on a loading or mid-mutation app
+// that handler early-returns, and jumping tabs for a switch that will not
+// happen is the worse half of the failure.
 on huddle_go_channel
   return if loading || mutation_phase != MutationPhase.idle || empty(huddle_channel)
   shell_tab = ShellTab.chat
@@ -111,8 +111,8 @@ on huddle_go_channel
     done -> choose_channel _
 
 // THE ONLY WAY OUT OF A HUDDLE. Leaving always leaves THE HUDDLE'S channel,
-// which is not always the one on screen: the docked pill and the popped panel
-// follow you onto every screen, and `active_channel` under them can be
+// which is not always the one on screen: the huddle window follows you onto
+// every screen, and `active_channel` under it can be
 // anything. In the channel-header pill the two coincide — that pill only draws
 // when `huddle_channel == active_channel` — so every leave control in the app
 // routes here and there is no second leave handler to keep in step.

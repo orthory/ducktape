@@ -390,8 +390,8 @@ on remove_channel_member_submit(key)
 //
 // It answers for the channel ON SCREEN only: `ChatData` carries the roster of
 // the active channel, and nothing on the wire says whether she is in a huddle
-// in some OTHER channel. So the docked titlebar pill and the "live elsewhere"
-// affordance stay dark rather than guess (see the report).
+// in some OTHER channel. So no "live elsewhere" affordance is drawn: the
+// pill stays dark rather than guess (see the report).
 on join_huddle_submit
   return if loading || mutation_phase != MutationPhase.idle || empty(active_channel) || active_channel_archived
   hydration_generation = hydration_generation + 1
@@ -400,15 +400,12 @@ on join_huddle_submit
   error = ""
   run every join_huddle(connected_rpc, password, active_channel) -> huddle_joined_ack _ | mutation_failed _
 
-// THE JOIN LANDS IN THE DOCK, AND OPENS NO WINDOW. Every face, every shared
-// screen, the media controls and Leave live in the in-window dock now
-// (`HuddleDock`, mounted in view.ice's window-level huddle slot), which rides
-// every tab and every channel — so a join has somewhere to be SEEN without
-// spawning a second OS window that falls behind the console the moment you
-// click anything in it. That is what this ack used to do, and it is why a
-// huddle looked like it had disappeared on the first channel or module
-// switch. Popping out is still here and is now what it always should have
-// been: an explicit click on the dock's own popout button (`pop_huddle`).
+// THE JOIN OPENS THE CALL'S WINDOW. That window is the only surface a huddle
+// has, so a join that opened none would be a call with nowhere to be seen.
+// It goes through `show_huddle` rather than opening outright: if a window is
+// somehow already up (the reconciler took the seat away and the reader joined
+// again before closing it), a second open would leak the first as an
+// untracked window, so the summon raises that one instead.
 //
 // AND THE ACK IS WHAT LANDS THE JOINED STATE, because nothing else was doing
 // it. `huddle_joined` has no local writer on the way IN — it is answered by
@@ -424,9 +421,6 @@ on join_huddle_submit
 on huddle_joined_ack(_result)
   mutation_phase = MutationPhase.idle
   error = ""
-  // A JOIN OPENS THE CALL'S WINDOW. That window is the only surface a huddle
-  // has, so a join that did not open one would be a call with nowhere to be.
-  // `show_huddle` raises it instead if one is somehow already up.
   huddle_joined = true
   huddle_channel = active_channel
   huddle_channel_name = active_channel_name
@@ -436,10 +430,12 @@ on huddle_joined_ack(_result)
   // The roster the tiles are drawn from, and the reconciler's own input. Same
   // one-root-window read `choose_channel` issues, on the same lane.
   chat_generation = chat_generation + 1
-  // A window task is terminal, so the window the call now lives in opens
-  // beside the load rather than after it.
+  // A window task is terminal, so the summon runs beside the load rather than
+  // after it.
   parallel
-    task window open huddle -> huddle_opened _
+    flow
+      from done true
+      done -> show_huddle()
     run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the

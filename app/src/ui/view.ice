@@ -89,7 +89,7 @@ view
             disabled value=hint
     // THE HUDDLE WINDOW — the same panel, now the whole content of a real OS
     // window instead of a card wearing drawn traffic lights. Its close button
-    // docks (see `window_was_closed`); leaving the huddle closes it.
+    // only closes it (see `window_was_closed`); leaving the huddle closes it too.
     if huddle_win == some(window)
       HuddlePanel #huddle
         with
@@ -222,7 +222,6 @@ view
               huddle_joined_at
               huddle_now
               call_muted
-              huddle_popped
               messages
               has_older_history
               history_view

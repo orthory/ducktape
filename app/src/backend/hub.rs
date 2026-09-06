@@ -305,8 +305,8 @@ pub fn tray_open_action(
 }
 
 /// Put the call's window in front of you: open one when none is up, raise the
-/// one that is. The LIVE pill and the tray's huddle row both mean exactly this,
-/// and neither of them knows or cares which case it is in.
+/// one that is. The LIVE pill means exactly this, and does not know or care
+/// which case it is in.
 ///
 /// Closing that window is NOT leaving, so this is the ordinary way back into a
 /// call that is still running behind your work.

@@ -1188,7 +1188,6 @@ test message_stream_reset_contract
         huddle_joined_at
         huddle_now
         call_muted
-        huddle_popped=false
         messages
         has_older_history
         history_view
@@ -1324,7 +1323,6 @@ test message_body_renders_as_one_rich_paragraph
         huddle_joined_at
         huddle_now
         call_muted
-        huddle_popped=false
         messages
         has_older_history
         history_view

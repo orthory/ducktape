@@ -110,9 +110,9 @@ daemon Ducktape
       title-hidden true
       titlebar-transparent true
       fullsize-content-view true
-  // The huddle, popped out. It keeps REAL chrome — no `platform macos` block
-  // here — because the OS close button IS the dock control; the console is
-  // the one window that trades its titlebar away to draw its own.
+  // The huddle's window. It keeps REAL chrome — no `platform macos` block
+  // here — because the OS close button is its only close control; the console
+  // is the one window that trades its titlebar away to draw its own.
   // The panel scrolls its stage now, so no roster can push the controls out;
   // the minimum only has to hold the two chrome bands plus one row of tiles.
   // 340 = 42 header + 52 controls + 2 rules + ~190 of stage, and the width
@@ -123,8 +123,8 @@ daemon Ducktape
     min-size 320 340
     // A CALL FLOATS. This is what lets the huddle be its own window instead of
     // a card parked over the console: at the normal level it would fall behind
-    // the console the moment you clicked back into your work, which is the
-    // hole the docked card was dug to fill. Small, always on top, and yours to
+    // the console the moment you clicked back into your work, which is how
+    // the huddle used to disappear. Small, always on top, and yours to
     // move — the placement is the OS's job, and it is better at it than a
     // per-screen inset was.
     level always-on-top

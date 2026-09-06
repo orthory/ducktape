@@ -1,6 +1,6 @@
-// The huddle surfaces: the channel-header controls, the in-window dock the
-// huddle lives in, the pill that dock folds down to, and the panel it pops out
-// into. All of them read one projection — the roster the chat module already
+// The huddle surfaces: the channel-header controls, the LIVE pill, and the
+// panel that is the whole content of the huddle's own window. All of them
+// read one projection — the roster the chat module already
 // keeps as `HuddleMember { user, node, joined_at }` — plus an elapsed string
 // the caller formats with `mmss`.
 //
@@ -28,15 +28,12 @@
 // duration is no duration: every `elapsed` here is empty-tolerant and the
 // surface falls back to the bare LIVE mark rather than a plausible 00:00.
 
-// THE CHANNEL-HEADER LIVE PILL — and it draws ONLY while the huddle is popped
-// out into its own window, which is the one state the in-window dock cannot
-// speak for. Everywhere else the dock IS the huddle, and a header pill beside
-// it was one call said twice on one screen.
-//
-// So the plate has one arm now: it RAISES the huddle window. It used to carry
-// a second, open-the-window arm; opening the huddle is the dock's popout
-// button. The ✕ beside it is its own button, which is how iced spells the
-// artifact's `stopPropagation` on a nested control.
+// THE CHANNEL-HEADER LIVE PILL — drawn in the huddle's own room whether or
+// not its window is up, because it is the way back into a call whose window
+// was closed. The plate has one arm: `show_huddle`, which opens the window if
+// it is gone and raises it if it is behind something. The ✕ beside it is its
+// own button, which is how iced spells the artifact's `stopPropagation` on a
+// nested control.
 component HuddleLivePill(elapsed:str, muted:bool)
   emits
     show_huddle
@@ -52,7 +49,7 @@ component HuddleLivePill(elapsed:str, muted:bool)
     row gap=8.0 align=center
       button -> emit(show_huddle)
         with
-          label="Focus the huddle window"
+          label="Show the huddle window"
           @icon_action
           @px-0px
           @py-0px
@@ -210,11 +207,10 @@ component HuddleTile(person:HuddleParticipant, muted:bool)
                 font=medium
                 @text-caption
 
-// THE CONTROL BAND, and the one surface BOTH huddle mounts share: the popped
-// window's bottom band and the in-window dock's are the same five controls
-// over the same call, so they are one component rather than two copies that
-// drift the day a sixth control lands. It carries its own top hairline
-// because it is always the last band of whatever mounts it.
+// THE CONTROL BAND: the five controls over the call, one component so that
+// a second mount can never drift from the first the day a sixth control
+// lands. It carries its own top hairline because it is always the last band
+// of whatever mounts it.
 component HuddleControls(muted:bool, camera:bool, sharing:bool)
   emits
     huddle_go_channel
@@ -448,7 +444,7 @@ component HuddleControls(muted:bool, camera:bool, sharing:bool)
 // one surface here that is a WINDOW rather than a pill. Three bands, and the
 // middle one takes the fill:
 //
-//   header (live mark · clock · #channel · dock)   — shrink, on `sidebar`
+//   header (live mark · clock · #channel)          — shrink, on `sidebar`
 //   [status strip, only when the call says something the clock does not]
 //   stage (video strip + roster grid), SCROLLING   — h=fill, on `bg`
 //   controls (mic · camera · open · Leave)         — shrink, on `sidebar`
@@ -471,9 +467,8 @@ component HuddleControls(muted:bool, camera:bool, sharing:bool)
 // IT DRAWS NO WINDOW CHROME. It used to be a 296px card pinned in the
 // console's corner, wearing three hand-drawn traffic lights as costume; it is
 // a real window now (`window huddle` in app.ice), so the frame, the shadow and
-// the dots are the OS's and the close button docks. The `collapse` button
-// stays because closing this window does NOT leave the huddle, and a control
-// that says so is worth one glyph.
+// the dots are the OS's. Closing this window does NOT leave the huddle (see
+// `window_was_closed`); Leave is the band's own button.
 //
 // It reads `huddle_roster` from app state, which is kept ONLY while
 // `active_channel == huddle_channel` — the same guard `huddle_channel` itself
@@ -493,7 +488,7 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
     // named. It used to be two bands: a mono "Huddle · <channel>" title over a
     // separate clock row whose right end printed the word `live` beside a
     // pulse dot that already said it. One row, read left to right: the live
-    // mark, the running clock, whose channel, dock.
+    // mark, the running clock, whose channel.
     box
       with
         w=fill
