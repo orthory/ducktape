@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, State};
+use axum::extract::{DefaultBodyLimit, OriginalUri, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -445,7 +445,17 @@ fn assemble(assembly: Assembly) -> Result<(Router, String)> {
         .route("/session", post(session))
         // Proxy the whole /v1/* surface (Claude Code calls /v1/messages and
         // /v1/messages/count_tokens, not just messages).
-        .route("/v1/{*rest}", any(proxy));
+        //
+        // axum's `Bytes` extractor (the `proxy` handler's `body` argument)
+        // applies a 2 MiB default limit unless overridden — every neighbour
+        // in this lane (the broker in front of it, the route policy in front
+        // of that) is sized for real model traffic, so this must match the
+        // broker's cap or a lent-credential run 413s on a body the broker and
+        // the route policy both already accepted.
+        .route(
+            "/v1/{*rest}",
+            any(proxy).layer(DefaultBodyLimit::max(crate::MAX_REQUEST_BYTES)),
+        );
     // NOT mounted-then-guarded: a route that exists and refuses is one bad
     // refactor away from a route that exists and accepts. See
     // [`CredentialUploads`] for why only the attested build has one.
