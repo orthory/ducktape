@@ -39,7 +39,7 @@
 // artifact's `stopPropagation` on a nested control.
 component HuddleLivePill(elapsed:str, muted:bool)
   emits
-    focus_huddle
+    show_huddle
     leave_huddle_here
   box #root
     with
@@ -50,7 +50,7 @@ component HuddleLivePill(elapsed:str, muted:bool)
       pt=5.0
       pb=5.0
     row gap=8.0 align=center
-      button -> emit(focus_huddle)
+      button -> emit(show_huddle)
         with
           label="Focus the huddle window"
           @icon_action
@@ -142,57 +142,6 @@ component HuddleStart()
     active bg=surface text=accent_fg border=control_line border-w=1.0 r=9.0
     hovered bg=muted_bg text=accent_fg border=control_line_hover
     pressed bg=subtle text=accent_fg
-
-// THE DOCK, COLLAPSED — the one line of the huddle that is left when the card
-// is folded away, and the ONLY thing this pill is now. It used to mean "the
-// call is somewhere else"; the dock above says that on every screen and says
-// it with faces, so the pill's whole job is to hand the card back.
-//
-// MOUNTED in the window-level `huddle` slot (view.ice), not on the titlebar:
-// `TitleBar`/`WorkspaceTabs` carry no huddle props, and the slot already sits
-// above the whole console, so it needs no signature change. The slot anchors
-// bottom-right; this component draws no offset of its own.
-// The visibility rule is `huddle_joined && !huddle_popped &&
-// huddle_dock_collapsed` — the dock's own rule with the collapse flipped.
-component HuddleDockedPill(channel:str, elapsed:str)
-  emits
-    expand_huddle_dock
-  box #root
-    with
-      r=8.0
-      shadow=shadow_toast
-      shadow-y=2.0
-      shadow-blur=8.0
-      clip=true
-    button -> emit(expand_huddle_dock)
-      with
-        label="Show the huddle"
-        @icon_action
-        @px-8px
-        @py-4px
-      row gap=7.0 align=center
-        PulseDot plate=6.0 tone="success"
-        text channel
-          with
-            size=10.5
-            wrap=none
-            font=code_medium
-            @text-toast_fg
-        if !empty(elapsed)
-          text elapsed
-            with
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-caption
-        Icon
-          with
-            name="popout"
-            tone="caption"
-            px=11.0
-      active bg=toast_bg text=toast_fg border=transparent border-w=1.0 r=8.0
-      hovered bg=ink_hover text=toast_fg
-      pressed bg=ink_hover text=toast_fg
 
 // ONE PARTICIPANT. The human/agent shape rule — circle vs rounded square — is
 // `PrincipalAvatar`'s, and this file reuses it now that the panel is a normal
@@ -531,7 +480,6 @@ component HuddleControls(muted:bool, camera:bool, sharing:bool)
 // carries, since a load of any other channel carries THAT channel's roster.
 component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str, muted:bool, camera:bool, sharing:bool, stage:str, video_live:bool)
   emits
-    dock_huddle
     huddle_go_channel
     leave_huddle_here
     toggle_call_mute
@@ -580,7 +528,6 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
         // much room the row hands it, never how much it draws. Only a
         // `clip=true` ancestor cuts the overflow, which is why the channel
         // list's own rows survive the same names (their 236px pane clips).
-        // Without this box the name painted straight through the dock button.
         box w=fill clip=true
           row gap=3.0 align=center
             text "#"
@@ -595,19 +542,6 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
                 wrap=none
                 font=display
                 @text-muted
-        button -> emit(dock_huddle)
-          with
-            label="Dock the huddle window"
-            @icon_action
-            @p-5px
-          Icon
-            with
-              name="collapse"
-              tone="muted"
-              px=12.0
-          active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-          hovered bg=subtle text=fg
-          pressed bg=subtle text=fg
     box
       with
         w=fill
@@ -684,197 +618,3 @@ component HuddlePanel(channel:str, elapsed:str, rows:[HuddleTileRow], status:str
         toggle_call_screen
         huddle_go_channel
         leave_huddle_here
-
-// THE IN-WINDOW DOCK — the huddle itself, riding the console window on EVERY
-// tab and EVERY channel.
-//
-// THIS IS THE SURFACE THE HUDDLE LIVES ON, and the popped window is now the
-// explicit second choice rather than what a join does to you. The old flow
-// opened an OS window on the join ack: the moment you clicked another channel
-// or another module, the main window said nothing about the call at all and
-// the huddle window fell BEHIND it — a live call you could neither see nor
-// find. The call session never stopped (it is subscribed on `huddle_joined`
-// in handlers/lifecycle.ice, not on any window), so what vanished was only the
-// picture of it. This is that picture, anchored where the console can always
-// draw it.
-//
-// SAME BANDS AS THE PANEL, one card narrower: the header names the call, the
-// stage band carries the shared screen, the live strip and the roster grid,
-// and `HuddleControls` below is literally the panel's own control band. Its
-// two chrome buttons are what the panel's single `collapse` splits into here:
-// `popout` hands the huddle to its own OS window, `collapse` folds the card
-// down to `HuddleDockedPill` without touching the call.
-//
-// ONE VIDEO SURFACE IN THE APP, EVER. The `extern call_video_*` widgets each
-// run their own 4 ms repaint clock while a tile is live (video.rs), so a dock
-// and a panel drawing at once would be two clocks for one call. They cannot
-// both be up: this component is mounted under `!huddle_popped` and the panel
-// only inside the window whose existence IS `huddle_popped`
-// (state/derived.ice).
-//
-// THE HEIGHT IS THE WRAPPER'S, not the roster's. view.ice gives the card a
-// 320 x 300 box because the timeline underneath it has to give back exactly
-// that much (`huddle_timeline_inset`) — a card that grew with its roster would
-// be a card the timeline could only guess at. So one band takes the fill and
-// scrolls, and a ten-person huddle lengthens the strip inside it.
-component HuddleDock(channel:str, elapsed:str, rows:[HuddleTileRow], status:str, muted:bool, camera:bool, sharing:bool, stage:str, video_live:bool)
-  emits
-    collapse_huddle_dock
-    pop_huddle
-    huddle_go_channel
-    leave_huddle_here
-    toggle_call_mute
-    toggle_call_camera
-    toggle_call_screen
-  // NO FIXED WIDTH AND NO `max-w` OF ITS OWN. The card is exactly as wide as
-  // the column view.ice gives it, and that column is a portion of the window —
-  // the clamp lives there, once, beside the rule that closes the column. A
-  // width here would be a second owner of the same number, and it is why a
-  // joined huddle used to sit in a 312px card on a 2560px screen.
-  box #root
-    with
-      w=fill
-      h=fill
-      bg=surface
-      border=border
-      border-w=1.0
-      r=13.0
-      clip=true
-      shadow=shadow_modal
-      shadow-y=16.0
-      shadow-blur=40.0
-    col w=fill h=fill
-      box
-        with
-          w=fill
-          pl=13.0
-          pr=7.0
-          pt=9.0
-          pb=9.0
-          bg=sidebar
-        row
-          with
-            w=fill
-            gap=8.0
-            align=center
-          PulseDot plate=7.0 tone="success"
-          if !empty(elapsed)
-            text elapsed
-              with
-                size=13.0
-                wrap=none
-                font=code_semibold
-                @text-fg
-          if empty(elapsed)
-            text "LIVE"
-              with
-                size=13.0
-                wrap=none
-                font=code_semibold
-                @text-fg
-          // Clipped for the panel's own reason: a `wrap=none` name lays out at
-          // its INTRINSIC width and paints straight through the buttons unless
-          // an ancestor cuts it.
-          box w=fill clip=true
-            row gap=3.0 align=center
-              text "#"
-                with
-                  size=12.0
-                  wrap=none
-                  font=display
-                  @text-hint
-              text channel
-                with
-                  size=12.0
-                  wrap=none
-                  font=display
-                  @text-muted
-          button -> emit(pop_huddle)
-            with
-              label="Open the huddle in its own window"
-              @icon_action
-              @p-5px
-            Icon
-              with
-                name="popout"
-                tone="muted"
-                px=12.0
-            active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-            hovered bg=subtle text=fg
-            pressed bg=subtle text=fg
-          button -> emit(collapse_huddle_dock)
-            with
-              label="Collapse the huddle to a pill"
-              @icon_action
-              @p-5px
-            Icon
-              with
-                name="collapse"
-                tone="muted"
-                px=12.0
-            active bg=transparent text=muted border=transparent border-w=1.0 r=6.0
-            hovered bg=subtle text=fg
-            pressed bg=subtle text=fg
-      box
-        with
-          w=fill
-          h=1.0
-          bg=separator
-        space w=1.0 h=1.0
-      // The call's own word, on the panel's own terms: a bare `live` is what
-      // the pulse dot and the clock above already say.
-      if !empty(status) && (status != "live")
-        box
-          with
-            w=fill
-            pl=13.0
-            pr=13.0
-            pt=7.0
-            pb=7.0
-            bg=subtle
-          text status
-            with
-              w=fill
-              size=10.5
-              wrap=none
-              font=code_medium
-              @text-caption
-      // THE ONE BAND THAT TAKES THE FILL, so the card is exactly the height
-      // its wrapper names (view.ice) and the timeline's inset is that same
-      // number rather than a guess about content. A ten-person roster
-      // lengthens the strip INSIDE this band; the card never grows.
-      box w=fill h=fill
-        scroll
-          with
-            dir=vertical
-            w=fill
-            h=fill
-          col
-            with
-              w=fill
-              gap=10.0
-              pl=12.0
-              pr=12.0
-              pt=12.0
-              pb=12.0
-            if !empty(stage)
-              extern call_video_stage(stage)
-            if video_live
-              extern call_video_tiles(stage)
-            // 132, not the panel's 168: this card is 312 wide, so the max-cell
-            // that gives the panel 2-4 columns would give the dock exactly one
-            // and strand a 34px avatar in a 288px bar.
-            grid max-cell=132.0 gap=8.0
-              for tile in rows
-                HuddleTile person=tile.person muted=tile.muted
-      HuddleControls #controls
-        with
-          muted
-          camera
-          sharing
-        forward
-          toggle_call_mute
-          toggle_call_camera
-          toggle_call_screen
-          huddle_go_channel
-          leave_huddle_here

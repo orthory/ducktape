@@ -2,9 +2,9 @@
 //
 // TWO FACTS SHAPE THIS FILE:
 //
-// 1. POPPING IS A WINDOW, NOT A BOOL. `pop_huddle`/`dock_huddle` open and
-//    close the daemon's third window and touch no chain; `huddle_win` holding
-//    an id IS "the huddle is popped out".
+// 1. THE CALL IS A WINDOW, NOT A CARD. Joining opens the daemon's third
+//    window and touches no chain; `huddle_win` holding an id IS "the window is
+//    up". Closing it is not leaving — only `leave_huddle_here` ends a call.
 // 2. THE ELAPSED CLOCK IS A LOCAL SESSION FACT. It is counted by a 1 Hz tick on
 //    THIS machine into `huddle_now`, never derived from a module record's time:
 //    a consensus write is stamped with the block HEIGHT on a validator network
@@ -62,29 +62,23 @@ on toggle_call_screen
   call_video_live = call_video_live_after(call_peers, call_camera, call_sharing)
   huddle_stage = huddle_stage_peer(call_peers, call_sharing)
 
-// COLLAPSING IS NOT LEAVING, AND IT IS NOT POPPING. Two named events rather
-// than one toggle, because each surface means exactly one of them: the dock's
-// chevron folds the card away, the pill it folds into gives it back. Neither
-// touches the call — `huddle_joined` and the media session subscribed on it
-// are none of this flag's business.
-on collapse_huddle_dock
-  huddle_dock_collapsed = true
-
-on expand_huddle_dock
-  huddle_dock_collapsed = false
-
-// POPPING OPENS A REAL WINDOW, and the window's existence IS the popped
-// state — there is no `huddle_popped` bool to keep in step with it. Docking
-// closes it; so does the OS close button, which lands in `window_was_closed`
-// (handlers/lifecycle.ice) and clears `huddle_win` there. The open-or-raise
-// split lives in the VIEW: the LIVE pill's `popped` prop routes its click to
-// `focus_huddle` while the window is up, so this guard is a belt, not a path.
-on pop_huddle
-  return if huddle_win != none
-  task window open huddle -> huddle_opened _
-
-on focus_huddle
-  task window focus target=window_target(huddle_win)
+// THE CALL IS A WINDOW, and this is the one way to put it in front of you:
+// open it if it is gone, raise it if it is behind something. One discriminant,
+// one branch — the same decision the status item's Open row makes, which is
+// why they share `WindowSummon`.
+//
+// CLOSING THAT WINDOW IS NOT LEAVING. A call is a session and the window is a
+// view of it, so the OS close button (and ⌘W) only clears `huddle_win` in
+// `window_was_closed`; the media session stays subscribed on `huddle_joined`.
+// The channel's LIVE pill and the tray's huddle row both route here, so a
+// closed window is always one click from being back.
+on show_huddle
+  let summon = huddle_summon(huddle_win)
+  match summon
+    WindowSummon.open
+      task window open huddle -> huddle_opened _
+    WindowSummon.raise
+      task window focus target=window_target(huddle_win)
 
 on huddle_opened(id)
   huddle_win = some(id)
@@ -94,8 +88,6 @@ on huddle_opened(id)
 // handlers/chat.ice and lifecycle.ice ends with a
 // `window_target_unless(huddle_joined, huddle_win)` close — a no-op while
 // she is still in, the window's end the moment she is not.
-on dock_huddle
-  task window close target=window_target(huddle_win)
 
 // The panel and the huddle's channel are the same conversation, so opening one
 // docks the other. `choose_channel` owns the whole channel-switch reset; this
@@ -156,9 +148,6 @@ on leave_huddle_here
 // everything standing, which is why nothing here is done optimistically.
 on huddle_left(_result)
   huddle_joined = false
-  // The next huddle starts showing: a collapse was a choice about THIS call,
-  // and this call is over.
-  huddle_dock_collapsed = false
   huddle_roster = []
   huddle_rows = []
   huddle_channel = ""

@@ -121,6 +121,13 @@ daemon Ducktape
     icon-rgba "../../assets/icon.rgba" 128 128
     size 320 460
     min-size 320 340
+    // A CALL FLOATS. This is what lets the huddle be its own window instead of
+    // a card parked over the console: at the normal level it would fall behind
+    // the console the moment you clicked back into your work, which is the
+    // hole the docked card was dug to fill. Small, always on top, and yours to
+    // move — the placement is the OS's job, and it is better at it than a
+    // per-screen inset was.
+    level always-on-top
     platform linux
       app-id "dev.ducktape.app"
 

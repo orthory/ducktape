@@ -74,14 +74,14 @@ fn the_tray_open_row_branches_once_on_a_discriminant() {
         .filter(|line| line.trim_start().starts_with("match "))
         .count();
     assert_eq!(branches, 1, "one branch, not a ladder: {body}");
-    assert!(body.contains("TrayOpen.open"), "no open arm: {body}");
-    assert!(body.contains("TrayOpen.raise"), "no raise arm: {body}");
+    assert!(body.contains("WindowSummon.open"), "no open arm: {body}");
+    assert!(body.contains("WindowSummon.raise"), "no raise arm: {body}");
     assert!(
         body.contains("task window open onboarding"),
         "the open arm no longer opens a window: {body}"
     );
     assert!(
-        EXTERNS.contains("pure tray_open_action(console:window-id?, onboarding:window-id?) -> TrayOpen"),
+        EXTERNS.contains("pure tray_open_action(console:window-id?, onboarding:window-id?) -> WindowSummon"),
         "backend.ice lost the tray-open discriminant"
     );
 }

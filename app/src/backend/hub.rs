@@ -297,10 +297,23 @@ pub fn window_target_unless(keep: bool, current: Option<iced::window::Id>) -> ic
 pub fn tray_open_action(
     console: Option<iced::window::Id>,
     onboarding: Option<iced::window::Id>,
-) -> crate::TrayOpen {
+) -> crate::WindowSummon {
     match console.is_none() && onboarding.is_none() {
-        true => crate::TrayOpen::Open,
-        false => crate::TrayOpen::Raise,
+        true => crate::WindowSummon::Open,
+        false => crate::WindowSummon::Raise,
+    }
+}
+
+/// Put the call's window in front of you: open one when none is up, raise the
+/// one that is. The LIVE pill and the tray's huddle row both mean exactly this,
+/// and neither of them knows or cares which case it is in.
+///
+/// Closing that window is NOT leaving, so this is the ordinary way back into a
+/// call that is still running behind your work.
+pub fn huddle_summon(huddle: Option<iced::window::Id>) -> crate::WindowSummon {
+    match huddle.is_none() {
+        true => crate::WindowSummon::Open,
+        false => crate::WindowSummon::Raise,
     }
 }
 

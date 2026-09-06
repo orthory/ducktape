@@ -17,6 +17,5 @@ state
   // nothing writes it to disk, so every launch starts with the huddle showing.
   // `false` is expanded — a joined huddle draws itself, and folding it to the
   // pill is a choice this device then keeps until the huddle ends.
-  huddle_dock_collapsed = false
   huddle_roster:[HuddleParticipant] = []
   huddle_rows:[HuddleTileRow] = []

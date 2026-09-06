@@ -162,7 +162,10 @@ extern crate::backend
   pure without_window(current:window-id?, closed:window-id) -> window-id?
   // "Open Ducktape" as a discriminant: nothing tracked means there is nothing
   // to raise, so the row must open a window instead of focusing a fresh id.
-  pure tray_open_action(console:window-id?, onboarding:window-id?) -> TrayOpen
+  pure tray_open_action(console:window-id?, onboarding:window-id?) -> WindowSummon
+  // The same decision for the call's window: the LIVE pill and the tray's
+  // huddle row both mean "put it in front of me", whether or not one is up.
+  pure huddle_summon(huddle:window-id?) -> WindowSummon
   sync window_target(current:window-id?) -> window-id
   sync window_target_unless(keep:bool, current:window-id?) -> window-id
   // THE RECOVERY-PHRASE CEREMONY, in two calls. `create_device_key` picks a
@@ -245,8 +248,6 @@ extern crate::backend
   files_history(rpc:str, generation:i64) -> FsHistory ! HydrationError
   pure size_label(bytes:i64) -> str
   pure shell_nav(tab:ShellTab, approvals:i64, agent_live:bool) -> [NavItem]
-  pure huddle_dock_bottom(tab:ShellTab) -> f64
-  pure huddle_timeline_inset(docked:bool, pilled:bool) -> f64
   pure open_proposals(rows:&[ProposalRow]) -> i64
   pure plural(count:i64, one:&str, many:&str) -> str
   pure members_summary(connected:bool, rows:&[MemberRow]) -> str

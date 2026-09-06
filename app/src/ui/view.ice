@@ -103,7 +103,6 @@ view
           stage=huddle_stage
           video_live=call_video_live
         events
-          dock_huddle -> dock_huddle
           huddle_go_channel -> huddle_go_channel
           leave_huddle_here -> leave_huddle_here
           toggle_call_mute -> toggle_call_mute
@@ -218,8 +217,6 @@ view
               channel_members
               post_refusal
               huddle_joined
-              huddle_docked
-              huddle_pilled
               huddle_channel
               huddle_channel_name
               huddle_joined_at
@@ -254,7 +251,7 @@ view
               choose_channel -> choose_channel _
               choose_dm -> choose_dm _
               toggle_channel_settings -> toggle_channel_settings
-              focus_huddle -> focus_huddle
+              show_huddle -> show_huddle
               leave_huddle_here -> leave_huddle_here
               huddle_go_channel -> huddle_go_channel
               join_huddle_submit -> join_huddle_submit
@@ -625,87 +622,6 @@ view
             events
               refresh_explorer -> refresh_explorer
               copy_to_clipboard -> copy_to_clipboard _ _
-        huddle:
-          // THE HUDDLE LAYER — bottom-right of the MODULE's own box
-          // (components/shell.ice), never the window's, and it changes no
-          // one's width. `huddle_dock_bottom` is the one number that keeps it
-          // off whatever the tab put on its bottom edge: a composer band on
-          // Chat and Shell, the window wall everywhere else.
-          //
-          // THE HUDDLE, ON EVERY TAB AND EVERY CHANNEL. There is exactly one
-          // kind of term missing from the two arms below and it is missing on
-          // purpose: nothing here reads WHERE you are. A call you are in does
-          // not stop being live because you opened Pages or clicked another
-          // room, and the media session under it never thought it did — it is
-          // subscribed on `huddle_joined` (handlers/lifecycle.ice) and nothing
-          // else. What used to happen instead — a pill on some screens, and
-          // nothing at all while the popped window sat behind the console —
-          // WAS the defect: the huddle was still running and the app had
-          // stopped saying so.
-          //
-          // Three states, two arms and a window: open here, folded to the pill
-          // below, or popped into its own OS window, where `huddle_popped`
-          // blanks both arms (`huddle_docked`/`huddle_pilled`,
-          // state/derived.ice) and the window draws the panel. That is also
-          // what keeps exactly ONE video surface alive at a time — see
-          // `HuddleDock`.
-          //
-          // EVERY `box` HERE IS INSIDE AN ARM, AND THE ARMS ARE THIS `col`'S.
-          // A container laid out with no child is a crash, not an empty
-          // corner: `Container::operate` unwraps its one layout child
-          // (iced_widget container.rs), and `operate` is what an accessibility
-          // action walks — so a wrapper box holding only `if`s that are all
-          // false aborts the process the moment a screen reader presses
-          // anything. A `col` with no children is fine; a `box` with none is
-          // not, so no `box` in this slot may sit above the conditions.
-          col w=fill h=fill
-            if huddle_docked
-              box
-                with
-                  w=fill
-                  h=fill
-                  align-x=end
-                  align-y=end
-                  pr=13.0
-                  pb=huddle_dock_bottom(shell_tab)
-                // 320 x 300, and the card inside carries neither: the wrapper
-                // is the ONE owner of the floating card's size, which is what
-                // the timeline's inset is computed from.
-                box w=320.0 h=300.0
-                  HuddleDock
-                    with
-                      channel=huddle_channel_name
-                      elapsed=mmss(huddle_now - huddle_joined_at)
-                      rows=huddle_rows
-                      status=call_status
-                      muted=call_muted
-                      camera=call_camera
-                      sharing=call_sharing
-                      stage=huddle_stage
-                      video_live=call_video_live
-                    events
-                      collapse_huddle_dock -> collapse_huddle_dock
-                      pop_huddle -> pop_huddle
-                      huddle_go_channel -> huddle_go_channel
-                      leave_huddle_here -> leave_huddle_here
-                      toggle_call_mute -> toggle_call_mute
-                      toggle_call_camera -> toggle_call_camera
-                      toggle_call_screen -> toggle_call_screen
-            if huddle_pilled
-              box
-                with
-                  w=fill
-                  h=fill
-                  align-x=end
-                  align-y=end
-                  pr=13.0
-                  pb=huddle_dock_bottom(shell_tab)
-                HuddleDockedPill
-                  with
-                    channel=huddle_channel_name
-                    elapsed=mmss(huddle_now - huddle_joined_at)
-                  events
-                    expand_huddle_dock -> expand_huddle_dock
         palette:
           OverlayLayer draft<->channel_draft query<->palette_draft #overlays
             with

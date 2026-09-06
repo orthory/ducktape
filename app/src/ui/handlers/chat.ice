@@ -424,9 +424,9 @@ on join_huddle_submit
 on huddle_joined_ack(_result)
   mutation_phase = MutationPhase.idle
   error = ""
-  // A join is a huddle to look at. Whatever the last one was folded to, this
-  // one draws itself.
-  huddle_dock_collapsed = false
+  // A JOIN OPENS THE CALL'S WINDOW. That window is the only surface a huddle
+  // has, so a join that did not open one would be a call with nowhere to be.
+  // `show_huddle` raises it instead if one is somehow already up.
   huddle_joined = true
   huddle_channel = active_channel
   huddle_channel_name = active_channel_name
@@ -436,7 +436,11 @@ on huddle_joined_ack(_result)
   // The roster the tiles are drawn from, and the reconciler's own input. Same
   // one-root-window read `choose_channel` issues, on the same lane.
   chat_generation = chat_generation + 1
-  run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
+  // A window task is terminal, so the window the call now lives in opens
+  // beside the load rather than after it.
+  parallel
+    task window open huddle -> huddle_opened _
+    run replace lane=chat_load load_channel_window(connected_rpc, active_channel, chat_generation) -> chat_updated _ | chat_load_failed _
 
 // Leaving is `leave_huddle_here` in handlers/huddle.ice, which leaves the
 // HUDDLE'S channel rather than the one on screen — the same button serves the

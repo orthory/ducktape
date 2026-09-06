@@ -10,6 +10,4 @@ derived
   // surfaces read them: the two arms of the huddle layer, and the chat
   // timeline's inset, which has to lift its last rows by exactly what the
   // layer above them covers.
-  huddle_docked = huddle_joined && !huddle_popped && !huddle_dock_collapsed
-  huddle_pilled = huddle_joined && !huddle_popped && huddle_dock_collapsed
   mutation_busy = mutation_phase != MutationPhase.idle

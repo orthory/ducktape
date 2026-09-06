@@ -239,7 +239,7 @@ fn node_operations_are_a_first_class_screen() {
     }
 
     let shell = include_str!("../ui/components/shell.ice");
-    assert!(shell.contains("ShellTab.node\n                    slot node"));
+    assert!(shell.contains("ShellTab.node\n                  slot node"));
     let view = include_str!("../ui/view.ice");
     assert!(view.contains("node:\n          NodeScreen"));
     assert!(view.contains("settings:\n          SettingsScreen"));
@@ -593,20 +593,22 @@ fn a_move_off_the_agents_tab_keeps_a_live_load_that_already_answered() {
     );
 }
 
-/// THE JOIN LANDS IN THE DOCK, AND OPENS NO WINDOW. Every face, every shared
-/// screen and every media control lives in the in-window dock; a join routed
-/// back to the generic `chat_acked` would leave someone sitting in a live call
-/// watching a static pill, which is indistinguishable from a huddle that does
-/// not work — so the route is pinned here.
+/// THE JOIN OPENS THE CALL'S WINDOW, AND THE CONSOLE KEEPS SAYING SO.
 ///
-/// The ack used to open the popped huddle window, and that is the defect this
-/// now pins the inverse of: the second OS window fell behind the console the
-/// moment anything in the console was clicked, and the console said nothing
-/// about the call at all. Popping out is an explicit click on the dock now, so
-/// an `open huddle` task reappearing in this ack is a regression, not a
-/// convenience.
+/// A huddle has exactly one surface — its own window — so an ack that opened
+/// none would leave someone in a live call with nowhere to see it. The route is
+/// pinned here because a join routed back to the generic `chat_acked` would
+/// land the same silence.
+///
+/// THIS USED TO BE THE OPPOSITE ASSERTION, and the defect it guarded is worth
+/// restating because it is what the two lines below now answer: a second OS
+/// window fell behind the console the moment anything in the console was
+/// clicked, and the console said nothing about the call at all. So the window
+/// floats (`level always-on-top`, app.ice) and the channel's LIVE pill draws
+/// whenever that channel's call is live rather than only while the window is
+/// up — the pill is the way back to a window someone has closed.
 #[test]
-fn joining_a_huddle_lands_in_the_in_window_dock() {
+fn joining_a_huddle_opens_the_call_window() {
     let handler = inlined(include_str!("../ui/handlers/chat.ice"));
     assert!(
         handler
@@ -619,19 +621,14 @@ fn joining_a_huddle_lands_in_the_in_window_dock() {
         .1;
     let ack = ack.split_once("\non ").map_or(ack, |split| split.0);
     assert!(
-        !ack.contains("task window open huddle"),
-        "the join lands in the dock — the popped window is an explicit choice"
-    );
-    assert!(
-        ack.contains("huddle_dock_collapsed = false"),
-        "a join is a huddle to look at, whatever the last one was folded to"
+        ack.contains("task window open huddle"),
+        "a join that opens no window is a call with nowhere to be"
     );
     // AND THE ACK LANDS THE JOINED STATE ITSELF. `huddle_joined` has no other
-    // writer on the way in: it is answered off a chat load's roster, and the
-    // load that answered it used to be the popped window's. With no window,
-    // an ack that only cleared the mutation left the write committed, the
-    // chain roster listing her, and the app showing the start button with no
-    // media session — `call_session` is gated on this very flag.
+    // writer on the way in: it is answered off a chat load's roster, and an ack
+    // that only cleared the mutation left the write committed, the chain roster
+    // listing her, and the app showing the start button with no media session —
+    // `call_session` is gated on this very flag.
     for landed in [
         "huddle_joined = true",
         "huddle_channel = active_channel",
@@ -647,264 +644,40 @@ fn joining_a_huddle_lands_in_the_in_window_dock() {
         ),
         "and asks that channel for the roster the tiles and the reconciler need"
     );
-    let huddle = inlined(include_str!("../ui/handlers/huddle.ice"));
-    let popped = huddle
-        .split_once("on pop_huddle")
-        .expect("popping out still exists")
+    // THE WINDOW FLOATS, or it is behind the console the moment you click back
+    // into your work — the hole the docked card was dug to fill.
+    let app = include_str!("../ui/app.ice");
+    let huddle_window = app
+        .split_once("window huddle")
+        .expect("the huddle window is declared")
         .1;
+    let huddle_window = huddle_window
+        .split_once("\n  window ")
+        .map_or(huddle_window, |split| split.0);
     assert!(
-        popped.contains("task window open huddle"),
-        "popping out is what opens the window now"
+        huddle_window.contains("level always-on-top"),
+        "the call window stopped floating: {huddle_window}"
     );
-}
-
-/// THE HUDDLE IS SHOWN WHEREVER YOU ARE, AND DRAWN ONCE.
-///
-/// A call you are in does not stop being live because you opened Pages or
-/// clicked another room — the media session is subscribed on `huddle_joined`
-/// and nothing else (handlers/lifecycle.ice). The UI used to disagree: the
-/// docked pill carried a `shell_tab`/`active_channel` term, the panel lived in
-/// a second OS window, and between them a live huddle could be invisible on
-/// the screen you were actually looking at. So the dock's visibility rule may
-/// not read WHERE you are at all, and this is the guard that says so — it
-/// fails on the next `shell_tab ==` term anybody adds to either arm.
-///
-/// It also pins the other half: the dock and the panel each mount the
-/// `extern call_video_*` widgets, and each of those runs its own 4 ms repaint
-/// clock while a tile is live (video.rs). Two of them up at once would be two
-/// clocks for one call, so the two mounts must be mutually exclusive — the
-/// dock under `!huddle_popped`, the panel only inside the window whose
-/// existence IS `huddle_popped` (state/derived.ice).
-#[test]
-fn the_huddle_dock_rides_every_tab_and_keeps_one_video_surface() {
-    let view = inlined(include_str!("../ui/view.ice"));
-
-    // 1. THE TWO ARMS of the window-level huddle slot, as authored.
-    let slot = view
-        .split_once("\n        huddle:\n")
-        .expect("the window-level huddle slot")
-        .1;
-    let slot = slot
-        .split_once("\n        palette:\n")
-        .map_or(slot, |split| split.0);
-    let arms: Vec<&str> = slot
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("if "))
-        .collect();
-    assert_eq!(
-        arms,
-        ["if huddle_docked", "if huddle_pilled"],
-        "the dock is expanded or folded to its pill, and nothing else gates it"
-    );
-    // `huddle_docked`/`huddle_pilled` are derived from the huddle and nothing
-    // else, which is the property this walk is really about.
-    let derived_arms = inlined(include_str!("../ui/state/derived.ice"));
-    let derived_arms: Vec<&str> = derived_arms
-        .lines()
-        .filter(|line| line.trim_start().starts_with("huddle_"))
-        .collect();
-    for arm in arms.iter().copied().chain(derived_arms) {
-        for elsewhere in ["shell_tab", "active_channel", "huddle_channel "] {
-            assert!(
-                !arm.contains(elsewhere),
-                "the huddle rides every tab and every channel: {arm:?} reads {elsewhere}"
-            );
-        }
-    }
-    // `inlined` folds each mount's `with` block onto its own line, so a mount
-    // is the head of a line — which is also what keeps `HuddleDock` from
-    // matching inside `HuddleDockedPill`.
-    let mounts: Vec<&str> = slot
-        .lines()
-        .filter_map(|line| line.split_whitespace().next())
-        .filter(|head| head.starts_with("Huddle"))
-        .collect();
-    assert_eq!(
-        mounts,
-        ["HuddleDock", "HuddleDockedPill"],
-        "the expanded card and the folded pill, and nothing else in this slot"
-    );
-
-    // 2. THE PANEL IS THE WINDOW'S, and only the window's.
-    let panel_at = view
-        .find("      HuddlePanel #huddle")
-        .expect("the popped panel is mounted");
-    let guard = view[..panel_at]
-        .lines()
-        .rev()
-        .find(|line| line.trim().starts_with("if "))
-        .expect("the panel is guarded");
-    assert_eq!(
-        guard.trim(),
-        "if huddle_win == some(window)",
-        "the panel draws inside the huddle window and nowhere else"
-    );
-    let derived = inlined(include_str!("../ui/state/derived.ice"));
-    assert!(
-        derived.contains("huddle_popped = huddle_win != none"),
-        "`!huddle_popped` on the dock is what makes the two mounts exclusive"
-    );
-
-    // 3. AND THE VIDEO WIDGETS LIVE IN EXACTLY THOSE TWO COMPONENTS.
-    let components = inlined(include_str!("../ui/components/huddle.ice"));
-    let mut mounting: Vec<&str> = Vec::new();
-    let mut component = "";
-    for line in components.lines() {
-        if let Some(rest) = line.strip_prefix("component ") {
-            component = rest.split('(').next().unwrap_or(rest);
-        }
-        if line.trim().starts_with("extern call_video_") {
-            mounting.push(component);
-        }
-    }
-    mounting.sort_unstable();
-    mounting.dedup();
-    assert_eq!(
-        mounting,
-        ["HuddleDock", "HuddlePanel"],
-        "a third video surface is a third repaint clock on one call"
-    );
-}
-
-/// THE HUDDLE FLOATS, AND NOTHING UNDER IT MOVES SIDEWAYS.
-///
-/// It was a cell in the content row for exactly one round: taking a column of
-/// its own shoved the whole module — chat screen, sidebar and all — across the
-/// window every time a call started, which is not a trade anybody wants for a
-/// call they can already hear. So it is a LAYER again, and the two things that
-/// make a layer honest are pinned here:
-///
-/// 1. IT IS THE MODULE'S CORNER. The stack is inside `#content`, so the card
-///    can never reach the nav rail or the titlebar, and the inset that keeps
-///    it off a composer is one number per tab.
-/// 2. WHAT IT COVERS PAYS FOR IT. The chat timeline is bottom-anchored, so it
-///    carries a bottom inset exactly the height of the card plus its gutter —
-///    the newest message stops above the card instead of behind it.
-///
-/// And the card still carries no size of its own: the wrapper in view.ice owns
-/// 320 x 300, which is the number `huddle_timeline_inset` is computed from.
-#[test]
-fn the_huddle_floats_over_the_module_without_moving_it() {
-    let shell = include_str!("../ui/components/shell.ice");
-    let content = shell
-        .split_once("          box #content")
-        .expect("the module's own box")
-        .1;
-    let content = content
-        .split_once("\n      slot palette")
-        .map_or(content, |split| split.0);
-    assert!(
-        content.contains("            stack w=fill h=fill")
-            && content.contains("              slot huddle"),
-        "the huddle is a layer over the module's box, and only over that box"
-    );
-    assert!(
-        content.contains("              w=fill\n"),
-        "the module's box keeps the whole row: a layer reflows nothing"
-    );
-    let layers = shell
-        .rsplit_once("\n      slot palette")
-        .expect("the window-level layers")
-        .1;
-    assert!(
-        !layers.contains("slot huddle"),
-        "over the window it would reach the rail and the titlebar"
-    );
-
-    let view = inlined(include_str!("../ui/view.ice"));
-    let slot = view
-        .split_once("\n        huddle:\n")
-        .expect("the huddle slot")
-        .1;
-    let slot = slot
-        .split_once("\n        palette:\n")
-        .map_or(slot, |split| split.0);
-    let anchors: Vec<&str> = slot
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("box w=fill h=fill"))
-        .collect();
-    assert_eq!(
-        anchors,
-        ["box w=fill h=fill align-x=end align-y=end pr=13.0 pb=huddle_dock_bottom(shell_tab)"; 2],
-        "both arms anchor bottom-right of the module, a tab's own bottom band \
-         above its edge"
-    );
-    assert!(
-        slot.contains("box w=320.0 h=300.0"),
-        "the wrapper owns the card's size, once, where the inset can read it"
-    );
-
-    // NO CHILDLESS CONTAINER, IN ANY STATE. `Container::operate` unwraps its
-    // one layout child, and `operate` is what an accessibility action walks —
-    // so a `box` whose only children are `if`s that can all be false aborts
-    // the process the moment a screen reader presses anything in this app. A
-    // `col` with no children is fine; a `box` with none is not. Every `box`
-    // here therefore sits INSIDE an arm, under the slot's one `col`.
-    let indent_of = |line: &str| line.len() - line.trim_start().len();
-    let lines: Vec<&str> = slot
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
-    for (index, line) in lines.iter().enumerate() {
-        if !line.trim_start().starts_with("box ") {
-            continue;
-        }
-        let depth = indent_of(line);
-        let child = lines[index + 1..]
-            .iter()
-            .find(|next| indent_of(next) <= depth || !next.trim().starts_with("//"))
-            .map(|next| next.trim())
-            .unwrap_or_default();
-        assert!(
-            !child.starts_with("if "),
-            "a box whose only child is a condition is laid out with no child \
-             when that condition is false, and `operate` unwraps it: {line:?}"
-        );
-    }
-
-    // THE CARD CARRIES NO SIZE. A `max-w` or a fixed `w=` on any of the
-    // huddle's own surfaces is a second owner of that number — and the reason
-    // a joined huddle used to sit in a 312px card on a 2560px screen.
-    let components = inlined(include_str!("../ui/components/huddle.ice"));
-    let mut component = "";
-    for line in components.lines() {
-        if let Some(rest) = line.strip_prefix("component ") {
-            component = rest.split('(').next().unwrap_or(rest);
-        }
-        let reflows =
-            ["HuddleDock", "HuddlePanel", "HuddleTile", "HuddleControls"].contains(&component);
-        assert!(
-            !(reflows && line.contains("max-w=")),
-            "{component} must reflow with the box it is given: {line:?}"
-        );
-    }
-    let dock = components
-        .split_once("component HuddleDock(")
-        .expect("the dock")
-        .1;
-    assert!(
-        dock.contains("box #root w=fill h=fill bg=surface"),
-        "the dock is exactly the box its wrapper hands it, in both directions"
-    );
-
-    // AND THE TIMELINE GIVES THE ROOM BACK. The stream is the surface the card
-    // sits on, so its bottom inset is not optional decoration.
+    // AND THE CONSOLE SAYS THE CALL IS LIVE whether or not that window is up.
     let chat = inlined(include_str!("../ui/screens/chat.ice"));
-    let stream = chat
-        .split_once("scroll #message-stream")
-        .expect("the message stream")
-        .0;
-    let inset = stream
-        .lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty())
-        .unwrap_or_default();
     assert!(
-        inset.contains("pb=huddle_timeline_inset(huddle_docked, huddle_pilled)"),
-        "the newest message stops above the card, not behind it: {inset:?}"
+        chat.contains("if huddle_joined && huddle_channel == active_channel"),
+        "the LIVE pill stopped drawing for the channel's own call"
     );
+    assert!(
+        !chat.contains("huddle_joined && huddle_channel == active_channel && huddle_popped"),
+        "the pill is gated on the window again, so a closed window has no way back"
+    );
+    // ONE VIDEO SURFACE, EVER. The `call_video_*` widgets each run a 4 ms
+    // repaint clock while a tile is live, so a second component drawing them
+    // would be two clocks for one call. Only the panel may.
+    let huddle = include_str!("../ui/components/huddle.ice");
+    for component in ["HuddleDock(", "HuddleDockedPill("] {
+        assert!(
+            !huddle.contains(&format!("component {component}")),
+            "{component} is back — the call has one surface, its window"
+        );
+    }
 }
 
 /// ONE HUDDLE SURFACE AT A TIME.
@@ -931,9 +704,14 @@ fn the_chat_header_carries_no_second_huddle_surface() {
         .find(|line| line.trim().starts_with("if "))
         .map(str::trim)
         .expect("its guard");
+    // THE PILL IS THE WAY BACK, so it cannot be gated on the window being up.
+    // It used to carry `&& huddle_popped` because the in-window dock covered
+    // the other case; with the call in its own window and nothing else drawing
+    // it, that term made the pill vanish in exactly the state it is needed —
+    // the window closed and the call still running.
     assert_eq!(
-        pill, "if huddle_joined && huddle_channel == active_channel && huddle_popped",
-        "the header pill draws only while the dock cannot: the huddle is in its own window"
+        pill, "if huddle_joined && huddle_channel == active_channel",
+        "the pill is gated on the window again, so a closed window has no way back"
     );
     let components = inlined(include_str!("../ui/components/huddle.ice"));
     assert!(
@@ -2409,59 +2187,5 @@ fn the_account_card_gates_founding_and_the_last_key() {
     assert!(
         gate_line.contains("account_keys <= 1"),
         "the last key is never offered for removal: {gate_line}"
-    );
-}
-
-/// THE TWO NUMBERS THE FLOATING HUDDLE IS MADE OF.
-///
-/// A layer covers what is under it unless somebody does the arithmetic, and
-/// this is the arithmetic: how far above the module's bottom edge the card
-/// sits, and how much the timeline under it gives back. They are a pair — the
-/// inset is the card's own height plus its gutter — so they are pinned
-/// together, in the crate that owns them rather than in a comment.
-#[test]
-fn the_huddle_clears_the_composer_and_the_timeline_clears_the_huddle() {
-    use crate::backend::{huddle_dock_bottom, huddle_timeline_inset};
-
-    // TWO TABS PUT A COMPOSER on their bottom edge, and its Send button is at
-    // the right end of it — exactly where a bottom-right card lands.
-    let composer_band = huddle_dock_bottom(crate::ShellTab::Chat);
-    assert_eq!(composer_band, huddle_dock_bottom(crate::ShellTab::Shell));
-    for wall in [
-        crate::ShellTab::Pages,
-        crate::ShellTab::Forge,
-        crate::ShellTab::Agents,
-        crate::ShellTab::Files,
-        crate::ShellTab::Node,
-        crate::ShellTab::Members,
-        crate::ShellTab::Governance,
-        crate::ShellTab::Settings,
-        crate::ShellTab::Explorer,
-    ] {
-        let gutter = huddle_dock_bottom(wall);
-        assert!(
-            gutter > 0.0 && gutter < composer_band,
-            "{wall:?} ends its content at the wall and takes the plain gutter"
-        );
-    }
-
-    // AND THE INSET IS THE CARD, NOT A GUESS. view.ice sizes the wrapper; this
-    // is that height plus its gutter, which is why the two are read together.
-    let view = inlined(include_str!("../ui/view.ice"));
-    assert!(
-        view.contains("box w=320.0 h=300.0"),
-        "the wrapper's size is what the inset below is computed from"
-    );
-    let docked = huddle_timeline_inset(true, false);
-    let pilled = huddle_timeline_inset(false, true);
-    assert_eq!(docked, 313.0, "300 of card and its 13 gutter");
-    assert!(
-        pilled > 0.0 && pilled < docked,
-        "a folded huddle still stands on the last row: {pilled}"
-    );
-    assert_eq!(
-        huddle_timeline_inset(false, false),
-        0.0,
-        "no card, no inset — the timeline runs to the composer"
     );
 }

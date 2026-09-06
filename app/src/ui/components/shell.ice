@@ -902,58 +902,33 @@ component WorkspaceTabs(network:str, status:str, height:i64, sync_line:str, load
               h=fill
               bg=bg
               clip=true
-            // THE HUDDLE FLOATS, AND IT FLOATS HERE. Two rules, and the second
-            // is why this stack is inside `#content` rather than around the
-            // window:
-            //
-            // 1. NOTHING REFLOWS. A huddle that took a row cell of its own
-            //    pushed the whole module sideways every time a call started —
-            //    the chat screen, sidebar and all, shifted under the reader's
-            //    pointer. A layer changes no one's width.
-            // 2. IT IS THE MODULE'S CORNER, not the window's. Over the content
-            //    box the card can never reach the nav rail or the titlebar,
-            //    and the inset that keeps it off the composer is one number
-            //    per tab (view.ice, `huddle_dock_bottom`) rather than a guess
-            //    about the whole window.
-            //
-            // What a layer cannot do is get out of the way of what is under
-            // it, so the surface it covers pays for it: the chat timeline
-            // carries a matching bottom inset while the card is up
-            // (`huddle_timeline_inset`, screens/chat.ice), which lifts its
-            // last rows clear instead of hiding them.
-            stack w=fill h=fill
-              col w=fill h=fill
-                if degraded
-                  ConnectionBanner status=status
-                slot notice
-                match tab
-                  ShellTab.chat
-                    slot chat
-                  ShellTab.shell
-                    slot shell
-                  ShellTab.pages
-                    slot pages
-                  ShellTab.forge
-                    slot forge
-                  ShellTab.agents
-                    slot agents
-                  ShellTab.files
-                    slot files
-                  ShellTab.explorer
-                    slot explorer
-                  ShellTab.node
-                    slot node
-                  ShellTab.members
-                    slot members
-                  ShellTab.governance
-                    slot governance
-                  ShellTab.settings
-                    slot settings
-              // A SLOT and not a prop, for the palette's and the bell's own
-              // reason: `WorkspaceTabs` carries no huddle state, and a
-              // TitleBar seat would both widen a signature main.rs pins and
-              // land the card on the status/bell cluster.
-              slot huddle
+            col w=fill h=fill
+              if degraded
+                ConnectionBanner status=status
+              slot notice
+              match tab
+                ShellTab.chat
+                  slot chat
+                ShellTab.shell
+                  slot shell
+                ShellTab.pages
+                  slot pages
+                ShellTab.forge
+                  slot forge
+                ShellTab.agents
+                  slot agents
+                ShellTab.files
+                  slot files
+                ShellTab.explorer
+                  slot explorer
+                ShellTab.node
+                  slot node
+                ShellTab.members
+                  slot members
+                ShellTab.governance
+                  slot governance
+                ShellTab.settings
+                  slot settings
 
       slot palette
       slot bell
