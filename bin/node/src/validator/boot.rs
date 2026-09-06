@@ -203,36 +203,56 @@ pub(super) enum CatchUp {
     Rebootstrap { retained_from: u64 },
 }
 
-/// the DETECTION predicate, over the answer to one probe request for the
-/// single frame above the recovered floor.
-///
-/// exactly ONE answer is evidence of a gap: the server's own `RangePruned`,
-/// which it computes from the first block its journal still retains. every
-/// other outcome — frames served, the "empty batch" server error a peer
-/// returns when we are already AT its tip, a transport failure while the mesh
-/// warms, no peer tracked at all — leaves this validator on its local state,
-/// exactly as before. the asymmetry is deliberate: a re-bootstrap DISCARDS a
-/// locally recovered state, so it happens only on positive proof that the
-/// state can no longer be advanced from any peer.
-pub(super) fn decide_catch_up(
+/// how many probe answers must report the gap before a recovered seat is
+/// discarded. A `RangePruned` is UNSIGNED — the answering peer computes it
+/// from its own journal and nothing binds it — so one of them is one source's
+/// word, and acting on it hands any single source the power to make an honest
+/// validator throw away its consensus state and re-sync from a stranger's
+/// boundary. The probe rotates its source between answers, so corroboration
+/// costs one more round trip and buys the attacker a second peer.
+pub(super) const RANGE_PRUNED_CORROBORATION: usize = 2;
+
+/// the gap one probe answer reports, if it reports one: the server's own
+/// `RangePruned`, which it computes from the first block its journal still
+/// retains. every other outcome — frames served, the "empty batch" server
+/// error a peer returns when we are already AT its tip, a transport failure
+/// while the mesh warms — is not evidence of a gap.
+fn gap_retained_from(
     probe: &Result<Vec<statesync::FinalizedFrame>, statesync::SyncError>,
-) -> CatchUp {
+) -> Option<u64> {
     let Err(statesync::SyncError::RangePruned {
         requested_after,
         retained_from,
     }) = probe
     else {
-        return CatchUp::Local;
+        return None;
     };
     // the server reports the lowest height it can still ANCHOR a client at
     // (its first retained block minus one), so equal is servable and only
     // strictly above is a hole.
     let our_next_frame_is_gone = retained_from > requested_after;
-    if !our_next_frame_is_gone {
+    our_next_frame_is_gone.then_some(*retained_from)
+}
+
+/// the DETECTION predicate, over every answer the probe collected.
+///
+/// the asymmetry is deliberate: a re-bootstrap DISCARDS a locally recovered
+/// state, so it happens only on [`RANGE_PRUNED_CORROBORATION`] sources' proof
+/// that the state can no longer be advanced. anything else — one lone
+/// `RangePruned`, a served batch, a transport failure, no peer tracked at all
+/// — leaves this validator on its local state. the LOWEST corroborated
+/// `retained_from` is the one reported: it is the least this node has to
+/// believe about how far the window moved.
+pub(super) fn decide_catch_up(
+    probes: &[Result<Vec<statesync::FinalizedFrame>, statesync::SyncError>],
+) -> CatchUp {
+    let gaps: Vec<u64> = probes.iter().filter_map(gap_retained_from).collect();
+    let corroborated = gaps.len() >= RANGE_PRUNED_CORROBORATION;
+    if !corroborated {
         return CatchUp::Local;
     }
     CatchUp::Rebootstrap {
-        retained_from: *retained_from,
+        retained_from: gaps.into_iter().min().expect("corroborated is non-empty"),
     }
 }
 
@@ -277,11 +297,17 @@ pub(super) struct Seat {
     pub(super) pending_boot: Option<u64>,
 }
 
-/// one probe for the frame above `floor`, re-asked — at a DIFFERENT source
-/// every time — only while the answer is a transport failure: the mesh started
-/// moments ago and a send to a peer whose link is not up yet fails immediately
-/// (no recipients), while a peer that is up but not yet serving costs a
-/// request timeout. any other answer ends it.
+/// probes for the frame above `floor`, re-asked — at a DIFFERENT source every
+/// time — while the answer is a transport failure (the mesh started moments
+/// ago and a send to a peer whose link is not up yet fails immediately, no
+/// recipients, while a peer that is up but not yet serving costs a request
+/// timeout) or a LONE `RangePruned` still short of
+/// [`RANGE_PRUNED_CORROBORATION`]. any other answer ends it.
+///
+/// the ceiling: distinctness rides the source book's rotation, not an
+/// identity check on the answer — a book with one live peer corroborates
+/// itself. the book is the member ∪ resident set, so that is a network with
+/// exactly one other node up.
 ///
 /// [`crate::constants::BOOT_PROBE_BUDGET`] expiring also ends it, on the local
 /// state — and says so at `warn`, because from there on this node is running a
@@ -292,33 +318,45 @@ async fn probe_peer_frames<C>(
     client: &C,
     floor: u64,
     label: &str,
-) -> Result<Vec<statesync::FinalizedFrame>, statesync::SyncError>
+) -> Vec<Result<Vec<statesync::FinalizedFrame>, statesync::SyncError>>
 where
     C: statesync::SyncClient + crate::blob_fetch::SourceRotate,
 {
     let deadline = clock.current() + crate::constants::BOOT_PROBE_BUDGET;
     let mut attempts = 0u32;
+    let mut answers = Vec::new();
     loop {
         let answer = statesync::fetch_frames(client, floor, floor + 1).await;
         attempts += 1;
         let mesh_not_up_yet = matches!(answer, Err(statesync::SyncError::Transport(_)));
+        let reports_a_gap = gap_retained_from(&answer).is_some();
         if !mesh_not_up_yet {
-            return answer;
+            answers.push(answer);
+            let decisive = !reports_a_gap;
+            let corroborated = answers.len() >= RANGE_PRUNED_CORROBORATION;
+            if decisive || corroborated {
+                return answers;
+            }
         }
         let budget_left = clock.current() < deadline;
         if !budget_left {
+            let reason = match answers.is_empty() {
+                true => "catch_up_probe_unanswered",
+                false => "catch_up_gap_uncorroborated",
+            };
             tracing::warn!(
                 target: "ducktape::statesync",
                 node = %label,
-                reason = "catch_up_probe_unanswered",
+                reason,
                 attempts,
                 floor,
-                "no peer answered the boot catch-up probe within its budget; \
-                 proceeding on LOCAL state without having checked this floor \
-                 against any peer — if height then never moves, this node fell \
+                answers = answers.len(),
+                "the boot catch-up probe went uncorroborated within its budget; \
+                 proceeding on LOCAL state without having confirmed this floor \
+                 against enough peers — if height then never moves, this node fell \
                  out of the retained journal window and must be re-synced"
             );
-            return answer;
+            return answers;
         }
         if attempts == 1 || attempts.is_multiple_of(8) {
             tracing::debug!(
@@ -379,8 +417,8 @@ where
     if !somebody_to_ask {
         return seat;
     }
-    let probe = probe_peer_frames(context, client, local_height, label).await;
-    let CatchUp::Rebootstrap { retained_from } = decide_catch_up(&probe) else {
+    let probes = probe_peer_frames(context, client, local_height, label).await;
+    let CatchUp::Rebootstrap { retained_from } = decide_catch_up(&probes) else {
         // THE ONE SEAM ON THE VALIDATOR RESTART LANE THAT HOLDS A SOURCE, and
         // the same helper the resident restart runs (`replica::park`) at the
         // same point in its own boot: after the replay's fold, before this
@@ -408,9 +446,23 @@ where
     // CLOSE the recovered state's substrates before the sync opens its own on
     // the same paths: `sync_all_modules` rebuilds every qmdb store under its
     // canonical partition and installs forge's container into the canonical
-    // repo, so a live handle from the stale host would be a write race.
+    // repo, so a live handle from the stale host would be a write race. what
+    // OUTLIVES the seat is its trust anchor: this validator's own recovered
+    // epoch and participant set, the only thing the served boundary can be
+    // tied back to.
+    let anchor_epoch = seat.resume_epoch;
+    let anchor_participants: Vec<Vec<u8>> = seat
+        .member_keys
+        .iter()
+        .map(|k| k.as_ref().to_vec())
+        .collect();
     drop(seat);
+    let anchor = crate::sync::serve::TrustAnchor {
+        epoch: anchor_epoch,
+        participants: &anchor_participants,
+    };
     rebootstrap(
+        anchor,
         client,
         blob_peers,
         context,
@@ -439,6 +491,7 @@ where
 /// retries, which is the retry loop this deliberately does not spell itself.
 #[allow(clippy::too_many_arguments)]
 async fn rebootstrap<C>(
+    anchor: crate::sync::serve::TrustAnchor<'_>,
     client: &C,
     blob_peers: &std::sync::RwLock<Vec<ed25519::PublicKey>>,
     context: &commonware_runtime::tokio::Context,
@@ -467,6 +520,26 @@ where
                 label,
                 "a peer pruned past this validator's floor but served no boundary to \
                  re-bootstrap from: {e}"
+            );
+        }
+    };
+    // THE TRUST CHECK, before a single byte is installed and before the seat
+    // check below reads the served list at all: `participants` decides which
+    // keys the floor is verified against, so a set nothing local vouches for
+    // makes every check under it — the seat check included — circular.
+    let floor = match crate::sync::serve::verify_manifest_floor(namespace, anchor, &boundary) {
+        Ok(cert) => Some(recovery::FloorCert {
+            epoch: boundary.epoch,
+            height: boundary.height,
+            cert,
+        }),
+        Err(e) => {
+            fatal!(
+                label,
+                "the boundary this validator must re-bootstrap from (height {}, epoch {}) is \
+                 not tied to anything this node trusts: {e}",
+                boundary.height,
+                boundary.epoch
             );
         }
     };
@@ -532,16 +605,6 @@ where
     if let Err(e) = crate::sync::serve::reopen_preflight_synced_host(&host, boundary.root_hash) {
         fatal!(label, "validator re-bootstrap preflight: {e}");
     }
-    let floor = match crate::sync::serve::verify_manifest_floor(namespace, &boundary) {
-        Ok(cert) => cert.map(|cert| recovery::FloorCert {
-            epoch: boundary.epoch,
-            height: boundary.height,
-            cert,
-        }),
-        Err(e) => {
-            fatal!(label, "validator re-bootstrap floor verify: {e}");
-        }
-    };
     // re-derive whatever the local fold could not have indexed: this is the
     // one moment a sync client exists on the validator lane, exactly as the
     // promotion seat backfills before `run_promoted` heals against the same
@@ -691,14 +754,30 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_retaining_past_our_floor_forces_a_rebootstrap() {
+    fn corroborated_pruning_past_our_floor_forces_a_rebootstrap() {
         // the #1314 shape: down two hours at height 1_000, peers retained from
-        // 8_100. no frame between them exists anywhere, so waiting is futile.
+        // 8_100. no frame between them exists anywhere, so waiting is futile —
+        // once a SECOND source says so.
         assert_eq!(
-            decide_catch_up(&pruned(1_000, 8_100)),
+            decide_catch_up(&[pruned(1_000, 8_100), pruned(1_000, 8_200)]),
             CatchUp::Rebootstrap {
+                // the least this node has to believe: the lowest corroborated
+                // window edge, never the boldest claim.
                 retained_from: 8_100
             }
+        );
+    }
+
+    /// a `RangePruned` is unsigned and discarding a recovered seat on one of
+    /// them hands any single source a state-takeover primitive: it names the
+    /// boundary the victim then re-bootstraps from.
+    #[test]
+    fn a_lone_range_pruned_stays_local() {
+        assert_eq!(decide_catch_up(&[pruned(1_000, 8_100)]), CatchUp::Local);
+        // and a second answer that is NOT a gap does not corroborate one.
+        assert_eq!(
+            decide_catch_up(&[pruned(1_000, 8_100), Ok(Vec::new())]),
+            CatchUp::Local
         );
     }
 
@@ -706,31 +785,39 @@ mod tests {
     fn a_floor_the_peer_can_still_anchor_stays_local() {
         // `retained_from` is the lowest height a client can be anchored at, so
         // EQUAL is servable — the peer's next frame is ours.
-        assert_eq!(decide_catch_up(&pruned(64, 64)), CatchUp::Local);
+        assert_eq!(
+            decide_catch_up(&[pruned(64, 64), pruned(64, 64)]),
+            CatchUp::Local
+        );
         // and a peer that pruned BELOW us is not a gap either.
-        assert_eq!(decide_catch_up(&pruned(900, 64)), CatchUp::Local);
+        assert_eq!(
+            decide_catch_up(&[pruned(900, 64), pruned(900, 64)]),
+            CatchUp::Local
+        );
     }
 
     #[test]
     fn every_non_authoritative_answer_stays_local() {
+        // nothing collected at all.
+        assert_eq!(decide_catch_up(&[]), CatchUp::Local);
         // frames served: we are inside the window.
-        assert_eq!(decide_catch_up(&Ok(Vec::new())), CatchUp::Local);
+        assert_eq!(decide_catch_up(&[Ok(Vec::new())]), CatchUp::Local);
         // the mesh has not formed yet — absence of an answer is not evidence.
         assert_eq!(
-            decide_catch_up(&Err(SyncError::Transport("no recipients".into()))),
+            decide_catch_up(&[Err(SyncError::Transport("no recipients".into()))]),
             CatchUp::Local
         );
         // "empty batch for a non-empty range": we are AT the peer's tip.
         assert_eq!(
-            decide_catch_up(&Err(SyncError::Server("empty frame batch".into()))),
+            decide_catch_up(&[Err(SyncError::Server("empty frame batch".into()))]),
             CatchUp::Local
         );
         // a module-level pruning is a different lane entirely.
         assert_eq!(
-            decide_catch_up(&Err(SyncError::Pruned {
+            decide_catch_up(&[Err(SyncError::Pruned {
                 module: "chat".into(),
                 reason: "op range".into(),
-            })),
+            })]),
             CatchUp::Local
         );
     }
@@ -744,13 +831,70 @@ mod tests {
         let executor = commonware_runtime::deterministic::Runner::default();
         executor.start(|context| async move {
             let peer = StubPeer::failing(3);
-            let answer = probe_peer_frames(&context, &peer, 1_000, "t").await;
+            let answers = probe_peer_frames(&context, &peer, 1_000, "t").await;
             // the 4th ask answered, so the loop stopped there.
             assert_eq!(peer.asked.load(Ordering::Relaxed), 4);
             // one rotation per transport failure, none after the answer.
             assert_eq!(peer.rotations.load(Ordering::Relaxed), 3);
-            assert!(matches!(answer, Err(SyncError::Server(_))));
-            assert_eq!(decide_catch_up(&answer), CatchUp::Local);
+            assert!(matches!(answers.as_slice(), [Err(SyncError::Server(_))]));
+            assert_eq!(decide_catch_up(&answers), CatchUp::Local);
+        });
+    }
+
+    /// a peer that always answers `RangePruned`. the probe must ask a SECOND
+    /// source before that answer costs this node its recovered seat.
+    #[derive(Clone)]
+    struct PruningPeer {
+        asked: Arc<AtomicU32>,
+        rotations: Arc<AtomicU32>,
+    }
+
+    impl statesync::SyncClient for PruningPeer {
+        fn request(
+            &self,
+            _req: SyncRequest,
+        ) -> impl std::future::Future<Output = Result<SyncResponse, SyncError>> + Send {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            async move {
+                Ok(SyncResponse::RangePruned {
+                    requested_after: 1_000,
+                    retained_from: 8_100,
+                })
+            }
+        }
+    }
+
+    impl crate::blob_fetch::SourceRotate for PruningPeer {
+        fn rotate_source(&self) {
+            self.rotations.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// one `RangePruned` rotates the source and re-probes; only the
+    /// corroborated pair discards the seat.
+    #[test]
+    fn a_lone_range_pruned_rotates_and_re_probes() {
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let peer = PruningPeer {
+                asked: Arc::new(AtomicU32::new(0)),
+                rotations: Arc::new(AtomicU32::new(0)),
+            };
+            let answers = probe_peer_frames(&context, &peer, 1_000, "t").await;
+            assert_eq!(answers.len(), RANGE_PRUNED_CORROBORATION);
+            assert_eq!(
+                peer.asked.load(Ordering::Relaxed),
+                RANGE_PRUNED_CORROBORATION as u32
+            );
+            // rotated BETWEEN the two asks, so the second is a different
+            // source in the book.
+            assert_eq!(peer.rotations.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                decide_catch_up(&answers),
+                CatchUp::Rebootstrap {
+                    retained_from: 8_100
+                }
+            );
         });
     }
 
@@ -765,7 +909,7 @@ mod tests {
         executor.start(|context| async move {
             let peer = StubPeer::failing(u32::MAX);
             let started = context.current();
-            let answer = probe_peer_frames(&context, &peer, 1_000, "t").await;
+            let answers = probe_peer_frames(&context, &peer, 1_000, "t").await;
             let spent = context
                 .current()
                 .duration_since(started)
@@ -774,8 +918,10 @@ mod tests {
                 spent >= crate::constants::BOOT_PROBE_BUDGET,
                 "gave up after {spent:?}, before the budget"
             );
-            assert!(matches!(answer, Err(SyncError::Transport(_))));
-            assert_eq!(decide_catch_up(&answer), CatchUp::Local);
+            // a transport failure is never collected — the probe gave up
+            // holding nothing at all.
+            assert!(answers.is_empty());
+            assert_eq!(decide_catch_up(&answers), CatchUp::Local);
         });
     }
 

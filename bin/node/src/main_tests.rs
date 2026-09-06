@@ -397,17 +397,20 @@ fn promotion_boundary_retries_when_latest_excludes_self() {
     }
 }
 
+/// `view_base` is a SERVED field, so "the boundary sits on its own epoch base"
+/// was an excuse any source could claim to be promoted with no finalization
+/// floor at all. the floor is unconditional now — a source that really is on a
+/// fresh base finalizes its next block and serves one.
 #[test]
-fn promotion_boundary_accepts_latest_at_view_base_without_floor() {
+fn promotion_boundary_refuses_a_view_base_boundary_without_a_floor() {
     let host_hash = test_root(7);
     let latest = test_manifest_with_base(12, 12, host_hash, None);
 
     match choose_promotion_boundary(host_hash, &latest, &test_me()) {
-        PromotionBoundary::Promote { boundary, source } => {
-            assert_eq!(boundary.height, 12);
-            assert_eq!(source, PromotionBoundarySource::Latest);
+        PromotionBoundary::Retry => {}
+        PromotionBoundary::Promote { .. } => {
+            panic!("a boundary served without its floor must not promote")
         }
-        PromotionBoundary::Retry => panic!("view-base latest boundary should promote"),
     }
 }
 

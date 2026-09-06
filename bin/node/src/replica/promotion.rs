@@ -49,8 +49,13 @@ pub(crate) fn joiner_manifest_fetch_retry(
     }
 }
 
+/// a boundary is promotable only with its finalization floor ON THE WIRE. the
+/// floor used to be excused when `height <= view_base` — but `view_base` is a
+/// SERVED field, so that excuse was a source's to claim, and
+/// [`crate::sync::serve::verify_manifest_floor`] refuses such a boundary
+/// outright now. one rule, one place.
 pub(crate) fn latest_boundary_has_floor(latest: &statesync::Manifest) -> bool {
-    latest.height <= latest.view_base || latest.floor_cert.is_some()
+    latest.floor_cert.is_some()
 }
 
 pub(crate) fn choose_promotion_boundary<'a>(

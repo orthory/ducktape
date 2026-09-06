@@ -487,6 +487,17 @@ pub(super) async fn park(
     // current members.
     let mut announce_targets: Vec<ed25519::PublicKey> = validators.clone();
 
+    // THE LOCAL TRUST ROOT for every boundary this node adopts off the wire.
+    // A joiner has seated nothing yet, so its anchor is the descriptor's
+    // FOUNDING set at epoch 0 — the one set covered by the genesis
+    // fingerprint, and therefore the one a source cannot rewrite.
+    let founding_participants: Vec<Vec<u8>> =
+        validators.iter().map(|k| k.as_ref().to_vec()).collect();
+    let founding_anchor = crate::sync::serve::TrustAnchor {
+        epoch: 0,
+        participants: &founding_participants,
+    };
+
     let me_bytes = signer.public_key().as_ref().to_vec();
     // the tip EPOCH latch for the channel-bank warning and the plane
     // books — the mesh itself follows GENERATIONS via `mesh_window`.
@@ -2158,6 +2169,29 @@ pub(super) async fn park(
                             continue;
                         }
                     };
+                    // THE TRUST GATE, BEFORE a byte of served state is
+                    // installed: the boundary's participant set must tie
+                    // back to this node's anchor, and its floor must
+                    // verify under that set (real quorum signatures) —
+                    // the same gate promotion runs.
+                    let floor = match verify_manifest_floor(&namespace, founding_anchor, &m) {
+                        Ok(cert) => Some(recovery::FloorCert {
+                            epoch: m.epoch,
+                            height: m.height,
+                            cert,
+                        }),
+                        Err(e) => {
+                            metrics.record_sync_retry(e.to_string());
+                            tracing::debug!(
+                                target: "ducktape::statesync",
+                                node = %label,
+                                height = m.height,
+                                error = %e,
+                                "replica boundary refused; retrying"
+                            );
+                            continue;
+                        }
+                    };
                     tracing::info!(
                         target: "ducktape::statesync",
                         node = %label,
@@ -2196,28 +2230,6 @@ pub(super) async fn park(
                     .await
                     {
                         Ok(mut host) => {
-                            // the boundary's floor must verify (real
-                            // quorum signatures) before it becomes
-                            // this journal's genesis — the same gate
-                            // promotion runs.
-                            let floor = match verify_manifest_floor(&namespace, &m) {
-                                Ok(cert) => cert.map(|cert| recovery::FloorCert {
-                                    epoch: m.epoch,
-                                    height: m.height,
-                                    cert,
-                                }),
-                                Err(e) => {
-                                    metrics.record_sync_retry(e.to_string());
-                                    tracing::debug!(
-                                        target: "ducktape::statesync",
-                                        node = %label,
-                                        height = m.height,
-                                        error = %e,
-                                        "replica boundary floor refused; retrying"
-                                    );
-                                    continue;
-                                }
-                            };
                             let mut recovery = recovery_slot
                                 .take()
                                 .expect("the journal slot is filled whenever serving is None");
@@ -2449,16 +2461,22 @@ pub(super) async fn park(
                 continue;
             }
         };
-        // a boundary PAST the epoch base needs its
-        // finalization floor served alongside, or the respawned
-        // engine would re-deliver history the synced state already
-        // contains — retry until the source's floor catches up.
-        if m.height > m.view_base && m.floor_cert.is_none() {
+        // THE TRUST GATE, before a byte of served state is installed: the
+        // participant set must tie back to this node's anchor and the
+        // finalization floor must verify under it. (a boundary served without
+        // its floor is refused here too — the respawned engine would
+        // re-deliver history the synced state already contains.) the cert
+        // itself is re-verified at the promotion boundary below, which may be
+        // a LATER manifest than this one.
+        if let Err(e) = verify_manifest_floor(&namespace, founding_anchor, &m) {
+            metrics.record_sync_retry(e.to_string());
             tracing::debug!(
                 target: "ducktape::statesync",
                 node = %label,
                 height = m.height,
-                "admitted boundary lacks its finalization floor; retrying"
+                epoch = m.epoch,
+                error = %e,
+                "admitted boundary refused; retrying"
             );
             continue;
         }
@@ -2552,12 +2570,29 @@ pub(super) async fn park(
                             "promotion boundary chosen"
                         );
                         let boundary = boundary.clone();
-                        let boundary_floor = match verify_manifest_floor(&namespace, &boundary) {
-                            Ok(floor) => floor,
-                            Err(e) => {
-                                fatal!(label, "promotion floor verify: {e}");
-                            }
-                        };
+                        let boundary_floor =
+                            match verify_manifest_floor(&namespace, founding_anchor, &boundary) {
+                                Ok(floor) => floor,
+                                // RETRY, not fatal: a boundary sitting exactly
+                                // on a fresh epoch base carries no floor to
+                                // verify yet, and the serving node leaves that
+                                // state within a block. an unanchored
+                                // participant set retries here too — the next
+                                // source may be honest, and this node still
+                                // holds nothing it would rather keep.
+                                Err(e) => {
+                                    metrics.record_sync_retry(e.to_string());
+                                    tracing::debug!(
+                                        target: "ducktape::join",
+                                        node = %label,
+                                        height = boundary.height,
+                                        epoch = boundary.epoch,
+                                        error = %e,
+                                        "promotion boundary refused; retrying"
+                                    );
+                                    continue;
+                                }
+                            };
                         tracing::debug!(
                             target: "ducktape::join",
                             from = boundary.height,
@@ -2565,10 +2600,10 @@ pub(super) async fn park(
                             frames = 0,
                             "suffix install"
                         );
-                        let floor = boundary_floor.map(|cert| recovery::FloorCert {
+                        let floor = Some(recovery::FloorCert {
                             epoch: boundary.epoch,
                             height: boundary.height,
-                            cert,
+                            cert: boundary_floor,
                         });
                         // THE LAST MOMENT A SYNC CLIENT EXISTS: `run_promoted`
                         // seats from the baton and never sees one, so the
