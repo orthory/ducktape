@@ -304,6 +304,12 @@ pub struct AgentSession {
     /// the ed25519 public key that must sign every [`RunsMsg::AgentAction`] for
     /// this run.
     pub session_key: Vec<u8>,
+    /// the node key that held the run's execution lease when the session was
+    /// opened. the lease can MOVE mid-run (a reassignment, or an expiry that
+    /// re-leases the saga), and the session's authority is the lease — so every
+    /// acting op re-reads the live holder and refuses once it stops matching
+    /// this, and the new holder may open a session of its own.
+    pub holder: Vec<u8>,
     pub opened_at: u64,
     /// how many actions this session has applied — the audit counter.
     pub actions: u32,

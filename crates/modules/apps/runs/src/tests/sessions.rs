@@ -966,3 +966,74 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
         "{err:?}"
     );
 }
+
+/// the node the lease MOVED to (a `ReassignRun`, or a saga expiry re-leasing
+/// the run on its own).
+const NEW_ASSIGNEE: [u8; 32] = [0x11; 32];
+
+#[test]
+fn a_moved_lease_strands_the_old_session_and_lets_the_new_holder_open_one() {
+    const NEW_SESSION_KEY: [u8; 32] = [0x22; 32];
+    let (mut m, registry, run_id) = with_open_session(&[ACTION_CHAT_POST_MESSAGE], &[]);
+    let reassigned = |origin: Origin| {
+        CaptureCtx::new()
+            .at(6)
+            .with_origin(origin)
+            .with_registry(&registry)
+            .with_transcript("general", transcript(2))
+            .with_lease_holder(&run_id, &NEW_ASSIGNEE)
+    };
+    let post = AgentAction::PostMessage {
+        channel_id: "general".into(),
+        text: "still here".into(),
+        thread: None,
+    };
+
+    // the ex-holder's key is still bound, and still refused: its authority was
+    // the lease, and the lease left.
+    let mut ctx = reassigned(Origin::External(SESSION_KEY.to_vec()));
+    let err = exec(&mut m, &mut ctx, &act(&run_id, post.clone())).unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("lease has moved")),
+        "{err:?}"
+    );
+    assert!(ctx.chat_msgs().is_empty(), "{:?}", ctx.chat_msgs());
+    assert_eq!(sessions(&m)[0].session_key, SESSION_KEY.to_vec());
+
+    // the node actually executing the run now opens its own session,
+    // REPLACING the stranded one.
+    let mut ctx = reassigned(Origin::External(NEW_ASSIGNEE.to_vec()));
+    exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap();
+    commit(&mut m);
+    let live = sessions(&m);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].session_key, NEW_SESSION_KEY.to_vec());
+    assert_eq!(live[0].holder, NEW_ASSIGNEE.to_vec());
+
+    // and the new holder cannot re-open on top of its own live session.
+    let mut ctx = reassigned(Origin::External(NEW_ASSIGNEE.to_vec()));
+    let err = exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("already has an open agent session")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_moved_lease_stops_the_old_session_from_delegating() {
+    let (mut m, registry, run_id) = with_open_delegating_session(2);
+    let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()))
+        .with_lease_holder(&run_id, &NEW_ASSIGNEE);
+    let err = exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&run_id, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Module(reason) if reason.contains("lease has moved")),
+        "{err:?}"
+    );
+    assert!(ctx.dispatch_msgs().is_empty());
+    assert!(delegations(&m, &run_id).is_empty());
+}

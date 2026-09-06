@@ -33,8 +33,11 @@
 //!   the dispatch names, read directly). self-authorizing,
 //!   so an automated issue-mention run works with nobody at a keyboard, and
 //!   correct cross-node, because the lease names the node really executing.
-//! - **act** — the origin must BE the bound session key. no other origin, not
-//!   even the owner's or the assignee's, may act through a session.
+//! - **act** — the origin must BE the bound session key, AND the lease must
+//!   still sit where it did when the session opened. no other origin, not even
+//!   the owner's or the assignee's, may act through a session; and a lease that
+//!   moves (reassignment, expiry) strands the old session on the spot instead
+//!   of handing an evicted node the agent's grant for the rest of the run.
 //!
 //! ## LOUD, not degraded (the deliberate divergence from the settle path)
 //!
@@ -77,9 +80,9 @@ use super::{
     DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationState, DelegationStatus, DelegationView,
     DispatchQuery, DispatchReply, Error, Lane, MAX_ACTIONS_PER_SESSION,
     MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_BYTES,
-    MAX_DELEGATIONS_PER_RUN, Origin, RunAuthority, RunsModule, SESSION_KEY_LEN, SiblingReadBudget,
-    delegated_run_id_for, delegation_id_for, dispatch_decode_reply, dispatch_encode_query,
-    dispatch_id_for, page_thread_id,
+    MAX_DELEGATIONS_PER_RUN, Origin, RunAuthority, RunsModule, SESSION_KEY_LEN,
+    SiblingReadBudget, delegated_run_id_for, delegation_id_for, dispatch_decode_reply,
+    dispatch_encode_query, dispatch_id_for, page_thread_id,
 };
 use dispatch::DispatchStatus;
 use saga::{
@@ -115,17 +118,6 @@ impl RunsModule {
         let Some(entry) = self.pending_entry(&dispatch_id).cloned() else {
             return Err(Error::Module(format!("run is not in flight: {run_id}")));
         };
-        // one session per run, first binding wins. re-opening is REFUSED rather
-        // than overwriting: the live session's key is the authority the agent is
-        // currently acting under, and a silent replace would let a second (or
-        // squatting) opener revoke it mid-run and take over its remaining
-        // budget. a lost key ends with the run — sessions are cheap, runs are
-        // bounded.
-        if self.session(&run_id).is_some() {
-            return Err(Error::Module(format!(
-                "run already has an open agent session: {run_id}"
-            )));
-        }
         // THE AUTHORIZATION: the run's own committed lease.
         let holder = self
             .lease_holder(&*ctx, &dispatch_id)
@@ -136,6 +128,23 @@ impl RunsModule {
                 "only the node holding the run's execution lease may open its agent session: {run_id}"
             )));
         }
+        // one session per LEASE, first binding wins. re-opening under the same
+        // lease is REFUSED rather than overwriting: the live session's key is
+        // the authority the agent is currently acting under, and a silent
+        // replace would let a squatting opener revoke it mid-run and take over
+        // its remaining budget. but a lease that MOVED leaves a session whose
+        // holder no longer executes anything (its acting ops refuse from that
+        // moment on, see `session_holds_lease`) — and the node genuinely
+        // running the work now must be able to open its own, or the run has no
+        // write lane at all for the rest of its life.
+        let bound_to_this_lease = self
+            .session(&run_id)
+            .is_some_and(|open| open.holder == holder);
+        if bound_to_this_lease {
+            return Err(Error::Module(format!(
+                "run already has an open agent session: {run_id}"
+            )));
+        }
         // the agent id comes from the run's COMMITTED entry, never from the
         // payload — identity is never a submitter's to assert.
         self.pending_sessions.insert(
@@ -144,6 +153,7 @@ impl RunsModule {
                 run_id,
                 agent_id: entry.agent_id,
                 session_key,
+                holder,
                 opened_at: ctx.env().consensus_time,
                 actions: 0,
             }),
@@ -177,6 +187,7 @@ impl RunsModule {
                 "only the bound session key may act for run {run_id}"
             )));
         }
+        self.session_holds_lease(&*ctx, &run_id, &session).await?;
         // the session is pruned with its run, so a live session implies a live
         // run — but the two are separate maps, and a check that costs nothing is
         // cheaper than an invariant that only holds by argument.
@@ -296,6 +307,7 @@ impl RunsModule {
                 "only the bound session key may delegate for run {run_id}"
             )));
         }
+        self.session_holds_lease(&*ctx, &run_id, &session).await?;
         let entry = self
             .pending_entry(&dispatch_id_for(&run_id))
             .cloned()
@@ -497,6 +509,30 @@ impl RunsModule {
                 ..session
             }),
         );
+        Ok(())
+    }
+
+    /// the lease the session was opened under must still BE the run's lease.
+    /// `open_agent_session` reads it once, at bind time; a lease that moves —
+    /// an explicit `ReassignRun`, or an expiry saga re-leasing on its own —
+    /// otherwise leaves the ex-holder's key bound, spending the agent's whole
+    /// grant for the rest of the run on a node that stopped executing it. the
+    /// session's authority IS the lease, so every acting op re-reads it.
+    async fn session_holds_lease(
+        &self,
+        ctx: &dyn Ctx,
+        run_id: &str,
+        session: &AgentSession,
+    ) -> Result<(), Error> {
+        let holder = self
+            .lease_holder(ctx, &dispatch_id_for(run_id))
+            .await
+            .map_err(Error::Module)?;
+        if holder != session.holder {
+            return Err(Error::Module(format!(
+                "the run's execution lease has moved; its agent session is no longer authoritative: {run_id}"
+            )));
+        }
         Ok(())
     }
 
