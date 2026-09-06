@@ -6178,11 +6178,13 @@ name = "nat-traversal"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
+ "blake3",
  "borsh",
  "commonware-codec",
  "commonware-cryptography",
  "crossbeam-channel",
  "lru 0.18.1",
+ "rand 0.8.6",
  "smallvec",
  "thiserror 2.0.18",
  "tokio",

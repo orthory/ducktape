@@ -421,3 +421,48 @@ fn a_preexisting_symlink_in_place_of_a_dir_is_replaced_on_recheckout() {
         "converged clean"
     );
 }
+
+/// a pre-existing hard link at a File path must never be written through —
+/// `checkout` replaces the directory entry (temp file + rename), it does not
+/// open and truncate the shared inode (issue #1802, sibling of #1610).
+#[test]
+fn a_preexisting_hard_link_is_not_written_through() {
+    let node = ModuleNode::new();
+    node.seed_commit(
+        None,
+        "seed",
+        vec![put_inline(
+            &format!("{PREFIX}/notes.txt"),
+            b"committed body",
+            false,
+        )],
+    )
+    .expect("seed commit");
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let outside = tempfile::tempdir().unwrap();
+    let outside_file = outside.path().join("authorized_keys");
+    fs::write(&outside_file, b"do not touch").unwrap();
+
+    // the operator's working tree has `notes.txt` hard-linked to a file
+    // outside the checkout root — same inode, two names.
+    fs::create_dir_all(root).unwrap();
+    fs::hard_link(&outside_file, root.join("notes.txt")).unwrap();
+
+    checkout(&node, root, PREFIX, None).expect("checkout converges");
+
+    // the checked-out path holds the committed bytes...
+    assert_eq!(fs::read(root.join("notes.txt")).unwrap(), b"committed body");
+    // ...and the outside file, still sharing the OLD inode, is untouched.
+    assert_eq!(
+        fs::read(&outside_file).unwrap(),
+        b"do not touch",
+        "the pre-existing inode must not be written through"
+    );
+
+    assert!(
+        duckfs_client::status::status(root).unwrap().clean,
+        "converged clean"
+    );
+}

@@ -219,6 +219,58 @@ fn scan_pages_with_cursor() {
 }
 
 #[test]
+fn scan_pages_by_byte_budget_not_just_row_count() {
+    // #1809: a page well under MAX_SCAN_LIMIT rows can still be gigabytes —
+    // duckfs stage chunks put megabyte payloads in op rows. three ~1.5 MiB
+    // rows blow the 4 MiB page budget on the third row, so a `limit` of 10
+    // still pages after 2 entries.
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    let big_payload = vec![b'x'; 3 * 1024 * 1024 / 2];
+    for h in 1..=3 {
+        store
+            .apply_block(&block(h, vec![chat_op(&big_payload)]))
+            .unwrap();
+    }
+
+    let page = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
+    assert_eq!(
+        page.entries.len(),
+        2,
+        "stops adding rows once the running total would exceed MAX_INDEX_PAGE_BYTES"
+    );
+    assert!(page.has_more);
+    let cursor = page.next_after.clone().expect("cursor when has_more");
+
+    let rest = store
+        .scan("chat", OP_PREFIX.as_bytes(), Some(cursor.as_bytes()), 10)
+        .unwrap();
+    assert_eq!(
+        rest.entries.len(),
+        1,
+        "the cursor resumes past the budget cut"
+    );
+    assert!(!rest.has_more);
+}
+
+#[test]
+fn scan_never_wedges_on_a_single_row_over_the_byte_budget() {
+    // the budget check only fires once a page already holds a row — a lone
+    // oversized row must still page out instead of returning an empty page
+    // forever.
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    let huge_payload = vec![b'x'; 5 * 1024 * 1024];
+    store
+        .apply_block(&block(1, vec![chat_op(&huge_payload)]))
+        .unwrap();
+
+    let page = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
+    assert_eq!(page.entries.len(), 1, "at least one row always ships");
+    assert!(!page.has_more);
+}
+
+#[test]
 fn an_undeclared_modules_ops_are_skipped_not_poisoned() {
     // a module admitted after boot (modules register) has no database
     // here: its ops write nothing, every declared module's watermark still
@@ -408,13 +460,11 @@ fn a_new_mapper_folds_the_op_feed_the_database_already_held() {
         store
             .apply_block(&block(2, vec![chat_op(b"two"), chat_op(b"three")]))
             .unwrap();
-        assert!(
-            store
-                .scan("chat", b"seen/", None, 10)
-                .unwrap()
-                .entries
-                .is_empty()
-        );
+        assert!(store
+            .scan("chat", b"seen/", None, 10)
+            .unwrap()
+            .entries
+            .is_empty());
     }
     let store = mapped_store(dir.path());
     // NO BARRIER HERE, ON PURPOSE. `open` waits the refold out itself, and
