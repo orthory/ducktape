@@ -4,11 +4,15 @@
 //! authenticated, so reordering, replay, or splicing across streams fails to
 //! open, and the mandatory `Final` marker makes truncation detectable. The
 //! stream key ALSO binds the request blob's nonce, so an authentic response
-//! captured for one request cannot be replayed as the answer to another
-//! (empty-body GETs have no nonce and stay unbound — a GET-for-GET response
-//! swap is the accepted residual). Path hosts (the publisher node outside the
-//! enclave, any relay) see ciphertext, and a stolen bearer alone cannot
-//! produce a sealable body; the enclave dedupes request nonces per sub.
+//! captured for one request cannot be replayed as the answer to another. A
+//! sealed session seals EVERY request, an empty body included —
+//! `seal_request`/`open_request` AEAD-seal an empty plaintext into a
+//! non-empty blob (the tag alone) just as they do a full one — so even a
+//! bodyless GET carries a real nonce and stays bound; the enclave refuses any
+//! sealed-session request that arrives without a sealed body (`server.rs`).
+//! Path hosts (the publisher node outside the enclave, any relay) see
+//! ciphertext, and a stolen bearer alone cannot produce a sealable body; the
+//! enclave dedupes request nonces per sub.
 //!
 //! The request AEAD also binds the HTTP method and path+query as associated
 //! data (`request_aad`) — a relay holding a live bearer plus a captured sealed

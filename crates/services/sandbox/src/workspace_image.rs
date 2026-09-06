@@ -151,28 +151,65 @@ pub fn build(workdir: &Path, image: &Path, bytes: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// walk `image` back out into `dest`, which is created if absent.
+/// walk `image` back out, REPLACING `dest` with the result.
+///
+/// `rdump` only ever adds: it copies the image's entries into its target and
+/// never removes an entry the target has that the image lacks. Dumping
+/// straight into `dest` would union the pre-run tree with the post-run one —
+/// every file a run deleted or renamed away would silently come back. So the
+/// dump lands in a fresh sibling directory first, and only once it succeeds
+/// does `dest` get replaced by a rename swap: a failed `rdump` leaves the
+/// pre-run tree at `dest` untouched instead of half-merged.
 pub fn read_back(image: &Path, dest: &Path) -> Result<(), String> {
     let tool = crate::host_tools::find_system_tool("debugfs")
         .ok_or_else(|| "debugfs is not on PATH; install e2fsprogs".to_string())?;
-    std::fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
-    // `rdump / <dest>` lands the image root's entries DIRECTLY in dest — no
+    let fresh = sibling(dest, "readback");
+    let _ = std::fs::remove_dir_all(&fresh);
+    std::fs::create_dir_all(&fresh).map_err(|e| format!("create {}: {e}", fresh.display()))?;
+    // `rdump / <fresh>` lands the image root's entries DIRECTLY in fresh — no
     // wrapper directory. Verified on a real tree: the round trip is
     // byte-identical, modes included, once `lost+found` is dropped.
     let out = Command::new(&tool)
         .arg("-R")
-        .arg(format!("rdump / {}", dest.display()))
+        .arg(format!("rdump / {}", fresh.display()))
         .arg(image)
         .output()
         .map_err(|e| format!("run debugfs: {e}"))?;
     if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&fresh);
         return Err(format!(
             "debugfs exited with {}: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    drop_lost_found(dest)
+    drop_lost_found(&fresh)?;
+    swap_in(dest, &fresh)
+}
+
+/// `<dest>-<tag>`, alongside `dest` rather than inside it so the swap below is
+/// a same-filesystem rename, not a cross-device copy.
+fn sibling(dest: &Path, tag: &str) -> PathBuf {
+    let mut name = dest
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".{tag}"));
+    dest.with_file_name(name)
+}
+
+/// replace `dest` with `fresh`: `dest` → `<dest>.pre`, `fresh` → `dest`,
+/// then drop `.pre`. A failure past this point leaves `.pre` on disk rather
+/// than losing the pre-run tree.
+fn swap_in(dest: &Path, fresh: &Path) -> Result<(), String> {
+    let pre = sibling(dest, "pre");
+    let _ = std::fs::remove_dir_all(&pre);
+    if dest.exists() {
+        std::fs::rename(dest, &pre).map_err(|e| format!("stash {}: {e}", dest.display()))?;
+    }
+    std::fs::rename(fresh, dest).map_err(|e| format!("install {}: {e}", dest.display()))?;
+    let _ = std::fs::remove_dir_all(&pre);
+    Ok(())
 }
 
 /// build the per-run READ-ONLY asset image: the context doc, the skills tree,
@@ -555,6 +592,52 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["only.txt".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The regression this fix closes: `read_back` must REPLACE `dest`, not
+    /// merge into it. The image is built from a tree where the guest already
+    /// deleted `b` (a `git rm`, a "remove dead code" run); `dest` is the
+    /// ORIGINAL pre-run checkout, which still has `a` and `b` both. A naive
+    /// `rdump` into `dest` only adds entries, so `b` would survive the round
+    /// trip even though the guest removed it — read_back must make `dest`
+    /// match the image exactly.
+    #[test]
+    fn read_back_replaces_the_destination_instead_of_merging() {
+        if !have_e2fsprogs() {
+            return;
+        }
+        let root = scratch("replace-not-merge");
+
+        // The pre-run checkout: what `dest` looks like before the run.
+        let dest = root.join("dest");
+        std::fs::create_dir_all(&dest).expect("dest");
+        std::fs::write(dest.join("a.txt"), b"keep").expect("a");
+        std::fs::write(dest.join("b.txt"), b"delete me").expect("b");
+
+        // The post-run guest tree: same as dest, minus `b` — the guest deleted
+        // it during the run. This is what gets built into the image.
+        let guest = root.join("guest");
+        std::fs::create_dir_all(&guest).expect("guest");
+        std::fs::write(guest.join("a.txt"), b"keep").expect("a");
+
+        let image = root.join("ws.img");
+        build(&guest, &image, sized_for(&guest).expect("size")).expect("build");
+
+        read_back(&image, &dest).expect("read back");
+
+        let mut names: Vec<String> = std::fs::read_dir(&dest)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["a.txt".to_string()],
+            "b.txt must not come back: read_back replaces dest, it does not merge into it"
+        );
+        assert_eq!(std::fs::read(dest.join("a.txt")).expect("a back"), b"keep");
 
         let _ = std::fs::remove_dir_all(&root);
     }

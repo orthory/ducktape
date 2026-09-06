@@ -1461,6 +1461,7 @@ test files_write_bar_clears_the_crumb_bar
         preview_picture=fs_preview_picture
         preview_width=fs_preview_width
         preview_height=fs_preview_height
+        write_refusal=files_write_gate(fs_path, settings_user_key)
       events
         open_message_link -> open_message_link _
         fs_open_dir -> fs_open_dir _

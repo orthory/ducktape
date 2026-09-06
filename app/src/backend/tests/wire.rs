@@ -313,7 +313,8 @@ async fn a_huddles_roster_names_the_node_keys_its_media_is_admitted_by() {
     .await;
 
     let mine = me.public_key().as_ref().to_vec();
-    let (_channel, roster) = load_channel_facts(&rpc, "eng", Some(&mine))
+    let names = NameDirectory::default();
+    let (_channel, roster) = load_channel_facts(&rpc, "eng", ChatReader::new(Some(&mine), &names))
         .await
         .expect("the huddle's channel reads back")
         .expect("the huddle's channel is on this node");

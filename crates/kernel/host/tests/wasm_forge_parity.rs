@@ -23,9 +23,14 @@ use forge::{
 use host::{BlockContext, CapturePayloads, Host, MemberOutcome};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use sha2::{Digest as _, Sha256};
-use wasm_host::WasmModule;
+use wasm_host::{CompiledModule, WasmModule};
 
 const FORGE: &str = "forge";
+
+/// the chain id BOTH runtimes are constructed with — natively as a
+/// `with_chain_id` builder call, on the wasm side through the odb-served
+/// genesis config (`crate::guest`'s `shape().config`, #1773).
+const CHAIN_ID: &str = "test-chain";
 
 /// forge's SYNC surface as the host publishes it at a boundary: one
 /// self-contained container, never a resolver lane. independent of the disk
@@ -57,7 +62,8 @@ const FORGE_WASM: &[u8] = include_bytes!("fixtures/forge.component.wasm");
 fn native_host(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> Host {
     let forge = Forge::with_blobs(FORGE, dir.path().join(FORGE), blobs)
         .expect("open native forge")
-        .with_chat(CHAT);
+        .with_chat(CHAT)
+        .with_chain_id(CHAIN_ID);
     Host::genesis(vec![
         Box::new(forge),
         Box::new(Recorder::new(CHAT)),
@@ -67,12 +73,17 @@ fn native_host(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> Host {
 }
 
 /// the wasm `forge` tenant: the forge guest over a `ForgeOdbBacking` on `dir`
-/// — the exact `WasmModule::with_odb` composition bin/node uses — beside the
-/// SAME two native siblings.
+/// — the exact `WasmModule::over_odb` composition `noded::compose` uses,
+/// carrying the SAME chain id `noded::compose`'s `odb_genesis_config` would
+/// resolve from the network's bindings — beside the SAME two native siblings.
 fn wasm_forge(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> WasmModule {
     let backing =
         ForgeOdbBacking::open(FORGE, dir.path().join(FORGE), blobs).expect("open odb backing");
-    WasmModule::with_odb(FORGE, FORGE_WASM, Box::new(backing)).expect("load component")
+    let config = sdk::genesis_config::encode_config(&[("chain_id", CHAIN_ID.as_bytes())]);
+    CompiledModule::compile(FORGE_WASM)
+        .expect("compile component")
+        .over_odb(FORGE, Box::new(backing), Some(config))
+        .expect("load component")
 }
 
 fn wasm_host(dir: &tempfile::TempDir, blobs: blobstore::BlobHandle) -> Host {
@@ -760,4 +771,53 @@ fn a_wasm_tenant_without_the_pack_reaches_the_same_root_then_catches_up() {
         materialized,
         "the caught-up substrate serves the same tree"
     );
+}
+
+// ============================================================================
+// #1773 — the push-certificate chain check, on both runtimes
+// ============================================================================
+
+/// a `git push --signed` certificate is checked against THIS network's chain
+/// id identically whether forge runs native or wasm: a certificate minted for
+/// a different chain is refused on both, and one minted for this network's
+/// own id is accepted on both — proof the odb-served genesis config actually
+/// reaches [`forge::pushcert::signer`] through the guest, not just the root.
+#[test]
+fn a_push_certificate_checks_the_chain_id_identically_on_both_runtimes() {
+    use forge::PushCert;
+    use keyscheme::sshsig::GIT_SSH_NS;
+    use keyscheme::testkit::{ssh_key, sshsig};
+
+    let dir_n = tempfile::tempdir().unwrap();
+    let dir_w = tempfile::tempdir().unwrap();
+    let mut native = native_host(&dir_n, blobstore::BlobHandle::default());
+    let mut wasm = wasm_host(&dir_w, blobstore::BlobHandle::default());
+
+    let sk = ssh_key(1);
+    let certified = |chain_id: &str| {
+        let updates = vec![RefUpdate {
+            ref_name: "main".into(),
+            prev_oid: None,
+            new_oid: Some(vec![7u8; 20]),
+        }];
+        let cert_text =
+            forge::pushcert::certificate(&forge::pushcert::nonce(chain_id, REPO), &updates);
+        op(&ForgeMsg::PushRefs {
+            repo: REPO.into(),
+            updates,
+            pack_digest: Some(vec![9u8; 32]),
+            cert: Some(PushCert {
+                sshsig: sshsig(&sk, GIT_SSH_NS, &cert_text),
+                cert: cert_text,
+            }),
+        })
+    };
+
+    // a certificate minted for a DIFFERENT chain is refused on both runtimes.
+    let rejected = certified("some-other-chain");
+    assert!(!submit_both(&mut native, &mut wasm, 1, stranger(), rejected));
+
+    // this network's own chain id is accepted on both.
+    let accepted = certified(CHAIN_ID);
+    assert!(submit_both(&mut native, &mut wasm, 2, stranger(), accepted));
 }

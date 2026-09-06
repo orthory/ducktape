@@ -9,7 +9,7 @@
 use crate::interface::PrDiff;
 use crate::tracker_iface::{ItemDetail, ItemState, ItemSummary, ReviewVerdict};
 use crate::{ForgeMsg, decode_msg};
-use chat::client::{AuthorNames, ChatBlock, author_handle, author_name, paragraph_blocks};
+use chat::client::{ChatBlock, NameDirectory, author_display, author_handle, paragraph_blocks};
 
 /// One tracker listing row.
 #[derive(Clone, Debug, Hash, PartialEq, Default)]
@@ -27,7 +27,7 @@ pub struct ItemRow {
 
 /// Listing rows from the committed summaries: the wire lists ascending by
 /// number, the tracker renders newest first.
-pub fn item_rows(items: &[ItemSummary], names: &AuthorNames) -> Vec<ItemRow> {
+pub fn item_rows(items: &[ItemSummary], names: &NameDirectory) -> Vec<ItemRow> {
     items
         .iter()
         .rev()
@@ -38,7 +38,7 @@ pub fn item_rows(items: &[ItemSummary], names: &AuthorNames) -> Vec<ItemRow> {
                 kind: kind_key(item.kind).into(),
                 state: state_key(item.state).into(),
                 title: item.title.clone(),
-                author_name: author_name(&handle, names),
+                author_name: author_display(&handle, names),
                 author: handle,
             }
         })
@@ -141,7 +141,7 @@ fn body_blocks(body: &str) -> Vec<ChatBlock> {
 /// Build the item pane's view model from the committed detail + its pinned
 /// diff (PRs with a locally-computable patch; `None` for issues and for
 /// diff-query misses).
-pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>, names: &AuthorNames) -> ItemView {
+pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>, names: &NameDirectory) -> ItemView {
     let source_oid = diff.map(|d| d.source_oid.clone()).unwrap_or_default();
     let author = author_handle(&detail.summary.author);
     let reviews: Vec<ReviewRow> = detail
@@ -150,7 +150,7 @@ pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>, names: &AuthorNames
         .map(|review| {
             let handle = author_handle(&review.author);
             ReviewRow {
-                author_name: author_name(&handle, names),
+                author_name: author_display(&handle, names),
                 author: handle,
                 verdict: verdict_key(review.verdict).into(),
                 blocks: body_blocks(&review.body),
@@ -186,7 +186,7 @@ pub fn item_view(detail: &ItemDetail, diff: Option<&PrDiff>, names: &AuthorNames
         title: detail.summary.title.clone(),
         blocks: body_blocks(&detail.body),
         body: detail.body.clone(),
-        author_name: author_name(&author, names),
+        author_name: author_display(&author, names),
         author,
         created_at: i64::try_from(detail.summary.created_at).unwrap_or(i64::MAX),
         channel_id: detail.channel_id.clone(),
@@ -359,7 +359,7 @@ mod tests {
                 ),
             ]),
             Some(&diff()),
-            &AuthorNames::default(),
+            &NameDirectory::default(),
         );
         assert_eq!(view.kind, "pr");
         assert_eq!(view.state, "open");
@@ -390,7 +390,7 @@ mod tests {
         detail.body = "see [the plan](duck://page/plan?net=d0cdf950)".into();
         detail.reviews[0].body = "context at https://ducktape.industries/x".into();
         detail.reviews[0].comments[0].body = "also [#58](duck://forge/lab/58)".into();
-        let view = item_view(&detail, None, &AuthorNames::default());
+        let view = item_view(&detail, None, &NameDirectory::default());
 
         let links = |blocks: &[ChatBlock]| -> Vec<String> {
             blocks
@@ -421,7 +421,7 @@ mod tests {
                 review(0xbb, ReviewVerdict::Comment, head),
             ]),
             Some(&diff()),
-            &AuthorNames::default(),
+            &NameDirectory::default(),
         );
         assert_eq!(view.approvals, 1, "the re-review supersedes");
         assert_eq!(view.change_requests, 0);
@@ -433,7 +433,7 @@ mod tests {
         plain.summary.kind = ItemKind::Issue;
         plain.source_branch = None;
         plain.target_branch = None;
-        let view = item_view(&plain, None, &AuthorNames::default());
+        let view = item_view(&plain, None, &NameDirectory::default());
         assert_eq!(view.kind, "issue");
         assert!(view.source_branch.is_empty());
         assert!(view.source_oid.is_empty());

@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use data_plane::{DataPlaneTransport, DatagramFlow, PeerId, SendError};
+use tokio::sync::watch;
 
 use super::FRAME_SAMPLES;
 use super::codec::{CodecError, VoiceDecoder, VoiceEncoder};
@@ -156,12 +157,26 @@ impl<T: DataPlaneTransport> Drop for VoiceEngine<T> {
 }
 
 impl<T: DataPlaneTransport> VoiceEngine<T> {
-    pub fn new(flow: DatagramFlow<T>, config: VoiceConfig) -> Result<Self, CodecError> {
+    /// `recipients` is the same roster watch the host session gates sends
+    /// with. The pump re-checks it on every datagram so a peer dropped from
+    /// the roster stops feeding this engine's lanes immediately, not only
+    /// once the host's periodic sweep calls `forget_peer`.
+    pub fn new(
+        flow: DatagramFlow<T>,
+        config: VoiceConfig,
+        recipients: watch::Receiver<Vec<[u8; 32]>>,
+    ) -> Result<Self, CodecError> {
         let encoder = VoiceEncoder::new(config.bitrate_bits_per_sec)?;
         let flow = Arc::new(flow);
         let lanes: Lanes = Arc::new(Mutex::new(HashMap::new()));
         let malformed = Arc::new(AtomicU64::new(0));
-        let pump = tokio::spawn(pump(flow.clone(), lanes.clone(), config, malformed.clone()));
+        let pump = tokio::spawn(pump(
+            flow.clone(),
+            lanes.clone(),
+            config,
+            malformed.clone(),
+            recipients,
+        ));
         Ok(VoiceEngine {
             flow,
             encoder,
@@ -295,9 +310,17 @@ async fn pump<T: DataPlaneTransport>(
     lanes: Lanes,
     config: VoiceConfig,
     malformed: Arc<AtomicU64>,
+    recipients: watch::Receiver<Vec<[u8; 32]>>,
 ) {
     loop {
         let (peer, bytes) = flow.recv().await;
+        // the plane's admission is a standing ACL, not this call's live
+        // roster: a peer already kicked from the huddle can still have
+        // frames sitting in the flow's queue when they pop here. Re-check
+        // the roster on every datagram so those never open or feed a lane.
+        if !recipients.borrow().contains(&peer.0) {
+            continue;
+        }
         let Ok((header, payload)) = media::decode_frame(&bytes) else {
             malformed.fetch_add(1, Ordering::Relaxed);
             continue;

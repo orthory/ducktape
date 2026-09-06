@@ -265,11 +265,37 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
     // `user:{hex}` — the previous fixture invented prefixed entries and
     // asserted a compare no real roster row could satisfy.
     let me = [0xaau8; 32];
+    let my_passkey = [0xacu8; 32];
     let peer = [0xbbu8; 32];
+    // A seat taken with the person's passkey is the person's: the directory
+    // binds both keys to one account, and the roster recognises it.
+    let names = NameDirectory::new(BTreeMap::from([
+        (
+            hex_encode(&me),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&my_passkey),
+            BoundAccount {
+                number: 1,
+                name: "me".into(),
+            },
+        ),
+        (
+            hex_encode(&peer),
+            BoundAccount {
+                number: 2,
+                name: "peer".into(),
+            },
+        ),
+    ]));
     let roster = huddle_roster(
         &[
             chat::index::HuddleEntry {
-                user: hex_encode(&me),
+                user: hex_encode(&my_passkey),
                 node: "0a0a".into(),
                 joined_at: 10,
             },
@@ -279,12 +305,12 @@ fn the_huddle_roster_marks_the_row_this_device_holds() {
                 joined_at: 20,
             },
         ],
-        Some(&me),
-        &AuthorNames::default(),
+        ChatReader::new(Some(&me), &names),
     );
     assert_eq!(roster.len(), 2);
     assert!(roster[0].is_you && !roster[0].is_agent);
     assert!(!roster[1].is_you && !roster[1].is_agent);
+    assert_eq!(roster[0].label, "me");
     assert!(huddle_self(roster.clone()));
     assert!(!huddle_self(vec![roster[1].clone()]));
     // The fan-out the live session polls for is this roster's NODE keys with

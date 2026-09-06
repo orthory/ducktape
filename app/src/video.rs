@@ -378,8 +378,11 @@ pub(crate) fn store_preview(rgba: Vec<u8>, width: u32, height: u32) {
 /// "highest frame rate, then the HIGHEST resolution" (nokhwa-core `types.rs`),
 /// so a 720p/1080p webcam negotiated a mode whose q60 JPEG overran the mesh's
 /// ~126 KiB `MAX_FRAME_BYTES` and whose RGBA blew iced's 2 MiB upload cliff —
-/// both read as blinking. A camera with no VGA mode falls back to that same
-/// request and the capture shrink brings its frames onto the identical budget.
+/// both read as blinking. A camera that has no VGA mode, or refuses it, gets
+/// the largest mode INSIDE the capture budget instead ([`open_within_budget`]):
+/// every frame is shrunk onto that budget anyway, so a bigger mode only buys
+/// a bigger decode — a 1080p JPEG per frame at the camera's top rate is a
+/// whole core, and it bought nothing the wire could carry.
 ///
 /// A refusal turns the toggle back off and surfaces as "live · camera: …"
 /// through the status fold; the caller has nothing to decide.
@@ -392,9 +395,8 @@ fn open_camera(
     let vga = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::HighestResolution(
         Resolution::new(640, 480),
     ));
-    let any = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
     match nokhwa::Camera::new(CameraIndex::Index(0), vga)
-        .or_else(|_| nokhwa::Camera::new(CameraIndex::Index(0), any))
+        .or_else(|_| open_within_budget())
         .and_then(|mut device| device.open_stream().map(|()| device))
     {
         Ok(device) => Some(device),
@@ -403,6 +405,56 @@ fn open_camera(
             None
         }
     }
+}
+
+/// The camera in the largest mode that fits [`CAPTURE_PIXEL_BUDGET`], at that
+/// mode's highest frame rate — the same rule the VGA request states, applied
+/// to whatever modes the device actually offers. The device is probed at any
+/// mode nokhwa will open and re-set BEFORE the stream starts, so no frame is
+/// ever decoded at the probe's size.
+fn open_within_budget() -> Result<nokhwa::Camera, nokhwa::NokhwaError> {
+    use nokhwa::pixel_format::RgbAFormat;
+    use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
+
+    let probe = RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+    let mut device = nokhwa::Camera::new(CameraIndex::Index(0), probe)?;
+    let formats = device.compatible_camera_formats()?;
+    if let Some(format) = budget_format(&formats, CAPTURE_PIXEL_BUDGET) {
+        device.set_camera_requset(RequestedFormat::new::<RgbAFormat>(
+            RequestedFormatType::Exact(format),
+        ))?;
+    }
+    Ok(device)
+}
+
+/// Among the modes the capture can decode: the largest inside `budget` pixels
+/// at its highest frame rate; when none fits, the smallest mode there is, at
+/// its highest rate — the capture shrink brings that one onto the budget.
+fn budget_format(
+    formats: &[nokhwa::utils::CameraFormat],
+    budget: u32,
+) -> Option<nokhwa::utils::CameraFormat> {
+    use nokhwa::pixel_format::{FormatDecoder as _, RgbAFormat};
+    use nokhwa::utils::CameraFormat;
+
+    let pixels = |format: &CameraFormat| format.width() * format.height();
+    let decodable: Vec<CameraFormat> = formats
+        .iter()
+        .copied()
+        .filter(|format| RgbAFormat::FORMATS.contains(&format.format()))
+        .collect();
+    let largest_within_budget = decodable
+        .iter()
+        .copied()
+        .filter(|format| pixels(format) <= budget)
+        .max_by_key(|format| (pixels(format), format.frame_rate()));
+    let smallest_of_all = || {
+        decodable
+            .iter()
+            .copied()
+            .min_by_key(|format| (pixels(format), std::cmp::Reverse(format.frame_rate())))
+    };
+    largest_within_budget.or_else(smallest_of_all)
 }
 
 /// A source that will not open: say why on the session's status line, and put
@@ -425,9 +477,9 @@ fn refuse_source(
 /// X11 AND PURE RUST ON PURPOSE. `x11rb` is already in this binary (winit
 /// draws through it), so the desktop costs no new dependency, no C toolchain
 /// and no build-time system library — which the portal/pipewire route would
-/// cost on every machine that builds this app, to buy a Wayland path this app
-/// cannot use anyway: iced is built here with the `x11` feature and no
-/// `wayland`, so the app itself is an X client.
+/// cost on every machine that builds this app. The app itself runs natively
+/// on either display server; a share is an X11-session feature, and a
+/// Wayland session is refused below rather than grabbed.
 // ponytail: the WHOLE root window, so a multi-head desktop shares every head
 // at once — a per-monitor or per-window picker is the obvious next step and
 // wants a picker UI, not a different capture.
@@ -643,8 +695,10 @@ pub(crate) fn capture_thread(
             continue;
         }
         if !open.is(wanted) {
-            // Whatever was open is dropped HERE, by the assignment — a device
-            // is never held for a source nobody asked for.
+            // Whatever was open is released BEFORE the next source opens — a
+            // device is never held for a source nobody asked for, and a camera
+            // still streaming for the old one refuses the new open as busy.
+            drop(std::mem::replace(&mut open, Open::None));
             open = open_source(wanted, &events);
             continue;
         }
@@ -931,6 +985,43 @@ mod tests {
             &tile.handle,
             iced::widget::image::Handle::Rgba { pixels, .. } if pixels.len() == 64 * 48 * 4
         ));
+    }
+
+    /// THE FALLBACK NEVER DECODES BIGGER THAN THE BUDGET. A camera that refuses
+    /// VGA used to be opened at its fastest mode at its highest resolution —
+    /// every frame a 1080p JPEG decode that the shrink then threw most of away.
+    #[test]
+    fn the_camera_fallback_is_the_largest_mode_inside_the_budget() {
+        use nokhwa::utils::{CameraFormat, FrameFormat, Resolution};
+        let mode = |w: u32, h: u32, fps: u32, format: FrameFormat| {
+            CameraFormat::new(Resolution::new(w, h), format, fps)
+        };
+        let webcam = [
+            mode(1920, 1080, 60, FrameFormat::MJPEG),
+            mode(1280, 720, 60, FrameFormat::MJPEG),
+            mode(640, 360, 30, FrameFormat::MJPEG),
+            mode(640, 360, 60, FrameFormat::MJPEG),
+            mode(320, 240, 60, FrameFormat::YUYV),
+            // a format the capture cannot decode is never a candidate
+            mode(640, 480, 60, FrameFormat::GRAY),
+        ];
+        assert_eq!(
+            budget_format(&webcam, CAPTURE_PIXEL_BUDGET),
+            Some(mode(640, 360, 60, FrameFormat::MJPEG)),
+            "the largest mode inside the budget, at its highest rate"
+        );
+        // Nothing inside the budget: the smallest mode there is, at its
+        // highest rate — the shrink brings it onto the budget.
+        let big = [
+            mode(1920, 1080, 30, FrameFormat::MJPEG),
+            mode(1280, 720, 30, FrameFormat::MJPEG),
+            mode(1280, 720, 60, FrameFormat::MJPEG),
+        ];
+        assert_eq!(
+            budget_format(&big, CAPTURE_PIXEL_BUDGET),
+            Some(mode(1280, 720, 60, FrameFormat::MJPEG))
+        );
+        assert_eq!(budget_format(&[], CAPTURE_PIXEL_BUDGET), None);
     }
 
     #[test]

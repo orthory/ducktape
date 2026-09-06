@@ -153,6 +153,27 @@ fn clear_wrong_kind(disk: &Path, want: EntryKind) -> Result<(), CheckoutError> {
     }
 }
 
+/// write `bytes` to `disk` without ever writing through whatever inode
+/// currently sits at that path: assemble into a sibling temp name in the same
+/// directory, then `rename` over `disk`. `rename` replaces the directory
+/// entry atomically — a pre-existing hard link to a file outside the checkout
+/// root is never opened, truncated, or chmod'd, and a crash mid-write leaves
+/// the old (or nothing, on first checkout) content instead of a torn file.
+fn write_file_atomic(disk: &Path, bytes: &[u8], mode: u32) -> Result<(), CheckoutError> {
+    let file_name = disk
+        .file_name()
+        .ok_or_else(|| CheckoutError::Io(format!("{}: no file name", disk.display())))?;
+    let tmp = disk.with_file_name(format!(
+        ".{}.duckfs-tmp-{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, bytes).map_err(io)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(io)?;
+    std::fs::rename(&tmp, disk).map_err(io)?;
+    Ok(())
+}
+
 /// build every directory component of `parent` (which must be under `root`,
 /// already created), replacing a symlink or wrong-kind entry encountered along
 /// the way instead of writing through it — `create_dir_all` alone follows a
@@ -265,10 +286,8 @@ pub fn checkout_with(
                 let bytes = read_all(api, &entry.path, resolved.as_deref(), entry.size)?;
                 verify(entry, &bytes)?;
                 clear_wrong_kind(&disk, EntryKind::File)?;
-                std::fs::write(&disk, &bytes).map_err(io)?;
                 let mode = if entry.exec { 0o755 } else { 0o644 };
-                std::fs::set_permissions(&disk, std::fs::Permissions::from_mode(mode))
-                    .map_err(io)?;
+                write_file_atomic(&disk, &bytes, mode)?;
                 let (secs, nanos) = mtime_of(&disk)?;
                 recorded.insert(
                     entry.path.clone(),

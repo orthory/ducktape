@@ -253,17 +253,6 @@ pub(crate) fn registry_active_workspace() -> Option<String> {
     demo_registry()?.get("active")?.as_str().map(str::to_string)
 }
 
-/// The active workspace's name, from the CLI's registry. The app and
-/// the CLI name the same workspace, so the titlebar says `demo`, not an IP.
-fn active_workspace_name() -> Option<String> {
-    let workspace = registry_active_entry()?;
-    workspace
-        .get("name")
-        .or_else(|| workspace.get("id"))
-        .and_then(|name| name.as_str())
-        .map(str::to_string)
-}
-
 /// The active workspace's http endpoint, from the same registry the titlebar
 /// name comes from. This is what makes a bare `make dev` connect: with no
 /// `DUCKTAPE_NODE` and an empty endpoint field the app fell back to a
@@ -594,27 +583,22 @@ pub async fn forget_workspace(rpc: String) -> Result<bool, AppError> {
     Ok(write_prefs(&prefs))
 }
 
-/// The titlebar's chain label: the workspace serving the CONNECTED endpoint
-/// (the launch window may have picked any known network, so the registry's
-/// `active` cannot answer), then the demo registry's name, then the bound
-/// account, then the endpoint's host, then the product name.
-pub fn network_label(account_name: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
-    let connected = workspace_at(rpc.as_ref()).map(|(chain_id, _)| {
-        let named = chain_id.split('#').next().unwrap_or_default();
-        match named.is_empty() {
-            true => chain_id,
-            false => named.to_string(),
-        }
-    });
-    if let Some(workspace) = connected {
-        return workspace;
-    }
-    if let Some(workspace) = active_workspace_name() {
-        return workspace;
-    }
-    let named = account_name.as_ref().trim();
+/// The titlebar's network label: the NAME PART of the connected node's chain
+/// id (`name#hash`), the one fact every member of a network shares. Until the
+/// node has said which chain it serves, the endpoint's host stands in, and
+/// with no endpoint the product name does.
+///
+/// Nothing device-local feeds this: the CLI registry only knows the
+/// workspaces this machine created, and an account name is one person's,
+/// not the network's.
+pub fn network_label(chain_id: impl AsRef<str>, rpc: impl AsRef<str>) -> String {
+    let chain_id = chain_id.as_ref().trim();
+    let named = chain_id.split('#').next().unwrap_or_default();
     if !named.is_empty() {
         return named.to_string();
+    }
+    if !chain_id.is_empty() {
+        return chain_id.to_string();
     }
     let host = rpc
         .as_ref()
