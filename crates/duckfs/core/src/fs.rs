@@ -24,7 +24,7 @@ use crate::wire::{
     HISTORY_WINDOW, MAX_CHANGES_PER_COMMIT, MAX_CHUNKS_PER_FILE, MAX_GREP_SCAN_BYTES,
     MAX_INLINE_COMMIT_BYTES, MAX_MESSAGE_BYTES, MAX_META_ENTRIES, MAX_META_KEY_BYTES,
     MAX_META_VALUE_BYTES, MAX_OBJECT_READS_PER_OP, MAX_PIN_NAME_BYTES, MAX_PINS,
-    MAX_REFS_IMAGE_BYTES, MAX_STAGING_ENTRIES, MAX_STAGING_ENTRIES_PER_OWNER,
+    MAX_PINS_PER_OWNER, MAX_REFS_IMAGE_BYTES, MAX_STAGING_ENTRIES, MAX_STAGING_ENTRIES_PER_OWNER,
     MAX_SYMLINK_TARGET_BYTES, MAX_SYNC_IDS, MAX_SYNC_REPLY_BYTES, MAX_WATCH_MODULE_ID_BYTES,
     MAX_WATCHES, STAGING_QUOTA_BYTES, STAGING_TTL_BLOCKS, SyncObject, from_hex_32, to_hex,
 };
@@ -520,6 +520,19 @@ impl<S: ObjectStore> Fs<S> {
         }
         if pending.refs.pins.contains_key(&name) {
             return Err("files: pin name already exists".into());
+        }
+        // per-owner share of the global table (mirrors putblob's staging-entry
+        // cap): without it one owner fills MAX_PINS and every other member's pin
+        // — the operator's included — gets "pin table is full" forever, since
+        // only the squatter (or system) may unpin.
+        let owner_pins = pending
+            .refs
+            .pins
+            .values()
+            .filter(|p| p.owner == actor)
+            .count();
+        if owner_pins >= MAX_PINS_PER_OWNER {
+            return Err("files: pin quota exceeded".into());
         }
         // the id must hex-parse AND resolve in the PENDING view (head, window, or an
         // already-pinned id). a gc'd / unknown id is unpinnable — naming an

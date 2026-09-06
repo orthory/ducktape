@@ -681,6 +681,9 @@ mod tests {
         fn pin(&self, _: &str, _: &str) -> Result<(), ApiError> {
             unimplemented!()
         }
+        fn unpin(&self, _: &str) -> Result<(), ApiError> {
+            unimplemented!()
+        }
     }
 
     fn paths(list: &[&str]) -> BTreeSet<String> {

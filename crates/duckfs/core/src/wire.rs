@@ -58,6 +58,14 @@ pub const MAX_SYMLINK_TARGET_BYTES: usize = 4096;
 pub const STAGING_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
 pub const STAGING_TTL_BLOCKS: u64 = 4096;
 pub const MAX_PINS: usize = 1024;
+/// one owner's share of [`MAX_PINS`] — the pin-table analogue of
+/// [`MAX_STAGING_ENTRIES_PER_OWNER`]. without it, one owner can fill the whole
+/// global table (a permanent gc root each), refusing every other member's pin
+/// and — since staging quota is reclaimed at commit — parking unbounded bytes
+/// out of gc forever via {stage → commit → pin head} loops. 1024 / 32 = 32,
+/// mirroring the staging table's ratio (65_536 / 4096 = 16) at a size that
+/// still leaves room for many owners.
+pub const MAX_PINS_PER_OWNER: usize = MAX_PINS / 32;
 /// the global staging-table entry ceiling — [`MAX_PINS`] × 64 = 65_536. it is a
 /// consensus constant shared by BOTH the canonical decode and the execute path:
 /// [`decode_refs`](crate::state::decode_refs) rejects any refs image whose

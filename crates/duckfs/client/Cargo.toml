@@ -16,6 +16,11 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
+# percent-encode a pin name into the DELETE /v1/files/pin/{name} path segment —
+# already in the tree transitively (the `url` crate reqwest pulls in), pinned
+# here directly so the encoding is explicit rather than borrowed off reqwest's
+# internals.
+percent-encoding = "2"
 # `.duckfsignore` pattern matching. glob is already in the tree (a transitive
 # dep) and `matches_with(require_literal_separator)` IS gitignore's `*`-stops-at-
 # a-slash rule — a hand-rolled matcher would be the same semantics, badly.

@@ -12,7 +12,7 @@ use duckfs_client::http::HttpNode;
 use duckfs_client::index::Index;
 
 use crate::fs_cli::args::{CliError, NodeAddr, resolve_node};
-use crate::fs_cli::{CheckoutArgs, CommitArgs, PinArgs, StatusArgs};
+use crate::fs_cli::{CheckoutArgs, CommitArgs, PinArgs, StatusArgs, UnpinArgs};
 
 /// resolve the node for a verb running inside `dir`: the shared addressing
 /// ladder, with this checkout's `.duckfs` index as the ambient context rung —
@@ -175,5 +175,21 @@ pub fn pin(args: PinArgs) -> Result<(), CliError> {
         ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
     })?;
     println!("pinned {} as {}", args.snapshot, args.name);
+    Ok(())
+}
+
+/// `unpin <name>` — release a pin so gc can reclaim it once nothing else roots
+/// it. owner-gated at the module: only the pin's creator or `system` may
+/// release it.
+pub fn unpin(args: UnpinArgs) -> Result<(), CliError> {
+    use duckfs_client::api::{ApiError, NodeApi};
+
+    let node = signing_node(&args.addr, Path::new("."), args.key, args.trust_node)?;
+    node.unpin(&args.name).map_err(|e| match e {
+        ApiError::NotFound => CliError::failed("pin not found"),
+        ApiError::Rejected(m) => CliError::failed(m),
+        ApiError::Transport(m) => CliError::failed(format!("cannot reach the node: {m}")),
+    })?;
+    println!("unpinned {}", args.name);
     Ok(())
 }

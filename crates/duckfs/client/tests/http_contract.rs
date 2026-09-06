@@ -189,6 +189,22 @@ fn commit_posts_snake_case_and_parses_camelcase_block() {
 }
 
 #[test]
+fn unpin_deletes_the_percent_encoded_pin_path() {
+    let stub = Stub::new(|_method, _path, _body| (200, serde_json::json!({ "height": 9 })));
+    let node = HttpNode::new(stub.url());
+
+    // a name with a byte the path can't carry raw ('/') round-trips through
+    // percent-encoding rather than becoming an extra path segment.
+    node.unpin("a/b").expect("unpin ok");
+
+    let reqs = stub.requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].method, "DELETE");
+    assert_eq!(reqs[0].path, "/v1/files/pin/a%2Fb");
+    assert!(reqs[0].body.is_empty(), "DELETE carries no body");
+}
+
+#[test]
 fn a_400_error_envelope_surfaces_as_rejected_verbatim() {
     let stub = Stub::new(|_method, _path, _body| {
         (

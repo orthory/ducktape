@@ -234,4 +234,9 @@ impl NodeApi for ActorNodeApi {
         }))?;
         Ok(())
     }
+
+    fn unpin(&self, name: &str) -> Result<(), ApiError> {
+        self.submit(encode_msg(&FilesMsg::Unpin { name: name.into() }))?;
+        Ok(())
+    }
 }

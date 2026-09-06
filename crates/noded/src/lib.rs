@@ -724,6 +724,7 @@ pub fn router(handle: NodeHandle) -> Router {
         )
         .route("/v1/files/commit", post(files_commit))
         .route("/v1/files/pin", post(files_pin))
+        .route("/v1/files/pin/{name}", delete(files_unpin))
         .route("/v1/files/watch", post(files_watch))
         .route("/v1/files/stat", get(files_stat))
         .route("/v1/files/ls", get(files_ls))
