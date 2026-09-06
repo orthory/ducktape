@@ -347,8 +347,16 @@ fn push_may_carry_proof(commands: &[Vec<u8>], has_operator: bool) -> bool {
 /// of the certificate — its text, then the armored signature — one pkt-line
 /// each WITH its newline, then `push-cert-end`; the ref updates are inside
 /// the certificate, and the plain lines are not sent. `expected_nonce` is
-/// what this node advertised: a certificate must echo it (the chain half of
-/// the nonce is checked here, the repo half by consensus).
+/// what this node advertised: a certificate must echo it EXACTLY (both the
+/// chain half and the repo half). this check is only a front door — a
+/// certificate never has to pass through it to reach consensus (any account
+/// with `/v1/submit/frame` standing can carry one straight past this
+/// function), so it does not by itself bound what a validator will accept.
+/// consensus checks the repo half unconditionally (`pushcert::nonce_names_repo`)
+/// and, since #1761, pins its own network's chain half the first time it ever
+/// sees a verified one (`Tracker::accepted_chain`) — see the `pushcert`
+/// module doc for why that pin, not a chain-id check here, is the strictest
+/// gate reachable from inside forge today.
 fn parse_push_commands(
     commands: &[Vec<u8>],
     expected_nonce: Option<&str>,
