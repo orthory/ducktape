@@ -382,7 +382,11 @@ impl AgentModule {
 
     /// deregistration's authority check: the recorded owner, or governance —
     /// [`Self::owned_agent`] with the governance escape hatch added.
-    async fn deregistrable_agent(&self, ctx: &dyn Ctx, agent_id: &str) -> Result<AgentRecord, Error> {
+    async fn deregistrable_agent(
+        &self,
+        ctx: &dyn Ctx,
+        agent_id: &str,
+    ) -> Result<AgentRecord, Error> {
         let origin = &ctx.env().origin;
         let Some(record) = self.agent(agent_id).await? else {
             return Err(Error::Module(format!("unknown agent: {agent_id}")));
@@ -1144,7 +1148,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, Error::Module(_)));
         abort(&mut m);
-        assert!(get_agent(&m, "bot").is_some(), "the refused op staged nothing");
+        assert!(
+            get_agent(&m, "bot").is_some(),
+            "the refused op staged nothing"
+        );
 
         let mut owner_ctx = ctx_at(2, user(9));
         exec(
@@ -1170,7 +1177,10 @@ mod tests {
         let mut ctx = ctx_at(3, user(1));
         exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
         commit(&mut m);
-        assert_eq!(get_agent(&m, "bot").unwrap().owner, canonical_origin(&user(1)));
+        assert_eq!(
+            get_agent(&m, "bot").unwrap().owner,
+            canonical_origin(&user(1))
+        );
     }
 
     /// governance may deregister an agent it does not own — the escape hatch
@@ -1203,7 +1213,12 @@ mod tests {
         let mut m = module();
         for i in 0..MAX_AGENTS_PER_OWNER {
             let mut ctx = ctx_at(0, user(9));
-            exec(&mut m, &mut ctx, &admin(&register(&format!("a{i:04}"), &[]))).unwrap();
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register(&format!("a{i:04}"), &[])),
+            )
+            .unwrap();
         }
         commit(&mut m);
 
@@ -1314,7 +1329,12 @@ mod tests {
         let owners = MAX_REGISTERED_AGENTS / MAX_AGENTS_PER_OWNER;
         for i in 0..MAX_REGISTERED_AGENTS {
             let mut ctx = ctx_at(0, user((i % owners) as u8));
-            exec(&mut m, &mut ctx, &admin(&register(&format!("a{i:04}"), &[]))).unwrap();
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register(&format!("a{i:04}"), &[])),
+            )
+            .unwrap();
         }
         let mut ctx = ctx_at(0, user(owners as u8));
         let err = exec(&mut m, &mut ctx, &admin(&register("overflow", &[]))).unwrap_err();
