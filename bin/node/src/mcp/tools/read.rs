@@ -358,7 +358,19 @@ fn files_read(run: &Run, args: &Value) -> Result<Value> {
 /// cap, so each hit's own path is re-checked against the SAME predicate before
 /// it reaches the agent — closing the sibling-path leak without narrowing
 /// grep's textual-prefix search for callers that rely on it (the raw
-/// `/v1/files/grep` route has no cap at all).
+/// `/v1/files/grep` route has no cap at all). `prefix` itself is sent to
+/// duckfs UNCHANGED, deliberately: widening it to segment form
+/// (`/shared/team` -> `/shared/team/`) would close the sibling-scan at the
+/// source, but it would also silently empty a legitimate call whose `prefix`
+/// names one exact file rather than a directory (grep only matches a file
+/// candidate with `child == prefix || child.starts_with(prefix)`, and no
+/// file path ends in `/`). `retain_capped_hits` and `scrub_uncapped_cursor`
+/// below already re-check every hit and the resume cursor against the cap
+/// regardless of what duckfs scanned, so nothing outside the cap can reach
+/// the agent either way — a `next` cursor is a resume path, not a hit: #1663
+/// scrubbed `hits` but left `next` verbatim, so a page that runs out of
+/// budget mid-scan of an out-of-cap sibling could still hand back that
+/// sibling's path.
 fn files_grep(run: &Run, args: &Value) -> Result<Value> {
     let prefix = arg_str(args, "prefix")?;
     let pattern = arg_str(args, "pattern")?;
@@ -368,6 +380,7 @@ fn files_grep(run: &Run, args: &Value) -> Result<Value> {
         .node
         .files("grep", &[("pattern", pattern), ("prefix", prefix)])?;
     retain_capped_hits(&record, &mut reply);
+    scrub_uncapped_cursor(&record, &mut reply);
     Ok(reply)
 }
 
@@ -382,6 +395,30 @@ fn retain_capped_hits(record: &agent::AgentRecord, reply: &mut Value) {
             .and_then(Value::as_str)
             .is_some_and(|path| record.permits(&CapRequest::DuckfsRead(path)))
     });
+}
+
+/// a resume cursor the cap does not cover names a path in a sibling tree the
+/// agent may not read at all (the same leak `retain_capped_hits` closes for
+/// `hits`, #1755). Fall back to the last RETAINED hit's own path — still a
+/// valid resume point inside the cap — or drop `next` entirely when no hit
+/// survived filtering. A no-op if the reply carries no `next` cursor already.
+fn scrub_uncapped_cursor(record: &agent::AgentRecord, reply: &mut Value) {
+    // no cursor (missing key, or an explicit `null` meaning "no more pages")
+    // is nothing to scrub.
+    let Some(next) = reply.get("next").and_then(Value::as_str) else {
+        return;
+    };
+    if record.permits(&CapRequest::DuckfsRead(next)) {
+        return;
+    }
+    let fallback = reply
+        .get("hits")
+        .and_then(Value::as_array)
+        .and_then(|hits| hits.last())
+        .and_then(|hit| hit.get("path"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    reply["next"] = fallback;
 }
 
 fn gate_forge_read(run: &Run, repo: &str) -> Result<()> {
@@ -710,14 +747,10 @@ mod tests {
         );
     }
 
-    /// #1663: grep's own matcher is a raw string prefix (`/shared/team` also
-    /// matches `/shared/team-secrets/...`), but the cap it is gated on is
-    /// segment-boundary. A hit from a sibling path that only shares a textual
-    /// prefix with the capped one must be dropped before the reply reaches the
-    /// agent, while a hit truly under the cap must survive.
-    #[test]
-    fn grep_hits_outside_the_segment_boundary_cap_are_dropped() {
-        let record = agent::AgentRecord {
+    /// a record capped to `duckfs_read = ["/shared/team"]`, shared by the grep
+    /// cap tests below.
+    fn team_capped_record() -> agent::AgentRecord {
+        agent::AgentRecord {
             agent_id: "bot".into(),
             owner: saga::SagaOrigin::External(vec![9; 32]),
             display_name: "BOT".into(),
@@ -733,7 +766,17 @@ mod tests {
                 ..Default::default()
             },
             skills: vec![],
-        };
+        }
+    }
+
+    /// #1663: grep's own matcher is a raw string prefix (`/shared/team` also
+    /// matches `/shared/team-secrets/...`), but the cap it is gated on is
+    /// segment-boundary. A hit from a sibling path that only shares a textual
+    /// prefix with the capped one must be dropped before the reply reaches the
+    /// agent, while a hit truly under the cap must survive.
+    #[test]
+    fn grep_hits_outside_the_segment_boundary_cap_are_dropped() {
+        let record = team_capped_record();
         let mut reply = json!({
             "hits": [
                 {"path": "/shared/team/notes.txt", "line": 1, "text": "ok", "locator": "l1"},
@@ -749,5 +792,86 @@ mod tests {
             .map(|h| h["path"].as_str().unwrap())
             .collect();
         assert_eq!(paths, vec!["/shared/team/notes.txt"]);
+    }
+
+    /// #1755: a `next` cursor naming a path outside the cap (the sibling tree
+    /// `/shared/team-secrets/...`, reached because duckfs' grep walk prefixes
+    /// on a raw string) must never reach the agent — it is replaced with the
+    /// last retained hit's own path so the agent can still resume inside its
+    /// cap.
+    #[test]
+    fn an_uncapped_resume_cursor_is_replaced_by_the_last_retained_hit() {
+        let record = team_capped_record();
+        let mut reply = json!({
+            "hits": [
+                {"path": "/shared/team/a.txt", "line": 1, "text": "x", "locator": "l1"},
+            ],
+            "next": "/shared/team-secrets/creds.txt",
+        });
+        retain_capped_hits(&record, &mut reply);
+        scrub_uncapped_cursor(&record, &mut reply);
+        assert_eq!(reply["next"], json!("/shared/team/a.txt"));
+    }
+
+    /// same as above but no hit survived the cap filter at all: `next` is
+    /// dropped (set to `null`) rather than handed back uncovered.
+    #[test]
+    fn an_uncapped_resume_cursor_with_no_retained_hits_is_dropped() {
+        let record = team_capped_record();
+        let mut reply = json!({
+            "hits": [
+                {"path": "/shared/team-secrets/creds.txt", "line": 1, "text": "aws_secret=x", "locator": "l2"},
+            ],
+            "next": "/shared/team-secrets/creds.txt",
+        });
+        retain_capped_hits(&record, &mut reply);
+        scrub_uncapped_cursor(&record, &mut reply);
+        assert_eq!(reply["hits"].as_array().unwrap().len(), 0);
+        assert_eq!(reply["next"], Value::Null);
+    }
+
+    /// a resume cursor genuinely inside the cap survives untouched.
+    #[test]
+    fn a_capped_resume_cursor_survives() {
+        let record = team_capped_record();
+        let mut reply = json!({
+            "hits": [
+                {"path": "/shared/team/a.txt", "line": 1, "text": "x", "locator": "l1"},
+            ],
+            "next": "/shared/team/b.txt",
+        });
+        retain_capped_hits(&record, &mut reply);
+        scrub_uncapped_cursor(&record, &mut reply);
+        assert_eq!(reply["next"], json!("/shared/team/b.txt"));
+    }
+
+    /// `prefix` is never widened before it reaches duckfs: a cap (and a call)
+    /// naming one exact FILE, not a directory, must still see its own hit and
+    /// keep a cursor that resumes at that same file — `retain_capped_hits`'s
+    /// `p == pre` exact-match arm (mirroring `AgentRecord::permits`) covers
+    /// this without any prefix rewriting.
+    #[test]
+    fn a_cap_naming_one_exact_file_still_sees_its_own_hit_and_cursor() {
+        let record = agent::AgentRecord {
+            caps: agent::ResourceCaps {
+                duckfs_read: vec!["/shared/team/a.txt".into()],
+                ..Default::default()
+            },
+            ..team_capped_record()
+        };
+        let mut reply = json!({
+            "hits": [
+                {"path": "/shared/team/a.txt", "line": 1, "text": "x", "locator": "l1"},
+            ],
+            "next": "/shared/team/a.txt",
+        });
+        retain_capped_hits(&record, &mut reply);
+        scrub_uncapped_cursor(&record, &mut reply);
+        assert_eq!(
+            reply["hits"].as_array().unwrap().len(),
+            1,
+            "the exact-file hit must survive"
+        );
+        assert_eq!(reply["next"], json!("/shared/team/a.txt"));
     }
 }
