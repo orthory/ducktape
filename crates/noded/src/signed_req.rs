@@ -279,6 +279,14 @@ pub struct SignedBy(pub Vec<u8>);
 /// self-authenticating `/v1/submit/frame`, the volatile service-hello, the
 /// websocket upgrades, and `/v1/admin/*` (which carries its own gate).
 ///
+/// Two of those websocket upgrades are NOT actually unauthenticated:
+/// `/v1/call/ws` and `/v1/presence/ws` (`crate::call`) stay `Open` here — this
+/// gate is PoP-by-signature, and a live huddle/page has no acting key to sign
+/// with — but each checks its own `?token=` query param against this node's
+/// workspace secret before `on_upgrade`, the same [`Admission::Workspace`]
+/// proof `/v1/ws`'s gated topics already ask for (see
+/// `crate::stream::Admission`).
+///
 /// the ONE route family that mutates and is NOT here is the forge's
 /// `git-receive-pack`: `git push` cannot attach a header of its own, so its
 /// proof is git's OWN push certificate (`git push --signed`), refused inside
