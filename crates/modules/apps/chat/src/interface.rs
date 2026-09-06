@@ -305,6 +305,25 @@ pub enum ChatQuery {
     },
     /// global message-id lookup — the id-collision probe.
     Message { message_id: String },
+    /// what ONE external user may do in ONE channel — the standing a module
+    /// acting on that user's behalf must gate on. chat owns the answer so a
+    /// caller never carries a second copy of the admission rule.
+    Access { channel_id: String, user: Vec<u8> },
+}
+
+/// chat's answer to [`ChatQuery::Access`]: one user's standing in one channel.
+/// an unknown channel answers `false` to both — a caller fails closed on a
+/// channel that does not exist.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelAccess {
+    /// the user may see the channel's messages: a member, or any authenticated
+    /// user when the channel is [`PostPolicy::Open`]. archival does not close
+    /// reading.
+    pub may_read: bool,
+    /// the user's own `PostMessage` would be admitted — chat's post gate
+    /// verbatim, so an archived or members-only channel answers `false`.
+    pub may_post: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -313,6 +332,7 @@ pub enum ChatReply {
     Channel(Option<Channel>),
     Messages(Vec<MessageView>),
     Message(Option<MessageView>),
+    Access(ChannelAccess),
 }
 
 /// the hook notification payload: one follow-up [`sdk::Msg`]-shaped dispatch

@@ -89,6 +89,18 @@ fn post(channel: &str, message_id: &str, text: &str, thread: Option<u64>) -> Cha
     }
 }
 
+/// one user's standing in one channel, as the dispatch probe reads it.
+async fn access(module: &Chat, channel: &str, byte: u8) -> chat::ChannelAccess {
+    let req = ChatQuery::Access {
+        channel_id: channel.into(),
+        user: vec![byte; 32],
+    };
+    match query(module, req).await {
+        ChatReply::Access(access) => access,
+        other => panic!("expected Access, got {other:?}"),
+    }
+}
+
 async fn query(module: &Chat, req: ChatQuery) -> ChatReply {
     let reply = module.query(&encode_query(&req)).await.unwrap();
     decode_reply(&reply).unwrap()
@@ -2333,5 +2345,76 @@ fn users_cannot_archive_module_namespaced_channels() {
         )
         .await;
         assert_eq!(seqs(&reply), vec![1, 2]);
+    });
+}
+
+/// the standing probe a module acting on a user's behalf reads: chat answers
+/// what that ONE user may do in ONE channel, so the caller never carries a
+/// second copy of the admission rule. an absent channel is closed.
+#[test]
+fn access_answers_one_users_standing_from_chats_own_gates() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        // an absent channel is closed: the caller fails closed on it.
+        let absent = access(&module, "ghost", 1).await;
+        assert!(!absent.may_read && !absent.may_post);
+
+        // an OPEN channel admits any authenticated user, member or not.
+        module
+            .execute(
+                &mut ctx_with_origin(10, user(1)),
+                &module_msg(create_channel("open")),
+            )
+            .await
+            .unwrap();
+        // a MEMBERS-ONLY channel admits only its roster — owning is not
+        // membership, exactly as the post gate has it.
+        module
+            .execute(
+                &mut ctx_with_origin(11, user(1)),
+                &module_msg(ChatMsg::CreateChannel {
+                    channel_id: "core".into(),
+                    name: "Core".into(),
+                    post_policy: PostPolicy::MembersOnly,
+                }),
+            )
+            .await
+            .unwrap();
+        module
+            .execute(
+                &mut ctx_with_origin(12, user(1)),
+                &module_msg(ChatMsg::SetMembership {
+                    channel_id: "core".into(),
+                    user: vec![2; 32],
+                    member: true,
+                }),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        let stranger_open = access(&module, "open", 9).await;
+        assert!(stranger_open.may_read && stranger_open.may_post);
+        let owner_core = access(&module, "core", 1).await;
+        assert!(
+            !owner_core.may_read && !owner_core.may_post,
+            "owning is not membership"
+        );
+        let member_core = access(&module, "core", 2).await;
+        assert!(member_core.may_read && member_core.may_post);
+
+        // archiving closes POSTING (the post gate, verbatim) and leaves
+        // reading open.
+        module
+            .execute(
+                &mut ctx_with_origin(13, user(1)),
+                &module_msg(set_archived("core", true)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+        let archived = access(&module, "core", 2).await;
+        assert!(archived.may_read, "archival does not close reading");
+        assert!(!archived.may_post, "an archived channel takes no posts");
     });
 }
