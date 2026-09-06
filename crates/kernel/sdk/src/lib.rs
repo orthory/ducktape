@@ -618,8 +618,15 @@ pub trait Ctx {
 /// commitment, and the byte-level sync serve surface.
 #[async_trait::async_trait(?Send)]
 pub trait MerkleStore {
-    /// read one hashed key from COMMITTED state.
+    /// Read one hashed key from this store's current view. A guest adapter
+    /// includes the host's block overlay; a durable store exposes committed state.
     async fn get(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error>;
+
+    /// Read the state frozen at the preceding block boundary, bypassing any
+    /// host overlay. Durable stores already expose this view through `get`.
+    async fn get_committed(&self, key: &[u8; ROOT_LEN]) -> Result<Option<Vec<u8>>, Error> {
+        self.get(key).await
+    }
 
     /// apply + durably commit ONE batch of hashed-key writes (`None` = delete)
     /// at a block boundary. after this returns, [`MerkleStore::root`] reflects
@@ -650,7 +657,7 @@ pub trait MerkleStore {
 /// `query` routing), which would make a `Send` future impossible anyway.
 #[async_trait::async_trait(?Send)]
 pub trait Module {
-    /// this module's genesis-assigned id (e.g. "documents", "forge").
+    /// this module's assigned id (e.g. "documents", "forge").
     fn id(&self) -> ModuleId;
 
     /// the module's current authenticated root. called by the host to fold into
@@ -740,6 +747,22 @@ pub trait Module {
         )))
     }
 
+    /// Initialize a newly installed module from caller-supplied parameters.
+    /// The same hook runs for initial membership and later admission; reopen
+    /// and code replacement preserve state and do not initialize it again.
+    /// Initialization must be idempotent: a refused admission boundary or an
+    /// interrupted genesis composition can retry against its prepared store.
+    async fn initialize(&mut self, _params: &[u8]) -> Result<(), Error> {
+        Ok(())
+    }
+
+    /// Flush an adapter's operation-local writes into the host's block overlay.
+    /// Modules with block-finalization logic override this to flush writes only:
+    /// the guest's finalization export invokes `commit_block` once per block.
+    async fn flush_operation(&mut self) -> Result<(), Error> {
+        self.commit_block().await
+    }
+
     /// read-only projection serving other modules' [`Ctx::query`]. async, so a
     /// qmdb-backed module can serve a real read (`self.db.get(..).await`). defaults
     /// to [`Error::QueryUnsupported`] for modules with no read path.
@@ -823,27 +846,34 @@ pub trait Module {
         None
     }
 
-    /// this module's currently-running CODE identity: the 32-byte content hash
-    /// (sha256) of the component bytes it will execute, or `None` for a native
-    /// module whose code IS the node binary (nothing to hot-swap). the host
-    /// reconciles this against the code registry's committed active hash to
-    /// decide whether a boundary swap is needed — a cheap hash compare, so it
-    /// re-instantiates a component only on an actual change, never every block.
-    /// NEVER a consensus input: code is invisible to `root()` (state, not code,
-    /// composes the root-hash), so this is per-node realization bookkeeping only.
+    /// SHA-256 of the running deployment (component plus optional mapper).
+    /// The host binds this alongside the module's state root into the global
+    /// root, so a checkpoint authenticates the code needed to reopen it.
+    /// Native test harness modules return `None`.
     fn code_hash(&self) -> Option<Vec<u8>> {
         None
     }
 
-    /// hot-swap this module's executable CODE in place, KEEPING its host-owned
-    /// state — the live-update primitive. the host calls this at a code-registry
-    /// activation boundary AFTER it has fetched the out-of-band component bytes
-    /// and verified `sha256(bytes)` equals the consensus-committed hash; because
-    /// durable state is untouched, `root()` is unchanged and the root-hash stays
-    /// continuous across the swap. the default is unsupported — only the wasm
-    /// runtime module overrides it (a native module cannot swap its code).
-    fn swap_code(&mut self, _component_bytes: &[u8]) -> Result<(), Error> {
+    /// The optional mapper belonging to the currently running deployment.
+    /// The host exposes it to the derived tier at the same activation boundary
+    /// as the consensus component. It never executes inside consensus.
+    fn index_guest(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// Compile and validate a replacement without changing the running module.
+    /// The returned action installs it infallibly, preserving host-owned state.
+    /// Dropping the action cancels the replacement. This lets the host prepare
+    /// every swap before applying any part of an activation boundary.
+    fn prepare_swap(&mut self, _artifact_bytes: &[u8]) -> Result<Box<dyn FnOnce() + '_>, Error> {
         Err(Error::SwapUnsupported)
+    }
+
+    /// Replace the deployment at a clean block boundary. State stays intact;
+    /// the host's global root changes because it also binds the deployment hash.
+    fn swap_code(&mut self, artifact_bytes: &[u8]) -> Result<(), Error> {
+        self.prepare_swap(artifact_bytes)?();
+        Ok(())
     }
 }
 

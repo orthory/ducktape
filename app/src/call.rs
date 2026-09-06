@@ -234,12 +234,25 @@ pub fn call_session(rpc: String, channel_id: String) -> BoxStream<'static, CallE
     Box::pin(events_rx)
 }
 
-fn ws_url(rpc: &str, channel_id: &str) -> String {
+/// The upgrade itself is what the hub admits, so the workspace secret rides
+/// the query string: the same `service-link.token` the `/v1/ws` subscribe
+/// presents, because the call socket hands out live mic and camera bytes and
+/// the node gates those on proof of reading its own workspace.
+fn ws_url(rpc: &str, channel_id: &str, token: &str) -> String {
     let base = rpc.trim_end_matches('/');
     let base = base
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
-    format!("{base}/v1/call/ws?channel={channel_id}")
+    format!("{base}/v1/call/ws?channel={channel_id}&token={token}")
+}
+
+/// This node's workspace secret, found the way the agent stream finds it:
+/// the registered workspace whose endpoint is `rpc`. A node with no local
+/// workspace cannot be called into — the hub refuses every socket without it.
+fn workspace_secret(rpc: &str) -> Result<String, String> {
+    let (_, workspace) = crate::backend::workspace_at(rpc)
+        .ok_or_else(|| "this node has no local workspace, so its call hub cannot admit this device".to_string())?;
+    crate::backend::read_link_token(&workspace)
 }
 
 async fn run_session(
@@ -248,7 +261,16 @@ async fn run_session(
     mut events: iced::futures::channel::mpsc::UnboundedSender<CallEvent>,
 ) {
     let _ = events.send(CallEvent::of("connecting")).await;
-    let url = ws_url(&rpc, &channel_id);
+    let token = match workspace_secret(&rpc) {
+        Ok(token) => token,
+        Err(reason) => {
+            let _ = events
+                .send(CallEvent::failed("error", format!("call socket: {reason}")))
+                .await;
+            return;
+        }
+    };
+    let url = ws_url(&rpc, &channel_id, &token);
     let connected = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         tokio_tungstenite::connect_async(&url),
@@ -994,14 +1016,14 @@ mod tests {
     }
 
     #[test]
-    fn ws_url_swaps_scheme_only() {
+    fn ws_url_swaps_scheme_only_and_carries_the_workspace_secret() {
         assert_eq!(
-            ws_url("http://127.0.0.1:8844/", "eng"),
-            "ws://127.0.0.1:8844/v1/call/ws?channel=eng"
+            ws_url("http://127.0.0.1:8844/", "eng", "s3cret"),
+            "ws://127.0.0.1:8844/v1/call/ws?channel=eng&token=s3cret"
         );
         assert_eq!(
-            ws_url("https://node.example", "general"),
-            "wss://node.example/v1/call/ws?channel=general"
+            ws_url("https://node.example", "general", "s3cret"),
+            "wss://node.example/v1/call/ws?channel=general&token=s3cret"
         );
     }
 }

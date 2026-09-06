@@ -76,20 +76,17 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
-use sha2::{Digest as _, Sha256};
+use commonware_cryptography::{Verifier as _, ed25519};
 
 use crate::NodeHandle;
 
-/// PoP signing namespace for the mutating data plane.
-pub const DATA_REQ_NS: &[u8] = b"ducktape-data-req-v1";
-
-/// hex ed25519 public key (32 bytes) of the acting identity.
-pub const KEY_HEADER: &str = "x-ducktape-key";
-/// decimal unix seconds the request was signed at.
-pub const TS_HEADER: &str = "x-ducktape-ts";
-/// hex ed25519 signature (64 bytes) over the canonical request bytes.
-pub const SIG_HEADER: &str = "x-ducktape-sig";
+/// the CLIENT half — the namespace, the header trio, the canonical message
+/// and the signing — lives with the kernel's frame codec so every signer in
+/// the tree links the one spelling the daemon verifies against.
+pub use ::node::signed_req::{
+    DATA_REQ_NS, KEY_HEADER, SIG_HEADER, TS_HEADER, now_secs, request_headers, request_message,
+    sign_request,
+};
 
 /// the header trio one namespace's PoP travels in. control and data use
 /// different names so a control credential can never be replayed onto a data
@@ -118,14 +115,6 @@ pub const FRESHNESS_SECS: u64 = 30;
 /// filter string. Spelled here because the middleware runs OUTSIDE the route's
 /// layers and so cannot read the limit they install.
 const DEFAULT_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
-
-/// wall-clock seconds since the Unix epoch (saturating before 1970).
-pub(crate) fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PopError {
@@ -186,74 +175,6 @@ pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
-}
-
-/// the canonical bytes a data-plane request's PoP signs / verifies: method,
-/// path+query, the TARGET NODE's consensus key, the timestamp, and the sha256
-/// of the BODY. the body digest is what the control plane's message omits, and
-/// it is the difference that matters here: these routes carry the payload the
-/// mutation applies, so a signature that did not cover it would authenticate a
-/// caller while leaving an attacker free to swap what they wrote.
-///
-/// PUBLIC so a client signs the exact bytes the node verifies — one source of
-/// truth, never a reconstruction.
-pub fn request_message(
-    method: &str,
-    path_and_query: &str,
-    node_key: &[u8],
-    ts: u64,
-    body: &[u8],
-) -> Vec<u8> {
-    let digest = Sha256::digest(body);
-    let digest = digest.as_slice();
-    let mut m = Vec::with_capacity(method.len() + path_and_query.len() + node_key.len() + 45);
-    m.extend_from_slice(method.as_bytes());
-    m.push(0x1f);
-    m.extend_from_slice(path_and_query.as_bytes());
-    m.push(0x1f);
-    m.extend_from_slice(node_key);
-    m.push(0x1f);
-    m.extend_from_slice(&ts.to_be_bytes());
-    m.push(0x1f);
-    m.extend_from_slice(digest);
-    m
-}
-
-/// sign one data-plane request with an acting key, bound to the target node.
-pub fn sign_request(
-    signer: &ed25519::PrivateKey,
-    method: &str,
-    path_and_query: &str,
-    node_key: &[u8],
-    ts: u64,
-    body: &[u8],
-) -> ed25519::Signature {
-    signer.sign(
-        DATA_REQ_NS,
-        &request_message(method, path_and_query, node_key, ts, body),
-    )
-}
-
-/// the three headers a client attaches to a mutating request, ready to set
-/// verbatim. every in-tree writer goes through THIS — a second place that
-/// spells the trio is a second place to get the binding wrong.
-pub fn request_headers(
-    signer: &ed25519::PrivateKey,
-    method: &str,
-    path_and_query: &str,
-    node_key: &[u8],
-    body: &[u8],
-) -> [(&'static str, String); 3] {
-    let ts = now_secs();
-    let sig = sign_request(signer, method, path_and_query, node_key, ts, body);
-    [
-        (
-            KEY_HEADER,
-            duckfs_core::to_hex(signer.public_key().as_ref()),
-        ),
-        (TS_HEADER, ts.to_string()),
-        (SIG_HEADER, duckfs_core::to_hex(sig.as_ref())),
-    ]
 }
 
 /// the mark [`signed_write_guard`] puts on a request that arrived from a
@@ -330,10 +251,12 @@ enum Authority {
 
 /// the exact mutating POST paths that mutate the NODE rather than module state:
 /// `/v1/log-filter` retunes this process's tracing filter (a `trace` fills the
-/// operator's disk through `daemon.log`) and `/v1/invite` mints a bearer right
-/// to join this mesh for up to a year. neither handler reads [`SignedBy`],
-/// which is exactly why neither may be admitted on possession alone.
-const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite"];
+/// operator's disk through `daemon.log`), `/v1/invite` mints a bearer right to
+/// join this mesh for up to a year, and `/v1/huddle/node-proof` signs with
+/// THIS node's own mesh-identity key — none of which is a module write any
+/// acting key should be able to ask for. neither handler reads [`SignedBy`],
+/// which is exactly why none may be admitted on possession alone.
+const NODE_LEVEL_POSTS: &[&str] = &["/v1/log-filter", "/v1/invite", "/v1/huddle/node-proof"];
 
 /// the frameless op lane. an EXACT match, not a prefix: `/v1/submit/frame`
 /// carries its own signature inside the frame and stays open, and the other
@@ -388,7 +311,18 @@ impl Lane {
                 .then_some(Authority::Acting)
                 .or(removes.then_some(Authority::Operator)),
             Lane::Object => (replaces || removes).then_some(Authority::Acting),
-            Lane::Files | Lane::Submit => posts.then_some(Authority::Acting),
+            Lane::Files => posts.then_some(Authority::Acting),
+            // `/v1/submit` is the FRAMELESS lane: unlike Files/Workspace, the
+            // verified `SignedBy` key does NOT ride on as the op's origin — the
+            // validator re-signs the framed op with ITS OWN consensus key
+            // (`bin/node/src/validator/run/ingress.rs`, `node_link.rs`), the
+            // shape the node's own daemons need for an op that must carry the
+            // NODE's identity (a capability announce, a lease bid, a run bind).
+            // possession-of-any-key was therefore enough to mint an op under
+            // the VALIDATOR's own key (#1808) — so this lane is Operator-only,
+            // and a user submits through the self-authenticating
+            // `/v1/submit/frame` instead, whose signature IS the op's origin.
+            Lane::Submit => posts.then_some(Authority::Operator),
             // a pty/microVM on the HOST, and the two fixed node mutations.
             Lane::Term | Lane::NodeLevel => posts.then_some(Authority::Operator),
             Lane::Open => None,
@@ -464,6 +398,11 @@ pub enum WriteRefusal {
     NotOperator,
     /// the body is larger than any gated route accepts (or its stream broke).
     BodyOverCap,
+    /// this node carries no consensus key to salt the signature with — an
+    /// embedded daemon binding the empty salt would verify a signature minted
+    /// for ANY such daemon, so it refuses instead of falling back to a
+    /// wildcard.
+    NodeUnidentified,
 }
 
 impl WriteRefusal {
@@ -476,6 +415,7 @@ impl WriteRefusal {
             Self::SignatureInvalid => "signature_invalid",
             Self::NotOperator => "not_operator",
             Self::BodyOverCap => "body_over_cap",
+            Self::NodeUnidentified => "node_unidentified",
         }
     }
 
@@ -491,6 +431,9 @@ impl WriteRefusal {
             | Self::SignatureInvalid => StatusCode::UNAUTHORIZED,
             Self::NotOperator => StatusCode::FORBIDDEN,
             Self::BodyOverCap => StatusCode::PAYLOAD_TOO_LARGE,
+            // this node's own condition, not a defect in what the caller
+            // presented — retrying with any signature cannot fix it.
+            Self::NodeUnidentified => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 
@@ -510,6 +453,10 @@ impl WriteRefusal {
                  credential or a signature by its operator key"
             }
             Self::BodyOverCap => "the request body is larger than this node accepts",
+            Self::NodeUnidentified => {
+                "this node has no consensus key to bind the signature to, so it cannot \
+                 verify any mutating request"
+            }
         }
     }
 }
@@ -593,9 +540,13 @@ pub(crate) async fn signed_write_guard(
         Err(_) => return refuse(&path, WriteRefusal::BodyOverCap),
     };
     // the node key SALTS the signature: a mutation signed for this node cannot
-    // be replayed against another node the same key acts on. absent on the
-    // embedded daemon (no consensus identity), which binds the empty salt.
-    let node_key = handle.admin.node_key.clone().unwrap_or_default();
+    // be replayed against another node the same key acts on. an embedded
+    // daemon with no consensus identity has nothing to salt with — refuse
+    // rather than bind the empty salt, which would verify a signature minted
+    // for ANY such keyless daemon.
+    let Some(node_key) = handle.admin.node_key.clone().filter(|k| !k.is_empty()) else {
+        return refuse(&path, WriteRefusal::NodeUnidentified);
+    };
     let verified = verify_pop(&headers, DATA_HEADERS, DATA_REQ_NS, now_secs(), |ts| {
         request_message(method.as_str(), &path_and_query, &node_key, ts, &body)
     });
@@ -674,6 +625,7 @@ pub(crate) fn acting_origin(signed: Option<&SignedBy>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use commonware_cryptography::Signer as _;
 
     fn key(seed: u64) -> ed25519::PrivateKey {
         ed25519::PrivateKey::from_seed(seed)
@@ -852,7 +804,6 @@ mod tests {
         let gated: &[(Method, &str, Authority)] = &[
             // module-bound: the acting key rides on as `SignedBy` and the
             // module decides.
-            (Method::POST, "/v1/submit", Authority::Acting),
             (Method::POST, "/v1/fs/workspaces", Authority::Acting),
             (
                 Method::POST,
@@ -878,6 +829,9 @@ mod tests {
             // self-chosen key must not be enough.
             (Method::POST, "/v1/log-filter", Authority::Operator),
             (Method::POST, "/v1/invite", Authority::Operator),
+            // the frameless op lane: the framed op is re-signed as the NODE,
+            // never the caller (#1808), so it takes the same operator-only bar.
+            (Method::POST, "/v1/submit", Authority::Operator),
             (Method::DELETE, "/v1/fs/workspaces/abc", Authority::Operator),
             (Method::POST, "/v1/term/sessions", Authority::Operator),
             (
@@ -957,6 +911,41 @@ mod tests {
         assert!(cap("/v1/files/stage") < cap("/v1/files/object/shared/a.bin"));
     }
 
+    /// the embedded-daemon shape this refusal exists for: no consensus key
+    /// means no salt to bind a signature to, so the guard must refuse rather
+    /// than fall back to verifying against the empty salt — which would
+    /// admit a signature minted for ANY other keyless daemon.
+    #[tokio::test]
+    async fn a_keyless_daemon_refuses_rather_than_binding_an_empty_salt() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::post;
+        use tower::ServiceExt as _;
+
+        // `NodeHandle::channel()` carries `AdminConfig::default()`, whose
+        // `node_key` is `None` — exactly the embedded-daemon condition.
+        let (handle, _cmds, _hub) = crate::NodeHandle::channel();
+        let app = axum::Router::new()
+            .route("/v1/invite", post(|| async { StatusCode::OK }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                handle,
+                signed_write_guard,
+            ));
+
+        let caller = key(9);
+        let now = 9_000_000;
+        let sig = sign_request(&caller, "POST", "/v1/invite", &[], now, b"{}");
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/invite")
+            .body(Body::from("{}"))
+            .unwrap();
+        *req.headers_mut() = headers_for(&caller, &sig, now);
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[test]
     fn a_refusal_names_one_stable_reason_per_variant() {
         let all = [
@@ -966,6 +955,7 @@ mod tests {
             WriteRefusal::SignatureInvalid,
             WriteRefusal::NotOperator,
             WriteRefusal::BodyOverCap,
+            WriteRefusal::NodeUnidentified,
         ];
         let mut reasons: Vec<&str> = all.iter().map(|r| r.reason()).collect();
         reasons.sort_unstable();

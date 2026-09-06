@@ -32,11 +32,7 @@ pub fn optimistic_message(
         messages,
         body,
         message_id,
-        rpc::cached_user_key().as_deref(),
-        // THE SYNCHRONOUS READ: an Ice extern cannot await, and the mint must
-        // paint this frame. The directory is warm by any send — see
-        // `cached_account_names`.
-        &cached_account_names(),
+        ReaderFacts::cached().reader(),
     ))
 }
 
@@ -52,11 +48,7 @@ pub fn optimistic_thread_message(
         messages,
         body,
         message_id,
-        rpc::cached_user_key().as_deref(),
-        // THE SYNCHRONOUS READ: an Ice extern cannot await, and the mint must
-        // paint this frame. The directory is warm by any send — see
-        // `cached_account_names`.
-        &cached_account_names(),
+        ReaderFacts::cached().reader(),
     ))
 }
 
@@ -235,20 +227,22 @@ pub struct HuddleParticipant {
 /// the author renderer for the label.
 pub(crate) fn huddle_roster(
     members: &[chat::index::HuddleEntry],
-    me: Option<&[u8]>,
-    names: &AuthorNames,
+    reader: ChatReader<'_>,
 ) -> Vec<HuddleParticipant> {
-    let mine = me.map(hex_encode);
     members
         .iter()
         .map(|member| {
-            let label = author_name(&format!("user:{}", member.user), names);
+            let handle = format!("user:{}", member.user);
+            let label = author_display(&handle, reader.names);
             HuddleParticipant {
                 initials: initials_of(&label),
                 // The module refuses non-User authors ("only external users
                 // may join a huddle"), so every roster row is a person.
                 is_agent: false,
-                is_you: mine.as_deref() == Some(member.user.as_str()),
+                // The reader's ACCOUNT, not one key: a seat taken with the
+                // person's passkey or wallet is still their own seat, and a
+                // roster that could not recognise it wiped itself on load.
+                is_you: reader.is_me(&handle),
                 joined_at: number_i64(member.joined_at),
                 key: member.user.clone(),
                 node: member.node.clone(),
@@ -266,10 +260,22 @@ pub fn huddle_self(roster: Vec<HuddleParticipant>) -> bool {
 
 /// The call fan-out set: every roster peer's node key, self excluded — the
 /// shape `CallClientControl::Recipients` wants.
-pub fn huddle_recipient_nodes(roster: Vec<HuddleParticipant>) -> Vec<String> {
+///
+/// Excludes by BOTH `is_you` (this device's own roster row) AND `self_node`
+/// (this device's node key, whichever roster row carries it): a member's
+/// `node_proof` only proves that member's user holds the node key it names,
+/// never that the name is unique — a stale or replayed roster row can still
+/// carry another user's `user` field alongside THIS node's key, and fanning
+/// media to your own node is a loopback echo regardless of whose row it rides
+/// in on.
+pub fn huddle_recipient_nodes(
+    roster: Vec<HuddleParticipant>,
+    self_node: Option<&str>,
+) -> Vec<String> {
     roster
         .into_iter()
         .filter(|participant| !participant.is_you)
+        .filter(|participant| Some(participant.node.as_str()) != self_node)
         .map(|participant| participant.node)
         .collect()
 }
@@ -293,13 +299,15 @@ pub(crate) async fn huddle_fanout_nodes(
     channel_id: &str,
 ) -> Result<Vec<String>, String> {
     let client = rpc_client(rpc)?;
-    let me = local_user_key().await;
+    let facts = ReaderFacts::current().await;
+    let status = client.status().await.map_err(|error| error.to_string())?;
+    let self_node = (!status.public_key.is_empty()).then_some(status.public_key);
     // A huddle in a room this node cannot see has no fan-out set — an empty
     // one, not a failure: the poll re-reads on its own cadence and picks the
     // roster up as soon as the index answers for the room.
-    let facts = load_channel_facts(&client, channel_id, me.as_deref()).await?;
-    let roster = facts.map_or_else(Vec::new, |(_channel, roster)| roster);
-    Ok(huddle_recipient_nodes(roster))
+    let room = load_channel_facts(&client, channel_id, facts.reader()).await?;
+    let roster = room.map_or_else(Vec::new, |(_channel, roster)| roster);
+    Ok(huddle_recipient_nodes(roster, self_node.as_deref()))
 }
 
 // The huddle's elapsed clock is a LOCAL session fact on a NATIVE `every 1s`
@@ -315,12 +323,25 @@ pub async fn join_huddle(
         let rpc = rpc_client(&rpc)?;
         let status = rpc.status().await.map_err(|error| error.to_string())?;
         let node = public_key(&status.public_key, "node public key")?;
+        // Proof of possession: THIS node signs the join under its own key —
+        // never asserted by the joiner — so the roster can only ever name a
+        // node that agreed to route this user's media (issue #1792).
+        let user = local_user_key()
+            .await
+            .ok_or_else(|| "no local user key to join a huddle as".to_string())?;
+        let (_, node_proof_hex) = rpc
+            .huddle_node_proof(&channel_id, &hex_encode(&user))
+            .await
+            .map_err(|error| error.to_string())?;
+        let node_proof = hex_decode(&node_proof_hex)
+            .map_err(|_| "huddle node proof must be hexadecimal".to_string())?;
         signed_write(
             &rpc,
             "chat",
             chat::encode_msg(&ChatMsg::JoinHuddle {
                 channel_id: channel_id.clone(),
                 node,
+                node_proof,
             }),
             password,
         )
@@ -360,8 +381,13 @@ pub async fn leave_huddle(
 /// `@orthory` in `#general`, the room everybody actually writes in, parsed as
 /// plain text and minted no `Mark::Mention` for the module to fan out. The
 /// directory is a person's name wherever they can be read.
-async fn mention_candidates(rpc: &RpcClient, members: &[ChatMember]) -> MentionCandidates {
-    MentionCandidates::new(&account_names(rpc).await, members)
+///
+/// The directory as last read, not a read of its own: a send happens in a room
+/// that has been loaded, and every chat load and every identity op rewrites it
+/// (`refresh_names`). A query here would put an identity round trip in front of
+/// every message a person sends.
+fn mention_candidates(members: &[ChatMember]) -> MentionCandidates {
+    MentionCandidates::new(&names(), members)
 }
 
 pub async fn send_message(
@@ -389,7 +415,7 @@ pub async fn send_message(
                 message_id: required_id(message_id, "message")?,
                 blocks: parse_message_with_mentions(
                     &body,
-                    &mention_candidates(&rpc, &members).await,
+                    &mention_candidates(&members),
                 ),
                 thread: None,
                 as_agent: None,
@@ -468,12 +494,11 @@ pub async fn load_thread_page(
         let rpc = rpc_client(&rpc)?;
         let thread = query_thread_page(&rpc, &channel_id, root_seq, after_reply_seq).await?;
         let next_reply_seq = number_i64(thread.next_reply_seq.unwrap_or(0));
-        let current_user = local_user_key().await;
-        let names = account_names(&rpc).await;
+        let facts = ReaderFacts::current().await;
         let messages = thread
             .replies
             .into_iter()
-            .map(|row| chat_message(row, current_user.as_deref(), &names))
+            .map(|row| chat_message(row, facts.reader()))
             .collect();
         Ok(ThreadPageData {
             generation,
@@ -539,7 +564,7 @@ pub async fn send_reply(
                 message_id: message_id.clone(),
                 blocks: parse_message_with_mentions(
                     &body,
-                    &mention_candidates(&rpc, &members).await,
+                    &mention_candidates(&members),
                 ),
                 thread: Some(root_seq),
                 as_agent: None,
@@ -588,7 +613,7 @@ pub async fn edit_message(
                 seq,
                 blocks: parse_message_with_mentions(
                     &body,
-                    &mention_candidates(&rpc, &members).await,
+                    &mention_candidates(&members),
                 ),
                 base_rev: Some(base_rev),
             }),
@@ -683,14 +708,13 @@ pub async fn search_chat(
     channel_id: String,
     text: String,
 ) -> Result<ChatSearchData, AppError> {
-    // The reader, for the same `you` rendering the timeline does — a search hit
-    // was showing the RAW wire author (`user:3f8dc8…773`, the full 64-hex key
-    // with its prefix) as the row's headline, above the text it matched.
-    let current_user = local_user_key().await;
+    // The same naming the timeline does — a search hit was showing the RAW
+    // wire author (`user:3f8dc8…773`, the full 64-hex key with its prefix) as
+    // the row's headline, above the text it matched.
+    let facts = ReaderFacts::current().await;
     let result = async {
         let text = bounded_text(text, "search", 512)?;
         let rpc = rpc_client(&rpc)?;
-        let names = account_names(&rpc).await;
         // a `#tag` query filters by the exact hashtag (the index's tag
         // postings); anything else is full-text search.
         let query = match text.strip_prefix('#') {
@@ -729,7 +753,7 @@ pub async fn search_chat(
                     channel_id: hit.channel_id,
                     seq: number_i64(hit.seq),
                     root_seq: number_i64(hit.thread.unwrap_or(hit.seq)),
-                    author: author_display(&hit.author, current_user.as_deref(), &names),
+                    author: author_display(&hit.author, facts.names()),
                     text: hit.text,
                 })
                 .collect(),
@@ -775,7 +799,7 @@ pub async fn load_page_threads(
         let rpc = rpc_client(&rpc)?;
         let blocks = load_page_blocks(&rpc, &page_id).await?;
         let block_ids: Vec<String> = blocks.into_iter().map(|block| block.id).collect();
-        let names = account_names(&rpc).await;
+        let names = names();
         let threads: Vec<PageCommentThread> = query_page_thread_rows(&rpc, &page_id, &block_ids)
             .await?
             .into_iter()

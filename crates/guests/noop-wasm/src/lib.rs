@@ -8,7 +8,7 @@
 
 wit_bindgen::generate!({
     world: "module",
-    path: "../../kernel/module-guest/wit",
+    path: "../../module-sdk/wit",
 });
 
 use ducktape::module::host;
@@ -16,6 +16,14 @@ use ducktape::module::host;
 struct Component;
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// what the host must know to run this component: which substrate to
     /// wrap it over, which network parameters to seed, how queries read. a
     /// pure constant — the host reads it before any dispatch, with no env.

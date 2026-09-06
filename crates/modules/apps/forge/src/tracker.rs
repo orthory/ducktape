@@ -125,21 +125,6 @@ pub struct RepoTracker {
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 pub struct Tracker {
     pub repos: BTreeMap<String, RepoTracker>,
-    /// the chain-half of the nonce (`<chain id>/<repo>`) the FIRST
-    /// cert-verified `PushRefs` this forge instance ever accepted carried —
-    /// pinned once and never reassigned, like a repo's owner. consensus
-    /// cannot otherwise learn its own network's chain id (see
-    /// [`crate::pushcert`]'s module doc), so this is the strictest available
-    /// mitigation against a certificate harvested on one ducktape network
-    /// being replayed onto another through `/v1/submit` (#1761): once this
-    /// forge has accepted even ONE certified push, every later one — for ANY
-    /// repo — must carry the identical chain half, so a cert minted for a
-    /// different network is refused regardless of which unborn repo name it
-    /// targets. this does NOT close the very first certified push after
-    /// genesis (nothing has been pinned yet, so whichever chain-half arrives
-    /// first is trusted) — see the crate doc for why that residual gap needs
-    /// host wiring this module cannot reach on its own.
-    pub accepted_chain: Option<String>,
 }
 
 /// derive the item author from the dispatch origin — the same posture as
@@ -580,9 +565,6 @@ impl Tracker {
 
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut out = TRACKER_MAGIC.to_vec();
-        // an EMPTY chain half is `None` — a real chain id is never empty
-        // (see `sdk::genesis_config::CHAIN_ID`'s producers).
-        codec::put_str(&mut out, self.accepted_chain.as_deref().unwrap_or_default());
         codec::put_u32(&mut out, self.repos.len() as u32);
         for (repo, rt) in &self.repos {
             codec::put_str(&mut out, repo);
@@ -605,8 +587,6 @@ impl Tracker {
                 Error::Module("forge tracker: bad magic (not a TRK1 container)".into())
             })?;
         let mut r = Reader::new(body);
-        let accepted_chain_raw = r.str_()?;
-        let accepted_chain = (!accepted_chain_raw.is_empty()).then_some(accepted_chain_raw);
         let repo_count = r.u32()?;
         let mut repos = BTreeMap::new();
         for _ in 0..repo_count {
@@ -660,10 +640,7 @@ impl Tracker {
                 "forge tracker: trailing bytes after the container".into(),
             ));
         }
-        Ok(Self {
-            repos,
-            accepted_chain,
-        })
+        Ok(Self { repos })
     }
 }
 

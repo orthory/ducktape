@@ -466,7 +466,11 @@ async fn open_session<T: DataPlaneTransport>(
     )
     .await?;
 
-    let engine = VoiceEngine::new(mic_dgram, VoiceConfig::default())
+    // created ahead of the engine so its pump can be handed the same roster
+    // the session gates sends with — see `VoiceEngine::new`'s doc comment.
+    let (recipients_tx, recipients_rx) = watch::channel(Vec::new());
+
+    let engine = VoiceEngine::new(mic_dgram, VoiceConfig::default(), recipients_rx.clone())
         .map_err(|e| format!("voice codec init failed: {e}"))?;
 
     let registered = vec![
@@ -480,7 +484,6 @@ async fn open_session<T: DataPlaneTransport>(
 
     let (pcm_tx, pcm_rx) = mpsc::channel(PCM_LANE);
     let (mixed_tx, mixed_rx) = mpsc::channel(PCM_LANE);
-    let (recipients_tx, recipients_rx) = watch::channel(Vec::new());
     let (video_in_tx, video_in_rx) = mpsc::channel(VIDEO_LANE);
     let (video_out_tx, video_out_rx) = mpsc::channel(VIDEO_LANE);
     let (control_in_tx, control_in_rx) = mpsc::channel(CTL_LANE);
@@ -737,6 +740,29 @@ impl PeerLane {
     }
 }
 
+/// Drop the engine's speaker lanes (and this session's video lanes) for
+/// every peer no longer in `live`. The speakers are the engine's own set,
+/// not `peer_lanes`: a peer who talks with their camera off never opens a
+/// video lane. A peer who comes BACK is re-anchored by the media epoch, not
+/// by this — they restart their stream whether or not they ever left the
+/// roster.
+fn evict_departed<T: DataPlaneTransport>(
+    engine: &VoiceEngine<T>,
+    peer_lanes: &mut HashMap<[u8; 32], PeerLane>,
+    live: &HashSet<[u8; 32]>,
+) {
+    let departed: Vec<PeerId> = engine
+        .speaker_stats()
+        .iter()
+        .map(|speaker| speaker.peer)
+        .filter(|peer| !live.contains(&peer.0))
+        .collect();
+    for peer in departed {
+        engine.forget_peer(peer);
+    }
+    peer_lanes.retain(|peer, _| live.contains(peer));
+}
+
 /// The session pump: audio + camera video + call control, until the webview
 /// drops its lane ends.
 #[allow(clippy::too_many_arguments)]
@@ -791,6 +817,12 @@ async fn run_session<T: DataPlaneTransport>(
                 // dropped its lane; the session is over either way.
                 let Ok(()) = changed else { break };
                 flows.set_roster(&registered, &recipients.borrow());
+                // demux now refuses new datagrams from a departed peer, but
+                // their lane and any speaker state must go NOW too — waiting
+                // for the 1 Hz ctl_tick lets up to ~2.5 s of already-queued
+                // audio/video keep playing after they were kicked.
+                let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
+                evict_departed(&engine, &mut peer_lanes, &live);
             }
             captured = pcm_in.recv() => {
                 let Some(captured) = captured else { break };
@@ -860,6 +892,13 @@ async fn run_session<T: DataPlaneTransport>(
             }
             inbound = video.recv() => {
                 let (peer, bytes) = inbound;
+                // demux already roster-gates (set_roster above); this re-check
+                // covers fragments queued before a roster SHRINK drained —
+                // same pattern as `run_presence_session`.
+                if !recipients.borrow().contains(&peer.0) {
+                    peer_lanes.remove(&peer.0);
+                    continue;
+                }
                 let Ok((header, payload)) = media_service::video::decode_fragment(&bytes) else { continue };
                 let lane = peer_lanes.entry(peer.0).or_insert_with(|| PeerLane::new(header.epoch));
                 if lane.epoch != header.epoch {
@@ -971,24 +1010,10 @@ async fn run_session<T: DataPlaneTransport>(
                 // hints from peers no longer in the roster must not pin our rate.
                 let live: HashSet<[u8; 32]> = recipients.borrow().iter().copied().collect();
                 inbound_hints.retain(|peer, _| live.contains(peer));
-                // a peer who left frees BOTH receive lanes, video and audio:
-                // their state is dead weight the moment they are out of the
-                // roster, and a lane per departed peer accumulates for the
-                // life of the call. A peer who comes BACK is re-anchored by
-                // the media epoch, not by this — they restart their stream
-                // whether or not they ever left the roster.
-                // the speakers are the engine's own set, not `peer_lanes`: a peer
-                // who talks with their camera off never opens a video lane.
-                let departed: Vec<PeerId> = engine
-                    .speaker_stats()
-                    .iter()
-                    .map(|speaker| speaker.peer)
-                    .filter(|peer| !live.contains(&peer.0))
-                    .collect();
-                for peer in departed {
-                    engine.forget_peer(peer);
-                }
-                peer_lanes.retain(|peer, _| live.contains(peer));
+                // backstop for the immediate eviction on `recipients.changed()`
+                // above — covers a peer who never triggers a `changed()` wakeup
+                // (e.g. the watch coalesces two shrinks into one signal).
+                evict_departed(&engine, &mut peer_lanes, &live);
                 push_effective_rate(&recipients, &inbound_hints, &mut effective_kbps, &control_out);
                 window += 1;
                 if window >= 5 {

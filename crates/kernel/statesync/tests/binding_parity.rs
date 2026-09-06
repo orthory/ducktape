@@ -143,6 +143,7 @@ fn canned_response(req: &SyncRequest) -> SyncResponse {
             residents: vec![vec![2u8; 32]],
             floor_cert: Some(vec![0xAB; 8]),
             entries: vec![ManifestEntry {
+                code_hash: None,
                 module_id: "kv".into(),
                 root: StateRoot([3u8; 32]),
                 kind: PayloadKind::Snapshot,

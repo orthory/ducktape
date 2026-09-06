@@ -18,8 +18,6 @@ use std::path::Path;
 // unix-only: the VMM client speaks over unix sockets and the storage path
 // shells out to e2fsprogs.
 #[cfg(unix)]
-pub mod egress;
-#[cfg(unix)]
 pub mod firecracker_api;
 pub mod guest_paths;
 #[cfg(unix)]
@@ -39,8 +37,6 @@ pub mod workspace_image;
 #[cfg(unix)]
 pub mod executor_image;
 
-#[cfg(unix)]
-pub use egress::tap_egress_nftables;
 pub use guest_paths::GuestLayout;
 #[cfg(unix)]
 pub use host_tools::{find_executable, find_on_path, find_system_tool};

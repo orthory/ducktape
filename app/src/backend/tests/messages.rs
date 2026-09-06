@@ -81,7 +81,39 @@ fn the_post_gate_names_why_a_viewer_cannot_post() {
         post_gate(false, true, members.clone(), "cafe".into()),
         "members_only"
     );
-    assert_eq!(post_gate(false, true, members, "beef".into()), "");
+    assert_eq!(post_gate(false, true, members.clone(), "beef".into()), "");
+
+    // A seat is the ACCOUNT's: the viewer's passkey holds the seat, and her
+    // device key is bound to the same account, so the device may post too.
+    seed_names(NameDirectory::new(BTreeMap::from([
+        (
+            "beef".to_string(),
+            BoundAccount {
+                number: 7,
+                name: "b".into(),
+            },
+        ),
+        (
+            "b00f".to_string(),
+            BoundAccount {
+                number: 7,
+                name: "b".into(),
+            },
+        ),
+        (
+            "cafe".to_string(),
+            BoundAccount {
+                number: 8,
+                name: "c".into(),
+            },
+        ),
+    ])));
+    assert_eq!(post_gate(false, true, members.clone(), "b00f".into()), "");
+    assert_eq!(
+        post_gate(false, true, members, "cafe".into()),
+        "members_only"
+    );
+    seed_names(NameDirectory::default());
 }
 
 /// A SEARCH HIT SAYS WHICH ROOM IT IS IN, ONCE. The hit's `meta` was
@@ -156,7 +188,7 @@ fn an_unread_block_height_is_not_reported_as_zero() {
 
 /// A DISPLAY NAME MUST NOT BE FORMATTED TWICE. `search_chat` already runs the
 /// wire author through `author_display`, so an Explorer hit arrives holding
-/// "you", "user 48cedb0d…" or "@quackbot". The Explorer then ran `author_name`
+/// "alice", "user 48cedb0d…" or "@quackbot". The Explorer then ran `author_name`
 /// over that a SECOND time; none of those strings carries a `user:`/`agent:`
 /// prefix to split, so every one fell through to the `_` arm and every message
 /// hit in workspace search was attributed to "system".
@@ -166,9 +198,9 @@ fn an_unread_block_height_is_not_reported_as_zero() {
 #[test]
 fn a_search_hits_author_is_not_reformatted_into_system() {
     // What `search_chat` hands the Explorer, for each kind of author.
-    for displayed in ["you", "user 48cedb0d…", "@quackbot", "chat"] {
+    for displayed in ["alice", "user 48cedb0d…", "@quackbot", "chat"] {
         assert_eq!(
-            author_name(displayed, &AuthorNames::default()),
+            author_name(displayed),
             "system",
             "a second pass over a display name loses it — this is why the hit \
              must carry `hit.author` through untouched"
@@ -177,13 +209,10 @@ fn a_search_hits_author_is_not_reformatted_into_system() {
 
     // And the first pass is the one that is correct.
     assert_eq!(
-        author_display("user:48cedb0d131f", None, &AuthorNames::default()),
+        author_display("user:48cedb0d131f", &NameDirectory::default()),
         "user 48cedb0d…"
     );
-    assert_eq!(
-        author_name("agent:demo/quackbot", &AuthorNames::default()),
-        "@quackbot"
-    );
+    assert_eq!(author_name("agent:demo/quackbot"), "@quackbot");
 
     // The call site itself, pinned: the message arm must carry the author
     // through, never re-format it. Without this the assertions above hold
@@ -782,15 +811,18 @@ fn chat_reads_never_cross_the_dispatch_query_lane() {
         load_channel_facts.contains("ChatViewQuery::Channel {"),
         "the channel row reads the index view arm"
     );
-    // AND NEITHER DOES THE AUTHOR DIRECTORY IT NAMES THE ROSTER WITH. The
-    // filling reader (`account_names`) is an identity `/v1/query`, so reaching
-    // for it here would put the very round trip this test bans back inside the
-    // fold — one indirection further away, where the `.query(` sweep below
-    // cannot see it.
-    assert!(
-        load_channel_facts.contains("&cached_account_names()"),
-        "the fold's channel read takes the directory it already has"
-    );
+    // AND NEITHER DOES THE DIRECTORY IT NAMES THE ROSTER WITH. The filling
+    // read (`read_accounts`, behind `refresh_names`) is an identity
+    // `/v1/query`, so reaching for it here would put the very round trip this
+    // test bans back inside the fold — one indirection further away, where the
+    // `.query(` sweep below cannot see it. The reader handed in carries the
+    // directory as last read.
+    for body in [load_channel_row, load_channel_facts] {
+        assert!(
+            !body.contains("read_accounts(") && !body.contains("refresh_names("),
+            "the fold's channel read takes the directory it already has"
+        );
+    }
     for body in [load_channel_row, load_channel_facts] {
         assert!(
             !body.contains(".query("),
@@ -873,7 +905,7 @@ fn timeline_pages_are_one_root_view_call_without_a_message_walk() {
 /// message was attributed to `user bf431c5d…`, with the same account rendered
 /// "orthory" in the DIRECT list one pane to the left.
 ///
-/// The directory is built from the account page `load_dm_peers` already reads,
+/// The directory is built from the identity roster `read_accounts` pages,
 /// and EVERY key of an account answers to that account's name — a person with a
 /// laptop and a phone signs with two keys and is one name in the timeline.
 #[test]
@@ -892,26 +924,196 @@ fn every_key_of_an_account_renders_as_that_accounts_name() {
         bio: None,
         updated_at: 0,
     };
-    let names = account_names_of(&[
+    let names = directory_of(&[
         account(1, "eddy", vec![key(0x56)]),
         // two devices, one person
         account(2, "orthory", vec![key(0x03), key(0xbf)]),
     ]);
 
     let handle = |byte: u8| format!("user:{}", hex_encode(&[byte; 32]));
-    assert_eq!(author_name(&handle(0xbf), &names), "orthory");
+    assert_eq!(author_display(&handle(0xbf), &names), "orthory");
     assert_eq!(
-        author_name(&handle(0x03), &names),
+        author_display(&handle(0x03), &names),
         "orthory",
         "the second device is the same person, not a second one"
     );
-    assert_eq!(author_name(&handle(0x56), &names), "eddy");
+    assert_eq!(author_display(&handle(0x56), &names), "eddy");
     // A key on no account is still honestly its short hex; nothing is invented.
     assert_eq!(
-        author_name(&handle(0x11), &names),
+        author_display(&handle(0x11), &names),
         format!("user {}", short_label(&hex_encode(&[0x11u8; 32])))
     );
     // And a cold directory (a resident whose identity module cannot answer yet)
     // degrades to exactly that, for everyone.
-    assert!(account_names_of(&[]).is_empty());
+    assert!(directory_of(&[]).is_empty());
+}
+
+// ============================================================================
+// THE COPY RANGE. Every decision the two handler bodies apply is here, so this
+// is where the feature is actually pinned: which rows a range covers, what
+// comes out of it, and where a press leaves it.
+// ============================================================================
+
+fn message(seq: i64, author: &str, body: &str) -> ChatMessage {
+    ChatMessage {
+        id: format!("m{seq}"),
+        view_key: seq,
+        seq,
+        author: author.into(),
+        meta: String::new(),
+        body: body.into(),
+        blocks: Vec::new(),
+        pending: false,
+        rev: 0,
+        edited: false,
+        deleted: false,
+        reply_count: 0,
+        thread_seq: 0,
+        show_author: true,
+        initial: author[..1].to_uppercase(),
+        avatar_kind: "person".into(),
+        height: 0,
+        time: 0,
+        reactions: Vec::new(),
+        render_rev: 0,
+    }
+}
+
+fn room() -> Vec<ChatMessage> {
+    vec![
+        message(1, "ana", "first"),
+        message(2, "bo", "second"),
+        message(3, "ana", "third"),
+        message(4, "bo", "fourth"),
+    ]
+}
+
+/// A RANGE IS ITS TWO ENDS, IN EITHER ORDER. Dragging up a channel is as
+/// ordinary as dragging down it, and the reader's anchor is as often the newest
+/// row as the oldest — so `anchor` is not required to be the smaller seq.
+#[test]
+fn a_copy_range_covers_its_ends_whichever_way_round_they_are() {
+    let rows = room();
+    assert_eq!(copy_range_count(&rows, 2, 3), 2, "downwards");
+    assert_eq!(copy_range_count(&rows, 3, 2), 2, "and upwards");
+    assert_eq!(copy_range_count(&rows, 2, 2), 1, "one message is a range");
+    assert_eq!(copy_range_count(&rows, 0, 0), 0, "and none is not");
+    // An end that is no longer on screen is not an end. A range whose anchor
+    // was deleted or paged out covers nothing rather than silently widening to
+    // whatever is left.
+    assert_eq!(copy_range_count(&rows, 9, 9), 0, "an end nobody holds");
+}
+
+/// WHAT COMES OUT IS WHAT YOU COULD READ. Oldest first regardless of which end
+/// was clicked, one entry per message, blank-line separated so a multi-line
+/// body survives the paste.
+#[test]
+fn the_copied_text_reads_in_timeline_order() {
+    let rows = room();
+    assert_eq!(
+        copy_range_text(&rows, 3, 1),
+        "ana: first\n\nbo: second\n\nana: third",
+        "clicked bottom-up, pasted top-down"
+    );
+    assert_eq!(copy_range_text(&rows, 2, 2), "bo: second");
+}
+
+/// A TOMBSTONE IS NOT A LINE. A deleted row inside the range contributes
+/// nothing — there is no body to lift, and a placeholder would be a line the
+/// reader never wrote. The count follows the text, so the toast cannot claim
+/// more than reached the clipboard.
+#[test]
+fn a_deleted_row_inside_the_range_contributes_nothing() {
+    let mut rows = room();
+    rows[1].deleted = true;
+    rows[1].body = String::new();
+    assert_eq!(copy_range_text(&rows, 1, 3), "ana: first\n\nana: third");
+    assert_eq!(copy_range_toast(&rows, 1, 1), "Message copied");
+}
+
+/// SHIFT KEEPS THE ANCHOR, A PLAIN CLICK MOVES IT. This is the whole gesture.
+#[test]
+fn shift_extends_and_a_plain_click_starts_over() {
+    use crate::CopySurface::{Nowhere, Thread, Timeline};
+    let started = copy_range_after_press(0, Nowhere, 2, Timeline, false);
+    assert_eq!((started.anchor, started.head), (2, 2), "a click is a range of one");
+
+    let widened = copy_range_after_press(2, Timeline, 5, Timeline, true);
+    assert_eq!((widened.anchor, widened.head), (2, 5), "⇧ moves the far end");
+
+    let restarted = copy_range_after_press(2, Timeline, 5, Timeline, false);
+    assert_eq!((restarted.anchor, restarted.head), (5, 5), "no ⇧ starts over");
+
+    // ⇧ with nothing open is a plain click: there is no anchor to keep.
+    let nothing_to_extend = copy_range_after_press(0, Nowhere, 5, Timeline, true);
+    assert_eq!((nothing_to_extend.anchor, nothing_to_extend.head), (5, 5));
+
+    // AND A RANGE NEVER SPANS THE TWO SURFACES. A ⇧-click in the rail while a
+    // range is open in the stream starts a fresh one in the rail, because the
+    // rows between them are not a run of anything.
+    let crossed = copy_range_after_press(2, Timeline, 7, Thread, true);
+    assert_eq!((crossed.anchor, crossed.head), (7, 7));
+    assert_eq!(crossed.surface, Thread);
+}
+
+/// A ROW LIGHTS UP ONLY FOR A RANGE DRAWN WHERE IT LIVES. A reply and a
+/// timeline row draw their seqs from the SAME channel sequence, so without the
+/// surface a reply would tint inside a range whose copy never included it.
+#[test]
+fn the_surface_keeps_a_reply_out_of_the_streams_range() {
+    use crate::CopySurface::{Thread, Timeline};
+    assert!(seq_in_copy_range(3, 2, 5, Timeline, Timeline));
+    assert!(!seq_in_copy_range(3, 2, 5, Timeline, Thread), "a reply in the rail");
+    assert!(!seq_in_copy_range(6, 2, 5, Timeline, Timeline), "past the end");
+    assert!(!seq_in_copy_range(3, 0, 0, Timeline, Timeline), "no range at all");
+}
+
+/// THE PLATE IS ONE ANSWER, AND IT IS ORDERED. The row you are ON outranks a
+/// row that merely sits in a range; a deleted row wears neither, because a
+/// tint would say there is something there to lift.
+#[test]
+fn the_row_plate_ranks_selection_over_range_and_skips_a_tombstone() {
+    use crate::RowPlate::{Plain, Ranged, Selected};
+    assert_eq!(message_plate(false, false, false), Plain);
+    assert_eq!(message_plate(false, false, true), Ranged);
+    assert_eq!(message_plate(false, true, true), Selected);
+    assert_eq!(message_plate(true, true, true), Plain, "a tombstone tints for nothing");
+}
+
+/// THE CHORD LIFTS THE ROWS THE BAR COUNTED. The surface picks the list, so
+/// ⌘C in a rail-drawn range never reaches into the stream behind it.
+#[test]
+fn the_surface_picks_the_list_the_copy_reads() {
+    use crate::CopySurface::{Nowhere, Thread, Timeline};
+    let timeline = room();
+    let thread = vec![message(7, "cy", "a reply")];
+    assert_eq!(copy_range_rows(&timeline, &thread, Timeline).len(), 4);
+    assert_eq!(copy_range_rows(&timeline, &thread, Thread).len(), 1);
+    assert!(copy_range_rows(&timeline, &thread, Nowhere).is_empty());
+}
+
+/// A PENDING ROW IS NOT AN END OF ANYTHING. A message still in flight carries a
+/// negative seq, and a range with one at either end covers no rows: the bar
+/// holding the only Clear button would vanish while the ⌘C route, armed on the
+/// anchor, stayed armed with nothing able to disarm it. Pressing one ends the
+/// range instead of opening an unclearable one.
+#[test]
+fn a_press_on_a_pending_row_ends_the_range_rather_than_arming_a_dead_one() {
+    use crate::CopySurface::{Nowhere, Timeline};
+    let cleared = copy_range_after_press(0, Nowhere, -1, Timeline, false);
+    assert_eq!((cleared.anchor, cleared.head), (0, 0), "a plain click on one");
+    assert_eq!(cleared.surface, Nowhere);
+
+    let dropped = copy_range_after_press(2, Timeline, -3, Timeline, true);
+    assert_eq!(
+        (dropped.anchor, dropped.head),
+        (0, 0),
+        "and ⇧-clicking one drops the range it would otherwise have widened"
+    );
+    assert_eq!(dropped.surface, Nowhere);
+    assert_eq!(
+        copy_range_count(&room(), dropped.anchor, dropped.head),
+        0,
+        "which is the count the bar was already showing"
+    );
 }

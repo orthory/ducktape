@@ -179,7 +179,8 @@ fn pin_happy_path_moves_root_and_records_owner() {
     let pin = refs.pins.get("v1").expect("pin recorded under its name");
     assert_eq!(to_hex(&pin.snapshot), head, "pin protects the seeded head");
     assert_eq!(
-        pin.owner, files::Actor::System,
+        pin.owner,
+        files::Actor::System,
         "owner is the acting origin, not the payload"
     );
 }
@@ -470,7 +471,11 @@ fn watch_segment_boundary_does_not_leak_across_names() {
     )
     .expect("commit under the watched prefix");
     commit_block(&mut f);
-    assert_eq!(watch_msgs(&ctx).len(), 1, "fires under the real segment prefix");
+    assert_eq!(
+        watch_msgs(&ctx).len(),
+        1,
+        "fires under the real segment prefix"
+    );
     assert_eq!(watch_msgs(&ctx)[0].target, "indexer");
 }
 
@@ -491,7 +496,11 @@ fn watch_root_prefix_fires_for_everything() {
     )
     .expect("commit");
     commit_block(&mut f);
-    assert_eq!(watch_msgs(&ctx).len(), 1, "root watch fires for /sharedsecret/x");
+    assert_eq!(
+        watch_msgs(&ctx).len(),
+        1,
+        "root watch fires for /sharedsecret/x"
+    );
     assert_eq!(watch_msgs(&ctx)[0].target, "indexer");
 
     let ctx = commit(
@@ -503,7 +512,11 @@ fn watch_root_prefix_fires_for_everything() {
     )
     .expect("commit");
     commit_block(&mut f);
-    assert_eq!(watch_msgs(&ctx).len(), 1, "root watch fires for /shared/y too");
+    assert_eq!(
+        watch_msgs(&ctx).len(),
+        1,
+        "root watch fires for /shared/y too"
+    );
     assert_eq!(watch_msgs(&ctx)[0].target, "indexer");
 }
 

@@ -63,40 +63,103 @@ fn canonical_and_authority_table() {
     // ---- authority ----
     let seg = |p: &str| canonical(p).unwrap();
     // home: the owner writes under their own root (any depth ≥ 1 below it).
-    assert!(check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/home/ext:aa/x")).is_ok());
-    assert!(check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/home/ext:aa/deep/nested/f")).is_ok());
+    assert!(
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None
+            },
+            &seg("/home/ext:aa/x")
+        )
+        .is_ok()
+    );
+    assert!(
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None
+            },
+            &seg("/home/ext:aa/deep/nested/f")
+        )
+        .is_ok()
+    );
     // home: a different actor is rejected.
     assert!(
-        check_authority(&duckfs_core::Authority::External { key: vec![0xbb], account: None }, &seg("/home/ext:aa/x"))
-            .unwrap_err()
-            .contains("home owner")
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xbb],
+                account: None
+            },
+            &seg("/home/ext:aa/x")
+        )
+        .unwrap_err()
+        .contains("home owner")
     );
     // home: the home root itself (and bare /home) is never a writable file.
     assert!(
-        check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/home/ext:aa"))
-            .unwrap_err()
-            .contains("home root")
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None
+            },
+            &seg("/home/ext:aa")
+        )
+        .unwrap_err()
+        .contains("home root")
     );
     assert!(
-        check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/home"))
-            .unwrap_err()
-            .contains("home root")
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None
+            },
+            &seg("/home")
+        )
+        .unwrap_err()
+        .contains("home root")
     );
     // shared: any actor (here a plain module id) may write under it (≥ 2 segs).
-    assert!(check_authority(&duckfs_core::Authority::Module("chat".into()), &seg("/shared/x")).is_ok());
+    assert!(
+        check_authority(
+            &duckfs_core::Authority::Module("chat".into()),
+            &seg("/shared/x")
+        )
+        .is_ok()
+    );
     // shared: the /shared root itself is not a writable target.
-    assert!(check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/shared")).is_err());
+    assert!(
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None
+            },
+            &seg("/shared")
+        )
+        .is_err()
+    );
     // outside /home and /shared: rejected for a normal actor.
     assert!(
-        check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/etc/passwd"))
-            .unwrap_err()
-            .contains("outside")
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None
+            },
+            &seg("/etc/passwd")
+        )
+        .unwrap_err()
+        .contains("outside")
     );
     // the root path is outside for a normal actor (only system may touch it).
     assert!(
-        check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/"))
-            .unwrap_err()
-            .contains("outside")
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None
+            },
+            &seg("/")
+        )
+        .unwrap_err()
+        .contains("outside")
     );
     // system bypasses authority entirely (but the path is still canonical).
     assert!(check_authority(&duckfs_core::Authority::System, &seg("/etc/passwd")).is_ok());
@@ -116,10 +179,38 @@ fn path_errors_carry_the_files_prefix() {
         canonical("/shared/a\0b").unwrap_err(),
         canonical(&format!("/shared/{}", "x".repeat(256))).unwrap_err(),
         canonical(&format!("/shared{}", "/d".repeat(128))).unwrap_err(),
-        check_authority(&duckfs_core::Authority::External { key: vec![0xbb], account: None }, &seg("/home/ext:aa/x")).unwrap_err(),
-        check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/home")).unwrap_err(),
-        check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/shared")).unwrap_err(),
-        check_authority(&duckfs_core::Authority::External { key: vec![0xaa], account: None }, &seg("/etc/passwd")).unwrap_err(),
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xbb],
+                account: None,
+            },
+            &seg("/home/ext:aa/x"),
+        )
+        .unwrap_err(),
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None,
+            },
+            &seg("/home"),
+        )
+        .unwrap_err(),
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None,
+            },
+            &seg("/shared"),
+        )
+        .unwrap_err(),
+        check_authority(
+            &duckfs_core::Authority::External {
+                key: vec![0xaa],
+                account: None,
+            },
+            &seg("/etc/passwd"),
+        )
+        .unwrap_err(),
     ] {
         assert!(err.starts_with("files: "), "unprefixed path error: {err}");
     }

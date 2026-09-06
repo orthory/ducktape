@@ -77,6 +77,25 @@ enum WindowSummon
   open
   raise
 
+// WHICH PLATE A MESSAGE ROW WEARS. `selected_row` is the one plate in the app
+// that means "the row you are on"; `brand_wash` is deliberately lighter,
+// because a copy range is a RUN and painting five rows in the you-are-here
+// plate would say the reader is on all five.
+enum RowPlate
+  plain
+  selected
+  ranged
+
+// WHERE A COPY RANGE WAS DRAWN. A thread reply and a timeline row take their
+// seqs from the SAME channel sequence, so a reply can fall numerically inside
+// a range the reader drew in the stream behind it. The surface is what keeps
+// the two apart: a row lights up only for a range drawn where it lives, and
+// the chord lifts the same rows the bar is counting.
+enum CopySurface
+  nowhere
+  timeline
+  thread
+
 // The command chords this app answers, as one discriminant. macOS binds ⌘Q and
 // ⌘W through an app menu this app does not have, so it reads them itself — and
 // they differ only in the letter, which is exactly the shape one enum and one

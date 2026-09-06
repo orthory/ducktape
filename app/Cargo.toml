@@ -52,6 +52,10 @@ keystore.workspace = true
 # of holding the key in-process; `node::encode_frame` is the ONE encoder, and a
 # second implementation of a machine wire format is not a thing to write.
 node.workspace = true
+# the duckfs wire bounds an upload must agree with (inline cap, chunk size):
+# a threshold spelled here as a literal is a second copy the module cannot
+# see move.
+duckfs-core.workspace = true
 authpage.workspace = true
 # the ed25519 signer `keystore` hands back and `node::encode_frame` signs with.
 commonware-cryptography.workspace = true
@@ -86,8 +90,9 @@ tokio-tungstenite = "0.24"
 nokhwa = { version = "0.10", features = ["input-native"] }
 # The screen-share leg (`src/video.rs`): a root-window grab over X11. Already
 # in this binary under winit, and pure Rust — the portal/pipewire route would
-# put a build-time system library on every machine that builds this app, to
-# reach a compositor iced is not built for here (`x11`, no `wayland`).
+# put a build-time system library on every machine that builds this app. A
+# Wayland session's X root holds X clients only, so the share refuses there
+# rather than grab a black desktop (`ScreenSource::open`).
 x11rb = "0.13"
 jpeg-encoder = "0.6"
 zune-jpeg = "0.4"
@@ -112,7 +117,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # works on every OS the app runs on.
 gethostname = "1"
 zeroize.workspace = true
-iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "x11"] }
+# BOTH LINUX DISPLAY SERVERS, NATIVELY. With `x11` alone a Wayland session
+# runs this app under XWayland: the compositor upscales a 1x buffer on every
+# fractionally scaled monitor (a blurred, pixelated console) and text input
+# reaches the window only through XIM, which an input method such as fcitx5
+# serves only when `XMODIFIERS` names it. `wayland` (winit's sctk backend,
+# pure Rust, libwayland dlopen'd at runtime) gives the compositor's own
+# fractional scale and the text-input-v3 protocol every Wayland input method
+# speaks. winit picks Wayland when `WAYLAND_DISPLAY` is set, X11 otherwise.
+iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "wayland", "x11"] }
 ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", default-features = false, features = ["log-timeline", "terminal"] }
 ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764" }
 ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", version = "=0.1.0", default-features = false, features = ["full-runtime"] }

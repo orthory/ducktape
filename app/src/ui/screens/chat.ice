@@ -20,7 +20,7 @@
 // row can only fire these six. With 4,096 rows that used to manufacture
 // 48 callback routes per row on every unrelated rebuild. This component keeps
 // the row loop's routing surface equal to what the row can actually do.
-component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64)
+component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -28,6 +28,7 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
     open_message_reactions(i64, str, i64)
     open_message_actions(i64, str, i64)
     open_message_link(str)
+    press_message(i64, CopySurface)
   // KEYED BY STABLE VIEW IDENTITY. This is the app's one virtual list that
   // prepends, so row state and measured height must follow the message rather
   // than the slot it occupied before the page arrived.
@@ -77,6 +78,7 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
               message
               selected=true
               menu_open=true
+              in_range=seq_in_copy_range(message.seq, copy_anchor_seq, copy_head_seq, copy_surface, CopySurface.timeline)
             forward
               add_reaction_at
               remove_reaction_at
@@ -84,14 +86,19 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
               open_message_reactions
               open_message_actions
               open_message_link
+              press_message
+      // THE RANGE'S ENDS JOIN THE CHEAP KEY. A quiet row keeps its memo until
+      // one of them moves, so shift-clicking down a channel re-renders the run
+      // that changed and leaves the rest of the scrollback alone.
       if message.seq != selected_message_seq
-        lazy message as cached_message
+        lazy message, copy_anchor_seq, copy_head_seq, copy_surface as cached_message
           stack #message(cached_message.id) w=fill
             MessageCard
               with
                 message=cached_message
                 selected=false
                 menu_open=false
+                in_range=seq_in_copy_range(cached_message.seq, copy_anchor_seq, copy_head_seq, copy_surface, CopySurface.timeline)
               forward
                 add_reaction_at
                 remove_reaction_at
@@ -99,11 +106,12 @@ component MessageTimeline(messages:[ChatMessage], unread_boundary:i64, unread_ma
                 open_message_reactions
                 open_message_actions
                 open_message_link
+                press_message
 
 // Same boundary for the rail: the root, target and menu rows stay live; quiet
 // replies keep their per-row memo. Paging controls stay outside this component
 // because they are constant-size chrome, not part of the chain-fed list.
-component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_target_seq:i64, thread_selected_seq:i64)
+component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_target_seq:i64, thread_selected_seq:i64, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   emits
     add_reaction_at(i64, str)
     remove_reaction_at(i64, str)
@@ -111,6 +119,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
     open_thread_message_actions(i64, str, i64)
     open_thread_message_reactions(i64, str, i64)
     open_message_link(str)
+    press_message(i64, CopySurface)
   keyed thread_message in messages by=thread_message.view_key
     with
       w=fill
@@ -127,6 +136,7 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
             message=thread_message
             selected=(thread_message.seq == thread_target_seq)
             menu_open=(thread_message.seq == thread_selected_seq)
+            in_range=seq_in_copy_range(thread_message.seq, copy_anchor_seq, copy_head_seq, copy_surface, CopySurface.thread)
           forward
             add_reaction_at
             remove_reaction_at
@@ -134,13 +144,15 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
             open_thread_message_actions
             open_thread_message_reactions
             open_message_link
+            press_message
       if thread_message.seq != active_thread_seq && thread_message.seq != thread_target_seq && thread_message.seq != thread_selected_seq
-        lazy thread_message as cached_reply
+        lazy thread_message, copy_anchor_seq, copy_head_seq, copy_surface as cached_reply
           ThreadMessageCard
             with
               message=cached_reply
               selected=false
               menu_open=false
+              in_range=seq_in_copy_range(cached_reply.seq, copy_anchor_seq, copy_head_seq, copy_surface, CopySurface.thread)
             forward
               add_reaction_at
               remove_reaction_at
@@ -148,10 +160,56 @@ component ThreadTimeline(messages:[ChatMessage], active_thread_seq:i64, thread_t
               open_thread_message_actions
               open_thread_message_reactions
               open_message_link
+              press_message
 
-component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool)
+component CopyRangeBar(count:i64)
+  emits
+    clear_copy_range()
+    copy_selected_messages()
+  box #root
+    with
+      w=fill
+      px=12.0
+      py=7.0
+      bg=brand_wash
+      border=card_line
+      border-w=1.0
+      r=9.0
+    row
+      with
+        w=fill
+        gap=9.0
+        align=center
+      text copy_range_label(count)
+        with
+          size=12.0
+          wrap=none
+          font=code_medium
+          @text-secondary_fg
+      // The hint is the whole discoverability of the gesture: nothing else on
+      // the row says a second click can widen what you are about to lift.
+      text "⇧-click another message to extend"
+        with
+          w=fill
+          size=11.0
+          @text-muted
+      button "Clear" -> emit(clear_copy_range)
+        with
+          h=26.0
+          p=5.0
+          @secondary_action
+      button "Copy" #copy-range -> emit(copy_selected_messages)
+        with
+          h=26.0
+          p=5.0
+          @primary_action
+
+component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, status:str, block_height:i64, bind search_draft:str, search_phase:SearchPhase, search_query:str, search_hits:[ChatSearchHit], rooms:[ChatSidebarRow], dm_rows:[DmSidebarRow], channel_create_open:bool, connected:bool, loading:bool, mutation_phase:MutationPhase, active_channel:str, active_dm_peer:str, active_dm:DmPeer, active_channel_name:str, active_channel_archived:bool, active_channel_members_only:bool, channel_members:[ChatMember], post_refusal:str, huddle_joined:bool, huddle_channel:str, huddle_channel_name:str, huddle_joined_at:i64, huddle_now:i64, call_muted:bool, messages:[ChatMessage], has_older_history:bool, history_view:bool, at_live_tail:bool, history_loading:bool, unread_boundary:i64, unread_marker_seq:i64, selected_message_seq:i64, selected_message_rev:i64, message_action:MessageAction, bind message_edit_draft:str, channel_settings_open:bool, bind channel_name_draft:str, bind member_key_draft:str, active_thread_seq:i64, thread_target_seq:i64, thread_messages:[ChatMessage], thread_selected_seq:i64, thread_selected_rev:i64, thread_message_action:MessageAction, bind thread_edit_draft:str, thread_has_more:bool, thread_next_reply_seq:i64, thread_loading:bool, copy_anchor_seq:i64, copy_head_seq:i64, copy_surface:CopySurface)
   lifetime retained
   emits
+    press_message(i64, CopySurface)
+    clear_copy_range()
+    copy_selected_messages()
     search_chat_submit()
     clear_chat_search()
     open_chat_search_hit(str, i64, i64)
@@ -788,13 +846,16 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                           // the quiet rows always did: the reaction handlers
                           // keep refusing while loading; the openers never
                           // did.
-                          lazy messages by active_channel, unread_boundary, unread_marker_seq, selected_message_seq as cached_messages
+                          lazy messages by active_channel, unread_boundary, unread_marker_seq, selected_message_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_messages
                             MessageTimeline
                               with
                                 messages=cached_messages
                                 unread_boundary
                                 unread_marker_seq
                                 selected_message_seq
+                                copy_anchor_seq
+                                copy_head_seq
+                                copy_surface
                               forward
                                 add_reaction_at
                                 remove_reaction_at
@@ -802,6 +863,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                                 open_message_reactions
                                 open_message_actions
                                 open_message_link
+                                press_message
                   overlay
                     with
                       when=(selected_message_seq > 0 && message_action != MessageAction.toolbar)
@@ -1284,6 +1346,21 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                 pr=18.0
                 pt=12.0
               ComposerGate reason=post_refusal
+          // THE COPY BAR, over the composer where the reader's eye already is.
+          // It is gated on a count and not on the two seqs, so it appears in
+          // the ONE surface whose list the range actually resolves in — the
+          // rail's copy of this bar is gated the same way on `thread_messages`.
+          if copy_range_count(messages, copy_anchor_seq, copy_head_seq) > 0
+            box
+              with
+                w=fill
+                pl=18.0
+                pr=18.0
+                pt=8.0
+              CopyRangeBar count=copy_range_count(messages, copy_anchor_seq, copy_head_seq)
+                forward
+                  clear_copy_range
+                  copy_selected_messages
           box
             with
               w=fill
@@ -1678,13 +1755,16 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                       // busy phase does not invalidate the timeline, and the
                       // workspace `loading` flag stays out of the key for the
                       // same reason the stream's does.
-                      lazy thread_messages by active_channel, active_thread_seq, thread_target_seq, thread_selected_seq as cached_thread_messages
+                      lazy thread_messages by active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_thread_messages
                         ThreadTimeline
                           with
                             messages=cached_thread_messages
                             active_thread_seq
                             thread_target_seq
                             thread_selected_seq
+                            copy_anchor_seq
+                            copy_head_seq
+                            copy_surface
                           forward
                             add_reaction_at
                             remove_reaction_at
@@ -1692,6 +1772,7 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                             open_thread_message_actions
                             open_thread_message_reactions
                             open_message_link
+                            press_message
                       if thread_has_more && thread_next_reply_seq > 0 && thread_loading
                         button "Loading replies…" -> emit(load_more_thread)
                           with
@@ -1737,6 +1818,19 @@ component ChatScreen(endpoint:str, network_name:str, network_chain_id:str, statu
                   // on it either — a term in the guard that the button does not
                   // wear is a dead control. The reason SENTENCE stays mounted once,
                   // over the stream's plate: 330px has no room to say it twice.
+                  // The rail's own copy bar, gated on the RAIL's list — so a
+                  // range drawn in the stream behind it leaves this empty.
+                  if copy_range_count(thread_messages, copy_anchor_seq, copy_head_seq) > 0
+                    box
+                      with
+                        w=fill
+                        pl=16.0
+                        pr=16.0
+                        pt=10.0
+                      CopyRangeBar count=copy_range_count(thread_messages, copy_anchor_seq, copy_head_seq)
+                        forward
+                          clear_copy_range
+                          copy_selected_messages
                   box
                     with
                       w=fill

@@ -383,7 +383,7 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // checkout that built it has that set.
     let modules_dir = match modules_dir {
         Some(dir) => dir,
-        None => workspace_config::modules_dir()?,
+        None => workspace_config::sim_modules_dir()?,
     };
 
     // the status module list and the index tier both extend only under valset
@@ -413,10 +413,6 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
     // the sim runs the SAME wasm index guests as the real daemons, from the
     // same founding set its components came from.
     let index = noded::open_index_store(&storage, &module_ids)?;
-    noded::converge_index_guests(
-        &index,
-        &noded::IndexGuests::from_dir(&modules_dir, &module_ids)?,
-    )?;
 
     // the log ring is a process-GLOBAL subscriber (and stacks a panic hook per
     // call), so wire it ONLY under `install_log` — the binary does; an embedder
@@ -488,7 +484,6 @@ pub fn boot(storage: &Path, listen: SocketAddr, opts: SimOpts) -> Result<SimHand
                 valset_keys,
                 invite_binding,
                 public_key,
-                module_ids,
                 cmd_rx,
                 control_rx,
                 stream_hub,
@@ -791,7 +786,6 @@ fn run_sim(
     valset_keys: Vec<Vec<u8>>,
     invite_binding: Vec<u8>,
     public_key: String,
-    module_ids: Vec<&'static str>,
     mut cmds: mpsc::Receiver<NodeCommand>,
     mut control: mpsc::Receiver<SimCommand>,
     stream_hub: StreamHub,
@@ -811,7 +805,6 @@ fn run_sim(
         // registries seeded from the sim's bindings. governance composes as
         // wasm, so its code registry is wired and UpdateModule proposals are
         // live in the sim.
-        let selection: &[&'static str] = &module_ids;
         let substrates = Substrates {
             forge_repo,
             duckfs_dir,
@@ -823,7 +816,6 @@ fn run_sim(
         };
         let mut stores = qmdb_stores(&context);
         let mut host = compose(
-            selection,
             &code,
             &mut stores,
             &substrates,
@@ -836,6 +828,7 @@ fn run_sim(
         .await
         .expect("sim genesis composes");
         host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &bindings)));
+        noded::converge_host_modules(&index, &host).expect("deployed index guests converge");
 
         // a lib must not write to stdout — this is a once-per-boot lifecycle
         // fact, so it rides tracing (visible on the binary's stderr + ring under
@@ -1170,7 +1163,7 @@ impl Sim {
                 time,
                 projection.record,
                 &projection.dispatches,
-                &self.node.host().module_roots(),
+                self.node.host(),
             );
             if let Some(root_hash) = projection.sealed_hash {
                 self.stream_hub.publish_block(

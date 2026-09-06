@@ -27,7 +27,7 @@ pub use backing::FilesOdbBacking;
 // the wasm-guest port. compiled for the `guest` feature (the wasm build) and
 // under `test` (so the native suite can drive the pure `dispatch` seam against
 // an in-memory odb); ABSENT under the bare `--no-default-features` wasm-
-// readiness gate, keeping sdk/guest-adapter out of the pure core.
+// readiness gate, keeping sdk/ducktape-module-sdk out of the pure core.
 #[cfg(any(feature = "guest", test))]
 mod guest;
 

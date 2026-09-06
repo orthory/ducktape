@@ -119,7 +119,13 @@ fn collect(
         collect_snapshot(snapshot, store, &mut visited, &mut missing, verify_chunks)?;
     }
     for pin in refs.pins.values() {
-        collect_snapshot(&pin.snapshot, store, &mut visited, &mut missing, verify_chunks)?;
+        collect_snapshot(
+            &pin.snapshot,
+            store,
+            &mut visited,
+            &mut missing,
+            verify_chunks,
+        )?;
     }
     for digest in refs.staging.keys() {
         collect_chunk(digest, store, &mut visited, &mut missing, verify_chunks)?;
@@ -371,7 +377,8 @@ mod tests {
     fn mark_covers_head_window_pins_and_staging() {
         let mut fs = new_fs();
         // an unreferenced staged chunk — a staging root.
-        fs.putblob(&crate::Authority::System, 1, b"staged-bytes").unwrap();
+        fs.putblob(&crate::Authority::System, 1, b"staged-bytes")
+            .unwrap();
         commit_block(&mut fs);
         let staged = object_id(Kind::Chunk, b"staged-bytes");
         // a committed snapshot — head + window root.
@@ -387,7 +394,8 @@ mod tests {
         commit_block(&mut fs);
         let head = fs.committed_head_for_test().unwrap();
         // pin it — a pin root.
-        fs.pin(&crate::Authority::System, 3, head.clone(), "p".into()).unwrap();
+        fs.pin(&crate::Authority::System, 3, head.clone(), "p".into())
+            .unwrap();
         commit_block(&mut fs);
 
         let live = mark(fs.refs(), fs.store_ref()).unwrap();

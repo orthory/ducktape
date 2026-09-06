@@ -72,7 +72,7 @@ impl StagedStore {
     /// committed-only query lane) must not see writes staged earlier in the
     /// same block. everything else reads [`get`](StagedStore::get).
     pub async fn get_committed(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.store.get(&store_key(key)).await
+        self.store.get_committed(&store_key(key)).await
     }
 
     /// stage `key -> value` (upsert) for this block WITHOUT committing. visible

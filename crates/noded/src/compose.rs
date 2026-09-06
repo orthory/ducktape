@@ -1,23 +1,12 @@
-//! the ONE module composer: a topology selection + a code source + a store
-//! source → a [`Host`]. genesis, restore, and statesync in `bin/node`, and the
-//! noded/simnode daemons, all build their hosts here — and every wasm module a
-//! host ever runs (a genesis tenant, a reopened or synced one, a live
-//! admission) enters through [`wasm_module`]: the component's DECLARED shape
-//! ([`WasmModule::declared_shape`] — backing, config keys, query mode) decides
-//! the substrate it is wrapped over, never a table the host keeps.
+//! The module composer: deployment hashes, a code source, and a store source
+//! produce a [`Host`]. Genesis, checkpoint restore, state sync, and live
+//! admissions all instantiate Wasm through [`wasm_module`]. Each component's
+//! declared shape chooses its backing, configuration keys, and query mode.
 //!
-//! the module SET is the modules registry's: at block zero the founder's
-//! bundle (which is exactly what the registry seeds from), at any later
-//! boundary the registry's roster on the code it designates for that height
-//! (`modules::code_at`). the natives (the compiled-in registries) are the
-//! topology selection's, since they carry no registry entry.
-//!
-//! what varies per caller is injected, never branched on here: WHERE a store
-//! comes from (`QmdbStore::init` on a fresh/reopened dir, `sync_from` at a
-//! verified root) is the [`StoreSource`]; WHERE the component bytes come from
-//! (a managed dir, the blob plane, the mesh) is the [`host::CodeSource`]; and
-//! whether this is block zero over the founder's bundle or a boundary over
-//! the registry's roster is the [`Boot`] mode.
+//! Genesis supplies deployment hashes and initialization parameters. Reopen
+//! supplies the checkpoint's authenticated deployment hashes, including the
+//! registry's own code. The reopened registry identifies later admissions and
+//! the code designated for each replay height. No native module is inserted.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -25,7 +14,6 @@ use std::path::PathBuf;
 use host::Host;
 use sdk::{MerkleStore, Module, StateRoot};
 use sha2::Digest as _;
-use topology::{Code, TOPOLOGY};
 use wasm_host::{Backing, CompiledModule, Shape, WasmModule};
 
 /// a boxed, non-`Send` future (the host and every store are `!Send`).
@@ -70,25 +58,19 @@ pub struct Bindings<'a> {
 
 /// how the composed host comes up.
 pub enum Boot<'a, 'b> {
-    /// block zero. the native registries seed — valset from `validators`, the
-    /// modules registry from `bundle` — and the wasm set IS `bundle` (module
-    /// id → the sha256 of its genesis component: the code source is asked for
-    /// these bytes, checked against the hash). every module starts
-    /// [`Start::Fresh`]. PRECONDITION: `bundle`'s key set is EXACTLY the
-    /// selection's wasm ids — every entry lands in the modules root, so a
-    /// stray key would move the genesis root; [`compose`] refuses any drift
-    /// by name.
+    /// Block zero: `bundle` maps ids to deployment hashes. Every component
+    /// starts fresh and receives the same encoded initialization parameters;
+    /// the registry and validator set consume their respective entries.
     Genesis {
         validators: &'a [Vec<u8>],
         bundle: &'a BTreeMap<String, [u8; 32]>,
     },
-    /// a checkpoint or manifest boundary at `height`. the natives reopen as
-    /// committed, the wasm set is the modules registry's roster on the code it
-    /// designates for `height`, and each module [`Start::Resume`]s from
-    /// `snapshots` — except one whose first activation is past `height`,
-    /// which the boundary predates: it starts fresh, as it did live.
+    /// A checkpoint or state-sync boundary at `height`. `codes` authenticates
+    /// the running deployments independently of the registry they implement.
+    /// Stores reopen and map/ODB tenants install their boundary snapshots.
     Reopen {
         height: u64,
+        codes: &'a BTreeMap<String, [u8; 32]>,
         /// two lifetimes, like `StoreSource`'s `&mut StoreSource<'_>`: the
         /// borrow ends with the compose, the futures' lifetime is the
         /// closure's, so one source serves a compose AND a later
@@ -105,7 +87,7 @@ pub enum Start<'a, 'b> {
     /// map-backed one installs it as its initial map; an odb-backed one
     /// carries it alongside the wrap in [`wasm_module`] regardless of `start`,
     /// since it is never persisted — see [`wasm_host::CompiledModule::over_odb`]).
-    Fresh,
+    Fresh { parameters: &'a [u8] },
     /// the module's state at a boundary: its store reopens or resyncs (the
     /// store source's business) and `snapshots(id, backing)` installs a
     /// map/odb image if the source has one.
@@ -114,68 +96,75 @@ pub enum Start<'a, 'b> {
     },
 }
 
-/// compose `selection` into a [`Host`]: every id must be in the topology; the
-/// natives come from the selection, the wasm set from the boot mode (the
-/// bundle at genesis, the registry at a reopen). the returned host carries no
-/// module factory — the caller wires [`Admissions`] over its canonical
-/// substrates.
+/// Compose the boot mode's deployment set into a [`Host`];
+/// the boot mode supplies the authenticated module set and initialization or
+/// snapshot data. Every module uses the same Wasm constructor.
 pub async fn compose(
-    selection: &[&'static str],
     code: &dyn host::CodeSource,
     stores: &mut StoreSource<'_>,
     substrates: &Substrates,
     bindings: &Bindings<'_>,
     mut boot: Boot<'_, '_>,
 ) -> Result<Host, String> {
-    let specs = selection
-        .iter()
-        .map(|id| {
-            TOPOLOGY
-                .spec(id)
-                .ok_or_else(|| format!("module {id} is not in the topology"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let mut host = Host::new();
-    for spec in &specs {
-        match spec.code {
-            Code::Native => register_new(&mut host, native(spec.id, stores, &boot).await?)?,
-            Code::Wasm => {}
-        }
-    }
-    let active = match &boot {
-        Boot::Genesis { bundle, .. } => {
-            check_bundle_keys(selection, bundle)?;
-            bundle
-                .iter()
-                .map(|(id, hash)| ActiveCode {
-                    id: id.clone(),
-                    hash: *hash,
-                    seat: Seat::Fresh,
-                })
-                .collect()
-        }
-        Boot::Reopen { height, .. } => registry_active_set(&host, *height).await?,
+    let parameters = match &boot {
+        Boot::Genesis { validators, bundle } => sdk::genesis_config::encode_config(&[
+            ("modules", &sdk::wire::encode(bundle)),
+            ("validators", &sdk::wire::encode(validators)),
+        ]),
+        Boot::Reopen { .. } => sdk::genesis_config::encode_config(&[]),
     };
-    for entry in active {
-        let bytes = fetch_code(code, &entry.id, &entry.hash).await?;
+    let codes = match &boot {
+        Boot::Genesis { bundle, .. } => *bundle,
+        Boot::Reopen { codes, .. } => *codes,
+    };
+    for id in codes.keys() {
+        workspace_config::validate_module_id(id)?;
+    }
+    for (id, hash) in codes {
+        let bytes = fetch_code(code, id, hash).await?;
         let start = match &mut boot {
-            Boot::Genesis { .. } => Start::Fresh,
-            Boot::Reopen { snapshots, .. } => match entry.seat {
-                Seat::Fresh => Start::Fresh,
+            Boot::Genesis { .. } => Start::Fresh {
+                parameters: &parameters,
+            },
+            Boot::Reopen { snapshots, .. } => Start::Resume {
+                snapshots: &mut **snapshots,
+            },
+        };
+        let module = wasm_module(id, &bytes, stores, substrates, bindings, start).await?;
+        register_new(&mut host, Box::new(module))?;
+    }
+    // Durable stores can have advanced beyond the checkpoint. Its registry
+    // names admissions replay will encounter; prepare those through the same
+    // fresh-state path used when they were admitted live.
+    if let Boot::Reopen {
+        height, snapshots, ..
+    } = &mut boot
+    {
+        for entry in registry_active_set(&host, *height).await? {
+            if host.module_root(&entry.id).is_some() {
+                continue;
+            }
+            let bytes = fetch_code(code, &entry.id, &entry.hash).await?;
+            let start = match entry.seat {
+                Seat::Fresh => Start::Fresh {
+                    parameters: &parameters,
+                },
                 Seat::Resume => Start::Resume {
                     snapshots: &mut **snapshots,
                 },
-            },
-        };
-        let module = wasm_module(&entry.id, &bytes, stores, substrates, bindings, start).await?;
-        register_new(&mut host, Box::new(module))?;
+            };
+            let module =
+                wasm_module(&entry.id, &bytes, stores, substrates, bindings, start).await?;
+            register_new(&mut host, Box::new(module))?;
+        }
     }
     Ok(host)
 }
 
 /// register a module the host does not hold yet. dispatch addresses modules
 /// by id, so a second module under one id — a registry roster entry colliding
-/// with a native — is refused, never silently replaced.
+/// with another entry — is refused, never silently replaced.
 fn register_new(host: &mut Host, module: Box<dyn Module>) -> Result<(), String> {
     let id = module.id();
     if host.module_root(&id).is_some() {
@@ -221,13 +210,11 @@ pub fn seat_at(entry: &modules::ModuleCode, height: u64) -> Option<([u8; 32], Se
 }
 
 /// the modules registry's roster at `height` ([`seat_at`] per entry). the
-/// registry is a native of the selection, so a reopen over a selection
-/// without it has no wasm set to read.
+/// registry is optional: without one there are no later admissions to seat.
 async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>, String> {
-    let roster = host.module_status().await.ok_or_else(|| {
-        "a reopen composes its wasm set from the modules registry, which this selection lacks"
-            .to_string()
-    })?;
+    let Some(roster) = host.module_status().await else {
+        return Ok(Vec::new());
+    };
     Ok(roster
         .into_iter()
         .filter_map(|entry| {
@@ -239,26 +226,6 @@ async fn registry_active_set(host: &Host, height: u64) -> Result<Vec<ActiveCode>
             })
         })
         .collect())
-}
-
-/// the bundle's key set is EXACTLY the selection's wasm ids: every entry
-/// seeds the modules registry (a stray key moves the genesis root) and every
-/// wasm tenant needs one (a missing key cannot compose). named both ways.
-fn check_bundle_keys(
-    selection: &[&'static str],
-    bundle: &BTreeMap<String, [u8; 32]>,
-) -> Result<(), String> {
-    let wanted: BTreeSet<&str> = TOPOLOGY.wasm_ids(selection).into_iter().collect();
-    let given: BTreeSet<&str> = bundle.keys().map(String::as_str).collect();
-    let missing: Vec<&str> = wanted.difference(&given).copied().collect();
-    let extra: Vec<&str> = given.difference(&wanted).copied().collect();
-    let is_exact = missing.is_empty() && extra.is_empty();
-    if is_exact {
-        return Ok(());
-    }
-    Err(format!(
-        "the bundle must key exactly the selection's wasm modules: missing {missing:?}, extra {extra:?}"
-    ))
 }
 
 /// the component bytes for `id` at `hash`, verified. a code source is a
@@ -287,58 +254,6 @@ pub async fn fetch_code(
     Ok(bytes)
 }
 
-/// the native system modules — all store-backed; the registries seed only at
-/// genesis (their `finish_seed` is idempotent on a seeded store regardless).
-async fn native(
-    id: &'static str,
-    stores: &mut StoreSource<'_>,
-    boot: &Boot<'_, '_>,
-) -> Result<Box<dyn Module>, String> {
-    let store = stores(id).await?;
-    let founding = match boot {
-        Boot::Genesis { validators, bundle } => Some((*validators, *bundle)),
-        Boot::Reopen { .. } => None,
-    };
-    match id {
-        "valset" => {
-            let mut valset = valset::Valset::new(id, store, "governance");
-            if let Some((validators, _)) = founding {
-                for key in validators {
-                    valset
-                        .seed(key.clone())
-                        .await
-                        .map_err(|e| format!("valset seed: {e}"))?;
-                }
-                valset
-                    .finish_seed()
-                    .await
-                    .map_err(|e| format!("valset seed: {e}"))?;
-            }
-            Ok(Box::new(valset))
-        }
-        "modules" => {
-            let mut registry = modules::Modules::new(id, store, "valset", "governance");
-            if let Some((_, bundle)) = founding {
-                for (module_id, hash) in bundle {
-                    registry
-                        .seed(module_id.as_str(), hash.to_vec())
-                        .await
-                        .map_err(|e| format!("modules seed {module_id}: {e}"))?;
-                }
-                registry
-                    .finish_seed()
-                    .await
-                    .map_err(|e| format!("modules seed: {e}"))?;
-            }
-            Ok(Box::new(registry))
-        }
-        "kv" => Ok(Box::new(kv::Kv::new(id, store))),
-        other => Err(format!(
-            "native module {other} has no constructor in the composer"
-        )),
-    }
-}
-
 /// the ONE wasm path: wrap `bytes` for `id` over the substrate its declared
 /// shape names. a store-backed module opens its store through the source; an
 /// odb-backed one opens the host substrate for its id and carries its
@@ -354,11 +269,12 @@ pub async fn wasm_module(
     bindings: &Bindings<'_>,
     start: Start<'_, '_>,
 ) -> Result<WasmModule, String> {
-    let compiled =
-        CompiledModule::compile(bytes).map_err(|e| format!("{id} component loads: {e}"))?;
+    workspace_config::validate_module_id(id)?;
+    let compiled = CompiledModule::compile_artifact(bytes)
+        .map_err(|e| format!("{id} component loads: {e}"))?;
     let shape = compiled.shape().clone();
     check_realizable(id, &shape)?;
-    let is_fresh = matches!(start, Start::Fresh);
+    let is_fresh = matches!(start, Start::Fresh { .. });
     let wrapped = match shape.backing {
         Backing::Map => compiled.over_map(id),
         Backing::Store => {
@@ -382,7 +298,7 @@ pub async fn wasm_module(
         // any other map entry (the guest's `save_state` never touches that
         // key), so only a fresh start seeds it — a resume's install below
         // replaces the whole map, config included.
-        Start::Fresh => {
+        Start::Fresh { parameters } => {
             let seeds_map_config = shape.backing == Backing::Map && !shape.config.is_empty();
             if seeds_map_config {
                 let (bytes, root) = wasm_host::initial_state(&[(
@@ -393,6 +309,10 @@ pub async fn wasm_module(
                     .install(&bytes, root)
                     .map_err(|e| format!("{id} genesis config installs: {e}"))?;
             }
+            module
+                .initialize(parameters)
+                .await
+                .map_err(|e| format!("{id} initializes: {e}"))?;
         }
         // a store-backed module's state IS its store: it never installs (and
         // `WasmModule::install` refuses), so the source is not even asked.
@@ -408,6 +328,25 @@ pub async fn wasm_module(
         }
     }
     Ok(module)
+}
+
+/// Readiness covers the whole deployment, including the optional mapper.
+pub fn validate_deployment(
+    id: &str,
+    bytes: &[u8],
+    index: &indexer::IndexStore,
+) -> Result<(), String> {
+    workspace_config::validate_module_id(id)?;
+    let artifact = module_artifact::ModuleArtifactRef::decode(bytes)?;
+    let shape =
+        WasmModule::declared_shape(artifact.component).map_err(|error| error.to_string())?;
+    check_realizable(id, &shape)?;
+    if let Some(mapper) = artifact.index {
+        index
+            .validate_guest(mapper)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// can THIS host run a component of `shape` under `id`? an odb declaration
@@ -572,6 +511,8 @@ impl Admissions {
 #[async_trait::async_trait(?Send)]
 impl host::ModuleFactory for Admissions {
     async fn instantiate(&self, id: &str, bytes: &[u8]) -> Result<host::Admitted, sdk::Error> {
+        let artifact =
+            module_artifact::ModuleArtifactRef::decode(bytes).map_err(sdk::Error::Module)?;
         let bindings = Bindings {
             invite: &self.invite,
             chain_id: &self.chain_id,
@@ -583,7 +524,9 @@ impl host::ModuleFactory for Admissions {
             &mut stores,
             &self.substrates,
             &bindings,
-            Start::Fresh,
+            Start::Fresh {
+                parameters: &sdk::genesis_config::encode_config(&[]),
+            },
         )
         .await;
         let refusal = match seated {
@@ -596,7 +539,7 @@ impl host::ModuleFactory for Admissions {
         // that are no module at all are another plane's record, and this
         // boundary is not the plane that realizes them. The extra compile is
         // paid on the refusal path alone, and the host latches the answer.
-        let is_a_module = wasm_host::speaks_module_abi(bytes);
+        let is_a_module = wasm_host::speaks_module_abi(artifact.component);
         match is_a_module {
             true => Err(sdk::Error::Module(refusal)),
             false => Ok(host::Admitted::ForeignAbi),

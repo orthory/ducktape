@@ -133,6 +133,7 @@ async fn replica_roles(
         Some(host) => (
             read_valset_members(host)
                 .await
+                .unwrap_or_default()
                 .iter()
                 .map(|k| hex_bytes(k))
                 .collect(),
@@ -617,6 +618,10 @@ pub(super) async fn park(
     let mut replica_epoch: u64 = 0;
     let mut replica_view_base: u64 = 0;
     let mut replica_watermark: Option<u64> = None;
+    // consecutive drain passes whose committed valset read failed — paces
+    // the warning for a host query that keeps erroring (#1820), same
+    // discipline as the validator drain's `valset_read_failed_checks`.
+    let mut valset_read_failed_checks: u64 = 0;
     // served seals awaiting the post-fold cross-check: a BACKFILLED
     // frame's trust is the served seal, verified against what OUR
     // fold produced (height -> served (disposition, root_hash)).
@@ -745,6 +750,12 @@ pub(super) async fn park(
         node_r.set_code_source(code_source.clone());
         // RESTORE the replay guard from the journal suffix the replay walked.
         node_r.seed_replay_window(rec.applied_frames.iter().copied());
+        // the observation barrier (see validator/mod.rs and engine.rs): a
+        // replica routinely folds several finalized frames in one drain
+        // pass, so without this the pass's LAST served height stands in for
+        // the valset-moving block's view whenever they differ — arming a
+        // ceiling (and, on promotion, a `view_base`) no validator agrees on.
+        node_r.watch_module("valset");
         replica_scheme = Some(replica_verifier(&namespace, &rec.participants));
         replica_orchestrator = Some(replica_orchestrator_at(
             rec.epoch,
@@ -1538,8 +1549,16 @@ pub(super) async fn park(
             // the safety net for anything this mirror missed.
             if !drained.is_empty()
                 && let Some(orch) = replica_orchestrator.as_mut()
+                // the observation barrier's stop point (see the resume
+                // sites' `watch_module("valset")`), NOT the pass's last
+                // served height: a replica routinely folds several
+                // finalized frames in one pass, and standing in the last
+                // served height would arm a ceiling (and, on promotion, a
+                // `view_base`) at a later view than every validator armed
+                // (#1819) whenever the valset-moving block isn't the last
+                // frame of the pass.
+                && let Some(folded_view) = node_r.last_engine_view()
             {
-                let folded_view = served_height.saturating_sub(replica_view_base);
                 // sync the mesh window at the same frozen read point —
                 // the replica mirror of the validator drain's discipline:
                 // a committed membership change widens the mesh at its
@@ -1559,113 +1578,146 @@ pub(super) async fn park(
                     node = %label,
                     "tracker round completed"
                 );
-                let members_raw = read_valset_members(node_r.host()).await;
-                let observed: Vec<ed25519::PublicKey> = members_raw
-                    .iter()
-                    .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                    .collect();
-                let residents_raw = read_valset_residents(node_r.host()).await;
-                let observed_residents: Vec<ed25519::PublicKey> = residents_raw
-                    .iter()
-                    .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
-                    .collect();
-                let mut actions =
-                    EpochActions::new(orch, folded_view, observed, observed_residents);
-                if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members() {
-                    tracing::info!(
-                        target: "ducktape::consensus",
-                        node = %label,
-                        observed_view = cutover.observed_view(),
-                        next_epoch = cutover.next_epoch(),
-                        cutover_view = cutover.cutover_view(),
-                        "replica membership change observed"
-                    );
-                    node_r.set_view_ceiling(cutover.cutover_view());
-                }
-                if let Some(plan) = actions.respawn() {
-                    let members = plan.valset().consensus_members();
-                    let member_bytes: Vec<Vec<u8>> =
-                        members.iter().map(|k| k.as_ref().to_vec()).collect();
-                    let plan_residents: Vec<ed25519::PublicKey> = plan
-                        .valset()
-                        .transport_members()
-                        .difference(members)
-                        .cloned()
-                        .collect();
-                    let plan_resident_bytes: Vec<Vec<u8>> =
-                        plan_residents.iter().map(|k| k.as_ref().to_vec()).collect();
-                    // THE ACTIVATION CUTOVER THAT SEATS THIS KEY: promotion
-                    // is decided HERE, off this node's own folded state —
-                    // never by polling members, who may already be halted
-                    // awaiting this very node's votes. stash the coords and
-                    // let the promotion block after the drain pass take the
-                    // node once this borrow ends.
-                    let seat_is_mine = members.contains(&signer.public_key());
-                    if seat_is_mine {
-                        seat_plan = Some(SeatCoords {
-                            epoch: plan.epoch(),
-                            view_base: plan.cutover_app_height(),
-                            participants: member_bytes,
-                            residents: plan_resident_bytes,
-                        });
-                    } else {
-                        // no mesh track here: the window sync above already
-                        // tracked the transport union at its GENERATION
-                        // index when the change committed. the epoch-plane
-                        // books follow the cutover, like the validator.
-                        if let Some(book) = &gateway_book {
-                            book.peers()
-                                .set_peers(plan.valset().transport_members().iter());
+                match read_valset_members(node_r.host()).await {
+                    Err(e) => {
+                        // a failed read is NOT an observation — see the
+                        // validator drain's identical discipline (#1820).
+                        valset_read_failed_checks += 1;
+                        let attempts = valset_read_failed_checks;
+                        let speak =
+                            attempts == 1 || attempts.is_multiple_of(VALSET_READ_WARN_EVERY);
+                        if speak {
+                            tracing::warn!(
+                                target: "ducktape::consensus",
+                                node = %label,
+                                reason = "valset_read_failed",
+                                attempts,
+                                error = %e,
+                                "committed valset read failed; skipping the replica cutover step this pass"
+                            );
                         }
-                        if let Some(peers) = &media_peers {
-                            peers.set_peers(plan.valset().transport_members().iter());
-                        }
-                        // the follower swap: same OrderedNode, fresh
-                        // orderer, cutover journaled — the epoch-local
-                        // view clock restarts with the new base.
-                        let follower = consensus::FollowerOrderer::new(replica_store.clone());
-                        if let Err(e) = node_r
-                            .cutover(
-                                follower,
-                                plan.epoch(),
-                                plan.cutover_app_height(),
-                                &member_bytes,
-                                &plan_resident_bytes,
-                            )
-                            .await
-                        {
-                            fatal!(label, "replica cutover journal write: {e}");
-                        }
-                        replica_scheme = Some(replica_verifier(&namespace, &member_bytes));
-                        replica_epoch = plan.epoch();
-                        replica_view_base = plan.cutover_app_height();
-                        replica_watermark = None;
-                        pending_seal_checks.clear();
-                        // force a checkpoint on the next pass — the
-                        // validator writes one immediately post-cutover
-                        // for the same restart-boundary reason.
-                        blocks_since_checkpoint = checkpoint_blocks;
-                        // ...and CLEAR the duty cooldown with it. The force
-                        // says "a restart must land on the new boundary", and
-                        // an unpaid cooldown from the previous checkpoint would
-                        // otherwise hold this one off for minutes.
-                        checkpoint_not_before = context.current();
-                        // ...and the CHANGE GATE with it. A cutover moves the
-                        // manifest's epoch/view_base WITHOUT moving the state
-                        // root, so `state_moved` is false at exactly the moment
-                        // the new boundary must reach disk. `None` is the gate's
-                        // own "re-anchor on the first cadence hit", so the force
-                        // stays a force. The validator's post-cutover checkpoint
-                        // escapes the gate by living in its own branch; the
-                        // replica routes through the shared one, so it clears it.
-                        replica_written_root = None;
-                        tracing::info!(
-                            target: "ducktape::consensus",
-                            node = %label,
-                            epoch = plan.epoch(),
-                            base_height = plan.cutover_app_height(),
-                            "replica epoch cutover; follower swapped in-loop"
+                    }
+                    Ok(members_raw) if members_raw.is_empty() => {
+                        fatal!(
+                            label,
+                            reason = "valset_read_empty",
+                            "committed valset query returned an empty set — an \
+                             unreadable valset must never read as an observation \
+                             of an empty one"
                         );
+                    }
+                    Ok(members_raw) => {
+                        valset_read_failed_checks = 0;
+                        let observed: Vec<ed25519::PublicKey> = members_raw
+                            .iter()
+                            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                            .collect();
+                        let residents_raw = read_valset_residents(node_r.host()).await;
+                        let observed_residents: Vec<ed25519::PublicKey> = residents_raw
+                            .iter()
+                            .filter_map(|k| ed25519::PublicKey::decode(k.as_slice()).ok())
+                            .collect();
+                        let mut actions =
+                            EpochActions::new(orch, folded_view, observed, observed_residents);
+                        if let Some(CutoverTrigger::Membership(cutover)) = actions.observe_members()
+                        {
+                            tracing::info!(
+                                target: "ducktape::consensus",
+                                node = %label,
+                                observed_view = cutover.observed_view(),
+                                next_epoch = cutover.next_epoch(),
+                                cutover_view = cutover.cutover_view(),
+                                "replica membership change observed"
+                            );
+                            node_r.set_view_ceiling(cutover.cutover_view());
+                        }
+                        if let Some(plan) = actions.respawn() {
+                            let members = plan.valset().consensus_members();
+                            let member_bytes: Vec<Vec<u8>> =
+                                members.iter().map(|k| k.as_ref().to_vec()).collect();
+                            let plan_residents: Vec<ed25519::PublicKey> = plan
+                                .valset()
+                                .transport_members()
+                                .difference(members)
+                                .cloned()
+                                .collect();
+                            let plan_resident_bytes: Vec<Vec<u8>> =
+                                plan_residents.iter().map(|k| k.as_ref().to_vec()).collect();
+                            // THE ACTIVATION CUTOVER THAT SEATS THIS KEY: promotion
+                            // is decided HERE, off this node's own folded state —
+                            // never by polling members, who may already be halted
+                            // awaiting this very node's votes. stash the coords and
+                            // let the promotion block after the drain pass take the
+                            // node once this borrow ends.
+                            let seat_is_mine = members.contains(&signer.public_key());
+                            if seat_is_mine {
+                                seat_plan = Some(SeatCoords {
+                                    epoch: plan.epoch(),
+                                    view_base: plan.cutover_app_height(),
+                                    participants: member_bytes,
+                                    residents: plan_resident_bytes,
+                                });
+                            } else {
+                                // no mesh track here: the window sync above already
+                                // tracked the transport union at its GENERATION
+                                // index when the change committed. the epoch-plane
+                                // books follow the cutover, like the validator.
+                                if let Some(book) = &gateway_book {
+                                    book.peers()
+                                        .set_peers(plan.valset().transport_members().iter());
+                                }
+                                if let Some(peers) = &media_peers {
+                                    peers.set_peers(plan.valset().transport_members().iter());
+                                }
+                                // the follower swap: same OrderedNode, fresh
+                                // orderer, cutover journaled — the epoch-local
+                                // view clock restarts with the new base.
+                                let follower =
+                                    consensus::FollowerOrderer::new(replica_store.clone());
+                                if let Err(e) = node_r
+                                    .cutover(
+                                        follower,
+                                        plan.epoch(),
+                                        plan.cutover_app_height(),
+                                        &member_bytes,
+                                        &plan_resident_bytes,
+                                    )
+                                    .await
+                                {
+                                    fatal!(label, "replica cutover journal write: {e}");
+                                }
+                                replica_scheme = Some(replica_verifier(&namespace, &member_bytes));
+                                replica_epoch = plan.epoch();
+                                replica_view_base = plan.cutover_app_height();
+                                replica_watermark = None;
+                                pending_seal_checks.clear();
+                                // force a checkpoint on the next pass — the
+                                // validator writes one immediately post-cutover
+                                // for the same restart-boundary reason.
+                                blocks_since_checkpoint = checkpoint_blocks;
+                                // ...and CLEAR the duty cooldown with it. The force
+                                // says "a restart must land on the new boundary", and
+                                // an unpaid cooldown from the previous checkpoint would
+                                // otherwise hold this one off for minutes.
+                                checkpoint_not_before = context.current();
+                                // ...and the CHANGE GATE with it. A cutover moves the
+                                // manifest's epoch/view_base WITHOUT moving the state
+                                // root, so `state_moved` is false at exactly the moment
+                                // the new boundary must reach disk. `None` is the gate's
+                                // own "re-anchor on the first cadence hit", so the force
+                                // stays a force. The validator's post-cutover checkpoint
+                                // escapes the gate by living in its own branch; the
+                                // replica routes through the shared one, so it clears it.
+                                replica_written_root = None;
+                                tracing::info!(
+                                    target: "ducktape::consensus",
+                                    node = %label,
+                                    epoch = plan.epoch(),
+                                    base_height = plan.cutover_app_height(),
+                                    "replica epoch cutover; follower swapped in-loop"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -1719,7 +1771,7 @@ pub(super) async fn park(
             {
                 let pos = node_r.sink_mut().oplog_pos().await;
                 let checkpoint_started = context.current();
-                let members = read_valset_members(node_r.host()).await;
+                let members = read_valset_members(node_r.host()).await.unwrap_or_default();
                 let residents = read_valset_residents(node_r.host()).await;
                 // the capture's OWN window: the two valset reads above are host
                 // queries that run module execution, and charging them to
@@ -2260,6 +2312,9 @@ pub(super) async fn park(
                                 None,
                                 m.height,
                                 SUFFIX_CATCHUP_MAX_ITERS,
+                                &namespace,
+                                founding_anchor,
+                                &replica_store,
                             )
                             .await
                             {
@@ -2295,13 +2350,11 @@ pub(super) async fn park(
                             let tip = caught.to_height.max(m.height);
                             metrics.begin_sync(Some(client.current_source().to_string()), tip);
                             metrics.record_sync_progress(tip);
-                            // seed the shared store with the folded
-                            // suffix: peers' resolvers can fetch these
-                            // from us, and a re-reported cert for a
-                            // just-folded height resolves locally.
-                            for bytes in &caught.frame_bytes {
-                                replica_store.put(bytes.clone());
-                            }
+                            // the folded suffix's bytes already landed in
+                            // `replica_store` window-by-window inside
+                            // `catch_up_suffix_frames`: peers' resolvers can
+                            // fetch these from us, and a re-reported cert for
+                            // a just-folded height resolves locally.
                             let root = host.root_hash();
                             // the fold pipeline: the follower orderer
                             // in the engine's seat of the SAME
@@ -2323,6 +2376,9 @@ pub(super) async fn park(
                                 m.view_base,
                             );
                             node_r.set_code_source(code_source.clone());
+                            // the observation barrier — see the resume site
+                            // above.
+                            node_r.watch_module("valset");
                             replica_scheme = Some(replica_verifier(&namespace, &m.participants));
                             replica_orchestrator = Some(replica_orchestrator_at(
                                 m.epoch,

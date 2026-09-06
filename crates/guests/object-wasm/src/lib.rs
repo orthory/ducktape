@@ -4,19 +4,19 @@
 //! `None` resolution, the object-read budget, staged-put discard on abort) AND
 //! the `StateBacking::Odb` seam (cross-dispatch overlay visibility via 'P', the
 //! refs state lane via 'r'). It calls the raw host imports directly (the
-//! `GuestOdb` ObjectStore wrapper in `guest-adapter` is proven separately by
+//! `GuestOdb` ObjectStore wrapper in `ducktape-module-sdk` is proven separately by
 //! compile).
 //!
 //! ops: 'p' put+same-dispatch-check · 'a' assert-absent · 'P' assert-present ·
 //! 'b' budget-probe · 'r' stage-refs-image · 'c' assert-genesis-config —
-//! decoded by hand rather than through `sdk::genesis_config` / `guest-adapter`
+//! decoded by hand rather than through `sdk::genesis_config` / the module SDK
 //! (this guest is deliberately standalone, calling the raw host imports the
 //! `GuestOdb` wrapper and `load_config` are proven to sit over), so it proves
 //! the odb `__config` seam from a plain reader's point of view too.
 
 wit_bindgen::generate!({
     world: "module",
-    path: "../../kernel/module-guest/wit",
+    path: "../../module-sdk/wit",
 });
 
 use ducktape::module::host;
@@ -62,6 +62,14 @@ fn distinct_id(i: u64) -> Vec<u8> {
 }
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// the object plane is the odb backing's: this guest declares odb, so the
     /// host wraps it over an object store (the kernel tests' mock) and never
     /// over a plain map.
@@ -190,7 +198,7 @@ impl Guest for Component {
             // the same reserved key [`sdk::genesis_config::CONFIG_KEY`] names
             // (`__config`) through the plain `state-get` import and decodes
             // the frame by hand (count, then length-prefixed key/value pairs)
-            // — the odb twin of `guest_adapter::load_config`.
+            // — the odb twin of `ducktape_module_sdk::load_config`.
             Some((b'c', want)) => {
                 let config = host::state_get(b"__config")
                     .ok_or_else(|| host::Error::Rejected("__config absent".into()))?;

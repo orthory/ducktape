@@ -788,7 +788,9 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 index_guest::delete(&mut out, key);
             }
         }
-        ChatMsg::JoinHuddle { channel_id, node } => {
+        ChatMsg::JoinHuddle {
+            channel_id, node, ..
+        } => {
             let Some(mut row) = read_channel(read, &channel_id)? else {
                 return Ok(out);
             };
@@ -827,11 +829,11 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             row.huddle.retain(|m| m.party != party);
             put_channel(&mut out, &row)?;
         }
-        ChatMsg::SweepHuddle { channel_id, party } => {
+        ChatMsg::SweepHuddle { channel_id, .. } => {
             let Some(mut row) = read_channel(read, &channel_id)? else {
                 return Ok(out);
             };
-            let target = party_handle(&party);
+            let target = party_handle(decode_stamp(op)?.participant().map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?);
             row.huddle.retain(|m| m.party != target);
             put_channel(&mut out, &row)?;
         }
@@ -1155,7 +1157,7 @@ mod tests {
                     blocks: blocks.clone(),
                 })
             }
-            ChatMsg::AddReaction { .. }
+            ChatMsg::SweepHuddle { .. } | ChatMsg::AddReaction { .. }
             | ChatMsg::RemoveReaction { .. }
             | ChatMsg::JoinHuddle { .. }
             | ChatMsg::LeaveHuddle { .. } => encode_assigned(&ChatAssigned::Participant {
@@ -1259,6 +1261,7 @@ mod tests {
                 ChatMsg::JoinHuddle {
                     channel_id: "g".into(),
                     node: vec![1; 32],
+                    node_proof: Vec::new(),
                 },
                 participant(),
             );
@@ -1874,6 +1877,7 @@ mod tests {
             &ChatMsg::JoinHuddle {
                 channel_id: "g".into(),
                 node: vec![0xab; 32],
+                node_proof: vec![0; 64],
             },
         );
         let ChatViewReply::Channel(Some(info)) =

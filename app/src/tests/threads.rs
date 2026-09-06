@@ -89,7 +89,7 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     // compiler-owned revision of `thread_messages` itself, so a writer that
     // forgets to bump anything can no longer leave stale pixels behind.
     assert!(chat.contains(
-        "lazy thread_messages by active_channel, active_thread_seq, thread_target_seq, thread_selected_seq as cached_thread_messages"
+        "lazy thread_messages by active_channel, active_thread_seq, thread_target_seq, thread_selected_seq, copy_anchor_seq, copy_head_seq, copy_surface as cached_thread_messages"
     ));
     // A `lazy` subtree reads nothing but its dependency, so the quiet arm can
     // only exist because the rows that read SCREEN state — the search target
@@ -98,7 +98,12 @@ fn the_thread_rail_virtualizes_and_caches_its_quiet_replies() {
     // The KEYED form is pinned too:
     // dropping `by (seq, render_rev)` silently reverts every visible reply to
     // a full row clone + hash per frame — the #1058 residue this collects.
-    assert!(chat.contains("lazy thread_message as cached_reply"));
+    // The copy range joins the per-reply key for the same reason it joins the
+    // stream's: a cached reply has to notice the range's ends moving or it
+    // keeps a stale plate while its neighbours tint.
+    assert!(chat.contains(
+        "lazy thread_message, copy_anchor_seq, copy_head_seq, copy_surface as cached_reply"
+    ));
     for live in [
         "thread_message.seq == thread_target_seq",
         "thread_message.seq == thread_selected_seq",
@@ -137,7 +142,10 @@ fn thread_messages_mirror_the_main_action_system() {
     // Confirmation is the pending dot disappearing, so the card needs no
     // timer or animation prop. (`card` starts right after the component name,
     // so the signature is its head.)
-    assert!(card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool)"));
+    // `in_range` is the fourth reading, and it is a reading and not a second
+    // selection: a reply inside the copy range wears the lighter plate, while
+    // `selected` still means the deep-link target and nothing else.
+    assert!(card.starts_with("(message:ChatMessage, selected:bool, menu_open:bool, in_range:bool)"));
     // `menu_open` cannot be `selected` here: in the rail `selected` marks the
     // deep-link TARGET reply, not the row whose action card is open.
     let chat_screen_rail = inlined(include_str!("../ui/screens/chat.ice"));

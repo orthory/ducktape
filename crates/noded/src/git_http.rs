@@ -352,11 +352,11 @@ fn push_may_carry_proof(commands: &[Vec<u8>], has_operator: bool) -> bool {
 /// certificate never has to pass through it to reach consensus (any account
 /// with `/v1/submit/frame` standing can carry one straight past this
 /// function), so it does not by itself bound what a validator will accept.
-/// consensus checks the repo half unconditionally (`pushcert::nonce_names_repo`)
-/// and, since #1761, pins its own network's chain half the first time it ever
-/// sees a verified one (`Tracker::accepted_chain`) — see the `pushcert`
-/// module doc for why that pin, not a chain-id check here, is the strictest
-/// gate reachable from inside forge today.
+/// consensus re-checks the full nonce itself, unaided (`pushcert::signer`,
+/// #1773) — forge learns its own chain id through the same genesis-config
+/// seam identity/gateway/runs use, so a certificate minted for a different
+/// ducktape network is refused regardless of whether it slips past this
+/// front door.
 fn parse_push_commands(
     commands: &[Vec<u8>],
     expected_nonce: Option<&str>,
@@ -800,7 +800,25 @@ pub(crate) async fn git_receive_pack(
         const REFUSAL: &str = "this push carries no proof: sign it (`git push --signed`) \
                                or present this node's operator credential";
         push_refused(&repo, "push_unauthenticated", REFUSAL);
-        return error_response(StatusCode::UNAUTHORIZED, REFUSAL);
+        // CONSUME-AND-REFUSE, LIKE EVERY OTHER PUSH REFUSAL BELOW. The pack is
+        // fully received by now, and an HTTP 401 at this point is what git
+        // prints as "the remote end hung up unexpectedly" — the one sentence
+        // that says nothing about signing. A `report-status` with `ng` per ref
+        // is what git renders as
+        // `! [remote rejected] main -> main (<reason>)`, so the reason reaches
+        // the person who has to act on it. Naming the refs is the PLAIN line
+        // split: the gate above has just established this body claims no
+        // certificate, so nothing is dearmored to answer it. A list that is
+        // not plain lines either has no refs to name — that is the malformed
+        // stream the parse below reports.
+        let Ok(PushCommands { cmds, .. }) = parse_push_commands(&commands, None) else {
+            return error_response(StatusCode::BAD_REQUEST, "malformed git command stream");
+        };
+        let results: Vec<(String, Option<String>)> = cmds
+            .into_iter()
+            .map(|(_, _, refname)| (refname, Some(REFUSAL.to_string())))
+            .collect();
+        return git_report_status(&results);
     }
 
     // the command list: plain `<old> <new> <refname>` lines, or — a signed
@@ -867,7 +885,8 @@ pub(crate) async fn git_receive_pack(
     // clean per-ref `ng` instead of a rejected block. every validator
     // re-verifies; this node is not trusted for it.
     if let Some(cert) = &cert
-        && let Err(reason) = forge::pushcert::signer(cert, &repo, &updates)
+        && let Err(reason) =
+            forge::pushcert::signer(cert, &handle.status.current().chain_id, &repo, &updates)
     {
         push_refused(&repo, push_refusal_reason(&reason), &reason);
         let results: Vec<(String, Option<String>)> = cmds
@@ -1243,7 +1262,7 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
             prev_oid: None,
             new_oid: Some(hex_to_bytes("ab5b1f3d5b7e3e0e0d33e2c6d1f6c2a7d3a7f1e2").unwrap()),
         }];
-        forge::pushcert::signer(&cert, "lab", &updates).expect("verifies");
+        forge::pushcert::signer(&cert, "chain-a", "lab", &updates).expect("verifies");
     }
 
     #[test]
@@ -1274,8 +1293,8 @@ ZYBzkWoVNWmNV5YTCuZwE=\n\
     /// receive-pack refuses a credential-less push BEFORE it ever attempts
     /// the certificate parse — checked on a command list that would fail
     /// `parse_push_commands` outright (neither valid triples nor a
-    /// certificate), so a wrongly-late gate would surface as a parse error
-    /// (400) rather than the auth refusal (401) this checks for.
+    /// certificate), so the gate cannot be reading anything the parse
+    /// produced.
     #[test]
     fn a_credential_less_push_is_refused_before_the_certificate_parse() {
         let unparseable_junk = vec![b"junk\n".to_vec()];

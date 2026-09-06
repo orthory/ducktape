@@ -202,7 +202,7 @@ mod interactive;
 // below — resolve through this crate.
 pub(crate) use sandbox_host::sandbox;
 #[cfg(unix)]
-pub use sandbox_host::{GuestAsset, GuestLayout, tap_egress_nftables};
+pub use sandbox_host::{GuestAsset, GuestLayout};
 #[cfg(unix)]
 pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
 mod spec;
@@ -1169,9 +1169,9 @@ impl CliProvider {
     /// - The child never runs on the host. `[sandbox] runtime` is
     ///   `firecracker` and there is no second arm, so the blast radius of
     ///   "trusted" is a guest this run booted and destroys.
-    /// - That sandbox has a private netns and an egress allowlist (broker +
-    ///   node RPC + public), so a project hook reaches nothing the run was not
-    ///   already given.
+    /// - The guest gets no tap device at all — its whole reach is the vsock
+    ///   tunnels (broker + node RPC + public, see [`wire_guest_tunnels`]), so a
+    ///   project hook reaches nothing the run was not already given.
     /// - `$HOME` is never mounted (D7): the config home the trust decision is
     ///   written into IS this run's, drawn per run and deleted with it.
     /// - Above all, the process being asked is an agent already executing

@@ -103,7 +103,8 @@ pub fn check_authority(authority: &crate::Authority, segments: &[String]) -> Res
                     Ok(())
                 } else {
                     Err(format!(
-                        "files: actor '{}' is not the home owner '{o}'", authority.actor()
+                        "files: actor '{}' is not the home owner '{o}'",
+                        authority.actor()
                     ))
                 }
             }

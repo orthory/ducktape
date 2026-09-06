@@ -95,7 +95,9 @@ impl<'a> Reader<'a> {
     pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, String> {
         let len = self.u64()?;
         let len = usize::try_from(len).map_err(|_| format!("files: {} truncated", self.what))?;
-        let end = self.off.checked_add(len)
+        let end = self
+            .off
+            .checked_add(len)
             .filter(|&end| end <= self.bytes.len())
             .ok_or_else(|| format!("files: {} truncated", self.what))?;
         let value = self.bytes[self.off..end].to_vec();

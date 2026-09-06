@@ -219,6 +219,58 @@ fn scan_pages_with_cursor() {
 }
 
 #[test]
+fn scan_pages_by_byte_budget_not_just_row_count() {
+    // #1809: a page well under MAX_SCAN_LIMIT rows can still be gigabytes —
+    // duckfs stage chunks put megabyte payloads in op rows. three ~1.5 MiB
+    // rows blow the 4 MiB page budget on the third row, so a `limit` of 10
+    // still pages after 2 entries.
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    let big_payload = vec![b'x'; 3 * 1024 * 1024 / 2];
+    for h in 1..=3 {
+        store
+            .apply_block(&block(h, vec![chat_op(&big_payload)]))
+            .unwrap();
+    }
+
+    let page = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
+    assert_eq!(
+        page.entries.len(),
+        2,
+        "stops adding rows once the running total would exceed MAX_INDEX_PAGE_BYTES"
+    );
+    assert!(page.has_more);
+    let cursor = page.next_after.clone().expect("cursor when has_more");
+
+    let rest = store
+        .scan("chat", OP_PREFIX.as_bytes(), Some(cursor.as_bytes()), 10)
+        .unwrap();
+    assert_eq!(
+        rest.entries.len(),
+        1,
+        "the cursor resumes past the budget cut"
+    );
+    assert!(!rest.has_more);
+}
+
+#[test]
+fn scan_never_wedges_on_a_single_row_over_the_byte_budget() {
+    // the budget check only fires once a page already holds a row — a lone
+    // oversized row must still page out instead of returning an empty page
+    // forever.
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    let huge_payload = vec![b'x'; 5 * 1024 * 1024];
+    store
+        .apply_block(&block(1, vec![chat_op(&huge_payload)]))
+        .unwrap();
+
+    let page = store.scan("chat", OP_PREFIX.as_bytes(), None, 10).unwrap();
+    assert_eq!(page.entries.len(), 1, "at least one row always ships");
+    assert!(!page.has_more);
+}
+
+#[test]
 fn an_undeclared_modules_ops_are_skipped_not_poisoned() {
     // a module admitted after boot (modules register) has no database
     // here: its ops write nothing, every declared module's watermark still
@@ -408,13 +460,11 @@ fn a_new_mapper_folds_the_op_feed_the_database_already_held() {
         store
             .apply_block(&block(2, vec![chat_op(b"two"), chat_op(b"three")]))
             .unwrap();
-        assert!(
-            store
-                .scan("chat", b"seen/", None, 10)
-                .unwrap()
-                .entries
-                .is_empty()
-        );
+        assert!(store
+            .scan("chat", b"seen/", None, 10)
+            .unwrap()
+            .entries
+            .is_empty());
     }
     let store = mapped_store(dir.path());
     // NO BARRIER HERE, ON PURPOSE. `open` waits the refold out itself, and
@@ -682,10 +732,18 @@ fn reopen_without_a_guest_converges_the_database() {
             Err(Error::ViewUnsupported)
         ));
         assert!(store.fold_status("chat").unwrap().is_none());
-        // already-derived rows still serve — the tier is read-available even
-        // without its mapper.
+        // Removing a mapper removes its output; the feed remains available
+        // for any later mapper to derive a fresh view.
         let seen = store.scan("chat", b"seen/", None, 10).unwrap();
-        assert_eq!(seen.entries.len(), 1);
+        assert!(seen.entries.is_empty());
+        assert_eq!(
+            store
+                .scan("chat", OP_PREFIX.as_bytes(), None, 10)
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
     }
     // and shipping one again REFOLDS: the guest is new to this database, so
     // the rows the previous one left are cleared and re-derived from the feed
@@ -1150,4 +1208,101 @@ fn drain_verdict_never_treats_equal_pending_as_progress() {
         drain_verdict(4, 4, Duration::from_millis(1), Duration::from_secs(60)),
         DrainVerdict::Waiting
     );
+}
+
+#[test]
+fn a_live_mapper_replacement_refolds_before_reads_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    store
+        .apply_block(&block(1, vec![chat_op(b"one"), chat_op(b"two")]))
+        .unwrap();
+    store.wait_folds_drained().unwrap();
+    let restamped = restamped_testmap();
+    store
+        .converge(&[IndexModule {
+            id: "chat",
+            guest: Some(&restamped),
+        }])
+        .unwrap();
+    assert_eq!(store.view("chat", b"count").unwrap(), 2u64.to_be_bytes());
+    assert_eq!(
+        store
+            .scan("chat", b"seen/", None, 10)
+            .unwrap()
+            .entries
+            .len(),
+        2
+    );
+    assert_eq!(store.fold_tip("chat").unwrap(), Some((1, 1)));
+    store.converge(&[IndexModule::bare("chat")]).unwrap();
+    assert!(matches!(
+        store.view("chat", b"count"),
+        Err(Error::ViewUnsupported)
+    ));
+    assert!(
+        store
+            .scan("chat", b"seen/", None, 10)
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_failed_mapper_replacement_refuses_reads_and_poisoned_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    assert!(
+        store
+            .converge(&[IndexModule {
+                id: "chat",
+                guest: Some(b"not wasm")
+            }])
+            .is_err()
+    );
+    assert!(store.is_poisoned());
+    assert!(store.view("chat", b"count").is_err());
+    assert!(store.get("chat", b"count").is_err());
+    assert!(store.scan("chat", b"seen/", None, 10).is_err());
+    assert!(store.apply_block(&block(1, vec![chat_op(b"one")])).is_err());
+}
+
+/// The two engine reads take separate snapshots. Their order and shared
+/// deployment guard prevent a watermark from vouching for unseen rows.
+#[test]
+fn a_view_reads_its_advisory_tip_before_query_under_one_deployment_guard() {
+    let body = include_str!("lib.rs")
+        .split("pub fn view_with_tip(")
+        .nth(1)
+        .unwrap()
+        .split("\n    /// ")
+        .next()
+        .unwrap();
+    let guard = body.find("let _deployment = m.read_deployment()?").unwrap();
+    let tip = body.find("let folded =").unwrap();
+    let view = body.find("let bytes = m.query(req)?").unwrap();
+    assert!(guard < tip && tip < view);
+    assert!(!body[tip..view].contains('?'), "tip errors are advisory");
+    assert!(
+        !body[guard..view].contains("drop("),
+        "the guard spans both reads"
+    );
+}
+
+#[test]
+fn an_unchanged_deployment_converges_while_a_view_holds_its_read_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mapped_store(dir.path());
+    let spec = IndexModule {
+        id: "chat",
+        guest: Some(TESTMAP),
+    };
+    let code_hash = sha2::Sha256::digest(TESTMAP);
+    store.converge_deployment(&spec, &code_hash).unwrap();
+    let module = store.module("chat").unwrap();
+    let _view = module.read_deployment().unwrap();
+    // A write lock here would wait for this very reader. The unchanged
+    // deployment must complete without taking one or touching mapper bytes.
+    store.converge_deployment(&spec, &code_hash).unwrap();
 }

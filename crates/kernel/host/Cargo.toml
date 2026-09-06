@@ -34,6 +34,7 @@ identity = { workspace = true }
 borsh = { workspace = true }
 
 [dev-dependencies]
+module-artifact = { workspace = true }
 # the fail-closed proof asserts the OPERATOR-facing line the boundary emits
 # before it errors: a capturing subscriber, not a log-shaped comment.
 tracing-subscriber = { version = "0.3" }

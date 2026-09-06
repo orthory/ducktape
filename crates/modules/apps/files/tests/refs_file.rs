@@ -10,8 +10,8 @@
 mod harness;
 use harness::open_files;
 
-use files::state::{PinEntry, Refs, Staged, root_bytes};
 use duckfs_disk::DiskStore;
+use files::state::{PinEntry, Refs, Staged, root_bytes};
 use files::{Kind, ObjectStore as _};
 use sdk::{Module as _, StateRoot};
 

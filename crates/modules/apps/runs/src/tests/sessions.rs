@@ -328,7 +328,7 @@ fn call_ids_are_idempotent_and_completed_calls_release_the_root_slot() {
     }
     assert_eq!(
         sessions(&m)[0].actions,
-        (MAX_DELEGATIONS_PER_RUN + 1) as u32
+        (MAX_DELEGATIONS_PER_RUN + 2) as u32
     );
     let mut joiner = module();
     joiner.install(&m.snapshot(), m.root()).unwrap();

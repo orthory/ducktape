@@ -64,14 +64,12 @@
 
 use std::collections::BTreeMap;
 
-use duckfs_core::{
-    decode_block_objects, encode_block_objects, encode_refs, Fs, ObjectStore,
-};
+use duckfs_core::{Fs, ObjectStore, decode_block_objects, encode_block_objects, encode_refs};
 use sdk::{Ctx, Error};
 
 /// the guest's SINGLE state key — the raw refs image, whose `sha256` the host
 /// derives the module root from (`StateBacking::Odb`). there is NO `__root`
-/// twin (unlike guest-adapter's `SnapshotBytes` tenants): the host owns the
+/// twin (unlike ducktape-module-sdk's `SnapshotBytes` tenants): the host owns the
 /// root derivation, so the guest persists the image alone. MUST equal
 /// `wasm_host::REFS_KEY` (`b"__state"`) — a mismatch silently forks the network.
 /// guest-only: the native test drives `dispatch` directly and never touches the
@@ -114,10 +112,9 @@ pub struct Dispatched {
 ///    (`object-put`, a staged host effect) — and return BOTH the new refs image
 ///    (`REFS_KEY`) and the updated block index (`__block_objects`) to re-stage.
 ///
-/// on a rejected op the `?` short-circuits BEFORE any flush or state save, so
-/// the host aborts the block with nothing staged — the native
-/// reject-then-`abort_block` sequence (the whole block's `__block_objects` and
-/// refs stage are discarded together).
+/// A rejected operation returns before object flush or state save. Earlier
+/// accepted dispatches retain their refs and block-object index; the host owns
+/// rollback of the failed unit's other effects.
 #[cfg(any(feature = "guest", test))]
 pub async fn dispatch<S: ObjectStore>(
     fs: &mut Fs<S>,
@@ -136,9 +133,7 @@ pub async fn dispatch<S: ObjectStore>(
     // before commit_block takes the pending.
     let block_objects = encode_block_objects(&fs.block_objects());
     // seed_block_objects always set a pending, so commit_block yields Some.
-    let (refs, _height, objects) = fs
-        .commit_block()
-        .expect("seed_block_objects set a pending");
+    let (refs, _height, objects) = fs.commit_block().expect("seed_block_objects set a pending");
     // flush this dispatch's staged objects; ordering vs. the refs save is
     // irrelevant here — the host enforces objects-before-refs at the real block
     // boundary (`StateBacking::Odb::commit_block`).
@@ -158,10 +153,9 @@ pub async fn dispatch<S: ObjectStore>(
 
 #[cfg(feature = "guest")]
 mod entry {
-    use super::{dispatch, BLOCK_OBJECTS_KEY, REFS_KEY};
-    use duckfs_core::{decode_refs, Fs, Refs};
-    use guest_adapter::{host, GuestOdb, WitCtx};
-    use guest_adapter::{block_on, error_to_wit};
+    use super::{BLOCK_OBJECTS_KEY, REFS_KEY, dispatch};
+    use duckfs_core::{Fs, Refs, decode_refs};
+    use ducktape_module_sdk::{GuestOdb, WitCtx, block_on, error_to_wit, host};
 
     /// the wasm-facing entry surface. all object I/O rides [`GuestOdb`]; the
     /// refs image rides the host `state-*` lane under [`REFS_KEY`]. a zero-sized
@@ -176,9 +170,8 @@ mod entry {
         fn load() -> Result<Fs<GuestOdb>, host::Error> {
             let refs = match host::state_get(REFS_KEY) {
                 None => Refs::default(),
-                Some(bytes) => decode_refs(&bytes).map_err(|e| {
-                    host::Error::Rejected(format!("files: refs image decode: {e}"))
-                })?,
+                Some(bytes) => decode_refs(&bytes)
+                    .map_err(|e| host::Error::Rejected(format!("files: refs image decode: {e}")))?,
             };
             Ok(Fs::new(GuestOdb, refs))
         }
@@ -191,8 +184,13 @@ mod entry {
             let mut fs = Self::load()?;
             let mut ctx = WitCtx::new();
             let block_objects = host::state_get(BLOCK_OBJECTS_KEY);
-            let out = block_on(dispatch(&mut fs, &mut ctx, &payload, block_objects.as_deref()))
-                .map_err(error_to_wit)?;
+            let out = block_on(dispatch(
+                &mut fs,
+                &mut ctx,
+                &payload,
+                block_objects.as_deref(),
+            ))
+            .map_err(error_to_wit)?;
             host::state_set(REFS_KEY, &out.refs_image);
             host::state_set(BLOCK_OBJECTS_KEY, &out.block_objects);
             Ok(())
@@ -214,11 +212,19 @@ mod entry {
     /// `guest-builder` — this export is the whole of the guest's entry wiring.
     struct Component;
 
-    impl guest_adapter::Guest for Component {
+    impl ducktape_module_sdk::Guest for Component {
+        fn initialize(_params: Vec<u8>) -> Result<(), ducktape_module_sdk::host::Error> {
+            Ok(())
+        }
+
+        fn finalize_block() -> Result<(), ducktape_module_sdk::host::Error> {
+            Ok(())
+        }
+
         /// an odb port: the host wraps this component over the duckfs
         /// substrate it provides for the module's id.
         fn shape() -> host::ModuleShape {
-            guest_adapter::odb_shape()
+            ducktape_module_sdk::odb_shape()
         }
 
         fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
@@ -238,7 +244,7 @@ mod entry {
         }
     }
 
-    guest_adapter::export_module!(Component);
+    ducktape_module_sdk::export_module!(Component);
 }
 
 #[cfg(feature = "guest")]
@@ -246,12 +252,12 @@ pub use entry::FilesGuest;
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch, Dispatched};
+    use super::{Dispatched, dispatch};
     use base64::Engine as _;
     use duckfs_core::objects::object_id;
     use duckfs_core::{
-        encode_msg, encode_putblob, encode_refs, to_hex, Change, Content, Fs, FilesMsg, Kind,
-        MemStore, ObjectId, ObjectStore, Refs,
+        Change, Content, FilesMsg, Fs, Kind, MemStore, ObjectId, ObjectStore, Refs, encode_msg,
+        encode_putblob, encode_refs, to_hex,
     };
     use sdk::{Ctx, Env, Error, Event, Msg, Origin, StateRoot};
     use std::cell::RefCell;
@@ -344,6 +350,10 @@ mod tests {
             }
         }
         fn dispatch(&mut self, height: u64, time: u64, payload: &[u8]) -> Result<(), Error> {
+            self.dispatch_ctx(&mut ctx_at(height, time), payload)
+        }
+
+        fn dispatch_ctx(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
             let refs = match &self.refs_image {
                 None => Refs::default(),
                 Some(bytes) => duckfs_core::decode_refs(bytes).unwrap(),
@@ -354,7 +364,7 @@ mod tests {
                 block_objects,
             } = futures::executor::block_on(dispatch(
                 &mut fs,
-                &mut ctx_at(height, time),
+                ctx,
                 payload,
                 self.block_objects.as_deref(),
             ))?;
@@ -423,14 +433,23 @@ mod tests {
     /// origin, height/time 1) — the single-sourced verb, no guest seam.
     fn apply_native(fs: &mut Fs<MemStore>, payload: &[u8]) -> Result<(), String> {
         match payload.first() {
-            Some(&duckfs_core::PUTBLOB_FRAME_TAG) => fs.putblob(&duckfs_core::Authority::System, 1, &payload[1..]),
+            Some(&duckfs_core::PUTBLOB_FRAME_TAG) => {
+                fs.putblob(&duckfs_core::Authority::System, 1, &payload[1..])
+            }
             _ => match duckfs_core::decode_msg(payload)? {
                 FilesMsg::Commit {
                     base_snapshot,
                     message,
                     changes,
                 } => fs
-                    .commit(&duckfs_core::Authority::System, 1, 1, base_snapshot, message, changes)
+                    .commit(
+                        &duckfs_core::Authority::System,
+                        1,
+                        1,
+                        base_snapshot,
+                        message,
+                        changes,
+                    )
                     .map(|_| ()),
                 other => panic!("test only drives commits/putblob, got {other:?}"),
             },
@@ -515,10 +534,7 @@ mod tests {
         lane.dispatch(1, 1, &commit_inline("/a", content)).unwrap();
         lane.dispatch(1, 1, &encode_putblob(content)).unwrap();
 
-        let native = native_block(&[
-            commit_inline("/a", content),
-            encode_putblob(content),
-        ]);
+        let native = native_block(&[commit_inline("/a", content), encode_putblob(content)]);
         assert!(
             lane.refs().staging.is_empty(),
             "guest must dedup the putblob against the block index (no new staging entry)"
@@ -549,5 +565,108 @@ mod tests {
             matches!(&err, Error::Module(m) if m.contains("chunk not available")),
             "expected the availability reject across the block boundary, got {err:?}"
         );
+    }
+
+    fn program_ctx(standing: identity::ProgramStanding) -> sdk_testkit::TestCtx {
+        sdk_testkit::TestCtx::with_env(Env {
+            height: 1,
+            consensus_time: 1,
+            origin: Origin::Program(7),
+            me: "files".into(),
+            cause: sdk::Cause::Direct,
+        })
+        .on_query("identity", move |req| {
+            assert_eq!(
+                identity::decode_query(req).unwrap(),
+                identity::IdentityQuery::Get { number: 7 }
+            );
+            Ok(identity::encode_reply(&identity::IdentityReply::Account(
+                Some(identity::AccountView {
+                    number: 7,
+                    name: "Program".into(),
+                    control: identity::Control::Program {
+                        controller: 1,
+                        executor: "executor".into(),
+                        generation: 0,
+                        standing: standing.clone(),
+                    },
+                    keys: Vec::new(),
+                    avatar: None,
+                    bio: None,
+                    updated_at: 1,
+                }),
+            )))
+        })
+    }
+
+    #[test]
+    fn program_native_and_guest_match_source_messages_outputs_and_same_block_revisions() {
+        let mut native = Fs::new(MemStore::new(), Refs::default());
+        let mut guest = GuestLane::new();
+        let mut run = |payload: Vec<u8>| {
+            let mut native_ctx = program_ctx(identity::ProgramStanding::Active);
+            let mut guest_ctx = program_ctx(identity::ProgramStanding::Active);
+            futures::executor::block_on(crate::adapter::apply_op(
+                &mut native,
+                &mut native_ctx,
+                &payload,
+            ))
+            .unwrap();
+            guest.dispatch_ctx(&mut guest_ctx, &payload).unwrap();
+            assert_eq!(native_ctx.msgs(), guest_ctx.msgs());
+            assert_eq!(native_ctx.output(), guest_ctx.output());
+            assert_eq!(
+                encode_refs(native.pending_refs()),
+                encode_refs(&guest.refs())
+            );
+            let output = duckfs_core::decode_write_output(native_ctx.output().unwrap()).unwrap();
+            assert_eq!(output.actor, duckfs_core::Actor::Account(7));
+            output
+        };
+        let first = run(commit_inline("/home/acct:7/result", b"program output"));
+        let duckfs_core::WriteOutcome::Commit { snapshot } = first.outcome else {
+            panic!("commit output")
+        };
+        let pin = FilesMsg::Pin {
+            snapshot,
+            name: "program pin".into(),
+        };
+        assert_eq!(run(encode_msg(&pin)).source_revision, 2);
+        assert_eq!(
+            run(encode_msg(&FilesMsg::Unpin {
+                name: "program pin".into()
+            }))
+            .source_revision,
+            3
+        );
+        assert_eq!(run(encode_msg(&pin)).source_revision, 4);
+    }
+
+    #[test]
+    fn refused_program_native_and_guest_preserve_state_and_emit_nothing() {
+        let mut native = Fs::new(MemStore::new(), Refs::default());
+        let mut guest = GuestLane::new();
+        for (standing, path) in [
+            (identity::ProgramStanding::Active, "/home/acct:1/private"),
+            (identity::ProgramStanding::Suspended, "/home/acct:7/result"),
+        ] {
+            let payload = commit_inline(path, b"refused");
+            let mut native_ctx = program_ctx(standing.clone());
+            let mut guest_ctx = program_ctx(standing);
+            let native_error = futures::executor::block_on(crate::adapter::apply_op(
+                &mut native,
+                &mut native_ctx,
+                &payload,
+            ))
+            .unwrap_err();
+            let guest_error = guest.dispatch_ctx(&mut guest_ctx, &payload).unwrap_err();
+            assert_eq!(native_error.to_string(), guest_error.to_string());
+            assert_eq!(*native.pending_refs(), Refs::default());
+            assert!(guest.refs_image.is_none());
+            assert!(native_ctx.msgs().is_empty());
+            assert!(guest_ctx.msgs().is_empty());
+            assert!(native_ctx.output().is_none());
+            assert!(guest_ctx.output().is_none());
+        }
     }
 }

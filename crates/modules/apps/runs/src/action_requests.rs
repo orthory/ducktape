@@ -87,6 +87,7 @@ impl RunsModule {
         if let Some(existing) = self.action_request(&id) {
             let exact = existing.view.account == request.account
                 && existing.view.generation == request.generation
+                && existing.view.run_id == request.run_id
                 && existing.view.target == request.target
                 && existing.view.payload == request.payload;
             if !exact {
@@ -416,10 +417,7 @@ impl RunsModule {
         };
         self.request_call(ctx, &request)?;
         self.request_authority(ctx, &request).await?;
-        let decided = matches!(
-            request.view.status,
-            ActionStatus::Completed { .. } | ActionStatus::Rejected { .. }
-        );
+        let decided = !matches!(request.view.status, ActionStatus::AwaitingProgram);
         if decided {
             return Err(Error::Module("action request was already decided".into()));
         }
@@ -482,10 +480,13 @@ impl RunsModule {
                 }
             }
         }
-        if let Err(error) = self.request_authority(ctx, request).await {
-            view.status = ActionStatus::Rejected {
-                reason: error.to_string(),
-            };
+        // A grant or lease change is not a terminal receipt: the program may
+        // already have authorized a target call. A generation change fences
+        // every such call permanently, so it can terminate a waiting request.
+        let control = self.account_control(ctx, view.account).await?;
+        let same_generation = matches!(control, identity::Control::Program { generation, executor, standing: identity::ProgramStanding::Active, .. } if generation == view.generation && executor == self.agent);
+        if !same_generation {
+            view.status = ActionStatus::Rejected { reason: "program authority changed since this action was proposed".into() };
             return Ok(Some(view));
         }
         let query = attribution::AttributionQuery::ChangesOf {

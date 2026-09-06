@@ -1357,15 +1357,19 @@ impl Chat {
         Ok(())
     }
 
-    /// join (or start) the channel's huddle. people only — the roster is a
-    /// room of people, so module/system parties are rejected — and
-    /// members-only channels gate exactly like posting. re-joining with the
-    /// same node key stages nothing (idempotent, byte-identical op log).
+    /// join (or start) the channel's huddle. only external users may — the
+    /// roster is a room of people, so module/system origins are rejected —
+    /// and members-only channels gate exactly like posting. `node_proof` must
+    /// verify as `node`'s own signature over this join (proof of possession —
+    /// see [`interface::huddle_join_preimage`]), refused with
+    /// `huddle_node_proof_invalid` otherwise. re-joining with the same node
+    /// key stages nothing (idempotent, byte-identical op log).
     async fn stage_join_huddle(
         &mut self,
         authority: &Authority,
         channel_id: &str,
         node: Vec<u8>,
+        node_proof: Vec<u8>,
         now: u64,
     ) -> Result<Party, Error> {
         let party = authority.party.clone();
@@ -1378,6 +1382,14 @@ impl Chat {
                 "huddle node key must be {HUDDLE_NODE_KEY_BYTES} bytes, got {}",
                 node.len()
             )));
+        }
+        let (namespace, preimage) = match &authority.origin {
+            Origin::External(key) => (HUDDLE_JOIN_NS, huddle_join_preimage(channel_id, key)),
+            Origin::Program(account) => (PROGRAM_HUDDLE_JOIN_NS, program_huddle_join_preimage(channel_id, *account)),
+            Origin::Module(_) | Origin::System => return Err(Error::Module("only people may join a huddle".into())),
+        };
+        if !keyscheme::KeyScheme::Ed25519.verify(&node, namespace, &preimage, &node_proof) {
+            return Err(Error::Module("huddle_node_proof_invalid".into()));
         }
         let mut channel = self.require_channel(channel_id).await?;
         let party = authority.participant(channel.huddle.iter().map(|member| &member.party));
@@ -1445,7 +1457,7 @@ impl Chat {
         authority: &Authority,
         channel_id: &str,
         target: &Party,
-    ) -> Result<(), Error> {
+    ) -> Result<Party, Error> {
         let party = &authority.party;
         require_non_empty("channel_id", channel_id)?;
         if !party.is_person() {
@@ -1454,8 +1466,7 @@ impl Chat {
         if target == party {
             return self
                 .stage_leave_huddle(authority, channel_id)
-                .await
-                .map(|_| ());
+                .await;
         }
         let mut channel = self.require_channel(channel_id).await?;
         let owns_entry = authority.owns(target);
@@ -1467,9 +1478,10 @@ impl Chat {
         let before = channel.huddle.len();
         channel.huddle.retain(|m| m.party != *target);
         if channel.huddle.len() == before {
-            return Ok(());
+            return Ok(target.clone());
         }
-        self.store_channel(&channel)
+        self.store_channel(&channel)?;
+        Ok(target.clone())
     }
 
     /// hand one report to the attribution plane in this unit — the write and
@@ -1739,9 +1751,9 @@ impl Chat {
                 self.stage_membership(&*ctx, &authority, &channel_id, member_party, member)
                     .await
             }
-            ChatMsg::JoinHuddle { channel_id, node } => {
+            ChatMsg::JoinHuddle { channel_id, node, node_proof } => {
                 let participant = self
-                    .stage_join_huddle(&authority, &channel_id, node, now)
+                    .stage_join_huddle(&authority, &channel_id, node, node_proof, now)
                     .await?;
                 ctx.set_assigned(encode_assigned(&ChatAssigned::Participant {
                     actor: party.clone(),
@@ -1761,8 +1773,9 @@ impl Chat {
                 channel_id,
                 party: target,
             } => {
-                self.stage_sweep_huddle(&authority, &channel_id, &target)
-                    .await
+                let participant = self.stage_sweep_huddle(&authority, &channel_id, &target).await?;
+                ctx.set_assigned(encode_assigned(&ChatAssigned::Participant {actor: party.clone(), participant}));
+                Ok(())
             }
         }
     }

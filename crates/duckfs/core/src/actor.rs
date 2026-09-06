@@ -108,11 +108,15 @@ impl Authority {
             Actor::Account(0) => Err("files: account zero is not an actor".into()),
             Actor::Account(_) | Actor::System => Ok(()),
             Actor::Key(key) => {
-                if key.is_empty() { return Err("files: actor key is empty".into()); }
+                if key.is_empty() {
+                    return Err("files: actor key is empty".into());
+                }
                 Ok(())
             }
             Actor::Module(module) => {
-                if module.is_empty() { return Err("files: actor module is empty".into()); }
+                if module.is_empty() {
+                    return Err("files: actor module is empty".into());
+                }
                 Ok(())
             }
         }
@@ -121,9 +125,11 @@ impl Authority {
     pub fn actor(&self) -> Actor {
         match self {
             Self::External { key, account: None } => Actor::Key(key.clone()),
-            Self::External { account: Some(number), .. } | Self::Program(number) => {
-                Actor::Account(*number)
+            Self::External {
+                account: Some(number),
+                ..
             }
+            | Self::Program(number) => Actor::Account(*number),
             Self::Module(module) => Actor::Module(module.clone()),
             Self::System => Actor::System,
         }

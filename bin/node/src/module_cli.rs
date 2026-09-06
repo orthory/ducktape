@@ -8,7 +8,6 @@
 use std::path::PathBuf;
 
 use commonware_cryptography::Signer as _;
-use topology::PRODUCTION;
 
 use crate::cli::{CeremonyOutcome, GovSigner, rpc_call, rpc_query};
 use crate::cli_args::{Selector, StatusArgs};
@@ -27,7 +26,7 @@ pub enum ModuleCmd {
     Status(StatusArgs),
 }
 
-/// `<id> <component.wasm> [--after N]` — shared by update and register.
+/// `<id> <component.wasm> [--index <index.wasm>] [--after N]` — shared by update and register.
 #[derive(Debug, clap::Args)]
 pub struct StageArgs {
     /// the module id the code belongs to
@@ -36,7 +35,13 @@ pub struct StageArgs {
     /// the component bytes to stage
     #[arg(value_name = "COMPONENT.WASM")]
     pub component: PathBuf,
-    /// blocks after the current height at which the swap activates
+    /// Optional mapper deployed and activated with this component; omission removes it.
+    #[arg(long, value_name = "INDEX.WASM")]
+    pub index: Option<PathBuf>,
+    /// blocks after the proposal's EXECUTE height (not this node's height
+    /// right now) at which the swap activates — the same value for every
+    /// member co-signing the same proposal, whatever height each one is at
+    /// when it runs this command.
     #[arg(long, default_value_t = 50)]
     pub after: u64,
     #[command(flatten)]
@@ -74,7 +79,7 @@ impl Verb {
     fn action(
         self,
         module_id: &str,
-        activation_height: u64,
+        activation_lead: u64,
         code_hash: [u8; 32],
     ) -> governance::GovAction {
         let name = format!("{module_id}@{}", short(&code_hash));
@@ -84,13 +89,13 @@ impl Verb {
             Verb::Update => governance::GovAction::UpdateModule {
                 name,
                 module_id,
-                activation_height,
+                activation_lead,
                 code_hash,
             },
             Verb::Register => governance::GovAction::RegisterModule {
                 name,
                 module_id,
-                activation_height,
+                activation_lead,
                 code_hash,
             },
         }
@@ -106,19 +111,16 @@ fn cmd_register(args: StageArgs) -> CommandResult {
 }
 
 /// the ceremony's "same proposal" test for a module verb: the same variant,
-/// module and code is the same proposal whatever activation height the
-/// proposer computed — each member computes its own from its own height —
-/// PROVIDED that activation still clears `floor`, this node's
-/// `height + MIN_SWAP_LEAD`. the registry applies that floor at execute
-/// time, so a proposal already inside it can never be scheduled: joining it
-/// would land one more ballot on a doomed proposal and leave the operator
-/// unable to schedule those bytes until it expires. such a proposal is
-/// skipped and a fresh one minted.
+/// module, code AND lead is the same proposal. `activation_lead` is relative
+/// to the EXECUTE height, not whichever member's height happened to be
+/// current when it proposed — so unlike the old absolute-height scheme, this
+/// never goes stale while a ballot is outstanding; a member joins an open
+/// proposal for as long as it stays Open, whatever height it runs at.
 fn matches_module_action<'a>(
     verb: Verb,
     module_id: &'a str,
     code_hash: &'a [u8],
-    floor: u64,
+    activation_lead: u64,
 ) -> impl Fn(&governance::GovAction) -> bool + 'a {
     use governance::GovAction;
     move |action| match (verb, action) {
@@ -127,7 +129,7 @@ fn matches_module_action<'a>(
             GovAction::UpdateModule {
                 module_id: m,
                 code_hash: h,
-                activation_height,
+                activation_lead: lead,
                 ..
             },
         )
@@ -136,39 +138,42 @@ fn matches_module_action<'a>(
             GovAction::RegisterModule {
                 module_id: m,
                 code_hash: h,
-                activation_height,
+                activation_lead: lead,
                 ..
             },
-        ) => {
-            let same_code = m == module_id && h.as_slice() == code_hash;
-            let still_schedulable = *activation_height > floor;
-            same_code && still_schedulable
-        }
+        ) => m == module_id && h.as_slice() == code_hash && *lead == activation_lead,
         (Verb::Update, _) | (Verb::Register, _) => false,
     }
 }
 
-/// `module update|register <id> <component.wasm> [--after N]`: stage the bytes
+/// `module update|register <id> <component.wasm> [--index <index.wasm>] [--after N]`: stage the bytes
 /// at this node (fan-out to every validator), refuse unless every member holds
 /// them, then drive the governance proposal that schedules the swap at this
-/// node's height + N and read the registry back for its verdict.
+/// execution height + N and read the registry back for its verdict.
 fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     config::validate_module_id(&args.id)?;
     // the static half of the registry's lead rule, checked before anything is
-    // staged or proposed: an activation at or under the floor is refused at
-    // execute whatever the ceremony does.
+    // staged or proposed: a lead at or under the floor can never schedule,
+    // whatever height Execute lands at (governance validates this again at
+    // Propose — this is just an earlier, friendlier refusal).
     let lead_too_short = args.after <= modules::MIN_SWAP_LEAD;
     if lead_too_short {
         return Err(format!(
-            "--after {} cannot schedule anything: activation must exceed height+MIN_SWAP_LEAD ({}), \
-             and the ceremony's own blocks eat into the lead — leave room (the default is 50)",
+            "--after {} cannot schedule anything: activation must exceed \
+             execute-height+MIN_SWAP_LEAD ({}) (the default is 50)",
             args.after,
             modules::MIN_SWAP_LEAD
         )
         .into());
     }
-    let bytes = std::fs::read(&args.component)
+    let component = std::fs::read(&args.component)
         .map_err(|e| format!("read {}: {e}", args.component.display()))?;
+    let index = args
+        .index
+        .as_ref()
+        .map(|path| std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display())))
+        .transpose()?;
+    let bytes = module_artifact::ModuleArtifact { component, index }.encode();
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, verb.name())?;
@@ -182,7 +187,14 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     // 1. the registry's static rules, before anything is staged or proposed:
     //    each would reject governance's execute in-kernel and leave a
     //    proposal open for its whole voting period.
-    let precheck = registry_precheck(verb, &read_module_status(rpc_addr)?, &args.id, &code_hash)?;
+    let live_modules = read_live_modules(rpc_addr)?;
+    let precheck = registry_precheck(
+        verb,
+        &read_module_status(rpc_addr)?,
+        &live_modules,
+        &args.id,
+        &code_hash,
+    )?;
     match precheck {
         Precheck::Proceed => {}
         // a member running the verb after the deciding ballot (or after the
@@ -220,27 +232,19 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     let signer = crate::cli::gov_signer(rpc_addr, &cfg_path, &resolved)?;
     let pubkey_hex = signer_pubkey_hex(&signer);
 
-    // 4. activation = this node's height + N (each member computes its own).
-    //    an `--after` that wraps would land UNDER the floor in release, where
-    //    the matcher's debug assert is compiled out: the verb would mint a
-    //    proposal the registry refuses at execute.
-    let height = current_height(rpc_addr)?;
-    let activation_height = height
-        .checked_add(args.after)
-        .ok_or("--after overflows the chain height")?;
-    let floor = height + modules::MIN_SWAP_LEAD;
-
-    // 5. the ceremony: join an open proposal for the same (verb, id, hash)
-    //    that can still be scheduled, or propose; cast yes; execute when
-    //    decidable
-    let matches = matches_module_action(verb, &args.id, &code_hash, floor);
+    // 4. the ceremony: join an open proposal for the same (verb, id, hash,
+    //    lead) or propose; cast yes; execute when decidable. `--after` is the
+    //    activation_lead governance applies RELATIVE TO THE EXECUTE HEIGHT
+    //    (#1775) — every member co-signing the same proposal passes the same
+    //    number, so no per-member height computation is needed here at all.
+    let matches = matches_module_action(verb, &args.id, &code_hash, args.after);
     let ceremony = crate::cli::drive_proposal_ceremony(
         &node,
         &signer,
         &pubkey_hex,
         verb.name(),
         "module:",
-        verb.action(&args.id, activation_height, code_hash),
+        verb.action(&args.id, args.after, code_hash),
         &matches,
     );
     let outcome = match ceremony {
@@ -357,22 +361,19 @@ impl Held {
 fn registry_precheck(
     verb: Verb,
     modules: &[modules::ModuleCode],
+    live_modules: &[String],
     id: &str,
     code_hash: &[u8; 32],
 ) -> Result<Precheck, String> {
-    // a genesis id is code this host already runs, so the registry's
-    // `handle_schedule_register` refuses to re-admit it (`ctx.module_root`) —
-    // and that refusal lands in-kernel, leaving the proposal open for its whole
-    // voting period. the registry read cannot see it: a NATIVE module carries no
-    // registry entry at all.
-    let registering_a_genesis_module = matches!(verb, Verb::Register) && PRODUCTION.contains(&id);
-    if registering_a_genesis_module {
-        return Err(format!(
-            "{id} is a genesis module — its code changes with `module update`, not `register`"
-        ));
-    }
     if let Some(held) = registry_holds(modules, id, code_hash) {
         return Ok(Precheck::AlreadyHeld(held));
+    }
+    let already_live = live_modules.iter().any(|live| live == id);
+    let registering_live_module = matches!(verb, Verb::Register) && already_live;
+    if registering_live_module {
+        return Err(format!(
+            "module {id} is already registered (code changes go through `module update`)"
+        ));
     }
     let entry = modules.iter().find(|m| m.module_id == id);
     let other_swap_pending = entry.map(|m| m.pending.is_some());
@@ -393,10 +394,10 @@ fn registry_precheck(
 /// the registry's schedule rules, for a refusal it does not narrate itself.
 fn registry_rules() -> String {
     format!(
-        "its rules: activation must exceed height+MIN_SWAP_LEAD ({}) at EXECUTE time, so --after must \
-         leave room for the ceremony's own blocks (the default is 50); one pending swap per module \
-         (cancel it first); `register` needs an unregistered id and `update` a registered one; the \
-         code must differ from the active code",
+        "its rules: --after (the activation lead) must exceed MIN_SWAP_LEAD ({}) — it is relative \
+         to the EXECUTE height, so a long ballot never goes stale (the default is 50); one pending \
+         swap per module (cancel it first); `register` needs an unregistered id and `update` a \
+         registered one; the code must differ from the active code",
         modules::MIN_SWAP_LEAD
     )
 }
@@ -416,15 +417,18 @@ fn registry_holds(modules: &[modules::ModuleCode], id: &str, code_hash: &[u8; 32
     already_active.then_some(Held::Active)
 }
 
-/// this node's committed height, from the rpc status snapshot.
-fn current_height(rpc_addr: &str) -> Result<u64, String> {
+/// The running host determines which ids are occupied, including modules
+/// with no code-registry record. A default build catalog says nothing about
+/// the module set of this network.
+fn read_live_modules(rpc_addr: &str) -> Result<Vec<String>, String> {
     let reply = rpc_call(rpc_addr, &serde_json::json!({ "cmd": "status" }))?;
     if reply["ok"] != true {
         return Err(format!("status: {}", reply["error"]));
     }
-    reply["status"]["height"]
-        .as_u64()
-        .ok_or_else(|| "node status carries no height".into())
+    let Some(modules) = reply["status"]["modules"].as_object() else {
+        return Err("node status carries no module roster".into());
+    };
+    Ok(modules.keys().cloned().collect())
 }
 
 /// the signer's public key as hex: the proposal-id seed the ceremony mints
@@ -616,7 +620,7 @@ fn digest_matches(reply: &StageReply, bytes: &[u8]) -> Result<[u8; 32], String> 
     let agree = theirs[..] == ours[..];
     if !agree {
         return Err(format!(
-            "stage digest {} is not the sha256 of the file we read ({})",
+            "stage digest {} is not the sha256 of the deployment we packaged ({})",
             reply.digest,
             hex_bytes(&ours)
         ));
@@ -784,7 +788,7 @@ mod tests {
             history: Vec::new(),
         };
         let precheck =
-            |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, "hello", &ours);
+            |verb, modules: &[ModuleCode]| registry_precheck(verb, modules, &[], "hello", &ours);
 
         // register: a free id proceeds; any existing entry refuses
         assert!(matches!(
@@ -829,23 +833,24 @@ mod tests {
             "scheduled"
         );
         assert_eq!(Held::Active.word(), "active");
-        // a genesis id carries no registry entry when it is native, so only the
-        // topology set catches it — the registry would refuse it in-kernel
-        let err = registry_precheck(Verb::Register, &[], "identity", &ours).unwrap_err();
-        assert!(err.contains("genesis module"), "{err}");
-        // update is how a genesis module's code changes: no genesis refusal
-        let err = registry_precheck(Verb::Update, &[], "identity", &ours).unwrap_err();
+        // A familiar name is available when this network does not run it.
+        assert!(matches!(
+            registry_precheck(Verb::Register, &[], &[], "identity", &ours),
+            Ok(Precheck::Proceed)
+        ));
+        let live = vec!["identity".to_string()];
+        let err = registry_precheck(Verb::Register, &[], &live, "identity", &ours).unwrap_err();
+        assert!(err.contains("already registered"), "{err}");
+        let err = registry_precheck(Verb::Update, &[], &live, "identity", &ours).unwrap_err();
         assert!(err.contains("unregistered module identity"), "{err}");
     }
 
     #[test]
-    fn the_matcher_ignores_the_activation_height_but_not_the_verb_or_the_floor() {
+    fn the_matcher_checks_verb_id_code_and_lead() {
         let hash = [0xabu8; 32];
-        let floor = 50;
         let update = Verb::Update.action("hello", 100, hash);
-        let register = Verb::Register.action("hello", 200, hash);
-        let same_update = matches_module_action(Verb::Update, "hello", &hash, floor);
-        assert!(same_update(&Verb::Update.action("hello", 999, hash)));
+        let register = Verb::Register.action("hello", 100, hash);
+        let same_update = matches_module_action(Verb::Update, "hello", &hash, 100);
         assert!(same_update(&update));
         assert!(!same_update(&register), "register is not update");
         assert!(!same_update(&Verb::Update.action("other", 100, hash)));
@@ -854,11 +859,11 @@ mod tests {
             100,
             [0xcdu8; 32]
         )));
-        // a proposal this node's floor has already overtaken cannot be
-        // scheduled by anyone: not joined, whatever its code
-        assert!(!same_update(&Verb::Update.action("hello", floor, hash)));
-        assert!(same_update(&Verb::Update.action("hello", floor + 1, hash)));
-        let same_register = matches_module_action(Verb::Register, "hello", &hash, floor);
+        // activation_lead is now a fixed part of the action's identity (it is
+        // relative to the EXECUTE height, so it never goes stale): a
+        // different lead is a DIFFERENT proposal, not one to join.
+        assert!(!same_update(&Verb::Update.action("hello", 999, hash)));
+        let same_register = matches_module_action(Verb::Register, "hello", &hash, 100);
         assert!(same_register(&register));
         assert!(!same_register(&update));
     }

@@ -7,8 +7,8 @@
 mod wire;
 pub use wire::*;
 
-mod codec;
 mod actor;
+mod codec;
 pub use actor::{Actor, Authority};
 
 pub mod fs;

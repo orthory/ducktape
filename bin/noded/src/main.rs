@@ -102,10 +102,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // this daemon runs no network, so its index guests come from the same
     // founding set its components do, not from a genesis.
     let index = noded::open_index_store(&storage, MODULE_IDS)?;
-    noded::converge_index_guests(
-        &index,
-        &noded::IndexGuests::from_dir(&modules_dir, MODULE_IDS)?,
-    )?;
 
     let log_ring = noded::LogRing::default();
     noded::log::init(Some(log_ring.clone()), Some(storage.join("daemon.log")));
@@ -253,7 +249,6 @@ fn run_node(
         };
         let mut stores = qmdb_stores(&context);
         let mut host = compose(
-            MODULE_IDS,
             &code,
             &mut stores,
             &substrates,
@@ -267,6 +262,7 @@ fn run_node(
         .await
         .expect("noded genesis composes");
         host.set_module_factory(Box::new(Admissions::new(&context, &substrates, &bindings)));
+        noded::converge_host_modules(&index, &host).expect("deployed index guests converge");
 
         tracing::info!(
             target: "ducktape::consensus",
@@ -673,7 +669,7 @@ async fn submit_one(
         consensus_time,
         record,
         &out.dispatches,
-        &host.module_roots(),
+        host,
     );
 
     // fan the block out live after the derived index had its chance to

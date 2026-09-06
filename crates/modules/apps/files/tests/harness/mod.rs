@@ -19,11 +19,16 @@ pub fn test_ctx(origin: Origin, height: u64) -> TestCtx {
         origin,
         me: "files".into(),
         cause: sdk::Cause::Direct,
-    }).on_query("identity", |req| {
-        let identity::IdentityQuery::OfKey { .. } = identity::decode_query(req).map_err(sdk::Error::Module)? else {
+    })
+    .on_query("identity", |req| {
+        let identity::IdentityQuery::OfKey { .. } =
+            identity::decode_query(req).map_err(sdk::Error::Module)?
+        else {
             return Err(sdk::Error::QueryUnsupported);
         };
-        Ok(identity::encode_reply(&identity::IdentityReply::Account(None)))
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            None,
+        )))
     })
 }
 
@@ -44,19 +49,28 @@ pub fn to_hex(bytes: &[u8]) -> String {
 /// Re-openable in-memory sibling state for the files crash/restart tests. The
 /// filesystem itself still reloads its refs and objects from its actual disk.
 #[derive(Clone, Default)]
-pub struct SharedStore(std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>);
+pub struct SharedStore(
+    std::rc::Rc<std::cell::RefCell<std::collections::BTreeMap<Vec<u8>, Vec<u8>>>>,
+);
 
 #[async_trait::async_trait(?Send)]
 impl sdk::MerkleStore for SharedStore {
     async fn get(&self, key: &[u8; sdk::ROOT_LEN]) -> Result<Option<Vec<u8>>, sdk::Error> {
         Ok(self.0.borrow().get(key.as_slice()).cloned())
     }
-    async fn commit_batch(&mut self, writes: Vec<([u8; sdk::ROOT_LEN], Option<Vec<u8>>)>) -> Result<(), sdk::Error> {
+    async fn commit_batch(
+        &mut self,
+        writes: Vec<([u8; sdk::ROOT_LEN], Option<Vec<u8>>)>,
+    ) -> Result<(), sdk::Error> {
         let mut map = self.0.borrow_mut();
         for (key, value) in writes {
             match value {
-                Some(value) => { map.insert(key.to_vec(), value); }
-                None => { map.remove(key.as_slice()); }
+                Some(value) => {
+                    map.insert(key.to_vec(), value);
+                }
+                None => {
+                    map.remove(key.as_slice());
+                }
             }
         }
         Ok(())
@@ -73,5 +87,8 @@ impl sdk::MerkleStore for SharedStore {
 }
 
 pub fn watch_msgs(ctx: &TestCtx) -> Vec<&sdk::Msg> {
-    ctx.msgs().iter().filter(|msg| msg.target != "attribution").collect()
+    ctx.msgs()
+        .iter()
+        .filter(|msg| msg.target != "attribution")
+        .collect()
 }

@@ -55,6 +55,9 @@ pub(crate) struct BindConfig<'a> {
     /// this node's consensus public key — the salt every owner PoP on the
     /// admin namespace is bound to.
     pub(crate) node_key: Vec<u8>,
+    /// this node's own mesh-identity signer, wired onto the handle so
+    /// `POST /v1/huddle/node-proof` can mint a `JoinHuddle.node_proof` for it.
+    pub(crate) signer: commonware_cryptography::ed25519::PrivateKey,
     /// how the owner-gated admin namespace is exposed.
     pub(crate) admin_exposure: noded::AdminExposure,
 }
@@ -108,6 +111,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         gateway_enabled,
         log_ring,
         node_key,
+        signer,
         admin_exposure,
     } = config;
     // the rpc listener binds OUTSIDE the runtime (plain std tcp on OS threads)
@@ -168,12 +172,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // /v1/index/* lanes light up through the handle below. an open failure
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index". opened
-    // BARE over the genesis set: the index guests are the network's, carried
-    // by its genesis, and a joiner fetches that off the mesh after these
+    // BARE before hydration: the module set and index guests are the
+    // network's, carried by its genesis, which a joiner fetches after these
     // surfaces are up — the boot's genesis hydration
     // (`host_state::hydrate_genesis`) converges them. a module the registry
     // admitted after genesis gets its database when the host composes.
-    let index = noded::open_index_store(storage, topology::PRODUCTION)?;
+    let index = noded::open_index_store::<&str>(storage, &[])?;
     // this node's operator credential: minted fresh each boot and written 0600
     // beside node.toml, exactly like the service link token. Minted on EVERY
     // boot, `DUCKTAPE_ADMIN=off` included — it is no longer the admin
@@ -206,6 +210,7 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
         .with_index_store(index.clone())
         .with_call(voice_lane)
         .with_code_stage(code_stage_lane)
+        .with_node_signer(signer)
         // the duckfs workspace RPC's managed-checkout root (disk state, separate
         // from the module's own `<storage>/duckfs` dir).
         .with_duckfs_workspaces(storage.join("duckfs-workspaces"))

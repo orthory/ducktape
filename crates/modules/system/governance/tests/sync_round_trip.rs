@@ -201,7 +201,7 @@ fn synced_store_reconstructs_source_root_proposals_and_redemptions() {
                 action: GovAction::UpdateModule {
                     name: "hello-replacement".into(),
                     module_id: "hello".into(),
-                    activation_height: 900,
+                    activation_lead: 900,
                     code_hash: vec![3; 32],
                 },
                 voting_period: 100,

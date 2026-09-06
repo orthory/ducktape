@@ -1,11 +1,17 @@
 use host::Host;
 use recovery::{Manifest, Recovery};
-use statesync::{fetch_frames, fetch_manifest};
+use statesync::{fetch_frames_capped, fetch_manifest};
 
+use crate::blob_fetch::SourceRotate;
 use crate::constants::CUTOVER_DELAY;
 use crate::explorer::IndexFold;
-use crate::sync::serve::to_node_disposition;
+use crate::sync::serve::{TrustAnchor, to_node_disposition, verify_manifest_floor};
 use crate::util::hex;
+
+/// height span a single catch-up window covers before its frames are applied
+/// and dropped — bounds the suffix fold's working set to one window
+/// regardless of how far behind the source's (unverified) tip claims to be.
+const CATCHUP_WINDOW_HEIGHTS: u64 = statesync::MAX_APPLIED_FRAMES as u64;
 
 pub(crate) async fn apply_verified_suffix_frame(
     host: &mut Host,
@@ -119,6 +125,7 @@ where
     if let Some(fold) = fold {
         use recovery::ReplaySink as _;
         fold.folded_block(&recovery::FoldedBlock {
+            host,
             height: frame.height,
             frame: &frame.frame,
             disposition: seal.disposition,
@@ -133,9 +140,11 @@ where
 #[derive(Debug, Default)]
 pub(crate) struct SuffixCatchupApply {
     pub(crate) applied: usize,
-    frames: Vec<Vec<u8>>,
 }
 
+/// apply one fetched window's frames, then hand each frame's bytes to `store`
+/// as it lands — the window's bytes never accumulate past this call, so a
+/// full-run backlog never holds more than one window's worth at a time.
 pub(crate) async fn apply_suffix_frames<E>(
     recovery: &mut Recovery<E>,
     host: &mut Host,
@@ -143,6 +152,7 @@ pub(crate) async fn apply_suffix_frames<E>(
     to_height: u64,
     frames: Vec<statesync::FinalizedFrame>,
     mut fold: Option<&mut IndexFold<'_>>,
+    store: &consensus::ContentStore,
 ) -> Result<SuffixCatchupApply, String>
 where
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
@@ -170,6 +180,13 @@ where
     let mut last = from_height;
     let mut applied = SuffixCatchupApply::default();
     for frame in frames {
+        // STRICTLY INCREASING, in range: a real height gap is not itself
+        // evidence of an omitted block — the cutover ceiling (`node`'s
+        // `OrderedNode::view_ceiling`) discards straggler views on every
+        // honest node, so a legitimate suffix can skip a height. What
+        // catches a source that omits (or invents) a block it actually
+        // holds is the root-hash cross-check below, over the frames it DID
+        // serve, against the tip this run already anchored.
         if frame.height <= last || frame.height > to_height {
             return Err(format!(
                 "catch-up frame height {} outside ({last}, {to_height}]",
@@ -179,7 +196,7 @@ where
         apply_and_journal_verified_frame(recovery, host, &frame, fold.as_deref_mut()).await?;
         last = frame.height;
         applied.applied += 1;
-        applied.frames.push(frame.frame.clone());
+        store.put(frame.frame);
     }
     Ok(applied)
 }
@@ -187,7 +204,6 @@ where
 #[derive(Debug)]
 pub(crate) struct SuffixCatchup {
     pub(crate) to_height: u64,
-    pub(crate) frame_bytes: Vec<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -196,6 +212,7 @@ pub(crate) enum SuffixCatchupError {
     Fatal(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn catch_up_suffix_frames<C, E>(
     client: &C,
     recovery: &mut Recovery<E>,
@@ -203,20 +220,34 @@ pub(crate) async fn catch_up_suffix_frames<C, E>(
     fold: Option<&mut IndexFold<'_>>,
     recovered_height: u64,
     max_iterations: usize,
+    namespace: &[u8],
+    anchor: TrustAnchor<'_>,
+    store: &consensus::ContentStore,
 ) -> Result<SuffixCatchup, SuffixCatchupError>
 where
-    C: statesync::SyncClient,
+    C: statesync::SyncClient + SourceRotate,
     E: recovery::Context + commonware_runtime::BufferPooler + commonware_runtime::Supervisor,
 {
     let mut fold = fold;
     let mut current_height = recovered_height;
     let mut total_frames = 0usize;
-    let mut frame_bytes = Vec::new();
 
     for _ in 0..=max_iterations {
         let tip = fetch_manifest(client).await.map_err(|e| {
             SuffixCatchupError::Retry(format!("catch-up manifest unavailable: {e}"))
         })?;
+        // THE TRUST GATE: the tip's height, root_hash, and floor are the
+        // SOURCE's own claim about itself — verify_manifest_floor ties its
+        // participant set back to this node's anchor and checks a real
+        // quorum signed its floor, exactly like the boundary this replica
+        // already bootstrapped from. a tip that fails this is not a frame
+        // shortage worth retrying against the SAME source; rotate away.
+        if let Err(e) = verify_manifest_floor(namespace, anchor, &tip) {
+            client.rotate_source();
+            return Err(SuffixCatchupError::Retry(format!(
+                "catch-up tip manifest unanchored: {e}"
+            )));
+        }
         if tip.height <= current_height {
             if tip.height == current_height && host.root_hash() != tip.root_hash {
                 return Err(SuffixCatchupError::Fatal(format!(
@@ -235,52 +266,70 @@ where
             );
             return Ok(SuffixCatchup {
                 to_height: current_height,
-                frame_bytes,
             });
         }
 
-        let frames = match fetch_frames(client, current_height, tip.height).await {
-            Ok(frames) => frames,
-            Err(statesync::SyncError::RangePruned {
-                requested_after,
-                retained_from,
-            }) => {
-                // the follower side of the same wedge (#493, macOS "missing blocks").
-                // it printed the SAME impossible range on every certificate, which is
-                // indistinguishable from healthy catch-up — and so it read as boot
-                // noise for days. `permanent` is the word that ends the guessing: this
-                // does not heal by waiting, because the source can only prune FURTHER
-                // ahead of us.
-                tracing::error!(
-                    target: "ducktape::statesync",
+        // WINDOWED: apply and discard each fetched span before asking for the
+        // next one, so the suffix fold's working set never grows past one
+        // window regardless of how far behind the (unverified, but now
+        // anchored) tip claims to be.
+        while current_height < tip.height {
+            let window_to = current_height
+                .saturating_add(CATCHUP_WINDOW_HEIGHTS)
+                .min(tip.height);
+            let frames = match fetch_frames_capped(
+                client,
+                current_height,
+                window_to,
+                statesync::MAX_CATCHUP_BYTES,
+            )
+            .await
+            {
+                Ok(frames) => frames,
+                Err(statesync::SyncError::RangePruned {
                     requested_after,
                     retained_from,
-                    gap_blocks = retained_from.saturating_sub(requested_after),
-                    permanent = true,
-                    "catch-up IMPOSSIBLE — the source pruned past our height; waiting will \
-                     never fix this, we must full-sync from a fresh checkpoint"
-                );
-                return Err(SuffixCatchupError::Retry(format!(
-                    "source pruned past requested height {requested_after}; retained from \
-                     {retained_from}"
-                )));
-            }
-            Err(e) => {
-                return Err(SuffixCatchupError::Retry(format!(
-                    "catch-up frame suffix unavailable: {e}"
-                )));
-            }
-        };
-        let applied = apply_suffix_frames(
-            recovery,
-            host,
-            current_height,
-            tip.height,
-            frames,
-            fold.as_deref_mut(),
-        )
-        .await
-        .map_err(SuffixCatchupError::Fatal)?;
+                }) => {
+                    // the follower side of the same wedge (#493, macOS "missing blocks").
+                    // it printed the SAME impossible range on every certificate, which is
+                    // indistinguishable from healthy catch-up — and so it read as boot
+                    // noise for days. `permanent` is the word that ends the guessing: this
+                    // does not heal by waiting, because the source can only prune FURTHER
+                    // ahead of us.
+                    tracing::error!(
+                        target: "ducktape::statesync",
+                        requested_after,
+                        retained_from,
+                        gap_blocks = retained_from.saturating_sub(requested_after),
+                        permanent = true,
+                        "catch-up IMPOSSIBLE — the source pruned past our height; waiting will \
+                         never fix this, we must full-sync from a fresh checkpoint"
+                    );
+                    return Err(SuffixCatchupError::Retry(format!(
+                        "source pruned past requested height {requested_after}; retained from \
+                         {retained_from}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(SuffixCatchupError::Retry(format!(
+                        "catch-up frame suffix unavailable: {e}"
+                    )));
+                }
+            };
+            let applied = apply_suffix_frames(
+                recovery,
+                host,
+                current_height,
+                window_to,
+                frames,
+                fold.as_deref_mut(),
+                store,
+            )
+            .await
+            .map_err(SuffixCatchupError::Fatal)?;
+            current_height = window_to;
+            total_frames += applied.applied;
+        }
         if host.root_hash() != tip.root_hash {
             return Err(SuffixCatchupError::Fatal(format!(
                 "catch-up frames landed at {}, target manifest {}",
@@ -288,9 +337,6 @@ where
                 hex(&tip.root_hash)
             )));
         }
-        current_height = tip.height;
-        total_frames += applied.applied;
-        frame_bytes.extend(applied.frames);
     }
 
     tracing::debug!(
@@ -302,7 +348,6 @@ where
     );
     Ok(SuffixCatchup {
         to_height: current_height,
-        frame_bytes,
     })
 }
 
@@ -363,6 +408,7 @@ mod tests {
             // the change is already IN the checkpointed valset root: it is the
             // block at `height` that moved it.
             roots: vec![("valset".to_string(), VALSET_ROOT)],
+            codes: Vec::new(),
             snapshots: Vec::new(),
             oplog_pos: 0,
             next_seq: 0,

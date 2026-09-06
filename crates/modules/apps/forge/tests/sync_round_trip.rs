@@ -134,9 +134,8 @@ fn build_container(name: &str, oid: &[u8], pack: &[u8]) -> Vec<u8> {
 /// the TRK1 magic + a zero repo count.
 fn empty_tracker_section() -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&12u32.to_le_bytes());
+    out.extend_from_slice(&8u32.to_le_bytes());
     out.extend_from_slice(b"TRK\x01");
-    out.extend_from_slice(&0u32.to_le_bytes()); // accepted_chain: empty = None
     out.extend_from_slice(&0u32.to_le_bytes()); // repo count
     out
 }

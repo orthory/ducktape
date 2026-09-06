@@ -270,7 +270,9 @@ impl<S: ObjectStore> Fs<S> {
     /// The effective refs after earlier operations in this block. Adapters use
     /// this for source publication; public read queries stay committed-only.
     pub fn pending_refs(&self) -> &Refs {
-        self.pending.as_ref().map_or(&self.refs, |pending| &pending.refs)
+        self.pending
+            .as_ref()
+            .map_or(&self.refs, |pending| &pending.refs)
     }
 
     /// read-only access to the object store — the `&self` twin of
@@ -339,7 +341,9 @@ impl<S: ObjectStore> Fs<S> {
         authority.validate()?;
         self.require_pending(height);
         let before = self.pending_refs().clone();
-        let next_revision = before.source_revision.checked_add(1)
+        let next_revision = before
+            .source_revision
+            .checked_add(1)
             .ok_or_else(|| "files: source revision exhausted".to_string())?;
         match operation(self) {
             Ok(output) => {
@@ -356,29 +360,76 @@ impl<S: ObjectStore> Fs<S> {
         }
     }
 
-    pub fn putblob(&mut self, authority: &Authority, height: u64, bytes: &[u8]) -> Result<(), String> {
-        self.transact(authority, height, |fs| fs.putblob_apply(authority, height, bytes))
+    pub fn putblob(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.putblob_apply(authority, height, bytes)
+        })
     }
 
-    pub fn commit(&mut self, authority: &Authority, height: u64, time: u64,
-        base: Option<String>, message: String, changes: Vec<Change>) -> Result<Vec<Notification>, String> {
-        self.transact(authority, height, |fs| fs.commit_apply(authority, height, time, base, message, changes))
+    pub fn commit(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        time: u64,
+        base: Option<String>,
+        message: String,
+        changes: Vec<Change>,
+    ) -> Result<Vec<Notification>, String> {
+        self.transact(authority, height, |fs| {
+            fs.commit_apply(authority, height, time, base, message, changes)
+        })
     }
 
-    pub fn pin(&mut self, authority: &Authority, height: u64, snapshot: String, name: String) -> Result<(), String> {
-        self.transact(authority, height, |fs| fs.pin_apply(authority, height, snapshot, name))
+    pub fn pin(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        snapshot: String,
+        name: String,
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.pin_apply(authority, height, snapshot, name)
+        })
     }
 
-    pub fn unpin(&mut self, authority: &Authority, height: u64, name: String) -> Result<(), String> {
-        self.transact(authority, height, |fs| fs.unpin_apply(authority, height, name))
+    pub fn unpin(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        name: String,
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.unpin_apply(authority, height, name)
+        })
     }
 
-    pub fn watch(&mut self, authority: &Authority, height: u64, prefix: String, module_id: String) -> Result<(), String> {
-        self.transact(authority, height, |fs| fs.watch_apply(authority, height, prefix, module_id))
+    pub fn watch(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        prefix: String,
+        module_id: String,
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.watch_apply(authority, height, prefix, module_id)
+        })
     }
 
-    pub fn unwatch(&mut self, authority: &Authority, height: u64, prefix: String, module_id: String) -> Result<(), String> {
-        self.transact(authority, height, |fs| fs.unwatch_apply(authority, height, prefix, module_id))
+    pub fn unwatch(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        prefix: String,
+        module_id: String,
+    ) -> Result<(), String> {
+        self.transact(authority, height, |fs| {
+            fs.unwatch_apply(authority, height, prefix, module_id)
+        })
     }
 
     // ---- op surface (semantics land in tasks 7/9/10) ------------------------
@@ -386,7 +437,12 @@ impl<S: ObjectStore> Fs<S> {
     /// stage a raw chunk for a later commit to reference. bytes are consensus
     /// state: staged now, durable at THIS block's commit, gc-reachable via the
     /// staging table until referenced or expired.
-    fn putblob_apply(&mut self, authority: &Authority, height: u64, bytes: &[u8]) -> Result<(), String> {
+    fn putblob_apply(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
         // tick the deterministic staging sweep first, over the pending view, so
         // same-block ops and the quota below see the post-sweep state.
         self.require_pending(height);
@@ -455,7 +511,11 @@ impl<S: ObjectStore> Fs<S> {
         if used.saturating_add(len) > quota {
             return Err("files: staging quota exceeded".into());
         }
-        refuse_refs_growth(&pending.refs, staged_entry_len(&authority.actor()), self.window_cap)?;
+        refuse_refs_growth(
+            &pending.refs,
+            staged_entry_len(&authority.actor()),
+            self.window_cap,
+        )?;
 
         // stage: the entry makes the chunk gc-reachable (task 13 marks staging
         // digests as roots), and the bytes ride pending.objects so they are
@@ -583,7 +643,11 @@ impl<S: ObjectStore> Fs<S> {
         if !refs_contains_snapshot(&pending.refs, &id) {
             return Err("files: snapshot not resolvable".into());
         }
-        refuse_refs_growth(&pending.refs, pin_entry_len(&name, &authority.actor()), self.window_cap)?;
+        refuse_refs_growth(
+            &pending.refs,
+            pin_entry_len(&name, &authority.actor()),
+            self.window_cap,
+        )?;
 
         pending.refs.pins.insert(
             name,
@@ -597,7 +661,12 @@ impl<S: ObjectStore> Fs<S> {
 
     /// remove a pin by name — owner-gated: only the pin's creator or system.
     /// mutates the PENDING view only (see [`Fs::pin`] for the height/sweep rules).
-    fn unpin_apply(&mut self, authority: &Authority, height: u64, name: String) -> Result<(), String> {
+    fn unpin_apply(
+        &mut self,
+        authority: &Authority,
+        height: u64,
+        name: String,
+    ) -> Result<(), String> {
         self.require_pending(height);
         let pending = self.pending.as_mut().expect("require_pending set it");
         // `transact` restores the sweep if this verb is refused.
@@ -649,7 +718,11 @@ impl<S: ObjectStore> Fs<S> {
         if pending.refs.watches.contains(&key) {
             return Err("files: watch already registered".into());
         }
-        refuse_refs_growth(&pending.refs, watch_entry_len(&key.0, &key.1), self.window_cap)?;
+        refuse_refs_growth(
+            &pending.refs,
+            watch_entry_len(&key.0, &key.1),
+            self.window_cap,
+        )?;
         pending.refs.watches.insert(key);
         Ok(())
     }
@@ -1585,8 +1658,10 @@ mod consensus_uniformity {
         let mut b = new_fs();
         a.store_mut().put(Kind::Chunk, b"orphan-payload").unwrap();
 
-        a.putblob(&crate::Authority::System, 1, b"orphan-payload").unwrap();
-        b.putblob(&crate::Authority::System, 1, b"orphan-payload").unwrap();
+        a.putblob(&crate::Authority::System, 1, b"orphan-payload")
+            .unwrap();
+        b.putblob(&crate::Authority::System, 1, b"orphan-payload")
+            .unwrap();
         commit_block(&mut a);
         commit_block(&mut b);
 
@@ -1618,8 +1693,22 @@ mod consensus_uniformity {
         a.store_mut().put(Kind::Chunk, b"data-x").unwrap(); // A holds the orphan
         let mut b = new_fs(); // B does not
 
-        let ra = a.commit(&crate::Authority::System, 1, 1, None, "c".into(), vec![change.clone()]);
-        let rb = b.commit(&crate::Authority::System, 1, 1, None, "c".into(), vec![change]);
+        let ra = a.commit(
+            &crate::Authority::System,
+            1,
+            1,
+            None,
+            "c".into(),
+            vec![change.clone()],
+        );
+        let rb = b.commit(
+            &crate::Authority::System,
+            1,
+            1,
+            None,
+            "c".into(),
+            vec![change],
+        );
 
         assert_eq!(
             ra.is_ok(),
@@ -1721,9 +1810,15 @@ mod object_read_budget {
                 Some(head),
                 "rm".into(),
                 vec![
-                    Change::Rm { path: "/d0/f0".into() },
-                    Change::Rm { path: "/d1/f1".into() },
-                    Change::Rm { path: "/d2/f2".into() },
+                    Change::Rm {
+                        path: "/d0/f0".into(),
+                    },
+                    Change::Rm {
+                        path: "/d1/f1".into(),
+                    },
+                    Change::Rm {
+                        path: "/d2/f2".into(),
+                    },
                 ],
             )
             .map(|_| ())
@@ -1756,9 +1851,15 @@ mod object_read_budget {
             Some(head),
             "rm".into(),
             vec![
-                Change::Rm { path: "/d0/f0".into() },
-                Change::Rm { path: "/d1/f1".into() },
-                Change::Rm { path: "/d2/f2".into() },
+                Change::Rm {
+                    path: "/d0/f0".into(),
+                },
+                Change::Rm {
+                    path: "/d1/f1".into(),
+                },
+                Change::Rm {
+                    path: "/d2/f2".into(),
+                },
             ],
         )
         .expect("within-budget commit must succeed");

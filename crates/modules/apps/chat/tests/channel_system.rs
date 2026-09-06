@@ -10,10 +10,11 @@
 use chat::Chat;
 use chat::client::dm_channel_id;
 use chat::{
-    Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, MAX_CHANNELS_PER_CREATOR,
-    MAX_HOOKS_PER_CHANNEL, MAX_QUERY_LIMIT, Mark, Party, PostPolicy, Span, decode_event,
-    decode_reply, encode_msg, encode_query,
+    Party, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS,
+    MAX_CHANNELS_PER_CREATOR, MAX_HOOKS_PER_CHANNEL, MAX_QUERY_LIMIT, Mark, PostPolicy, Span,
+    decode_event, decode_reply, encode_msg, encode_query, huddle_join_preimage,
 };
+use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use identity::{
     AccountView, IdentityQuery, IdentityReply, decode_query as identity_decode_query,
@@ -81,6 +82,26 @@ fn user(byte: u8) -> Origin {
 
 fn author_of(byte: u8) -> Party {
     Party::Key(vec![byte; 32])
+}
+
+/// a deterministic node keypair for huddle tests — `seed` picks the key, so
+/// callers that need the SAME node across a re-join reuse the same seed.
+fn node_key(seed: u64) -> ed25519::PrivateKey {
+    ed25519::PrivateKey::from_seed(seed)
+}
+
+/// a `JoinHuddle` for `user_bytes` naming `node`, with a real proof of
+/// possession — the shape every huddle test now needs past the node-length
+/// gate.
+fn join_huddle(channel_id: &str, user_bytes: &[u8], node: &ed25519::PrivateKey) -> ChatMsg {
+    let node_key = node.public_key().as_ref().to_vec();
+    let preimage = huddle_join_preimage(channel_id, user_bytes);
+    let node_proof = node.sign(HUDDLE_JOIN_NS, &preimage).as_ref().to_vec();
+    ChatMsg::JoinHuddle {
+        channel_id: channel_id.into(),
+        node: node_key,
+        node_proof,
+    }
 }
 
 fn module_msg(payload: ChatMsg) -> Msg {
@@ -1359,16 +1380,24 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
             .unwrap();
         module.commit_block().await.unwrap();
 
-        let join = |node_byte: u8| ChatMsg::JoinHuddle {
-            channel_id: "general".into(),
-            node: vec![node_byte; 32],
+        let node_a1 = node_key(0xa1);
+        let node_a2 = node_key(0xa2);
+        let node_b1 = node_key(0xb1);
+        let join = |user_bytes: &[u8], node: &ed25519::PrivateKey| {
+            join_huddle("general", user_bytes, node)
         };
         module
-            .execute(&mut ctx_with_origin(20, user(1)), &module_msg(join(0xa1)))
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(join(&[1u8; 32], &node_a1)),
+            )
             .await
             .unwrap();
         module
-            .execute(&mut ctx_with_origin(21, user(2)), &module_msg(join(0xa2)))
+            .execute(
+                &mut ctx_with_origin(21, user(2)),
+                &module_msg(join(&[2u8; 32], &node_a2)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1385,7 +1414,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         };
         assert_eq!(channel.huddle.len(), 2);
         assert_eq!(channel.huddle[0].party, Party::Key(vec![1u8; 32]));
-        assert_eq!(channel.huddle[0].node, vec![0xa1; 32]);
+        assert_eq!(channel.huddle[0].node, node_a1.public_key().as_ref());
         assert_eq!(channel.huddle[0].joined_at, 20);
         assert_eq!(channel.huddle[1].party, Party::Key(vec![2u8; 32]));
         assert_eq!(channel.huddle[1].joined_at, 21);
@@ -1393,7 +1422,10 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         // re-join with the same node key is idempotent: root unchanged.
         let settled = module.root();
         module
-            .execute(&mut ctx_with_origin(30, user(1)), &module_msg(join(0xa1)))
+            .execute(
+                &mut ctx_with_origin(30, user(1)),
+                &module_msg(join(&[1u8; 32], &node_a1)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1402,7 +1434,10 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         // re-join with a NEW node key re-routes without duplicating the entry
         // or resetting join order.
         module
-            .execute(&mut ctx_with_origin(31, user(1)), &module_msg(join(0xb1)))
+            .execute(
+                &mut ctx_with_origin(31, user(1)),
+                &module_msg(join(&[1u8; 32], &node_b1)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1418,7 +1453,7 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
         };
         assert_eq!(channel.huddle.len(), 2);
         assert_eq!(channel.huddle[0].party, Party::Key(vec![1u8; 32]));
-        assert_eq!(channel.huddle[0].node, vec![0xb1; 32]);
+        assert_eq!(channel.huddle[0].node, node_b1.public_key().as_ref());
         assert_eq!(channel.huddle[0].joined_at, 20, "rejoin keeps join order");
 
         // leave removes exactly the leaver; the last leave empties the roster.
@@ -1462,6 +1497,78 @@ fn huddle_join_and_leave_maintain_the_roster_in_join_order() {
 }
 
 #[test]
+fn huddle_join_refuses_a_node_proof_from_the_wrong_signer() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut module = chat_on!(context, "chat");
+        module
+            .execute(&mut ctx_at(10), &module_msg(create_channel("general")))
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // the `node` field names `node_b`'s key, but the proof is `node_a`'s
+        // signature — proof of possession must fail: naming a key you do not
+        // hold is exactly the loopback/hijack this check exists to close.
+        let node_a = node_key(1);
+        let node_b = node_key(2);
+        let preimage = huddle_join_preimage("general", &[1u8; 32]);
+        let wrong_proof = node_a.sign(HUDDLE_JOIN_NS, &preimage).as_ref().to_vec();
+        let err = module
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(ChatMsg::JoinHuddle {
+                    channel_id: "general".into(),
+                    node: node_b.public_key().as_ref().to_vec(),
+                    node_proof: wrong_proof,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("huddle_node_proof_invalid"),
+            "{err:?}"
+        );
+
+        // the matching proof (same node, same preimage) succeeds.
+        module
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_a)),
+            )
+            .await
+            .unwrap();
+        module.commit_block().await.unwrap();
+
+        // re-joining with a NEW node key needs a NEW proof: the old node's
+        // proof does not authorize the new node.
+        let preimage = huddle_join_preimage("general", &[1u8; 32]);
+        let stale_proof = node_a.sign(HUDDLE_JOIN_NS, &preimage).as_ref().to_vec();
+        let err = module
+            .execute(
+                &mut ctx_with_origin(30, user(1)),
+                &module_msg(ChatMsg::JoinHuddle {
+                    channel_id: "general".into(),
+                    node: node_b.public_key().as_ref().to_vec(),
+                    node_proof: stale_proof,
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("huddle_node_proof_invalid"),
+            "{err:?}"
+        );
+        module
+            .execute(
+                &mut ctx_with_origin(30, user(1)),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_b)),
+            )
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
 fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
     deterministic::Runner::default().start(|context| async move {
         let mut module = chat_on!(context, "chat");
@@ -1476,10 +1583,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
             let err = module
                 .execute(
                     &mut ctx_with_origin(20, origin),
-                    &module_msg(ChatMsg::JoinHuddle {
-                        channel_id: "general".into(),
-                        node: vec![0xaa; 32],
-                    }),
+                    &module_msg(join_huddle("general", &[0xaa; 32], &node_key(0xaa))),
                 )
                 .await
                 .unwrap_err();
@@ -1493,6 +1597,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
                 &module_msg(ChatMsg::JoinHuddle {
                     channel_id: "general".into(),
                     node: vec![0xaa; 31],
+                    node_proof: Vec::new(),
                 }),
             )
             .await
@@ -1501,13 +1606,11 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
 
         // the roster cap rejects the 33rd participant.
         for i in 0..chat::MAX_HUDDLE_MEMBERS {
+            let i = i as u8;
             module
                 .execute(
-                    &mut ctx_with_origin(20, user(i as u8)),
-                    &module_msg(ChatMsg::JoinHuddle {
-                        channel_id: "general".into(),
-                        node: vec![i as u8; 32],
-                    }),
+                    &mut ctx_with_origin(20, user(i)),
+                    &module_msg(join_huddle("general", &[i; 32], &node_key(u64::from(i)))),
                 )
                 .await
                 .unwrap();
@@ -1515,10 +1618,7 @@ fn huddle_rejects_non_users_bad_node_keys_and_over_capacity() {
         let err = module
             .execute(
                 &mut ctx_with_origin(20, user(200)),
-                &module_msg(ChatMsg::JoinHuddle {
-                    channel_id: "general".into(),
-                    node: vec![0xcc; 32],
-                }),
+                &module_msg(join_huddle("general", &[200; 32], &node_key(200))),
             )
             .await
             .unwrap_err();
@@ -1555,19 +1655,22 @@ fn huddle_join_gates_on_members_only_policy_like_posting() {
             .unwrap();
         module.commit_block().await.unwrap();
 
-        let join = ChatMsg::JoinHuddle {
-            channel_id: "core".into(),
-            node: vec![0xaa; 32],
-        };
+        let node = node_key(0xaa);
         // a non-member is turned away exactly like a non-member post.
         let err = module
-            .execute(&mut ctx_with_origin(20, user(2)), &module_msg(join.clone()))
+            .execute(
+                &mut ctx_with_origin(20, user(2)),
+                &module_msg(join_huddle("core", &[2u8; 32], &node)),
+            )
             .await
             .unwrap_err();
         assert!(format!("{err:?}").contains("members-only"));
         // the member joins fine.
         module
-            .execute(&mut ctx_with_origin(20, user(1)), &module_msg(join))
+            .execute(
+                &mut ctx_with_origin(20, user(1)),
+                &module_msg(join_huddle("core", &[1u8; 32], &node)),
+            )
             .await
             .unwrap();
         module.commit_block().await.unwrap();
@@ -1596,10 +1699,7 @@ fn sweep_huddle_self_is_a_leave_and_is_idempotent() {
         module
             .execute(
                 &mut ctx_with_origin(20, user(1)),
-                &module_msg(ChatMsg::JoinHuddle {
-                    channel_id: "general".into(),
-                    node: vec![0xa1; 32],
-                }),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_key(0xa1))),
             )
             .await
             .unwrap();
@@ -1658,10 +1758,7 @@ fn sweep_huddle_of_another_user_by_a_non_admin_is_refused() {
         module
             .execute(
                 &mut ctx_with_origin(20, user(1)),
-                &module_msg(ChatMsg::JoinHuddle {
-                    channel_id: "general".into(),
-                    node: vec![0xa1; 32],
-                }),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_key(0xa1))),
             )
             .await
             .unwrap();
@@ -1709,10 +1806,7 @@ fn sweep_huddle_of_another_user_by_the_channel_admin_succeeds() {
         module
             .execute(
                 &mut ctx_with_origin(20, user(1)),
-                &module_msg(ChatMsg::JoinHuddle {
-                    channel_id: "general".into(),
-                    node: vec![0xa1; 32],
-                }),
+                &module_msg(join_huddle("general", &[1u8; 32], &node_key(0xa1))),
             )
             .await
             .unwrap();
@@ -2001,10 +2095,7 @@ fn archived_channels_reject_writes_until_unarchived() {
                 seq: 1,
                 emoji: "wave".into(),
             },
-            ChatMsg::JoinHuddle {
-                channel_id: "general".into(),
-                node: vec![0xa1; 32],
-            },
+            join_huddle("general", &[2u8; 32], &node_key(0xa1)),
         ] {
             let err = module
                 .execute(&mut ctx_with_origin(13, user(2)), &module_msg(op))

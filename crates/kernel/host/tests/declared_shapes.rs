@@ -35,7 +35,7 @@ fn expected() -> BTreeMap<String, Shape> {
         // never observe a same-block staged write.
         ("dispatch", shape(Backing::Store, NONE, true)),
         ("files", shape(Backing::Odb, NONE, false)),
-        ("forge", shape(Backing::Odb, NONE, false)),
+        ("forge", shape(Backing::Odb, CHAIN_ID, false)),
         ("gateway", shape(Backing::Store, CHAIN_ID, false)),
         ("governance", shape(Backing::Store, INVITE, false)),
         ("hello", shape(Backing::Map, NONE, false)),
@@ -43,6 +43,8 @@ fn expected() -> BTreeMap<String, Shape> {
         ("identity", shape(Backing::Store, CHAIN_ID, false)),
         ("inbox", shape(Backing::Store, NONE, false)),
         ("kv", shape(Backing::Store, NONE, false)),
+        ("modules", shape(Backing::Store, NONE, false)),
+        ("valset", shape(Backing::Store, NONE, false)),
         ("noop", shape(Backing::Map, NONE, false)),
         ("pages", shape(Backing::Store, NONE, false)),
         ("runs", shape(Backing::Map, CHAIN_ID, false)),

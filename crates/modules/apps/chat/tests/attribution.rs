@@ -5,6 +5,7 @@ use attribution::{
 };
 use chat::{Block, Chat, ChatMsg, ChatQuery, ChatReply, Mark, Party, PostPolicy, Span};
 use futures::executor::block_on;
+use commonware_cryptography::{Signer as _, ed25519};
 use host::{BlockContext, Host};
 use identity::{Identity, IdentityMsg, KeyScheme};
 use pages::{InlineMark, NewBlock, PageMsg, Pages, SpanMark};
@@ -504,6 +505,8 @@ fn a_local_page_rejection_preserves_previous_staging_without_abort() {
 fn joining_identity_preserves_only_the_original_keys_source_rights() {
     block_on(async {
         let mut host = boot().await;
+        let node = ed25519::PrivateKey::from_seed(99);
+        let node_proof = node.sign(chat::HUDDLE_JOIN_NS, &chat::huddle_join_preimage("room", &[99; 32])).as_ref().to_vec();
         apply(
             &mut host,
             key(99),
@@ -574,7 +577,8 @@ fn joining_identity_preserves_only_the_original_keys_source_rights() {
             "chat",
             ChatMsg::JoinHuddle {
                 channel_id: "room".into(),
-                node: vec![99; 32],
+                node: node.public_key().as_ref().to_vec(),
+                node_proof: node_proof.clone(),
             },
         )
         .await;
@@ -606,7 +610,8 @@ fn joining_identity_preserves_only_the_original_keys_source_rights() {
             "chat",
             ChatMsg::JoinHuddle {
                 channel_id: "room".into(),
-                node: vec![99; 32],
+                node: node.public_key().as_ref().to_vec(),
+                node_proof: node_proof.clone(),
             },
         )
         .await;

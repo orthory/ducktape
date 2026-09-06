@@ -3,8 +3,8 @@
 
 use attribution::{AttributionMsg, ObjectRef, Reason, Relation};
 use duckfs_core::{
-    Actor, Authority, FilesMsg, FilesWriteOutput, Fs, Kind, ObjectStore, PUTBLOB_FRAME_TAG,
-    Refs, WriteOutcome, decode_msg, encode_write_output, to_hex,
+    Actor, Authority, FilesMsg, FilesWriteOutput, Fs, Kind, ObjectStore, PUTBLOB_FRAME_TAG, Refs,
+    WriteOutcome, decode_msg, encode_write_output, to_hex,
 };
 use sdk::{Ctx, Error, Msg, Origin};
 
@@ -12,7 +12,9 @@ async fn identity_account(
     ctx: &dyn Ctx,
     query: identity::IdentityQuery,
 ) -> Result<Option<identity::AccountView>, Error> {
-    let bytes = ctx.query("identity", &identity::encode_query(&query)).await?;
+    let bytes = ctx
+        .query("identity", &identity::encode_query(&query))
+        .await?;
     let reply = identity::decode_reply(&bytes).map_err(Error::Module)?;
     let identity::IdentityReply::Account(account) = reply else {
         return Err(Error::Module("files: unexpected identity reply".into()));
@@ -26,14 +28,24 @@ async fn authority(ctx: &dyn Ctx) -> Result<Authority, Error> {
             if key.is_empty() {
                 return Err(Error::Module("files: external key is empty".into()));
             }
-            let account = identity_account(ctx, identity::IdentityQuery::OfKey { key: key.clone() }).await?;
-            Ok(Authority::External { key: key.clone(), account: account.map(|account| account.number) })
+            let account =
+                identity_account(ctx, identity::IdentityQuery::OfKey { key: key.clone() }).await?;
+            Ok(Authority::External {
+                key: key.clone(),
+                account: account.map(|account| account.number),
+            })
         }
         Origin::Program(number) => {
-            let account = identity_account(ctx, identity::IdentityQuery::Get { number: *number }).await?
+            let account = identity_account(ctx, identity::IdentityQuery::Get { number: *number })
+                .await?
                 .ok_or_else(|| Error::Module("files: program account does not exist".into()))?;
-            let active_program = matches!(account.control,
-                identity::Control::Program { standing: identity::ProgramStanding::Active, .. });
+            let active_program = matches!(
+                account.control,
+                identity::Control::Program {
+                    standing: identity::ProgramStanding::Active,
+                    ..
+                }
+            );
             if !active_program {
                 return Err(Error::Module("files: program account is not active".into()));
             }
@@ -55,16 +67,30 @@ fn attributed_actor(actor: &Actor) -> attribution::Actor {
 
 fn relation(owner: &Actor, reason: Reason, detail: Vec<u8>) -> Vec<Relation> {
     match owner {
-        Actor::Account(recipient) => vec![Relation { recipient: *recipient, reason, detail }],
+        Actor::Account(recipient) => vec![Relation {
+            recipient: *recipient,
+            reason,
+            detail,
+        }],
         Actor::Key(_) | Actor::Module(_) | Actor::System => Vec::new(),
     }
 }
 
-fn publish(ctx: &mut dyn Ctx, actor: &Actor, revision: u64, kind: &str, object: String, relations: Vec<Relation>) {
+fn publish(
+    ctx: &mut dyn Ctx,
+    actor: &Actor,
+    revision: u64,
+    kind: &str,
+    object: String,
+    relations: Vec<Relation>,
+) {
     ctx.emit_msg(Msg {
         target: "attribution".into(),
         payload: attribution::encode_msg(&AttributionMsg::Attribute {
-            object: ObjectRef { kind: kind.into(), object },
+            object: ObjectRef {
+                kind: kind.into(),
+                object,
+            },
             revision,
             actor: attributed_actor(actor),
             relations,
@@ -77,19 +103,38 @@ fn publish_changes(ctx: &mut dyn Ctx, actor: &Actor, before: &Refs, after: &Refs
     let new_snapshot = after.head != before.head;
     if new_snapshot {
         let snapshot = after.head.expect("a commit sets the head");
-        publish(ctx, actor, after.source_revision, "snapshot", to_hex(&snapshot),
-            relation(actor, Reason::Authorship, Vec::new()));
+        publish(
+            ctx,
+            actor,
+            after.source_revision,
+            "snapshot",
+            to_hex(&snapshot),
+            relation(actor, Reason::Authorship, Vec::new()),
+        );
     }
     for (name, pin) in &after.pins {
         let changed_pin = before.pins.get(name) != Some(pin);
         if changed_pin {
-            publish(ctx, actor, after.source_revision, "pin", to_hex(name.as_bytes()),
-                relation(&pin.owner, Reason::Ownership, pin.snapshot.to_vec()));
+            publish(
+                ctx,
+                actor,
+                after.source_revision,
+                "pin",
+                to_hex(name.as_bytes()),
+                relation(&pin.owner, Reason::Ownership, pin.snapshot.to_vec()),
+            );
         }
     }
     for name in before.pins.keys() {
         if !after.pins.contains_key(name) {
-            publish(ctx, actor, after.source_revision, "pin", to_hex(name.as_bytes()), Vec::new());
+            publish(
+                ctx,
+                actor,
+                after.source_revision,
+                "pin",
+                to_hex(name.as_bytes()),
+                Vec::new(),
+            );
         }
     }
 }
@@ -105,39 +150,70 @@ pub(crate) async fn apply_op<S: ObjectStore>(
     let before = fs.pending_refs().clone();
     let outcome = match payload.first() {
         Some(&PUTBLOB_FRAME_TAG) => {
-            fs.putblob(&authority, env.height, &payload[1..]).map_err(Error::Module)?;
-            WriteOutcome::PutBlob { chunk: to_hex(&duckfs_core::objects::object_id(Kind::Chunk, &payload[1..])) }
+            fs.putblob(&authority, env.height, &payload[1..])
+                .map_err(Error::Module)?;
+            WriteOutcome::PutBlob {
+                chunk: to_hex(&duckfs_core::objects::object_id(Kind::Chunk, &payload[1..])),
+            }
         }
         _ => match decode_msg(payload).map_err(Error::Module)? {
-            FilesMsg::Commit { base_snapshot, message, changes } => {
-                let notifications = fs.commit(&authority, env.height, env.consensus_time, base_snapshot, message, changes)
+            FilesMsg::Commit {
+                base_snapshot,
+                message,
+                changes,
+            } => {
+                let notifications = fs
+                    .commit(
+                        &authority,
+                        env.height,
+                        env.consensus_time,
+                        base_snapshot,
+                        message,
+                        changes,
+                    )
                     .map_err(Error::Module)?;
                 for notification in notifications {
-                    ctx.emit_msg(Msg { target: notification.module_id.clone(), payload: notification.payload() });
+                    ctx.emit_msg(Msg {
+                        target: notification.module_id.clone(),
+                        payload: notification.payload(),
+                    });
                 }
-                WriteOutcome::Commit { snapshot: to_hex(&fs.pending_refs().head.expect("commit sets head")) }
+                WriteOutcome::Commit {
+                    snapshot: to_hex(&fs.pending_refs().head.expect("commit sets head")),
+                }
             }
             FilesMsg::Pin { snapshot, name } => {
-                fs.pin(&authority, env.height, snapshot.clone(), name.clone()).map_err(Error::Module)?;
+                fs.pin(&authority, env.height, snapshot.clone(), name.clone())
+                    .map_err(Error::Module)?;
                 let pin = fs.pending_refs().pins.get(&name).expect("pin inserted");
-                WriteOutcome::Pin { snapshot: to_hex(&pin.snapshot), name }
+                WriteOutcome::Pin {
+                    snapshot: to_hex(&pin.snapshot),
+                    name,
+                }
             }
             FilesMsg::Unpin { name } => {
-                fs.unpin(&authority, env.height, name.clone()).map_err(Error::Module)?;
+                fs.unpin(&authority, env.height, name.clone())
+                    .map_err(Error::Module)?;
                 WriteOutcome::Unpin { name }
             }
             FilesMsg::Watch { prefix, module_id } => {
-                fs.watch(&authority, env.height, prefix.clone(), module_id.clone()).map_err(Error::Module)?;
+                fs.watch(&authority, env.height, prefix.clone(), module_id.clone())
+                    .map_err(Error::Module)?;
                 WriteOutcome::Watch { prefix, module_id }
             }
             FilesMsg::Unwatch { prefix, module_id } => {
-                fs.unwatch(&authority, env.height, prefix.clone(), module_id.clone()).map_err(Error::Module)?;
+                fs.unwatch(&authority, env.height, prefix.clone(), module_id.clone())
+                    .map_err(Error::Module)?;
                 WriteOutcome::Unwatch { prefix, module_id }
             }
         },
     };
     let after = fs.pending_refs();
     publish_changes(ctx, &actor, &before, after);
-    ctx.set_output(encode_write_output(&FilesWriteOutput { actor, source_revision: after.source_revision, outcome }));
+    ctx.set_output(encode_write_output(&FilesWriteOutput {
+        actor,
+        source_revision: after.source_revision,
+        outcome,
+    }));
     Ok(())
 }

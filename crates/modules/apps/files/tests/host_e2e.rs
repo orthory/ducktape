@@ -38,10 +38,19 @@ fn open_host(dir: &tempfile::TempDir) -> Host {
 
 fn open_host_with_attribution(dir: &tempfile::TempDir, attribution: harness::SharedStore) -> Host {
     let m = files::Files::open(FILES, dir.path().to_path_buf()).expect("open files");
-    Host::genesis(vec![Box::new(m),
-        Box::new(identity::Identity::new("identity", Box::new(sdk_testkit::MemStore::new()), "test".into())),
-        Box::new(attribution::AttributionModule::new("attribution", Box::new(attribution))),
-    ]).expect("genesis")
+    Host::genesis(vec![
+        Box::new(m),
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "test".into(),
+        )),
+        Box::new(attribution::AttributionModule::new(
+            "attribution",
+            Box::new(attribution),
+        )),
+    ])
+    .expect("genesis")
 }
 
 /// the block-constant consensus context: height doubles as the agreed logical
@@ -342,7 +351,11 @@ fn host_flow() {
     match query(&host, &FilesQuery::History { limit: 8 }) {
         FilesReply::History(snaps) => {
             let latest = snaps.first().expect("one commit in history");
-            assert_eq!(latest.author.to_string(), owner, "author recorded as ext:<hex>");
+            assert_eq!(
+                latest.author.to_string(),
+                owner,
+                "author recorded as ext:<hex>"
+            );
         }
         other => panic!("history: {other:?}"),
     }

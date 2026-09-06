@@ -132,8 +132,7 @@ impl recovery::ReplaySink for IndexFold<'_> {
         let height = block.height;
         // the index covers every module the host runs at this block: one the
         // boundary admitted gets its database before its first op folds.
-        let covered =
-            noded::index_host_modules(self.index, block.roots.iter().map(|(id, _)| id.as_str()));
+        let covered = noded::converge_host_modules(self.index, block.host);
         if let Err(err) = covered {
             tracing::error!(
                 target: "ducktape::modules",

@@ -1,6 +1,6 @@
 //! the wasm port of this module, built the ADAPTER
 //! way: the NATIVE `dispatch` crate is compiled to wasm32 unmodified and adapted
-//! to the `ducktape:module` world through `guest-adapter`, so the module's logic
+//! to the `ducktape:module` world through `ducktape-module-sdk`, so the module's logic
 //! is single-sourced (a behavior change in the native crate IS the wasm change).
 //!
 //! dispatch is a SELF-CONTAINED consensus plane: its `execute` reads
@@ -9,7 +9,7 @@
 //! imports. it makes exactly one cross-module `query-module` read inside
 //! execute — a `Call`'s admission read of the program account's control
 //! record off identity — which the runtime resolves by memoized replay like
-//! the `tagging`/`runs` tenants' sibling reads; every other arm reads only its
+//! the `attribution`/`runs` tenants' sibling reads; every other arm reads only its
 //! own store. its query surface is COMMITTED-ONLY regardless of caller, which
 //! this component declares (`shape().committed_queries`): the host drops the
 //! outer staged overlay for a query round, so `WitStore` answers the native
@@ -63,19 +63,19 @@ const SAGA_MODULE_ID: &str = "saga";
 /// config, like the saga id.
 const IDENTITY_MODULE_ID: &str = "identity";
 
-use guest_adapter::WitStore;
+use ducktape_module_sdk::WitStore;
 
 // store-backed port: no snapshot — the host owns the real qmdb store and the
-// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
-guest_adapter::store_guest! {
+// module is rebuilt fresh per dispatch (see `ducktape_module_sdk::store_guest!`).
+ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: DispatchModule,
     // the query lane is committed-only regardless of caller: the host's
     // between-block reads of the queue heads must never observe a same-block
     // staged write.
-    shape: guest_adapter::host::ModuleShape {
+    shape: ducktape_module_sdk::host::ModuleShape {
         committed_queries: true,
-        ..guest_adapter::store_shape()
+        ..ducktape_module_sdk::store_shape()
     },
     new: DispatchModule::new(
         MODULE_ID,

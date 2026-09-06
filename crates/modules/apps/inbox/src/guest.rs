@@ -1,13 +1,13 @@
 //! the wasm port of this module, built the ADAPTER way: the NATIVE `inbox`
 //! crate is compiled to wasm32 unmodified and adapted to the `ducktape:module`
-//! world through `guest-adapter`, so the module's logic is single-sourced (a
+//! world through `ducktape-module-sdk`, so the module's logic is single-sourced (a
 //! behavior change in the native crate IS the wasm change).
 //!
 //! store-backed port: the host owns the real qmdb store and the module is
 //! rebuilt fresh per dispatch over [`WitStore`] (see
-//! `guest_adapter::store_guest!`).
+//! `ducktape_module_sdk::store_guest!`).
 
-use guest_adapter::WitStore;
+use ducktape_module_sdk::WitStore;
 
 use crate::Inbox;
 
@@ -21,9 +21,9 @@ const MODULE_ID: &str = "inbox";
 const ATTRIBUTION_ID: &str = "attribution";
 const IDENTITY_ID: &str = "identity";
 
-guest_adapter::store_guest! {
+ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: Inbox,
-    shape: guest_adapter::store_shape(),
+    shape: ducktape_module_sdk::store_shape(),
     new: Inbox::new(MODULE_ID, Box::new(WitStore), ATTRIBUTION_ID, IDENTITY_ID),
 }

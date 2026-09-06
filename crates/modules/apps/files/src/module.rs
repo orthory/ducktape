@@ -9,8 +9,7 @@ use duckfs_core::fs::{Fs, StagedObjects};
 use duckfs_core::state::Refs;
 use duckfs_core::store::{MemRefs, MemStore, ObjectStore, RefsStore};
 use duckfs_core::{
-    GC_PERIOD_BLOCKS, Kind, ObjectId, decode_query,
-    decode_sync_req, encode_reply, encode_sync_resp,
+    GC_PERIOD_BLOCKS, Kind, ObjectId, decode_query, decode_sync_req, encode_reply, encode_sync_resp,
 };
 use duckfs_disk::{DiskRefs, DiskStore};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot, StateSyncHandle};

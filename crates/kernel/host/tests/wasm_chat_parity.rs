@@ -12,8 +12,10 @@
 //! against a shared sink module.
 
 use chat::{
-    Block, Chat, ChatMsg, ChatQuery, ChatReply, PostPolicy, decode_reply, encode_msg, encode_query,
+    Block, Chat, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS, PostPolicy, decode_reply,
+    encode_msg, encode_query, huddle_join_preimage,
 };
+use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host, MemberOutcome, SubmitError};
 use sdk::{Ctx, Error, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
@@ -30,6 +32,18 @@ const CHAT_WASM: &[u8] = include_bytes!("fixtures/chat.component.wasm");
 /// ids; the parity claim only needs them distinct and non-empty).
 fn key(tag: u8) -> Vec<u8> {
     vec![tag; 32]
+}
+
+/// a real `JoinHuddle` for `user_bytes`, naming `node` and carrying its proof
+/// of possession — the shape `stage_join_huddle` now requires past the
+/// node-length gate.
+fn join_huddle(channel_id: &str, user_bytes: &[u8], node: &ed25519::PrivateKey) -> ChatMsg {
+    let preimage = huddle_join_preimage(channel_id, user_bytes);
+    ChatMsg::JoinHuddle {
+        channel_id: channel_id.into(),
+        node: node.public_key().as_ref().to_vec(),
+        node_proof: node.sign(HUDDLE_JOIN_NS, &preimage).as_ref().to_vec(),
+    }
 }
 
 fn op(m: &ChatMsg) -> Msg {
@@ -334,19 +348,13 @@ fn same_ops_identical_roots_block_by_block() {
             ),
             (
                 bob.clone(),
-                ChatMsg::JoinHuddle {
-                    channel_id: "general".into(),
-                    node: vec![0x11; 32],
-                },
+                join_huddle("general", &bob, &ed25519::PrivateKey::from_seed(0x11)),
                 true,
             ),
             // re-joining with the same node key: stages nothing.
             (
                 bob.clone(),
-                ChatMsg::JoinHuddle {
-                    channel_id: "general".into(),
-                    node: vec![0x11; 32],
-                },
+                join_huddle("general", &bob, &ed25519::PrivateKey::from_seed(0x11)),
                 false,
             ),
             (

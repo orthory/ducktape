@@ -79,6 +79,7 @@ mod host_reads;
 mod host_resources;
 mod host_state;
 mod join_gate;
+mod known_nodes;
 #[cfg(test)]
 mod main_tests;
 mod mcp;
@@ -556,6 +557,7 @@ fn run_node(
         // the owner-gated admin namespace resolves ownership against this node's
         // own key; exposure is the operator's `DUCKTAPE_ADMIN` choice.
         node_key: signer.public_key().as_ref().to_vec(),
+        signer: signer.clone(),
         admin_exposure: noded::AdminExposure::from_env(),
     })?;
 

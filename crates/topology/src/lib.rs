@@ -1,60 +1,19 @@
-//! The module composition topology — ONE source for the module id universe
-//! and the named genesis selections every composer draws from.
+//! Build presets for the founding sets staged beside the binaries.
 //!
-//! No composer keeps a hand-counted id list of its own: the id universe lives
-//! in one [`ModuleTopology`] value, and each backend's genesis set is a NAMED
-//! SELECTION validated against it — [`PRODUCTION`] for the node, [`SIM_BASE`]
-//! and [`SIM_VALSET`] for simnode.
-//!
-//! A row says WHICH module, WHERE ITS CODE COMES FROM, and whether it ships an
-//! index guest — nothing more. Most host-facing facts (the substrate its
-//! state lives on, the network config it seeds, its query mode) stay the
-//! module's own declaration (a wasm component's `shape` export,
-//! `wasm_host::Shape`) rather than a row here, since a table that repeated
-//! those would be a second source of truth for something with no access
-//! problem — nothing outside the crate needs to know it before the crate
-//! itself is built, and it would hold nothing for a module the registry
-//! admits after genesis.
-//!
-//! `has_index_guest` is the one exception: it MUST be readable by a composer
-//! that only holds a directory of bare wasm files (`workspace_config::genesis`,
-//! composing `node init --modules <dir>` over an arbitrary operator
-//! directory) with no access to any crate's source tree to read
-//! `src/index_guest.rs` from. `crates/noded/build.rs` cross-checks this flag
-//! against that same file at every build, so the two declarations cannot
-//! drift apart unnoticed.
-//!
-//! Inter-module wiring is NOT here either: a module's guest compiles in the
-//! siblings it reads, so the guest is the wiring.
-//!
-//! This is a plan, NOT a root-hash. Every backend instantiates it through the
-//! ONE composer (`noded::compose`) — each spec's `code` decides wasm component
-//! or native struct, identically for node, noded and simnode — but their roots
-//! still differ, because a root is composed from a SELECTION and its genesis
-//! bindings, not from this catalog. One topology never means one root-hash — it
-//! means one place the module SET (and the drift guard on it) lives.
-//!
-//! A leaf crate with no dependencies: the catalog is pure `&'static str`, and
-//! the kernel (`host`) knows nothing of the product modules composed over it.
+//! [`PRODUCTION`] names the default `modules/` directory; [`SIM_BASE`] and
+//! [`SIM_VALSET`] name the simulator selections in `sim-modules/`. This catalog
+//! decides which files a build stages. It does not restrict the module ids or
+//! optional mappers an operator's genesis or a live registry admission may use.
+//! Every runtime module, including `modules` and `valset`, is Wasm and declares
+//! its own backing, configuration keys, and query mode through `shape`.
 
-/// Where a module's CODE comes from: compiled into the binary, or a wasm
-/// component the modules registry can swap at a height boundary.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Code {
-    Native,
-    Wasm,
-}
-
-/// A single module in the composition universe.
+/// One module in the build catalog.
 pub struct ModuleSpec {
     /// The consensus-visible module id (the key in the host registry / root-hash).
     pub id: &'static str,
-    /// Where this module's code comes from.
-    pub code: Code,
     /// Whether this module's crate carries an index guest (`src/index_guest.rs`,
-    /// staged by `crates/noded/build.rs` as `<id>.index.wasm`). A `--modules
-    /// <dir>` founding set is checked against this flag — present-but-not-declared
-    /// and declared-but-absent are both refused (`workspace_config::genesis`).
+    /// staged by `crates/noded/build.rs` as `<id>.index.wasm`). This is a build
+    /// consistency check; operator-supplied directories discover their own files.
     pub has_index_guest: bool,
 }
 
@@ -77,19 +36,13 @@ impl ModuleTopology {
         self.modules.iter().find(|m| m.id == id)
     }
 
-    /// the `code == Wasm` ids of `selection`, in selection order.
+    /// Component ids in a build preset, in the preset's order.
     pub fn wasm_ids(&self, selection: &[&'static str]) -> Vec<&'static str> {
-        selection
-            .iter()
-            .copied()
-            .filter(|id| self.spec(id).is_some_and(|m| m.code == Code::Wasm))
-            .collect()
+        selection.to_vec()
     }
 
-    /// the ids of `selection` whose crate declares an index guest, in
-    /// selection order — what a founding set MUST carry an `<id>.index.wasm`
-    /// for (`workspace_config::genesis::Genesis::compose` refuses a set that
-    /// omits one, or that carries one for an id not in this list).
+    /// Mapper ids in a build preset. Arbitrary founding directories discover
+    /// their own mappers independently of this catalog.
     pub fn index_guest_ids(&self, selection: &[&'static str]) -> Vec<&'static str> {
         selection
             .iter()
@@ -102,7 +55,6 @@ impl ModuleTopology {
 const fn wasm(id: &'static str) -> ModuleSpec {
     ModuleSpec {
         id,
-        code: Code::Wasm,
         has_index_guest: false,
     }
 }
@@ -110,16 +62,7 @@ const fn wasm(id: &'static str) -> ModuleSpec {
 const fn wasm_indexed(id: &'static str) -> ModuleSpec {
     ModuleSpec {
         id,
-        code: Code::Wasm,
         has_index_guest: true,
-    }
-}
-
-const fn native(id: &'static str) -> ModuleSpec {
-    ModuleSpec {
-        id,
-        code: Code::Native,
-        has_index_guest: false,
     }
 }
 
@@ -139,19 +82,17 @@ const MODULES: &[ModuleSpec] = &[
     wasm("governance"),
     wasm("identity"),
     wasm_indexed("inbox"),
-    native("kv"),
-    native("modules"),
+    wasm("kv"),
+    wasm("modules"),
     wasm_indexed("pages"),
     wasm("runs"),
     wasm_indexed("saga"),
     wasm_indexed("tasks"),
-    native("valset"),
+    wasm("valset"),
 ];
 
-/// node's production genesis set (19) — every node runs exactly these, so the
-/// set is in the root-hash. A module here is consensus
-/// state forever; experiments live unwired in `crates/labs` and appear in no
-/// selection.
+/// Default founding set (19). An operator may compose a different set with
+/// `node init --modules`; each network pins the resulting deployments.
 pub const PRODUCTION: &[&str] = &[
     "pages",
     "chat",
@@ -210,7 +151,7 @@ pub const SIM_BASE: &[&str] = &[
 /// host-injected once-per-block boundary `Advance` ride every block.
 pub const SIM_VALSET: &[&str] = &["kv", "valset", "acl", "governance", "modules"];
 
-/// The one topology value composers read.
+/// The catalog the build staging code reads.
 pub const TOPOLOGY: ModuleTopology = ModuleTopology {
     modules: MODULES,
     production: PRODUCTION,
@@ -347,23 +288,9 @@ mod tests {
         assert!(TOPOLOGY.spec("not-a-module").is_none());
     }
 
-    /// The `code` column is consensus-adjacent: a wrong `code` sends a native
-    /// module to the wasm loader, or a wasm tenant to a constructor the
-    /// composer does not have.
     #[test]
-    fn code_column_pins_the_natives() {
-        let native: Vec<&str> = MODULES
-            .iter()
-            .filter(|m| m.code == Code::Native)
-            .map(|m| m.id)
-            .collect();
-        assert_eq!(sorted(&native), ["kv", "modules", "valset"]);
-    }
-
-    #[test]
-    fn wasm_ids_selects_only_wasm_specs_in_selection_order() {
-        let ids = TOPOLOGY.wasm_ids(SIM_VALSET);
-        assert_eq!(ids, ["acl", "governance"]);
+    fn wasm_ids_preserves_the_preset_order() {
+        assert_eq!(TOPOLOGY.wasm_ids(SIM_VALSET), SIM_VALSET);
     }
 
     /// pins today's index-guest-shipping set — the same 5 crates that carry

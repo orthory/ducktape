@@ -13,6 +13,7 @@ use sdk::{Event, Msg, StateRoot};
 
 pub mod log_file;
 pub mod resource_limits;
+pub mod signed_req;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -1601,6 +1602,13 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // height is the same deterministic no-op everywhere.
             let is_resume_replay = self.resume_floor.is_some_and(|floor| height <= floor);
             if is_resume_replay {
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    reason = "resume_replay",
+                    "skipped a re-reported frame the recovered state already contains"
+                );
                 continue;
             }
             // MONOTONICITY. above the resume floor every height is this
@@ -1651,6 +1659,17 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                         reason: None,
                     }),
                 }
+                // a discard seals nothing and journals nothing, so without
+                // this line a batch vanishes from the log entirely — the one
+                // shape that looks exactly like a halted chain (#1766).
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    ceiling,
+                    reason = "cutover_ceiling",
+                    "discarded a batch finalized past the cutover ceiling"
+                );
                 continue;
             }
             // THE REPLAY WINDOW: this exact batch already applied at a recent
@@ -1951,7 +1970,15 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                     "block committed"
                 );
             } else {
-                tracing::debug!(target: "ducktape::consensus", height, view, "idle block");
+                // the member counts ride it: an "idle block" carrying rejected
+                // members is a REAL op silently dying, not the heartbeat nop.
+                tracing::debug!(
+                    target: "ducktape::consensus",
+                    height,
+                    view,
+                    rejected = rejected_count,
+                    "idle block"
+                );
             }
             last_sealed_view = Some(view);
             // OBSERVATION BARRIER (once per batch): end the drain right after a
@@ -2125,6 +2152,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// accessors cannot borrow both at once.
     pub fn sink_and_host(&mut self) -> (&mut S, &Host) {
         (&mut self.sink, &self.host)
+    }
+
+    /// Readiness preflight against the running module's retained state shape.
+    pub fn check_module_replacement(&mut self, id: &str, bytes: &[u8]) -> Result<(), sdk::Error> {
+        self.host.check_module_replacement(id, bytes)
     }
 
     /// borrow the wrapped host (queries, module_root inspection, ...).

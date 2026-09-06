@@ -5,7 +5,7 @@
 
 wit_bindgen::generate!({
     world: "module",
-    path: "../../kernel/module-guest/wit",
+    path: "../../module-sdk/wit",
 });
 
 use ducktape::module::host;
@@ -45,6 +45,14 @@ impl Guest for Component {
 
     fn acknowledge(_ack: host::Ack) -> Result<(), host::Error> {
         Err(host::Error::Rejected("module has no outbound queue".into()))
+    }
+
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
     }
 
     fn shape() -> host::ModuleShape {

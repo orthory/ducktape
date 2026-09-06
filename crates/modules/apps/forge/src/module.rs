@@ -333,6 +333,12 @@ pub struct Forge {
     /// where issue/PR discussion-channel follow-ups go (`emit_msg` target).
     /// `None` (tests / minimal deployments without chat) emits nothing.
     chat_target: Option<String>,
+    /// this network's chain id — the wasm tenant's genesis-config twin
+    /// (`crate::guest`'s `shape().config`, #1773). empty for a native `Forge`
+    /// that never carries a push certificate (every unit test but the
+    /// pushcert ones); `with_chain_id` sets the real one. a certificate whose
+    /// nonce disagrees with it is refused in `push_principal`.
+    chain_id: String,
     /// the expensive per-repo pack payloads used to assemble snapshots.
     ///
     /// `snapshot()` packs the object closure of every branch head, and the
@@ -457,6 +463,7 @@ impl Forge {
                 staged_tracker: None,
             },
             chat_target: None,
+            chain_id: String::new(),
             snapshot_cache: std::cell::RefCell::new(None),
         };
         let restored_cache = forge.restore_snapshot_cache();
@@ -469,6 +476,13 @@ impl Forge {
     /// opens no discussion channels.
     pub fn with_chat(mut self, target: impl Into<String>) -> Self {
         self.chat_target = Some(target.into());
+        self
+    }
+
+    /// this network's chain id — the genesis-config parameter a push
+    /// certificate's nonce is checked against (`pushcert::signer`, #1773).
+    pub fn with_chain_id(mut self, chain_id: impl Into<String>) -> Self {
+        self.chain_id = chain_id.into();
         self
     }
 
@@ -962,7 +976,12 @@ impl Module for Forge {
     /// execute never opens a Git repo.
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         self.state
-            .apply(ctx, &msg.payload, self.chat_target.as_deref())
+            .apply(
+                ctx,
+                &msg.payload,
+                self.chat_target.as_deref(),
+                &self.chain_id,
+            )
             .await
     }
 
@@ -1754,7 +1773,9 @@ mod tests {
         use keyscheme::sshsig::GIT_SSH_NS;
         use keyscheme::testkit::{ssh_key, sshsig};
         let base = tmp_base("signed-push");
-        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let mut forge = Forge::init("forge", base.clone())
+            .unwrap()
+            .with_chain_id("chain-a");
         let signed = |seed: u8, updates: Vec<RefUpdate>| {
             let cert = pushcert::certificate(&pushcert::nonce("chain-a", "lab"), &updates);
             ForgeMsg::PushRefs {
@@ -1817,6 +1838,22 @@ mod tests {
         };
         *repo = "other".into();
         assert!(refused(&mut forge, 6, &elsewhere).contains("nonce"));
+        // …on THIS chain: a certificate minted for a different ducktape
+        // network is refused, never trusted as this network's first
+        // certified push (#1773 — no more "pin whichever chain arrives
+        // first").
+        let updates = vec![main_to(Some('b'), 'c')];
+        let cert = pushcert::certificate(&pushcert::nonce("some-other-chain", "lab"), &updates);
+        let cross_chain = ForgeMsg::PushRefs {
+            repo: "lab".into(),
+            pack_digest: Some(vec![9u8; 32]),
+            cert: Some(PushCert {
+                sshsig: sshsig(&ssh_key(ALICE), GIT_SSH_NS, &cert),
+                cert,
+            }),
+            updates,
+        };
+        assert!(refused(&mut forge, 6, &cross_chain).contains("nonce"));
         // …by the key it embeds (a flipped key byte is someone else's blob).
         let mut forged = signed(ALICE, vec![main_to(Some('b'), 'c')]);
         let ForgeMsg::PushRefs {
@@ -1839,21 +1876,20 @@ mod tests {
         assert!(refused(&mut forge, 9, &refused_stale).contains("non-fast-forward"));
     }
 
-    // #1761: consensus cannot learn its own chain id (the plumbing genesis
-    // config gives `identity`/`gateway`/`runs` is unreachable from an
-    // `Odb`-backed module — see `pushcert`'s module doc), so the strictest
-    // check forge can enforce is pinning the chain half of the FIRST
-    // cert-verified push it ever accepts and refusing every later one whose
-    // nonce carries a different chain — closing the replay against an
-    // ALREADY-ACTIVE forge even though the very first certified push can't be
-    // checked against anything yet.
+    // #1773: forge learns its own chain id through the genesis-config seam
+    // (`crate::guest`'s `shape().config`, `noded::compose`'s
+    // `odb_genesis_config`), so `pushcert::signer` checks a certificate's
+    // nonce against it directly — no pinning off whichever chain the first
+    // cert-verified push happens to carry.
     #[test]
-    fn a_replayed_certificate_from_a_different_chain_is_refused_after_the_first_pin() {
+    fn a_certificate_from_a_different_chain_is_refused_even_on_an_unborn_repo() {
         use crate::pushcert;
         use keyscheme::sshsig::GIT_SSH_NS;
         use keyscheme::testkit::{ssh_key, sshsig};
         let base = tmp_base("cross-chain-replay");
-        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let mut forge = Forge::init("forge", base.clone())
+            .unwrap()
+            .with_chain_id("home");
         let signed = |chain: &str, repo: &str, seed: u8, updates: Vec<RefUpdate>| {
             let cert = pushcert::certificate(&pushcert::nonce(chain, repo), &updates);
             ForgeMsg::PushRefs {
@@ -1872,7 +1908,7 @@ mod tests {
             new_oid: Some(oid(c).as_bytes().to_vec()),
         };
 
-        // the network's own first certified push pins "home".
+        // the network's own chain accepts a certified birth.
         exec_commit(
             &mut forge,
             &mut ctx_at(1),
@@ -1882,14 +1918,15 @@ mod tests {
         // a certificate minted on a DIFFERENT chain, harvested and replayed
         // to squat an as-yet-unborn repo name on THIS network, is refused —
         // even though its nonce names the (unborn) repo correctly and the
-        // signature verifies.
+        // signature verifies. no "first push wins" residual gap: consensus
+        // checks the chain id it was seeded with from block one.
         let err = exec(
             &mut forge,
             &mut ctx_at(2),
             &signed("away", "stolen", 2, vec![birth('b')]),
         )
         .unwrap_err();
-        assert!(err.to_string().contains("chain"), "{err}");
+        assert!(err.to_string().contains("nonce"), "{err}");
         futures::executor::block_on(forge.abort_block()).unwrap();
         assert!(
             forge.read_head("stolen").is_none(),

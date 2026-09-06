@@ -238,7 +238,20 @@ pub struct Client {
     /// neither it nor a per-request user signature, so a client without one
     /// READS — its writes come back as the node's 401 naming the credential.
     operator_token: Option<String>,
+    /// The PERSON's proof for a raw-bytes write lane (`/v1/files/stage`,
+    /// `/v1/files/blob`): signs each request with the acting key, bound to the
+    /// target node, so the node records the person as the writer and charges
+    /// the write to them. Preferred over the operator credential when both
+    /// are held — a credentialed write is the node's, not the person's.
+    write_auth: Option<WriteAuth>,
 }
+
+/// Signs one mutating request: `(method, path_and_query, body)` in, the
+/// headers that prove possession out. The signing itself lives with the
+/// kernel's frame codec (`node::signed_req::request_headers`); this crate
+/// carries the hook only, and stays free of node internals.
+pub type WriteAuth =
+    std::sync::Arc<dyn Fn(&str, &str, &[u8]) -> Vec<(String, String)> + Send + Sync>;
 
 /// The header the operator credential travels in — the same one `/v1/admin/*`
 /// takes, because it is the same secret and the same bar ("can read the node's
@@ -315,6 +328,7 @@ impl Client {
             base,
             http,
             operator_token: None,
+            write_auth: None,
         })
     }
 
@@ -325,6 +339,12 @@ impl Client {
         self
     }
 
+    /// Sign every raw-bytes write with the person's key — see [`WriteAuth`].
+    pub fn with_write_auth(mut self, auth: WriteAuth) -> Self {
+        self.write_auth = Some(auth);
+        self
+    }
+
     /// Attach the operator credential when this client holds one. Harmless on a
     /// read (the gate never looks) and required on every write.
     fn credentialed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -332,6 +352,23 @@ impl Client {
             Some(token) => request.header(OPERATOR_TOKEN_HEADER, token),
             None => request,
         }
+    }
+
+    /// Prove a raw-bytes write: the person's signature over exactly these
+    /// bytes when a signer is held, else the operator credential.
+    fn proven(
+        &self,
+        request: reqwest::RequestBuilder,
+        method: &str,
+        path: &str,
+        body: &[u8],
+    ) -> reqwest::RequestBuilder {
+        let Some(sign) = self.write_auth.as_ref() else {
+            return self.credentialed(request);
+        };
+        sign(method, path, body)
+            .into_iter()
+            .fold(request, |request, (name, value)| request.header(name, value))
     }
 
     /// Canonical origin without a trailing slash.
@@ -470,28 +507,16 @@ impl Client {
         decode_json(response).await
     }
 
-    /// One POST against a `/v1/files/*` write lane with a JSON body — the
-    /// files browser's mutation transport (the node encodes + submits the
-    /// corresponding `FilesMsg`).
-    pub async fn files_post(
-        &self,
-        lane: &str,
-        body: &serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let response = self
-            .credentialed(self.http.post(self.url(&format!("v1/files/{lane}"))?))
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| Error::new(format!("RPC files {lane} failed: {error}")))?;
-        decode_json(response).await
-    }
-
     /// Stage one duckfs chunk (`POST /v1/files/stage`, raw bytes ≤ 1 MiB) —
     /// returns the staged chunk's digest.
     pub async fn files_stage(&self, bytes: Vec<u8>) -> Result<String> {
         let response = self
-            .credentialed(self.http.post(self.url("v1/files/stage")?))
+            .proven(
+                self.http.post(self.url("v1/files/stage")?),
+                "POST",
+                "/v1/files/stage",
+                &bytes,
+            )
             .header("content-type", "application/octet-stream")
             .body(bytes)
             .send()
@@ -511,7 +536,12 @@ impl Client {
     /// a pack staged there would never be found by a `pack_digest` lookup.
     pub async fn put_blob(&self, bytes: Vec<u8>) -> Result<String> {
         let response = self
-            .credentialed(self.http.post(self.url("v1/files/blob")?))
+            .proven(
+                self.http.post(self.url("v1/files/blob")?),
+                "POST",
+                "/v1/files/blob",
+                &bytes,
+            )
             .header("content-type", "application/octet-stream")
             .body(bytes)
             .send()
@@ -760,6 +790,34 @@ impl Client {
         }
         let minted: Minted = decode_json(response).await?;
         Ok(minted.invite)
+    }
+
+    /// Mint this node's `node_proof` for a `JoinHuddle`: its own mesh-identity
+    /// key signing `channel_id` ‖ `user` (hex origin bytes). The NODE mints
+    /// it, not the caller — proof of possession needs the private key this
+    /// node holds, never sent over the wire. Answers `(node, node_proof)`,
+    /// both hex. 503 on a daemon with no mesh identity.
+    pub async fn huddle_node_proof(
+        &self,
+        channel_id: &str,
+        user_hex: &str,
+    ) -> Result<(String, String)> {
+        let response = self
+            .credentialed(self.http.post(self.url("v1/huddle/node-proof")?))
+            .json(&serde_json::json!({ "channel_id": channel_id, "user": user_hex }))
+            .send()
+            .await
+            .map_err(|error| Error::new(format!("minting a huddle node proof failed: {error}")))?;
+        if !response.status().is_success() {
+            return Err(response_error(response).await);
+        }
+        #[derive(Deserialize)]
+        struct Minted {
+            node: String,
+            node_proof: String,
+        }
+        let minted: Minted = decode_json(response).await?;
+        Ok((minted.node, minted.node_proof))
     }
 
     /// Connect to the node stream and subscribe to committed module changes.
