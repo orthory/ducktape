@@ -59,7 +59,7 @@ fn cmd_log_filter(args: crate::cli_args::LogFilterArgs) -> CommandResult {
         key: args.key,
     };
     let base = ctx.http_base()?;
-    let node_key = crate::node_http::node_public_key(&base)?;
+    let node_key = crate::node_http::pinned_node_key(&base, args.trust_node)?;
     let mut stdin = std::io::BufReader::new(std::io::stdin());
     let signer = crate::userkey_cli::load_user_signer(&ctx.key_path()?, &mut stdin)?;
 

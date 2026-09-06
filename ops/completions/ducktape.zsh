@@ -14,7 +14,7 @@ _ducktape() {
     local node_work=(list admit revoke)
     local node_join=(requests state)
     local node_netstack=(swap)
-    local node_flags=(--config -n --network --sync-only --json --yes --out --dir --name --modules --genesis --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --block-time-ms --ttl-days --node --key --native --component)
+    local node_flags=(--config -n --network --sync-only --json --yes --out --dir --name --modules --genesis --listen --advertised --http --rpc --gateway --primary-coordinator --wireguard-listen --wireguard-advertised --invite-listen --block-time-ms --ttl-days --node --key --native --component --trust-node)
 
     local user_key=(init restore unlock reveal status)
     local user_cred=(add list remove grant revoke inspect seal)
@@ -28,7 +28,7 @@ _ducktape() {
     local gateway_verbs=(bind unbind list help)
     local gateway_flags=(--workspace -n --network --label --port --account)
     local fs_verbs=(ls cat stat history diff checkout status commit pin help)
-    local fs_flags=(-n --network --json --node --message --no-rebase --snapshot --limit --prefix --path --key)
+    local fs_flags=(-n --network --json --node --message --no-rebase --snapshot --limit --prefix --path --key --trust-node)
     local service_verbs=(run list enable disable status help)
     local service_flags=(--config --workspace -n --network --json --yes -y --enable --no-enable)
     # every service verb takes a KIND now, `list`/`status` included.
