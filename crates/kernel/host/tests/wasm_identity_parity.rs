@@ -415,15 +415,17 @@ async fn same_ops_inner(context: &deterministic::Context) {
     )
     .await;
 
-    // h6: a non-founding member (the device) evicts the joiner — membership,
-    // not founding, is the authority; the joiner's generation stays at 1.
+    // h6: a non-founding member (the passkey, admitted at h4) evicts the
+    // device it admitted at h5 — membership, not founding, is the authority,
+    // and a key only drops one admitted no earlier than itself. the device's
+    // generation stays at 1.
     roundtrip(
         &mut native,
         &mut wasm,
         &w,
         6,
-        Origin::External(ed_pub(&w.device)),
-        remove_key(&ed_pub(&w.joiner)),
+        Origin::External(wa_pub(&w.passkey)),
+        remove_key(&ed_pub(&w.device)),
         true,
     )
     .await;
@@ -442,7 +444,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
     .await;
 
     // decoded spot check on the wasm side: the surviving association is the
-    // founder + the passkey + the device, the name trimmed, the joiner
+    // founder + the passkey + the joiner, the name trimmed, the device
     // unlinked at generation 1.
     let reply = wasm
         .query("identity", &encode_query(&IdentityQuery::Get { number: 1 }))
@@ -455,7 +457,7 @@ async fn same_ops_inner(context: &deterministic::Context) {
     };
     assert_eq!(acc.number, 1);
     assert_eq!(acc.name, "Kim");
-    let mut survivors = vec![ed_pub(&w.founder_a), ed_pub(&w.device), wa_pub(&w.passkey)];
+    let mut survivors = vec![ed_pub(&w.founder_a), ed_pub(&w.joiner), wa_pub(&w.passkey)];
     survivors.sort();
     let keys: Vec<Vec<u8>> = acc.keys.iter().map(|k| k.pubkey.clone()).collect();
     assert_eq!(keys, survivors, "ascending by public key");
@@ -463,11 +465,11 @@ async fn same_ops_inner(context: &deterministic::Context) {
         .query(
             "identity",
             &encode_query(&IdentityQuery::OfKey {
-                key: ed_pub(&w.joiner),
+                key: ed_pub(&w.device),
             }),
         )
         .await
-        .expect("of_key joiner");
+        .expect("of_key device");
     assert_eq!(
         identity::decode_reply(&reply).expect("decode"),
         identity::IdentityReply::Account(None)
@@ -476,11 +478,11 @@ async fn same_ops_inner(context: &deterministic::Context) {
         .query(
             "identity",
             &encode_query(&IdentityQuery::KeyGen {
-                key: ed_pub(&w.joiner),
+                key: ed_pub(&w.device),
             }),
         )
         .await
-        .expect("key_gen joiner");
+        .expect("key_gen device");
     assert_eq!(
         identity::decode_reply(&reply).expect("decode"),
         identity::IdentityReply::Gen(1),

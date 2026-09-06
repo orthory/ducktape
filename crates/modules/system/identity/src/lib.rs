@@ -18,8 +18,10 @@
 //!   dies at: an unspent one neither follows its author onto another account
 //!   nor outlives [`MAX_CONSENT_TTL`]. there is no revoke op -- the clock is
 //!   the revocation, and it is why the ceiling is days rather than months.
-//! - [`IdentityMsg::RemoveKey`] drops a key (any member may drop any, except
-//!   the last -- an account always keeps at least one live key).
+//! - [`IdentityMsg::RemoveKey`] drops a key: a member removes ITSELF or a key
+//!   admitted no earlier than it was, never the last one. seniority is what
+//!   stops a key admitted by a mis-issued consent from evicting the founders
+//!   who predate it -- an account cannot be taken over from the bottom.
 //! - [`IdentityMsg::SetName`] / [`IdentityMsg::SetProfile`] are member-gated
 //!   by the origin alone.
 //!
@@ -518,19 +520,38 @@ impl Identity {
         Ok(())
     }
 
-    /// drop `key` from the origin's account. any member may drop any member
-    /// (including itself), except the last remaining one.
+    /// drop `key` from the origin's account: itself, or a key admitted no
+    /// earlier than the origin was. never the last remaining one.
     async fn remove_key(&mut self, ctx: &mut dyn Ctx, key: Vec<u8>) -> Result<(), Error> {
+        let origin = Self::origin_key(ctx)?;
         let (number, mut record) = self.account_of_origin(ctx).await?;
-        if !record.keys.contains_key(&key) {
+        let Some(target) = record.keys.get(&key) else {
             return Err(Error::Module(
                 "target key is not a member of this account".into(),
             ));
-        }
+        };
         let last_key = record.keys.len() == 1;
         if last_key {
             return Err(Error::Module(
                 "cannot remove the last key of an account".into(),
+            ));
+        }
+        // SENIORITY. the origin is a member, so the record holds its meta.
+        // keys admitted in the same block are peers; a key admitted later is
+        // junior and may be dropped. this is what an outstanding consent
+        // cannot buy: the key it admits can never evict the members that
+        // predate it, so a mis-issued ticket costs a squatter, not the
+        // account.
+        let removing_self = key == origin;
+        let senior_target = target.added_at
+            < record
+                .keys
+                .get(&origin)
+                .expect("the origin is a member of its own account")
+                .added_at;
+        if !removing_self && senior_target {
+            return Err(Error::Module(
+                "cannot remove a key admitted before your own".into(),
             ));
         }
         record.keys.remove(&key);

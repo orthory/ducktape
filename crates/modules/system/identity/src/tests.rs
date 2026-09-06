@@ -394,6 +394,32 @@ fn a_consent_expires_and_cannot_outlive_the_ceiling() {
     assert_eq!(of_key(&id, &ed_pub(&k)).unwrap().number, 1);
 }
 
+/// SENIORITY: a key admitted later never evicts one admitted earlier, so a
+/// redeemed stale ticket cannot take the account over. self-removal is always
+/// allowed, and a senior drops a junior.
+#[test]
+fn a_junior_key_cannot_remove_a_senior_one() {
+    let mut id = new_identity();
+    let (a, b, c) = (ed(1), ed(2), ed(3));
+    create(&mut id, &ed_pub(&a), "alice", KeyScheme::Ed25519).unwrap();
+    add_key_at(&mut id, &ed_pub(&b), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&b), 0, 1), NOW + 1).unwrap();
+    add_key_at(&mut id, &ed_pub(&c), KeyScheme::Ed25519, ed_consent(&a, KeyScheme::Ed25519, &ed_pub(&c), 0, 1), NOW + 2).unwrap();
+
+    refused(
+        apply(&mut id, &ed_pub(&c), IdentityMsg::RemoveKey { key: ed_pub(&a) }).unwrap_err(),
+        "admitted before your own",
+    );
+    refused(
+        apply(&mut id, &ed_pub(&c), IdentityMsg::RemoveKey { key: ed_pub(&b) }).unwrap_err(),
+        "admitted before your own",
+    );
+    // the junior may always leave ...
+    apply(&mut id, &ed_pub(&c), IdentityMsg::RemoveKey { key: ed_pub(&c) }).unwrap();
+    // ... and the founder drops the key it admitted.
+    apply(&mut id, &ed_pub(&a), IdentityMsg::RemoveKey { key: ed_pub(&b) }).unwrap();
+    assert_eq!(get(&id, 1).unwrap().keys.len(), 1);
+}
+
 #[test]
 fn a_wallet_founds_and_a_passkey_and_a_wallet_consent() {
     let mut id = new_identity();
