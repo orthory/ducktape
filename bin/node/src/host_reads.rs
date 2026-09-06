@@ -5,17 +5,20 @@ use host::Host;
 
 /// read the valset module's current membership projection (committed state —
 /// called between drains, outside any block).
-pub(crate) async fn read_valset_members(host: &Host) -> Vec<Vec<u8>> {
+///
+/// an unreadable valset is NOT an observation of an empty one (#1820): a
+/// transient query error and a genuinely empty committed set must stay
+/// distinguishable to the cutover step, so this returns `Err` on either the
+/// query or the decode failing rather than degrading both to `Vec::new()`.
+pub(crate) async fn read_valset_members(host: &Host) -> Result<Vec<Vec<u8>>, String> {
     use valset::{ValsetQuery, ValsetReply, decode_reply, encode_query};
-    let Ok(reply) = host
+    let reply = host
         .query("valset", &encode_query(&ValsetQuery::Validators))
         .await
-    else {
-        return Vec::new();
-    };
-    match decode_reply(&reply) {
-        Ok(ValsetReply::Validators(v)) => v,
-        Ok(_) | Err(_) => Vec::new(),
+        .map_err(|e| e.to_string())?;
+    match decode_reply(&reply)? {
+        ValsetReply::Validators(v) => Ok(v),
+        other => Err(format!("unexpected valset reply variant: {other:?}")),
     }
 }
 
@@ -130,4 +133,91 @@ pub(crate) fn resume_resident_keys(
         );
     }
     Ok(keys)
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::executor::block_on;
+    use sdk::{Ctx, Error, Module, ModuleId, Msg, StateRoot};
+
+    use super::*;
+
+    /// a valset stand-in that serves exactly the `Validators` reply this test
+    /// stages — `Ok(keys)` for a real read, or `Err` to stand in for a query
+    /// that failed (a qmdb read error, the module momentarily unresolvable).
+    struct FakeValset(Result<Vec<Vec<u8>>, String>);
+
+    #[async_trait::async_trait(?Send)]
+    impl Module for FakeValset {
+        fn id(&self) -> ModuleId {
+            "valset".into()
+        }
+
+        fn root(&self) -> StateRoot {
+            StateRoot::ZERO
+        }
+
+        async fn execute(&mut self, _ctx: &mut dyn Ctx, _msg: &Msg) -> Result<(), Error> {
+            Err(Error::QueryUnsupported)
+        }
+
+        async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
+            use valset::{ValsetQuery, ValsetReply, decode_query, encode_reply};
+            match decode_query(req) {
+                Ok(ValsetQuery::Validators) => match &self.0 {
+                    Ok(keys) => Ok(encode_reply(&ValsetReply::Validators(keys.clone()))),
+                    Err(reason) => Err(Error::Module(reason.clone())),
+                },
+                _ => Err(Error::QueryUnsupported),
+            }
+        }
+    }
+
+    fn host_serving(members: Result<Vec<Vec<u8>>, String>) -> Host {
+        Host::genesis(vec![Box::new(FakeValset(members))]).expect("genesis")
+    }
+
+    /// #1820: a query error is NOT an observation of an empty set — the two
+    /// must stay distinguishable so the drain can skip the cutover step
+    /// instead of feeding it a bogus empty membership.
+    #[test]
+    fn a_failed_query_is_err_not_an_empty_set() {
+        let host = host_serving(Err("qmdb read error".into()));
+        let result = block_on(read_valset_members(&host));
+        assert!(
+            result.is_err(),
+            "a query failure must surface as Err, never as Ok(vec![])"
+        );
+    }
+
+    /// #1820: a genuinely empty committed set is a SUCCESSFUL read — the
+    /// impossible state the drain fatals on, never conflated with a failed
+    /// read that should just retry next block.
+    #[test]
+    fn a_successful_empty_read_is_ok_of_an_empty_vec() {
+        let host = host_serving(Ok(Vec::new()));
+        let result = block_on(read_valset_members(&host));
+        assert_eq!(
+            result,
+            Ok(Vec::new()),
+            "an empty committed set is a successful read, distinct from a failed one"
+        );
+    }
+
+    /// the ordinary case still reads through.
+    #[test]
+    fn a_successful_nonempty_read_returns_the_members() {
+        let host = host_serving(Ok(vec![vec![7u8; 32]]));
+        let result = block_on(read_valset_members(&host));
+        assert_eq!(result, Ok(vec![vec![7u8; 32]]));
+    }
+
+    /// an unregistered "valset" target — the same shape a query error takes
+    /// on a live host — is also Err, not an empty set.
+    #[test]
+    fn an_unregistered_valset_module_is_err() {
+        let host = Host::genesis(Vec::new()).expect("genesis");
+        let result = block_on(read_valset_members(&host));
+        assert!(result.is_err());
+    }
 }

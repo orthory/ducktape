@@ -281,6 +281,11 @@ struct ValidatorRuntime<'a> {
     /// the directory itself was unchanged. Not a deletion — it paces the
     /// warning for a filesystem that will never accept the rewrite.
     workspace_mark_lost_checks: u64,
+    /// consecutive drain ticks whose committed valset read failed. Paces the
+    /// warning for a host query that keeps erroring (#1820) — a failed read
+    /// is not an observation, so the cutover step is skipped for that tick
+    /// rather than fed an empty set.
+    valset_read_failed_checks: u64,
 }
 
 pub(super) async fn run(state: ValidatorLoopState<'_>) {
@@ -581,6 +586,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         workspace_mark,
         next_workspace_check: context.current() + WORKSPACE_CHECK_INTERVAL,
         workspace_mark_lost_checks: 0,
+        valset_read_failed_checks: 0,
     };
     // the startup snapshot: the RECOVERED boundary serves on /v1/status the
     // moment the loop exists, not after the first drain.

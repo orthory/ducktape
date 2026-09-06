@@ -16,7 +16,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-index-check labs-gate audit
+.PHONY: all app app-release dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -197,6 +197,8 @@ install-node:
 	$(CARGO) install --path bin/node --locked --target-dir target
 	rm -rf "$(CARGO_BIN)/modules"
 	cp -r target/release/modules "$(CARGO_BIN)/modules"
+	rm -rf "$(CARGO_BIN)/sim-modules"
+	cp -r target/release/sim-modules "$(CARGO_BIN)/sim-modules"
 	@echo "installed the founding set into $(CARGO_BIN)/modules"
 
 ## coordinator -> ~/.cargo/bin/ducktape-coordinator
@@ -252,26 +254,28 @@ test: wasm-modules-check wasm-embed-check
 # That is not hypothetical — it shipped and sat on dev for 81 commits.
 	$(CARGO) build $(LOCKED) -p noded-bin -p simnode -p ducktape-app
 
-## rebuild every wasm guest module into its componentized artifact and refresh
-## EVERY committed copy in one sweep (the canonical artifact in the module's
-## own directory, which the build stages into the founding set, + the kernel
-## test fixtures), so the copies can never drift apart. requires
-## wasm-tools (cargo install wasm-tools); the wasm32-unknown-unknown target
-## comes from the pinned rust-toolchain.toml. component bytes are toolchain-
-## dependent: a rebuild on a different rustc may legitimately differ from the
-## committed bytes — commit the refreshed set TOGETHER; `wasm-modules-check`
-## guards mutual consistency. bytes no longer depend on WHERE the checkout
-## lives (guest-builder remaps the path prefixes away), so the same toolchain
-## on any box reproduces them — `wasm-repro-check` is that pin. nor on WHEN:
-## guest-builder seeds the scratch workspace from the host `Cargo.lock`, so a
-## crates.io publish no longer moves these bytes — a `Cargo.lock` bump that
-## touches a guest-graph crate does, and that is a reviewable diff.
+## rebuild every wasm guest into its artifact and refresh EVERY committed copy
+## in one sweep (the canonical artifact in the module's own directory, which
+## the build stages into the founding set, + the kernel test fixtures), so the
+## copies can never drift apart. requires wasm-tools (cargo install
+## wasm-tools --version "$$(cat wasm-tools.version)"); the wasm32 target uses
+## rust-toolchain.toml. every guest is built ALONE, out of the platform
+## repository at this checkout's HEAD (bin/guest-builder), so HEAD must be
+## pushed first; each module's guest.lock records the revision and the
+## registry versions its artifact came from and seeds its next build, so a
+## crates.io publish never moves the bytes, and a revision that changes none
+## of what a module compiles leaves its bytes as they are. component bytes
+## ARE toolchain-dependent: a rebuild on a different rustc may legitimately
+## differ from the committed bytes — move the channel and the whole set
+## together. `wasm-modules-check` guards the copies' mutual consistency,
+## `wasm-rebuild-check` every artifact against a rebuild of its source, and
+## `wasm-repro-check` that nothing builder-local reaches the bytes.
 #
 # Every product/example module carries its own guest port (src/guest.rs behind
-# the `guest` feature); guest-builder synthesizes the packaging workspace and
-# writes the canonical component.wasm into the module directory itself. The
-# five kernel-fixture test guests (hello, hello-replacement, sibling, object,
-# noop) keep their standalone crates/guests workspaces below.
+# the `guest` feature); guest-builder builds it out of the repository and
+# writes the canonical component.wasm and guest.lock into the module directory
+# itself. The five kernel-fixture test guests (hello, hello-replacement, noop,
+# sibling, object) keep their standalone crates/guests workspaces below.
 BUILDER_MODULES := \
   crates/examples/directory \
   crates/modules/apps/inbox crates/modules/apps/pages crates/modules/apps/agent \
@@ -281,7 +285,8 @@ BUILDER_MODULES := \
   crates/modules/system/tagging crates/modules/system/dispatch \
   crates/modules/system/capability crates/modules/system/identity \
   crates/modules/system/gateway crates/modules/system/governance \
-  crates/modules/system/saga crates/modules/system/acl crates/modules/system/kv
+  crates/modules/system/saga crates/modules/system/acl crates/modules/system/kv \
+  crates/modules/system/modules crates/modules/system/valset
 
 # Modules that additionally ship an INDEX guest (src/index_guest.rs behind the
 # `index-guest` feature): guest-builder --index writes the canonical
@@ -305,6 +310,8 @@ INDEX_MODULES := \
 NETSTACK_GUEST := crates/networking/netstack-machine
 
 wasm-modules:
+	@test "$$(wasm-tools --version)" = "wasm-tools $$(cat wasm-tools.version)" || \
+	  { echo "install wasm-tools at the version in wasm-tools.version" >&2; exit 1; }
 	@for m in $(BUILDER_MODULES); do \
 	  id=$$(basename $$m) && \
 	  $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m && \
@@ -373,6 +380,12 @@ wasm-modules-check:
 	done
 	@test -f $(NETSTACK_GUEST)/component.wasm \
 	  || { echo "missing $(NETSTACK_GUEST)/component.wasm (make wasm-modules)"; exit 1; }
+# every built guest carries its lock: the record of the revision and the
+# registry versions the artifact came from, without which a rebuild cannot
+# reproduce it.
+	@for m in $(BUILDER_MODULES) $(INDEX_MODULES) $(NETSTACK_GUEST); do \
+	  test -f $$m/guest.lock || { echo "missing $$m/guest.lock (make wasm-modules)"; exit 1; }; \
+	done
 # and no committed artifact may carry a builder-local absolute path. guest-builder
 # remaps the checkout, CARGO_HOME and RUSTUP_HOME prefixes to stable tokens (see
 # `remap_flags`), so a `/home/...` or `/Users/...` in the bytes means an artifact
@@ -383,8 +396,6 @@ wasm-modules-check:
 	    echo "rebuild with make wasm-modules (guest-builder --remap-path-prefix)"; exit 1; }
 	@echo "wasm module artifacts are mutually consistent"
 
-## the reproducibility gate: one guest built from TWO different checkout paths
-## must be byte-identical, and carry no host path. Needs the wasm32 target and
 ## the binary embeds no wasm (AGENTS.md, "No Embedded Wasm"): an
 ## include_bytes!/include_str! of a `.wasm` is allowed only in a test — a file
 ## under a `tests/` directory or named `tests.rs`, or below the file's first
@@ -401,32 +412,45 @@ wasm-embed-check:
 	[ "$$bad" = 0 ] || { echo "a non-test source embeds a .wasm — the binary is not the module set (AGENTS.md)"; exit 1; }; \
 	echo "wasm-embed-check: no non-test include of a .wasm"
 
-## wasm-tools (which `wasm-modules-check` deliberately does not), so it stands
-## apart from the pre-push `test` gate. See ops/wasm-repro-check.sh.
+## the reproducibility gate: one guest built twice, in two scratch directories,
+## must be byte-identical and carry no host path. Needs the wasm32 target,
+## wasm-tools and a pushed HEAD (which `wasm-modules-check` deliberately does
+## not), so it stands apart from the pre-push `test` gate. See
+## ops/wasm-repro-check.sh.
 wasm-repro-check:
 	@bash ops/wasm-repro-check.sh
 
-INDEX_CHECK_DIR := $(CURDIR)/target/wasm-index-check
+REBUILD_CHECK_DIR := $(CURDIR)/target/wasm-rebuild-check
 
-## the drift gate the committed INDEX guests never had: rebuild each
-## index.wasm from its source and compare it with the committed bytes.
-## `wasm-modules-check` only cmps committed copies against each other, so an
-## index guest could drift arbitrarily far from the sources beside it and stay
-## green, which is exactly what happened (#1363). Needs the wasm32 target, so
-## like `wasm-repro-check` it stands apart from the pre-push `test` gate.
-wasm-index-check:
-	@mkdir -p "$(INDEX_CHECK_DIR)"
+## the drift gate between an artifact and its source: rebuild every guest out
+## of the repository at HEAD, seeded from its committed guest.lock, and compare
+## it with the committed bytes. `wasm-modules-check` only cmps committed copies
+## against each other, so an artifact could drift arbitrarily far from the
+## source beside it and stay green. A `--out` build leaves the module
+## directory (lock included) untouched, so the tree stays clean under the
+## check. Needs the wasm32 target, wasm-tools and a pushed HEAD, so like
+## `wasm-repro-check` it stands apart from the pre-push `test` gate.
+wasm-rebuild-check:
+	@mkdir -p "$(REBUILD_CHECK_DIR)"
+	@for m in $(BUILDER_MODULES) $(NETSTACK_GUEST); do \
+	  id=$$(basename $$m) && \
+	  $(CARGO) run -q $(LOCKED) -p guest-builder -- $$m \
+	    --out "$(REBUILD_CHECK_DIR)/$$id.component.wasm" >/dev/null || exit 1; \
+	  cmp $$m/component.wasm "$(REBUILD_CHECK_DIR)/$$id.component.wasm" || { \
+	    echo "$$m/component.wasm does not match a rebuild of its source. Refresh it:"; \
+	    echo "    $(CARGO) run -p guest-builder -- $$m"; \
+	    echo "  and commit the result with its kernel fixture copy."; exit 1; }; \
+	done
 	@for m in $(INDEX_MODULES); do \
 	  id=$$(basename $$m) && \
 	  $(CARGO) run -q $(LOCKED) -p guest-builder -- --index $$m \
-	    --out "$(INDEX_CHECK_DIR)/$$id.wasm" >/dev/null || exit 1; \
-	  cmp $$m/index.wasm "$(INDEX_CHECK_DIR)/$$id.wasm" || { \
+	    --out "$(REBUILD_CHECK_DIR)/$$id.index.wasm" >/dev/null || exit 1; \
+	  cmp $$m/index.wasm "$(REBUILD_CHECK_DIR)/$$id.index.wasm" || { \
 	    echo "$$m/index.wasm does not match a rebuild of its source. Refresh it:"; \
 	    echo "    $(CARGO) run -p guest-builder -- --index $$m"; \
-	    echo "  and commit the result. (Not \`make wasm-modules\`: that also"; \
-	    echo "  rewrites every component.wasm and would move the genesis hash.)"; exit 1; }; \
+	    echo "  and commit the result."; exit 1; }; \
 	done
-	@echo "committed index guests match a rebuild on this toolchain"
+	@echo "committed guests match a rebuild of their source at HEAD"
 
 ## the supply-chain tripwire: RustSec advisories and yanked crates against the
 ## committed Cargo.lock, under `deny.toml` — where every carried advisory is

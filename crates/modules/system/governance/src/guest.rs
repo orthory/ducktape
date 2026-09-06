@@ -1,6 +1,6 @@
 //! the wasm port of this module, built the ADAPTER way: the NATIVE
 //! `governance` crate is compiled to wasm32 unmodified and adapted to the
-//! `ducktape:module` world through `guest-adapter`, so the module's logic is
+//! `ducktape:module` world through `ducktape-module-sdk`, so the module's logic is
 //! single-sourced (a behavior change in the native crate IS the wasm change).
 //! the packaging cdylib around this port is synthesized by `guest-builder` —
 //! this module is the whole of the guest's hand-written surface.
@@ -52,7 +52,7 @@
 //! port's sibling ids.
 
 use crate::Governance;
-use guest_adapter::{WitStore, host, load_store_config};
+use ducktape_module_sdk::{WitStore, host, load_store_config};
 use sdk::genesis_config;
 
 /// the genesis-constant id this module registers under (the native twin's id:
@@ -86,16 +86,16 @@ fn invite_binding() -> Result<Vec<u8>, host::Error> {
 }
 
 // store-backed port: no snapshot — the host owns the real qmdb store and the
-// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
+// module is rebuilt fresh per dispatch (see `ducktape_module_sdk::store_guest!`).
 // the per-network invite binding comes from the store-seeded genesis config
 // via the bespoke `invite_binding` above (a bytes param, not the chain_id
 // twins' string).
-guest_adapter::store_guest! {
+ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: Governance,
-    shape: guest_adapter::host::ModuleShape {
+    shape: ducktape_module_sdk::host::ModuleShape {
         config: vec![genesis_config::INVITE.into()],
-        ..guest_adapter::store_shape()
+        ..ducktape_module_sdk::store_shape()
     },
     new: Governance::new(MODULE_ID, Box::new(WitStore), VALSET_ID, IDENTITY_ID)
         .with_invite_binding(invite_binding()?)

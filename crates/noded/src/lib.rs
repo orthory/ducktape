@@ -36,7 +36,7 @@ pub mod blobs;
 // the `Host` finisher.
 pub mod bundle;
 // the ONE module composer every host in the workspace builds its module set
-// through: a topology selection + a code source + a store source.
+// through: deployment hashes + a code source + a store source.
 pub mod compose;
 pub mod log;
 pub mod stream;
@@ -119,9 +119,8 @@ pub use term_consensus::{command_blocks, command_text, session_channel};
 // /v1/blocks.
 mod index;
 pub use index::{
-    BlocksParams, FOLDED_HEADER, IndexGuests, IndexScanParams, converge_index_guests,
-    index_block_ops, index_host_modules, index_origin, open_index_store, stale_modules,
-    stamp_stale_modules,
+    BlocksParams, FOLDED_HEADER, IndexScanParams, converge_host_modules, index_block_ops,
+    index_host_modules, index_origin, open_index_store, stale_modules, stamp_stale_modules,
 };
 // the ducktape_* Prometheus series + GET /metrics.
 mod metrics;

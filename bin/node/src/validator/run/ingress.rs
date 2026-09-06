@@ -52,7 +52,11 @@ impl ValidatorRuntime<'_> {
             // change, so the 1/s pace bounds staleness far below block rate.
             let hex_set = |keys: Vec<Vec<u8>>| keys.iter().map(|k| hex_bytes(k)).collect();
             self.status.publish_peers(noded::PeersStanding {
-                validators: hex_set(read_valset_members(self.node.host()).await),
+                validators: hex_set(
+                    read_valset_members(self.node.host())
+                        .await
+                        .unwrap_or_default(),
+                ),
                 residents: hex_set(read_valset_residents(self.node.host()).await),
                 height: self.node.finalized().map(|f| f.height).unwrap_or(0),
                 epoch: Some(self.orchestrator.epoch()),
@@ -76,7 +80,11 @@ impl ValidatorRuntime<'_> {
     /// stamped with this validator's own chain position.
     async fn peers_sample(&self) -> noded::peers::PeersView {
         let hex_set = |keys: Vec<Vec<u8>>| keys.iter().map(|k| hex_bytes(k)).collect();
-        let validators = hex_set(read_valset_members(self.node.host()).await);
+        let validators = hex_set(
+            read_valset_members(self.node.host())
+                .await
+                .unwrap_or_default(),
+        );
         let residents = hex_set(read_valset_residents(self.node.host()).await);
         let height = self.node.finalized().map(|f| f.height).unwrap_or(0);
         let epoch = Some(self.orchestrator.epoch());
@@ -137,7 +145,7 @@ impl ValidatorRuntime<'_> {
                 // read-time hygiene: an approved joiner holds
                 // STANDING now (resident or already validator) —
                 // its request is settled, drop it.
-                let members = read_valset_members(node.host()).await;
+                let members = read_valset_members(node.host()).await.unwrap_or_default();
                 let residents_now = read_valset_residents(node.host()).await;
                 join_requests.retain(|joiner, _| {
                     !members.contains(joiner) && !residents_now.contains(joiner)
@@ -247,7 +255,7 @@ impl ValidatorRuntime<'_> {
             );
             return;
         }
-        let members = read_valset_members(node.host()).await;
+        let members = read_valset_members(node.host()).await.unwrap_or_default();
         let residents_now = read_valset_residents(node.host()).await;
         // V7: issuer in committed valset. NON-TERMINAL — this member's local
         // view cannot distinguish a REMOVED issuer (invite dead) from a
@@ -409,7 +417,7 @@ impl ValidatorRuntime<'_> {
         let needs_node_standing = matches!(msg, relay::RelayMsg::BlobOffer { .. });
         let (members_now, residents_now) = if needs_node_standing {
             (
-                read_valset_members(node.host()).await,
+                read_valset_members(node.host()).await.unwrap_or_default(),
                 read_valset_residents(node.host()).await,
             )
         } else {
@@ -485,6 +493,7 @@ impl ValidatorRuntime<'_> {
         let peers: Vec<ed25519::PublicKey> = if relay::required_blob_digest(&frame).is_some() {
             read_valset_members(node.host())
                 .await
+                .unwrap_or_default()
                 .iter()
                 .filter_map(|raw| ed25519::PublicKey::decode(raw.as_slice()).ok())
                 .filter(|key| key != &signer.public_key())

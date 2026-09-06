@@ -46,7 +46,7 @@
 //! vouches for the DERIVED ROWS and only moves when ops arrive. guest code
 //! itself lives in the engine's own reserved 0x00 keyspace — invisible to
 //! scans and wiped by nothing this crate does; every node converges its own
-//! into each database from the guests its genesis carries ([`IndexStore::converge`]).
+//! into each database from the running module deployments ([`IndexStore::converge`]).
 //!
 //! alongside the per-module databases the store keeps ONE internal blocks
 //! database (`<base>/_blocks/`, never a module): `blk/{height:016x}` holds the
@@ -59,7 +59,9 @@
 //!
 //! failure policy: a host-write error POISONS the store (writes refuse, reads
 //! keep serving) rather than skipping a block — a silent gap would break the
-//! watermark's contiguity promise. a guest-fold error never poisons: the
+//! watermark's contiguity promise. A failed mapper replacement also poisons
+//! writes and refuses reads of that module until it is reconverged; readers
+//! must not see a partially replaced deployment. A guest-fold error never poisons: the
 //! engine retains the events and retries, and the backlog is observable.
 //!
 //! when canonical state advances WITHOUT the op stream — state-sync installs
@@ -73,12 +75,12 @@
 //! the source's own op rows below it ([`IndexStore::write_backfill_rows`] +
 //! [`IndexStore::set_backfill_floor`], the joiner's inline join-seam walk).
 //!
-//! a MAPPER change is the other way derived rows go stale, and it needs no
-//! boundary: the op feed is still there. [`converge_guest`] clears the derived
+//! A mapper changes at its module's deployment activation. The op feed stays
+//! available: [`converge_guest`] clears the derived
 //! keyspace and re-drives the fold over the rows the database already holds,
 //! leaving `op/` and `meta/` alone — a new mapper changes what the rows MEAN,
-//! never what the feed saw. that re-drive completes before [`IndexStore::open`]
-//! returns, so no reader ever sees the cleared keyspace.
+//! never what the feed saw. Readers wait for replacement and refold to finish
+//! under the deployment guard, at boot and at live activation.
 //!
 //! the full contract a per-module index guest must satisfy (fold rules, view
 //! rules, when NOT to index) is `docs/records/specs/indexable-spec.md`; the
@@ -283,6 +285,11 @@ pub struct FoldStatus {
     pub last_error: Option<String>,
 }
 
+enum DeploymentState {
+    Ready { code_hash: Option<Vec<u8>> },
+    Failed,
+}
+
 /// one module's open database plus its guest's declared roles.
 ///
 /// the roles are what the LAST converge established — read back from the
@@ -291,6 +298,8 @@ pub struct FoldStatus {
 /// converge, which is why they are atomics on a shared handle.
 struct ModuleIndex {
     db: Arc<Db>,
+    /// Readers wait until mapper replacement and its refold finish together.
+    deployment: RwLock<DeploymentState>,
     /// the guest exports `on_apply` — a fold trigger is registered.
     has_fold: AtomicBool,
     /// the guest exports `query` — [`IndexStore::view`] routes to it.
@@ -298,6 +307,17 @@ struct ModuleIndex {
 }
 
 impl ModuleIndex {
+    fn read_deployment(&self) -> Result<RwLockReadGuard<'_, DeploymentState>> {
+        let guard = self
+            .deployment
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        match *guard {
+            DeploymentState::Ready { .. } => Ok(guard),
+            DeploymentState::Failed => Err(Error::Poisoned),
+        }
+    }
+
     fn folds(&self) -> bool {
         self.has_fold.load(Ordering::Acquire)
     }
@@ -306,10 +326,24 @@ impl ModuleIndex {
         self.has_view.load(Ordering::Acquire)
     }
 
+    fn query(&self, req: &[u8]) -> Result<Vec<u8>> {
+        let supports_view = self.views();
+        if !supports_view {
+            return Err(Error::ViewUnsupported);
+        }
+        self.db.query(GUEST_NAME, req).map_err(view_error)
+    }
+
     fn set_roles(&self, has_fold: bool, has_view: bool) {
         self.has_fold.store(has_fold, Ordering::Release);
         self.has_view.store(has_view, Ordering::Release);
     }
+}
+
+/// A view and its advisory watermark, read from the same deployed mapper.
+pub struct IndexedView {
+    pub bytes: Vec<u8>,
+    pub folded: Option<(u64, u32)>,
 }
 
 /// the per-module index store: one fluent31 database per module the host
@@ -415,6 +449,7 @@ impl IndexStore {
         let (has_fold, has_view) = installed_roles(&db)?;
         let module = ModuleIndex {
             db,
+            deployment: RwLock::new(DeploymentState::Ready { code_hash: None }),
             has_fold: AtomicBool::new(has_fold),
             has_view: AtomicBool::new(has_view),
         };
@@ -438,9 +473,67 @@ impl IndexStore {
     /// database already holding these bytes (the marker says so).
     pub fn converge(&self, modules: &[IndexModule]) -> Result<()> {
         for spec in modules {
-            let m = self.module(spec.id)?;
-            let (has_fold, has_view) = converge_guest(&m.db, spec)?;
-            m.set_roles(has_fold, has_view);
+            let module = self.module(spec.id)?;
+            self.converge_module(&module, spec, None)?;
+        }
+        Ok(())
+    }
+
+    /// Converge a deployment whose identity the caller has authenticated.
+    /// That hash commits both component and mapper. An unchanged identity
+    /// needs only a shared guard: no Wasm hashing, database read, or wait for
+    /// an active view on the ordinary per-block path.
+    pub fn converge_deployment(&self, spec: &IndexModule, code_hash: &[u8]) -> Result<()> {
+        let module = self.module(spec.id)?;
+        {
+            let deployment = module
+                .deployment
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            let unchanged = matches!(&*deployment,
+                DeploymentState::Ready { code_hash: Some(current) } if current == code_hash);
+            if unchanged {
+                return Ok(());
+            }
+        }
+        self.converge_module(&module, spec, Some(code_hash))
+    }
+
+    fn converge_module(
+        &self,
+        module: &ModuleIndex,
+        spec: &IndexModule,
+        code_hash: Option<&[u8]>,
+    ) -> Result<()> {
+        let mut deployment = module
+            .deployment
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (has_fold, has_view) = match converge_guest(&module.db, spec) {
+            Ok(roles) => roles,
+            Err(error) => {
+                *deployment = DeploymentState::Failed;
+                self.poisoned.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
+        module.set_roles(has_fold, has_view);
+        *deployment = DeploymentState::Ready {
+            code_hash: code_hash.map(<[u8]>::to_vec),
+        };
+        Ok(())
+    }
+
+    /// Compile candidate mapper bytes without installing them or changing data.
+    pub fn validate_guest(&self, bytes: &[u8]) -> Result<()> {
+        let roles = self.blocks.wasm_entries(bytes)?;
+        let maps_or_queries = roles
+            .iter()
+            .any(|role| role == "on_apply" || role == "query");
+        if !maps_or_queries {
+            return Err(Error::View(
+                "index guest must export on_apply or query".into(),
+            ));
         }
         Ok(())
     }
@@ -875,7 +968,9 @@ impl IndexStore {
 
     /// point read of one stored key at the current snapshot.
     pub fn get(&self, module: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Ok(self.db(module)?.get(key)?)
+        let m = self.module(module)?;
+        let _deployment = m.read_deployment()?;
+        Ok(m.db.get(key)?)
     }
 
     /// one page of keys under `prefix`, strictly after cursor `after` when
@@ -888,7 +983,9 @@ impl IndexStore {
         after: Option<&[u8]>,
         limit: usize,
     ) -> Result<Page> {
-        let db = self.db(module)?;
+        let m = self.module(module)?;
+        let _deployment = m.read_deployment()?;
+        let db = &m.db;
         let (lo, hi) = scan_bounds(prefix, after);
         let snap = db.snapshot();
         let iter = db.iter_at(Some(&lo), hi.as_deref(), false, &snap)?;
@@ -902,10 +999,24 @@ impl IndexStore {
     /// stale but consistent.
     pub fn view(&self, module: &str, req: &[u8]) -> Result<Vec<u8>> {
         let m = self.module(module)?;
-        if !m.views() {
-            return Err(Error::ViewUnsupported);
-        }
-        m.db.query(GUEST_NAME, req).map_err(view_error)
+        let _deployment = m.read_deployment()?;
+        m.query(req)
+    }
+
+    /// Read the advisory tip before the view while holding one deployment
+    /// guard. A replacement cannot put an old mapper's tip on a new view.
+    /// An unreadable tip means unknown; it never prevents serving the view.
+    pub fn view_with_tip(&self, module: &str, req: &[u8]) -> Result<IndexedView> {
+        let m = self.module(module)?;
+        let _deployment = m.read_deployment()?;
+        let folded =
+            m.db.get(FOLD_TIP.as_bytes())
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(index_guest::decode_fold_tip);
+        let bytes = m.query(req)?;
+        Ok(IndexedView { bytes, folded })
     }
 
     /// a live feed of committed writes in `[lo, hi)` on one module's
@@ -1007,7 +1118,9 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         if installed {
             db.uninstall_module(GUEST_NAME)?;
         }
-        if marker.is_some() {
+        let had_guest = marker.is_some() || installed;
+        if had_guest {
+            clear_derived(db)?;
             db.delete(META_GUEST)?;
         }
         return Ok((false, false));
@@ -1022,6 +1135,13 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
     let roles = db.wasm_entries(bytes)?;
     let has_fold = roles.iter().any(|r| r == "on_apply");
     let has_view = roles.iter().any(|r| r == "query");
+    let has_supported_role = has_fold || has_view;
+    if !has_supported_role {
+        return Err(Error::View(
+            "index guest must export on_apply or query".into(),
+        ));
+    }
+
     // the feed goes down FIRST: its pending events describe the previous
     // mapper's work, and `delete_trigger` discards them with the registration
     // — the same clean slate a boundary stamp takes, minus the amnesia.
@@ -1029,8 +1149,8 @@ fn converge_guest(db: &Db, spec: &IndexModule) -> Result<(bool, bool)> {
         db.delete_trigger(FOLD_TRIGGER)?;
     }
     db.install_module(GUEST_NAME, bytes)?;
+    clear_derived(db)?;
     if has_fold {
-        clear_derived(db)?;
         create_fold_trigger(db)?;
         // AND WAIT FOR IT. `replay_op_feed` only STAGES the re-writes; the
         // trigger runner folds them behind it. Returning here would hand the

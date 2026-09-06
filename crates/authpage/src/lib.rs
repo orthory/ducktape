@@ -251,53 +251,74 @@ fn hex_0x(text: &str) -> Result<Vec<u8>, String> {
 /// a one-shot loopback HTTP listener the page delivers its result to. Bound
 /// on an ephemeral 127.0.0.1 port; [`Listener::wait`] serves exactly one
 /// result POST and returns.
+///
+/// The port alone is not a secret — any local process, or any web origin the
+/// user has open, can connect to it. `state` (32 random bytes, carried as a
+/// path segment the page echoes back verbatim, since it posts to `cb`
+/// exactly as given) binds the answer to THIS ceremony: [`serve_one`] refuses
+/// every request whose path does not match rather than trusting whoever
+/// connects first.
 pub struct Listener {
     listener: TcpListener,
+    state: String,
 }
 
 impl Listener {
     pub fn bind() -> std::io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        Ok(Self { listener })
+        let raw: [u8; 32] = rand::random();
+        Ok(Self {
+            listener,
+            state: B64.encode(raw),
+        })
     }
 
     /// the `cb` to put in the request URL — loopback, which is all the page
-    /// will deliver to.
+    /// will deliver to, with the ceremony's `state` in the path.
     pub fn callback_url(&self) -> String {
         let port = self
             .listener
             .local_addr()
             .map(|addr| addr.port())
             .unwrap_or_default();
-        format!("http://127.0.0.1:{port}/")
+        format!("http://127.0.0.1:{port}/cb/{}", self.state)
     }
 
-    /// block until the page POSTs a result (a stray GET — a favicon probe, a
-    /// tab reload — is answered and ignored), then answer it and return.
+    /// block until the page POSTs a result to `/cb/<state>` — anything else
+    /// (a wrong path, a stray GET, a malformed body) is answered and ignored,
+    /// never ends the wait — then answer it and return. Only [`abandon`],
+    /// which is handed this same `callback_url`, can end the wait early.
     pub fn wait(self) -> Result<Outcome, String> {
+        let path = format!("/cb/{}", self.state);
         loop {
             let (stream, _) = self
                 .listener
                 .accept()
                 .map_err(|e| format!("auth callback listener: {e}"))?;
-            if let Some(outcome) = serve_one(stream)? {
+            if let Some(outcome) = serve_one(stream, &path)? {
                 return Ok(outcome);
             }
         }
     }
 }
 
-/// one HTTP exchange: `Some(outcome)` for a result POST, `None` for anything
-/// else (answered with a holding page).
-fn serve_one(mut stream: TcpStream) -> Result<Option<Outcome>, String> {
-    let (method, body) = read_request(&mut stream)?;
+/// one HTTP exchange: `Some(outcome)` for a result POST landing on
+/// `expected_path`, `None` for anything else (answered and ignored — a wrong
+/// path gets a 404, a non-POST or a malformed body gets a holding/error page,
+/// but the wait keeps going in every case).
+fn serve_one(mut stream: TcpStream, expected_path: &str) -> Result<Option<Outcome>, String> {
+    let (method, path, body) = read_request(&mut stream)?;
+    if path != expected_path {
+        respond(&mut stream, 404, "Not found.");
+        return Ok(None);
+    }
     if method != "POST" {
         respond(&mut stream, 200, "Waiting for the ceremony to finish…");
         return Ok(None);
     }
     let Some(result) = form_field(&body, "result") else {
         respond(&mut stream, 400, "The callback carried no result.");
-        return Err("auth page POSTed no `result` field".into());
+        return Ok(None);
     };
     match parse_result(&result) {
         Ok(outcome) => {
@@ -315,18 +336,17 @@ fn serve_one(mut stream: TcpStream) -> Result<Option<Outcome>, String> {
     }
 }
 
-/// the request line's method and the body (`content-length` bounded).
-fn read_request(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
+/// the request line's method and path, and the body (`content-length`
+/// bounded).
+fn read_request(stream: &mut TcpStream) -> Result<(String, String, Vec<u8>), String> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader
         .read_line(&mut line)
         .map_err(|e| format!("auth callback: {e}"))?;
-    let method = line
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let path = parts.next().unwrap_or_default().to_string();
     let mut content_length = 0usize;
     loop {
         line.clear();
@@ -351,12 +371,13 @@ fn read_request(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
     reader
         .read_exact(&mut body)
         .map_err(|e| format!("auth callback body: {e}"))?;
-    Ok((method, body))
+    Ok((method, path, body))
 }
 
 fn respond(stream: &mut TcpStream, status: u16, text: &str) {
     let reason = match status {
         200 => "OK",
+        404 => "Not Found",
         _ => "Bad Request",
     };
     // the same card the page and the relay's "Done" wear (ops/auth-page).
@@ -429,14 +450,13 @@ fn form_decode(value: &[u8]) -> Vec<u8> {
 /// give up on a ceremony: deliver an error result to `callback_url` ourselves,
 /// so a [`Listener::wait`] blocked on it returns `Err` and its thread ends —
 /// the one way to unblock a std accept. Best-effort; a listener already gone
-/// needs nothing.
+/// needs nothing. `callback_url` is the exact URL [`Listener::callback_url`]
+/// handed out, path (and state) included, so this lands on the same
+/// `serve_one` check any other request has to pass.
 pub fn abandon(callback_url: &str, reason: &str) {
-    let Some(port) = callback_url
-        .trim_start_matches("http://127.0.0.1:")
-        .trim_end_matches('/')
-        .parse::<u16>()
-        .ok()
-    else {
+    let rest = callback_url.trim_start_matches("http://127.0.0.1:");
+    let (port_text, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let Ok(port) = port_text.parse::<u16>() else {
         return;
     };
     let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
@@ -445,7 +465,7 @@ pub fn abandon(callback_url: &str, reason: &str) {
     let result = serde_json::json!({ "op": "", "error": "abandoned", "message": reason });
     let body = format!("result={}", url_encode(&result.to_string()));
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n\
+        "POST /{path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/x-www-form-urlencoded\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
@@ -905,40 +925,62 @@ mod tests {
         assert!(parse_result(r#"{"op":"get","authenticatorData":"AQ"}"#).is_err());
     }
 
-    /// the page's delivery, as bytes on the wire: a form POST to the callback,
-    /// answered 200 with a page the user reads, the outcome handed back.
+    /// split a `callback_url` into the loopback port and the path the page
+    /// (or a test peer) must hit.
+    fn port_and_path(cb: &str) -> (u16, String) {
+        let rest = cb.trim_start_matches("http://127.0.0.1:");
+        let (port, path) = rest.split_once('/').unwrap();
+        (port.parse().unwrap(), format!("/{path}"))
+    }
+
+    fn send(port: u16, request: &str) -> String {
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        answer
+    }
+
+    const REAL_BODY: &str = "result=%7B%22op%22%3A%22eth%22%2C%22address%22%3A%220xab%22%2C%22signature%22%3A%220x01%22%2C%22message%22%3A%22AQID%22%7D&x=y+z";
+
+    fn post(path: &str, body: &str) -> String {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// the page's delivery, as bytes on the wire: only a POST to the exact
+    /// `/cb/<state>` path lands the result — a wrong path (someone else's
+    /// process, a stray probe) is 404'd and the wait keeps going, and a
+    /// right-path POST missing its `result` field is 400'd rather than
+    /// aborting the ceremony.
     #[test]
-    fn the_listener_serves_one_form_post_and_ignores_a_probe() {
+    fn the_listener_ignores_the_wrong_path_and_serves_the_real_post() {
         let listener = Listener::bind().unwrap();
-        let cb = listener.callback_url();
-        let port: u16 = cb
-            .trim_start_matches("http://127.0.0.1:")
-            .trim_end_matches('/')
-            .parse()
-            .unwrap();
+        let (port, path) = port_and_path(&listener.callback_url());
         let served = std::thread::spawn(move || listener.wait());
 
-        // a stray GET first (a favicon probe) — answered, not the result.
-        let mut probe = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-        probe
-            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n")
-            .unwrap();
-        let mut answer = String::new();
-        probe.read_to_string(&mut answer).unwrap();
-        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        // wrong path entirely (an unrelated local peer guessing at paths).
+        let answer = send(port, "GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
 
-        let body = "result=%7B%22op%22%3A%22eth%22%2C%22address%22%3A%220xab%22%2C%22signature%22%3A%220x01%22%2C%22message%22%3A%22AQID%22%7D&x=y+z";
-        let mut post = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-        post.write_all(
-            format!(
-                "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-        let mut answer = String::new();
-        post.read_to_string(&mut answer).unwrap();
+        // a POST with the real body but the WRONG path — same as an attacker
+        // who doesn't know this ceremony's state — must not land the result.
+        let answer = send(port, &post("/cb/wrong-state", REAL_BODY));
+        assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
+
+        // right path, but a stray GET (a tab reload) — held, not landed.
+        let answer = send(port, &format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n"));
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert!(answer.contains("Waiting"), "{answer}");
+
+        // right path, malformed body — refused, but the wait keeps going.
+        let answer = send(port, &post(&path, "not a form body"));
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+
+        // right path, real body — this is the one that lands.
+        let answer = send(port, &post(&path, REAL_BODY));
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert!(answer.contains("return to ducktape"), "{answer}");
 

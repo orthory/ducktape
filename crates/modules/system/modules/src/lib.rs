@@ -42,6 +42,9 @@
 //! frozen boundary snapshot — while the reconciliation applies over the
 //! staged view like every other write.
 
+#[cfg(all(feature = "guest", target_arch = "wasm32"))]
+mod guest;
+
 mod interface;
 pub use interface::*;
 
@@ -702,6 +705,24 @@ impl Module for Modules {
 
     async fn resolver_sync_target(&self) -> Result<ResolverSyncTarget, Error> {
         self.staged.sync_target().await
+    }
+
+    async fn initialize(&mut self, params: &[u8]) -> Result<(), Error> {
+        let config = sdk::genesis_config::decode_config(params)?;
+        let roster: std::collections::BTreeMap<String, Vec<u8>> =
+            match sdk::genesis_config::find(&config, "modules") {
+                Some(bytes) => sdk::wire::decode(bytes).map_err(Error::Module)?,
+                None => Default::default(),
+            };
+        for (id, hash) in roster {
+            if hash.len() != CODE_HASH_LEN {
+                return Err(Error::Module(
+                    "initial module code hash must be 32 bytes".into(),
+                ));
+            }
+            self.seed(id, hash).await?;
+        }
+        self.finish_seed().await
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {

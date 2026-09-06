@@ -156,7 +156,7 @@ pub struct Resolved {
 /// signed for.
 #[derive(Debug)]
 pub struct GenesisModules {
-    /// id -> sha256 of the genesis component, for every wasm tenant.
+    /// id -> sha256 of the genesis deployment, for every wasm tenant.
     pub hashes: BTreeMap<String, [u8; 32]>,
     /// where the bytes come from.
     pub source: GenesisSource,
@@ -174,10 +174,7 @@ pub enum GenesisSource {
     FoundingSet(PathBuf),
 }
 
-// the component bundle's naming and hashing live beside the composer, where
-// the daemons that also read a bundle dir can reach them; `config::*` keeps
-// re-exporting both for `bin/node`'s own call sites.
-pub use noded::bundle::{component_path, hash_bundle};
+pub use workspace_config::component_path;
 
 /// Everything a SERVICE DAEMON legitimately needs from its node's workspace —
 /// and, being a member of [`Resolved`], everything the NODE knows about the
@@ -880,10 +877,7 @@ fn resolve_dev_shape(raw: DevSeedToml) -> Result<Resolved, String> {
     // a typo'd `listen` must be told about the typo, not about the bundle.
     let founding_set = PathBuf::from(&raw.modules);
     let genesis = GenesisModules {
-        hashes: hash_bundle(
-            &founding_set,
-            &topology::TOPOLOGY.wasm_ids(topology::PRODUCTION),
-        )?,
+        hashes: workspace_config::Genesis::compose(&founding_set)?.module_hashes(),
         source: GenesisSource::FoundingSet(founding_set),
     };
     Ok(Resolved {
@@ -1376,7 +1370,6 @@ mod tests {
 
     #[test]
     fn dev_shape_hashes_its_modules_dir() {
-        use sha2::Digest as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let modules = dir.path().join("modules");
         std::fs::create_dir_all(&modules).expect("modules dir");
@@ -1402,13 +1395,13 @@ mod tests {
         );
         assert_eq!(
             r.genesis.hashes["pages"],
-            <[u8; 32]>::from(sha2::Sha256::digest(b"pages")),
-            "each hash is the sha256 of the component file on disk"
+            module_artifact::ModuleArtifact::component(b"pages".to_vec()).hash(),
+            "each hash commits the whole deployment from disk"
         );
     }
 
     #[test]
-    fn dev_shape_names_a_missing_component() {
+    fn dev_shape_refuses_an_empty_module_directory() {
         let dir = tempfile::tempdir().expect("tempdir");
         let modules = dir.path().join("modules");
         std::fs::create_dir_all(&modules).expect("modules dir");
@@ -1424,14 +1417,8 @@ mod tests {
         )
         .expect("write node.toml");
         let err = resolve(&cfg).expect_err("an empty bundle dir is refused");
-        // the refusal names the FULL path of the first component it could not
-        // read — an operator pointed at the wrong directory needs the path,
-        // not a bare module id. `hash_bundle` walks BY ID, so "first" is the
-        // alphabetically first wasm module, not the first in topology order.
-        let mut ids = topology::TOPOLOGY.wasm_ids(topology::PRODUCTION);
-        ids.sort_unstable();
-        let missing = component_path(&modules, ids[0]);
-        assert!(err.contains(&missing.display().to_string()), "{err}");
+        assert!(err.contains(&modules.display().to_string()), "{err}");
+        assert!(err.contains("no module components"), "{err}");
     }
 
     /// a network with no modules is not a runnable network — its nodes would

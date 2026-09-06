@@ -11,6 +11,10 @@ use std::time::Duration;
 /// (`noded::MAX_MODULE_ARTIFACT_BYTES`) — a peer-facing artifact was 64x
 /// larger than what an operator could ever stage locally.
 pub(crate) const MAX_MODULE_CODE_BYTES: u64 = noded::MAX_MODULE_ARTIFACT_BYTES as u64;
+/// one warning when the committed valset read first fails, then one per this
+/// many further drain passes, for a host query that keeps erroring (#1820).
+/// shared by the validator drain and the replica park loop.
+pub(crate) const VALSET_READ_WARN_EVERY: u64 = 600;
 /// how many source conversations a code-blob fetch tries before reporting
 /// the miss (each conversation resumes the staged prefix, so retries only
 /// ever pay for bytes not yet landed).

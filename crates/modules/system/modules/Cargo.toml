@@ -1,13 +1,15 @@
 # modules — the network module-code registry. It commits each hot-swappable
 # module's active code hash and at most one readiness-gated scheduled swap.
-# Native module (no wasm guest); component bytes remain content-addressed and
-# out-of-band.
 [package]
 name = "modules"
 version.workspace = true
 edition.workspace = true
 
+[features]
+guest = ["dep:ducktape-module-sdk"]
+
 [dependencies]
+ducktape-module-sdk = { workspace = true, optional = true }
 sdk = { workspace = true }
 # the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
 borsh = { workspace = true }

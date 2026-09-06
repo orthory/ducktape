@@ -5,8 +5,8 @@
 //! What must hold at the boundary `H`:
 //!   * the host's out-of-block `realize_module_swaps(H, src)` fetches the
 //!     committed target hash's bytes, verifies sha256, and swaps the component
-//!     KEEPING the host-owned state — the module's `root()` (and thus the
-//!     root-hash) is byte-identical across the swap itself;
+//!     KEEPING the host-owned state — the module's `root()` stays identical,
+//!     while the global root changes to bind the new deployment;
 //!   * the drain injects EXACTLY ONE System-origin modreg `Advance` in block `H`,
 //!     flipping the committed active hash into the root-hash (the consensus
 //!     commitment to the new code);
@@ -38,8 +38,12 @@ const HELLO_REPLACEMENT: &[u8] = include_bytes!("fixtures/hello-replacement.comp
 /// `modules::MIN_SWAP_LEAD` from the scheduling block.
 const H: u64 = 10;
 
+fn deployment(bytes: &[u8]) -> Vec<u8> {
+    module_artifact::ModuleArtifact::component(bytes.to_vec()).encode()
+}
+
 fn sha(bytes: &[u8]) -> Vec<u8> {
-    sha2::Sha256::digest(bytes).to_vec()
+    sha2::Sha256::digest(deployment(bytes)).to_vec()
 }
 
 /// the test-side `CodeSource`: a plain in-memory content-addressed map — the
@@ -48,7 +52,7 @@ struct MapSource(BTreeMap<Vec<u8>, Vec<u8>>);
 
 impl MapSource {
     fn with(components: &[&[u8]]) -> Self {
-        Self(components.iter().map(|c| (sha(c), c.to_vec())).collect())
+        Self(components.iter().map(|c| (sha(c), deployment(c))).collect())
     }
 }
 
@@ -209,10 +213,10 @@ fn run_swap_scenario() -> (Host, StateRoot) {
         wasm_root_before,
         "the swap keeps the host-owned state: root is byte-identical"
     );
-    assert_eq!(
+    assert_ne!(
         host.root_hash(),
         root_hash_before,
-        "code is invisible to the root-hash: realization alone moves nothing"
+        "the global root binds the running deployment as well as its state"
     );
     // idempotent: a second realization at the same height is a no-op.
     realize(&mut host, H, &src).expect("re-realize is Ok");
@@ -471,7 +475,7 @@ impl MeshSource {
     fn serving(served: &[&[u8]]) -> Self {
         Self {
             local: std::sync::Mutex::new(BTreeMap::new()),
-            remote: served.iter().map(|c| (sha(c), c.to_vec())).collect(),
+            remote: served.iter().map(|c| (sha(c), deployment(c))).collect(),
         }
     }
 
@@ -499,7 +503,7 @@ impl CodeSource for MeshSource {
             return Some(hit.clone());
         }
         let pulled = self.remote.get(code_hash)?;
-        let verified = sha(pulled) == code_hash;
+        let verified = sha2::Sha256::digest(pulled).as_slice() == code_hash;
         if !verified {
             return None; // content-addressed: an unverified pull is never published.
         }
@@ -718,4 +722,19 @@ fn a_missing_second_module_realizes_neither() {
     );
     assert_eq!(host.module_code_hash("zz-hello"), Some(sha(HELLO_V1)));
     assert_eq!(root0, host.root_hash(), "nothing moved the root-hash");
+
+    // Possession and a matching hash are insufficient: compiling the second
+    // deployment must also succeed before the first replacement takes effect.
+    let mut malformed = MapSource::with(&[HELLO_V1, HELLO_REPLACEMENT]);
+    malformed
+        .0
+        .insert(absent, deployment(b"a component this node never received"));
+    realize(&mut host, H, &malformed).expect_err("invalid second component fails closed");
+    assert_eq!(host.module_code_hash("hello"), Some(sha(HELLO_V1)));
+    assert_eq!(host.module_code_hash("zz-hello"), Some(sha(HELLO_V1)));
+    assert_eq!(
+        root0,
+        host.root_hash(),
+        "a compile refusal applies neither swap"
+    );
 }
