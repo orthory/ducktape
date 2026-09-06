@@ -116,7 +116,7 @@ fn with_valset_genesis_appends_topology_sim_valset_and_wires_the_code_registry()
         action: governance::GovAction::UpdateModule {
             name: "x".into(),
             module_id: "chat".into(),
-            activation_height: 10_000,
+            activation_lead: 10_000,
             code_hash: vec![0; 32],
         },
         voting_period: 600_000,

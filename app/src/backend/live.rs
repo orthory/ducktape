@@ -708,7 +708,7 @@ pub fn fold_live_chat(
         active_channel_archived = channel.archived;
         active_channel_members_only = channel.members_only;
     }
-    let seated = channel_members.iter().any(|member| member.key == me);
+    let seated = seated_in(&channel_members, &me);
     let post_refusal = if active_channel_archived {
         "channel_archived".into()
     } else if active_channel_members_only && !seated {
@@ -839,25 +839,23 @@ pub(crate) async fn folded_update(
     };
     match module {
         "chat" => {
-            let current_user = local_user_key().await;
+            // THE DIRECTORY AS LAST READ, NOT A FRESH READ: this is inside the
+            // live decoder fold, where a query would freeze every subscriber
+            // for as long as the node's select loop is busy (issue #1018). It
+            // is warm by the connect that opened this stream.
+            let facts = ReaderFacts::current().await;
             let origin_kind = stream_origin_kind(&op.origin.kind);
-            // THE CACHED DIRECTORY, NOT A FRESH READ: this is inside the live
-            // decoder fold, where a query would freeze every subscriber for as
-            // long as the node's select loop is busy (issue #1018). It is warm
-            // by the connect that opened this stream.
-            let names = cached_account_names();
             // THE ONE ARRIVAL A READER CANNOT AFFORD TO FIND LATER. A mention
             // and a DM used to reach nothing but the in-app bell, which is
             // worth nothing behind another window. Pure decision, cached
             // reads, no query — see `notify`.
-            notify_chat_op(&payload, op.origin.id.as_deref(), &names);
+            notify_chat_op(&payload, op.origin.id.as_deref(), facts.names());
             let folded = chat::client::delta_from_op(
                 &payload,
                 op.assigned.as_ref(),
                 origin_kind,
                 op.origin.id.as_deref(),
-                current_user.as_deref(),
-                &names,
+                facts.reader(),
                 op.height,
             );
             let delta = match folded {
@@ -1027,8 +1025,8 @@ pub(crate) async fn load_channel_row(
     channel_id: &str,
 ) -> Result<Option<ChatChannel>, String> {
     let rpc = rpc_client(rpc)?;
-    let facts = load_channel_facts(&rpc, channel_id, None).await?;
-    Ok(facts.map(|(channel, _roster)| channel))
+    let room = load_channel_facts(&rpc, channel_id, ChatReader::nobody()).await?;
+    Ok(room.map(|(channel, _roster)| channel))
 }
 
 /// One scoped catch-up load, flag-selected per plane: the chat slices
@@ -1684,13 +1682,10 @@ pub async fn load_chat_hit(
         if reply.thread != Some(root_seq) {
             return Err("search result does not belong to the selected thread".into());
         }
-        let current_user = local_user_key().await;
+        let facts = ReaderFacts::current().await;
         chat.active_thread_seq = root.seq;
         chat.thread_target_seq = number_i64(target_seq);
-        chat.thread_messages = vec![
-            root,
-            chat_message(reply, current_user.as_deref(), &account_names(&rpc).await),
-        ];
+        chat.thread_messages = vec![root, chat_message(reply, facts.reader())];
         Ok(chat)
     }
     .await
@@ -1804,84 +1799,6 @@ pub struct DmPeersData {
     pub peers: Vec<DmPeer>,
 }
 
-/// THE ACCOUNT DIRECTORY EVERY AUTHORED ROW IS NAMED AGAINST, cached for the
-/// process and keyed by the endpoint it was read from.
-///
-/// A chat row carries `user:{hex}` and nothing else — the module stamps a KEY,
-/// because a key is what signed the frame — while the name that key registered
-/// lives in the identity module's own store. Nothing joined the two, so the
-/// timeline printed `user bf431c5d…` at a person the DIRECT list one pane over
-/// was already calling "orthory".
-///
-/// It is a CACHE and not a per-load read for the reason `local_user_key` is
-/// one: this is consulted once per rendered row, on every load and every folded
-/// live delta, and the answer changes only when someone registers or renames an
-/// account. `load_dm_peers` is what refreshes it — that load already pages every
-/// account for its own rows, and the live stream re-runs it on every identity
-/// op (`LiveKind.plane`), so the directory follows a rename without a query of
-/// its own.
-static ACCOUNT_NAMES: tokio::sync::RwLock<Option<(String, AuthorNames)>> =
-    tokio::sync::RwLock::const_new(None);
-
-/// The directory for this endpoint, read from the identity module when the
-/// cache is cold or holds another node's answer. An identity module that cannot
-/// answer yet (a resident still joining) yields an empty directory — hex names,
-/// corrected by the `dm_peers` refresh the first identity op triggers.
-pub(crate) async fn account_names(rpc: &RpcClient) -> AuthorNames {
-    let origin = rpc.origin().to_string();
-    let cached = ACCOUNT_NAMES.read().await.clone();
-    if let Some((cached_origin, names)) = cached
-        && cached_origin == origin
-    {
-        return names;
-    }
-    let Ok(names) = read_account_names(rpc).await else {
-        return AuthorNames::default();
-    };
-    *ACCOUNT_NAMES.write().await = Some((origin, names.clone()));
-    names
-}
-
-/// The cached directory WITHOUT filling it — for the two callers that cannot
-/// wait on a round trip: the synchronous optimistic mint, and the live stream's
-/// decoder fold, where a `/v1/query` freezes every subscriber for as long as the
-/// node's select loop is busy (issue #1018). Cold reads as an empty directory;
-/// the connect's chat load warms it before either can run.
-pub(crate) fn cached_account_names() -> AuthorNames {
-    ACCOUNT_NAMES
-        .try_read()
-        .ok()
-        .and_then(|cached| cached.as_ref().map(|(_origin, names)| names.clone()))
-        .unwrap_or_default()
-}
-
-async fn read_account_names(rpc: &RpcClient) -> Result<AuthorNames, String> {
-    let reply: IdentityReply = rpc
-        .query(
-            "identity",
-            &IdentityQuery::All {
-                from: 0,
-                limit: identity::MAX_QUERY_LIMIT,
-            },
-        )
-        .await?;
-    let IdentityReply::Accounts(accounts) = reply else {
-        return Err("the identity module returned the wrong reply".to_string());
-    };
-    Ok(account_names_of(&accounts))
-}
-
-/// EVERY key of an account answers to that account's name: a person with a
-/// phone and a laptop signs with two keys and is one name in the timeline.
-pub(crate) fn account_names_of(accounts: &[AccountView]) -> AuthorNames {
-    AuthorNames::new(accounts.iter().flat_map(|account| {
-        account
-            .keys
-            .iter()
-            .map(|key| (hex_encode(&key.pubkey), account.name.clone()))
-    }))
-}
-
 /// The people this device can open a DM with, one row per identity account.
 ///
 /// Registered agents are NOT here: a DM is a chat channel seated on public
@@ -1897,27 +1814,9 @@ pub async fn load_dm_peers(rpc: String, generation: i64) -> Result<DmPeersData, 
     async {
         let client = rpc_client(&rpc)?;
         let me = local_user_key().await;
-        let reply: IdentityReply = client
-            .query(
-                "identity",
-                &IdentityQuery::All {
-                    from: 0,
-                    limit: identity::MAX_QUERY_LIMIT,
-                },
-            )
-            .await?;
-        let accounts = match reply {
-            IdentityReply::Accounts(accounts) => accounts,
-            IdentityReply::Account(_) | IdentityReply::Gen(_) => {
-                return Err("the identity module returned the wrong reply".to_string());
-            }
-        };
-        // THE DIRECTORY RIDES THIS LOAD. It is the same page of accounts the
-        // author names are read from, and this load re-runs on every identity op
-        // — so a rename reaches the timeline with no query of its own. See
-        // `ACCOUNT_NAMES`.
-        *ACCOUNT_NAMES.write().await =
-            Some((client.origin().to_string(), account_names_of(&accounts)));
+        // The same read that refreshes the name directory: an identity op
+        // reloads this directory, and every label on screen moves with it.
+        let accounts = read_accounts(&client).await?;
         // self is the account THIS key is a member of (a key holds at most one).
         let is_mine = |account: &AccountView| {
             me.as_ref()
@@ -2106,12 +2005,13 @@ pub async fn open_dm(
             password.clone(),
         )
         .await?;
+        let names = names();
         let seated = members
             .iter()
             .map(|key| {
                 let handle = hex_encode(key);
                 ChatMember {
-                    label: short_label(&handle),
+                    label: names.member_label(&handle),
                     key: handle,
                 }
             })
@@ -2142,7 +2042,8 @@ pub async fn open_dm(
 }
 
 /// Why the viewer may not post here, as a stable reason token — empty when
-/// she may. A members-only channel she is not seated in refuses her post.
+/// she may. A members-only channel she is not seated in refuses her post; a
+/// seat is hers under any key of her account ([`seated_in`]).
 pub fn post_gate(
     archived: bool,
     members_only: bool,
@@ -2152,7 +2053,7 @@ pub fn post_gate(
     if archived {
         return "channel_archived".into();
     }
-    let seated = members.iter().any(|member| member.key == me);
+    let seated = seated_in(&members, &me);
     if members_only && !seated {
         return "members_only".into();
     }

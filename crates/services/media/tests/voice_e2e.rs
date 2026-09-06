@@ -14,6 +14,7 @@ use data_plane::{
 use media_service::voice::{
     FRAME_SAMPLES, MediaHeader, SAMPLE_RATE, VoiceConfig, VoiceEncoder, VoiceEngine, media,
 };
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 fn peer(n: u8) -> PeerId {
@@ -75,6 +76,9 @@ fn mesh(n: u8, link: LinkModel, config: VoiceConfig) -> Vec<(PeerId, VoiceEngine
             net.set_link(*a, *b, link);
         }
     }
+    // every member is a live recipient for the whole mesh's lifetime —
+    // these tests never shrink the roster, so a fixed watch value is enough.
+    let roster: Vec<[u8; 32]> = peers.iter().map(|p| p.0).collect();
     peers
         .iter()
         .map(|p| {
@@ -89,7 +93,11 @@ fn mesh(n: u8, link: LinkModel, config: VoiceConfig) -> Vec<(PeerId, VoiceEngine
             let flow_handle = plane
                 .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
                 .expect("register voice flow");
-            (*p, VoiceEngine::new(flow_handle, config).expect("engine"))
+            let (_roster_tx, roster_rx) = watch::channel(roster.clone());
+            (
+                *p,
+                VoiceEngine::new(flow_handle, config, roster_rx).expect("engine"),
+            )
         })
         .collect()
 }
@@ -97,12 +105,15 @@ fn mesh(n: u8, link: LinkModel, config: VoiceConfig) -> Vec<(PeerId, VoiceEngine
 /// A's engine plus a RAW flow handle for B on the same voice flow, so a test
 /// can hand A frames at a chosen wire seq — a fresh session starts at 0, a
 /// two-minute-old one is near 6000, and only the raw handle can say which.
-fn rejoin_rig() -> (
+type RejoinRig = (
     VoiceEngine<SimEndpoint>,
     DatagramFlow<SimEndpoint>,
     PeerId,
     PeerId,
-) {
+    watch::Sender<Vec<[u8; 32]>>,
+);
+
+fn rejoin_rig() -> RejoinRig {
     let (a, b) = (peer(1), peer(2));
     let net = SimNet::new();
     net.set_link(
@@ -135,11 +146,14 @@ fn rejoin_rig() -> (
     let flow_b = plane(net.endpoint(b))
         .datagram_flow(Service::Voice, flow, DatagramPolicy { max_queued: 64 })
         .expect("B flow");
+    // A's roster starts with B in it; tests that shrink it get the sender back.
+    let (roster_tx, roster_rx) = watch::channel(vec![b.0]);
     (
-        VoiceEngine::new(flow_a, test_config()).expect("engine"),
+        VoiceEngine::new(flow_a, test_config(), roster_rx).expect("engine"),
         flow_b,
         a,
         b,
+        roster_tx,
     )
 }
 
@@ -148,7 +162,7 @@ fn rejoin_rig() -> (
 /// at their old high seq — counts every one of those frames late.
 #[tokio::test(start_paused = true)]
 async fn forgetting_a_departed_peer_admits_their_rejoined_stream() {
-    let (engine_a, flow_b, a, b) = rejoin_rig();
+    let (engine_a, flow_b, a, b, _roster_tx) = rejoin_rig();
     let mut encoder = VoiceEncoder::new(32_000).expect("encoder");
     let payload = encoder.encode(&tone(440.0, 0)).expect("encode");
     let voice = |epoch: u32, seq: u16| {
@@ -210,7 +224,7 @@ async fn forgetting_a_departed_peer_admits_their_rejoined_stream() {
 /// from stale traffic is the epoch they stamp on it.
 #[tokio::test(start_paused = true)]
 async fn a_new_epoch_reopens_the_lane_without_a_roster_departure() {
-    let (engine_a, flow_b, a, _b) = rejoin_rig();
+    let (engine_a, flow_b, a, _b, _roster_tx) = rejoin_rig();
     let mut encoder = VoiceEncoder::new(32_000).expect("encoder");
     let payload = encoder.encode(&tone(440.0, 0)).expect("encode");
     let voice = |epoch: u32, seq: u16| {
@@ -253,6 +267,47 @@ async fn a_new_epoch_reopens_the_lane_without_a_roster_departure() {
     );
     assert_eq!(jitter.played, 4, "restarted peer inaudible: {jitter:?}");
     assert_eq!(stats[0].bad_packets, 0);
+}
+
+/// The pump re-checks the roster on every datagram, not just at admission:
+/// frames from B that were already sitting in the flow's queue when the
+/// roster shrinks must still be skipped, so a kicked peer's queued traffic
+/// never opens or feeds a speaker lane (issue #1793).
+#[tokio::test(start_paused = true)]
+async fn roster_shrink_drains_frames_already_queued_from_the_departed_peer() {
+    let (engine_a, flow_b, a, _b, roster_tx) = rejoin_rig();
+    let mut encoder = VoiceEncoder::new(32_000).expect("encoder");
+    let payload = encoder.encode(&tone(440.0, 0)).expect("encode");
+    let voice = |seq: u16| {
+        media::encode_frame(
+            MediaHeader {
+                epoch: 1,
+                seq,
+                timestamp: u32::from(seq).wrapping_mul(FRAME_SAMPLES as u32),
+            },
+            &payload,
+        )
+        .expect("media frame")
+    };
+
+    // B is still in the roster: queue several frames onto the flow.
+    for seq in 0..4u16 {
+        flow_b.send_to(a, &voice(seq)).await.expect("send");
+    }
+    // The roster shrinks to exclude B before the pump ever looks at them.
+    roster_tx
+        .send(vec![])
+        .expect("engine's roster receiver alive");
+    sleep(TICK).await;
+    for _ in 0..4 {
+        engine_a.playout();
+    }
+
+    let stats = engine_a.speaker_stats();
+    assert!(
+        stats.is_empty(),
+        "a departed peer's already-queued frames must never open a lane: {stats:?}"
+    );
 }
 
 fn test_config() -> VoiceConfig {

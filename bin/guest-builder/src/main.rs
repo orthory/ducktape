@@ -18,7 +18,9 @@
 //! repository as a git source ([`PLATFORM_GIT`]) at the revision the shell
 //! lock pins — never out of the checkout in place. that is what makes a module
 //! independently buildable and its bytes reproducible: the build inputs are
-//! the module's revision, its lock, and the toolchain, and nothing else.
+//! the module's revision, its lock, and the toolchain — the rust channel
+//! `rust-toolchain.toml` pins and the componentizer [`WASM_TOOLS_VERSION`]
+//! pins — and nothing else.
 //!
 //! * every platform crate the module reads (the SDK, a sibling's wire types,
 //!   the wasm32 patch stubs) resolves inside that one git source at that one
@@ -67,6 +69,16 @@ use std::process::{self, Command};
 /// every symbol hash, so two builders spelling it differently would produce
 /// different bytes for the same revision.
 const PLATFORM_GIT: &str = "https://github.com/orthory/ducktape";
+
+/// the componentizer every committed component came out of. see
+/// [`refuse_other_componentizer`] for why it is pinned rather than floating;
+/// `the_workflows_install_the_pinned_componentizer` keeps CI in step with it.
+const WASM_TOOLS_VERSION: &str = include_str!("../../../wasm-tools.version").trim_ascii();
+
+/// how to get it, carried in every message that names it.
+fn install_wasm_tools() -> String {
+    format!("cargo install wasm-tools --locked --version {WASM_TOOLS_VERSION}")
+}
 
 const USAGE: &str = "usage: guest-builder <module-dir> [--index] [--rev <sha>] \
      [--out <artifact.wasm>] [--scratch <dir>]";
@@ -696,19 +708,7 @@ fn build(scratch: &Path, name: &str, kind: GuestKind, rustflags: &str) -> Result
 }
 
 fn componentize(cdylib: &Path, out: &Path) -> Result<(), String> {
-    let required = include_str!("../../../wasm-tools.version").trim();
-    let version = Command::new("wasm-tools")
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("running wasm-tools: {e}"))?;
-    let actual = String::from_utf8_lossy(&version.stdout);
-    let matches_pin = version.status.success() && actual.trim() == format!("wasm-tools {required}");
-    if !matches_pin {
-        return Err(format!(
-            "component builds require wasm-tools {required}; install with cargo install wasm-tools --locked --version {required}"
-        ));
-    }
-
+    refuse_other_componentizer()?;
     let status = Command::new("wasm-tools")
         .arg("component")
         .arg("new")
@@ -716,11 +716,36 @@ fn componentize(cdylib: &Path, out: &Path) -> Result<(), String> {
         .arg("-o")
         .arg(out)
         .status()
-        .map_err(|e| format!("running wasm-tools (cargo install wasm-tools): {e}"))?;
+        .map_err(|e| format!("running wasm-tools ({}): {e}", install_wasm_tools()))?;
     if !status.success() {
         return Err(format!("componentizing {} failed", cdylib.display()));
     }
     Ok(())
+}
+
+/// the componentizer writes the component's own sections, and they move
+/// between releases: 1.253 and 1.258 spell `target_features` differently, so
+/// one cdylib becomes two artifacts. that makes `wasm-tools` a build input
+/// exactly like the rust channel, and `cargo install wasm-tools` floats to the
+/// newest release — a box that ran it last week and a CI runner that runs it
+/// today disagree on every component. pinned here because this is the one
+/// place every gated artifact is componentized.
+fn refuse_other_componentizer() -> Result<(), String> {
+    let output = Command::new("wasm-tools")
+        .arg("--version")
+        .output()
+        .map_err(|e| format!("running wasm-tools ({}): {e}", install_wasm_tools()))?;
+    let installed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let pinned = format!("wasm-tools {WASM_TOOLS_VERSION}");
+    let is_the_pinned_componentizer = output.status.success() && installed == pinned;
+    if is_the_pinned_componentizer {
+        return Ok(());
+    }
+    Err(format!(
+        "{installed} componentizes to different bytes than {pinned}, which every \
+         committed component came out of:\n    {}",
+        install_wasm_tools()
+    ))
 }
 
 /// an index guest ships as the built cdylib itself — fluentabi is core wasm,
@@ -785,6 +810,27 @@ fn write(path: &Path, content: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// every workflow that componentizes must install the pinned
+    /// componentizer, or the runner refuses the build it was added to run.
+    /// two places, one version: this is what keeps them one.
+    #[test]
+    fn the_workflows_install_the_pinned_componentizer() {
+        let root = default_platform_root().unwrap();
+        let install = r#"cargo install wasm-tools --locked --version "$(cat wasm-tools.version)""#;
+        for workflow in ["pr.yml", "guest-wasm-mac-smoke.yml"] {
+            let path = root.join(".github/workflows").join(workflow);
+            let text = fs::read_to_string(&path).unwrap();
+            let installs_wasm_tools = text.contains("cargo install wasm-tools");
+            if !installs_wasm_tools {
+                continue;
+            }
+            assert!(
+                text.contains(install),
+                "{workflow} installs a componentizer other than the pinned one:\n    {install}"
+            );
+        }
+    }
 
     /// a written git reference is hashed into every symbol name, so the shell
     /// must name the module by source alone and leave the revision to the lock.

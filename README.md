@@ -128,7 +128,9 @@ target/release/coordinator --listen 0.0.0.0:3478
 
 ### Build wasm module components (guest-builder)
 
-Prerequisite: `cargo install wasm-tools`. The wasm32 target is not one of them
+Prerequisite: `cargo install wasm-tools --locked --version 1.253.0` — the
+componentizer is pinned like the rust channel (a different one writes different
+component bytes; `guest-builder` refuses any other). The wasm32 target is not one of them
 — `rust-toolchain.toml` lists it, so rustup installs it with the pinned
 channel.
 

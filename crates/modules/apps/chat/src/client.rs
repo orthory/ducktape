@@ -61,6 +61,151 @@ pub struct ChatMember {
     pub label: String,
 }
 
+/// The account a user key is bound to: its number (the identity, which the
+/// DM derivation and every "same person" test hang on) and its display name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BoundAccount {
+    pub number: u64,
+    pub name: String,
+}
+
+/// The network's name directory: the account bound to each user key, keyed
+/// by the key's hex. Every surface that names a key names the account holding
+/// it; a key the directory does not know is named by its handle.
+///
+/// Names are display text, NOT identity — two accounts may share one — so
+/// nothing here compares names; "the same person" is the account NUMBER, and
+/// a person's passkey, wallet and device key all resolve to one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NameDirectory {
+    accounts: BTreeMap<String, BoundAccount>,
+}
+
+/// The directory a reader with no network in frame renders through: every
+/// key is named by its handle.
+static NOBODY_KNOWN: NameDirectory = NameDirectory::empty();
+
+impl NameDirectory {
+    pub fn new(accounts: BTreeMap<String, BoundAccount>) -> Self {
+        Self { accounts }
+    }
+
+    /// A directory that knows no one — the cold state before a network has
+    /// been read.
+    pub const fn empty() -> Self {
+        Self {
+            accounts: BTreeMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+    }
+
+    /// The account name bound to a user key (hex), if any.
+    pub fn name_of(&self, key_hex: &str) -> Option<&str> {
+        self.accounts
+            .get(key_hex)
+            .map(|account| account.name.as_str())
+    }
+
+    /// The account number a user key (hex) is bound to, if any.
+    pub fn account_of(&self, key_hex: &str) -> Option<u64> {
+        self.accounts.get(key_hex).map(|account| account.number)
+    }
+
+    /// A member's label: the bound name, else the shortened key.
+    pub fn member_label(&self, key_hex: &str) -> String {
+        self.name_of(key_hex)
+            .map_or_else(|| short_label(key_hex), str::to_string)
+    }
+
+    /// EVERY key of the account THIS key belongs to, the key itself included —
+    /// an account is a set of keys (a phone and a laptop sign with different
+    /// ones), so anything that has to REACH a person addresses all of them,
+    /// not the one it happened to see. The account is the NUMBER, so two
+    /// accounts that chose one display name stay two people. An unregistered
+    /// key answers with itself alone: it is still a real identity, just an
+    /// unnamed one. Ascending by key hex, so the answer is stable across two
+    /// readings of the same directory.
+    pub fn account_keys_of(&self, key: &[u8]) -> Vec<Vec<u8>> {
+        let Some(number) = self.account_of(&hex_encode(key)) else {
+            return vec![key.to_vec()];
+        };
+        self.accounts
+            .iter()
+            .filter(|(_key_hex, account)| account.number == number)
+            .filter_map(|(key_hex, _account)| hex_bytes(key_hex))
+            .collect()
+    }
+
+    /// `(account name lowercased, its keys)` for every account in the
+    /// directory, ascending by name — the handles a writer can type after `@`.
+    /// A name is what gets TYPED, so two accounts registered under one name
+    /// are one handle addressing both: the word names them equally.
+    fn by_name(&self) -> BTreeMap<String, Vec<Vec<u8>>> {
+        let mut handles: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+        for (key_hex, account) in &self.accounts {
+            let Some(bytes) = hex_bytes(key_hex) else {
+                continue;
+            };
+            handles
+                .entry(account.name.to_ascii_lowercase())
+                .or_default()
+                .push(bytes);
+        }
+        handles
+    }
+}
+
+/// A reader's view of the timeline: the key the reader signs with — the
+/// `by me` facts hang on it — and the directory every author is named
+/// through. The reader is named the way everyone else is: by their account.
+#[derive(Clone, Copy, Debug)]
+pub struct ChatReader<'a> {
+    pub key: Option<&'a [u8]>,
+    pub names: &'a NameDirectory,
+}
+
+impl ChatReader<'static> {
+    /// No key and no directory: nothing is `by me`, every author is a handle.
+    pub fn nobody() -> Self {
+        Self {
+            key: None,
+            names: &NOBODY_KNOWN,
+        }
+    }
+}
+
+impl<'a> ChatReader<'a> {
+    pub fn new(key: Option<&'a [u8]>, names: &'a NameDirectory) -> Self {
+        Self { key, names }
+    }
+
+    /// The reader's own rendered handle (`user:{hex}`), when a key is held.
+    fn handle(&self) -> Option<String> {
+        self.key.map(|key| format!("user:{}", hex_encode(key)))
+    }
+
+    /// True when `handle` is the reader: the reader's own key, or another
+    /// key of the reader's ACCOUNT — a passkey or wallet the same person
+    /// signed with is still them.
+    pub fn is_me(&self, handle: &str) -> bool {
+        let Some(mine) = self.key.map(hex_encode) else {
+            return false;
+        };
+        let Some(("user", theirs)) = handle.split_once(':') else {
+            return false;
+        };
+        let same_key = theirs == mine;
+        let same_account = match (self.names.account_of(&mine), self.names.account_of(theirs)) {
+            (Some(my_account), Some(their_account)) => my_account == their_account,
+            _ => false,
+        };
+        same_key || same_account
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChatMessage {
     pub id: String,
@@ -321,8 +466,7 @@ pub fn delta_from_op(
     assigned: Option<&serde_json::Value>,
     origin_kind: &str,
     origin_id: Option<&str>,
-    current_user: Option<&[u8]>,
-    names: &AuthorNames,
+    reader: ChatReader<'_>,
     height: u64,
 ) -> Result<Option<ChatDelta>, String> {
     let msg = decode_msg(payload)?;
@@ -400,7 +544,7 @@ pub fn delta_from_op(
                 reactions: Vec::new(),
                 tags: Vec::new(),
             };
-            let message = chat_message(row, current_user, names);
+            let message = chat_message(row, reader);
             match thread {
                 Some(root_seq) => ChatDelta::Reply {
                     channel_id,
@@ -451,7 +595,7 @@ pub fn delta_from_op(
             ChatDelta::Edited {
                 channel_id,
                 seq: number_i64(seq),
-                message: chat_message(carrier, current_user, names),
+                message: chat_message(carrier, reader),
             }
         }
         ChatMsg::DeleteMessage { channel_id, seq } => ChatDelta::Deleted {
@@ -462,12 +606,12 @@ pub fn delta_from_op(
             channel_id,
             seq,
             emoji,
-        } => reaction_delta(channel_id, seq, emoji, true, &origin, current_user),
+        } => reaction_delta(channel_id, seq, emoji, true, &origin, reader),
         ChatMsg::RemoveReaction {
             channel_id,
             seq,
             emoji,
-        } => reaction_delta(channel_id, seq, emoji, false, &origin, current_user),
+        } => reaction_delta(channel_id, seq, emoji, false, &origin, reader),
         ChatMsg::RegisterHook { .. } | ChatMsg::UnregisterHook { .. } => return Ok(None),
         ChatMsg::SetMembership {
             channel_id,
@@ -479,7 +623,7 @@ pub fn delta_from_op(
                 channel_id,
                 added: member,
                 member: ChatMember {
-                    label: short_label(&id),
+                    label: reader.names.member_label(&id),
                     key: id,
                 },
             }
@@ -497,10 +641,10 @@ fn reaction_delta(
     emoji: String,
     added: bool,
     origin: &OriginTag,
-    current_user: Option<&[u8]>,
+    reader: ChatReader<'_>,
 ) -> ChatDelta {
     let reactor = index::author(origin, None);
-    let by_me = current_user.is_some_and(|key| reactor == format!("user:{}", hex_encode(key)));
+    let by_me = reader.is_me(&reactor);
     ChatDelta::Reaction {
         channel_id,
         seq: number_i64(seq),
@@ -773,17 +917,17 @@ pub fn optimistic_message(
     mut messages: Vec<ChatMessage>,
     body: String,
     message_id: String,
-    current_user: Option<&[u8]>,
-    names: &AuthorNames,
+    reader: ChatReader<'_>,
 ) -> Vec<ChatMessage> {
     let blocks = paragraph_blocks(&body);
-    let handle = current_user.map(|key| format!("user:{}", hex_encode(key)));
-    let (author, initial) = match handle.as_deref() {
+    // A device with no key cannot sign a send, so the keyless mint is a row
+    // with no author to name: it stays unattributed rather than inventing one.
+    let (author, initial) = match reader.handle() {
         Some(handle) => (
-            author_display(handle, current_user, names),
-            avatar_initial(handle, names),
+            author_display(&handle, reader.names),
+            avatar_initial(&handle, reader.names),
         ),
-        None => ("you".into(), "•".into()),
+        None => (String::new(), "•".into()),
     };
     // Pending sequences remain descending negatives for the existing numeric
     // guards and ordering. Each concurrent placeholder must be unique inside
@@ -1061,7 +1205,7 @@ pub fn merge_thread_reply(
 // row rendering — MsgRow (the index/feed shape) → the rendered ChatMessage
 // ============================================================================
 
-pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>, names: &AuthorNames) -> ChatMessage {
+pub fn chat_message(row: MsgRow, reader: ChatReader<'_>) -> ChatMessage {
     let edited = row.rev > 0;
     let meta = if edited {
         format!("#{} · edited", row.seq)
@@ -1078,7 +1222,7 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>, names: &AuthorName
         id: row.message_id,
         view_key,
         seq: number_i64(row.seq),
-        author: author_display(&row.author, current_user, names),
+        author: author_display(&row.author, reader.names),
         meta,
         body: if row.deleted {
             "Message deleted".into()
@@ -1093,7 +1237,7 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>, names: &AuthorName
         reply_count: number_i64(row.reply_count),
         thread_seq: number_i64(row.thread.unwrap_or(0)),
         show_author: true,
-        initial: avatar_initial(&row.author, names),
+        initial: avatar_initial(&row.author, reader.names),
         avatar_kind: avatar_kind(&row.author).into(),
         height: number_i64(row.height),
         time: number_i64(row.time),
@@ -1101,7 +1245,7 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>, names: &AuthorName
             .reactions
             .into_iter()
             .map(|reaction| {
-                let reacted_by_me = reacted_by_user(&reaction.reactors, current_user);
+                let reacted_by_me = reacted_by_reader(&reaction.reactors, reader);
                 ChatReaction {
                     emoji: reaction.emoji,
                     count: count_i64(reaction.reactors.len()),
@@ -1115,19 +1259,10 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>, names: &AuthorName
     .seed_render_rev()
 }
 
-/// True when the local user's rendered author string (`user:{hex}`) is among a
-/// reaction's reactors.
-fn reacted_by_user(reactors: &[String], current_user: Option<&[u8]>) -> bool {
-    current_user.is_some_and(|key| {
-        let handle = format!("user:{}", hex_encode(key));
-        reactors.contains(&handle)
-    })
-}
-
-/// True when the message's rendered author IS the local user — the same
-/// `user:{hex}` comparison the reaction check makes, against the same key.
-fn authored_by_user(author: &str, current_user: Option<&[u8]>) -> bool {
-    current_user.is_some_and(|key| author == format!("user:{}", hex_encode(key)))
+/// True when the reader's rendered handle (`user:{hex}`) is among a reaction's
+/// reactors.
+fn reacted_by_reader(reactors: &[String], reader: ChatReader<'_>) -> bool {
+    reactors.iter().any(|reactor| reader.is_me(reactor))
 }
 
 /// Slack-style grouping: a message shows its avatar + author header only when it
@@ -1336,125 +1471,23 @@ pub fn author_handle(author: &AuthorRef) -> String {
     }
 }
 
+/// The label an author renders under: a user by the account name the
+/// directory binds to their key, every author the directory cannot name by
+/// the plain handle rendering of [`author_name`]. The reader's own writing is
+/// named exactly like anyone else's — by their account, never by a pronoun.
+pub fn author_display(author: &str, names: &NameDirectory) -> String {
+    let Some(("user", id)) = author.split_once(':') else {
+        return author_name(author);
+    };
+    names
+        .name_of(id)
+        .map_or_else(|| author_name(author), str::to_string)
+}
+
 /// The display name for a rendered author string (`user:{id}`,
-/// `agent:{module}/{agent}`, `module:{id}`, or `system`).
-/// The author label a READER sees: `you` for the reader's own writing, the
-/// rendered handle otherwise.
-///
-/// Every other surface in the shell already says `you` — the huddle roster, the
-/// member roster — while the timeline printed the reader's own messages as
-/// `user 3f8dc828…`, a hex nobody recognises as themselves. The plain
-/// [`author_name`] stays for the places that render an author with no reader in
-/// frame (a page comment's opener, a wire label).
-pub fn author_display(author: &str, current_user: Option<&[u8]>, names: &AuthorNames) -> String {
-    match authored_by_user(author, current_user) {
-        true => "you".into(),
-        false => author_name(author, names),
-    }
-}
-
-/// THE ACCOUNT DIRECTORY A ROW IS READ AGAINST: member public key (lowercase
-/// hex) → the account name that key is registered under.
-///
-/// A chat row carries a KEY and nothing else — `user:{hex}` is all the module
-/// ever stamps — and the name a person chose lives in the identity module, in
-/// another store, reachable only by a query. Without this, every author on
-/// every timeline rendered as `user bf431c5d…` while the same account's name sat
-/// in the DIRECT list one pane to the left.
-///
-/// A key with no entry has no account here (or the directory has not loaded
-/// yet), and falls back to that short hex — which is a true statement about the
-/// key, not a guess at a name.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AuthorNames {
-    by_key: BTreeMap<String, String>,
-}
-
-impl AuthorNames {
-    /// `(member public key hex, account name)` pairs. Keys are lowercased on
-    /// the way in, so a caller's hex casing cannot decide whether a name is
-    /// found.
-    pub fn new(entries: impl IntoIterator<Item = (String, String)>) -> Self {
-        Self {
-            by_key: entries
-                .into_iter()
-                .map(|(key, name)| (key.to_ascii_lowercase(), name))
-                .filter(|(key, name)| !key.is_empty() && !name.is_empty())
-                .collect(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_key.is_empty()
-    }
-
-    /// The account name a raw key is registered under.
-    pub fn name_of(&self, key: &[u8]) -> Option<&str> {
-        self.by_key.get(&hex_encode(key)).map(String::as_str)
-    }
-
-    /// EVERY key of the account `name` names — an account is a set of keys
-    /// (a phone and a laptop sign with different ones), so anything that has
-    /// to REACH a person addresses all of them, not the one it happened to
-    /// see. Case-insensitive on the name; ascending by key hex, so the answer
-    /// is stable across two readings of the same directory.
-    pub fn keys_named(&self, name: &str) -> Vec<Vec<u8>> {
-        let wanted = name.to_ascii_lowercase();
-        self.by_key
-            .iter()
-            .filter(|(_key, registered)| registered.to_ascii_lowercase() == wanted)
-            .filter_map(|(key, _registered)| hex_bytes(key))
-            .collect()
-    }
-
-    /// Every key of the account THIS key belongs to, the key itself included —
-    /// the set a mention of that person must address. An unregistered key
-    /// answers with itself alone: it is still a real identity, just an unnamed
-    /// one.
-    pub fn account_keys_of(&self, key: &[u8]) -> Vec<Vec<u8>> {
-        let Some(name) = self.name_of(key) else {
-            return vec![key.to_vec()];
-        };
-        self.keys_named(name)
-    }
-
-    /// `(account name, its keys)` for every account in the directory,
-    /// ascending by name.
-    fn accounts(&self) -> BTreeMap<String, Vec<Vec<u8>>> {
-        let mut accounts: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
-        for (key, name) in &self.by_key {
-            let Some(bytes) = hex_bytes(key) else {
-                continue;
-            };
-            accounts
-                .entry(name.to_ascii_lowercase())
-                .or_default()
-                .push(bytes);
-        }
-        accounts
-    }
-
-    /// The account name behind a rendered author handle — only a `user:` handle
-    /// can have one; an agent and a module already name themselves.
-    fn of_handle(&self, author: &str) -> Option<&str> {
-        let Some(("user", id)) = author.split_once(':') else {
-            return None;
-        };
-        self.by_key
-            .get(&id.to_ascii_lowercase())
-            .map(String::as_str)
-    }
-}
-
-pub fn author_name(author: &str, names: &AuthorNames) -> String {
-    match names.of_handle(author) {
-        Some(name) => name.to_string(),
-        None => unnamed_author(author),
-    }
-}
-
-/// The handle itself, rendered — what an author with no account entry reads as.
-fn unnamed_author(author: &str) -> String {
+/// `agent:{module}/{agent}`, `module:{id}`, or `system`) with no directory in
+/// frame: a user is named by the shortened key.
+pub fn author_name(author: &str) -> String {
     match author.split_once(':') {
         Some(("user", id)) => format!("user {}", short_label(id)),
         Some(("agent", path)) => {
@@ -1466,14 +1499,11 @@ fn unnamed_author(author: &str) -> String {
     }
 }
 
-/// The stable identity an avatar is derived from: the shortened id for a user,
-/// the agent/module name otherwise.
-fn avatar_source(author: &str, names: &AuthorNames) -> String {
-    if let Some(name) = names.of_handle(author) {
-        return name.to_string();
-    }
+/// The text an avatar is derived from: the user's bound name (else the
+/// shortened key), the agent/module name otherwise.
+fn avatar_source(author: &str, names: &NameDirectory) -> String {
     match author.split_once(':') {
-        Some(("user", id)) => short_label(id),
+        Some(("user", id)) => names.member_label(id),
         Some(("agent", path)) => path.rsplit('/').next().unwrap_or(path).to_string(),
         Some(("module", id)) => id.to_string(),
         _ => "system".into(),
@@ -1483,7 +1513,7 @@ fn avatar_source(author: &str, names: &AuthorNames) -> String {
 /// The single-glyph avatar label for an author: the first alphanumeric character
 /// of its identity, uppercased. Falls back to a neutral dot when there is
 /// nothing to show.
-fn avatar_initial(author: &str, names: &AuthorNames) -> String {
+fn avatar_initial(author: &str, names: &NameDirectory) -> String {
     initial_of(&avatar_source(author, names))
 }
 
@@ -1864,15 +1894,15 @@ const MIN_KEY_PREFIX: usize = 4;
 impl MentionCandidates {
     /// The directory (by account name) unioned with `members` (by key). A key
     /// the directory already names is not re-added under its hex.
-    pub fn new(directory: &AuthorNames, members: &[ChatMember]) -> Self {
+    pub fn new(directory: &NameDirectory, members: &[ChatMember]) -> Self {
         let mut targets: Vec<MentionTarget> = directory
-            .accounts()
+            .by_name()
             .into_iter()
             .map(|(handle, keys)| MentionTarget { handle, keys })
             .collect();
         for member in members {
             let key = member_key_bytes(member);
-            if directory.name_of(&key).is_some() {
+            if directory.name_of(&hex_encode(&key)).is_some() {
                 continue;
             }
             targets.push(MentionTarget {
@@ -2242,9 +2272,8 @@ mod tests {
             reactions,
             tags: Vec::new(),
         };
-        let anon = AuthorNames::default();
-        let plain = chat_message(row(Vec::new()), None, &anon);
-        let identical = chat_message(row(Vec::new()), None, &anon);
+        let plain = chat_message(row(Vec::new()), ChatReader::nobody());
+        let identical = chat_message(row(Vec::new()), ChatReader::nobody());
         assert_eq!(
             plain.render_rev, identical.render_rev,
             "identical content seeds identically — the cached subtree is kept"
@@ -2254,8 +2283,7 @@ mod tests {
                 emoji: "👍".into(),
                 reactors: vec!["user:cd".into()],
             }]),
-            None,
-            &anon,
+            ChatReader::nobody(),
         );
         assert_ne!(
             plain.render_rev, reacted.render_rev,
@@ -2267,10 +2295,10 @@ mod tests {
         // row's body never changes (the settle REPLACES the row and moves
         // `seq`), and every fresh send mints a fresh id — the field that does
         // move the seed.
-        let minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), None, &anon);
-        let re_minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), None, &anon);
+        let minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), ChatReader::nobody());
+        let re_minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), ChatReader::nobody());
         assert_eq!(minted[0].render_rev, re_minted[0].render_rev);
-        let other = optimistic_message(Vec::new(), "hello".into(), "op2".into(), None, &anon);
+        let other = optimistic_message(Vec::new(), "hello".into(), "op2".into(), ChatReader::nobody());
         assert_ne!(minted[0].render_rev, other[0].render_rev);
     }
 
@@ -2297,32 +2325,47 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_sees_their_own_writing_as_you() {
+    fn every_author_is_named_by_the_directory_the_reader_included() {
         let me = vec![0xab; 32];
         let mine = format!("user:{}", hex_encode(&me));
         let theirs = format!("user:{}", hex_encode(&[0xcd; 32]));
+        let unbound = format!("user:{}", hex_encode(&[0xef; 32]));
+        let my_passkey = format!("user:{}", hex_encode(&[0x11; 32]));
+        let names = NameDirectory::new(BTreeMap::from([
+            (hex_encode(&me), BoundAccount { number: 1, name: "alice".into() }),
+            (hex_encode(&[0x11; 32]), BoundAccount { number: 1, name: "alice".into() }),
+            (hex_encode(&[0xcd; 32]), BoundAccount { number: 2, name: "bob".into() }),
+        ]));
 
-        let anon = AuthorNames::default();
-        assert_eq!(author_display(&mine, Some(&me), &anon), "you");
-        // The same row read by anyone else is still the handle.
+        // The reader's own writing carries their account name, like anyone's.
+        assert_eq!(author_display(&mine, &names), "alice");
+        assert_eq!(author_display(&theirs, &names), "bob");
+        // A key the directory cannot name falls back to the handle rendering.
+        assert_eq!(author_display(&unbound, &names), author_name(&unbound));
+        assert!(author_name(&unbound).starts_with("user efefefef"));
+        // No directory at all (the boot race) names everyone by handle.
+        assert_eq!(author_display(&mine, ChatReader::nobody().names), author_name(&mine));
+        // An agent is never in the directory.
+        assert_eq!(author_display("agent:demo/quackbot", &names), "@quackbot");
+
+        // The avatar follows the name, and a member label follows the same rule.
+        assert_eq!(avatar_initial(&mine, &names), "A");
+        assert_eq!(names.member_label(&hex_encode(&me)), "alice");
         assert_eq!(
-            author_display(&mine, Some(&[0xcd; 32]), &anon),
-            author_name(&mine, &anon)
+            names.member_label(&hex_encode(&[0xef; 32])),
+            short_label(&hex_encode(&[0xef; 32]))
         );
-        assert_eq!(
-            author_display(&theirs, Some(&me), &anon),
-            author_name(&theirs, &anon)
-        );
-        // No local key (the boot race) renders nobody as `you`.
-        assert_eq!(
-            author_display(&mine, None, &anon),
-            author_name(&mine, &anon)
-        );
-        // An agent is never the reader.
-        assert_eq!(
-            author_display("agent:demo/quackbot", Some(&me), &anon),
-            "@quackbot"
-        );
+
+        // `by me` hangs on the reader's ACCOUNT, never on a name: the key
+        // itself, or another key the same account holds.
+        let reader = ChatReader::new(Some(&me), &names);
+        assert!(reacted_by_reader(std::slice::from_ref(&mine), reader));
+        assert!(reacted_by_reader(std::slice::from_ref(&my_passkey), reader));
+        assert!(!reacted_by_reader(std::slice::from_ref(&theirs), reader));
+        assert!(!reacted_by_reader(&[mine], ChatReader::nobody()));
+        // Two keys the directory does not know are two people.
+        let cold = ChatReader::new(Some(&me), ChatReader::nobody().names);
+        assert!(!reacted_by_reader(&[my_passkey], cold));
     }
 
     /// A KEY IS NOT A NAME, AND THE READER NEVER ASKED FOR ONE. `user:{hex}` is
@@ -2333,20 +2376,23 @@ mod tests {
     fn a_registered_account_renders_by_name() {
         let key = vec![0xbf; 32];
         let handle = format!("user:{}", hex_encode(&key));
-        let names = AuthorNames::new([(hex_encode(&key).to_ascii_uppercase(), "orthory".into())]);
+        let names = NameDirectory::new(BTreeMap::from([(
+            hex_encode(&key),
+            BoundAccount {
+                number: 2,
+                name: "orthory".into(),
+            },
+        )]));
 
-        // Hex casing is the directory's problem, not the caller's.
-        assert_eq!(author_name(&handle, &names), "orthory");
+        assert_eq!(author_display(&handle, &names), "orthory");
         // The avatar follows the name — an "O", not the first hex nibble.
         assert_eq!(avatar_initial(&handle, &names), "O");
-        // A reader still sees their own writing as `you`, name or no name.
-        assert_eq!(author_display(&handle, Some(&key), &names), "you");
-        // And a key with no account is still honestly its short hex.
+        // A key with no account is still honestly its short hex.
         let stranger = format!("user:{}", hex_encode(&[0x11; 32]));
-        assert_eq!(author_name(&stranger, &names), "user 11111111…");
+        assert_eq!(author_display(&stranger, &names), "user 11111111…");
         // A module or agent names itself; the directory has no say.
-        assert_eq!(author_name("agent:demo/quackbot", &names), "@quackbot");
-        assert_eq!(author_name("module:runs", &names), "runs");
+        assert_eq!(author_display("agent:demo/quackbot", &names), "@quackbot");
+        assert_eq!(author_display("module:runs", &names), "runs");
     }
 
     #[test]
@@ -2372,8 +2418,7 @@ mod tests {
             Some(&assigned),
             "external",
             Some("ext:ab"),
-            None,
-            &AuthorNames::default(),
+            ChatReader::nobody(),
             276_199,
         )
         .expect("a well-formed op folds")
@@ -2567,13 +2612,18 @@ mod tests {
         assert_eq!(message_body(&blocks), "- apples\n- bananas\n- pears");
     }
 
-    fn directory() -> AuthorNames {
-        AuthorNames::new([
-            ("aa11".into(), "eddy".into()),
-            ("bb22".into(), "orthory".into()),
-            ("cc33".into(), "orthory".into()),
-            ("dd44".into(), "orthory-ops".into()),
-        ])
+    fn directory() -> NameDirectory {
+        let account = |number: u64, name: &str| BoundAccount {
+            number,
+            name: name.into(),
+        };
+        NameDirectory::new(BTreeMap::from([
+            ("aa11".into(), account(1, "eddy")),
+            // one account, two devices — a mention of it reaches both keys.
+            ("bb22".into(), account(2, "orthory")),
+            ("cc33".into(), account(2, "orthory")),
+            ("dd44".into(), account(3, "orthory-ops")),
+        ]))
     }
 
     fn mention_keys(blocks: &[Block]) -> Vec<Vec<u8>> {
@@ -2687,7 +2737,7 @@ mod tests {
     #[test]
     fn mentions_resolve_against_the_member_roster() {
         let roster =
-            |members: &[ChatMember]| MentionCandidates::new(&AuthorNames::default(), members);
+            |members: &[ChatMember]| MentionCandidates::new(&NameDirectory::default(), members);
         let members = vec![
             ChatMember {
                 key: "a1b2c3d4e5f6".into(),
@@ -2752,9 +2802,15 @@ mod tests {
             format!("user:{}", hex_encode(&[0xab; 32])),
             "system".to_string(),
         ];
-        assert!(reacted_by_user(&reactors, Some(&[0xab; 32])));
-        assert!(!reacted_by_user(&reactors, Some(&[0xcd; 32])));
-        assert!(!reacted_by_user(&reactors, None));
+        let names = NameDirectory::default();
+        let me = [0xab; 32];
+        let someone_else = [0xcd; 32];
+        assert!(reacted_by_reader(&reactors, ChatReader::new(Some(&me), &names)));
+        assert!(!reacted_by_reader(
+            &reactors,
+            ChatReader::new(Some(&someone_else), &names)
+        ));
+        assert!(!reacted_by_reader(&reactors, ChatReader::nobody()));
     }
 
     #[test]

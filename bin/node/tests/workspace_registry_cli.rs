@@ -119,7 +119,7 @@ fn init_writes_the_sandbox_table_exactly_when_the_host_can_start_the_adapter() {
     // an executable named like the adapter, and its hard deps beside it: PATH
     // is the only half of the probe a test owns.
     let bins = tempfile::tempdir().expect("fake bin dir");
-    for bin in ["firecracker", "mke2fs", "debugfs", "nft"] {
+    for bin in ["firecracker", "mke2fs", "debugfs"] {
         let fake = bins.path().join(bin);
         std::fs::write(&fake, "#!/bin/sh\nexit 0\n").expect("write fake runtime");
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))

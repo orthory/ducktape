@@ -2197,9 +2197,10 @@ mod tests {
         );
     }
 
-    /// a module verb must JOIN the founder's open proposal even though every
-    /// member computed its own activation height, so the matcher — not action
-    /// equality — decides which fields identify "the same proposal".
+    /// a module verb must JOIN the founder's open proposal by whichever
+    /// fields ITS OWN matcher cares about, not full action equality — a
+    /// caller whose matcher ignores a field (here, `activation_lead`) still
+    /// finds the right open proposal among unrelated ones.
     #[test]
     fn open_proposal_matching_ignores_fields_the_matcher_ignores() {
         use super::open_proposal_matching;
@@ -2223,9 +2224,8 @@ mod tests {
             GovAction::UpdateModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                // the founder computed 61; this member computes 60 below —
-                // the matcher must join anyway.
-                activation_height: 61,
+                // a lead the matcher below does not compare against.
+                activation_lead: 61,
                 code_hash: hash.clone(),
             },
         );
@@ -2235,7 +2235,7 @@ mod tests {
             GovAction::UpdateModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                activation_height: 60,
+                activation_lead: 60,
                 code_hash: hash.clone(),
             },
         );
@@ -2245,13 +2245,13 @@ mod tests {
             GovAction::RegisterModule {
                 name: "x".into(),
                 module_id: "hello".into(),
-                activation_height: 60,
+                activation_lead: 60,
                 code_hash: hash.clone(),
             },
         );
         let views = vec![settled, other, founders];
-        // the second member computed height 61, not 60 — equality on the whole
-        // action would never join the founder's proposal.
+        // the matcher below cares only about module_id and code_hash — a
+        // different activation_lead must not stop it from joining "founders".
         let matches = |a: &GovAction| {
             matches!(a, GovAction::UpdateModule { module_id, code_hash, .. }
                 if module_id == "hello" && *code_hash == hash)

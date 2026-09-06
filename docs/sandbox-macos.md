@@ -65,8 +65,8 @@ entitlement (re-run `build.sh` — it codesigns), `kern.hv_support`, `mke2fs` /
 ## What differs from Linux, deliberately
 
 - **No tap, no nftables.** A macOS guest gets no network device at all; runs
-  reach the host over the vsock tunnel allowlist only. That is the stricter
-  of the two Linux configurations, not a degraded one.
+  reach the host over the vsock tunnel allowlist only — the same as Linux,
+  where the single production `VmConfig` also sets no tap.
 - **The kernel is the Kata Containers VM kernel, not the Firecracker CI
   kernel.** VZ attaches virtio over PCI; the Firecracker CI kernel is
   virtio-MMIO only and boots into a silent black hole (no console, no disks).

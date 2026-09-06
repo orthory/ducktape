@@ -33,7 +33,9 @@ use tokio::sync::{Semaphore, oneshot, watch};
 use airlock::client::{Gateway, SessionRefusedBy, SessionResponseFault};
 pub use airlock::wire::WorkRef;
 
-const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+// Shared with the airlock gateway's own `DefaultBodyLimit` (`airlock::server::assemble`) —
+// see `airlock::MAX_REQUEST_BYTES` for why the two must match.
+use airlock::MAX_REQUEST_BYTES;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 // Lifetime spend guards for ONE broker. A headless run makes a handful of
 // requests, but an INTERACTIVE session is long-lived — every user turn is 1+

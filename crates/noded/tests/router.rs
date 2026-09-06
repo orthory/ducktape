@@ -355,12 +355,25 @@ async fn an_unproven_push_is_refused() {
         .body(Body::from(unsigned_push_body()))
         .unwrap();
     let response = noded::router(handle).oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // CONSUME-AND-REFUSE: the pack was received, so the answer is git's own
+    // report-status with the ref rejected — what git prints as
+    // `! [remote rejected] main -> main (<reason>)`. An HTTP error here is
+    // what git reports as "the remote end hung up unexpectedly", with the
+    // reason lost.
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let report = String::from_utf8_lossy(&bytes);
     assert!(
-        body_json(response).await["error"]
-            .as_str()
-            .is_some_and(|msg| msg.contains("git push --signed")),
-        "the refusal names the two proofs a push can carry"
+        report.contains("unpack ok"),
+        "a report-status answers the push: {report}"
+    );
+    assert!(
+        report.contains("ng refs/heads/main "),
+        "the ref is rejected, not the connection: {report}"
+    );
+    assert!(
+        report.contains("git push --signed"),
+        "the refusal names the two proofs a push can carry: {report}"
     );
 }
 

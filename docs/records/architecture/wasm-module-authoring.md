@@ -173,9 +173,13 @@ a panic location names its line, and a guest expands the SDK's macros, so a
 line added anywhere above them in `crates/module-sdk/src/lib.rs` (a comment
 included) moves every guest that expands them. They are identical from any box:
 the unpacked revision, the cargo home, the rustup home and the scratch are
-remapped to fixed tokens. They are toolchain-dependent: a rebuild on another
-rustc may legitimately differ, so a channel move rebuilds the whole set and
-commits it as one change.
+remapped to fixed tokens. They are toolchain-dependent, and the toolchain is two pins:
+a rebuild on another rustc, or through another `wasm-tools` (the componentizer
+writes the component's own sections and they move between releases), may
+legitimately differ, so moving either pin rebuilds the whole set and commits it
+as one change. `rust-toolchain.toml` holds the channel and `WASM_TOOLS_VERSION`
+in `bin/guest-builder` holds the componentizer, which refuses to build through
+any other version.
 
 The committed copies of one module's component MUST stay byte-identical
 (nothing is embedded: the founder bundles the canonical artifact and the
@@ -183,7 +187,7 @@ descriptor commits the component-plus-mapper deployment hash; the kernel
 test fixtures — the node pins' bundle — carry the same bytes).
 `wasm-modules-check` gates that and rides the pre-push `make test` gate;
 `wasm-rebuild-check` gates the artifact against its source and needs the wasm32
-target, `wasm-tools` and a pushed HEAD.
+target, the pinned `wasm-tools` and a pushed HEAD.
 
 ### Out-of-tree modules
 
@@ -217,6 +221,7 @@ blst = { git = "https://github.com/orthory/ducktape", rev = "<sha>" }
 `ducktape_module_sdk::sdk`. Build and componentize:
 
 ```
+cargo install wasm-tools --locked --version 1.253.0   # the pinned componentizer
 cargo build --target wasm32-unknown-unknown --release
 wasm-tools component new target/wasm32-unknown-unknown/release/example_module.wasm -o component.wasm
 ```

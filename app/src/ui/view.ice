@@ -242,6 +242,9 @@ view
               thread_has_more
               thread_next_reply_seq
               thread_loading
+              copy_anchor_seq
+              copy_head_seq
+              copy_surface
             events
               search_chat_submit -> search_chat_submit
               clear_chat_search -> clear_chat_search
@@ -267,6 +270,9 @@ view
               begin_message_edit -> begin_message_edit _ _ _
               arm_message_delete -> arm_message_delete _ _ _
               clear_message_selection -> clear_message_selection
+              press_message -> press_message _ _
+              clear_copy_range -> clear_copy_range
+              copy_selected_messages -> copy_selected_messages
               add_reaction_submit -> add_reaction_submit _
               edit_message_submit -> edit_message_submit
               delete_message_submit -> delete_message_submit
@@ -416,6 +422,7 @@ view
               preview_picture=fs_preview_picture
               preview_width=fs_preview_width
               preview_height=fs_preview_height
+              write_refusal=files_write_gate(fs_path, settings_user_key)
               dark
             events
               open_message_link -> open_message_link _
