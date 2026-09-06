@@ -237,6 +237,21 @@ fn signed_lookup(
     (key, request)
 }
 
+/// A signed `Register` for `caller`. The coordinator answers a `Lookup` only
+/// to a caller it has already bound to that datagram's source (#1595), so a
+/// valid client must register itself before its lookup loop starts — exactly
+/// the same order every legitimate rendezvous caller already follows.
+fn signed_register(signer: &ed25519::PrivateKey, caller: NodeKey, timestamp: u64) -> Vec<u8> {
+    let inner = Msg::Register { key: caller };
+    let encoded_inner = inner.encode_inline();
+    AuthRequest {
+        caller,
+        auth: sign_authenticator(signer, &encoded_inner, timestamp, None),
+        inner,
+    }
+    .encode()
+}
+
 async fn valid_client(
     target: SocketAddr,
     deadline: Instant,
@@ -251,7 +266,17 @@ async fn valid_client(
     };
     let socket = UdpSocket::bind(bind).await?;
     socket.connect(target).await?;
-    let signer = ed25519::PrivateKey::from_seed(seed);
+    // The coordinator now refuses a Lookup from a caller it has not bound to
+    // that datagram's own source (#1595), and a live registration is never
+    // repointed to a new source until it expires (a genuine NAT rebind and a
+    // replayed keepalive from elsewhere are wire-indistinguishable). Reusing
+    // `seed` as the identity across separate phases/intervals — each its own
+    // fresh socket — would collide with a still-live registration bound to
+    // the PREVIOUS socket's now-closed port, so every Lookup on the new
+    // socket would be refused. Mixing the freshly bound ephemeral port into
+    // the identity gives every socket lifetime its own registration.
+    let local_port = socket.local_addr()?.port();
+    let signer = ed25519::PrivateKey::from_seed(seed ^ ((local_port as u64) << 32));
     let caller = node_key(&signer);
     let mut stats = LoadStats::new(timeout);
     let mut signed_at = now_secs();
@@ -267,6 +292,13 @@ async fn valid_client(
             signed_at = now;
         }
         let started = Instant::now();
+        // Re-sent every cycle, not just once at start: a lost Register (UDP,
+        // no retry — dropped under the coordinator's own receive backlog
+        // during a flood) would otherwise leave every later Lookup from this
+        // socket unbound and unanswered (#1595) for the rest of the run.
+        socket
+            .send(&signed_register(&signer, caller, signed_at))
+            .await?;
         socket.send(&request).await?;
         stats.valid_sent += 1;
 
@@ -596,12 +628,15 @@ mod tests {
         .await
         .unwrap();
         assert!(flood.load.invalid_sent != 0);
+        // Generous window: the flood leaves the coordinator's own UDP
+        // receive queue backlogged for a beat, and a single-client recovery
+        // phase must outlast that backlog rather than race it.
         let recovery = run_phase(
             target,
-            Duration::from_secs(1),
+            Duration::from_secs(2),
             1,
             0,
-            Duration::from_millis(100),
+            Duration::from_millis(200),
             0,
         )
         .await
