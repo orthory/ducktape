@@ -12,17 +12,14 @@ use serde::{Deserialize, Serialize};
 /// a wildcard; every `Some` field must match the triggering event. a flat
 /// single-shape struct in both the JSON wire and the snapshot codec.
 #[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-// deny_unknown_fields is load-bearing: every field is an Option, so without
-// it the RETIRED tagged shape ({"message_posted":{...}}) would silently parse
-// as an all-None trigger that fires on every message — a quiet-corruption
-// hazard, not a flag day. Unknown keys must reject loudly.
+// Every field is optional, so unknown fields must reject instead of
+// accidentally producing a trigger that matches everything.
 #[serde(deny_unknown_fields)]
 pub struct Trigger {
     /// an exact channel id, or `None` for any channel.
     pub channel_id: Option<String>,
-    /// a substring tested against each mention's ACTOR string (see the module's
-    /// `actor_of`) — `ext:{hex}` for a user, `{module}/{agent_id}` for an
-    /// agent; `None` = no mention constraint.
+    /// A substring matched against each mentioned account's `acct:{number}`
+    /// rendering; `None` imposes no mention constraint.
     pub mention: Option<String>,
     /// a case-sensitive substring tested against the post's concatenated
     /// text blocks; `None` = no text constraint.
@@ -46,16 +43,10 @@ pub enum Action {
         task_id_prefix: String,
         title_template: String,
     },
-    /// deliver an inbox notification. `kind` is literal; `member_template` and
-    /// `body_template` are substituted at fire time.
-    ///
-    /// `member_template` must substitute to an inbox QUEUE NAME, which is an
-    /// origin's `sdk::Origin::actor_string` — inbox refuses an ack from anyone
-    /// but that origin. `{author}` is the ownable form (a rule only ever fires
-    /// on a user-authored post, so it renders `ext:{hex}`); a literal or a
-    /// `{mention}` of a non-user names a queue nobody can ever ack.
-    DeliverInbox {
-        member_template: String,
+    /// Publish a source-owned report to this rule owner. Body substitutions
+    /// share the existing action-template budget.
+    Report {
+        recipient: sdk::AccountNumber,
         kind: String,
         body_template: String,
     },
@@ -66,17 +57,9 @@ pub enum Action {
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub rule_id: String,
-    /// who created it, and the ONLY principal that may enable, disable, or
-    /// delete it: the authenticated external submitter's raw key bytes — the
-    /// same principal domain `chat::Channel::owner` records.
-    ///
-    /// REQUIRED, never optional. A rule is a STANDING capability: once created
-    /// it keeps firing under `Origin::Module("automations")` — posting to
-    /// channels, creating tasks, delivering to inboxes — until someone deletes
-    /// it. An ownerless rule would be an unattributable standing grant, so the
-    /// record makes one unrepresentable and the create op refuses every origin
-    /// that is not an external submitter.
-    pub owner: Vec<u8>,
+    /// The account whose current authority authorizes every fire.
+    pub owner: sdk::AccountNumber,
+    pub authority: RuleAuthority,
     pub enabled: bool,
     pub trigger: Trigger,
     pub action: Action,
@@ -100,10 +83,6 @@ pub struct RunRecord {
     pub detail: String,
 }
 
-/// the admin family is OWNER-BOUND: the submitter of a `CreateRule` becomes the
-/// new rule's [`Rule::owner`], and `SetEnabled`/`DeleteRule` are refused unless
-/// the submitter IS that owner. only an external submitter may own a rule, so
-/// module and system origins are refused outright on all three.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum AutomationsMsg {
@@ -114,7 +93,7 @@ pub enum AutomationsMsg {
         action: Action,
     },
     /// enable or disable an OWN rule — a disabled rule stays registered and
-    /// stops firing.
+    /// stops firing. An explicit enable captures the current identity generation.
     SetEnabled { rule_id: String, enabled: bool },
     /// delete an OWN rule.
     DeleteRule { rule_id: String },
@@ -168,4 +147,12 @@ pub fn encode_reply(r: &AutomationsReply) -> Vec<u8> {
 
 pub fn decode_reply(b: &[u8]) -> Result<AutomationsReply, String> {
     sdk::wire::decode(b)
+}
+
+/// A standing grant is tied to the authority under which it was enabled.
+#[derive(BorshSerialize, BorshDeserialize, Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuleAuthority {
+    Keys,
+    Program { generation: u64 },
 }

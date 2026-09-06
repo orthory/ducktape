@@ -36,6 +36,7 @@ impl TestCtx {
                 consensus_time: 1,
                 origin: Origin::External(origin),
                 me: "gateway".into(),
+                cause: sdk::Cause::Direct,
             },
             accounts,
         }

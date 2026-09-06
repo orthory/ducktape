@@ -648,9 +648,11 @@ fn row_dispatches(payload: &[u8], origin: &sdk::Origin) -> Vec<host::DispatchRec
     vec![host::DispatchRecord {
         module: "directory".into(),
         origin: origin.clone(),
+        cause: sdk::Cause::Direct,
         payload: payload.to_vec(),
         emitted_msgs: 0,
         emitted_events: 0,
+        output: None,
         assigned: Vec::new(),
     }]
 }

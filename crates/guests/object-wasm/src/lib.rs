@@ -65,6 +65,14 @@ impl Guest for Component {
     /// the object plane is the odb backing's: this guest declares odb, so the
     /// host wraps it over an object store (the kernel tests' mock) and never
     /// over a plain map.
+    fn pending_items() -> Result<Vec<host::PendingItem>, host::Error> {
+        Ok(Vec::new())
+    }
+
+    fn acknowledge(_ack: host::Ack) -> Result<(), host::Error> {
+        Err(host::Error::Rejected("module has no outbound queue".into()))
+    }
+
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             backing: host::Backing::Odb,

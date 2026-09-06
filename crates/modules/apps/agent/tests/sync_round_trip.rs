@@ -1,64 +1,194 @@
 //! state-sync round-trip: a joiner reconstructs a byte-identical qmdb root by
 //! pulling a source store's operation range through commonware's qmdb sync,
 //! then wraps a fresh `AgentModule` around the injected store — the same
-//! discriminating property chat and pages prove, over the registry layout.
+//! discriminating property chat and pages prove, over this module's layout.
 //!
-//! the source registers agents covering both owner origin shapes and both
-//! statuses, UPDATES a record (key overwrite) and pauses another, so the op
-//! log carries overwrites a naive "export live records and re-apply sorted"
-//! could never reproduce — the qmdb root is operation-log ordered. only a
-//! real sync that ships the ACTUAL proven op range lands on the same root.
-//!
-//! the roster (the registry's one enumeration record, consensus-consumed by
-//! runs' engagement domain) is ordinary store state under a reserved key, so
-//! it syncs like any record — the joiner answers the full listing exactly
-//! like the source.
+//! the source provisions a program account (the correlated request written,
+//! then consumed by identity's answer — a delete in the op log), replaces
+//! its program (a key overwrite), and runs one invocation through a change
+//! and a completion (the invocation record overwritten as it advances), so
+//! the op log carries overwrites and deletes a naive "export live records
+//! and re-apply sorted" could never reproduce — the qmdb root is
+//! operation-log ordered. only a real sync that ships the ACTUAL proven op
+//! range lands on the same root.
 
-use agent::AgentModule;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
 use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg, AgentQuery, AgentReply, AgentStatus,
-    decode_reply, encode_msg, encode_query,
+    AgentModule, AgentMsg, AgentQuery, AgentReply, CallOutcome, Continuation, Decode, Program,
+    Siblings, Status, Step, Value, decode_reply, encode_msg, encode_query,
 };
+use attribution::{Actor, AttributionEvent, Change, ChangeEntry, ChangeKind, Reason, Source};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
-use saga::SagaOrigin;
-use sdk::{Env, MerkleStore as _, Module, Msg, Origin, StateRoot};
+use dispatch::{CallCompleted, Delivery};
+use identity::{
+    AccountView, Control, IdentityEvent, IdentityQuery, IdentityReply, KeyScheme, KeyView,
+    ProgramStanding,
+};
+use sdk::{
+    AccountNumber, CallId, Cause, Env, Error, Hop, ItemRef, MerkleStore as _, Module, Msg, Origin,
+    Root, StateRoot,
+};
 use sdk_testkit::TestCtx;
 use statesync::qmdb::QmdbStore;
 
-/// drives `execute` with a controllable env; the registry queries nothing.
-fn ctx(height: u64, origin: Origin) -> TestCtx {
-    TestCtx::with_env(Env {
-        height,
-        consensus_time: height,
-        origin,
-        me: "agent".into(),
-    })
+const ALICE: AccountNumber = 1;
+const ALICE_KEY: [u8; 32] = [0xA1; 32];
+
+fn siblings() -> Siblings {
+    Siblings {
+        identity: "identity".into(),
+        attribution: "attribution".into(),
+        dispatch: "dispatch".into(),
+    }
 }
 
-fn user(byte: u8) -> Origin {
-    Origin::External(vec![byte; 32])
+/// identity's book and attribution's ledger as the round trip scripts them.
+struct Scripted {
+    accounts: Rc<RefCell<BTreeMap<AccountNumber, AccountView>>>,
+    changes: Rc<RefCell<BTreeMap<u64, Change>>>,
 }
 
-fn register(agent_id: &str, actions: &[&str]) -> AgentMsg {
-    AgentMsg::RegisterAgent {
-        agent_id: agent_id.into(),
-        display_name: agent_id.to_uppercase(),
-        capability: "model-1".into(),
-        allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
-        recipe_hash: None,
-        caps: None,
-        skills: None,
+impl Scripted {
+    fn new() -> Self {
+        let alice = AccountView {
+            number: ALICE,
+            name: "alice".into(),
+            control: Control::Keys,
+            keys: vec![KeyView {
+                scheme: KeyScheme::Ed25519,
+                pubkey: ALICE_KEY.to_vec(),
+                label: None,
+                added_at: 0,
+            }],
+            avatar: None,
+            bio: None,
+            updated_at: 0,
+        };
+        Self {
+            accounts: Rc::new(RefCell::new(BTreeMap::from([(ALICE, alice)]))),
+            changes: Rc::new(RefCell::new(BTreeMap::new())),
+        }
+    }
+
+    fn found_program(&self, number: AccountNumber, generation: u64) {
+        self.accounts.borrow_mut().insert(
+            number,
+            AccountView {
+                number,
+                name: "bot".into(),
+                control: Control::Program {
+                    controller: ALICE,
+                    executor: "agent".into(),
+                    generation,
+                    standing: ProgramStanding::Active,
+                },
+                keys: Vec::new(),
+                avatar: None,
+                bio: None,
+                updated_at: 0,
+            },
+        );
+    }
+
+    fn ctx(&self, height: u64, origin: Origin, cause: Cause) -> TestCtx {
+        let accounts = Rc::clone(&self.accounts);
+        let changes = Rc::clone(&self.changes);
+        TestCtx::with_env(Env {
+            height,
+            consensus_time: height,
+            origin,
+            me: "agent".into(),
+            cause,
+        })
+        .on_query("identity", move |req| {
+            let reply = match identity::decode_query(req).map_err(Error::Module)? {
+                IdentityQuery::Get { number } => {
+                    IdentityReply::Account(accounts.borrow().get(&number).cloned())
+                }
+                IdentityQuery::OfKey { key } => IdentityReply::Account(
+                    accounts
+                        .borrow()
+                        .values()
+                        .find(|view| view.keys.iter().any(|held| held.pubkey == key))
+                        .cloned(),
+                ),
+                other => return Err(Error::Module(format!("unscripted {other:?}"))),
+            };
+            Ok(identity::encode_reply(&reply))
+        })
+        .on_query("attribution", move |req| {
+            let reply = match attribution::decode_query(req).map_err(Error::Module)? {
+                attribution::AttributionQuery::Changes { after, limit } => {
+                    attribution::AttributionReply::Changes(
+                        changes
+                            .borrow()
+                            .range(after + 1..)
+                            .take(limit as usize)
+                            .map(|(seq, change)| ChangeEntry {
+                                at: *seq,
+                                change: change.clone(),
+                            })
+                            .collect(),
+                    )
+                }
+                other => return Err(Error::Module(format!("unscripted {other:?}"))),
+            };
+            Ok(attribution::encode_reply(&reply))
+        })
+    }
+}
+
+fn program(text: &str) -> Program {
+    Program {
+        steps: vec![
+            Step::Call {
+                module: "chat".into(),
+                msg: Value::Map(BTreeMap::from([
+                    ("text".into(), Value::Text(text.into())),
+                    (
+                        "reply_to".into(),
+                        Value::Ref(vec!["change".into(), "source".into(), "object".into()]),
+                    ),
+                ])),
+                bind: "posted".into(),
+                decode: Decode::Json,
+                on_failure: Continuation::Unhandled,
+            },
+            Step::Finish,
+        ],
+    }
+}
+
+fn mention(seq: u64, recipient: AccountNumber) -> Change {
+    Change {
+        seq,
+        source: Source {
+            module: "chat".into(),
+            kind: "message".into(),
+            object: format!("m{seq}"),
+        },
+        revision: 1,
+        recipient,
+        reason: Reason::Mention,
+        kind: ChangeKind::Added,
+        detail: Vec::new(),
+        actor: Actor::Account(ALICE),
+        cause: Cause::Direct,
+        height: 3,
     }
 }
 
 // drive one op through the REAL module path: execute + commit_block (one op
 // per block-height), so the committed op log is what a validator produces.
-async fn apply_commit(m: &mut AgentModule, height: u64, origin: Origin, op: &AgentMsg) {
+async fn apply_commit(m: &mut AgentModule, ctx: &mut TestCtx, payload: Vec<u8>) {
     let msg = Msg {
         target: "agent".into(),
-        payload: encode_msg(op),
+        payload,
     };
-    m.execute(&mut ctx(height, origin), &msg).await.unwrap();
+    m.execute(ctx, &msg).await.unwrap();
     m.commit_block().await.unwrap();
 }
 
@@ -67,62 +197,116 @@ async fn query_reply(m: &AgentModule, q: &AgentQuery) -> AgentReply {
 }
 
 #[test]
-fn synced_store_reconstructs_source_root_and_registry() {
+fn synced_store_reconstructs_source_root_and_records() {
     deterministic::Runner::default().start(|context| async move {
-        // SOURCE: build the registry through the real op path — an external
-        // and a module owner, an update (overwrite) and a pause (overwrite),
-        // so the op log carries more than inserts. hook None: this proof is
-        // about the store lane, not the recipe plane.
+        let scripted = Scripted::new();
+        let alice = Origin::External(ALICE_KEY.to_vec());
         let mut src = AgentModule::new(
             "agent",
             Box::new(QmdbStore::init(context.child("src"), "src").await),
-            "saga",
-            None,
+            siblings(),
+        );
+
+        // SOURCE: provision (request written, then consumed), replace (the
+        // binding overwritten at generation 1), one invocation started by a
+        // change and finished by its completion (the record overwritten).
+        let mut ctx = scripted.ctx(1, alice.clone(), Cause::Direct);
+        apply_commit(
+            &mut src,
+            &mut ctx,
+            encode_msg(&AgentMsg::Provision {
+                name: "bot".into(),
+                program: program("first"),
+            }),
+        )
+        .await;
+        let account: AccountNumber = 2;
+        scripted.found_program(account, 0);
+        let mut ctx = scripted.ctx(1, Origin::Module("identity".into()), Cause::Direct);
+        apply_commit(
+            &mut src,
+            &mut ctx,
+            identity::encode_event(&IdentityEvent::ProgramCreated {
+                request: 1,
+                account,
+                controller: ALICE,
+            }),
+        )
+        .await;
+        let mut ctx = scripted.ctx(2, alice, Cause::Direct);
+        apply_commit(
+            &mut src,
+            &mut ctx,
+            encode_msg(&AgentMsg::Replace {
+                account,
+                program: program("second"),
+            }),
+        )
+        .await;
+        scripted.found_program(account, 1);
+
+        let change = mention(9, account);
+        scripted.changes.borrow_mut().insert(9, change.clone());
+        let item = ItemRef {
+            source: "attribution".into(),
+            item: 4,
+        };
+        let mut ctx = scripted.ctx(
+            3,
+            Origin::Module("attribution".into()),
+            Cause::Chain {
+                root: Root::Item(item.clone()),
+                hop: Hop::Delivery(item),
+            },
         );
         apply_commit(
             &mut src,
-            1,
-            user(9),
-            &register("alpha", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE]),
+            &mut ctx,
+            attribution::encode_event(&AttributionEvent::Changed(change)),
         )
         .await;
-        apply_commit(
-            &mut src,
-            2,
-            Origin::Module("automations".into()),
-            &register("beta", &[]),
-        )
-        .await;
-        apply_commit(
-            &mut src,
-            3,
-            user(9),
-            &AgentMsg::UpdateAgent {
-                agent_id: "alpha".into(),
-                display_name: Some("Alpha Prime".into()),
-                capability: Some("model-2".into()),
-                allowed_actions: None,
-                recipe_hash: None,
-                caps: None,
-                skills: None,
-            },
-        )
-        .await;
-        apply_commit(
-            &mut src,
+        let id = CallId {
+            requester: "agent".into(),
+            invocation: format!("{account}/9"),
+            step: 0,
+        };
+        let mut ctx = scripted.ctx(
             4,
-            Origin::Module("automations".into()),
-            &AgentMsg::PauseAgent {
-                agent_id: "beta".into(),
+            Origin::Module("dispatch".into()),
+            Cause::Chain {
+                root: Root::Item(ItemRef {
+                    source: "attribution".into(),
+                    item: 4,
+                }),
+                hop: Hop::Completion(id.clone()),
             },
+        );
+        apply_commit(
+            &mut src,
+            &mut ctx,
+            dispatch::encode_delivery(&Delivery::CallCompleted(CallCompleted {
+                id,
+                account,
+                outcome: CallOutcome::Applied {
+                    output: br#"{"message_id":"m10"}"#.to_vec(),
+                    assigned: Vec::new(),
+                },
+            })),
         )
         .await;
+
         let src_root: StateRoot = src.root();
         assert_ne!(src_root, StateRoot::ZERO, "source must have a real root");
-        // capture the source's answers to compare against the joiner's.
-        let AgentReply::Agents(src_listing) = query_reply(&src, &AgentQuery::Agents).await else {
-            panic!("expected a listing");
-        };
+        let src_binding = query_reply(&src, &AgentQuery::Binding { account }).await;
+        let src_invocations = query_reply(
+            &src,
+            &AgentQuery::Invocations {
+                account,
+                after: 0,
+                limit: 8,
+            },
+        )
+        .await;
 
         // the module consumed its store, so REOPEN the committed partitions
         // as a bare store for the handoff (drop first — one owner at a time).
@@ -146,7 +330,7 @@ fn synced_store_reconstructs_source_root_and_registry() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let synced = AgentModule::new("agent", Box::new(store), "saga", None);
+        let synced = AgentModule::new("agent", Box::new(store), siblings());
 
         // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner
         // needs at the boundary height.
@@ -156,32 +340,37 @@ fn synced_store_reconstructs_source_root_and_registry() {
             "synced store root must equal the source root"
         );
 
-        // the roster synced with the records: the joiner lists exactly like
-        // the source, and every committed mutation survived.
-        let AgentReply::Agents(listing) = query_reply(&synced, &AgentQuery::Agents).await else {
-            panic!("expected a listing");
+        // every committed mutation survived: the replaced binding at its
+        // generation, the finished invocation with its bound outcome.
+        let binding = query_reply(&synced, &AgentQuery::Binding { account }).await;
+        assert_eq!(binding, src_binding);
+        let AgentReply::Binding(Some(binding)) = binding else {
+            panic!("bound");
         };
-        assert_eq!(listing, src_listing);
-        assert_eq!(listing.len(), 2);
-        assert_eq!(listing[0].agent_id, "alpha");
-        assert_eq!(listing[0].display_name, "Alpha Prime");
-        assert_eq!(listing[0].capability, "model-2");
-        assert_eq!(listing[0].owner, SagaOrigin::External(vec![9; 32]));
-        assert_eq!(listing[1].agent_id, "beta");
-        assert_eq!(listing[1].status, AgentStatus::Paused);
-        assert_eq!(listing[1].owner, SagaOrigin::Module("automations".into()));
-
-        // the point read answers like the source too.
-        let AgentReply::Agent(Some(alpha)) = query_reply(
+        assert_eq!(binding.program, program("second"));
+        assert_eq!(binding.revision, 1);
+        let invocations = query_reply(
             &synced,
-            &AgentQuery::Agent {
-                agent_id: "alpha".into(),
+            &AgentQuery::Invocations {
+                account,
+                after: 0,
+                limit: 8,
             },
         )
-        .await
-        else {
-            panic!("expected the alpha record");
+        .await;
+        assert_eq!(invocations, src_invocations);
+        let AgentReply::Invocations(listing) = invocations else {
+            panic!("listing");
         };
-        assert_eq!(alpha, listing[0]);
+        assert_eq!(listing.len(), 1);
+        assert_eq!(listing[0].invocation.seq, 9);
+        assert_eq!(
+            listing[0].invocation.status,
+            Status::Finished { at_step: 1 }
+        );
+        assert_eq!(
+            listing[0].invocation.bindings["posted"],
+            serde_json::json!({"applied": {"output": {"message_id": "m10"}, "assigned": null}})
+        );
     });
 }

@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 
-use chat::AuthorRef;
+use chat::Party;
 use sdk::{Error, Msg, Origin};
 
 use crate::codec::{self, Reader};
@@ -51,7 +51,7 @@ pub struct Item {
     pub kind: ItemKind,
     pub title: String,
     pub body: String,
-    pub author: AuthorRef,
+    pub author: Party,
     pub state: ItemState,
     pub created_at: u64,
     pub updated_at: u64,
@@ -116,7 +116,7 @@ pub struct RepoTracker {
     /// [`crate::tracker_iface::MAX_OPEN_ITEMS_PER_ACTOR`] is checked against.
     /// an entry is removed once its count reaches zero, so this map never
     /// outgrows `open_count`.
-    pub open_by_author: BTreeMap<AuthorRef, u64>,
+    pub open_by_author: BTreeMap<Party, u64>,
     pub items: BTreeMap<u64, Item>,
 }
 
@@ -162,13 +162,14 @@ pub struct Tracker {
 ///   only on its two once-per-block injections (`modules::Advance` and
 ///   `dispatch::DeliverPending`), neither of which targets forge. an
 ///   unreachable arm stays refused rather than minting an unowned item.
-pub fn author_from_origin(origin: &Origin) -> Result<AuthorRef, Error> {
+pub fn author_from_origin(origin: &Origin) -> Result<Party, Error> {
     match origin {
         Origin::External(id) if id.is_empty() => Err(Error::Module(
             "forge: tracker ops require an authenticated origin".into(),
         )),
-        Origin::External(id) => Ok(AuthorRef::User(id.clone())),
-        Origin::Module(m) => Ok(AuthorRef::Module(m.clone())),
+        Origin::External(id) => Ok(Party::Key(id.clone())),
+        Origin::Module(m) => Ok(Party::Module(m.clone())),
+        Origin::Program(account) => Ok(Party::Account(*account)),
         Origin::System => Err(Error::Module(
             "forge: tracker ops require an authenticated origin".into(),
         )),
@@ -207,7 +208,7 @@ pub fn parse_hex_oid(s: &str, field: &str) -> Result<Oid, Error> {
 /// refuse an open/reopen once the repo or the author is at its OPEN-item
 /// ceiling. named so the two caps this crate enforces (a repo cap, and an
 /// author's share of it) read as one decision at every call site.
-fn require_open_slot(rt: &RepoTracker, author: &AuthorRef, repo: &str) -> Result<(), Error> {
+fn require_open_slot(rt: &RepoTracker, author: &Party, repo: &str) -> Result<(), Error> {
     if rt.open_count as usize >= MAX_OPEN_ITEMS_PER_REPO {
         return Err(Error::Module(format!(
             "forge: repo {repo:?} is at its open-item cap ({MAX_OPEN_ITEMS_PER_REPO}); close or \
@@ -226,13 +227,13 @@ fn require_open_slot(rt: &RepoTracker, author: &AuthorRef, repo: &str) -> Result
 
 /// record that `author` just opened (or reopened) an item — the
 /// [`RepoTracker::open_by_author`] half of [`require_open_slot`]'s ceiling.
-fn note_author_opened(rt: &mut RepoTracker, author: &AuthorRef) {
+fn note_author_opened(rt: &mut RepoTracker, author: &Party) {
     *rt.open_by_author.entry(author.clone()).or_insert(0) += 1;
 }
 
 /// record that `author`'s item just closed or merged, pruning the entry at
 /// zero so the map never outgrows the live open count.
-fn note_author_closed(rt: &mut RepoTracker, author: &AuthorRef) {
+fn note_author_closed(rt: &mut RepoTracker, author: &Party) {
     use std::collections::btree_map::Entry;
     if let Entry::Occupied(mut e) = rt.open_by_author.entry(author.clone()) {
         *e.get_mut() -= 1;
@@ -297,7 +298,7 @@ impl Tracker {
         kind: ItemKind,
         title: String,
         body: String,
-        author: AuthorRef,
+        author: Party,
         now: u64,
         branches: Option<(String, String)>,
     ) -> Result<u64, Error> {
@@ -340,7 +341,7 @@ impl Tracker {
         &mut self,
         repo: &str,
         number: u64,
-        editor: &AuthorRef,
+        editor: &Party,
         title: Option<String>,
         body: Option<String>,
         now: u64,
@@ -455,7 +456,7 @@ impl Tracker {
         &mut self,
         repo: &str,
         number: u64,
-        author: AuthorRef,
+        author: Party,
         verdict: ReviewVerdict,
         body: String,
         commit_oid: &str,
@@ -539,7 +540,7 @@ impl Tracker {
     /// self-filed review must never unlock `MergePr`. reviews are still
     /// stored and shown (`ItemDetail::reviews`); they just no longer feed
     /// authorization.
-    pub fn pr_author(&self, repo: &str, number: u64) -> Result<AuthorRef, Error> {
+    pub fn pr_author(&self, repo: &str, number: u64) -> Result<Party, Error> {
         let item = self.item(repo, number)?;
         if item.kind != ItemKind::Pr {
             return Err(Error::Module(format!(
@@ -631,7 +632,7 @@ impl Tracker {
             // pure function of `items`' states, derived here rather than
             // trusted from bytes so the two can never drift apart.
             let mut open_count = 0u64;
-            let mut open_by_author: BTreeMap<AuthorRef, u64> = BTreeMap::new();
+            let mut open_by_author: BTreeMap<Party, u64> = BTreeMap::new();
             for item in items.values() {
                 if item.state == ItemState::Open {
                     open_count += 1;
@@ -666,37 +667,33 @@ impl Tracker {
     }
 }
 
-fn encode_author(out: &mut Vec<u8>, a: &AuthorRef) {
+fn encode_author(out: &mut Vec<u8>, a: &Party) {
     match a {
-        AuthorRef::User(id) => {
+        Party::Key(id) => {
             codec::put_u8(out, 0);
             codec::put_bytes(out, id);
         }
-        AuthorRef::Agent { module, agent_id } => {
+        Party::Account(account) => {
             codec::put_u8(out, 1);
-            codec::put_str(out, module);
-            codec::put_str(out, agent_id);
+            codec::put_u64(out, *account);
         }
-        AuthorRef::Module(m) => {
+        Party::Module(m) => {
             codec::put_u8(out, 2);
             codec::put_str(out, m);
         }
-        AuthorRef::System => codec::put_u8(out, 3),
+        Party::System => codec::put_u8(out, 3),
     }
 }
 
-fn decode_author(r: &mut Reader) -> Result<AuthorRef, Error> {
+fn decode_author(r: &mut Reader) -> Result<Party, Error> {
     Ok(match r.u8()? {
         0 => {
             let len = r.u32()? as usize;
-            AuthorRef::User(r.take(len)?.to_vec())
+            Party::Key(r.take(len)?.to_vec())
         }
-        1 => AuthorRef::Agent {
-            module: r.str_()?,
-            agent_id: r.str_()?,
-        },
-        2 => AuthorRef::Module(r.str_()?),
-        3 => AuthorRef::System,
+        1 => Party::Account(r.u64()?),
+        2 => Party::Module(r.str_()?),
+        3 => Party::System,
         t => return Err(Error::Module(format!("forge tracker: bad author tag {t}"))),
     })
 }
@@ -886,7 +883,6 @@ pub fn system_line_msg(
             message_id,
             blocks: vec![chat::Block::paragraph(text)],
             thread: None,
-            as_agent: None,
         }),
     }
 }
@@ -895,8 +891,8 @@ pub fn system_line_msg(
 mod tests {
     use super::*;
 
-    fn user(b: u8) -> AuthorRef {
-        AuthorRef::User(vec![b; 4])
+    fn user(b: u8) -> Party {
+        Party::Key(vec![b; 4])
     }
 
     #[test]
@@ -1029,7 +1025,7 @@ mod tests {
             ItemKind::Pr,
             "pr".into(),
             "prbody".into(),
-            AuthorRef::Module("runs".into()),
+            Party::Module("runs".into()),
             2,
             Some(("feature/x".into(), "main".into())),
         )

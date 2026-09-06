@@ -13,11 +13,10 @@
 //! types. shell-side effects (rpc loads, iced styling, editors) stay in the
 //! shell.
 
-use index_guest::{OriginTag, user_handle};
 use sha2::{Digest, Sha256};
 
 use crate::index::{self, MsgRow};
-use crate::{AuthorRef, Block, ChatAssigned, ChatMsg, Mark, PostPolicy, Span, decode_msg};
+use crate::{Block, ChatAssigned, ChatMsg, Mark, Party, PostPolicy, Span, decode_msg};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -319,14 +318,14 @@ pub enum ChatDelta {
 pub fn delta_from_op(
     payload: &[u8],
     assigned: Option<&serde_json::Value>,
-    origin_kind: &str,
-    origin_id: Option<&str>,
+    _origin_kind: &str,
+    _origin_id: Option<&str>,
     current_user: Option<&[u8]>,
     names: &AuthorNames,
     height: u64,
 ) -> Result<Option<ChatDelta>, String> {
     let msg = decode_msg(payload)?;
-    let origin = origin_tag(origin_kind, origin_id);
+    let actor = decode_stamp(assigned)?.actor().clone();
     let delta = match msg {
         ChatMsg::CreateChannel {
             channel_id,
@@ -346,7 +345,7 @@ pub fn delta_from_op(
             counterpart: _,
             name,
         } => {
-            let ChatAssigned::DmChannel { channel_id } = decode_stamp(assigned)? else {
+            let ChatAssigned::DmChannel { channel_id, .. } = decode_stamp(assigned)? else {
                 return Err("applied CreateDmChannel carried a non-DmChannel stamp".into());
             };
             ChatDelta::ChannelCreated {
@@ -373,18 +372,17 @@ pub fn delta_from_op(
         ChatMsg::PostMessage {
             channel_id,
             message_id,
-            blocks,
+            blocks: _,
             thread,
-            as_agent,
         } => {
-            let ChatAssigned::Posted { seq } = decode_stamp(assigned)? else {
+            let ChatAssigned::Posted { seq, blocks, .. } = decode_stamp(assigned)? else {
                 return Err("applied PostMessage carried a non-Posted stamp".into());
             };
             let row = MsgRow {
                 channel_id: channel_id.clone(),
                 seq,
                 message_id,
-                author: index::author(&origin, as_agent.as_deref()),
+                author: index::party_handle(&actor),
                 height,
                 time: 0,
                 blocks,
@@ -418,17 +416,17 @@ pub fn delta_from_op(
         ChatMsg::EditMessage {
             channel_id,
             seq,
-            blocks,
+            blocks: _,
             base_rev,
         } => {
-            let ChatAssigned::Edited { rev } = decode_stamp(assigned)? else {
+            let ChatAssigned::Edited { rev, blocks, .. } = decode_stamp(assigned)? else {
                 return Err("applied EditMessage carried a non-Edited stamp".into());
             };
             let carrier = MsgRow {
                 channel_id: channel_id.clone(),
                 seq,
                 message_id: String::new(),
-                author: index::author(&origin, None),
+                author: index::party_handle(&actor),
                 // An edit's stamp is the ORIGINAL post's block, never the
                 // edit's — and `merge_message_edit` copies only body/blocks/
                 // rev/edited/meta off this carrier, so the row on screen keeps
@@ -462,19 +460,35 @@ pub fn delta_from_op(
             channel_id,
             seq,
             emoji,
-        } => reaction_delta(channel_id, seq, emoji, true, &origin, current_user),
+        } => reaction_delta(
+            channel_id,
+            seq,
+            emoji,
+            true,
+            decode_stamp(assigned)?.participant()?,
+            current_user,
+            names,
+        ),
         ChatMsg::RemoveReaction {
             channel_id,
             seq,
             emoji,
-        } => reaction_delta(channel_id, seq, emoji, false, &origin, current_user),
+        } => reaction_delta(
+            channel_id,
+            seq,
+            emoji,
+            false,
+            decode_stamp(assigned)?.participant()?,
+            current_user,
+            names,
+        ),
         ChatMsg::RegisterHook { .. } | ChatMsg::UnregisterHook { .. } => return Ok(None),
         ChatMsg::SetMembership {
             channel_id,
-            user,
+            party,
             member,
         } => {
-            let id = user_handle(&user);
+            let id = index::party_handle(&party);
             ChatDelta::Membership {
                 channel_id,
                 added: member,
@@ -496,11 +510,12 @@ fn reaction_delta(
     seq: u64,
     emoji: String,
     added: bool,
-    origin: &OriginTag,
+    actor: &Party,
     current_user: Option<&[u8]>,
+    names: &AuthorNames,
 ) -> ChatDelta {
-    let reactor = index::author(origin, None);
-    let by_me = current_user.is_some_and(|key| reactor == format!("user:{}", hex_encode(key)));
+    let reactor = index::party_handle(actor);
+    let by_me = current_user.is_some_and(|key| names.owns_handle(&reactor, key));
     ChatDelta::Reaction {
         channel_id,
         seq: number_i64(seq),
@@ -508,14 +523,6 @@ fn reaction_delta(
         added,
         reactor,
         by_me,
-    }
-}
-
-fn origin_tag(kind: &str, id: Option<&str>) -> OriginTag {
-    match kind {
-        "external" => OriginTag::external(id.unwrap_or_default()),
-        "module" => OriginTag::module(id.unwrap_or_default()),
-        _ => OriginTag::system(),
     }
 }
 
@@ -1101,7 +1108,7 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>, names: &AuthorName
             .reactions
             .into_iter()
             .map(|reaction| {
-                let reacted_by_me = reacted_by_user(&reaction.reactors, current_user);
+                let reacted_by_me = reacted_by_user(&reaction.reactors, current_user, names);
                 ChatReaction {
                     emoji: reaction.emoji,
                     count: count_i64(reaction.reactors.len()),
@@ -1115,19 +1122,15 @@ pub fn chat_message(row: MsgRow, current_user: Option<&[u8]>, names: &AuthorName
     .seed_render_rev()
 }
 
-/// True when the local user's rendered author string (`user:{hex}`) is among a
-/// reaction's reactors.
-fn reacted_by_user(reactors: &[String], current_user: Option<&[u8]>) -> bool {
-    current_user.is_some_and(|key| {
-        let handle = format!("user:{}", hex_encode(key));
-        reactors.contains(&handle)
-    })
+/// True when a reactor is the reader's account or their exact signed key.
+fn reacted_by_user(reactors: &[String], current_user: Option<&[u8]>, names: &AuthorNames) -> bool {
+    current_user.is_some_and(|key| reactors.iter().any(|handle| names.owns_handle(handle, key)))
 }
 
-/// True when the message's rendered author IS the local user — the same
-/// `user:{hex}` comparison the reaction check makes, against the same key.
-fn authored_by_user(author: &str, current_user: Option<&[u8]>) -> bool {
-    current_user.is_some_and(|key| author == format!("user:{}", hex_encode(key)))
+/// Account authorship and the reader's own historic key authorship both
+/// belong to the reader; another key's old records never transfer with it.
+fn authored_by_user(author: &str, current_user: Option<&[u8]>, names: &AuthorNames) -> bool {
+    current_user.is_some_and(|key| names.owns_handle(author, key))
 }
 
 /// Slack-style grouping: a message shows its avatar + author header only when it
@@ -1323,21 +1326,16 @@ pub fn plain_rich_spans(text: &str) -> Vec<ChatSpan> {
 // authorship + avatars — display identity derived from rendered handles
 // ============================================================================
 
-/// An [`AuthorRef`] as the rendered handle the display fns parse — the same
-/// vocabulary the index stamps (`user:{hex}`, `agent:{module}/{agent}`,
+/// A [`Party`] as the rendered handle the display fns parse — the same
+/// vocabulary the index stamps (`user:{hex}`, `acct:{number}`,
 /// `module:{id}`, `system`), so every module surface names an author
 /// identically.
-pub fn author_handle(author: &AuthorRef) -> String {
-    match author {
-        AuthorRef::User(key) => format!("user:{}", hex_encode(key)),
-        AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
-        AuthorRef::Module(id) => format!("module:{id}"),
-        AuthorRef::System => "system".into(),
-    }
+pub fn author_handle(author: &Party) -> String {
+    index::party_handle(author)
 }
 
 /// The display name for a rendered author string (`user:{id}`,
-/// `agent:{module}/{agent}`, `module:{id}`, or `system`).
+/// `acct:{number}`, `module:{id}`, or `system`).
 /// The author label a READER sees: `you` for the reader's own writing, the
 /// rendered handle otherwise.
 ///
@@ -1347,27 +1345,21 @@ pub fn author_handle(author: &AuthorRef) -> String {
 /// [`author_name`] stays for the places that render an author with no reader in
 /// frame (a page comment's opener, a wire label).
 pub fn author_display(author: &str, current_user: Option<&[u8]>, names: &AuthorNames) -> String {
-    match authored_by_user(author, current_user) {
+    match authored_by_user(author, current_user, names) {
         true => "you".into(),
         false => author_name(author, names),
     }
 }
 
-/// THE ACCOUNT DIRECTORY A ROW IS READ AGAINST: member public key (lowercase
-/// hex) → the account name that key is registered under.
-///
-/// A chat row carries a KEY and nothing else — `user:{hex}` is all the module
-/// ever stamps — and the name a person chose lives in the identity module, in
-/// another store, reachable only by a query. Without this, every author on
-/// every timeline rendered as `user bf431c5d…` while the same account's name sat
-/// in the DIRECT list one pane to the left.
-///
-/// A key with no entry has no account here (or the directory has not loaded
-/// yet), and falls back to that short hex — which is a true statement about the
-/// key, not a guess at a name.
+/// Account names and verified key memberships used to render stable authors.
+/// Program accounts have directory entries without keys. A key whose account
+/// is unknown remains a key handle, so missing directory data cannot fabricate
+/// membership or merge two people with the same display name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AuthorNames {
     by_key: BTreeMap<String, String>,
+    by_account: BTreeMap<u64, String>,
+    account_by_key: BTreeMap<String, u64>,
 }
 
 impl AuthorNames {
@@ -1381,11 +1373,52 @@ impl AuthorNames {
                 .map(|(key, name)| (key.to_ascii_lowercase(), name))
                 .filter(|(key, name)| !key.is_empty() && !name.is_empty())
                 .collect(),
+            by_account: BTreeMap::new(),
+            account_by_key: BTreeMap::new(),
         }
     }
 
+    /// Authoritative account records supply stable handles and key membership.
+    pub fn from_accounts<'a>(
+        accounts: impl IntoIterator<Item = &'a identity::AccountView>,
+    ) -> Self {
+        let mut names = Self::default();
+        for account in accounts {
+            names
+                .by_account
+                .insert(account.number, account.name.clone());
+            for key in &account.keys {
+                let key = hex_encode(&key.pubkey);
+                names.by_key.insert(key.clone(), account.name.clone());
+                names.account_by_key.insert(key, account.number);
+            }
+        }
+        names
+    }
+
+    pub fn party_of(&self, key: &[u8]) -> Party {
+        match self.account_by_key.get(&hex_encode(key)) {
+            Some(account) => Party::Account(*account),
+            None => Party::Key(key.to_vec()),
+        }
+    }
+
+    pub fn parties_of(&self, key: &[u8]) -> Vec<Party> {
+        vec![self.party_of(key)]
+    }
+
+    pub fn owns_handle(&self, handle: &str, key: &[u8]) -> bool {
+        let is_account = handle == self.handle_of(key);
+        let is_original_key = handle == index::party_handle(&Party::Key(key.to_vec()));
+        is_account || is_original_key
+    }
+
+    pub fn handle_of(&self, key: &[u8]) -> String {
+        index::party_handle(&self.party_of(key))
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.by_key.is_empty()
+        self.by_key.is_empty() && self.by_account.is_empty()
     }
 
     /// The account name a raw key is registered under.
@@ -1412,10 +1445,14 @@ impl AuthorNames {
     /// answers with itself alone: it is still a real identity, just an unnamed
     /// one.
     pub fn account_keys_of(&self, key: &[u8]) -> Vec<Vec<u8>> {
-        let Some(name) = self.name_of(key) else {
+        let Some(account) = self.account_by_key.get(&hex_encode(key)) else {
             return vec![key.to_vec()];
         };
-        self.keys_named(name)
+        self.account_by_key
+            .iter()
+            .filter(|(_, number)| *number == account)
+            .filter_map(|(key, _)| hex_bytes(key))
+            .collect()
     }
 
     /// `(account name, its keys)` for every account in the directory,
@@ -1434,15 +1471,19 @@ impl AuthorNames {
         accounts
     }
 
-    /// The account name behind a rendered author handle — only a `user:` handle
-    /// can have one; an agent and a module already name themselves.
+    /// The directory name behind either an account or signed-key handle.
     fn of_handle(&self, author: &str) -> Option<&str> {
-        let Some(("user", id)) = author.split_once(':') else {
-            return None;
-        };
-        self.by_key
-            .get(&id.to_ascii_lowercase())
-            .map(String::as_str)
+        match author.split_once(':') {
+            Some(("acct", number)) => self
+                .by_account
+                .get(&number.parse::<u64>().ok()?)
+                .map(String::as_str),
+            Some(("user", key)) => self
+                .by_key
+                .get(&key.to_ascii_lowercase())
+                .map(String::as_str),
+            _ => None,
+        }
     }
 }
 
@@ -1457,10 +1498,7 @@ pub fn author_name(author: &str, names: &AuthorNames) -> String {
 fn unnamed_author(author: &str) -> String {
     match author.split_once(':') {
         Some(("user", id)) => format!("user {}", short_label(id)),
-        Some(("agent", path)) => {
-            let name = path.rsplit('/').next().unwrap_or(path);
-            format!("@{name}")
-        }
+        Some(("acct", account)) => format!("account {account}"),
         Some(("module", id)) => id.to_string(),
         _ => "system".into(),
     }
@@ -1474,7 +1512,7 @@ fn avatar_source(author: &str, names: &AuthorNames) -> String {
     }
     match author.split_once(':') {
         Some(("user", id)) => short_label(id),
-        Some(("agent", path)) => path.rsplit('/').next().unwrap_or(path).to_string(),
+        Some(("acct", account)) => account.to_string(),
         Some(("module", id)) => id.to_string(),
         _ => "system".into(),
     }
@@ -1489,7 +1527,7 @@ fn avatar_initial(author: &str, names: &AuthorNames) -> String {
 
 fn avatar_kind(author: &str) -> &'static str {
     match author.split_once(':') {
-        Some(("user", _)) => "human",
+        Some(("user" | "acct", _)) => "human",
         Some(_) | None => "agent",
     }
 }
@@ -1667,16 +1705,8 @@ fn inline_spans(text: &str, mentions: &MentionCandidates) -> Vec<Span> {
             let handle: String = chars[index..index + len].iter().collect();
             spans.push(Span {
                 text: handle,
-                // ONE VISIBLE HANDLE, ONE MARK PER KEY OF THE ACCOUNT. An
-                // account signs with several keys and a mention has to reach
-                // the person, not the device: `collect_mentions` walks every
-                // mark of a span, so each key becomes its own `AuthorRef`
-                // while the reader still sees one `@name`.
-                marks: target
-                    .keys
-                    .iter()
-                    .map(|key| Mark::Mention(AuthorRef::User(key.clone())))
-                    .collect(),
+                // A directory account is one mark, regardless of its keys.
+                marks: target.parties.iter().cloned().map(Mark::Mention).collect(),
             });
             index += len;
         } else if let Some((label, target, len)) = reference {
@@ -1853,8 +1883,8 @@ pub struct MentionCandidates {
 pub struct MentionTarget {
     /// what the writer types after `@`, lowercased.
     pub handle: String,
-    /// every key the mention addresses — an account is a SET of keys.
-    pub keys: Vec<Vec<u8>>,
+    /// The stable account or explicitly named key this handle addresses.
+    pub parties: Vec<Party>,
 }
 
 /// The shortest `@key` fragment that may stand for a member key. A name is
@@ -1868,16 +1898,58 @@ impl MentionCandidates {
         let mut targets: Vec<MentionTarget> = directory
             .accounts()
             .into_iter()
-            .map(|(handle, keys)| MentionTarget { handle, keys })
+            .map(|(handle, keys)| MentionTarget {
+                handle,
+                parties: keys
+                    .into_iter()
+                    .filter(|key| !directory.account_by_key.contains_key(&hex_encode(key)))
+                    .map(Party::Key)
+                    .collect(),
+            })
+            .filter(|target| !target.parties.is_empty())
             .collect();
+        let mut counts = BTreeMap::<String, usize>::new();
+        for name in directory.by_account.values() {
+            *counts.entry(name.to_ascii_lowercase()).or_default() += 1;
+        }
+        for (account, name) in &directory.by_account {
+            let name = name.to_ascii_lowercase();
+            let ambiguous = name.is_empty() || counts.get(&name).copied().unwrap_or(0) > 1;
+            let handle = if ambiguous {
+                format!("account-{account}")
+            } else {
+                name
+            };
+            targets.push(MentionTarget {
+                handle,
+                parties: vec![Party::Account(*account)],
+            });
+        }
         for member in members {
+            if let Some(number) = member
+                .key
+                .strip_prefix("acct:")
+                .and_then(|id| id.parse::<u64>().ok())
+            {
+                if !directory.by_account.contains_key(&number) {
+                    targets.push(MentionTarget {
+                        handle: format!("account-{number}"),
+                        parties: vec![Party::Account(number)],
+                    });
+                }
+                continue;
+            }
             let key = member_key_bytes(member);
             if directory.name_of(&key).is_some() {
                 continue;
             }
             targets.push(MentionTarget {
-                handle: member.key.to_ascii_lowercase(),
-                keys: vec![key],
+                handle: member
+                    .key
+                    .strip_prefix("user:")
+                    .unwrap_or(&member.key)
+                    .to_ascii_lowercase(),
+                parties: vec![Party::Key(key)],
             });
         }
         targets.sort_by(|left, right| {
@@ -1966,10 +2038,10 @@ fn mention_at<'a>(
 /// True when any `Mark::Mention` in `blocks` addresses one of `keys` — the
 /// reader's own account keys, so "was I mentioned?" is answered for the
 /// PERSON and not for the one device that happens to be signing here.
-pub fn mentions_reach(blocks: &[Block], keys: &[Vec<u8>]) -> bool {
+pub fn mentions_reach(blocks: &[Block], parties: &[Party]) -> bool {
     let addressed = |mark: &Mark| match mark {
-        Mark::Mention(AuthorRef::User(key)) => keys.contains(key),
-        Mark::Mention(_) | Mark::Bold | Mark::Italic | Mark::Link(_) => false,
+        Mark::Mention(party) => parties.contains(party),
+        Mark::Bold | Mark::Italic | Mark::Link(_) => false,
     };
     blocks.iter().any(|block| {
         let spans = match block {
@@ -1980,12 +2052,13 @@ pub fn mentions_reach(blocks: &[Block], keys: &[Vec<u8>]) -> bool {
     })
 }
 
-/// A member key back to `AuthorRef::User` bytes: keys are rendered by
+/// A member key back to `Party::Key` bytes: keys are rendered by
 /// [`user_handle`] — printable identities pass through verbatim, raw key
 /// bytes arrive hex-encoded — so an even-length all-hex key decodes, and
 /// anything else is the identity's own bytes.
 fn member_key_bytes(member: &ChatMember) -> Vec<u8> {
-    hex_bytes(&member.key).unwrap_or_else(|| member.key.as_bytes().to_vec())
+    let key = member.key.strip_prefix("user:").unwrap_or(&member.key);
+    hex_bytes(key).unwrap_or_else(|| key.as_bytes().to_vec())
 }
 
 /// If `chars[at..]` opens with `marker` and has a later closing `marker`, the
@@ -2075,6 +2148,46 @@ mod tests {
             author: author.into(),
             ..ChatMessage::default()
         }
+    }
+
+    #[test]
+    fn account_directory_names_programs_and_unifies_a_readers_keys() {
+        let account = |number, name: &str, keys: Vec<Vec<u8>>| identity::AccountView {
+            number,
+            name: name.into(),
+            control: identity::Control::Keys,
+            keys: keys
+                .into_iter()
+                .map(|pubkey| identity::KeyView {
+                    scheme: identity::KeyScheme::Ed25519,
+                    pubkey,
+                    label: None,
+                    added_at: 0,
+                })
+                .collect(),
+            avatar: None,
+            bio: None,
+            updated_at: 0,
+        };
+        let human = account(1, "same", vec![vec![1; 32], vec![2; 32]]);
+        let mut program = account(2, "bot", Vec::new());
+        program.control = identity::Control::Program {
+            controller: 1,
+            executor: "agent".into(),
+            generation: 0,
+            standing: identity::ProgramStanding::Active,
+        };
+        let names = AuthorNames::from_accounts([&human, &program]);
+        assert_eq!(author_display("acct:1", Some(&[2; 32]), &names), "you");
+        assert_eq!(author_name("acct:2", &names), "bot");
+        let blocks = parse_message_with_mentions("ping @bot", &MentionCandidates::new(&names, &[]));
+        assert!(mentions_reach(&blocks, &[Party::Account(2)]));
+        let collision = account(3, "same", vec![vec![3; 32]]);
+        let names = AuthorNames::from_accounts([&human, &collision]);
+        let candidates = MentionCandidates::new(&names, &[]);
+        assert!(candidates.handles().contains(&"account-1"));
+        assert!(candidates.handles().contains(&"account-3"));
+        assert!(!candidates.handles().contains(&"same"));
     }
 
     #[test]
@@ -2319,10 +2432,7 @@ mod tests {
             author_name(&mine, &anon)
         );
         // An agent is never the reader.
-        assert_eq!(
-            author_display("agent:demo/quackbot", Some(&me), &anon),
-            "@quackbot"
-        );
+        assert_eq!(author_display("acct:5", Some(&me), &anon), "account 5");
     }
 
     /// A KEY IS NOT A NAME, AND THE READER NEVER ASKED FOR ONE. `user:{hex}` is
@@ -2345,7 +2455,7 @@ mod tests {
         let stranger = format!("user:{}", hex_encode(&[0x11; 32]));
         assert_eq!(author_name(&stranger, &names), "user 11111111…");
         // A module or agent names itself; the directory has no say.
-        assert_eq!(author_name("agent:demo/quackbot", &names), "@quackbot");
+        assert_eq!(author_name("acct:5", &names), "account 5");
         assert_eq!(author_name("module:runs", &names), "runs");
     }
 
@@ -2363,10 +2473,9 @@ mod tests {
                 marks: Vec::new(),
             }])],
             thread: None,
-            as_agent: None,
         })
         .expect("a PostMessage encodes");
-        let assigned = serde_json::json!({ "posted": { "seq": 7 } });
+        let assigned = serde_json::json!({ "posted": { "seq": 7, "actor": { "key": [171, 171] }, "blocks": [] } });
         let delta = delta_from_op(
             &payload,
             Some(&assigned),
@@ -2395,7 +2504,7 @@ mod tests {
 
         // the round trip that matters: the DM is created by a USER author, and
         // this is the rule that author faces. A ':' here would reject every DM.
-        crate::Chat::validate_channel_namespace(&AuthorRef::User(vec![0xab; 32]), &id)
+        crate::Chat::validate_channel_namespace(&Party::Key(vec![0xab; 32]), &id)
             .expect("a user-authored DM channel id must pass the namespace rule");
     }
 
@@ -2584,7 +2693,7 @@ mod tests {
             .iter()
             .flat_map(|span| span.marks.iter())
             .filter_map(|mark| match mark {
-                Mark::Mention(AuthorRef::User(key)) => Some(key.clone()),
+                Mark::Mention(Party::Key(key)) => Some(key.clone()),
                 _ => None,
             })
             .collect()
@@ -2652,16 +2761,28 @@ mod tests {
         // orthory reads this on either device.
         assert!(mentions_reach(
             &blocks,
-            &names.account_keys_of(&[0xbb, 0x22])
+            &names
+                .keys_named("orthory")
+                .into_iter()
+                .map(Party::Key)
+                .collect::<Vec<_>>()
         ));
         assert!(mentions_reach(
             &blocks,
-            &names.account_keys_of(&[0xcc, 0x33])
+            &names
+                .keys_named("orthory")
+                .into_iter()
+                .map(Party::Key)
+                .collect::<Vec<_>>()
         ));
         // orthory-ops is a different account and is not addressed.
         assert!(!mentions_reach(
             &blocks,
-            &names.account_keys_of(&[0xdd, 0x44])
+            &names
+                .account_keys_of(&[0xdd, 0x44])
+                .into_iter()
+                .map(Party::Key)
+                .collect::<Vec<_>>()
         ));
     }
 
@@ -2707,7 +2828,7 @@ mod tests {
             .find(|span| span.marks.iter().any(|m| matches!(m, Mark::Mention(_))))
             .expect("a mention span");
         assert_eq!(mention.text, "@a1b2");
-        let Mark::Mention(AuthorRef::User(bytes)) = &mention.marks[0] else {
+        let Mark::Mention(Party::Key(bytes)) = &mention.marks[0] else {
             panic!("user mention expected");
         };
         assert_eq!(bytes, &vec![0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6]);
@@ -2752,15 +2873,23 @@ mod tests {
             format!("user:{}", hex_encode(&[0xab; 32])),
             "system".to_string(),
         ];
-        assert!(reacted_by_user(&reactors, Some(&[0xab; 32])));
-        assert!(!reacted_by_user(&reactors, Some(&[0xcd; 32])));
-        assert!(!reacted_by_user(&reactors, None));
+        assert!(reacted_by_user(
+            &reactors,
+            Some(&[0xab; 32]),
+            &AuthorNames::default()
+        ));
+        assert!(!reacted_by_user(
+            &reactors,
+            Some(&[0xcd; 32]),
+            &AuthorNames::default()
+        ));
+        assert!(!reacted_by_user(&reactors, None, &AuthorNames::default()));
     }
 
     #[test]
     fn avatars_distinguish_humans_from_software_authors() {
         assert_eq!(avatar_kind("user:deadbeef"), "human");
-        for author in ["agent:chat/reviewer", "module:forge", "system"] {
+        for author in ["module:reviewer", "module:forge", "system"] {
             assert_eq!(avatar_kind(author), "agent");
         }
     }

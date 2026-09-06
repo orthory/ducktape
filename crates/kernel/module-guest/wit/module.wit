@@ -13,21 +13,100 @@ interface host {
     consensus-time: u64,
     me: string,
     origin: origin,
+    /// what THIS dispatch descends from (`sdk::Cause`).
+    cause: cause,
   }
 
-  /// who triggered THIS dispatch.
+  /// who triggered THIS dispatch. `program` is a program account the host
+  /// proved live and executed by the requesting module before the call unit
+  /// ran — an identity, never a credential.
   variant origin {
     external(list<u8>),
     from-module(string),
+    program(u64),
     system,
+  }
+
+  /// the identity of one call a module queued: `(requester, invocation,
+  /// step)`, immutable once queued (`sdk::CallId`).
+  record call-id {
+    requester: string,
+    invocation: string,
+    step: u64,
+  }
+
+  /// one item in a source module's outbound queue (`sdk::ItemRef`).
+  record item-ref {
+    source: string,
+    item: u64,
+  }
+
+  /// one record of a source's own change log that several deliveries fan
+  /// out from (`sdk::Root::Change`).
+  record change-ref {
+    source: string,
+    seq: u64,
+  }
+
+  /// where a causal chain started (`sdk::Root`).
+  variant root {
+    item(item-ref),
+    call(call-id),
+    change(change-ref),
+  }
+
+  /// the latest link of a causal chain (`sdk::Hop`).
+  variant hop {
+    delivery(item-ref),
+    call(call-id),
+    completion(call-id),
+  }
+
+  /// a chain's root and latest link.
+  record chain {
+    root: root,
+    hop: hop,
+  }
+
+  /// the causal context of one dispatch (`sdk::Cause`): a submitted op or
+  /// host injection, or a link the host ran on a module's behalf.
+  variant cause {
+    direct,
+    chain(chain),
+  }
+
+  /// one queued item as a source reports it (`sdk::PendingItem`).
+  record pending-item {
+    item: u64,
+    target: string,
+    payload: list<u8>,
+    cause: cause,
+  }
+
+  /// how a delivery ended, as the host reports it (`sdk::DeliveryOutcome`).
+  variant delivery-outcome {
+    applied,
+    failed(string),
+    unrepresentable,
+  }
+
+  /// the host's acknowledgment of one delivery (`sdk::Ack`).
+  record ack {
+    item: u64,
+    target: string,
+    outcome: delivery-outcome,
   }
 
   /// the deterministic error a module may surface. `rejected` is a clean,
   /// deterministic no-op-on-every-honest-validator failure.
   variant error {
     rejected(string),
-    not-found,
+    unknown-module(string),
+    self-query,
     unsupported,
+    sync-unsupported,
+    swap-unsupported,
+    budget-exceeded,
   }
 
   /// where a module's COMMITTED state lives: the substrate the host wraps
@@ -115,6 +194,11 @@ interface host {
 
   /// emit a write intent — re-dispatched as a follow-up op, never reentrant.
   emit-msg: func(target: string, payload: list<u8>);
+  /// declare this op's output — staged with the op, capped by the host at
+  /// `sdk::MAX_OUTPUT_BYTES` (exceeding it rejects the op), last write wins
+  /// within one dispatch. a call unit's output rides its completion back to
+  /// the requester.
+  set-output: func(bytes: list<u8>);
   /// emit an observability event — leaves the state machine.
   emit-event: func(source: string, payload: list<u8>);
   /// declare this dispatch's assigned stamp — values the module ASSIGNED
@@ -128,7 +212,7 @@ interface host {
 /// the host surface; it owns no durable memory across dispatches (the host
 /// re-instantiates per call), so state lives entirely behind `host.state-*`.
 world module {
-  use host.{error, module-shape};
+  use host.{ack, error, module-shape, pending-item};
   import host;
 
   /// this component's shape: what the host must know to run it. a pure
@@ -139,4 +223,12 @@ world module {
   export execute: func(payload: list<u8>) -> result<_, error>;
   /// read-only projection of this module's state.
   export query: func(req: list<u8>) -> result<list<u8>, error>;
+  /// the head of this module's COMMITTED outbound queue, in delivery order
+  /// (`sdk::Module::pending_items`). the host runs it in a committed-only
+  /// round; a read or decode failure is an error, never an empty queue.
+  export pending-items: func() -> result<list<pending-item>, error>;
+  /// retire one queued item with the host's acknowledgment of its delivery
+  /// (`sdk::Module::acknowledge`). runs like `execute`: staged writes,
+  /// committed or aborted with the delivery unit.
+  export acknowledge: func(ack: ack) -> result<_, error>;
 }

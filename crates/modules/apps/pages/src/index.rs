@@ -40,7 +40,7 @@
 //! identical in the engine transaction and the native test harness.
 
 use index_guest::search::{self, DEFAULT_POSTING_CAP};
-use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes};
+use index_guest::{Fail, OpRow, StateRead, Writes};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PageError;
@@ -74,6 +74,7 @@ const FAIL_PAGE_READ: i32 = 5;
 /// `Block` straight out of this row.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PageBlockRow {
+    pub author: crate::Party,
     pub block_id: String,
     /// the page (root block id) this block belongs to; a root names itself.
     pub page_id: String,
@@ -100,6 +101,7 @@ impl PageBlockRow {
     /// [`crate::PageQuery::GetPage`] returns for the same id.
     fn to_block(&self) -> Block {
         Block {
+            author: self.author.clone(),
             id: self.block_id.clone(),
             parent: self.parent.clone(),
             page: self.page_id.clone(),
@@ -156,7 +158,7 @@ pub struct PageRow {
 pub struct ThreadRow {
     pub id: String,
     pub target: String,
-    /// rendered opener: `user:{id}`, `agent:{module}/{agent}`, `module:{id}`,
+    /// rendered opener: `user:{id}`, `acct:{number}`, `module:{id}`,
     /// or `system`.
     pub opener: String,
     pub created_at: u64,
@@ -279,15 +281,12 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// rendered author, mirroring how the module derives authorship: the origin
-/// decides, `as_agent` refines a module origin into an agent author.
-fn render_author(origin: &OriginTag, as_agent: Option<&str>) -> String {
-    let id = origin.id.as_deref().unwrap_or_default();
-    match (origin.kind, as_agent) {
-        (OriginKind::Module, Some(agent)) => format!("agent:{id}/{agent}"),
-        (OriginKind::Module, None) => format!("module:{id}"),
-        (OriginKind::External, _) => format!("user:{id}"),
-        (OriginKind::System, _) => "system".to_string(),
+fn render_author(party: &crate::Party) -> String {
+    match party {
+        crate::Party::Account(account) => format!("acct:{account}"),
+        crate::Party::Key(key) => format!("user:{}", index_guest::user_handle(key)),
+        crate::Party::Module(module) => format!("module:{module}"),
+        crate::Party::System => "system".into(),
     }
 }
 
@@ -360,11 +359,7 @@ fn delete_subtree(read: &impl StateRead, out: &mut Writes, root: PageBlockRow) -
 /// delete every thread anchored to `target`: rows, markers, and comment
 /// pointers. one scan pass per removed block, mirroring the module's
 /// `purge_comments_for_target`.
-fn purge_target_threads(
-    read: &impl StateRead,
-    out: &mut Writes,
-    target: &str,
-) -> Result<(), Fail> {
+fn purge_target_threads(read: &impl StateRead, out: &mut Writes, target: &str) -> Result<(), Fail> {
     let prefix = ctgt_prefix(target);
     let mut after: Option<Vec<u8>> = None;
     loop {
@@ -422,10 +417,7 @@ fn put_thread(out: &mut Writes, row: &ThreadRow) -> Result<(), Fail> {
 /// resolve a comment id to its owning thread row via the `cmt/` pointer. an
 /// absent pointer means the comment predates this index — a deterministic
 /// skip, like every pre-index record.
-fn thread_of_comment(
-    read: &impl StateRead,
-    comment_id: &str,
-) -> Result<Option<ThreadRow>, Fail> {
+fn thread_of_comment(read: &impl StateRead, comment_id: &str) -> Result<Option<ThreadRow>, Fail> {
     let Some(pointer) = read.get(cmt_key(comment_id).as_bytes()) else {
         return Ok(None);
     };
@@ -502,6 +494,9 @@ fn move_block(
 /// fold one applied op into derived writes.
 pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
     let msg = decode_msg(&op.payload).map_err(|e| Fail::new(FAIL_OP_DECODE, e))?;
+    let actor = crate::decode_assigned(&op.assigned)
+        .map_err(|e| Fail::new(FAIL_OP_DECODE, e))?
+        .actor;
     let mut out = Writes::new();
     match msg {
         PageMsg::CreatePage { page_id, title } => {
@@ -519,6 +514,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 },
             )?;
             let row = PageBlockRow {
+                author: actor.clone(),
                 page_id: page_id.clone(),
                 block_id: page_id,
                 parent: None,
@@ -561,6 +557,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 return Ok(out);
             };
             let row = PageBlockRow {
+                author: actor.clone(),
                 block_id: block.id.clone(),
                 page_id,
                 parent: Some(parent.clone()),
@@ -672,10 +669,9 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             target,
             text,
             anchor,
-            as_agent,
             ..
         } => {
-            let author = render_author(&op.origin, as_agent.as_deref());
+            let author = render_author(&actor);
             let comment = CommentRow {
                 id: comment_id.clone(),
                 author: author.clone(),
@@ -692,11 +688,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 None => {
                     // a fresh thread: the opener is this comment's author and
                     // the target marker makes it scannable per target.
-                    index_guest::put(
-                        &mut out,
-                        ctgt_key(&target, &thread_id),
-                        Vec::new(),
-                    );
+                    index_guest::put(&mut out, ctgt_key(&target, &thread_id), Vec::new());
                     ThreadRow {
                         id: thread_id.clone(),
                         target,
@@ -732,8 +724,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut thread) = thread_of_comment(read, &comment_id)? else {
                 return Ok(out);
             };
-            let Some(comment) = thread.comments.iter_mut().find(|c| c.id == comment_id)
-            else {
+            let Some(comment) = thread.comments.iter_mut().find(|c| c.id == comment_id) else {
                 return Ok(out);
             };
             comment.text = text;
@@ -744,8 +735,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut thread) = thread_of_comment(read, &comment_id)? else {
                 return Ok(out);
             };
-            let Some(comment) = thread.comments.iter_mut().find(|c| c.id == comment_id)
-            else {
+            let Some(comment) = thread.comments.iter_mut().find(|c| c.id == comment_id) else {
                 return Ok(out);
             };
             comment.deleted = true;
@@ -767,7 +757,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 return Ok(out);
             };
             thread.resolved = resolved;
-            thread.resolved_by = resolved.then(|| render_author(&op.origin, None));
+            thread.resolved_by = resolved.then(|| render_author(&actor));
             put_thread(&mut out, &thread)?;
         }
     }
@@ -1074,7 +1064,9 @@ mod tests {
             time: 1_000 + height,
             origin: OriginTag::external("jess"),
             payload: encode_msg(msg),
-            assigned: Vec::new(),
+            assigned: crate::encode_assigned(&crate::PageAssigned {
+                actor: crate::Party::Key(b"jess".to_vec()),
+            }),
         }
     }
 
@@ -1119,7 +1111,6 @@ mod tests {
             text: text.into(),
             anchor: None,
             mentions: Vec::new(),
-            as_agent: None,
         }
     }
 
@@ -1150,7 +1141,10 @@ mod tests {
     }
 
     fn threads(map: &Map, targets: &[&str]) -> Vec<TargetThreadsRow> {
-        match view(map, serde_json::json!({"threads_for_targets": {"targets": targets}})) {
+        match view(
+            map,
+            serde_json::json!({"threads_for_targets": {"targets": targets}}),
+        ) {
             PagesViewReply::Threads(groups) => groups,
             other => panic!("expected threads, got {other:?}"),
         }
@@ -1373,10 +1367,8 @@ mod tests {
                 create("mid", "M", Some("alpha")),
             ],
         );
-        let got: Vec<(String, Option<String>)> = list(&map)
-            .into_iter()
-            .map(|r| (r.id, r.parent))
-            .collect();
+        let got: Vec<(String, Option<String>)> =
+            list(&map).into_iter().map(|r| (r.id, r.parent)).collect();
         assert_eq!(
             got,
             [
@@ -1399,10 +1391,8 @@ mod tests {
                 create("alpha", "usurper", None),
             ],
         );
-        let titles: Vec<(String, String)> = list(&map)
-            .into_iter()
-            .map(|r| (r.id, r.title))
-            .collect();
+        let titles: Vec<(String, String)> =
+            list(&map).into_iter().map(|r| (r.id, r.title)).collect();
         assert_eq!(
             titles,
             [
@@ -1457,10 +1447,8 @@ mod tests {
         );
 
         // the subtree removal takes parent AND its nested child page rows.
-        let got: Vec<(String, Option<String>)> = list(&map)
-            .into_iter()
-            .map(|r| (r.id, r.parent))
-            .collect();
+        let got: Vec<(String, Option<String>)> =
+            list(&map).into_iter().map(|r| (r.id, r.parent)).collect();
         assert_eq!(got, [("grand".into(), None)]);
         // the deleted page's block subtree left the search index with it.
         assert!(search(&map, serde_json::json!({"search": {"text": "doomed"}})).is_empty());
@@ -1523,7 +1511,10 @@ mod tests {
         let t1 = &groups[0].threads[0];
         assert!(t1.resolved);
         assert_eq!(t1.resolved_by.as_deref(), Some("user:jess"));
-        assert!(t1.comments[0].deleted, "the tombstone is served, not hidden");
+        assert!(
+            t1.comments[0].deleted,
+            "the tombstone is served, not hidden"
+        );
         assert_eq!(t1.comments[0].text, "", "tombstoned content is emptied");
         assert_eq!(t1.comments[1].text, "reworded");
         assert_eq!(t1.comments[1].edited_at, Some(1_002));

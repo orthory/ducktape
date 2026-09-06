@@ -714,7 +714,7 @@ fn git_control_sanitization_rejects_nested_object_and_ref_symlinks() {
 fn attribution_addresses_round_trip_a_label_shaped_agent_id() {
     let longest = "x".repeat(63);
     for id in [AGENT, "qa-luna", "a", longest.as_str()] {
-        assert!(agent::validate_agent_id(id).is_ok(), "{id}");
+        assert!(runs::validate_agent_id(id).is_ok(), "{id}");
         let local = attribution_email_local_part(id);
         assert_eq!(local, id);
         assert!(local.len() <= 63, "{local}");

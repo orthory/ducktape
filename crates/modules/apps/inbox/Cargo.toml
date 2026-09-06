@@ -26,6 +26,11 @@ guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 # and its tests. the engine shell rides the `index-guest` feature.
 index_guest = { workspace = true }
 sdk = { workspace = true }
+# the two collaborators' wire surfaces: the attribution plane whose canonical
+# changes this inbox receives (`AttributionEvent`, `ChangeRef`), and identity,
+# the resolver of recipients and admin keys (`AccountNumber`, `Control`).
+attribution = { workspace = true }
+identity = { workspace = true }
 # the store-record codec: compact, canonical, deterministic. wire stays sdk::wire.
 borsh = { workspace = true }
 serde = { workspace = true }
@@ -42,5 +47,4 @@ inbox = { path = ".", features = ["testkit"] }
 statesync = { workspace = true }
 commonware-runtime = { workspace = true }
 futures = "0.3"
-host = { workspace = true }
 sdk-testkit = { workspace = true }

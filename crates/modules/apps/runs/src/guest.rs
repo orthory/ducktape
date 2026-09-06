@@ -71,14 +71,14 @@ use sdk::{Error, Module as _, Msg, StateRoot};
 const MODULE_ID: &str = "runs";
 /// the sibling ids compiled into this instance — EXACTLY the production
 /// wiring (`bin/node/src/host_state.rs`): chat is the transcript/probe/reply
-/// surface, saga the dead-letter origin, tagging the engagement intake's
+/// surface, saga the dead-letter origin, attribution the engagement intake's
 /// trusted origin, dispatch every run's recipe registry + executor +
 /// lifecycle ledger, agent the registry hook's trusted origin, tasks/jobs the
 /// action and board lanes, files the envelope's source-snapshot pin, forge
 /// the PR/merge sink target, pages the `[[page:]]` context + effects lane.
 const CHAT_ID: &str = "chat";
 const SAGA_ID: &str = "saga";
-const TAGGING_ID: &str = "tagging";
+const ATTRIBUTION_ID: &str = "attribution";
 const DISPATCH_ID: &str = "dispatch";
 const AGENT_ID: &str = "agent";
 const TASKS_ID: &str = "tasks";
@@ -106,7 +106,7 @@ fn loaded_module() -> Result<RunsModule, host::Error> {
         MODULE_ID,
         CHAT_ID,
         SAGA_ID,
-        TAGGING_ID,
+        ATTRIBUTION_ID,
         DISPATCH_ID,
         AGENT_ID,
         Some(TASKS_ID.into()),
@@ -179,6 +179,20 @@ impl Guest for Component {
         Ok(())
     }
 
+    fn pending_items() -> Result<Vec<host::PendingItem>, host::Error> {
+        let module = loaded_module()?;
+        block_on(module.pending_items()).map(|items| items.into_iter().map(guest_adapter::pending_item_to_wit).collect()).map_err(to_wit_error)
+    }
+
+    fn acknowledge(ack: host::Ack) -> Result<(), host::Error> {
+        let mut module = loaded_module()?;
+        let mut ctx = WitCtx::new();
+        block_on(module.acknowledge(&mut ctx, &guest_adapter::ack_from_wit(ack))).map_err(to_wit_error)?;
+        block_on(module.commit_block()).map_err(to_wit_error)?;
+        save_state(&module.snapshot(), module.root().as_bytes());
+        Ok(())
+    }
+
     fn query(req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
         // the loaded snapshot was saved post-inner-commit, so the native
         // query's committed+pending union serves it with an empty overlay —
@@ -188,7 +202,7 @@ impl Guest for Component {
         // the ring reloaded off `__history` — so the ctx-less native `query`
         // is the whole surface.
         let module = loaded_module()?;
-        block_on(module.query(&req)).map_err(to_wit_error)
+        block_on(module.query_with(&WitCtx::new(), &req)).map_err(to_wit_error)
     }
 }
 

@@ -1,17 +1,17 @@
 use std::collections::BTreeMap;
 
-use agent::{CapRequest, MAX_DUCKFS_WRITE_TEXT_BYTES};
+use crate::{CapRequest, MAX_DUCKFS_WRITE_TEXT_BYTES};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use files::paths::canonical as canonical_duckfs_path;
 
 use super::facets::{WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of};
 use super::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentRecord, AgentResponse, BTreeSet,
+    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, ModelRecord, AgentResponse, BTreeSet,
     Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus,
     DispatchMsg, EntryInfo, Error, FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply,
     MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, Msg,
-    Origin, PendingState, ReplyBlock, ResultEvent, RunsModule, SagaOrigin, TaskMsg, TaskQuery,
+    Origin, PendingState, ReplyBlock, ResultEvent, RunsModule, RunOrigin, TaskMsg, TaskQuery,
     TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg, chat_encode_query,
     decode_result_event, dispatch_encode_msg, dispatch_id_for, files_decode_reply,
     files_encode_msg, files_encode_query, page_thread_id, reply_message_id, tasks_decode_reply,
@@ -212,12 +212,15 @@ pub(super) fn failure_excerpt(reason: &str) -> String {
     crate::truncate_on_boundary(&line, FAILURE_EXCERPT_BYTES, "…")
 }
 
-/// the canonical state form of a dispatch origin (see [`SagaOrigin`]).
-pub(super) fn canonical_origin(origin: &Origin) -> SagaOrigin {
+/// the canonical state form of a dispatch origin (see [`RunOrigin`]). a
+/// program account has no run standing of its own, so its origin is refused
+/// rather than mapped.
+pub(super) fn canonical_origin(origin: &Origin) -> Result<RunOrigin, Error> {
     match origin {
-        Origin::External(key) => SagaOrigin::External(key.clone()),
-        Origin::Module(module) => SagaOrigin::Module(module.clone()),
-        Origin::System => SagaOrigin::System,
+        Origin::External(key) => Ok(RunOrigin::External(key.clone())),
+        Origin::Module(module) => Ok(RunOrigin::Module(module.clone())),
+        Origin::Program(account) => Ok(RunOrigin::Program(*account)),
+        Origin::System => Ok(RunOrigin::System),
     }
 }
 
@@ -232,7 +235,7 @@ fn task_status(name: &str) -> Option<TaskStatus> {
 }
 
 /// whether the registry granted this agent an action name.
-pub(super) fn allows(agent: &AgentRecord, action: &str) -> bool {
+pub(super) fn allows(agent: &ModelRecord, action: &str) -> bool {
     agent.allowed_actions.iter().any(|a| a == action)
 }
 
@@ -298,7 +301,7 @@ impl RunsModule {
     }
 
     /// Cancel unfinished descendants when their caller exits. A root exit
-    /// removes the complete ephemeral result tree; no AgentRecord relation is
+    /// removes the complete ephemeral result tree; no ModelRecord relation is
     /// left behind.
     fn close_delegations_for_run(&mut self, ctx: &mut dyn Ctx, run_id: &str, entry: &PendingState) {
         let root_exit = entry.delegation_id.is_none();
@@ -1016,27 +1019,14 @@ impl RunsModule {
                 text,
                 anchor: None,
                 mentions: Vec::new(),
-                as_agent: Some(entry.agent_id.clone()),
+
             }),
         })
     }
 
-    /// the run REQUESTER's own chat standing in the channel a
-    /// `chat.post_message` action NAMES.
-    ///
-    /// `RunsMsg::RequestRun` admits a submitter only where its own key may post
-    /// (see [`RunsModule::may_post`]), but that gate covers the run's channel —
-    /// and this action carries its OWN `channel_id`. chat admits a module/agent
-    /// author into every channel, so without this the whole gate is bypassed by
-    /// one sibling field: an agent holding `chat.post_message` would write into
-    /// any members-only channel on the network, and a prompt-injected agent
-    /// would do it on a stranger's behalf. the requester's standing is the
-    /// authority the run is speaking under, so it is the one that must cover the
-    /// target channel too.
-    ///
-    /// a module/system requester is not narrowed, exactly as at request time —
-    /// chat's own post policy always admits those origins. an empty external key
-    /// is nobody, and fails closed. memoized per channel by `known`.
+    /// Both the model user and an explicit external requester must retain
+    /// posting access to a tool action's destination. Targets independently
+    /// apply their normal Program account gate when the action actually runs.
     async fn requester_may_post(
         &self,
         ctx: &dyn Ctx,
@@ -1044,13 +1034,16 @@ impl RunsModule {
         channel_id: &str,
         known: &mut BTreeMap<String, bool>,
     ) -> Result<bool, String> {
-        let SagaOrigin::External(key) = &entry.requester else {
-            return Ok(true);
+        if let Some(answer) = known.get(channel_id) { return Ok(*answer); }
+        let bytes = ctx.query(&self.chat, &chat_encode_query(&ChatQuery::Access {
+            channel_id: channel_id.into(), party: chat::Party::Account(entry.account),
+        })).await.map_err(|error| error.to_string())?;
+        let ChatReply::Access(access) = chat_decode_reply(&bytes).map_err(|error| error.to_string())? else { return Err("unexpected chat access reply".into()); };
+        let requester_allowed = match &entry.requester {
+            RunOrigin::External(key) => !key.is_empty() && self.may_post(ctx, key, channel_id).await?,
+            RunOrigin::Program(_) | RunOrigin::Module(_) | RunOrigin::System => true,
         };
-        if let Some(answer) = known.get(channel_id) {
-            return Ok(*answer);
-        }
-        let may_post = !key.is_empty() && self.may_post(ctx, key, channel_id).await?;
+        let may_post = access.may_post && requester_allowed;
         known.insert(channel_id.to_string(), may_post);
         Ok(may_post)
     }
@@ -1145,7 +1138,7 @@ impl RunsModule {
     pub(super) async fn duckfs_write_msg(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         action: &AgentAction,
     ) -> Result<Msg, String> {
         let AgentAction::DuckfsWriteText {
@@ -1300,7 +1293,7 @@ impl RunsModule {
                 message_id: reply_message_id(run_id),
                 blocks: vec![Block::paragraph(text)],
                 thread: entry.thread_root,
-                as_agent: Some(entry.agent_id.clone()),
+
             }),
         })
     }
@@ -1340,7 +1333,7 @@ impl RunsModule {
     /// comment, a reply IN that comment thread), the agent's own chat posts, and
     /// the task writes — all drained in this same delivery block (P2, P6). every
     /// one rides this MODULE's origin, which is what lets chat and pages refine
-    /// `as_agent` into `AuthorRef::Agent { module, agent_id }` — authorship no
+    /// `as_agent` into `Party::Agent { module, agent_id }` — authorship no
     /// external submitter can forge.
     pub(super) async fn emit_response(
         &self,
@@ -1367,7 +1360,7 @@ impl RunsModule {
                         message_id: reply_message_id(run_id),
                         blocks: to_chat_blocks(&response.reply_blocks),
                         thread: entry.thread_root,
-                        as_agent: Some(entry.agent_id.clone()),
+
                     }),
                 });
             }
@@ -1385,7 +1378,7 @@ impl RunsModule {
                         message_id: post_message_id(run_id, &lane.slot(index)),
                         blocks: vec![Block::paragraph(text)],
                         thread,
-                        as_agent: Some(entry.agent_id.clone()),
+
                     }),
                 },
                 AgentAction::CreateTask { task_id, title } => Msg {
@@ -1434,7 +1427,7 @@ pub(super) fn is_duckfs_action(action: &AgentAction) -> bool {
     matches!(action, AgentAction::DuckfsWriteText { .. })
 }
 
-fn validate_duckfs_text_write(agent: &AgentRecord, path: &str, text: &str) -> Result<(), String> {
+fn validate_duckfs_text_write(agent: &ModelRecord, path: &str, text: &str) -> Result<(), String> {
     canonical_duckfs_path(path)?;
     if text.len() > MAX_DUCKFS_WRITE_TEXT_BYTES {
         return Err(format!(
@@ -1454,17 +1447,18 @@ fn validate_duckfs_text_write(agent: &AgentRecord, path: &str, text: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::{AgentStatus, ResourceCaps};
+    use crate::{ModelStatus, ResourceCaps};
 
-    fn agent_with_write(prefix: &str) -> AgentRecord {
-        AgentRecord {
+    fn agent_with_write(prefix: &str) -> ModelRecord {
+        ModelRecord {
+            account: 2,
             agent_id: "bot".into(),
-            owner: SagaOrigin::System,
+            owner: RunOrigin::System,
             display_name: "Bot".into(),
             capability: "codex".into(),
-            allowed_actions: vec![agent::ACTION_DUCKFS_WRITE_TEXT.into()],
-            status: AgentStatus::Active,
-            role: agent::AgentRole::General,
+            allowed_actions: vec![crate::ACTION_DUCKFS_WRITE_TEXT.into()],
+            status: ModelStatus::Active,
+            role: crate::ModelRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: Vec::new(),

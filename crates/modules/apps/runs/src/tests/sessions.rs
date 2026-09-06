@@ -1,5 +1,5 @@
 use super::*;
-use agent::{ACTION_CHAT_POST_MESSAGE, ACTION_PAGES_COMMENT};
+use crate::{ACTION_CHAT_POST_MESSAGE, ACTION_PAGES_COMMENT};
 use pages::PageMsg;
 
 // ---- the agent session lane --------------------------------------------------
@@ -21,8 +21,8 @@ fn awaiting_session_run(actions: &[&str], caps: &[&str]) -> (RunsModule, Registr
     let mut registry = registry(&[("bot", actions)]);
     registry.get_mut("bot").unwrap().caps.pages_write =
         caps.iter().map(|s| s.to_string()).collect();
-    let mut m = watched(TurnPolicy::All, &registry).with_pages_module("pages");
-    engage_post(&mut m, &registry, 2, &[]);
+    let mut m = configured(&registry).with_pages_module("pages");
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     (m, registry, run_id_for("general", 2, "bot"))
 }
@@ -108,8 +108,8 @@ fn with_open_delegating_session(budget: u32) -> (RunsModule, Registry, String) {
     ]);
     registry.get_mut("bot").unwrap().caps.subagent_budget = budget;
     registry.get_mut("worker").unwrap().caps.subagent_budget = budget;
-    let mut m = watched(TurnPolicy::All, &registry);
-    engage_post(&mut m, &registry, 2, &[]);
+    let mut m = configured(&registry);
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     let run_id = run_id_for("general", 2, "bot");
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(ASSIGNEE.to_vec()));
@@ -606,7 +606,7 @@ fn only_the_bound_session_key_may_act() {
 #[test]
 fn a_granted_action_emits_a_module_origin_follow_up_carrying_as_agent() {
     // the emitted op rides THIS module's origin, which is what lets pages (and
-    // chat) refine `as_agent` into AuthorRef::Agent { module: runs, agent_id } —
+    // chat) refine `as_agent` into Party::Agent { module: runs, agent_id } —
     // the attribution the frameless lane could never produce.
     let (mut m, registry, run_id) = with_open_session(&[ACTION_PAGES_COMMENT], &["p1"]);
     let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
@@ -619,13 +619,13 @@ fn a_granted_action_emits_a_module_origin_follow_up_carrying_as_agent() {
         comment_id,
         target,
         text,
-        as_agent,
+
         ..
     } = &msgs[0]
     else {
         panic!("expected AddComment, got {:?}", msgs[0]);
     };
-    assert_eq!(as_agent.as_deref(), Some("bot"), "agent-attributed");
+
     assert_eq!(target, "b-p");
     assert_eq!(text, "looks good");
     // the session lane's id space is DISJOINT from the settle path's: the
@@ -768,13 +768,13 @@ fn post_message_needs_its_own_grant_and_chat_post_does_not_widen_into_it() {
         message_id,
         blocks,
         thread,
-        as_agent,
+
     } = &msgs[0]
     else {
         panic!("expected PostMessage, got {:?}", msgs[0]);
     };
     assert_eq!(channel_id, "general");
-    assert_eq!(as_agent.as_deref(), Some("bot"), "agent-attributed");
+
     assert_eq!(*thread, None);
     assert_eq!(blocks, &vec![Block::paragraph("still working on it")]);
     assert_eq!(
@@ -871,7 +871,7 @@ fn the_session_prunes_on_every_settle_path() {
         let mut ctx = session_ctx(&registry, &run_id, Origin::External(SESSION_KEY.to_vec()));
         let err = exec(&mut m, &mut ctx, &act(&run_id, comment("b-p"))).unwrap_err();
         assert!(
-            matches!(&err, Error::Module(reason) if reason.contains("no open agent session")),
+            matches!(&err, Error::Module(reason) if reason.contains("run is not in flight")),
             "{what}: a settled run's key must not act: {err:?}"
         );
     }
@@ -940,7 +940,7 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
 
     // an orphaned session: the same session, but the pending section is empty.
     let orphaned =
-        crate::state::encode_committed(&m.watches, &BTreeMap::new(), &m.sessions, &m.delegations);
+        crate::state::encode_committed(&m.action_requests, m.next_action_item, &BTreeMap::new(), &m.sessions, &m.delegations, &m.models);
     let err = module().install(&orphaned, StateRoot::ZERO).unwrap_err();
     assert!(
         matches!(&err, Error::Module(reason) if reason.contains("names no in-flight run")),
@@ -959,7 +959,7 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
             (run_id.clone(), s)
         })
         .collect();
-    let forged = crate::state::encode_committed(&m.watches, &m.pending, &stunted, &m.delegations);
+    let forged = crate::state::encode_committed(&m.action_requests, m.next_action_item, &m.pending, &stunted, &m.delegations, &m.models);
     let err = module().install(&forged, StateRoot::ZERO).unwrap_err();
     assert!(
         matches!(&err, Error::Module(reason) if reason.contains("32-byte ed25519 key")),
@@ -1048,7 +1048,7 @@ fn a_callee_whose_owner_cannot_read_the_channel_is_refused() {
             .with_members_only("general", vec![9; 32])
     };
 
-    registry.get_mut("worker").unwrap().owner = SagaOrigin::External(vec![8; 32]);
+    registry.get_mut("worker").unwrap().owner = RunOrigin::External(vec![8; 32]);
     let mut ctx = private(&registry);
     let err = exec(
         &mut m,
@@ -1064,12 +1064,12 @@ fn a_callee_whose_owner_cannot_read_the_channel_is_refused() {
     assert!(delegations(&m, &run_id).is_empty());
 
     // an owner who can read the channel dispatches as before.
-    registry.get_mut("worker").unwrap().owner = SagaOrigin::External(vec![9; 32]);
+    registry.get_mut("worker").unwrap().owner = RunOrigin::External(vec![9; 32]);
     let mut ctx = private(&registry);
     exec(
         &mut m,
         &mut ctx,
-        &delegate(&run_id, "parser", "worker", "Implement the parser."),
+        &delegate(&run_id, "parser-allowed", "worker", "Implement the parser."),
     )
     .unwrap();
     assert_eq!(ctx.dispatch_msgs().len(), 1);

@@ -179,7 +179,10 @@ pub async fn drive(
     lane: &mut dyn Lane,
 ) -> Result<Vec<Event>, Error> {
     let mut queue: VecDeque<Msg> = VecDeque::new();
-    let Offered { follows, mut unclaimed } = offer(workers, initial).await;
+    let Offered {
+        follows,
+        mut unclaimed,
+    } = offer(workers, initial).await;
     queue.extend(follows);
     let mut rounds = 1u32;
     loop {
@@ -201,7 +204,10 @@ pub async fn drive(
             return Err(Error::BudgetExceeded);
         }
         let events = lane.submit(follow).await?;
-        let Offered { follows, unclaimed: more } = offer(workers, events).await;
+        let Offered {
+            follows,
+            unclaimed: more,
+        } = offer(workers, events).await;
         queue.extend(follows);
         unclaimed.extend(more);
     }
@@ -270,16 +276,28 @@ mod tests {
     #[test]
     fn offer_routes_and_reports_unclaimed() {
         let workers: Vec<Box<dyn Worker>> = vec![
-            Box::new(StubWorker { trigger: "a", follow: Some(msg("x")) }),
-            Box::new(StubWorker { trigger: "b", follow: Some(msg("y")) }),
+            Box::new(StubWorker {
+                trigger: "a",
+                follow: Some(msg("x")),
+            }),
+            Box::new(StubWorker {
+                trigger: "b",
+                follow: Some(msg("y")),
+            }),
         ];
         let out = block_on(offer(&workers, vec![event("a"), event("b"), event("c")]));
         assert_eq!(
-            out.follows.iter().map(|m| m.target.clone()).collect::<Vec<_>>(),
+            out.follows
+                .iter()
+                .map(|m| m.target.clone())
+                .collect::<Vec<_>>(),
             vec!["x", "y"]
         );
         assert_eq!(
-            out.unclaimed.iter().map(|e| e.source.clone()).collect::<Vec<_>>(),
+            out.unclaimed
+                .iter()
+                .map(|e| e.source.clone())
+                .collect::<Vec<_>>(),
             vec!["c"]
         );
     }
@@ -288,8 +306,10 @@ mod tests {
     /// follow-up nor unclaimed.
     #[test]
     fn offer_handled_none_is_a_silent_claim() {
-        let workers: Vec<Box<dyn Worker>> =
-            vec![Box::new(StubWorker { trigger: "a", follow: None })];
+        let workers: Vec<Box<dyn Worker>> = vec![Box::new(StubWorker {
+            trigger: "a",
+            follow: None,
+        })];
         let out = block_on(offer(&workers, vec![event("a")]));
         assert!(out.follows.is_empty());
         assert!(out.unclaimed.is_empty());
@@ -300,10 +320,18 @@ mod tests {
     #[test]
     fn drive_nudges_until_the_mailbox_drains() {
         let workers: Vec<Box<dyn Worker>> = Vec::new();
-        let mut lane = StubLane { submitted: Vec::new(), echo: Vec::new(), nudge_budget: 3 };
+        let mut lane = StubLane {
+            submitted: Vec::new(),
+            echo: Vec::new(),
+            nudge_budget: 3,
+        };
         let unclaimed = block_on(drive(&workers, Vec::new(), &mut lane)).expect("drive");
         assert!(unclaimed.is_empty());
-        assert_eq!(lane.submitted.len(), 3, "one Nudge per pending check until drained");
+        assert_eq!(
+            lane.submitted.len(),
+            3,
+            "one Nudge per pending check until drained"
+        );
         let nudge = dispatch::encode_msg(&dispatch::DispatchMsg::Nudge {});
         for m in &lane.submitted {
             assert_eq!(m.target, dispatch::DEFAULT_DISPATCH_TARGET);
@@ -315,9 +343,15 @@ mod tests {
     /// the budget stops it at MAX_WORKER_ROUNDS - 1 submits.
     #[test]
     fn drive_bounds_a_self_retriggering_worker() {
-        let workers: Vec<Box<dyn Worker>> =
-            vec![Box::new(StubWorker { trigger: "loop", follow: Some(msg("again")) })];
-        let mut lane = StubLane { submitted: Vec::new(), echo: vec![event("loop")], nudge_budget: 0 };
+        let workers: Vec<Box<dyn Worker>> = vec![Box::new(StubWorker {
+            trigger: "loop",
+            follow: Some(msg("again")),
+        })];
+        let mut lane = StubLane {
+            submitted: Vec::new(),
+            echo: vec![event("loop")],
+            nudge_budget: 0,
+        };
         let err = block_on(drive(&workers, vec![event("loop")], &mut lane)).expect_err("budget");
         assert!(matches!(err, Error::BudgetExceeded), "got {err:?}");
         assert_eq!(lane.submitted.len(), MAX_WORKER_ROUNDS as usize - 1);

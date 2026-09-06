@@ -22,7 +22,7 @@ use automations::{
     decode_reply, encode_msg, encode_query,
 };
 use chat::{
-    AuthorRef, ChannelAccess, ChatEvent, ChatReply, encode_event as chat_encode_event,
+    ChannelAccess, ChatEvent, ChatReply, Party, encode_event as chat_encode_event,
     encode_reply as chat_encode_reply,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -40,6 +40,20 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         consensus_time: height,
         origin,
         me: "automations".into(),
+        cause: sdk::Cause::Direct,
+    })
+    .on_query("identity", |_req| {
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            Some(identity::AccountView {
+                number: 1,
+                name: "Operator".into(),
+                control: identity::Control::Keys,
+                keys: Vec::new(),
+                avatar: None,
+                bio: None,
+                updated_at: 0,
+            }),
+        )))
     })
     .on_query("chat", |_req| {
         Ok(chat_encode_reply(&ChatReply::Access(ChannelAccess {
@@ -80,7 +94,7 @@ fn posted(channel: &str, seq: u64) -> Msg {
             channel_id: channel.into(),
             seq,
             thread_root: None,
-            author: AuthorRef::User(vec![1; 32]),
+            author: Party::Key(vec![1; 32]),
             mentions: Vec::new(),
         }),
     }
@@ -131,7 +145,8 @@ fn synced_store_reconstructs_source_root_rules_and_history() {
             Box::new(QmdbStore::init(context.child("src"), "src").await),
             "chat",
             "tasks",
-            "inbox",
+            "identity",
+            "attribution",
         );
         apply_commit(
             &mut src,
@@ -140,10 +155,10 @@ fn synced_store_reconstructs_source_root_rules_and_history() {
             admin(&create(
                 "alpha",
                 None,
-                Action::DeliverInbox {
+                Action::Report {
                     // #1739: `DeliverInbox` may reach only the rule owner's
                     // own inbox queue -- `operator()`'s literal `ext:{hex}`.
-                    member_template: format!("ext:{}", "09".repeat(32)),
+                    recipient: 1,
                     kind: "note".into(),
                     body_template: "a post landed".into(),
                 },
@@ -238,7 +253,14 @@ fn synced_store_reconstructs_source_root_rules_and_history() {
         let store = QmdbStore::sync_from(context.child("dst"), "dst", target, resolver)
             .await
             .expect("sync_from");
-        let synced = Automations::new("automations", Box::new(store), "chat", "tasks", "inbox");
+        let mut synced = Automations::new(
+            "automations",
+            Box::new(store),
+            "chat",
+            "tasks",
+            "identity",
+            "attribution",
+        );
 
         // THE PROPERTY: identical qmdb root — the root-hash linkage a joiner
         // needs at the boundary height.
@@ -266,6 +288,26 @@ fn synced_store_reconstructs_source_root_rules_and_history() {
             synced_replies[1],
             AutomationsReply::Rule(None),
             "the deleted rule stays deleted on the joiner"
+        );
+
+        let mut write_ctx = ctx(8, Origin::Module("chat".into()));
+        synced
+            .execute(&mut write_ctx, &posted("general", 1))
+            .await
+            .unwrap();
+        let report = write_ctx
+            .msgs()
+            .iter()
+            .find(|message| message.target == "attribution")
+            .unwrap();
+        let attribution::AttributionMsg::Attribute { object, .. } =
+            attribution::decode_msg(&report.payload).unwrap()
+        else {
+            panic!("report");
+        };
+        assert_eq!(
+            object.object, "2",
+            "the durable source sequence resumes after sync"
         );
     });
 }

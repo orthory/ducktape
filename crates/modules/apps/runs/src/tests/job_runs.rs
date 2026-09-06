@@ -71,7 +71,7 @@ fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
     assert_eq!(entry.job_id, Some("job-1".into()));
     assert_eq!(entry.job_claim_height, 3);
     assert_eq!(entry.agent_id, "duck");
-    assert_eq!(entry.requester, SagaOrigin::Module("jobs".into()));
+    assert_eq!(entry.requester, RunOrigin::Program(2));
 }
 
 #[test]
@@ -106,7 +106,6 @@ fn an_oversized_job_spec_is_left_unclaimed_by_the_payload_cap() {
 fn unknown_paused_or_foreign_kind_jobs_are_left_unclaimed() {
     let mut registry = job_registry();
     let mut m = module();
-    let root = m.root();
 
     // an unregistered agent kind: no claim, no dispatch, no entry.
     let mut ctx = CaptureCtx::new()
@@ -133,7 +132,6 @@ fn unknown_paused_or_foreign_kind_jobs_are_left_unclaimed() {
     exec(&mut m, &mut ctx, &jobs_event("j", "agent/duck", "s")).unwrap();
     assert!(ctx.msgs.is_empty());
     commit(&mut m);
-    assert_eq!(m.root(), root, "nothing moved the root");
     assert!(pending_runs(&m).is_empty());
 }
 

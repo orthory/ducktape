@@ -10,8 +10,8 @@
 
 use std::collections::BTreeMap;
 
-use agent::{
-    ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentQuery, AgentRecord, AgentReply, AgentStatus,
+use runs::{
+    ACTION_CHAT_POST, ACTION_TASKS_CREATE, ModelQuery, ModelRecord, ModelReply, ModelStatus,
     decode_query as agent_decode_query, encode_reply as agent_encode_reply,
 };
 use chat::{
@@ -36,7 +36,7 @@ use tasks::{JobsEvent, encode_job_event as jobs_encode_event};
 /// dispatch module's turn-claim probe with "not taken".
 struct TestCtx {
     env: Env,
-    agents: BTreeMap<String, AgentRecord>,
+    agents: BTreeMap<String, ModelRecord>,
     transcripts: BTreeMap<String, Vec<MessageView>>,
 }
 impl TestCtx {
@@ -47,6 +47,7 @@ impl TestCtx {
                 consensus_time: height,
                 origin,
                 me: "runs".into(),
+                cause: sdk::Cause::Direct,
             },
             agents: BTreeMap::new(),
             transcripts: BTreeMap::new(),
@@ -55,18 +56,18 @@ impl TestCtx {
     fn with_agent(mut self, agent_id: &str, actions: &[&str]) -> Self {
         self.agents.insert(
             agent_id.into(),
-            AgentRecord {
+            ModelRecord {
                 agent_id: agent_id.into(),
                 owner: SagaOrigin::External(b"alice".to_vec()),
                 display_name: agent_id.to_uppercase(),
                 capability: "model-1".into(),
                 allowed_actions: actions.iter().map(|s| s.to_string()).collect(),
-                status: AgentStatus::Active,
-                role: agent::AgentRole::General,
+                status: ModelStatus::Active,
+                role: runs::ModelRole::General,
                 created_at: 0,
                 updated_at: 0,
                 recipe_hash: Vec::new(),
-                caps: agent::ResourceCaps::default(),
+                caps: runs::ResourceCaps::default(),
                 skills: Vec::new(),
             },
         );
@@ -88,10 +89,10 @@ impl Ctx for TestCtx {
     async fn query(&self, target: &str, req: &[u8]) -> Result<Vec<u8>, Error> {
         match target {
             "agent" => match agent_decode_query(req).map_err(Error::Module)? {
-                AgentQuery::Agent { agent_id } => Ok(agent_encode_reply(&AgentReply::Agent(
+                ModelQuery::Agent { agent_id } => Ok(agent_encode_reply(&ModelReply::Agent(
                     self.agents.get(&agent_id).cloned(),
                 ))),
-                AgentQuery::Agents => Ok(agent_encode_reply(&AgentReply::Agents(
+                ModelQuery::Agents => Ok(agent_encode_reply(&ModelReply::Agents(
                     self.agents.values().cloned().collect(),
                 ))),
             },

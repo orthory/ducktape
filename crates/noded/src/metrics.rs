@@ -131,6 +131,7 @@ fn origin_kind(origin: &sdk::Origin) -> &'static str {
     match origin {
         sdk::Origin::External(_) => "external",
         sdk::Origin::Module(_) => "module",
+        sdk::Origin::Program(_) => "program",
         sdk::Origin::System => "system",
     }
 }

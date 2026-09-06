@@ -434,7 +434,7 @@ async fn an_agent_run_gets_a_scoped_endpoint_while_the_private_key_stays_host_si
     assert_eq!(out_of_scope, 403);
     assert!(actions.lock().unwrap().is_empty());
 
-    let action = agent::AgentAction::CreateTask {
+    let action = runs::AgentAction::CreateTask {
         task_id: "task-1".into(),
         title: "scoped".into(),
     };

@@ -1,8 +1,7 @@
 use super::{
-    AuthorRef, Comment, MAX_COMMENT_AGENT_ID_BYTES, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES,
-    MAX_COMMENT_TEXT_BYTES, MAX_COMMENT_WORK_PER_TARGET, MAX_COMMENTS_PER_THREAD,
-    MAX_THREAD_ID_BYTES, MAX_THREADS_PER_TARGET, Origin, PageError, PageMsg, Pages, Thread,
-    ThreadView, author_from_origin, id_is_index_safe,
+    Comment, MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES,
+    MAX_COMMENT_WORK_PER_TARGET, MAX_COMMENTS_PER_THREAD, MAX_THREAD_ID_BYTES,
+    MAX_THREADS_PER_TARGET, PageError, PageMsg, Pages, Thread, ThreadView, id_is_index_safe,
 };
 use crate::text_ranges::{TextEdit, rebase_anchor, valid_range};
 
@@ -180,7 +179,7 @@ impl Pages {
     pub(super) async fn apply_comment_op(
         &mut self,
         msg: PageMsg,
-        origin: &Origin,
+        authority: &super::Authority,
         now: u64,
     ) -> Result<(), PageError> {
         match msg {
@@ -190,8 +189,7 @@ impl Pages {
                 target,
                 text,
                 anchor,
-                mentions: _,
-                as_agent,
+                mentions,
             } => {
                 // bound the client-minted ids BEFORE staging: they drive the
                 // size of the shared derived blocks (the target index and the
@@ -211,26 +209,7 @@ impl Pages {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }
-                // `as_agent` refines a MODULE origin into an individual agent
-                // author (chat's refine pattern): modules are genesis-trusted
-                // code, so the module half stays origin-derived and
-                // spoof-proof; an external or system submitter claiming an
-                // agent identity is rejected outright.
-                let author = match as_agent {
-                    None => author_from_origin(origin)?,
-                    Some(agent_id) => {
-                        if agent_id.is_empty() {
-                            return Err(PageError::EmptyAgent);
-                        }
-                        if agent_id.len() > MAX_COMMENT_AGENT_ID_BYTES {
-                            return Err(PageError::AgentIdTooLarge);
-                        }
-                        match author_from_origin(origin)? {
-                            AuthorRef::Module(module) => AuthorRef::Agent { module, agent_id },
-                            _ => return Err(PageError::AgentNeedsModuleOrigin),
-                        }
-                    }
-                };
+                let author = authority.actor.clone();
                 if self.load_comment(&comment_id).await?.is_some() {
                     return Err(PageError::DuplicateComment);
                 }
@@ -252,6 +231,7 @@ impl Pages {
                             thread_id: thread_id.clone(),
                             author,
                             text,
+                            mentions: mentions.clone(),
                             created_at: now,
                             edited_at: None,
                             deleted: false,
@@ -289,6 +269,7 @@ impl Pages {
                             thread_id: thread_id.clone(),
                             author: author.clone(),
                             text,
+                            mentions: mentions.clone(),
                             created_at: now,
                             edited_at: None,
                             deleted: false,
@@ -321,18 +302,17 @@ impl Pages {
                 // WHO first, then WHAT: an explicit re-home rewrites the
                 // anchor its OPENER placed, so it carries the same
                 // stored-author rule as `EditComment`/`DeleteComment` — and
-                // `author_from_origin` refuses the empty (pre-consensus)
+                // the resolved-author boundary refuses the empty (pre-consensus)
                 // origin here exactly as it does on its four siblings.
                 // Ungated, this was also the aiming device for the comment
                 // purge: re-home a stranger's thread onto a throwaway block,
                 // `RemoveBlock` it, and their comments are hard-deleted past
                 // the very author check `DeleteComment` enforces.
-                let author = author_from_origin(origin)?;
                 let mut thread = self
                     .load_thread(&thread_id)
                     .await?
                     .ok_or(PageError::ThreadNotFound)?;
-                if thread.opener != author {
+                if !authority.owns(&thread.opener) {
                     return Err(PageError::NotAuthor);
                 }
                 if target.len() > MAX_COMMENT_TARGET_BYTES || !id_is_index_safe(&target) {
@@ -367,12 +347,13 @@ impl Pages {
                 self.store_thread(&thread)
             }
             PageMsg::EditComment {
-                comment_id, text, ..
+                comment_id,
+                text,
+                mentions,
             } => {
                 if text.len() > MAX_COMMENT_TEXT_BYTES {
                     return Err(PageError::TextTooLarge);
                 }
-                let author = author_from_origin(origin)?;
                 let mut c = self
                     .load_comment(&comment_id)
                     .await?
@@ -380,15 +361,15 @@ impl Pages {
                 if c.deleted {
                     return Err(PageError::CommentNotFound);
                 }
-                if c.author != author {
+                if !authority.owns(&c.author) {
                     return Err(PageError::NotAuthor);
                 }
                 c.text = text;
+                c.mentions = mentions;
                 c.edited_at = Some(now);
                 self.store_comment(&c)
             }
             PageMsg::DeleteComment { comment_id } => {
-                let author = author_from_origin(origin)?;
                 let mut c = self
                     .load_comment(&comment_id)
                     .await?
@@ -396,11 +377,12 @@ impl Pages {
                 if c.deleted {
                     return Ok(()); // idempotent
                 }
-                if c.author != author {
+                if !authority.owns(&c.author) {
                     return Err(PageError::NotAuthor);
                 }
                 c.deleted = true;
                 c.text = String::new();
+                c.mentions.clear();
                 let thread_id = c.thread_id.clone();
                 self.store_comment(&c)?;
                 // if no live comments remain, remove the whole thread.
@@ -431,7 +413,7 @@ impl Pages {
                 thread_id,
                 resolved,
             } => {
-                let author = author_from_origin(origin)?;
+                let author = authority.actor.clone();
                 let mut thread = self
                     .load_thread(&thread_id)
                     .await?

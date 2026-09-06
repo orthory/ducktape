@@ -8,6 +8,8 @@ mod wire;
 pub use wire::*;
 
 mod codec;
+mod actor;
+pub use actor::{Actor, Authority};
 
 pub mod fs;
 pub mod gc;

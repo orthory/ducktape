@@ -148,7 +148,11 @@ impl BlockSink for PinRecorder {
         &mut self,
         _height: u64,
         _frame: &[u8],
+        _prepared: &host::PreparedWork,
     ) -> Result<(), node::Error> {
+        Ok(())
+    }
+    async fn witness(&mut self, _height: u64, _witness: &host::Witness) -> Result<(), node::Error> {
         Ok(())
     }
     async fn seal(&mut self, _seal: &node::BlockSeal) -> Result<(), node::Error> {

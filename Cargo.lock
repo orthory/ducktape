@@ -148,18 +148,19 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "borsh",
- "capability",
  "commonware-runtime",
- "duckdns",
+ "dispatch 0.1.0",
  "futures",
  "guest-adapter",
- "saga",
+ "identity",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
  "statesync",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -859,6 +860,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "attribution"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "borsh",
+ "commonware-runtime",
+ "futures",
+ "guest-adapter",
+ "identity",
+ "sdk",
+ "sdk-testkit",
+ "serde",
+ "serde_json",
+ "statesync",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "authpage"
 version = "0.1.0"
 dependencies = [
@@ -885,13 +904,14 @@ name = "automations"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "borsh",
  "chat",
  "commonware-runtime",
  "futures",
  "guest-adapter",
  "host",
- "inbox",
+ "identity",
  "sdk",
  "sdk-testkit",
  "serde",
@@ -1505,18 +1525,21 @@ name = "chat"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
+ "borsh",
  "commonware-runtime",
+ "futures",
  "guest-adapter",
  "host",
  "identity",
  "index-guest",
+ "pages",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tempfile",
  "unicode-normalization",
 ]
@@ -2108,13 +2131,13 @@ dependencies = [
 name = "compute-service"
 version = "0.1.0"
 dependencies = [
- "agent",
  "async-trait",
  "dispatch 0.1.0",
  "futures",
  "host",
  "provider-host",
  "run-envelope",
+ "runs",
  "saga",
  "sdk",
  "serde",
@@ -3162,15 +3185,18 @@ name = "dispatch"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "capability",
  "commonware-runtime",
  "futures",
  "guest-adapter",
+ "identity",
  "saga",
  "sdk",
  "sdk-testkit",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "statesync",
 ]
 
@@ -3637,12 +3663,15 @@ name = "files"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "base64 0.22.1",
+ "commonware-cryptography",
  "duckfs-core",
  "duckfs-disk",
  "futures",
  "guest-adapter",
  "host",
+ "identity",
  "sdk",
  "sdk-testkit",
  "serde_json",
@@ -4592,9 +4621,11 @@ dependencies = [
  "acl",
  "agent",
  "async-trait",
+ "attribution",
  "automations",
  "base64 0.22.1",
  "blobstore",
+ "borsh",
  "capability",
  "chat",
  "commonware-cryptography",
@@ -4622,7 +4653,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tasks",
  "tempfile",
  "tracing",
@@ -5156,11 +5186,12 @@ name = "inbox"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "borsh",
  "commonware-runtime",
  "futures",
  "guest-adapter",
- "host",
+ "identity",
  "inbox",
  "index-guest",
  "sdk",
@@ -6269,6 +6300,7 @@ dependencies = [
  "anyhow",
  "argon2",
  "async-trait",
+ "attribution",
  "authpage",
  "axum",
  "base64 0.22.1",
@@ -6331,7 +6363,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tasks",
  "tempfile",
  "tokio",
@@ -6357,6 +6388,7 @@ dependencies = [
  "agent",
  "agent-service",
  "async-trait",
+ "attribution",
  "axum",
  "base64 0.22.1",
  "blobstore",
@@ -6398,7 +6430,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tasks",
  "tempfile",
  "tokio",
@@ -7243,9 +7274,11 @@ name = "pages"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "commonware-runtime",
  "guest-adapter",
  "host",
+ "identity",
  "index-guest",
  "sdk",
  "sdk-testkit",
@@ -7253,7 +7286,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tempfile",
  "tokio",
 ]
@@ -8476,7 +8508,10 @@ version = "0.1.0"
 dependencies = [
  "agent",
  "async-trait",
+ "attribution",
  "base64 0.22.1",
+ "borsh",
+ "capability",
  "chat",
  "commonware-runtime",
  "dispatch 0.1.0",
@@ -8485,6 +8520,7 @@ dependencies = [
  "futures",
  "guest-adapter",
  "host",
+ "identity",
  "pages",
  "saga",
  "sdk",
@@ -8493,8 +8529,8 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "statesync",
- "tagging",
  "tasks",
+ "valset",
 ]
 
 [[package]]
@@ -8774,6 +8810,7 @@ name = "sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "borsh",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -9508,22 +9545,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tagging"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "borsh",
- "commonware-runtime",
- "futures",
- "guest-adapter",
- "sdk",
- "sdk-testkit",
- "serde",
- "serde_json",
- "statesync",
-]
-
-[[package]]
 name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9546,10 +9567,12 @@ name = "tasks"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "attribution",
  "commonware-runtime",
  "futures",
  "guest-adapter",
  "host",
+ "identity",
  "index-guest",
  "sdk",
  "sdk-testkit",

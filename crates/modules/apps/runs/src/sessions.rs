@@ -21,7 +21,7 @@
 //! agent's tool server. an op signed by it provably came from that run — and
 //! consensus refuses it the moment it exceeds the owner's committed grant.
 //!
-//! the owner's authority is never asked for: `AgentRecord { owner,
+//! the owner's authority is never asked for: `ModelRecord { owner,
 //! allowed_actions, caps }` IS the capability grant, already committed.
 //! registering an agent with `pages.comment` is the act of authorizing it. what
 //! this lane adds is not authority but PROOF of who is exercising it.
@@ -76,13 +76,13 @@
 use super::pages_effects::is_pages_action;
 use super::response::is_duckfs_action;
 use super::{
-    AgentAction, AgentResponse, AgentSession, AgentStatus, BTreeMap, Ctx, DELEGATED_CHILD_CORES,
+    AgentAction, AgentResponse, AgentSession, BTreeMap, Ctx, DELEGATED_CHILD_CORES,
     DELEGATED_CHILD_MEM_GB, DelegationRequest, DelegationState, DelegationStatus, DelegationView,
     DispatchQuery, DispatchReply, Error, Lane, MAX_ACTIONS_PER_SESSION,
     MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATION_REQUEST_ID_BYTES, MAX_DELEGATIONS_BYTES,
-    MAX_DELEGATIONS_PER_RUN, Origin, RunAuthority, RunsModule, SESSION_KEY_LEN, SagaOrigin,
-    SiblingReadBudget, delegated_run_id_for, delegation_id_for, dispatch_decode_reply,
-    dispatch_encode_query, dispatch_id_for, page_thread_id,
+    MAX_DELEGATIONS_PER_RUN, ModelStatus, Origin, RunAuthority, RunOrigin, RunsModule,
+    SESSION_KEY_LEN, SiblingReadBudget, delegated_run_id_for, delegation_id_for,
+    dispatch_decode_reply, dispatch_encode_query, dispatch_id_for, page_thread_id,
 };
 use dispatch::DispatchStatus;
 use saga::{
@@ -161,8 +161,51 @@ impl RunsModule {
         Ok(())
     }
 
-    /// apply ONE agent action, signed by the run's bound session key.
     pub(super) async fn agent_action(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: String,
+        action: AgentAction,
+    ) -> Result<(), Error> {
+        let Some(entry) = self.pending_entry(&dispatch_id_for(&run_id)).cloned() else {
+            return Err(Error::Module("run is not in flight".into()));
+        };
+        let Some(session) = self.session(&run_id).cloned() else {
+            return Err(Error::Module("run session is not open".into()));
+        };
+        let generation = self.active_generation(&*ctx, entry.account).await?;
+        if generation != entry.generation {
+            return Err(Error::Module("run program authority changed".into()));
+        }
+        let mut effects = super::action_requests::EffectsCtx {
+            inner: ctx,
+            messages: Vec::new(),
+        };
+        self.prepare_agent_action(&mut effects, run_id.clone(), action)
+            .await?;
+        let [message]: [sdk::Msg; 1] =
+            std::mem::take(&mut effects.messages)
+                .try_into()
+                .map_err(|_| {
+                    Error::Module("one tool action must prepare exactly one target message".into())
+                })?;
+        let request_id = crate::action_request_id(&run_id, session.actions);
+        self.stage_action_request(
+            &entry,
+            request_id.clone(),
+            super::action_requests::RequestScope::Session {
+                holder: session.holder,
+            },
+            message,
+        )?;
+        effects.inner.set_output(sdk::wire::encode(
+            &serde_json::json!({"request_id": request_id}),
+        ));
+        Ok(())
+    }
+
+    /// apply ONE agent action, signed by the run's bound session key.
+    async fn prepare_agent_action(
         &mut self,
         ctx: &mut dyn Ctx,
         run_id: String,
@@ -262,7 +305,7 @@ impl RunsModule {
             ctx.emit_msg(msg);
         } else {
             // MODULE origin, exactly like the settle path's — which is what lets
-            // chat refine `as_agent` into `AuthorRef::Agent { module, agent_id }`:
+            // chat refine `as_agent` into `Party::Agent { module, agent_id }`:
             // the attribution the frameless lane could not produce at all.
             self.emit_response(ctx, &run_id, &entry, lane, validated)
                 .await;
@@ -282,10 +325,76 @@ impl RunsModule {
         Ok(())
     }
 
-    /// Start one caller/callee edge while the caller is live. This deliberately
-    /// does not mutate either AgentRecord: hierarchy is unnecessary when the
-    /// actual relation lasts only for these two runs.
     pub(super) async fn delegate_run(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        run_id: String,
+        request_id: String,
+        request: DelegationRequest,
+        _budget: &SiblingReadBudget,
+    ) -> Result<(), Error> {
+        let Some(session) = self.session(&run_id).cloned() else {
+            return Err(Error::Module("run session closed".into()));
+        };
+        if ctx.env().origin != Origin::External(session.session_key.clone()) {
+            return Err(Error::Module(
+                "only the bound session key may propose delegation".into(),
+            ));
+        }
+        self.session_holds_lease(&*ctx, &run_id, &session).await?;
+        let Some(entry) = self.pending_entry(&dispatch_id_for(&run_id)).cloned() else {
+            return Err(Error::Module("run is not in flight".into()));
+        };
+        let generation = self.active_generation(&*ctx, entry.account).await?;
+        if generation != entry.generation {
+            return Err(Error::Module("run program authority changed".into()));
+        }
+        if session.actions >= MAX_ACTIONS_PER_SESSION {
+            return Err(Error::Module("session action budget exhausted".into()));
+        }
+        if sdk::wire::encode(&request).len() > MAX_DELEGATIONS_BYTES {
+            return Err(Error::Module(
+                "delegation request exceeds the byte bound".into(),
+            ));
+        }
+        let id = crate::delegation_action_id(&run_id, &request_id);
+        let payload = crate::encode_msg(&crate::RunsMsg::ExecuteDelegation {
+            run_id: run_id.clone(),
+            request_id,
+            request,
+        });
+        if let Some(existing) = self.action_request(&id) {
+            let exact = existing.view.payload == sdk::wire::decode::<serde_json::Value>(&payload).map_err(Error::Module)?;
+            if !exact { return Err(Error::Module("request_id was already used for a different agent call".into())); }
+            ctx.set_output(sdk::wire::encode(&serde_json::json!({"request_id": id})));
+            return Ok(());
+        }
+        self.stage_action_request(
+            &entry,
+            id.clone(),
+            super::action_requests::RequestScope::Session {
+                holder: session.holder.clone(),
+            },
+            sdk::Msg {
+                target: self.id.clone(),
+                payload,
+            },
+        )?;
+        self.pending_sessions.insert(
+            run_id,
+            Some(AgentSession {
+                actions: session.actions + 1,
+                ..session
+            }),
+        );
+        ctx.set_output(sdk::wire::encode(&serde_json::json!({"request_id": id})));
+        Ok(())
+    }
+
+    /// Start one caller/callee edge while the caller is live. This deliberately
+    /// does not mutate either ModelRecord: hierarchy is unnecessary when the
+    /// actual relation lasts only for these two runs.
+    pub(super) async fn execute_delegation(
         &mut self,
         ctx: &mut dyn Ctx,
         run_id: String,
@@ -293,19 +402,21 @@ impl RunsModule {
         request: DelegationRequest,
         budget: &SiblingReadBudget,
     ) -> Result<(), Error> {
-        let Origin::External(submitter) = &ctx.env().origin else {
-            return Err(Error::Module(
-                "an agent call must be signed by the caller's session key".into(),
-            ));
-        };
         let session = self
             .session(&run_id)
             .cloned()
-            .ok_or_else(|| Error::Module(format!("run has no open agent session: {run_id}")))?;
-        if *submitter != session.session_key {
-            return Err(Error::Module(format!(
-                "only the bound session key may delegate for run {run_id}"
-            )));
+            .ok_or_else(|| Error::Module("run session closed".into()))?;
+        let Some(owner) = self.pending_entry(&dispatch_id_for(&run_id)) else {
+            return Err(Error::Module("run is not in flight".into()));
+        };
+        if ctx.env().origin != Origin::Program(owner.account) {
+            return Err(Error::Module(
+                "only the run's program may delegate work".into(),
+            ));
+        }
+        let generation = self.active_generation(&*ctx, owner.account).await?;
+        if generation != owner.generation {
+            return Err(Error::Module("run program authority changed".into()));
         }
         self.session_holds_lease(&*ctx, &run_id, &session).await?;
         let entry = self
@@ -334,11 +445,6 @@ impl RunsModule {
                     "request_id was already used for a different agent call".into(),
                 ))
             };
-        }
-        if session.actions >= MAX_ACTIONS_PER_SESSION {
-            return Err(Error::Module(format!(
-                "session for run {run_id} has spent its budget of {MAX_ACTIONS_PER_SESSION} actions"
-            )));
         }
 
         if request.agent_id == entry.agent_id {
@@ -371,7 +477,7 @@ impl RunsModule {
                     entry.agent_id
                 ))
             })?;
-        if caller.status != AgentStatus::Active {
+        if caller.status != ModelStatus::Active {
             return Err(Error::Module(format!(
                 "caller agent is paused: {}",
                 caller.agent_id
@@ -433,7 +539,7 @@ impl RunsModule {
         // owner is the account that will see the bytes, so its READ standing is
         // the gate. a module/system owner is not narrowed — chat admits those
         // origins everywhere already.
-        if let SagaOrigin::External(owner) = &callee.owner {
+        if let RunOrigin::External(owner) = &callee.owner {
             let may_read = !owner.is_empty()
                 && self
                     .may_read(&*ctx, owner, &entry.channel_id)
@@ -450,7 +556,7 @@ impl RunsModule {
         let extra = crate::envelope::library_skills(&request.skills).map_err(Error::Module)?;
         if let Some(skill) = extra
             .iter()
-            .find(|skill| !caller.permits(&agent::CapRequest::DuckfsRead(&skill.source_prefix)))
+            .find(|skill| !caller.permits(&crate::CapRequest::DuckfsRead(&skill.source_prefix)))
         {
             return Err(Error::Module(format!(
                 "the call authority cannot read delegated skill {}",
@@ -524,13 +630,6 @@ impl RunsModule {
             Some(RunAuthority::from_record(&scoped_callee)),
             Some(delegation_id),
         );
-        self.pending_sessions.insert(
-            run_id,
-            Some(AgentSession {
-                actions: session.actions + 1,
-                ..session
-            }),
-        );
         Ok(())
     }
 
@@ -540,7 +639,7 @@ impl RunsModule {
     /// otherwise leaves the ex-holder's key bound, spending the agent's whole
     /// grant for the rest of the run on a node that stopped executing it. the
     /// session's authority IS the lease, so every acting op re-reads it.
-    async fn session_holds_lease(
+    pub(super) async fn session_holds_lease(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,

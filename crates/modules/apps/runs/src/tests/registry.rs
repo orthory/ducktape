@@ -3,17 +3,13 @@ use super::*;
 // ---- the registry hook ------------------------------------------------------
 
 #[test]
-fn a_registered_agent_event_registers_the_dispatch_recipe() {
+fn a_model_registration_registers_the_dispatch_recipe() {
     let mut m = module();
     let mut ctx = CaptureCtx::new().with_agent_origin();
-    exec(
-        &mut m,
-        &mut ctx,
-        &agent_event(&AgentEvent::Registered {
+    m.on_model_event(&mut ctx, ModelEvent::Registered {
             agent_id: "bot".into(),
             capability: "model-1".into(),
-        }),
-    )
+        })
     .unwrap();
 
     let recipes = ctx.dispatch_msgs();
@@ -48,14 +44,10 @@ fn a_registered_agent_event_registers_the_dispatch_recipe() {
 fn a_capability_change_event_retunes_the_dispatch_recipe() {
     let mut m = module();
     let mut ctx = CaptureCtx::new().with_agent_origin();
-    exec(
-        &mut m,
-        &mut ctx,
-        &agent_event(&AgentEvent::CapabilityChanged {
+    m.on_model_event(&mut ctx, ModelEvent::CapabilityChanged {
             agent_id: "bot".into(),
             capability: "model-2".into(),
-        }),
-    )
+        })
     .unwrap();
     assert_eq!(
         ctx.dispatch_msgs(),
@@ -71,16 +63,12 @@ fn a_capability_change_event_retunes_the_dispatch_recipe() {
 }
 
 #[test]
-fn a_deregistered_event_removes_the_dispatch_recipe() {
+fn a_model_removal_removes_the_dispatch_recipe() {
     let mut m = module();
     let mut ctx = CaptureCtx::new().with_agent_origin();
-    exec(
-        &mut m,
-        &mut ctx,
-        &agent_event(&AgentEvent::Deregistered {
+    m.on_model_event(&mut ctx, ModelEvent::Deregistered {
             agent_id: "bot".into(),
-        }),
-    )
+        })
     .unwrap();
     assert_eq!(
         ctx.dispatch_msgs(),
@@ -91,7 +79,7 @@ fn a_deregistered_event_removes_the_dispatch_recipe() {
 }
 
 #[test]
-fn the_registry_hook_may_error_to_abort_the_registration_block() {
+fn the_model_recipe_update_may_error_to_abort_the_registration_block() {
     let mut m = module();
 
     // an agent id whose recipe id would blow the dispatch id cap: the
@@ -99,14 +87,10 @@ fn the_registry_hook_may_error_to_abort_the_registration_block() {
     // seam (the registry record must never land without its recipe).
     let oversized = "x".repeat(dispatch::MAX_ID_BYTES);
     let mut ctx = CaptureCtx::new().with_agent_origin();
-    let err = exec(
-        &mut m,
-        &mut ctx,
-        &agent_event(&AgentEvent::Registered {
+    let err = m.on_model_event(&mut ctx, ModelEvent::Registered {
             agent_id: oversized,
             capability: "model-1".into(),
-        }),
-    )
+        })
     .unwrap_err();
     assert!(matches!(err, Error::Module(reason) if reason.contains("recipe id")));
 

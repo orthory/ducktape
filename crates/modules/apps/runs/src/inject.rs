@@ -294,6 +294,7 @@ fn append_page_read_marker(blocks: &mut Vec<Block>) {
         return;
     };
     blocks.push(Block {
+        author: pages::Party::System,
         id: PAGE_READ_TRUNCATION_BLOCK_ID.into(),
         parent: Some(root.id.clone()),
         page: root.page.clone(),
@@ -711,6 +712,7 @@ mod tests {
     /// a page block with derived-by-the-module fields filled in by hand.
     fn block(id: &str, parent: Option<&str>, kind: BlockKind, text: &str) -> Block {
         Block {
+            author: pages::Party::System,
             id: id.into(),
             parent: parent.map(str::to_string),
             page: "root".into(),
@@ -935,7 +937,7 @@ mod tests {
     #[test]
     fn a_rendered_page_link_carries_the_network_it_was_rendered_on() {
         let on_a_network = RunsModule::new(
-            "runs", "chat", "saga", "tagging", "dispatch", "agent", None, None,
+            "runs", "chat", "saga", "attribution", "dispatch", "agent", None, None,
         )
         .with_chain_id("dognet#d0cdf950");
         assert_eq!(on_a_network.net_query(), TEST_NET);
@@ -949,7 +951,7 @@ mod tests {
         );
         // an unwired chain id (dev tools, tests) renders the hand-typed form.
         let nowhere = RunsModule::new(
-            "runs", "chat", "saga", "tagging", "dispatch", "agent", None, None,
+            "runs", "chat", "saga", "attribution", "dispatch", "agent", None, None,
         );
         assert_eq!(nowhere.net_query(), "");
         let bare = render_pages_section(
@@ -967,7 +969,7 @@ mod tests {
             seq: 1,
             head: MessageHead {
                 message_id: "m1".into(),
-                author: chat::AuthorRef::User(vec![1; 32]),
+                author: chat::Party::Key(vec![1; 32]),
                 blocks: vec![
                     ChatBlock::paragraph("see [Plan](duck://page/plan)"),
                     ChatBlock::Code {
@@ -977,6 +979,7 @@ mod tests {
                 ],
                 created_at: 0,
                 rev: 0,
+            revision: 1,
                 edited_at: None,
                 base_rev: None,
                 deleted: false,

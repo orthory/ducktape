@@ -9,10 +9,8 @@ version.workspace = true
 # no output parsing opinions, no credential handling — contract enforcement
 # is the dispatch module's consensus-side validation.
 [dependencies]
-# for the ONE skill-count cap: the assembler re-checks what the registry
-# enforces (agent::MAX_SKILLS_PER_AGENT) rather than restating it — two numbers
-# that can drift is how a record consensus accepts becomes a run nothing loads.
-agent = { workspace = true }
+# Share model configuration and its validation bounds with the run composer.
+runs = { workspace = true }
 async-trait = { workspace = true }
 provider-host = { workspace = true }
 dispatch = { workspace = true }

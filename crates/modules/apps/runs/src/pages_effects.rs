@@ -17,16 +17,16 @@
 //! and the forge sink's branch probes.
 //!
 //! attribution: `AddComment` carries `as_agent` (pages refines the
-//! `Module("runs")` origin into `AuthorRef::Agent`, exactly like chat);
+//! `Module("runs")` origin into `Party::Agent`, exactly like chat);
 //! `SetChecked` stores no author — a `Block` has no author field — so it is
 //! origin-gated only.
 
 use std::collections::BTreeMap;
 
-use agent::CapRequest;
+use crate::CapRequest;
 
 use super::response::allows;
-use super::{AgentAction, AgentRecord, Ctx, Lane, Msg, PendingState, RunsModule};
+use super::{AgentAction, ModelRecord, Ctx, Lane, Msg, PendingState, RunsModule};
 use pages::{
     MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES, MAX_THREAD_ID_BYTES,
     MAX_THREADS_PER_TARGET, PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg,
@@ -150,7 +150,7 @@ impl RunsModule {
         &self,
         ctx: &dyn Ctx,
         pages: &str,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         run_id: &str,
         slot: &str,
         action: &AgentAction,
@@ -206,8 +206,8 @@ impl RunsModule {
                         anchor: None,
                         mentions: Vec::new(),
                         // pages refines Module("runs") + as_agent into
-                        // AuthorRef::Agent — the same wire chat replies use.
-                        as_agent: Some(agent.agent_id.clone()),
+                        // Party::Agent — the same wire chat replies use.
+
                     }),
                 })
             }
@@ -232,7 +232,7 @@ impl RunsModule {
     }
 
     /// the D3 cap gate: pages_write is page-id scoped with `"*"` allowed.
-    pub(super) fn check_pages_write(&self, agent: &AgentRecord, page: &str) -> Result<(), String> {
+    pub(super) fn check_pages_write(&self, agent: &ModelRecord, page: &str) -> Result<(), String> {
         if agent.permits(&CapRequest::PagesWrite(page)) {
             Ok(())
         } else {

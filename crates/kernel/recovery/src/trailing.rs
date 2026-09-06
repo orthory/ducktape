@@ -90,7 +90,13 @@ pub(crate) fn trailing_wal_height(records: &[Record], checkpoint: Option<u64>) -
                     pending = None;
                 }
             }
-            Record::Pinned { .. } | Record::Cutover { .. } => {}
+            Record::Pinned { .. }
+            | Record::Cutover { .. }
+            | Record::PreparedCall { .. }
+            | Record::PreparedDelivery { .. }
+            | Record::Schedule { .. }
+            | Record::Trace { .. }
+            | Record::Witnessed { .. } => {}
         }
     }
     pending
@@ -230,7 +236,7 @@ mod tests {
 
     #[test]
     fn classify_single_verified_claim_selectively_replays() {
-            classify_trailing(7, &ids(&["files"]), &ids(&["files"])).expect("verified");
+        classify_trailing(7, &ids(&["files"]), &ids(&["files"])).expect("verified");
     }
 
     #[test]

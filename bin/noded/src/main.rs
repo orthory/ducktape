@@ -529,7 +529,20 @@ impl host::worker::Lane for OracleLane<'_> {
     }
 
     async fn pending(&self) -> bool {
-        self.host.has_pending_deliveries().await
+        match self.host.has_pending_work().await {
+            Ok(pending) => pending,
+            // an unreadable queue fails the next block closed on its own; the
+            // pump does not manufacture one.
+            Err(e) => {
+                tracing::warn!(
+                    target: "ducktape::modules",
+                    error = %e,
+                    reason = "pending_work_unreadable",
+                    "could not read the committed queues"
+                );
+                false
+            }
+        }
     }
 }
 

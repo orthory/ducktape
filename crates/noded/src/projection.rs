@@ -55,6 +55,7 @@ pub fn project_root_op(
             // frames only carry verified External authorship; label the
             // impossible rest.
             Origin::Module(id) => format!("module:{id}"),
+            Origin::Program(account) => format!("acct:{account}"),
             Origin::System => "system".into(),
         },
         disposition,
@@ -257,9 +258,11 @@ mod tests {
         host::DispatchRecord {
             module: module.into(),
             origin: Origin::Module("source".into()),
+            cause: sdk::Cause::Direct,
             payload: payload.to_vec(),
             emitted_msgs: 0,
             emitted_events: 0,
+            output: None,
             assigned: Vec::new(),
         }
     }

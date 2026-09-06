@@ -1,59 +1,93 @@
-//! the dispatch module — the network's task plane.
+//! the dispatch module — the network's queue plane.
+//!
+//! two committed FIFO queues, both drained by the host between blocks:
+//!
+//! * the CALL QUEUE. a module executing a program account queues a call on
+//!   its behalf ([`DispatchMsg::Call`]); the host reads the committed head
+//!   batch ([`DispatchQuery::PendingCalls`]), runs each call at its target as a
+//!   `Program(account)`-origin unit, and finalizes it back here in order
+//!   ([`DispatchMsg::CompleteCall`]), which moves the outcome into the mailbox.
+//! * the MAILBOX. items addressed to receiver modules — a dispatch's judged
+//!   saga result, a call's completion. the host reads the committed head batch
+//!   (`Module::pending_items`), delivers each item in its own unit, and
+//!   acknowledges it back here in order (`Module::acknowledge`).
 //!
 //! a [`Recipe`] is a consensus-registered what-to-run manifest: required
 //! capability, routing mode, output contract. a module runs one with
 //! [`DispatchMsg::Dispatch`], carrying the ENTIRE input as opaque payload
 //! data. this module stages a saga trigger for the work (rendezvous over the
 //! capability's providers, or statically pinned to one node), validates the
-//! agreed result against the recipe's [`OutputContract`], and delivers a
-//! [`ResultEvent`] back to the dispatching module.
+//! agreed result against the recipe's [`OutputContract`], and queues a
+//! [`ResultEvent`] for the dispatching module in the mailbox.
 //!
 //! ## qmdb-backed
 //!
 //! the plane is pure logic over a host-injected [`sdk::MerkleStore`] with the
-//! shared [`StagedStore`] overlay in front of it. every recipe, every dispatch
-//! and every mailbox entry is its OWN store key (see `records`), so an op
-//! touches only the keys it names, `root()` is the store's cached merkle root,
-//! and state-sync rides the store's resolver lane rather than a byte snapshot
+//! shared [`StagedStore`] overlay in front of it. every recipe, dispatch, call
+//! and mailbox entry is its OWN store key (see `records`), so an op touches
+//! only the keys it names, `root()` is the store's cached merkle root, and
+//! state-sync rides the store's resolver lane rather than a byte snapshot
 //! whose preimage was re-serialized on every single `root()` call.
 //!
-//! ## the never-pop-stack rule (result delivery)
+//! ## the never-pop-stack rule (delivery)
 //!
-//! a result is NEVER handed back inside the block that agreed on it. the saga
-//! callback lands here, the checked outcome is staged into a MAILBOX, and the
-//! block commits. the host drain notices the committed non-empty mailbox at
-//! the start of a LATER block and injects one System-origin
-//! [`DispatchMsg::DeliverPending`]; only that dispatch emits the events (at
-//! most [`MAX_DELIVERIES_PER_BLOCK`] per block, FIFO) to their receivers. the
-//! receiver consumes the result in its own block, its own failure domain.
+//! an outcome is NEVER handed to its receiver inside the block that agreed on
+//! it. the saga callback or the host's `CompleteCall` lands here, the outcome
+//! is recorded and a mailbox item appended, and the block commits. the host's
+//! between-block pump reads the COMMITTED mailbox head (`pending_items`, at
+//! most [`MAX_DELIVERIES_PER_BLOCK`] items, FIFO), delivers each item to its
+//! receiver in an isolated unit, and acknowledges it (`acknowledge`), which
+//! retires the item; the receiver consumes the outcome in its own failure
+//! domain. a receiver that rejects a delivery is acknowledged
+//! `Failed { reason }`: nothing of its unit commits, the item is retired with
+//! that outcome on its receipt (queryable as `DispatchStatus::Delivered` /
+//! `CallStatus::Delivered`), and the queue keeps moving — a rejecting receiver
+//! never stalls the plane.
 //!
-//! a receiver's `ResultEvent` intake is an intake like chat's hook intake:
-//! it runs inside the delivery block, so it MUST NOT error on event content —
-//! a decode/shape problem is the receiver's to swallow (log, mark, move on),
-//! never to bubble. an erroring receiver would abort the delivery block, the
-//! mailbox would stay committed-non-empty, and the host would re-inject next
-//! block: a permanent abort loop. same discipline the platform already
-//! demands of chat hook subscribers.
+//! ## numbering
+//!
+//! every queue number (a call's `enqueued`, a mailbox `item`) is monotonic and
+//! never reused: the cursors persist forever, a drained queue keeps
+//! `head == next`. the host finalizes and acknowledges BY NUMBER and recovery
+//! replays those ops, so a reused number would let a stale finalization or
+//! acknowledgment retire a new entry. a below-head number is therefore always
+//! an idempotent replay: `CompleteCall` re-checks the outcome digest and
+//! `acknowledge` is a no-op.
+//!
+//! ## every record is written in full at admission
+//!
+//! the ops that retire an entry — `CompleteCall`, `acknowledge` — are the
+//! host's, fixed, and run for every entry the plane admitted; they must never
+//! fail on a record's size. so admission is where size is decided: a `Call` is
+//! refused unless its record encodes under the store cap WITH a maximal
+//! outcome in place, and a delivery's receipt is always strictly smaller than
+//! the record that passed the cap.
 //!
 //! ## retention
 //!
-//! the RECORD is permanent, the PAYLOAD is not. a dispatch record is the
+//! the RECORD is permanent, the OUTCOME is not. a dispatch record is the
 //! network's turn-claim key — `runs` asks "does this dispatch id exist?" to
 //! refuse a second run for a `run_id` it already ran, long after its own
-//! pending entry is gone — so a record is never evicted, ever. what is
-//! unbounded is the outcome: up to [`MAX_RESULT_BYTES`] per dispatch. delivery
-//! therefore hands the bytes to the receiver and DROPS this module's copy, in
-//! the same transition, leaving a fixed-size receipt. state then grows with the
-//! number of dispatches, not with the size of their results — and because each
-//! dispatch is its own record, that permanent count costs nothing per op.
+//! pending entry is gone — and a call record is its id's permanent claim, so
+//! neither is ever evicted. what is unbounded is the outcome: up to
+//! [`MAX_RESULT_BYTES`] per dispatch, up to `sdk::MAX_OUTPUT_BYTES` per call.
+//! acknowledgment therefore hands the bytes to the receiver and DROPS this
+//! module's copy, leaving a receipt that keeps only what a reader can still
+//! ask for: how the delivery ended, and for a call the outcome's summary
+//! ([`CallOutcomeSummary`]: the output as a digest, the rest verbatim). state
+//! then grows with the number of entries, not with the size of their
+//! outcomes — and because each entry is its own record, that permanent count
+//! costs nothing per op.
 //!
 //! ## self-containment
 //!
 //! this module imports no app module and no app interface. its collaborators
-//! are saga (async work lifecycle) and the capability registry (indirectly,
-//! via saga assignment). the receiver of a delivery is always the module
-//! that dispatched — `Dispatch` is module-origin-only — so results route by
-//! construction, never by configuration.
+//! are saga (async work lifecycle), identity (the program-account control
+//! record a call is admitted against) and the capability registry
+//! (indirectly, via saga assignment). the receiver of a delivery is always
+//! the module that dispatched or queued — `Dispatch` and `Call` are
+//! module-origin-only — so outcomes route by construction, never by
+//! configuration.
 
 // the wire surface: this module's shared types, flattened at the crate root.
 mod interface;
@@ -62,27 +96,33 @@ pub use interface::*;
 // the store key space and the per-record codecs.
 mod records;
 
+use sha2::Digest as _;
 use std::collections::BTreeMap;
 
 use capability::{validate_resources, validate_tag};
+use identity::{Control, IdentityQuery, IdentityReply, ProgramStanding};
 use records::{
-    Mailbox, committed_dispatch, committed_mailbox, committed_recipe, dispatch_key_of,
-    encode_dispatch, encode_recipe, mailbox_key, recipe_key, stage_mailbox, staged_dispatch,
-    staged_mailbox, staged_recipe,
+    CallRecord, CallRecordStatus, Calls, MailEntry, Mailbox, call_key, claim_key, committed_call,
+    committed_calls, committed_claim, committed_dispatch, committed_mail_entry, committed_mailbox,
+    committed_recipe, dispatch_key_of, encode_call, encode_claim, encode_dispatch,
+    encode_mail_entry, encode_recipe, mailbox_key, recipe_key, stage_calls, stage_mailbox,
+    staged_call, staged_calls, staged_claim, staged_dispatch, staged_mail_entry, staged_mailbox,
+    staged_recipe,
 };
 use saga::{
     MAX_ASSIGNEE_BYTES, SagaCallback, SagaMsg, SagaOrigin, SagaOutcome, decode_callback,
     encode_msg as saga_encode_msg,
 };
 use sdk::{
-    Ctx, Error, Event, MerkleStore, Module, ModuleId, Msg, Origin, ResolverSyncTarget, StagedStore,
+    AccountNumber, Ack, CallId, Cause, Ctx, DeliveryOutcome, Error, Event, Hop, ItemRef,
+    MerkleStore, Module, ModuleId, Msg, Origin, PendingItem, ResolverSyncTarget, Root, StagedStore,
     StateRoot, StateSyncHandle,
 };
 
-/// the field separator inside composite dispatch keys and saga ids (the shared
-/// [`sdk::KEY_SEP`]). rejected inside caller-chosen ids by [`sdk::validate_id`]
-/// so a crafted id can never forge another receiver's key.
-const SEP: char = sdk::KEY_SEP;
+/// the field separator inside composite dispatch keys, call claims and saga
+/// ids (the shared [`sdk::KEY_SEP`]). rejected inside caller-chosen ids by
+/// [`sdk::validate_id`] so a crafted id can never forge another's key.
+pub(crate) const SEP: char = sdk::KEY_SEP;
 
 /// the recipe namespace `runs` derives an agent's recipe id into
 /// (`runs::recipe_id_for`, `agent/{agent_id}`) — reserved so no External
@@ -107,15 +147,16 @@ fn is_reserved_recipe_id(recipe_id: &str) -> bool {
 /// serialized operation's framing (32-byte hashed key, varint length prefix,
 /// operation tag), exactly as `kv::MAX_VALUE_LEN` reasons.
 ///
-/// this is the BACKSTOP the storage swap adds: every wire-supplied field that
-/// reaches a record is bounded by its own named cap first — ids by
+/// for the recipe and dispatch records this is a BACKSTOP: every wire-supplied
+/// field that reaches one is bounded by its own named cap first — ids by
 /// [`MAX_ID_BYTES`], `description` by [`MAX_DESCRIPTION_BYTES`], `capability`
 /// by `capability::MAX_TAG_LEN`, a `Routing::Pinned` key by saga's
 /// [`MAX_ASSIGNEE_BYTES`], an outcome by saga's `MAX_RESULT_BYTES` /
-/// `MAX_ERROR_BYTES` — so no path reaches this bound today. it stays because a
-/// field added without its own cap would otherwise commit a record every later
-/// read panics on, and an op frame carries up to `node::MAX_FRAME_BYTES`
-/// (1 MiB + 16 KiB) to build one from.
+/// `MAX_ERROR_BYTES` — so no path reaches it. for a CALL record it is the
+/// admission rule itself: the payload is admitted only if the record still
+/// encodes under this with a maximal outcome in place (module header, "every
+/// record is written in full at admission"), because the finalizer that adds
+/// the outcome is the host's and must never fail on size.
 pub const MAX_RECORD_BYTES: usize = (1 << 20) - 4 * 1024;
 
 /// the composite state key: dispatches are namespaced PER RECEIVER, so two
@@ -172,6 +213,7 @@ fn stage_record(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DispatchState {
     pub(crate) receiver: ModuleId,
+    pub(crate) cause: Cause,
     pub(crate) dispatch_id: String,
     pub(crate) recipe_id: String,
     pub(crate) contract: OutputContract,
@@ -183,12 +225,13 @@ pub(crate) struct DispatchState {
 }
 
 /// the stored lifecycle discriminant (the wire shape carries `saga_id` inside
-/// the variant; state keeps it as its own field).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// the variant; state keeps it as its own field). `Delivered` keeps how the
+/// receiver's unit ended — the receipt's one queryable fact about delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Status {
     AwaitingResult,
     AwaitingDelivery,
-    Delivered,
+    Delivered { delivery: DeliveryOutcome },
 }
 
 // ---- the module -----------------------------------------------------------------
@@ -197,6 +240,9 @@ pub struct DispatchModule {
     id: ModuleId,
     /// the saga module dispatches trigger through — genesis config, not state.
     saga: ModuleId,
+    /// the identity module a call's program account is read from — genesis
+    /// config, not state.
+    identity: ModuleId,
     /// the host-injected authenticated store plus this block's staging overlay
     /// (read-your-writes; folded into `root()` at `commit_block`).
     staged: StagedStore,
@@ -208,11 +254,13 @@ impl DispatchModule {
     pub fn new(
         id: impl Into<ModuleId>,
         saga: impl Into<ModuleId>,
+        identity: impl Into<ModuleId>,
         store: Box<dyn MerkleStore>,
     ) -> Self {
         Self {
             id: id.into(),
             saga: saga.into(),
+            identity: identity.into(),
             staged: StagedStore::new(store),
         }
     }
@@ -253,7 +301,9 @@ impl DispatchModule {
         Ok(())
     }
 
-    /// the canonical state form of the acting origin — recipe ownership.
+    /// the canonical state form of the acting origin — recipe ownership. a
+    /// program account has no `SagaOrigin` form: it acts only through calls
+    /// its executor queued, and owning a recipe is the executor's to do.
     fn acting_origin(origin: &Origin) -> Result<SagaOrigin, Error> {
         match origin {
             Origin::External(key) if key.is_empty() => {
@@ -261,6 +311,7 @@ impl DispatchModule {
             }
             Origin::External(key) => Ok(SagaOrigin::External(key.clone())),
             Origin::Module(module) => Ok(SagaOrigin::Module(module.clone())),
+            Origin::Program(_) => Err(Error::Module("a program account cannot own recipes".into())),
             Origin::System => Ok(SagaOrigin::System),
         }
     }
@@ -347,29 +398,49 @@ impl DispatchModule {
         dispatch.updated_at = ctx.env().consensus_time;
 
         let record = encode_dispatch(&dispatch);
-        // saga bounds both outcome shapes (MAX_RESULT_BYTES / MAX_ERROR_BYTES)
-        // far below the store's record cap, so this cannot fire. if those caps
-        // ever drift, DROP the result rather than return `Err`: this arm runs
-        // inside a finalized block, where an error is a permanent abort loop.
-        if let Err(e) = check_record(&record, "dispatch record") {
-            self.note(
-                ctx,
-                format!("dropped oversized dispatch record {key:?}: {e}"),
-            );
-            return Ok(());
-        }
+        check_record(&record, "dispatch record")?;
+        let remaining = self.consume_reservation().await?;
         let mailbox = staged_mailbox(&self.staged).await?;
+        let next_item = mailbox
+            .next
+            .checked_add(1)
+            .ok_or_else(|| Error::Module("reserved mailbox numbering exhausted".into()))?;
+        records::stage_reservations(&mut self.staged, remaining);
         self.staged.stage(dispatch_key_of(&key), record);
-        self.staged
-            .stage(mailbox_key(mailbox.next), key.into_bytes());
+        self.staged.stage(
+            mailbox_key(mailbox.next),
+            encode_mail_entry(&MailEntry::Result { dispatch_key: key }),
+        );
         stage_mailbox(
             &mut self.staged,
             Mailbox {
                 head: mailbox.head,
-                next: mailbox.next + 1,
+                next: next_item,
             },
         );
         Ok(())
+    }
+
+    async fn reserve_completion(&self) -> Result<u64, Error> {
+        let mailbox = staged_mailbox(&self.staged).await?;
+        let reserved = records::staged_reservations(&self.staged).await?;
+        let next = reserved.checked_add(1).ok_or_else(|| {
+            Error::Module("mailbox numbering cannot reserve a completion slot".into())
+        })?;
+        let completions_fit = mailbox.next.checked_add(next).is_some();
+        if !completions_fit {
+            return Err(Error::Module(
+                "mailbox numbering cannot reserve a completion slot".into(),
+            ));
+        }
+        Ok(next)
+    }
+
+    async fn consume_reservation(&self) -> Result<u64, Error> {
+        records::staged_reservations(&self.staged)
+            .await?
+            .checked_sub(1)
+            .ok_or_else(|| Error::Module("completion has no reserved mailbox slot".into()))
     }
 
     async fn on_dispatch(
@@ -423,6 +494,7 @@ impl DispatchModule {
         // a refusal emits no trigger and stages nothing.
         let record = encode_dispatch(&DispatchState {
             receiver: receiver.clone(),
+            cause: env.cause.clone(),
             dispatch_id: dispatch_id.clone(),
             recipe_id,
             contract: recipe.output_contract,
@@ -433,6 +505,18 @@ impl DispatchModule {
             updated_at: now,
         });
         check_record(&record, "dispatch record")?;
+        // The inherited context is variable-sized. Reserve the largest saga
+        // outcome now, before emitting work that must later record its result.
+        let outcome_fits = record
+            .len()
+            .checked_add(MAX_RESULT_BYTES + 8)
+            .is_some_and(|bytes| bytes <= MAX_RECORD_BYTES);
+        if !outcome_fits {
+            return Err(Error::Module(
+                "dispatch context leaves no room for its result".into(),
+            ));
+        }
+        let reserved = self.reserve_completion().await?;
         ctx.emit_msg(Msg {
             target: self.saga.clone(),
             payload: saga_encode_msg(&SagaMsg::Trigger {
@@ -458,6 +542,7 @@ impl DispatchModule {
                 pinned_assignee,
             }),
         });
+        records::stage_reservations(&mut self.staged, reserved);
         self.staged.stage(dispatch_key_of(&key), record);
         Ok(())
     }
@@ -519,83 +604,424 @@ impl DispatchModule {
         Ok(())
     }
 
-    /// the host-injected delivery sweep: emit up to
-    /// [`MAX_DELIVERIES_PER_BLOCK`] mailbox events, FIFO, each as one
-    /// follow-up `Msg` to its receiver.
-    ///
-    /// the queue is the contiguous `head..next` range, so the batch is a plain
-    /// seq walk: every arm below removes its entry, and `head` lands exactly on
-    /// the first seq the sweep did not reach.
-    async fn on_deliver_pending(&mut self, ctx: &mut dyn Ctx) -> Result<(), Error> {
-        if !matches!(ctx.env().origin, Origin::System) {
+    // ---- the call queue ----------------------------------------------------------------
+
+    /// the generation of `account`'s control record, provided the account is
+    /// an ACTIVE program executed by `requester` — the admission read of a
+    /// `Call`. every other control state is a distinct refusal.
+    async fn executed_program_generation(
+        &self,
+        ctx: &dyn Ctx,
+        account: AccountNumber,
+        requester: &str,
+    ) -> Result<u64, Error> {
+        let reply = ctx
+            .query(
+                &self.identity,
+                &identity::encode_query(&IdentityQuery::Get { number: account }),
+            )
+            .await?;
+        let IdentityReply::Account(view) = identity::decode_reply(&reply).map_err(Error::Module)?
+        else {
             return Err(Error::Module(
-                "DeliverPending is System-origin only (host-injected)".into(),
+                "identity answered an account read with a non-account reply".into(),
             ));
+        };
+        let Some(view) = view else {
+            return Err(Error::Module(format!("account {account} does not exist")));
+        };
+        match view.control {
+            Control::Keys => Err(Error::Module(format!(
+                "account {account} is key-held, not a program"
+            ))),
+            Control::Revoked { .. } => Err(Error::Module(format!(
+                "program account {account} is revoked"
+            ))),
+            Control::Program {
+                executor,
+                generation,
+                standing,
+                ..
+            } => {
+                let executed_by_requester = executor == requester;
+                if !executed_by_requester {
+                    return Err(Error::Module(format!(
+                        "program account {account} is executed by {executor:?}, not {requester:?}"
+                    )));
+                }
+                match standing {
+                    ProgramStanding::Active => Ok(generation),
+                    ProgramStanding::Suspended => Err(Error::Module(format!(
+                        "program account {account} is suspended"
+                    ))),
+                }
+            }
         }
-        let now = ctx.env().consensus_time;
-        let mailbox = staged_mailbox(&self.staged).await?;
-        let end = mailbox
-            .head
-            .saturating_add(MAX_DELIVERIES_PER_BLOCK as u64)
-            .min(mailbox.next);
-        // an EMPTY mailbox is the common case (the host injects a sweep on the
-        // block after every callback), and it must stage NOTHING: staging a
-        // delete of an already-absent cursor key still appends an operation the
-        // store hashes, so an idle sweep would move the root every block.
-        if end == mailbox.head {
+    }
+
+    /// an admitted id re-queued: a no-op when every admitted fact matches,
+    /// else a rejected replay that names the first fact that differs. the
+    /// cause is compared whole — the same id from another hop of the same
+    /// chain is a different call. the record's lifecycle is not a fact of the
+    /// call, so a replay after completion or delivery is a no-op too.
+    fn same_call(existing: &CallRecord, replay: &CallRecord) -> Result<(), Error> {
+        let differing = [
+            ("account", existing.account != replay.account),
+            ("target", existing.target != replay.target),
+            ("payload", existing.payload != replay.payload),
+            ("cause", existing.cause != replay.cause),
+            ("generation", existing.generation != replay.generation),
+        ];
+        let Some((what, _)) = differing.iter().find(|(_, differs)| *differs) else {
             return Ok(());
+        };
+        Err(Error::Module(format!(
+            "call {} was already queued with a different {what}",
+            call_name(&replay.id)
+        )))
+    }
+
+    async fn on_call(&mut self, ctx: &mut dyn Ctx, call: CallFields) -> Result<(), Error> {
+        // module-origin only: the queuing module IS the requester, so the
+        // completion always has somewhere to land — and it is the executor
+        // the account's control record must name.
+        let Origin::Module(requester) = &ctx.env().origin else {
+            return Err(Error::Module(
+                "Call is module-origin only (the queuing module executes the account and receives the completion)"
+                    .into(),
+            ));
+        };
+        let requester = requester.clone();
+        sdk::validate_id("invocation", &call.invocation, MAX_ID_BYTES)?;
+        sdk::require_non_empty("target", &call.target)?;
+        if call.payload.len() > MAX_PAYLOAD_BYTES {
+            return Err(Error::Module(format!(
+                "payload is {} bytes; the cap is {MAX_PAYLOAD_BYTES}",
+                call.payload.len()
+            )));
         }
-        for seq in mailbox.head..end {
-            let entry_key = mailbox_key(seq);
-            // a mailbox entry without its record (or without a recorded
-            // outcome) cannot be built by this module's own transitions — but
-            // this arm is host-injected every block while the mailbox is
-            // non-empty, so erroring here would abort every future block (the
-            // poison loop the module header forbids). drop the orphan and leave
-            // a diagnostic event instead.
-            let Some(raw) = self.staged.get(&entry_key).await? else {
-                self.note(ctx, format!("dropped empty mailbox slot {seq}"));
-                continue;
+        let generation = self
+            .executed_program_generation(ctx, call.account, &requester)
+            .await?;
+        let id = CallId {
+            requester,
+            invocation: call.invocation,
+            step: call.step,
+        };
+        let record = CallRecord {
+            cause: ctx.env().cause.clone(),
+            id,
+            account: call.account,
+            generation,
+            target: call.target,
+            payload: call.payload,
+            status: CallRecordStatus::Queued,
+        };
+        if let Some(enqueued) = staged_claim(&self.staged, &record.id).await? {
+            let Some(existing) = staged_call(&self.staged, enqueued).await? else {
+                return Err(Error::Module(format!(
+                    "call {} is claimed under {enqueued} but has no record",
+                    call_name(&record.id)
+                )));
             };
-            self.staged.delete(entry_key);
-            let key = String::from_utf8_lossy(&raw).into_owned();
-            let Some(mut dispatch) = staged_dispatch(&self.staged, &key).await? else {
-                self.note(ctx, format!("dropped orphaned mailbox entry {key:?}"));
-                continue;
-            };
-            // TAKE, never clone: the receiver now owns the bytes, and a second
-            // copy here would grow this record forever (crate header,
-            // "retention"). the RECORD stays — it is `runs`' permanent turn
-            // claim.
-            let Some(outcome) = dispatch.outcome.take() else {
-                self.note(
-                    ctx,
-                    format!("dropped mailbox entry {key:?} with no recorded outcome"),
-                );
-                continue;
-            };
-            dispatch.status = Status::Delivered;
-            dispatch.updated_at = now;
-            ctx.emit_msg(Msg {
-                target: dispatch.receiver.clone(),
-                payload: encode_result_event(&ResultEvent {
-                    dispatch_id: dispatch.dispatch_id.clone(),
-                    recipe_id: dispatch.recipe_id.clone(),
-                    outcome,
-                }),
-            });
-            // strictly smaller than the record that already passed the cap.
-            self.staged
-                .stage(dispatch_key_of(&key), encode_dispatch(&dispatch));
+            return Self::same_call(&existing, &record);
         }
-        stage_mailbox(
+        // CAPACITY AT ADMISSION: the call takes one queue number now and one
+        // mailbox number at completion; both numberings are u64 and never
+        // reused, so both are proven here, ahead of every open call's slot.
+        let calls = staged_calls(&self.staged).await?;
+        let Some(next_call) = calls.next.checked_add(1) else {
+            return Err(Error::Module("call queue numbering exhausted".into()));
+        };
+        let reserved = self.reserve_completion().await?;
+        // PROVE THE FINALIZER CAN WRITE: the completed record is the queued
+        // one plus an outcome the host caps; if the largest outcome does not
+        // fit beside this payload, the payload is refused now, never at
+        // `CompleteCall`.
+        let worst_case = CallRecord {
+            status: CallRecordStatus::Completed {
+                outcome: CallOutcome::Applied {
+                    output: vec![0; sdk::MAX_OUTPUT_BYTES],
+                    assigned: vec![0; sdk::MAX_ASSIGNED_BYTES],
+                },
+            },
+            ..record.clone()
+        };
+        check_record(&encode_call(&worst_case), "completed call record")?;
+        // checked everything; stage everything.
+        records::stage_reservations(&mut self.staged, reserved);
+        self.staged
+            .stage(claim_key(&record.id), encode_claim(calls.next));
+        self.staged
+            .stage(call_key(calls.next), encode_call(&record));
+        stage_calls(
             &mut self.staged,
-            Mailbox {
-                head: end,
-                next: mailbox.next,
+            Calls {
+                head: calls.head,
+                next: next_call,
             },
         );
         Ok(())
+    }
+
+    /// a `CompleteCall` below the head: the host re-running a finalization
+    /// (recovery replay). a no-op when the outcome is the one recorded — by
+    /// summary, since a delivered call keeps only that — else an error, so a
+    /// finalizer that disagrees with the record can never be waved through.
+    async fn same_completion(
+        &self,
+        enqueued: u64,
+        id: &CallId,
+        outcome: &CallOutcome,
+    ) -> Result<(), Error> {
+        let Some(record) = staged_call(&self.staged, enqueued).await? else {
+            return Err(Error::Module(format!(
+                "completed call {enqueued} has no record"
+            )));
+        };
+        if record.id != *id {
+            return Err(Error::Module(format!(
+                "call {enqueued} is {}, not {}",
+                call_name(&record.id),
+                call_name(id)
+            )));
+        }
+        let recorded = match &record.status {
+            CallRecordStatus::Queued => {
+                return Err(Error::Module(format!(
+                    "call {enqueued} is below the queue head yet still queued"
+                )));
+            }
+            CallRecordStatus::Completed { outcome } => outcome.summary(),
+            CallRecordStatus::Delivered { outcome, .. } => outcome.clone(),
+        };
+        let same_outcome = recorded == outcome.summary();
+        if !same_outcome {
+            return Err(Error::Module(format!(
+                "call {enqueued} was already completed with a different outcome"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn on_complete_call(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        enqueued: u64,
+        id: CallId,
+        outcome: CallOutcome,
+    ) -> Result<(), Error> {
+        if !matches!(ctx.env().origin, Origin::System) {
+            return Err(Error::Module(
+                "CompleteCall is System-origin only (the host's finalizer)".into(),
+            ));
+        }
+        let calls = staged_calls(&self.staged).await?;
+        let already_completed = enqueued < calls.head;
+        if already_completed {
+            return self.same_completion(enqueued, &id, &outcome).await;
+        }
+        let at_head = enqueued == calls.head && enqueued < calls.next;
+        if !at_head {
+            return Err(Error::Module(format!(
+                "CompleteCall {enqueued} is out of order: the call queue head is {}",
+                calls.head
+            )));
+        }
+        let Some(mut record) = staged_call(&self.staged, enqueued).await? else {
+            return Err(Error::Module(format!("call {enqueued} has no record")));
+        };
+        if record.id != id {
+            return Err(Error::Module(format!(
+                "call {enqueued} is {}, not {}",
+                call_name(&record.id),
+                call_name(&id)
+            )));
+        }
+        let CallRecordStatus::Queued = record.status else {
+            return Err(Error::Module(format!(
+                "call {enqueued} at the queue head is not queued"
+            )));
+        };
+        record.status = CallRecordStatus::Completed { outcome };
+        let completed = encode_call(&record);
+        // admission proved the maximal outcome fits; the host's outcome is
+        // within its caps, so this holds — checked anyway, before any write.
+        check_record(&completed, "completed call record")?;
+        let mailbox = staged_mailbox(&self.staged).await?;
+        let Some(next_item) = mailbox.next.checked_add(1) else {
+            return Err(Error::Module("mailbox numbering exhausted".into()));
+        };
+        let remaining = self.consume_reservation().await?;
+        records::stage_reservations(&mut self.staged, remaining);
+        self.staged.stage(call_key(enqueued), completed);
+        self.staged.stage(
+            mailbox_key(mailbox.next),
+            encode_mail_entry(&MailEntry::Call { enqueued }),
+        );
+        stage_mailbox(
+            &mut self.staged,
+            Mailbox {
+                head: mailbox.head,
+                next: next_item,
+            },
+        );
+        stage_calls(
+            &mut self.staged,
+            Calls {
+                head: enqueued + 1,
+                next: calls.next,
+            },
+        );
+        Ok(())
+    }
+
+    // ---- the mailbox ---------------------------------------------------------------------
+
+    /// one committed mailbox entry as the host delivers it: target, payload
+    /// and cause all derived from the record the entry points at. a pointer
+    /// without its record, or a record without an outcome, is an error — the
+    /// host refuses to run the block on a corrupt queue rather than skip work.
+    async fn committed_item(&self, item: u64, entry: MailEntry) -> Result<PendingItem, Error> {
+        match entry {
+            MailEntry::Result { dispatch_key } => {
+                let Some(dispatch) = committed_dispatch(&self.staged, &dispatch_key).await? else {
+                    return Err(Error::Module(format!(
+                        "mailbox item {item} points at dispatch {dispatch_key:?}, which has no record"
+                    )));
+                };
+                let Some(outcome) = dispatch.outcome else {
+                    return Err(Error::Module(format!(
+                        "mailbox item {item} points at dispatch {dispatch_key:?}, which has no recorded outcome"
+                    )));
+                };
+                let item_ref = ItemRef {
+                    source: self.id.clone(),
+                    item,
+                };
+                Ok(PendingItem {
+                    item,
+                    target: dispatch.receiver,
+                    payload: encode_delivery(&Delivery::Result(ResultEvent {
+                        dispatch_id: dispatch.dispatch_id,
+                        recipe_id: dispatch.recipe_id,
+                        outcome,
+                    })),
+                    cause: Cause::Chain {
+                        root: match dispatch.cause {
+                            Cause::Direct => Root::Item(item_ref.clone()),
+                            Cause::Chain { root, .. } => root,
+                        },
+                        hop: Hop::Delivery(item_ref),
+                    },
+                })
+            }
+            MailEntry::Call { enqueued } => {
+                let Some(record) = committed_call(&self.staged, enqueued).await? else {
+                    return Err(Error::Module(format!(
+                        "mailbox item {item} points at call {enqueued}, which has no record"
+                    )));
+                };
+                let CallRecordStatus::Completed { outcome } = record.status else {
+                    return Err(Error::Module(format!(
+                        "mailbox item {item} points at call {enqueued}, which is not completed"
+                    )));
+                };
+                Ok(PendingItem {
+                    item,
+                    target: record.id.requester.clone(),
+                    payload: encode_delivery(&Delivery::CallCompleted(CallCompleted {
+                        id: record.id.clone(),
+                        account: record.account,
+                        outcome,
+                    })),
+                    cause: Cause::Chain {
+                        root: record.cause.root_for_call(&record.id),
+                        hop: Hop::Completion(record.id),
+                    },
+                })
+            }
+        }
+    }
+
+    /// the receipt a delivered dispatch leaves: its record with the outcome
+    /// TAKEN, never cloned — the receiver owns the bytes now, and a second copy
+    /// here would grow this record forever (module header, "retention") — and
+    /// the delivery outcome in its place. the RECORD stays — it is `runs`'
+    /// permanent turn claim.
+    async fn result_receipt(
+        &self,
+        dispatch_key: &str,
+        delivery: DeliveryOutcome,
+        now: u64,
+    ) -> Result<Receipt, Error> {
+        let Some(mut dispatch) = staged_dispatch(&self.staged, dispatch_key).await? else {
+            return Err(Error::Module(format!(
+                "dispatch {dispatch_key:?} in the mailbox has no record"
+            )));
+        };
+        let Some(_outcome) = dispatch.outcome.take() else {
+            return Err(Error::Module(format!(
+                "dispatch {dispatch_key:?} in the mailbox has no recorded outcome"
+            )));
+        };
+        dispatch.status = Status::Delivered { delivery };
+        dispatch.updated_at = now;
+        Ok(Receipt {
+            target: dispatch.receiver.clone(),
+            key: dispatch_key_of(dispatch_key),
+            record: encode_dispatch(&dispatch),
+        })
+    }
+
+    /// the receipt a delivered call leaves: its record with the outcome
+    /// reduced to its summary, plus the delivery outcome.
+    async fn call_receipt(
+        &self,
+        enqueued: u64,
+        delivery: DeliveryOutcome,
+    ) -> Result<Receipt, Error> {
+        let Some(mut record) = staged_call(&self.staged, enqueued).await? else {
+            return Err(Error::Module(format!(
+                "call {enqueued} in the mailbox has no record"
+            )));
+        };
+        let CallRecordStatus::Completed { outcome } = &record.status else {
+            return Err(Error::Module(format!(
+                "call {enqueued} in the mailbox is not completed"
+            )));
+        };
+        record.status = CallRecordStatus::Delivered {
+            outcome: outcome.summary(),
+            delivery,
+        };
+        Ok(Receipt {
+            target: record.id.requester.clone(),
+            key: call_key(enqueued),
+            record: encode_call(&record),
+        })
+    }
+
+    /// the breadcrumb a non-applied delivery leaves beside its receipt, so the
+    /// event stream shows the failure where it happened.
+    fn note_delivery_outcome(&self, ctx: &mut dyn Ctx, ack: &Ack) {
+        match &ack.outcome {
+            DeliveryOutcome::Applied => {}
+            DeliveryOutcome::Failed { reason } => self.note(
+                ctx,
+                format!(
+                    "delivery of mailbox item {} to {:?} failed: {reason}",
+                    ack.item, ack.target
+                ),
+            ),
+            DeliveryOutcome::Unrepresentable => self.note(
+                ctx,
+                format!(
+                    "delivery of mailbox item {} to {:?} was unrepresentable; retired with the fixed marker",
+                    ack.item, ack.target
+                ),
+            ),
+        }
     }
 
     async fn on_register_recipe(
@@ -735,11 +1161,93 @@ impl DispatchModule {
                 dispatch_id,
                 attempt,
             } => self.on_reassign(ctx, dispatch_id, attempt).await,
-            DispatchMsg::DeliverPending {} => self.on_deliver_pending(ctx).await,
-            // the block's EXISTENCE is the point (it carries the host's
-            // delivery injection); the op itself stages nothing.
+            DispatchMsg::Call {
+                invocation,
+                step,
+                account,
+                target,
+                payload,
+            } => {
+                self.on_call(
+                    ctx,
+                    CallFields {
+                        invocation,
+                        step,
+                        account,
+                        target,
+                        payload,
+                    },
+                )
+                .await
+            }
+            DispatchMsg::CompleteCall {
+                enqueued,
+                id,
+                outcome,
+            } => self.on_complete_call(ctx, enqueued, id, outcome).await,
+            // the block's EXISTENCE is the point (it gives the host's
+            // between-block pump a block to run in); the op stages nothing.
             DispatchMsg::Nudge {} => Ok(()),
         }
+    }
+
+    fn call_view(enqueued: u64, r: CallRecord) -> CallView {
+        CallView {
+            enqueued,
+            id: r.id,
+            account: r.account,
+            generation: r.generation,
+            target: r.target,
+            payload_digest: sha2::Sha256::digest(&r.payload).into(),
+            cause: r.cause,
+            status: match r.status {
+                CallRecordStatus::Queued => CallStatus::Queued,
+                CallRecordStatus::Completed { outcome } => CallStatus::Completed {
+                    outcome: outcome.summary(),
+                },
+                CallRecordStatus::Delivered { outcome, delivery } => {
+                    CallStatus::Delivered { outcome, delivery }
+                }
+            },
+        }
+    }
+
+    /// a queued call as the host runs it: the cause is the chain the
+    /// requester's admitting cause gives the call, with the call itself as
+    /// the hop.
+    fn pending_call(enqueued: u64, r: CallRecord) -> PendingCall {
+        PendingCall {
+            enqueued,
+            cause: Cause::Chain {
+                root: r.cause.root_for_call(&r.id),
+                hop: Hop::Call(r.id.clone()),
+            },
+            id: r.id,
+            account: r.account,
+            generation: r.generation,
+            target: r.target,
+            payload: r.payload,
+        }
+    }
+
+    /// the committed head batch of the call queue, in order. a number in the
+    /// queue without its record is an error (fail closed, like the mailbox).
+    async fn committed_pending_calls(&self) -> Result<Vec<PendingCall>, Error> {
+        let calls = committed_calls(&self.staged).await?;
+        let end = calls
+            .head
+            .saturating_add(MAX_DELIVERIES_PER_BLOCK as u64)
+            .min(calls.next);
+        let mut batch = Vec::new();
+        for enqueued in calls.head..end {
+            let Some(record) = committed_call(&self.staged, enqueued).await? else {
+                return Err(Error::Module(format!(
+                    "call {enqueued} in the queue has no record"
+                )));
+            };
+            batch.push(Self::pending_call(enqueued, record));
+        }
+        Ok(batch)
     }
 
     fn view(d: DispatchState) -> DispatchView {
@@ -747,16 +1255,41 @@ impl DispatchModule {
             dispatch_id: d.dispatch_id,
             recipe_id: d.recipe_id,
             receiver: d.receiver,
+            cause: d.cause,
             status: match d.status {
                 Status::AwaitingResult => DispatchStatus::AwaitingResult { saga_id: d.saga_id },
                 Status::AwaitingDelivery => DispatchStatus::AwaitingDelivery,
-                Status::Delivered => DispatchStatus::Delivered,
+                Status::Delivered { delivery } => DispatchStatus::Delivered { delivery },
             },
             outcome: d.outcome,
             created_at: d.created_at,
             updated_at: d.updated_at,
         }
     }
+}
+
+/// a readable call id for error messages: `requester/invocation#step`.
+fn call_name(id: &CallId) -> String {
+    format!("{}/{}#{}", id.requester, id.invocation, id.step)
+}
+
+/// the [`DispatchMsg::Call`] payload — one named value so the call handler
+/// takes two arguments instead of six.
+struct CallFields {
+    invocation: String,
+    step: u64,
+    account: AccountNumber,
+    target: ModuleId,
+    payload: Vec<u8>,
+}
+
+/// the write an acknowledgment leaves for a delivered item, decided before
+/// anything is staged: the target the item was addressed to (the ack's
+/// correlation check), and the receipt record under its key.
+struct Receipt {
+    target: ModuleId,
+    key: Vec<u8>,
+    record: Vec<u8>,
 }
 
 /// the [`DispatchMsg::RegisterRecipe`] payload minus its id — one named value
@@ -799,7 +1332,8 @@ impl Module for DispatchModule {
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), Error> {
         // route by origin: the saga module sends exactly one payload family
-        // (terminal callbacks); everything else is the admin/dispatch surface.
+        // (terminal callbacks); everything else — External, Module, Program,
+        // System — is the admin/queue surface, whose arms refuse by origin.
         match &ctx.env().origin {
             Origin::Module(m) if *m == self.saga => {
                 let payload = msg.payload.clone();
@@ -809,10 +1343,89 @@ impl Module for DispatchModule {
         }
     }
 
+    /// the committed mailbox head, at most [`MAX_DELIVERIES_PER_BLOCK`] items,
+    /// FIFO — COMMITTED state only, never the overlay: the host asks at a
+    /// block boundary and every validator must answer the same.
+    async fn pending_items(&self) -> Result<Vec<PendingItem>, Error> {
+        let mailbox = committed_mailbox(&self.staged).await?;
+        let end = mailbox
+            .head
+            .saturating_add(MAX_DELIVERIES_PER_BLOCK as u64)
+            .min(mailbox.next);
+        let mut items = Vec::new();
+        for item in mailbox.head..end {
+            let Some(entry) = committed_mail_entry(&self.staged, item).await? else {
+                return Err(Error::Module(format!(
+                    "mailbox item {item} in the queue has no entry"
+                )));
+            };
+            items.push(self.committed_item(item, entry).await?);
+        }
+        Ok(items)
+    }
+
+    /// retire the mailbox head with the host's acknowledgment. below the head
+    /// is a recovery replay (a no-op); above it is a host bug (an error); at
+    /// it, the ack's target must be the one the item derives to, and the item
+    /// is retired with the outcome on its receipt. the receipt drops the
+    /// outcome bytes, so it fits wherever the record did — except a `Failed`
+    /// reason larger than the room that made, which is an error the host
+    /// answers by retrying with `Unrepresentable` (fixed-size, always fits):
+    /// a reason is never truncated and never silently dropped.
+    async fn acknowledge(&mut self, ctx: &mut dyn Ctx, ack: &Ack) -> Result<(), Error> {
+        let mailbox = staged_mailbox(&self.staged).await?;
+        let already_retired = ack.item < mailbox.head;
+        if already_retired {
+            return Ok(());
+        }
+        let at_head = ack.item == mailbox.head && ack.item < mailbox.next;
+        if !at_head {
+            return Err(Error::Module(format!(
+                "acknowledgment of mailbox item {} is out of order: the head is {}",
+                ack.item, mailbox.head
+            )));
+        }
+        let Some(entry) = staged_mail_entry(&self.staged, ack.item).await? else {
+            return Err(Error::Module(format!(
+                "mailbox item {} at the head has no entry",
+                ack.item
+            )));
+        };
+        let now = ctx.env().consensus_time;
+        let receipt = match entry {
+            MailEntry::Result { dispatch_key } => {
+                self.result_receipt(&dispatch_key, ack.outcome.clone(), now)
+                    .await?
+            }
+            MailEntry::Call { enqueued } => {
+                self.call_receipt(enqueued, ack.outcome.clone()).await?
+            }
+        };
+        let correlated = ack.target == receipt.target;
+        if !correlated {
+            return Err(Error::Module(format!(
+                "acknowledgment of mailbox item {} names {:?}; the item is addressed to {:?}",
+                ack.item, ack.target, receipt.target
+            )));
+        }
+        check_record(&receipt.record, "delivery receipt")?;
+        self.staged.delete(mailbox_key(ack.item));
+        self.staged.stage(receipt.key, receipt.record);
+        stage_mailbox(
+            &mut self.staged,
+            Mailbox {
+                head: ack.item + 1,
+                next: mailbox.next,
+            },
+        );
+        self.note_delivery_outcome(ctx, ack);
+        Ok(())
+    }
+
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
-        // COMMITTED state only: the host's delivery injection reads
-        // PendingDeliveries between blocks, and a staged overlay must never
-        // leak into that decision.
+        // COMMITTED state only: the host's between-block pump reads
+        // PendingCalls and PendingDeliveries at a block boundary, and a
+        // staged overlay must never leak into that decision.
         match decode_query(req).map_err(Error::Module)? {
             DispatchQuery::Recipe { recipe_id } => Ok(encode_reply(&DispatchReply::Recipe(
                 committed_recipe(&self.staged, &recipe_id).await?,
@@ -828,6 +1441,18 @@ impl Module for DispatchModule {
             DispatchQuery::PendingDeliveries => Ok(encode_reply(
                 &DispatchReply::PendingDeliveries(committed_mailbox(&self.staged).await?.len()),
             )),
+            DispatchQuery::PendingCalls => Ok(encode_reply(&DispatchReply::PendingCalls(
+                self.committed_pending_calls().await?,
+            ))),
+            DispatchQuery::Call { id } => {
+                let view = match committed_claim(&self.staged, &id).await? {
+                    Some(enqueued) => committed_call(&self.staged, enqueued)
+                        .await?
+                        .map(|record| Self::call_view(enqueued, record)),
+                    None => None,
+                };
+                Ok(encode_reply(&DispatchReply::Call(view)))
+            }
         }
     }
 

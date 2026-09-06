@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 
 use super::{
-    AgentQuery, AgentRecord, AgentReply, AgentStatus, CONTEXT_WINDOW, ChannelAccess, ChatQuery,
+    ModelRecord, ModelStatus, CONTEXT_WINDOW, ChannelAccess, ChatQuery,
     ChatReply, Ctx, DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply,
     MAX_PAYLOAD_BYTES, MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule,
-    SagaOrigin, SiblingReadBudget, SkillRef, agent_decode_reply, agent_encode_query,
+    RunOrigin, SiblingReadBudget, SkillRef, 
     chat_decode_reply, chat_encode_query, dispatch_decode_reply, dispatch_encode_msg,
     dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply, files_encode_query,
     inject, recipe_id_for,
@@ -23,20 +23,9 @@ impl RunsModule {
         &self,
         ctx: &dyn Ctx,
         agent_id: &str,
-    ) -> Result<Option<AgentRecord>, String> {
-        let reply = ctx
-            .query(
-                &self.agent,
-                &agent_encode_query(&AgentQuery::Agent {
-                    agent_id: agent_id.to_string(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("agent registry query failed: {e}"))?;
-        match agent_decode_reply(&reply) {
-            Ok(AgentReply::Agent(record)) => Ok(record),
-            _ => Err("unexpected agent reply for an agent lookup".into()),
-        }
+    ) -> Result<Option<ModelRecord>, String> {
+        let _ = ctx;
+        Ok(self.model(agent_id).cloned())
     }
 
     /// The live registry record narrowed by this run's admission ceiling.
@@ -47,7 +36,7 @@ impl RunsModule {
         &self,
         ctx: &dyn Ctx,
         entry: &PendingState,
-    ) -> Result<Option<AgentRecord>, String> {
+    ) -> Result<Option<ModelRecord>, String> {
         Ok(self
             .agent_record(ctx, &entry.agent_id)
             .await?
@@ -64,28 +53,11 @@ impl RunsModule {
         &self,
         ctx: &dyn Ctx,
         agent_id: &str,
-    ) -> Result<Option<AgentRecord>, String> {
+    ) -> Result<Option<ModelRecord>, String> {
         Ok(self
             .agent_record(ctx, agent_id)
             .await?
-            .filter(|a| a.status == AgentStatus::Active))
-    }
-
-    /// every ACTIVE registered agent, sorted — the deterministic engagement
-    /// domain for `All` and `RoundRobin`.
-    pub(super) async fn active_agent_ids(&self, ctx: &dyn Ctx) -> Result<Vec<String>, String> {
-        let reply = ctx
-            .query(&self.agent, &agent_encode_query(&AgentQuery::Agents))
-            .await
-            .map_err(|e| format!("agent registry query failed: {e}"))?;
-        match agent_decode_reply(&reply) {
-            Ok(AgentReply::Agents(records)) => Ok(records
-                .into_iter()
-                .filter(|a| a.status == AgentStatus::Active)
-                .map(|a| a.agent_id)
-                .collect()),
-            _ => Err("unexpected agent reply for an agents listing".into()),
-        }
+            .filter(|a| a.status == ModelStatus::Active))
     }
 
     // ---- the turn claim --------------------------------------------------------
@@ -162,7 +134,7 @@ impl RunsModule {
                 &self.chat,
                 &chat_encode_query(&ChatQuery::Access {
                     channel_id: channel_id.to_string(),
-                    user: user.to_vec(),
+                    party: chat::Party::Key(user.to_vec()),
                 }),
             )
             .await
@@ -228,7 +200,7 @@ impl RunsModule {
     pub(super) async fn portable_inputs(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         extra: &[SkillRef],
     ) -> Result<envelope::PortableInputs, String> {
         self.portable_inputs_with_workspace(ctx, agent, agent, extra)
@@ -241,8 +213,8 @@ impl RunsModule {
     async fn portable_inputs_with_workspace(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
-        workspace_agent: &AgentRecord,
+        agent: &ModelRecord,
+        workspace_agent: &ModelRecord,
         extra: &[SkillRef],
     ) -> Result<envelope::PortableInputs, String> {
         let source_snapshot = match self.files.clone() {
@@ -299,7 +271,7 @@ impl RunsModule {
     pub(super) async fn prepare_dispatch(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         run_id: &str,
         channel_id: &str,
         anchor_seq: u64,
@@ -319,14 +291,19 @@ impl RunsModule {
     pub(super) async fn prepare_dispatch_with_context(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         run_id: &str,
         channel_id: &str,
         anchor_seq: u64,
-        delegation: Option<(&AgentRecord, &str)>,
+        delegation: Option<(&ModelRecord, &str)>,
         extra: &[SkillRef],
         budget: &SiblingReadBudget,
     ) -> Result<PreparedDispatch, String> {
+        let generation = self.active_generation(ctx, agent.account).await.map_err(|e| e.to_string())?;
+
+        let bytes = ctx.query(&self.chat, &chat_encode_query(&ChatQuery::Access { channel_id: channel_id.into(), party: chat::Party::Account(agent.account) })).await.map_err(|error| error.to_string())?;
+        let ChatReply::Access(access) = chat_decode_reply(&bytes)? else { return Err("unexpected program channel access reply".into()); };
+        if !access.may_read { return Err("program may not read the requested channel".into()); }
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
         let mut portable = match super::forge_source::parse_forge_channel(channel_id) {
             Some(item_ref) => {
@@ -389,6 +366,8 @@ impl RunsModule {
             ));
         }
         Ok(PreparedDispatch {
+            account: agent.account,
+            generation,
             thread_root,
             payload,
         })
@@ -400,12 +379,14 @@ impl RunsModule {
     pub(super) async fn prepare_page_dispatch(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         run_id: &str,
         thread_id: &str,
         ordinal: u64,
         budget: &SiblingReadBudget,
     ) -> Result<PreparedDispatch, String> {
+        let generation = self.active_generation(ctx, agent.account).await.map_err(|e| e.to_string())?;
+
         let pages = self
             .pages
             .as_deref()
@@ -433,10 +414,10 @@ impl RunsModule {
             .cloned()
             .ok_or_else(|| format!("pages comment is missing: {thread_id}/{ordinal}"))?;
         let author = match &comment.author {
-            pages::AuthorRef::User(key) => format!("user:{}", crate::hex(key)),
-            pages::AuthorRef::Agent { module, agent_id } => format!("{module}/{agent_id}"),
-            pages::AuthorRef::Module(module) => format!("module:{module}"),
-            pages::AuthorRef::System => "system".into(),
+            pages::Party::Key(key) => format!("user:{}", crate::hex(key)),
+            pages::Party::Account(account) => format!("account:{account}"),
+            pages::Party::Module(module) => format!("module:{module}"),
+            pages::Party::System => "system".into(),
         };
         let block_reply = ctx
             .query(
@@ -476,6 +457,8 @@ impl RunsModule {
             ));
         }
         Ok(PreparedDispatch {
+            account: agent.account,
+            generation,
             thread_root: None,
             payload,
         })
@@ -493,7 +476,7 @@ impl RunsModule {
         agent_id: String,
         channel_id: String,
         anchor_seq: u64,
-        requester: SagaOrigin,
+        requester: RunOrigin,
         prepared: PreparedDispatch,
         demands: BTreeMap<String, u64>,
     ) {
@@ -522,7 +505,7 @@ impl RunsModule {
         workspace_agent_id: String,
         channel_id: String,
         anchor_seq: u64,
-        requester: SagaOrigin,
+        requester: RunOrigin,
         prepared: PreparedDispatch,
         demands: BTreeMap<String, u64>,
         authority: Option<super::RunAuthority>,
@@ -543,6 +526,9 @@ impl RunsModule {
         self.pending_overlay.insert(
             dispatch_id,
             Some(PendingState {
+                account: prepared.account,
+                generation: prepared.generation,
+                cause: ctx.env().cause.clone(),
                 run_id: run_id.to_string(),
                 workspace_agent_id,
                 agent_id,

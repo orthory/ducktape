@@ -49,8 +49,11 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Config, Engine, Store};
 
 use sdk::{
-    Ctx, Env as SdkEnv, Error as SdkError, Event, MerkleStore, Module, ModuleId, Msg,
-    Origin as SdkOrigin, ROOT_LEN, ResolverSyncTarget, StateRoot, StateSyncHandle,
+    Ack as SdkAck, CallId as SdkCallId, Cause as SdkCause, Ctx,
+    DeliveryOutcome as SdkDeliveryOutcome, Env as SdkEnv, Error as SdkError, Event, Hop as SdkHop,
+    ItemRef as SdkItemRef, MerkleStore, Module, ModuleId, Msg, Origin as SdkOrigin,
+    PendingItem as SdkPendingItem, ROOT_LEN, ResolverSyncTarget, Root as SdkRoot, StateRoot,
+    StateSyncHandle,
 };
 
 mod bindings {
@@ -79,6 +82,7 @@ mod bindings {
             "ducktape:module/host.object-put": trappable,
             "ducktape:module/host.emit-msg": trappable,
             "ducktape:module/host.emit-event": trappable,
+            "ducktape:module/host.set-output": trappable,
             "ducktape:module/host.set-assigned": trappable,
         },
     });
@@ -86,8 +90,10 @@ mod bindings {
 
 use bindings::Module as ModuleWorld;
 use bindings::ducktape::module::host::{
-    self, Backing as WitBacking, Env as WitEnv, Error as WitError, ModuleShape as WitShape,
-    Origin as WitOrigin,
+    self, Ack as WitAck, Backing as WitBacking, CallId as WitCallId, Cause as WitCause,
+    Chain as WitChain, ChangeRef as WitChangeRef, DeliveryOutcome as WitDeliveryOutcome,
+    Env as WitEnv, Error as WitError, Hop as WitHop, ItemRef as WitItemRef,
+    ModuleShape as WitShape, Origin as WitOrigin, PendingItem as WitPendingItem, Root as WitRoot,
 };
 
 /// where a wasm module's COMMITTED state lives: the kind a component declares
@@ -527,7 +533,10 @@ struct HostData {
     object_puts: BTreeMap<Vec<u8>, Vec<u8>>,
     out_msgs: Vec<(String, Vec<u8>)>,
     out_events: Vec<(String, Vec<u8>)>,
-    out_assigned: Vec<u8>,
+    /// the op's declared output ([`sdk::Ctx::set_output`]): last write wins,
+    /// `None` when the dispatch declared nothing.
+    out_output: sdk::Declared,
+    out_assigned: sdk::Declared,
     /// the store-resource ceilings this round runs under ([`GuestLimits`]).
     /// Lives in the store DATA because a wasmtime limiter is a projection out
     /// of `T` — every `Store::new` in this crate pairs with a `.limiter()` that
@@ -682,20 +691,23 @@ impl host::Host for HostData {
         self.out_events.push((source, payload));
         Ok(())
     }
-    /// the stamp carries the module-assigned scalars of one applied op, so it
-    /// is capped at [`sdk::MAX_ASSIGNED_BYTES`] — the SAME cap the host applies
-    /// after `execute` returns, moved to the call that allocates. a stamp
-    /// REPLACES the previous one, so only the meter charge accumulates.
-    fn set_assigned(&mut self, stamp: Vec<u8>) -> wasmtime::Result<()> {
-        if stamp.len() > sdk::MAX_ASSIGNED_BYTES {
-            return Err(wasmtime::Error::msg(format!(
-                "assigned stamp exceeds cap ({} > {})",
-                stamp.len(),
-                sdk::MAX_ASSIGNED_BYTES
-            )));
+    /// Retain only bounded declarations. Validation runs after the guest returns,
+    /// so rejection and error precedence match native execution.
+    fn set_output(&mut self, bytes: Vec<u8>) -> wasmtime::Result<()> {
+        let within_cap = bytes.len() <= sdk::MAX_OUTPUT_BYTES;
+        if within_cap {
+            self.charge(bytes.len())?;
         }
-        self.charge(stamp.len())?;
-        self.out_assigned = stamp;
+        self.out_output.declare(bytes, sdk::MAX_OUTPUT_BYTES);
+        Ok(())
+    }
+
+    fn set_assigned(&mut self, stamp: Vec<u8>) -> wasmtime::Result<()> {
+        let within_cap = stamp.len() <= sdk::MAX_ASSIGNED_BYTES;
+        if within_cap {
+            self.charge(stamp.len())?;
+        }
+        self.out_assigned.declare(stamp, sdk::MAX_ASSIGNED_BYTES);
         Ok(())
     }
 }
@@ -704,12 +716,13 @@ impl host::Host for HostData {
 /// sees. every arm is host-computed and identical on all validators.
 fn to_wit_error(e: SdkError) -> WitError {
     match e {
-        SdkError::UnknownModule(_) => WitError::NotFound,
-        SdkError::QueryUnsupported | SdkError::SyncUnsupported | SdkError::SwapUnsupported => {
-            WitError::Unsupported
-        }
-        SdkError::Module(m) => WitError::Rejected(m),
-        other => WitError::Rejected(other.to_string()),
+        SdkError::UnknownModule(id) => WitError::UnknownModule(id),
+        SdkError::SelfQuery => WitError::SelfQuery,
+        SdkError::QueryUnsupported => WitError::Unsupported,
+        SdkError::SyncUnsupported => WitError::SyncUnsupported,
+        SdkError::SwapUnsupported => WitError::SwapUnsupported,
+        SdkError::BudgetExceeded => WitError::BudgetExceeded,
+        SdkError::Module(message) => WitError::Rejected(message),
     }
 }
 
@@ -1160,12 +1173,45 @@ impl WasmModule {
         sealed: bool,
         req: &[u8],
         fuel: u64,
-    ) -> QueryRound {
+    ) -> ReadRound<Vec<u8>> {
         // committed-only tenants (opt-in) answer queries from committed state
         // alone: the staged overlay is dropped for this read. execute rounds are
         // untouched — and a query round never writes, so an empty stage is a pure
         // read-view change, not a loss of read-your-writes.
-        let staged = if self.committed_queries {
+        let committed_only = self.committed_queries;
+        self.read_round(env, memo, sealed, committed_only, fuel, |inst, store| {
+            inst.call_query(store, req)
+        })
+    }
+
+    /// one round of the guest's `pending-items` export: COMMITTED state only
+    /// (the host asks at a block boundary, and the answer must not observe a
+    /// staged overlay), ctx-less and sealed like a plain query.
+    fn pending_items_round(
+        &self,
+        env: WitEnv,
+        memo: SiblingMemo,
+        fuel: u64,
+    ) -> ReadRound<Vec<WitPendingItem>> {
+        self.read_round(env, memo, true, true, fuel, |inst, store| {
+            inst.call_pending_items(store)
+        })
+    }
+
+    /// the shared read-round runner behind [`WasmModule::query_round`] and
+    /// [`WasmModule::pending_items_round`]: instantiate over a throwaway copy
+    /// of the state view (`committed_only` drops the staged overlay), drive
+    /// ONE read export, and hand back its outcome with the replay bookkeeping.
+    fn read_round<R>(
+        &self,
+        env: WitEnv,
+        memo: SiblingMemo,
+        sealed: bool,
+        committed_only: bool,
+        fuel: u64,
+        call: impl FnOnce(&ModuleWorld, &mut Store<HostData>) -> wasmtime::Result<Result<R, WitError>>,
+    ) -> ReadRound<R> {
+        let staged = if committed_only {
             BTreeMap::new()
         } else {
             self.staged.clone()
@@ -1188,23 +1234,24 @@ impl WasmModule {
             object_puts: BTreeMap::new(),
             out_msgs: Vec::new(),
             out_events: Vec::new(),
-            out_assigned: Vec::new(),
+            out_output: sdk::Declared::Nothing,
+            out_assigned: sdk::Declared::Nothing,
             limits: GuestLimits::default(),
             host_bytes,
         };
         let mut store = Store::new(&self.engine, data);
         store.limiter(|d| &mut d.limits.0);
-        let call: Result<Result<Vec<u8>, WitError>, SdkError> = match store.set_fuel(fuel) {
+        let outcome: Result<Result<R, WitError>, SdkError> = match store.set_fuel(fuel) {
             Err(e) => Err(module_err(e)),
             Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker) {
                 Err(e) => Err(module_err(e)),
-                Ok(inst) => inst.call_query(&mut store, req).map_err(module_err),
+                Ok(inst) => call(&inst, &mut store).map_err(module_err),
             },
         };
         let fuel_left = store.get_fuel().unwrap_or(0);
         let data = store.into_data();
-        QueryRound {
-            outcome: call.and_then(|r| r.map_err(wit_err)),
+        ReadRound {
+            outcome: outcome.and_then(|r| r.map_err(wit_err)),
             memo: data.memo,
             pending: data.pending,
             fuel_left,
@@ -1212,12 +1259,12 @@ impl WasmModule {
     }
 }
 
-/// what one [`WasmModule::query_round`] round hands back to its driver.
-struct QueryRound {
-    outcome: Result<Vec<u8>, SdkError>,
+/// what one [`WasmModule::read_round`] round hands back to its driver.
+struct ReadRound<R> {
+    outcome: Result<R, SdkError>,
     memo: SiblingMemo,
     pending: Option<PendingRead>,
-    /// the round's UNSPENT fuel — the next round's whole budget. one query
+    /// the round's UNSPENT fuel — the next round's whole budget. one read
     /// spends one [`DEFAULT_FUEL`], however many rounds it replays.
     fuel_left: u64,
 }
@@ -1363,7 +1410,120 @@ fn to_wit_env(env: &SdkEnv) -> WitEnv {
         origin: match &env.origin {
             SdkOrigin::External(id) => WitOrigin::External(id.clone()),
             SdkOrigin::Module(id) => WitOrigin::FromModule(id.clone()),
+            SdkOrigin::Program(account) => WitOrigin::Program(*account),
             SdkOrigin::System => WitOrigin::System,
+        },
+        cause: to_wit_cause(&env.cause),
+    }
+}
+
+/// the ctx-less env a sealed read round runs under: no block, no origin, no
+/// chain — the guest reads its own committed state and nothing else.
+fn sealed_env(me: &str) -> WitEnv {
+    WitEnv {
+        height: 0,
+        consensus_time: 0,
+        me: me.to_string(),
+        origin: WitOrigin::System,
+        cause: WitCause::Direct,
+    }
+}
+
+// ---- the causal-context and queue types, both directions --------------------
+//
+// the exact inverses of guest-adapter's `*_from_wit` / `*_to_wit`, so a value
+// that crosses the boundary in and out reads the same on the host as it did in
+// the guest.
+
+fn to_wit_call_id(id: &SdkCallId) -> WitCallId {
+    WitCallId {
+        requester: id.requester.clone(),
+        invocation: id.invocation.clone(),
+        step: id.step,
+    }
+}
+
+fn call_id_from_wit(id: WitCallId) -> SdkCallId {
+    SdkCallId {
+        requester: id.requester,
+        invocation: id.invocation,
+        step: id.step,
+    }
+}
+
+fn to_wit_item_ref(item: &SdkItemRef) -> WitItemRef {
+    WitItemRef {
+        source: item.source.clone(),
+        item: item.item,
+    }
+}
+
+fn item_ref_from_wit(item: WitItemRef) -> SdkItemRef {
+    SdkItemRef {
+        source: item.source,
+        item: item.item,
+    }
+}
+
+fn to_wit_cause(cause: &SdkCause) -> WitCause {
+    match cause {
+        SdkCause::Direct => WitCause::Direct,
+        SdkCause::Chain { root, hop } => WitCause::Chain(WitChain {
+            root: match root {
+                SdkRoot::Item(item) => WitRoot::Item(to_wit_item_ref(item)),
+                SdkRoot::Call(id) => WitRoot::Call(to_wit_call_id(id)),
+                SdkRoot::Change { source, seq } => WitRoot::Change(WitChangeRef {
+                    source: source.clone(),
+                    seq: *seq,
+                }),
+            },
+            hop: match hop {
+                SdkHop::Delivery(item) => WitHop::Delivery(to_wit_item_ref(item)),
+                SdkHop::Call(id) => WitHop::Call(to_wit_call_id(id)),
+                SdkHop::Completion(id) => WitHop::Completion(to_wit_call_id(id)),
+            },
+        }),
+    }
+}
+
+fn cause_from_wit(cause: WitCause) -> SdkCause {
+    match cause {
+        WitCause::Direct => SdkCause::Direct,
+        WitCause::Chain(chain) => SdkCause::Chain {
+            root: match chain.root {
+                WitRoot::Item(item) => SdkRoot::Item(item_ref_from_wit(item)),
+                WitRoot::Call(id) => SdkRoot::Call(call_id_from_wit(id)),
+                WitRoot::Change(change) => SdkRoot::Change {
+                    source: change.source,
+                    seq: change.seq,
+                },
+            },
+            hop: match chain.hop {
+                WitHop::Delivery(item) => SdkHop::Delivery(item_ref_from_wit(item)),
+                WitHop::Call(id) => SdkHop::Call(call_id_from_wit(id)),
+                WitHop::Completion(id) => SdkHop::Completion(call_id_from_wit(id)),
+            },
+        },
+    }
+}
+
+fn pending_item_from_wit(item: WitPendingItem) -> SdkPendingItem {
+    SdkPendingItem {
+        item: item.item,
+        target: item.target,
+        payload: item.payload,
+        cause: cause_from_wit(item.cause),
+    }
+}
+
+fn to_wit_ack(ack: &SdkAck) -> WitAck {
+    WitAck {
+        item: ack.item,
+        target: ack.target.clone(),
+        outcome: match &ack.outcome {
+            SdkDeliveryOutcome::Applied => WitDeliveryOutcome::Applied,
+            SdkDeliveryOutcome::Failed { reason } => WitDeliveryOutcome::Failed(reason.clone()),
+            SdkDeliveryOutcome::Unrepresentable => WitDeliveryOutcome::Unrepresentable,
         },
     }
 }
@@ -1376,7 +1536,15 @@ fn module_err(e: impl std::fmt::Display) -> SdkError {
 }
 
 fn wit_err(e: WitError) -> SdkError {
-    SdkError::Module(format!("{e:?}"))
+    match e {
+        WitError::UnknownModule(id) => SdkError::UnknownModule(id),
+        WitError::SelfQuery => SdkError::SelfQuery,
+        WitError::Unsupported => SdkError::QueryUnsupported,
+        WitError::SyncUnsupported => SdkError::SyncUnsupported,
+        WitError::SwapUnsupported => SdkError::SwapUnsupported,
+        WitError::BudgetExceeded => SdkError::BudgetExceeded,
+        WitError::Rejected(message) => SdkError::Module(message),
+    }
 }
 
 /// the 32-byte content hash of a component — the code identity the registry
@@ -1389,6 +1557,215 @@ fn sha256(bytes: &[u8]) -> Vec<u8> {
 /// (`sha256(refs_bytes)`), where a `StateRoot` needs the array, not a `Vec`.
 fn sha256_array(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+#[derive(Clone, Copy)]
+enum Mutation {
+    Execute,
+    Acknowledge,
+}
+
+struct Declarations {
+    output: Option<Vec<u8>>,
+    assigned: Option<Vec<u8>>,
+}
+
+impl Mutation {
+    fn declarations(
+        self,
+        module: &str,
+        messages: usize,
+        output: sdk::Declared,
+        assigned: sdk::Declared,
+    ) -> Result<Declarations, SdkError> {
+        match self {
+            Self::Execute => Ok(Declarations {
+                output: output.into_value("op output")?,
+                assigned: assigned.into_value("op assigned stamp")?,
+            }),
+            Self::Acknowledge => {
+                let has_followups = messages != 0;
+                if has_followups {
+                    return Err(SdkError::Module(format!(
+                        "{module}: an acknowledgment emitted {messages} follow-up intents; none are allowed"
+                    )));
+                }
+                Ok(Declarations {
+                    output: None,
+                    assigned: assigned.into_value("acknowledgment assigned stamp")?,
+                })
+            }
+        }
+    }
+}
+
+impl WasmModule {
+    /// the shared MUTATING round loop behind [`Module::execute`] and
+    /// [`Module::acknowledge`]: memoized replay of one writing export over
+    /// the pre-dispatch stage, publishing its staged writes and intents only
+    /// when a round finishes clean. `call` drives the export against a fresh
+    /// instance each round.
+    async fn run_mutating(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        mutation: Mutation,
+        call: impl Fn(&ModuleWorld, &mut Store<HostData>) -> wasmtime::Result<Result<(), WitError>>,
+    ) -> Result<(), SdkError> {
+        let env = to_wit_env(ctx.env());
+        // capture the block height for the boundary: an Odb backing stamps it into
+        // its durable-height envelope at commit. every dispatch this block carries
+        // the same height, so re-setting it per dispatch is idempotent.
+        self.block_height = Some(env.height);
+        // every replay round re-runs the pure guest over the SAME pre-dispatch
+        // stage: an aborted round's writes must not leak into the next, or a
+        // replay could observe (e.g. double-apply) its own discarded effects.
+        let staged0 = std::mem::take(&mut self.staged);
+        // the object-plane twin of `staged0`: this block's staged puts so far.
+        // each round re-seeds its overlay from this and the pure guest re-issues
+        // its puts on top, so the overlay is identical across replay rounds.
+        let staged_objects0 = std::mem::take(&mut self.staged_objects);
+        let mut memo = SiblingMemo::default();
+        // ONE budget for the whole dispatch: each round starts with what the
+        // previous round left (see [`DEFAULT_FUEL`]). At zero the next round
+        // traps out of fuel immediately — the same deterministic rejection a
+        // single-round exhaustion produces.
+        let mut fuel_left = self.fuel;
+        while memo.within_budgets() {
+            // move map-backed committed + memo into owned per-round data;
+            // staged is a copy. store-backed rounds carry an empty map and
+            // resolve committed reads through the injected store instead.
+            let round_committed = match &mut self.backing {
+                StateBacking::Map { committed } => std::mem::take(committed),
+                StateBacking::Store { .. } => BTreeMap::new(),
+                // seed the round with the one refs entry; the guest reads it
+                // staged-over via the state lane. the backing keeps ownership of
+                // the committed refs (unlike Map's move-in/reclaim), so this
+                // round's copy is discarded after the call.
+                StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
+            };
+            let round_staged = staged0.clone();
+            let round_objects = staged_objects0.clone();
+            // charged for the block's stage + staged objects before the guest
+            // adds a byte (see `MAX_HOST_BYTES`).
+            let host_bytes = staged_bytes(&round_staged) + object_bytes(&round_objects);
+            let data = HostData {
+                env: Some(env.clone()),
+                committed: round_committed,
+                staged: round_staged,
+                memo: std::mem::take(&mut memo),
+                pending: None,
+                sealed: false,
+                store_backed: self.is_store_backed(),
+                object_puts: round_objects,
+                out_msgs: Vec::new(),
+                out_events: Vec::new(),
+                out_output: sdk::Declared::Nothing,
+                out_assigned: sdk::Declared::Nothing,
+                limits: GuestLimits::default(),
+                host_bytes,
+            };
+            let mut store = Store::new(&self.engine, data);
+            store.limiter(|d| &mut d.limits.0);
+
+            let outcome: Result<Result<(), WitError>, SdkError> = match store.set_fuel(fuel_left) {
+                Err(e) => Err(module_err(e)),
+                Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
+                {
+                    Err(e) => Err(module_err(e)),
+                    Ok(inst) => call(&inst, &mut store).map_err(module_err),
+                },
+            };
+            // carry the unspent fuel into the next replay round.
+            fuel_left = store.get_fuel().unwrap_or(0);
+
+            // reclaim state regardless of outcome (a trap leaves the moved-in
+            // state in the store; take it back so the module is never left empty).
+            let data = store.into_data();
+            if let StateBacking::Map { committed } = &mut self.backing {
+                *committed = data.committed;
+            }
+            memo = data.memo;
+
+            // a paused run: resolve the read (own store, odb backing, or host
+            // ctx) and replay.
+            if let Some(read) = data.pending {
+                match read {
+                    PendingRead::State(key) => match self.resolve_state_read(&key).await {
+                        Ok(answer) => {
+                            memo.states.insert(key, answer);
+                        }
+                        // a refused store read (bad key shape, store error) is
+                        // a deterministic rejection of the whole op.
+                        Err(e) => {
+                            self.staged = staged0;
+                            self.staged_objects = staged_objects0;
+                            return Err(e);
+                        }
+                    },
+                    read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_)) => {
+                        self.resolve_object_read(read, &mut memo);
+                    }
+                    read @ (PendingRead::Root(_) | PendingRead::Query(_, _)) => {
+                        memo.resolve(&*ctx, read).await;
+                    }
+                }
+                continue;
+            }
+
+            return match outcome {
+                Ok(Ok(())) => {
+                    let declarations = mutation.declarations(
+                        &self.id,
+                        data.out_msgs.len(),
+                        data.out_output,
+                        data.out_assigned,
+                    );
+                    let Declarations { output, assigned } = match declarations {
+                        Ok(values) => values,
+                        Err(error) => {
+                            self.staged = staged0;
+                            self.staged_objects = staged_objects0;
+                            return Err(error);
+                        }
+                    };
+                    self.staged = data.staged;
+                    // a clean dispatch promotes its staged puts into the block
+                    // accumulator (this dispatch's puts on top of the block's).
+                    self.staged_objects = data.object_puts;
+                    // only a clean execute publishes its intents; a rejection leaks nothing.
+                    for (target, payload) in data.out_msgs {
+                        ctx.emit_msg(Msg { target, payload });
+                    }
+                    for (source, payload) in data.out_events {
+                        ctx.emit_event(Event { source, payload });
+                    }
+                    if let Some(output) = output {
+                        ctx.set_output(output);
+                    }
+                    if let Some(assigned) = assigned {
+                        ctx.set_assigned(assigned);
+                    }
+                    Ok(())
+                }
+                // a rejected op stages nothing: the pre-dispatch overlays are
+                // restored (the host aborts the whole block on any execute
+                // error, so this only keeps the module-local invariant clean).
+                Ok(Err(e)) => {
+                    self.staged = staged0;
+                    self.staged_objects = staged_objects0;
+                    Err(wit_err(e))
+                }
+                Err(e) => {
+                    self.staged = staged0;
+                    self.staged_objects = staged_objects0;
+                    Err(e)
+                }
+            };
+        }
+        self.staged = staged0;
+        self.staged_objects = staged_objects0;
+        Err(memo.budget_error())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -1515,144 +1892,49 @@ impl Module for WasmModule {
     }
 
     async fn execute(&mut self, ctx: &mut dyn Ctx, msg: &Msg) -> Result<(), SdkError> {
-        let env = to_wit_env(ctx.env());
-        // capture the block height for the boundary: an Odb backing stamps it into
-        // its durable-height envelope at commit. every dispatch this block carries
-        // the same height, so re-setting it per dispatch is idempotent.
-        self.block_height = Some(env.height);
-        // every replay round re-runs the pure guest over the SAME pre-dispatch
-        // stage: an aborted round's writes must not leak into the next, or a
-        // replay could observe (e.g. double-apply) its own discarded effects.
-        let staged0 = std::mem::take(&mut self.staged);
-        // the object-plane twin of `staged0`: this block's staged puts so far.
-        // each round re-seeds its overlay from this and the pure guest re-issues
-        // its puts on top, so the overlay is identical across replay rounds.
-        let staged_objects0 = std::mem::take(&mut self.staged_objects);
+        self.run_mutating(ctx, Mutation::Execute, |inst, store| {
+            inst.call_execute(store, &msg.payload)
+        })
+        .await
+    }
+
+    async fn pending_items(&self) -> Result<Vec<SdkPendingItem>, SdkError> {
+        // every backing runs the guest's export: what a tenant has queued is
+        // the guest's to declare, whichever substrate holds its state.
+        let env = sealed_env(&self.id);
         let mut memo = SiblingMemo::default();
-        // ONE budget for the whole dispatch: each round starts with what the
-        // previous round left (see [`DEFAULT_FUEL`]). At zero the next round
-        // traps out of fuel immediately — the same deterministic rejection a
-        // single-round exhaustion produces.
         let mut fuel_left = self.fuel;
         while memo.within_budgets() {
-            // move map-backed committed + memo into owned per-round data;
-            // staged is a copy. store-backed rounds carry an empty map and
-            // resolve committed reads through the injected store instead.
-            let round_committed = match &mut self.backing {
-                StateBacking::Map { committed } => std::mem::take(committed),
-                StateBacking::Store { .. } => BTreeMap::new(),
-                // seed the round with the one refs entry; the guest reads it
-                // staged-over via the state lane. the backing keeps ownership of
-                // the committed refs (unlike Map's move-in/reclaim), so this
-                // round's copy is discarded after the call.
-                StateBacking::Odb { backing } => odb_committed(backing.as_ref(), &self.odb_config),
-            };
-            let round_staged = staged0.clone();
-            let round_objects = staged_objects0.clone();
-            // charged for the block's stage + staged objects before the guest
-            // adds a byte (see `MAX_HOST_BYTES`).
-            let host_bytes = staged_bytes(&round_staged) + object_bytes(&round_objects);
-            let data = HostData {
-                env: Some(env.clone()),
-                committed: round_committed,
-                staged: round_staged,
-                memo: std::mem::take(&mut memo),
-                pending: None,
-                sealed: false,
-                store_backed: self.is_store_backed(),
-                object_puts: round_objects,
-                out_msgs: Vec::new(),
-                out_events: Vec::new(),
-                out_assigned: Vec::new(),
-                limits: GuestLimits::default(),
-                host_bytes,
-            };
-            let mut store = Store::new(&self.engine, data);
-            store.limiter(|d| &mut d.limits.0);
-
-            let call: Result<Result<(), WitError>, SdkError> = match store.set_fuel(fuel_left) {
-                Err(e) => Err(module_err(e)),
-                Ok(()) => match ModuleWorld::instantiate(&mut store, &self.component, &self.linker)
-                {
-                    Err(e) => Err(module_err(e)),
-                    Ok(inst) => inst
-                        .call_execute(&mut store, &msg.payload)
-                        .map_err(module_err),
-                },
-            };
-            // carry the unspent fuel into the next replay round.
-            fuel_left = store.get_fuel().unwrap_or(0);
-
-            // reclaim state regardless of outcome (a trap leaves the moved-in
-            // state in the store; take it back so the module is never left empty).
-            let data = store.into_data();
-            if let StateBacking::Map { committed } = &mut self.backing {
-                *committed = data.committed;
+            let round = self.pending_items_round(env.clone(), memo, fuel_left);
+            memo = round.memo;
+            fuel_left = round.fuel_left;
+            match round.pending {
+                None => {
+                    return round
+                        .outcome
+                        .map(|items| items.into_iter().map(pending_item_from_wit).collect());
+                }
+                Some(PendingRead::State(key)) => {
+                    let answer = self.resolve_state_read(&key).await?;
+                    memo.states.insert(key, answer);
+                }
+                Some(read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_))) => {
+                    self.resolve_object_read(read, &mut memo);
+                }
+                Some(PendingRead::Root(_) | PendingRead::Query(_, _)) => {
+                    unreachable!("sealed runs never pause on sibling reads")
+                }
             }
-            memo = data.memo;
-
-            // a paused run: resolve the read (own store, odb backing, or host
-            // ctx) and replay.
-            if let Some(read) = data.pending {
-                match read {
-                    PendingRead::State(key) => match self.resolve_state_read(&key).await {
-                        Ok(answer) => {
-                            memo.states.insert(key, answer);
-                        }
-                        // a refused store read (bad key shape, store error) is
-                        // a deterministic rejection of the whole op.
-                        Err(e) => {
-                            self.staged = staged0;
-                            self.staged_objects = staged_objects0;
-                            return Err(e);
-                        }
-                    },
-                    read @ (PendingRead::ObjectStat(_) | PendingRead::ObjectGet(_)) => {
-                        self.resolve_object_read(read, &mut memo);
-                    }
-                    read @ (PendingRead::Root(_) | PendingRead::Query(_, _)) => {
-                        memo.resolve(&*ctx, read).await;
-                    }
-                }
-                continue;
-            }
-
-            return match call {
-                Ok(Ok(())) => {
-                    self.staged = data.staged;
-                    // a clean dispatch promotes its staged puts into the block
-                    // accumulator (this dispatch's puts on top of the block's).
-                    self.staged_objects = data.object_puts;
-                    // only a clean execute publishes its intents; a rejection leaks nothing.
-                    for (target, payload) in data.out_msgs {
-                        ctx.emit_msg(Msg { target, payload });
-                    }
-                    for (source, payload) in data.out_events {
-                        ctx.emit_event(Event { source, payload });
-                    }
-                    if !data.out_assigned.is_empty() {
-                        ctx.set_assigned(data.out_assigned);
-                    }
-                    Ok(())
-                }
-                // a rejected op stages nothing: the pre-dispatch overlays are
-                // restored (the host aborts the whole block on any execute
-                // error, so this only keeps the module-local invariant clean).
-                Ok(Err(e)) => {
-                    self.staged = staged0;
-                    self.staged_objects = staged_objects0;
-                    Err(wit_err(e))
-                }
-                Err(e) => {
-                    self.staged = staged0;
-                    self.staged_objects = staged_objects0;
-                    Err(e)
-                }
-            };
         }
-        self.staged = staged0;
-        self.staged_objects = staged_objects0;
         Err(memo.budget_error())
+    }
+
+    async fn acknowledge(&mut self, ctx: &mut dyn Ctx, ack: &SdkAck) -> Result<(), SdkError> {
+        let ack = to_wit_ack(ack);
+        self.run_mutating(ctx, Mutation::Acknowledge, |inst, store| {
+            inst.call_acknowledge(store, &ack)
+        })
+        .await
     }
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, SdkError> {
@@ -1669,12 +1951,7 @@ impl Module for WasmModule {
         // host-routed reads go through `query_with` instead, which resolves
         // them for real. committed-STORE reads still replay (the injected store
         // is this module's own state; no ctx needed).
-        let env = WitEnv {
-            height: 0,
-            consensus_time: 0,
-            me: self.id.clone(),
-            origin: WitOrigin::System,
-        };
+        let env = sealed_env(&self.id);
         let mut memo = SiblingMemo::default();
         let mut fuel_left = self.fuel;
         while memo.within_budgets() {
@@ -2010,8 +2287,9 @@ mod bounds {
             "at the cap"
         );
         assert!(
-            host::Host::set_assigned(&mut data, vec![0u8; sdk::MAX_ASSIGNED_BYTES + 1]).is_err(),
-            "over the cap"
+            host::Host::set_assigned(&mut data, vec![0u8; sdk::MAX_ASSIGNED_BYTES + 1]).is_ok(),
+            "declaration is checked after guest execution"
         );
+        assert!(data.out_assigned.into_value("op assigned stamp").is_err());
     }
 }

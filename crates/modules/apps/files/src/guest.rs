@@ -65,10 +65,9 @@
 use std::collections::BTreeMap;
 
 use duckfs_core::{
-    decode_block_objects, decode_msg, encode_block_objects, encode_refs, Fs, FilesMsg, ObjectStore,
-    PUTBLOB_FRAME_TAG,
+    decode_block_objects, encode_block_objects, encode_refs, Fs, ObjectStore,
 };
-use sdk::{Ctx, Error, Msg, Origin};
+use sdk::{Ctx, Error};
 
 /// the guest's SINGLE state key — the raw refs image, whose `sha256` the host
 /// derives the module root from (`StateBacking::Odb`). there is NO `__root`
@@ -90,71 +89,6 @@ const REFS_KEY: &[u8] = b"__state";
 /// in-memory `Pending::object_ids`.
 #[cfg(feature = "guest")]
 const BLOCK_OBJECTS_KEY: &[u8] = b"__block_objects";
-
-/// decode the op and delegate to the SAME [`Fs`] verb the native
-/// [`module`](crate::module) `execute` calls — arm-for-arm, no re-implemented
-/// decision. the acting identity is origin-derived (never the payload), exactly
-/// as native. generic over the store so the native test can drive it against an
-/// in-memory odb; the guest drives it against [`GuestOdb`].
-#[cfg(any(feature = "guest", test))]
-fn apply_op<S: ObjectStore>(
-    fs: &mut Fs<S>,
-    ctx: &mut dyn Ctx,
-    payload: &[u8],
-) -> Result<(), Error> {
-    let env = ctx.env().clone();
-    // the acting identity is origin-derived, never taken from the payload.
-    let actor = env.origin.actor_string();
-    // system maps to a module origin: it may register a watch for ANY module_id
-    // (the watch gate's `actor == "system"` branch), so it must be `is_module`.
-    let is_module = matches!(env.origin, Origin::Module(_) | Origin::System);
-    match payload.first() {
-        Some(&PUTBLOB_FRAME_TAG) => fs
-            .putblob(&actor, env.height, &payload[1..])
-            .map_err(Error::Module),
-        _ => match decode_msg(payload).map_err(Error::Module)? {
-            FilesMsg::Commit {
-                base_snapshot,
-                message,
-                changes,
-            } => {
-                let notifications = fs
-                    .commit(
-                        &actor,
-                        env.height,
-                        env.consensus_time,
-                        base_snapshot,
-                        message,
-                        changes,
-                    )
-                    .map_err(Error::Module)?;
-                // watch fan-out: each notification becomes a follow-up msg at the
-                // watching module (the task-9 `duckfs_notify` JSON shape),
-                // re-dispatched after execute returns — identical to native.
-                for n in notifications {
-                    let payload = n.payload();
-                    ctx.emit_msg(Msg {
-                        target: n.module_id,
-                        payload,
-                    });
-                }
-                Ok(())
-            }
-            FilesMsg::Pin { snapshot, name } => fs
-                .pin(&actor, env.height, snapshot, name)
-                .map_err(Error::Module),
-            FilesMsg::Unpin { name } => {
-                fs.unpin(&actor, env.height, name).map_err(Error::Module)
-            }
-            FilesMsg::Watch { prefix, module_id } => fs
-                .watch(&actor, env.height, is_module, prefix, module_id)
-                .map_err(Error::Module),
-            FilesMsg::Unwatch { prefix, module_id } => fs
-                .unwatch(&actor, env.height, is_module, prefix, module_id)
-                .map_err(Error::Module),
-        },
-    }
-}
 
 /// the two staged host writes one guest dispatch produces: the new refs image
 /// (under [`REFS_KEY`] — the root preimage) and the new block-object index
@@ -185,7 +119,7 @@ pub struct Dispatched {
 /// reject-then-`abort_block` sequence (the whole block's `__block_objects` and
 /// refs stage are discarded together).
 #[cfg(any(feature = "guest", test))]
-pub fn dispatch<S: ObjectStore>(
+pub async fn dispatch<S: ObjectStore>(
     fs: &mut Fs<S>,
     ctx: &mut dyn Ctx,
     payload: &[u8],
@@ -197,7 +131,7 @@ pub fn dispatch<S: ObjectStore>(
         Some(bytes) => decode_block_objects(bytes).map_err(Error::Module)?,
     };
     fs.seed_block_objects(height, index);
-    apply_op(fs, ctx, payload)?;
+    crate::adapter::apply_op(fs, ctx, payload).await?;
     // the updated index (prior-dispatch + this dispatch) to re-stage; read
     // before commit_block takes the pending.
     let block_objects = encode_block_objects(&fs.block_objects());
@@ -227,17 +161,7 @@ mod entry {
     use super::{dispatch, BLOCK_OBJECTS_KEY, REFS_KEY};
     use duckfs_core::{decode_refs, Fs, Refs};
     use guest_adapter::{host, GuestOdb, WitCtx};
-    use sdk::Error;
-
-    /// map an inner sdk error onto the wit surface — `Module` is the native
-    /// rejection verbatim (the INVERSE of the host's `to_wit_error`), so a
-    /// rejection reads identically whether files ran native or wasm.
-    fn to_wit_error(e: Error) -> host::Error {
-        match e {
-            Error::Module(m) => host::Error::Rejected(m),
-            other => host::Error::Rejected(other.to_string()),
-        }
-    }
+    use guest_adapter::{block_on, error_to_wit};
 
     /// the wasm-facing entry surface. all object I/O rides [`GuestOdb`]; the
     /// refs image rides the host `state-*` lane under [`REFS_KEY`]. a zero-sized
@@ -267,11 +191,8 @@ mod entry {
             let mut fs = Self::load()?;
             let mut ctx = WitCtx::new();
             let block_objects = host::state_get(BLOCK_OBJECTS_KEY);
-            // NOTE: no `block_on` — every `Fs` verb is synchronous (unlike the
-            // native `Module::execute` async signature the store-backed guests
-            // drive), so the guest applies the op straight-line.
-            let out = dispatch(&mut fs, &mut ctx, &payload, block_objects.as_deref())
-                .map_err(to_wit_error)?;
+            let out = block_on(dispatch(&mut fs, &mut ctx, &payload, block_objects.as_deref()))
+                .map_err(error_to_wit)?;
             host::state_set(REFS_KEY, &out.refs_image);
             host::state_set(BLOCK_OBJECTS_KEY, &out.block_objects);
             Ok(())
@@ -306,6 +227,14 @@ mod entry {
 
         fn query(req: Vec<u8>) -> Result<Vec<u8>, host::Error> {
             FilesGuest::query(req)
+        }
+
+        fn pending_items() -> Result<Vec<host::PendingItem>, host::Error> {
+            Ok(Vec::new())
+        }
+
+        fn acknowledge(_ack: host::Ack) -> Result<(), host::Error> {
+            Err(host::Error::Unsupported)
         }
     }
 
@@ -389,6 +318,7 @@ mod tests {
                 consensus_time: time,
                 origin: Origin::System,
                 me: "files".into(),
+                cause: sdk::Cause::Direct,
             },
             msgs: Vec::new(),
         }
@@ -422,12 +352,12 @@ mod tests {
             let Dispatched {
                 refs_image,
                 block_objects,
-            } = dispatch(
+            } = futures::executor::block_on(dispatch(
                 &mut fs,
                 &mut ctx_at(height, time),
                 payload,
                 self.block_objects.as_deref(),
-            )?;
+            ))?;
             self.refs_image = Some(refs_image);
             self.block_objects = Some(block_objects);
             Ok(())
@@ -493,14 +423,14 @@ mod tests {
     /// origin, height/time 1) — the single-sourced verb, no guest seam.
     fn apply_native(fs: &mut Fs<MemStore>, payload: &[u8]) -> Result<(), String> {
         match payload.first() {
-            Some(&duckfs_core::PUTBLOB_FRAME_TAG) => fs.putblob("system", 1, &payload[1..]),
+            Some(&duckfs_core::PUTBLOB_FRAME_TAG) => fs.putblob(&duckfs_core::Authority::System, 1, &payload[1..]),
             _ => match duckfs_core::decode_msg(payload)? {
                 FilesMsg::Commit {
                     base_snapshot,
                     message,
                     changes,
                 } => fs
-                    .commit("system", 1, 1, base_snapshot, message, changes)
+                    .commit(&duckfs_core::Authority::System, 1, 1, base_snapshot, message, changes)
                     .map(|_| ()),
                 other => panic!("test only drives commits/putblob, got {other:?}"),
             },

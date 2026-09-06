@@ -37,6 +37,7 @@ fn at(consensus_time: u64) -> TestCtx {
         consensus_time,
         origin: sdk::Origin::External(vec![1u8; 32]),
         me: "forge".into(),
+        cause: sdk::Cause::Direct,
     })
 }
 

@@ -1,67 +1,21 @@
 use super::{
-    AuthorRef, BTreeMap, Block, BlockKind, Error, MAX_BLOCK_LEN, MAX_MOVE_SUBTREE_READS,
-    MAX_PAGE_DEPTH, MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT, MAX_PAGE_TITLE_LEN, MAX_PAGES,
-    MAX_TRAVERSAL_WORK, MerkleStore, ModuleId, PAGE_INDEX_KEY, PageBlockPage, PageError, Pages,
-    StagedStore, to_page_err,
+    BTreeMap, Block, BlockKind, Error, MAX_BLOCK_LEN, MAX_MOVE_SUBTREE_READS, MAX_PAGE_DEPTH,
+    MAX_PAGE_QUERY_BYTES, MAX_PAGE_QUERY_LIMIT, MAX_PAGE_TITLE_LEN, MAX_PAGES, MAX_TRAVERSAL_WORK,
+    MerkleStore, ModuleId, PAGE_INDEX_KEY, PageBlockPage, PageError, Pages, StagedStore,
+    to_page_err,
 };
 
-/// reserved logical-key prefix for a page's recorded author — leads with NUL
-/// like the comment records, so it can never collide with a client-minted
-/// block/page id.
-const PAGE_AUTHOR_PREFIX: &str = "\u{0}pa:";
-
-fn page_author_key(page_id: &str) -> String {
-    format!("{PAGE_AUTHOR_PREFIX}{page_id}")
-}
-
 impl Pages {
-    /// load the author recorded for the page `page_id` names, through the
-    /// staged-over-committed overlay. `None` only when no `CreatePage`/
-    /// page-creating `InsertBlock` ever ran for this id — a decode failure is
-    /// corruption.
-    pub(super) async fn load_page_author(
-        &self,
-        page_id: &str,
-    ) -> Result<Option<AuthorRef>, PageError> {
-        match self.get(page_author_key(page_id).as_bytes()).await {
-            Some(b) => Ok(Some(
-                serde_json::from_slice(&b).map_err(|_| PageError::Corrupt)?,
-            )),
-            None => Ok(None),
-        }
-    }
-
-    /// stage the author of record for the page `page_id` names — written once,
-    /// at the page's creation.
-    pub(super) fn store_page_author(
-        &mut self,
-        page_id: &str,
-        author: &AuthorRef,
-    ) -> Result<(), PageError> {
-        self.stage(
-            &page_author_key(page_id),
-            serde_json::to_vec(author).expect("author serializable"),
-        )
-    }
-
-    /// whether `actor` may mutate a block belonging to page `page_id` — the
-    /// one predicate every block-op arm consults. author-only: the page's
-    /// recorded author (set once, at creation, from the creating origin) is
-    /// the sole principal admitted. Pages carry no collaborator/editor list
-    /// today, so there is no ACL to consult here; broadening this past the
-    /// author is a product decision, not a bug fix. A missing author record
-    /// can only mean a page block staged directly into the store outside
-    /// `apply` (a test fixture) — real pages always get one at creation — so
-    /// it is treated as unowned rather than refused.
+    /// The page's canonical author owns mutations to all its ordinary blocks.
+    /// A nested page owns its own document, while moves also require authority
+    /// over the old and new containing pages.
     pub(super) async fn may_edit(
         &self,
         page_id: &str,
-        actor: &AuthorRef,
+        authority: &super::Authority,
     ) -> Result<bool, PageError> {
-        Ok(match self.load_page_author(page_id).await? {
-            Some(author) => author == *actor,
-            None => true,
-        })
+        let page = self.require_block(page_id, PageError::Corrupt).await?;
+        Ok(authority.owns(&page.author))
     }
 
     /// wrap the host-constructed store under module identity `id`. sync — the
@@ -70,13 +24,19 @@ impl Pages {
         Self {
             id: id.into(),
             staged: StagedStore::new(store),
-            tagging: None,
+            attribution: None,
+            identity: None,
         }
     }
 
-    /// Report newly-added comments to the shared engagement router.
-    pub fn with_tagging(mut self, tagging: impl Into<ModuleId>) -> Self {
-        self.tagging = Some(tagging.into());
+    /// Publish every changed block and comment relation set to attribution.
+    pub fn with_attribution(mut self, attribution: impl Into<ModuleId>) -> Self {
+        self.attribution = Some(attribution.into());
+        self
+    }
+
+    pub fn with_identity(mut self, identity: impl Into<ModuleId>) -> Self {
+        self.identity = Some(identity.into());
         self
     }
 
@@ -182,7 +142,6 @@ impl Pages {
             let mut index = self.load_index().await.map_err(to_page_err)?;
             for page_id in removed_pages {
                 index.remove(&page_id);
-                self.delete_block(&page_author_key(&page_id));
             }
             self.stage_index(&index)?;
         }

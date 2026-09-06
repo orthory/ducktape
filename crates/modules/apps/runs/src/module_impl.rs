@@ -1,15 +1,13 @@
 use super::{
     Ctx, Error, Event, Module, ModuleId, Msg, Origin, RunAuthorityView, RunsModule, RunsQuery,
-    RunsReply, SiblingReadBudget, StateRoot, StateSyncHandle, WatchView, committed_root,
-    decode_query, dispatch_id_for, encode_reply,
+    RunsReply, SiblingReadBudget, StateRoot, StateSyncHandle, committed_root, decode_query,
+    dispatch_id_for, encode_reply,
 };
 
 #[derive(Clone, Copy)]
 enum ExecuteKind {
-    Engagement,
     Result,
     Jobs,
-    Agent,
     Saga,
     Chat,
     Admin,
@@ -62,10 +60,8 @@ impl RunsModule {
             return ExecuteKind::Admin;
         };
         [
-            (Some(self.tagging.as_str()), ExecuteKind::Engagement),
             (Some(self.dispatch.as_str()), ExecuteKind::Result),
             (self.jobs.as_deref(), ExecuteKind::Jobs),
-            (Some(self.agent.as_str()), ExecuteKind::Agent),
             (Some(self.saga.as_str()), ExecuteKind::Saga),
             (Some(self.chat.as_str()), ExecuteKind::Chat),
         ]
@@ -74,29 +70,42 @@ impl RunsModule {
         .unwrap_or(ExecuteKind::Admin)
     }
 
-    async fn execute_engagement(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
-        let budget = SiblingReadBudget::default();
-        self.on_engagement(
-            &mut BudgetCtx {
-                inner: ctx,
-                budget: &budget,
-            },
-            payload,
-            &budget,
-        )
-        .await
-    }
-
     async fn execute_result(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
         let budget = SiblingReadBudget::default();
+        let event = dispatch::decode_result_event(payload).map_err(Error::Module)?;
+        let entry = self.pending_entry(&event.dispatch_id).cloned();
+        let mut effects = super::action_requests::EffectsCtx {
+            inner: ctx,
+            messages: Vec::new(),
+        };
         self.on_result_event(
             &mut BudgetCtx {
-                inner: ctx,
+                inner: &mut effects,
                 budget: &budget,
             },
             payload,
         )
-        .await
+        .await?;
+        let messages = std::mem::take(&mut effects.messages);
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        for (index, message) in messages.into_iter().enumerate() {
+            let job_lifecycle = self.jobs.as_ref() == Some(&message.target)
+                && tasks::decode_job_msg(&message.payload).is_ok();
+            let lifecycle = message.target == self.dispatch || job_lifecycle;
+            if lifecycle {
+                effects.inner.emit_msg(message);
+                continue;
+            }
+            self.stage_action_request(
+                &entry,
+                format!("{}/result/{index}", entry.run_id),
+                super::action_requests::RequestScope::Result,
+                message,
+            )?;
+        }
+        Ok(())
     }
 
     async fn execute_jobs(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
@@ -109,17 +118,6 @@ impl RunsModule {
             payload,
         )
         .await
-    }
-
-    fn execute_agent(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
-        let budget = SiblingReadBudget::default();
-        self.on_agent_event(
-            &mut BudgetCtx {
-                inner: ctx,
-                budget: &budget,
-            },
-            payload,
-        )
     }
 
     fn drop_saga_callback(&mut self, ctx: &mut dyn Ctx) -> Result<(), Error> {
@@ -161,10 +159,12 @@ impl Module for RunsModule {
     /// the snapshot encoding.
     fn root(&self) -> StateRoot {
         committed_root(
-            &self.watches,
+            &self.action_requests,
+            self.next_action_item,
             &self.pending,
             &self.sessions,
             &self.delegations,
+            &self.models,
         )
     }
 
@@ -176,10 +176,8 @@ impl Module for RunsModule {
         // The one visible origin dispatch. Each arm delegates once to a
         // budgeted handler whose stack-owned ledger spans that whole execute.
         match self.execute_kind(&ctx.env().origin) {
-            ExecuteKind::Engagement => self.execute_engagement(ctx, &msg.payload).await,
             ExecuteKind::Result => self.execute_result(ctx, &msg.payload).await,
             ExecuteKind::Jobs => self.execute_jobs(ctx, &msg.payload).await,
-            ExecuteKind::Agent => self.execute_agent(ctx, &msg.payload),
             ExecuteKind::Saga => self.drop_saga_callback(ctx),
             ExecuteKind::Chat => self.drop_chat_follow_up(ctx),
             ExecuteKind::Admin => self.execute_admin(ctx, msg).await,
@@ -188,6 +186,19 @@ impl Module for RunsModule {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
+            RunsQuery::Model { query } => {
+                let reply = match query {
+                    crate::ModelQuery::Agents => crate::ModelReply::Agents(self.model_records()),
+                    crate::ModelQuery::Agent { agent_id } => {
+                        crate::ModelReply::Agent(self.model(&agent_id).cloned())
+                    }
+                };
+                Ok(encode_reply(&RunsReply::Model(reply)))
+            }
+            RunsQuery::ActionRequest { request_id } | RunsQuery::ActionPlan { request_id } => Ok(encode_reply(&RunsReply::ActionRequest(
+                self.action_request(&request_id)
+                    .map(|request| request.view.clone()),
+            ))),
             RunsQuery::PendingRuns => {
                 let runs = Self::visible_ids(&self.pending, &self.pending_overlay)
                     .into_iter()
@@ -197,18 +208,6 @@ impl Module for RunsModule {
                     })
                     .collect();
                 Ok(encode_reply(&RunsReply::PendingRuns(runs)))
-            }
-            RunsQuery::Watches => {
-                let watches = Self::visible_ids(&self.watches, &self.pending_watches)
-                    .into_iter()
-                    .filter_map(|channel_id| {
-                        self.watch(&channel_id).map(|policy| WatchView {
-                            channel_id: channel_id.clone(),
-                            policy: policy.clone(),
-                        })
-                    })
-                    .collect();
-                Ok(encode_reply(&RunsReply::Watches(watches)))
             }
             RunsQuery::RecentRuns => Ok(encode_reply(&RunsReply::RecentRuns(
                 // newest first: the ring appends at the back.
@@ -246,16 +245,38 @@ impl Module for RunsModule {
         }
     }
 
+    async fn pending_items(&self) -> Result<Vec<sdk::PendingItem>, Error> {
+        Ok(self.action_deliveries())
+    }
+
+    async fn acknowledge(&mut self, ctx: &mut dyn Ctx, ack: &sdk::Ack) -> Result<(), Error> {
+        self.acknowledge_action(ctx, ack)
+    }
+
+    async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
+        match decode_query(req).map_err(Error::Module)? {
+            RunsQuery::ActionRequest { request_id } => Ok(encode_reply(&RunsReply::ActionRequest(
+                self.action_view(ctx, &request_id).await?,
+            ))),
+            _ => self.query(req).await,
+        }
+    }
+
     async fn commit_block(&mut self) -> Result<(), Error> {
-        for (id, staged) in std::mem::take(&mut self.pending_watches) {
-            match staged {
-                Some(policy) => {
-                    self.watches.insert(id, policy);
+        for (id, record) in std::mem::take(&mut self.pending_models) {
+            match record {
+                Some(record) => {
+                    self.models.insert(id, record);
                 }
                 None => {
-                    self.watches.remove(&id);
+                    self.models.remove(&id);
                 }
             }
+        }
+        self.action_requests
+            .append(&mut self.pending_action_requests);
+        if let Some(next) = self.staged_next_action_item.take() {
+            self.next_action_item = next;
         }
         for (dispatch_id, staged) in std::mem::take(&mut self.pending_overlay) {
             match staged {
@@ -297,7 +318,9 @@ impl Module for RunsModule {
     }
 
     async fn abort_block(&mut self) -> Result<(), Error> {
-        self.pending_watches.clear();
+        self.pending_models.clear();
+        self.pending_action_requests.clear();
+        self.staged_next_action_item = None;
         self.pending_overlay.clear();
         self.pending_sessions.clear();
         self.pending_delegations.clear();

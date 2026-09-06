@@ -56,9 +56,10 @@ pub type SyncProof = Proof<merkle::mmr::Family, SyncDigest>;
 
 /// the codec read-config for [`SyncOp`] — MUST mirror the journal codec config
 /// every module's store is built with (fixed-width key => `()`, value bounded
-/// at 1 MiB). a mismatch would reject ops the source's own journal accepted.
+/// at [`sdk::MAX_STORE_VALUE_BYTES`]). a mismatch would reject ops the
+/// source's own journal accepted.
 fn op_read_cfg() -> ((), (RangeCfg<usize>, ())) {
-    ((), (RangeCfg::from(0..=1 << 20), ()))
+    ((), (RangeCfg::from(0..=sdk::MAX_STORE_VALUE_BYTES), ()))
 }
 
 /// generous ceiling on proof digests per response (proofs are O(log n) in
@@ -76,11 +77,14 @@ const MAX_OPS_PER_BATCH: u64 = 4096;
 /// (tasks, pages) walk straight into that assert. [`serve`] trims a batch to
 /// the largest op prefix that fits; the sync engine resumes by location, so a
 /// shorter batch is progress, never an error. sized so one op carrying the
-/// largest value the journal codec admits (1 MiB) plus a proof and pinned
-/// nodes at their decode ceilings always fits. bin/node compile-asserts this
-/// stays under its `MAX_MESSAGE_SIZE` with rpc-envelope headroom.
+/// largest value the journal codec admits ([`sdk::MAX_STORE_VALUE_BYTES`])
+/// plus a proof and pinned nodes at their decode ceilings always fits.
+/// bin/node compile-asserts this stays under its `MAX_MESSAGE_SIZE` with
+/// rpc-envelope headroom.
 pub const MAX_MODULE_REPLY_BYTES: usize = (1 << 21) - (64 << 10);
-const _: () = assert!(MAX_MODULE_REPLY_BYTES >= (1 << 20) + 2 * MAX_PROOF_DIGESTS * 32 + 4096);
+const _: () = assert!(
+    MAX_MODULE_REPLY_BYTES >= sdk::MAX_STORE_VALUE_BYTES + 2 * MAX_PROOF_DIGESTS * 32 + 4096
+);
 
 // ============================================================================
 // the request body a module's `serve_sync` understands.

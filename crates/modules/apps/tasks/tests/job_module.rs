@@ -29,7 +29,7 @@ const JOBS: &str = "tasks";
 /// `Box<dyn MerkleStore>`. these tests assert BEHAVIOR, so the in-memory store
 /// stands in for qmdb; the real-store round trip lives in `sync_round_trip`.
 fn jobs_on_mem() -> Jobs {
-    Jobs::new(JOBS, Box::new(MemStore::new()))
+    Jobs::new(JOBS, "identity", "attribution", Box::new(MemStore::new()))
 }
 
 // ---- wire builders ---------------------------------------------------------
@@ -103,14 +103,8 @@ fn ext(id: &str) -> Origin {
 /// the module's own external-actor derivation, mirrored so tests can name the
 /// exact worker/submitter string an external origin produces: `ext:` +
 /// lowercase hex (domain-separated from module ids and "system").
-fn actor(id: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::from("ext:");
-    for &b in id.as_bytes() {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    out
+fn actor(id: &str) -> tasks::Party {
+    tasks::Party::Key(id.as_bytes().to_vec())
 }
 
 // ---- a configurable dispatch ctx (height + origin) -------------------------
@@ -122,6 +116,12 @@ fn ctx(height: u64, origin: Origin) -> TestCtx {
         consensus_time: 0,
         origin,
         me: JOBS.into(),
+        cause: sdk::Cause::Direct,
+    })
+    .on_query("identity", |_| {
+        Ok(identity::encode_reply(&identity::IdentityReply::Account(
+            None,
+        )))
     })
 }
 
@@ -737,9 +737,15 @@ fn identities_are_derived_from_origin() {
         apply(&mut jobs, 1, ext("alice"), submit("j-ext", "k", "")).await;
         apply(&mut jobs, 1, Origin::System, submit("j-sys", "k", "")).await;
 
-        assert_eq!(get(&jobs, "j-mod").await.unwrap().submitter, "agent");
+        assert_eq!(
+            get(&jobs, "j-mod").await.unwrap().submitter,
+            tasks::Party::Module("agent".into())
+        );
         assert_eq!(get(&jobs, "j-ext").await.unwrap().submitter, actor("alice"));
-        assert_eq!(get(&jobs, "j-sys").await.unwrap().submitter, "system");
+        assert_eq!(
+            get(&jobs, "j-sys").await.unwrap().submitter,
+            tasks::Party::System
+        );
 
         // the pre-consensus empty-external default is not an authenticated actor.
         let err = stage(
@@ -864,7 +870,7 @@ fn claim_attempt_saturates_instead_of_wrapping() {
             "job_id": "j1",
             "kind": "k",
             "spec": "spec",
-            "submitter": "ext:00",
+            "submitter": {"key": [0]},
             "status": "pending",
             "attempt": u64::MAX,
             "claim": null,
@@ -882,7 +888,7 @@ fn claim_attempt_saturates_instead_of_wrapping() {
             ])
             .await
             .expect("seed the store");
-        let mut jobs = Jobs::new(JOBS, Box::new(store));
+        let mut jobs = Jobs::new(JOBS, "identity", "attribution", Box::new(store));
 
         apply(&mut jobs, 5, ext("worker-a"), claim("j1", 50)).await;
         let job = get(&jobs, "j1").await.expect("exists");
@@ -1037,6 +1043,15 @@ impl Module for ClaimingWorker {
 fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
     block_on(async {
         let mut host = Host::genesis(vec![
+            Box::new(identity::Identity::new(
+                "identity",
+                Box::new(MemStore::new()),
+                "test".into(),
+            )),
+            Box::new(attribution::AttributionModule::new(
+                "attribution",
+                Box::new(MemStore::new()),
+            )),
             Box::new(jobs_on_mem()),
             Box::new(ClaimingWorker { id: "agent".into() }),
         ])
@@ -1059,8 +1074,8 @@ fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
         let job = host_get(&host, "j1").await.expect("job exists");
         assert_eq!(job.status, JobStatus::Processing);
         assert_eq!(
-            job.claim.as_ref().map(|claim| claim.worker.as_str()),
-            Some("agent"),
+            job.claim.as_ref().map(|claim| &claim.worker),
+            Some(&tasks::Party::Module("agent".into())),
             "the worker identity is host-assigned from the module origin"
         );
         assert_eq!(
@@ -1074,7 +1089,19 @@ fn host_submit_fans_out_to_registered_worker_and_claims_same_block() {
 #[test]
 fn host_first_claim_wins_across_ordered_blocks() {
     block_on(async {
-        let mut host = Host::genesis(vec![Box::new(jobs_on_mem())]).expect("genesis");
+        let mut host = Host::genesis(vec![
+            Box::new(identity::Identity::new(
+                "identity",
+                Box::new(MemStore::new()),
+                "test".into(),
+            )),
+            Box::new(attribution::AttributionModule::new(
+                "attribution",
+                Box::new(MemStore::new()),
+            )),
+            Box::new(jobs_on_mem()),
+        ])
+        .expect("genesis");
 
         host.submit_at(as_origin(1, ext("submitter")), submit("j1", "k", ""))
             .await
@@ -1131,6 +1158,15 @@ impl Module for DoubleClaim {
 fn host_two_claims_in_one_block_abort_atomically() {
     block_on(async {
         let mut host = Host::genesis(vec![
+            Box::new(identity::Identity::new(
+                "identity",
+                Box::new(MemStore::new()),
+                "test".into(),
+            )),
+            Box::new(attribution::AttributionModule::new(
+                "attribution",
+                Box::new(MemStore::new()),
+            )),
             Box::new(jobs_on_mem()),
             Box::new(DoubleClaim {
                 job_id: "j1".into(),

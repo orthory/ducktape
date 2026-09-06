@@ -71,6 +71,7 @@ fn ctx(height: u64, founder: &Ed) -> TestCtx {
         consensus_time: height,
         origin: Origin::External(ed_pub(founder)),
         me: "gateway".into(),
+        cause: sdk::Cause::Direct,
     })
     .on_query("identity", move |req| {
         match identity_decode_query(req).map_err(Error::Module)? {

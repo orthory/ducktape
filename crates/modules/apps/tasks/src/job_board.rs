@@ -47,7 +47,7 @@ use sdk::{Ctx, Error, ModuleId, Msg, Origin, StagedStore};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, actor_from_origin,
+    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, Party, controls,
     encode_job_event, stage_record,
 };
 
@@ -97,7 +97,7 @@ fn decode_job(bytes: &[u8]) -> Result<Job, Error> {
 // through the overlay. the `Get` query does NOT.
 
 /// the live view of a single job, reading through the staged overlay.
-async fn load(staged: &StagedStore, job_id: &str) -> Result<Option<Job>, Error> {
+pub(crate) async fn load(staged: &StagedStore, job_id: &str) -> Result<Option<Job>, Error> {
     let Some(bytes) = staged.get(&record_key(job_id)).await? else {
         return Ok(None);
     };
@@ -225,7 +225,7 @@ async fn submit(
     job_id: String,
     kind: String,
     spec: String,
-    origin: &Origin,
+    actor: &Party,
     height: u64,
 ) -> Result<JobsEvent, Error> {
     // enforce every size cap HERE, at execute time, with rejection -- so
@@ -256,7 +256,7 @@ async fn submit(
         )));
     }
 
-    let submitter = actor_from_origin(origin)?;
+    let submitter = actor.clone();
     let spec_hash = Sha256::digest(spec.as_bytes()).to_vec();
     stage_job(
         staged,
@@ -287,7 +287,7 @@ async fn claim(
     staged: &mut StagedStore,
     job_id: String,
     lease_views: u64,
-    origin: &Origin,
+    actor: &Party,
     height: u64,
 ) -> Result<(), Error> {
     let mut job = require(staged, &job_id).await?;
@@ -299,7 +299,7 @@ async fn claim(
             job.status
         )));
     }
-    let worker = actor_from_origin(origin)?;
+    let worker = actor.clone();
     job.status = JobStatus::Processing;
     job.attempt = job.attempt.saturating_add(1);
     job.claim = Some(Claim {
@@ -316,6 +316,7 @@ async fn finalize(
     job_id: String,
     ok: bool,
     payload: String,
+    actor: &Party,
     origin: &Origin,
     height: u64,
 ) -> Result<(), Error> {
@@ -328,8 +329,11 @@ async fn finalize(
             job.status
         )));
     }
-    let worker = actor_from_origin(origin)?;
-    if job.claim.as_ref().map(|c| c.worker.as_str()) != Some(worker.as_str()) {
+    let is_claimant = job
+        .claim
+        .as_ref()
+        .is_some_and(|claim| controls(&claim.worker, actor, origin));
+    if !is_claimant {
         return Err(Error::Module(format!(
             "only the current claimant may finalize: {job_id}"
         )));
@@ -352,6 +356,7 @@ async fn finalize(
 async fn release(
     staged: &mut StagedStore,
     job_id: String,
+    actor: &Party,
     origin: &Origin,
     height: u64,
 ) -> Result<(), Error> {
@@ -362,8 +367,11 @@ async fn release(
             job.status
         )));
     }
-    let worker = actor_from_origin(origin)?;
-    if job.claim.as_ref().map(|c| c.worker.as_str()) != Some(worker.as_str()) {
+    let is_claimant = job
+        .claim
+        .as_ref()
+        .is_some_and(|claim| controls(&claim.worker, actor, origin));
+    if !is_claimant {
         return Err(Error::Module(format!(
             "only the current claimant may release: {job_id}"
         )));
@@ -414,6 +422,7 @@ async fn reclaim(staged: &mut StagedStore, job_id: String, height: u64) -> Resul
 async fn cancel(
     staged: &mut StagedStore,
     job_id: String,
+    actor: &Party,
     origin: &Origin,
     height: u64,
 ) -> Result<(), Error> {
@@ -425,8 +434,7 @@ async fn cancel(
             job.status
         )));
     }
-    let actor = actor_from_origin(origin)?;
-    if job.submitter != actor {
+    if !controls(&job.submitter, actor, origin) {
         return Err(Error::Module(format!(
             "only the submitter may cancel: {job_id}"
         )));
@@ -436,7 +444,12 @@ async fn cancel(
     stage_job(staged, &job)
 }
 
-async fn prune(staged: &mut StagedStore, job_id: String, origin: &Origin) -> Result<(), Error> {
+async fn prune(
+    staged: &mut StagedStore,
+    job_id: String,
+    actor: &Party,
+    origin: &Origin,
+) -> Result<(), Error> {
     let job = require(staged, &job_id).await?;
     if !job.status.is_terminal() {
         return Err(Error::Module(format!(
@@ -444,8 +457,7 @@ async fn prune(staged: &mut StagedStore, job_id: String, origin: &Origin) -> Res
             job.status
         )));
     }
-    let actor = actor_from_origin(origin)?;
-    if job.submitter != actor {
+    if !controls(&job.submitter, actor, origin) {
         return Err(Error::Module(format!(
             "only the submitter may prune: {job_id}"
         )));
@@ -462,14 +474,16 @@ pub(crate) async fn execute(
     staged: &mut StagedStore,
     ctx: &mut dyn Ctx,
     msg: JobsMsg,
+    actor: &Party,
     module_id: &ModuleId,
 ) -> Result<(), Error> {
     let env = ctx.env();
     let (origin, height) = (env.origin.clone(), env.height);
     match msg {
         JobsMsg::Submit { job_id, kind, spec } => {
-            let event = submit(staged, job_id, kind, spec, &origin, height).await?;
-            for worker in load_workers(staged).await? {
+            let workers = load_workers(staged).await?;
+            let event = submit(staged, job_id, kind, spec, actor, height).await?;
+            for worker in workers {
                 ctx.emit_msg(Msg {
                     target: worker,
                     payload: encode_job_event(&event),
@@ -480,16 +494,16 @@ pub(crate) async fn execute(
         JobsMsg::Claim {
             job_id,
             lease_views,
-        } => claim(staged, job_id, lease_views, &origin, height).await,
+        } => claim(staged, job_id, lease_views, actor, height).await,
         JobsMsg::Finalize {
             job_id,
             ok,
             payload,
-        } => finalize(staged, job_id, ok, payload, &origin, height).await,
-        JobsMsg::Release { job_id } => release(staged, job_id, &origin, height).await,
+        } => finalize(staged, job_id, ok, payload, actor, &origin, height).await,
+        JobsMsg::Release { job_id } => release(staged, job_id, actor, &origin, height).await,
         JobsMsg::Reclaim { job_id } => reclaim(staged, job_id, height).await,
-        JobsMsg::Cancel { job_id } => cancel(staged, job_id, &origin, height).await,
-        JobsMsg::Prune { job_id } => prune(staged, job_id, &origin).await,
+        JobsMsg::Cancel { job_id } => cancel(staged, job_id, actor, &origin, height).await,
+        JobsMsg::Prune { job_id } => prune(staged, job_id, actor, &origin).await,
         JobsMsg::RegisterWorker {} => register_worker(staged, &origin, module_id).await,
         JobsMsg::UnregisterWorker {} => unregister_worker(staged, &origin, module_id).await,
     }

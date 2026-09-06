@@ -3,11 +3,13 @@ name = "agent"
 edition.workspace = true
 version.workspace = true
 
-# the agent registry: a self-contained record book (owner, capability tag,
-# curated skills, granted actions, status). saga supplies the canonical
-# origin mirror; capability the shared capability-tag shape rule (wire types
-# only).
-# everything that ACTS on agents lives in the runs module.
+# the programmable-user module: provisions keyless PROGRAM ACCOUNTS through
+# identity, binds each to a structured reaction program, and runs that
+# program deterministically in consensus — one invocation per attribution
+# change delivered to the account, advancing through queries, queued calls
+# (dispatch's call queue, run by the host as the program account) and
+# reports (attribution). no model, no compute, no signing key: external work
+# is a recipe dispatch whose result comes back as data.
 [features]
 # the wasm-guest port (src/guest.rs): the dispatch shell over
 # guest-adapter. non-default and wasm-only — enabled solely by the
@@ -19,30 +21,28 @@ guest = ["dep:guest-adapter"]
 # crate, pulled only when the guest build compiles this crate for wasm32.
 guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 sdk = { workspace = true }
+# the three siblings whose wire surfaces cross this edge: identity (the
+# program account and its control record), attribution (the change that
+# invokes a program, and the report a program emits), dispatch (the call
+# queue and the mailbox a call's completion returns through). wire types
+# and codecs only — no sibling's module logic is linked here.
+identity = { workspace = true }
+attribution = { workspace = true }
+dispatch = { workspace = true }
 # the store-record codec (and, for interface types, the stored-embedded
 # derive): compact, canonical, deterministic. wire stays sdk::wire.
 borsh = { workspace = true }
-# default-features = false: only the wire types (SagaOrigin) cross this edge,
-# and the `agent` guest builds this crate for wasm32 — saga's native-only
-# index module (indexer -> unix-only IO) must not ride along. a direct path
-# dep because workspace inheritance cannot switch default features off; the
-# workspace's own dep is the same path, and feature unification keeps native
-# binaries (which enable saga's default `native`) whole.
-saga = { path = "../../system/saga", default-features = false }
-capability = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-futures = "0.3"
+futures = { workspace = true }
 sdk-testkit = { workspace = true }
+# the dispatch-shape lint parses this crate's source as a Rust AST. already in
+# the graph (serde_derive, async-trait); test-only here.
+syn = { version = "2", features = ["full"] }
 # the sync round-trip drives the module the way a host does: construct the
 # concrete QmdbStore and inject it as `Box<dyn MerkleStore>`.
 statesync = { workspace = true }
 commonware-runtime = { workspace = true }
-# TEST-ONLY (no layering edge at build time): the agent id rule is a copy of
-# duckdns's `.duck` label rule — because the id IS the local part of
-# `<agent_id>@agents.duck`. `agent_id_shape_matches_the_duckdns_label_rule`
-# pins the copies together so neither can drift alone.
-duckdns = { workspace = true }

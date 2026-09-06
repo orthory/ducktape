@@ -7,6 +7,17 @@ use super::{
 };
 
 impl RunsModule {
+    pub(super) async fn request_job_run(&mut self, ctx: &mut dyn Ctx, agent_id: String, job_id: String) -> Result<(), Error> {
+        let Some(model) = self.active_agent(&*ctx, &agent_id).await.map_err(Error::Module)? else { return Err(Error::Module("job model is not active".into())); };
+        if ctx.env().origin != sdk::Origin::Program(model.account) { return Err(Error::Module("job work requires its model's program account".into())); }
+        let Some(jobs) = &self.jobs else { return Err(Error::Module("jobs module is not configured".into())); };
+        let bytes = ctx.query(jobs, &jobs_encode_query(&JobsQuery::Get { job_id: job_id.clone() })).await?;
+        let JobsReply::Job(Some(job)) = jobs_decode_reply(&bytes).map_err(Error::Module)? else { return Err(Error::Module("job is unavailable".into())); };
+        if job.kind != format!("agent/{agent_id}") { return Err(Error::Module("job names another model".into())); }
+        let event = JobsEvent::Submitted { job_id, kind: job.kind, spec_hash: job_spec_hash(job.spec.as_bytes()), spec: job.spec, submitter: job.submitter };
+        self.on_jobs_event(ctx, &tasks::encode_job_event(&event)).await
+    }
+
     // ---- the jobs intake (origin == jobs) -----------------------------------------
 
     /// NO-FAIL ARM. jobs submits fan out in the submitter's block; the event
@@ -72,6 +83,22 @@ impl RunsModule {
             return Ok(());
         }
 
+        let authorized_program = ctx.env().origin == sdk::Origin::Program(agent.account);
+        if !authorized_program {
+            let item = self.staged_next_action_item.unwrap_or(self.next_action_item);
+            let next = item.checked_add(1).ok_or_else(|| Error::Module("job request counter exhausted".into()))?;
+            ctx.emit_msg(Msg {
+                target: self.attribution.clone(),
+                payload: attribution::encode_msg(&attribution::AttributionMsg::Attribute {
+                    object: attribution::ObjectRef { kind: "run_request".into(), object: item.to_string() }, revision: 1,
+                    actor: attribution::Actor::Module(self.id.clone()),
+                    relations: vec![attribution::Relation { recipient: agent.account, reason: attribution::Reason::Defined("model_run".into()), detail: super::encode_msg(&super::RunsMsg::RequestJobRun { agent_id: agent_id.into(), job_id }) }], transfers: Vec::new(),
+                }),
+            });
+            self.staged_next_action_item = Some(next);
+            return Ok(());
+        }
+
         let claim_height = ctx.env().height;
         let run_id = job_run_id_for(&job_id, agent_id, claim_height);
         let dispatch_id = dispatch_id_for(&run_id);
@@ -106,7 +133,7 @@ impl RunsModule {
         }
 
         let now = ctx.env().consensus_time;
-        let requester = canonical_origin(&ctx.env().origin);
+        let requester = canonical_origin(&ctx.env().origin)?;
         ctx.emit_msg(Msg {
             target: jobs,
             payload: jobs_encode_msg(&JobsMsg::Claim {
@@ -127,6 +154,9 @@ impl RunsModule {
         self.pending_overlay.insert(
             dispatch_id,
             Some(PendingState {
+                account: agent.account,
+                generation: self.active_generation(&*ctx, agent.account).await?,
+                cause: ctx.env().cause.clone(),
                 run_id: run_id.clone(),
                 workspace_agent_id: agent_id.to_string(),
                 agent_id: agent_id.to_string(),
@@ -175,7 +205,7 @@ impl RunsModule {
         };
         Ok(job.is_some_and(|job| {
             job.status == JobStatus::Processing
-                && job.claim.as_ref().map(|claim| claim.worker.as_str()) == Some(self.id.as_str())
+                && job.claim.as_ref().map(|claim| &claim.worker) == Some(&tasks::Party::Module(self.id.clone()))
                 && job.claim.as_ref().map(|claim| claim.claimed_at_height) == Some(claim_height)
         }))
     }

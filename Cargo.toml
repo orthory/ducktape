@@ -29,7 +29,7 @@
 #                      onchain, service = offchain.)
 #   crates/modules/system/ — system modules: consensus infrastructure (acl,
 #                      kv, valset, governance, identity, modules, saga,
-#                      capability, dispatch, tagging, gateway — which absorbed
+#                      capability, dispatch, attribution, gateway — which absorbed
 #                      the duckdns naming library it now consumes from
 #                      crates/duckdns)
 #   crates/modules/apps/   — application modules, the product features (forge,
@@ -119,7 +119,7 @@ members = [
     "crates/modules/system/saga",
     "crates/modules/system/capability",
     "crates/modules/system/dispatch",
-    "crates/modules/system/tagging",
+    "crates/modules/system/attribution",
     "crates/modules/system/gateway",
     # airlock — the two-party execution/auth contract. NOT a consensus module
     # (no MODULE_ID, no guest wasm): a protocol shared by the lender service,
@@ -349,7 +349,7 @@ modules = { path = "crates/modules/system/modules" }
 saga = { path = "crates/modules/system/saga" }
 capability = { path = "crates/modules/system/capability" }
 dispatch = { path = "crates/modules/system/dispatch" }
-tagging = { path = "crates/modules/system/tagging" }
+attribution = { path = "crates/modules/system/attribution" }
 gateway = { path = "crates/modules/system/gateway" }
 forge = { path = "crates/modules/apps/forge" }
 design = { path = "crates/design" }

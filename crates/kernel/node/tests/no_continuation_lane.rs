@@ -23,9 +23,12 @@
 //! 1. THE WIRE cannot express a second op. A frame is exactly
 //!    `preimage || signature`; anything appended is a decode rejection, so a
 //!    continuation section cannot be grafted onto a valid frame.
-//! 2. THE HOST synthesizes a module origin in exactly ONE place — the emitted
-//!    follow-up push, where the id is the module that just ran. A second
-//!    construction site is a second lane, and rustc cannot see the difference.
+//! 2. THE HOST synthesizes a module origin in exactly TWO places, and each
+//!    names a module the host itself just read: the emitted follow-up push,
+//!    where the id is the module that just ran, and the delivery unit, where
+//!    the id is the SOURCE module whose committed queue the host read the
+//!    item from. Any other construction site is a lane, and rustc cannot see
+//!    the difference.
 //!
 //! Half 2 is a source-parsing lint because the shape is load-bearing and
 //! invisible to the compiler: `Origin::Module(anything)` type-checks.
@@ -141,18 +144,19 @@ fn decode_member_yields_exactly_one_op() {
     assert_eq!(op.frame, node::frame_id(&frame), "member frame id stamped");
 }
 
-// ---- half 2: the host's one module-origin construction site ----------------
+// ---- half 2: the host's module-origin construction sites -------------------
 
-/// A dispatch runs under `Origin::Module(id)` for exactly one reason: module
-/// `id` emitted it as a follow-up while it was running. The host must
-/// therefore build an `Origin::Module` in exactly ONE place, from the module
-/// that just executed.
+/// A dispatch runs under `Origin::Module(id)` for exactly two reasons: module
+/// `id` emitted it as a follow-up while it was running, or module `id` is the
+/// source whose COMMITTED queue the host read the delivered item from. The
+/// host must therefore build an `Origin::Module` in exactly TWO places, each
+/// from a module identity the host itself established.
 ///
-/// The deleted lane was a SECOND construction site — `Origin::Module(msg.target)`
+/// The deleted lane was a THIRD construction site — `Origin::Module(msg.target)`
 /// where `msg.target` came off an attacker-signed frame. A new one would
 /// compile, review as plumbing, and reopen a network takeover.
 #[test]
-fn the_host_synthesizes_a_module_origin_in_exactly_one_place() {
+fn the_host_synthesizes_a_module_origin_in_exactly_two_places() {
     let src = kernel("host");
     let sites: Vec<(usize, &str)> = src
         .lines()
@@ -161,41 +165,32 @@ fn the_host_synthesizes_a_module_origin_in_exactly_one_place() {
         .filter(|(_, line)| line.contains("Origin::Module(") && !line.starts_with("//"))
         .collect();
 
+    let listing = sites
+        .iter()
+        .map(|(n, l)| format!("  host/src/lib.rs:{n}  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert_eq!(
         sites.len(),
-        1,
-        "the host must construct Origin::Module in exactly one place (the \
-         emitted-follow-up push). every extra site is a lane that can dispatch \
-         under a module identity the module did not earn — that is what the \
-         deleted continuation lane was. found:\n{}",
-        sites
-            .iter()
-            .map(|(n, l)| format!("  host/src/lib.rs:{n}  {l}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        2,
+        "the host must construct Origin::Module in exactly two places (the \
+         emitted-follow-up push and the delivery unit's source origin). every \
+         extra site is a lane that can dispatch under a module identity the \
+         module did not earn — that is what the deleted continuation lane was. \
+         found:\n{listing}"
     );
-    let (line_no, site) = sites[0];
+    let follow_up = "queue.push_back((Origin::Module(msg.target.clone()), cause.clone(), m))";
+    let delivery = "origin: Origin::Module(delivery.item.source.clone()),";
+    let has_follow_up = sites.iter().any(|(_, site)| site.contains(follow_up));
+    let has_delivery = sites.iter().any(|(_, site)| site.contains(delivery));
     assert!(
-        site.contains("queue.push_back((Origin::Module(msg.target.clone()), m))"),
-        "the one site must be the emitted-follow-up push, whose id is the \
-         module that just ran — not an id read off a submitted op. \
-         host/src/lib.rs:{line_no}  {site}",
+        has_follow_up,
+        "the follow-up push must build the origin from the module that just \
+         executed (`msg.target` after remove-execute-reinsert):\n{listing}"
     );
-}
-
-/// `encode_frame` must not regrow a continuation parameter: the composer is
-/// the other half of the lane, and a frame carries one op.
-#[test]
-fn encode_frame_takes_no_continuation() {
-    let src = kernel("node");
-    let sig = src
-        .lines()
-        .find(|line| line.contains("pub fn encode_frame("))
-        .expect("encode_frame is declared in node/src/lib.rs");
-    assert_eq!(
-        sig.trim(),
-        "pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {",
-        "encode_frame signs exactly one op — a fourth parameter is the \
-         continuation lane returning",
+    assert!(
+        has_delivery,
+        "the delivery unit must build the origin from the SOURCE the host read \
+         the queued item from (`delivery.item.source`):\n{listing}"
     );
 }

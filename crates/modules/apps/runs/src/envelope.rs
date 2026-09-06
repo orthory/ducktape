@@ -26,8 +26,8 @@
 
 use std::collections::BTreeSet;
 
-use agent::{AgentRecord, LoadMode, MAX_SKILLS_PER_AGENT, SKILL_LIBRARY_PREFIX, SkillRef};
-use chat::{AuthorRef, Block, MessageView};
+use crate::{ModelRecord, LoadMode, MAX_SKILLS_PER_AGENT, SKILL_LIBRARY_PREFIX, SkillRef};
+use chat::{Party, Block, MessageView};
 use files::paths::canonical as canonical_duckfs_path;
 use serde::Serialize;
 
@@ -51,7 +51,7 @@ pub(crate) const DEFAULT_PROMPT: &str =
     "You are a Ducktape agent. Reply helpfully and return only the requested JSON output.";
 
 /// the strict output contract riding every composed payload — exactly the
-/// [`agent::AgentResponse`] wire shape.
+/// [`crate::AgentResponse`] wire shape.
 pub(crate) const STRICT_OUTPUT_INSTRUCTION: &str = r#"Return ONLY a JSON object with this shape:
 {"reply_blocks":[{"id":"<uuid>","kind":"paragraph","text":"..."}],"actions":[],"commit_message":"Your Git subject\n\nOptional body"}
 Allowed reply block kinds are paragraph, heading, and code. heading is rendered as a paragraph in Ducktape chat. code may include an optional "lang". Actions are optional and must use only actions allowed by the agent registry. Use the live ducktape_delegate and ducktape_delegations tools for peer calls. Every call uses caller ∩ callee authority, and the root subagent_budget admits at most min(N, 8) concurrent calls across the whole recursive tree; completed calls release their slot. For uncommitted workspace changes, use commit_message to author the complete Git message; Ducktape preserves it. Git commits you create keep their own messages. Omit commit_message when no uncommitted changes remain. Do not include markdown fences around the JSON."#;
@@ -91,12 +91,12 @@ struct RunEnvelope<'a> {
     workspace: WorkspaceSource,
     skills: Vec<SkillEnvelope>,
     /// whether this agent's committed `duckfs_read` caps cover the global skill
-    /// library (`agent::SKILL_LIBRARY_PREFIX`). the HOST cannot work this out —
+    /// library (`crate::SKILL_LIBRARY_PREFIX`). the HOST cannot work this out —
     /// it has no registry to ask — so the composer states it, and the assembler
     /// emits the library paragraph only when it is true.
     ///
     /// a fact ABOUT the caps, never a widening of them: the answer comes from
-    /// `AgentRecord::library_readable`, which is `permits(DuckfsRead(..))` — the
+    /// `ModelRecord::library_readable`, which is `permits(DuckfsRead(..))` — the
     /// same call the MCP tool plane gates the real read on. so the document can
     /// only advertise a door that will actually open.
     library_readable: bool,
@@ -157,7 +157,7 @@ struct ResultContractEnvelope {
 }
 
 /// a C4 skill ref: a duckfs read-only source subtree the host mounts for the
-/// run, mirroring [`agent::SkillRef`]. a tracking skill's snapshot is resolved
+/// run, mirroring [`crate::SkillRef`]. a tracking skill's snapshot is resolved
 /// to the committed head at compose time (see `RunsModule::portable_inputs`).
 ///
 /// `always` is the curated [`LoadMode`], flattened to the bool the host needs:
@@ -187,14 +187,14 @@ pub(crate) struct PortableInputs {
 }
 
 /// the duckfs subtree a portable run's rw workspace is checked out from.
-fn workspace_source_prefix(agent: &AgentRecord) -> String {
+fn workspace_source_prefix(agent: &ModelRecord) -> String {
     format!("/shared/agent-workspaces/{}", agent.agent_id)
 }
 
 /// the duckfs workspace source for `agent`, pinned at `source_snapshot` — the
 /// non-forge composer lane's workspace.
 pub(crate) fn duckfs_workspace(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     source_snapshot: Option<String>,
 ) -> WorkspaceSource {
     WorkspaceSource::Duckfs {
@@ -218,7 +218,7 @@ pub(crate) fn duckfs_workspace(
 /// only what the agent lacks. curation ORDER is the order the host inlines the
 /// `always` bodies in, so the persona always assembles first.
 pub(crate) fn resolve_skills(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     extra: &[SkillRef],
     head: &Option<String>,
 ) -> Vec<SkillEnvelope> {
@@ -292,7 +292,7 @@ pub(crate) fn library_skills(names: &[String]) -> Result<Vec<SkillRef>, String> 
 /// to key the dispatch, and one id minted in two places is exactly the drift
 /// this field exists to close.
 fn envelope(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     run_id: &str,
     conversation: String,
     portable: PortableInputs,
@@ -321,8 +321,8 @@ fn envelope(
 /// window ending at the anchor.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_payload(
-    module_id: &str,
-    agent: &AgentRecord,
+    _module_id: &str,
+    agent: &ModelRecord,
     run_id: &str,
     transcript: &[MessageView],
     portable: PortableInputs,
@@ -330,7 +330,7 @@ pub(crate) fn render_payload(
     envelope(
         agent,
         run_id,
-        render_conversation(module_id, &agent.agent_id, transcript),
+        render_conversation(agent.account, transcript),
         portable,
     )
 }
@@ -338,7 +338,7 @@ pub(crate) fn render_payload(
 /// compose a job run's payload: same envelope, no thread key, and the
 /// conversation is the job's coordinates plus its FULL submitted spec.
 pub(crate) fn render_job_payload(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     run_id: &str,
     job_id: &str,
     spec: &str,
@@ -358,7 +358,7 @@ pub(crate) fn render_job_payload(
 /// context, while the conversation keeps the triggering comment and stable
 /// thread/ordinal coordinates explicit.
 pub(crate) fn render_page_comment_payload(
-    agent: &AgentRecord,
+    agent: &ModelRecord,
     run_id: &str,
     thread_id: &str,
     ordinal: u64,
@@ -379,17 +379,14 @@ pub(crate) fn render_page_comment_payload(
 /// the transcript block, rendered exactly as the flat-payload era did — the
 /// host feeds it to the model verbatim, so the wording is part of the
 /// committed prompt input.
-fn render_conversation(module_id: &str, agent_id: &str, transcript: &[MessageView]) -> String {
+fn render_conversation(account: u64, transcript: &[MessageView]) -> String {
     if transcript.is_empty() {
         return "No transcript was embedded for this run. Answer the user helpfully.".into();
     }
     let mut out = String::from("Conversation so far:\n");
     for message in transcript {
         let speaker = match &message.head.author {
-            AuthorRef::Agent {
-                module,
-                agent_id: author,
-            } if module == module_id && author == agent_id => "you",
+            Party::Account(author) if *author == account => "you",
             _ => "them",
         };
         out.push_str(&format!("[{speaker}] {}\n", render_message(message)));
@@ -413,12 +410,12 @@ fn render_message(message: &MessageView) -> String {
     )
 }
 
-fn render_author(author: &AuthorRef) -> String {
+fn render_author(author: &Party) -> String {
     match author {
-        AuthorRef::User(bytes) => format!("user:{}", hex(bytes)),
-        AuthorRef::Agent { module, agent_id } => format!("agent:{module}/{agent_id}"),
-        AuthorRef::Module(module) => format!("module:{module}"),
-        AuthorRef::System => "system".into(),
+        Party::Key(bytes) => format!("user:{}", hex(bytes)),
+        Party::Account(account) => format!("account:{account}"),
+        Party::Module(module) => format!("module:{module}"),
+        Party::System => "system".into(),
     }
 }
 
@@ -443,36 +440,37 @@ fn render_block(block: &Block) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent::AgentStatus;
+    use crate::ModelStatus;
     use chat::MessageHead;
-    use saga::SagaOrigin;
+    use sdk::Origin as RunOrigin;
     use serde_json::Value;
 
     /// an agent defined by its curated skills — there is no prompt to give it.
-    fn agent_with_skills(skills: Vec<agent::SkillRef>) -> AgentRecord {
-        AgentRecord {
+    fn agent_with_skills(skills: Vec<crate::SkillRef>) -> ModelRecord {
+        ModelRecord {
+            account: 2,
             agent_id: "bot".into(),
-            owner: SagaOrigin::External(vec![9; 32]),
+            owner: RunOrigin::External(vec![9; 32]),
             display_name: "BOT".into(),
             capability: "model-1".into(),
             allowed_actions: vec![],
-            status: AgentStatus::Active,
-            role: agent::AgentRole::General,
+            status: ModelStatus::Active,
+            role: crate::ModelRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: Vec::new(),
-            caps: agent::ResourceCaps::default(),
+            caps: crate::ResourceCaps::default(),
             skills,
         }
     }
 
-    fn bot() -> AgentRecord {
+    fn bot() -> ModelRecord {
         agent_with_skills(Vec::new())
     }
 
     /// a curated skill ref, as the registry commits it.
-    fn skill_ref(name: &str, load: LoadMode) -> agent::SkillRef {
-        agent::SkillRef {
+    fn skill_ref(name: &str, load: LoadMode) -> crate::SkillRef {
+        crate::SkillRef {
             name: name.into(),
             source_prefix: format!("/shared/skills/{name}"),
             source_snapshot: Some("bb".repeat(32)),
@@ -480,7 +478,7 @@ mod tests {
         }
     }
 
-    fn message(seq: u64, author: AuthorRef, text: &str) -> MessageView {
+    fn message(seq: u64, author: Party, text: &str) -> MessageView {
         MessageView {
             channel_id: "general".into(),
             seq,
@@ -490,6 +488,7 @@ mod tests {
                 blocks: vec![Block::paragraph(text)],
                 created_at: 0,
                 rev: 0,
+            revision: 1,
                 edited_at: None,
                 base_rev: None,
                 deleted: false,
@@ -541,7 +540,7 @@ mod tests {
     #[test]
     fn a_chat_envelope_carries_the_agent_identity_and_no_prompt_pin() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "hi bot")];
         let payload = render_payload("runs", &agent, &run_id("general", 1), &transcript, plain());
         let v = parse(&payload);
 
@@ -621,7 +620,7 @@ mod tests {
     /// would refuse it (the caps ARE that refusal — same `permits` call).
     #[test]
     fn the_envelope_states_the_agents_library_read_grant() {
-        let compose = |caps: agent::ResourceCaps| {
+        let compose = |caps: crate::ResourceCaps| {
             let mut agent = agent_with_skills(Vec::new());
             agent.caps = caps;
             let payload = render_payload(
@@ -640,20 +639,20 @@ mod tests {
         };
 
         assert_eq!(
-            compose(agent::ResourceCaps::default()),
+            compose(crate::ResourceCaps::default()),
             Value::Bool(false),
             "the empty default grants nothing, so the agent hears nothing about the library"
         );
         assert_eq!(
-            compose(agent::ResourceCaps {
-                duckfs_read: vec![agent::SKILL_LIBRARY_PREFIX.into()],
+            compose(crate::ResourceCaps {
+                duckfs_read: vec![crate::SKILL_LIBRARY_PREFIX.into()],
                 ..Default::default()
             }),
             Value::Bool(true),
             "the grant the app pre-fills is the grant the assembler acts on"
         );
         assert_eq!(
-            compose(agent::ResourceCaps {
+            compose(crate::ResourceCaps {
                 duckfs_read: vec!["/shared/agent-workspaces/bot".into()],
                 ..Default::default()
             }),
@@ -713,18 +712,18 @@ mod tests {
         // and the count is capped in consensus — the same ceiling the agent
         // record carries — so a huge request cannot commit a giant payload or
         // force a checkout per name for a doomed run.
-        let too_many: Vec<String> = (0..=agent::MAX_SKILLS_PER_AGENT)
+        let too_many: Vec<String> = (0..=crate::MAX_SKILLS_PER_AGENT)
             .map(|i| format!("s{i}"))
             .collect();
         assert!(library_skills(&too_many).is_err());
-        assert!(library_skills(&too_many[..agent::MAX_SKILLS_PER_AGENT]).is_ok());
+        assert!(library_skills(&too_many[..crate::MAX_SKILLS_PER_AGENT]).is_ok());
     }
 
     /// a tracking skill (no pin) still resolves to the committed head, and its
     /// load mode is untouched by that resolution.
     #[test]
     fn a_tracking_skill_resolves_to_the_head_and_keeps_its_load_mode() {
-        let agent = agent_with_skills(vec![agent::SkillRef {
+        let agent = agent_with_skills(vec![crate::SkillRef {
             name: "persona".into(),
             source_prefix: "/shared/skills/persona".into(),
             source_snapshot: None,
@@ -827,13 +826,10 @@ mod tests {
     fn envelope_bytes_are_deterministic() {
         let agent = bot();
         let transcript = vec![
-            message(1, AuthorRef::User(vec![1; 32]), "hello \"quoted\"\nline"),
+            message(1, Party::Key(vec![1; 32]), "hello \"quoted\"\nline"),
             message(
                 2,
-                AuthorRef::Agent {
-                    module: "runs".into(),
-                    agent_id: "bot".into(),
-                },
+                Party::Account(2),
                 "earlier reply",
             ),
         ];
@@ -876,21 +872,15 @@ mod tests {
     fn the_agents_own_messages_render_as_you() {
         let agent = bot();
         let transcript = vec![
-            message(1, AuthorRef::User(vec![1; 32]), "question"),
+            message(1, Party::Key(vec![1; 32]), "question"),
             message(
                 2,
-                AuthorRef::Agent {
-                    module: "runs".into(),
-                    agent_id: "bot".into(),
-                },
+                Party::Account(2),
                 "my own reply",
             ),
             message(
                 3,
-                AuthorRef::Agent {
-                    module: "runs".into(),
-                    agent_id: "other".into(),
-                },
+                Party::Account(3),
                 "someone else",
             ),
         ];
@@ -900,8 +890,8 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(conversation.contains("[them] user:"));
-        assert!(conversation.contains("[you] agent:runs/bot @2: my own reply"));
-        assert!(conversation.contains("[them] agent:runs/other @3: someone else"));
+        assert!(conversation.contains("[you] account:2 @2: my own reply"));
+        assert!(conversation.contains("[them] account:3 @3: someone else"));
     }
 
     // ---- the portable plan ---------------------------------------------------
@@ -909,7 +899,7 @@ mod tests {
     #[test]
     fn the_envelope_carries_source_coords_and_skills_but_no_mount_path() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "hi bot")];
         let skills = vec![SkillEnvelope {
             name: "release".into(),
             source_prefix: "/shared/skills/release".into(),
@@ -996,7 +986,7 @@ mod tests {
     #[test]
     fn the_envelope_composes_no_runtime_text() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "hi bot")];
         let payload = render_payload(
             "runs",
             &agent,
@@ -1024,7 +1014,7 @@ mod tests {
     #[test]
     fn a_forge_run_composes_tagged_source_item_context_and_requested_pr_sink() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "hi bot")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "hi bot")];
         let commit = "ab".repeat(20);
         let inputs = PortableInputs {
             workspace: WorkspaceSource::Forge {
@@ -1089,7 +1079,7 @@ mod tests {
     #[test]
     fn forge_envelope_bytes_are_deterministic() {
         let agent = bot();
-        let transcript = vec![message(1, AuthorRef::User(vec![1; 32]), "go")];
+        let transcript = vec![message(1, Party::Key(vec![1; 32]), "go")];
         let inputs = || PortableInputs {
             workspace: WorkspaceSource::Forge {
                 repo: "app".into(),

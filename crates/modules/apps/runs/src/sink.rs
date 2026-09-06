@@ -9,7 +9,7 @@
 //! of forge's wire types (`forge` stays a DEV-ONLY dependency; conformance
 //! tests pin every mirror against the real forge codec).
 
-use agent::{CapRequest, ReplyBlock};
+use crate::{CapRequest, ReplyBlock};
 use saga::{
     SagaQuery, SagaReply, decode_reply as saga_decode_reply, encode_query as saga_encode_query,
 };
@@ -618,6 +618,7 @@ mod tests {
                 consensus_time: t,
                 origin,
                 me: "forge".into(),
+                cause: sdk::Cause::Direct,
             });
             let msg = Msg {
                 target: "forge".into(),
@@ -666,7 +667,7 @@ mod tests {
         };
         assert_eq!(
             item.summary.author,
-            chat::AuthorRef::Module("runs".into()),
+            chat::Party::Module("runs".into()),
             "the PR is authored by the emitting MODULE, not a forged user"
         );
         let _ = std::fs::remove_dir_all(&base);

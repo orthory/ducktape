@@ -23,7 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use chat::AuthorRef;
+use chat::Party;
 use identity::{IdentityQuery, IdentityReply};
 use sdk::{Ctx, Error, Origin, StateRoot};
 use sha2::{Digest, Sha256};
@@ -656,7 +656,7 @@ impl ForgeState {
         name: &str,
         target: &str,
         number: u64,
-        actor: &AuthorRef,
+        actor: &Party,
         principal: &[u8],
     ) -> Result<(), Error> {
         let owner = self.tracker_view().owner(name);
@@ -1106,7 +1106,7 @@ pub fn decode_ref_target(bytes: &[u8]) -> Result<RefTarget, Error> {
 mod tests {
     use super::*;
     use crate::tracker_iface::ItemKind;
-    use chat::AuthorRef;
+    use chat::Party;
 
     fn oid(c: char) -> Oid {
         Oid::from_hex(&c.to_string().repeat(40)).unwrap()
@@ -1136,7 +1136,7 @@ mod tests {
                 ItemKind::Issue,
                 "t".into(),
                 String::new(),
-                AuthorRef::User(vec![1]),
+                Party::Key(vec![1]),
                 1,
                 None,
             )

@@ -1,163 +1,213 @@
-use super::{
-    Author, Ctx, EngagementEvent, EntityRef, Error, RunsModule, SagaOrigin, SiblingReadBudget,
-    TurnPolicy, canonical_origin, dispatch_id_for, page_channel_id, page_run_id_for, run_id_for,
-    tagging_decode_event,
-};
+//! Source context is read only after the user's program explicitly requests model work.
+use super::*;
 
 impl RunsModule {
-    // ---- the engagement intake (origin == tagging) ----------------------------------
-
-    /// which agents an engagement engages under `policy`. only ACTIVE
-    /// registered agents ever engage; every branch reads agreed state only
-    /// (registry queries included — they are consensus reads).
-    async fn engaged_agents(
-        &self,
-        ctx: &dyn Ctx,
-        policy: &TurnPolicy,
-        tags: &[EntityRef],
-        seq: u64,
-    ) -> Result<Vec<String>, String> {
-        match policy {
-            // entity tags naming THIS module's agents, in content order (the
-            // content module dedupes them).
-            TurnPolicy::Mention => {
-                let mut engaged = Vec::new();
-                for tag in tags {
-                    if tag.module != self.id {
-                        continue;
-                    }
-                    if self.active_agent(ctx, &tag.entity).await?.is_some() {
-                        engaged.push(tag.entity.clone());
-                    }
-                }
-                Ok(engaged)
-            }
-            TurnPolicy::All => self.active_agent_ids(ctx).await,
-            TurnPolicy::Assigned(agent_id) => {
-                Ok(if self.active_agent(ctx, agent_id).await?.is_some() {
-                    vec![agent_id.clone()]
-                } else {
-                    Vec::new()
-                })
-            }
-            TurnPolicy::RoundRobin => {
-                let active = self.active_agent_ids(ctx).await?;
-                Ok(if active.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![active[(seq % active.len() as u64) as usize].clone()]
-                })
-            }
-        }
-    }
-
-    /// NO-FAIL ARM. the tagging plane routes a user post here in the same
-    /// block as the post itself — an `Err` would abort the post (and every
-    /// other subscriber's delivery), so malformed events, unwatched
-    /// channels, failed context pins, and oversized payloads are all staged
-    /// no-ops. the plane's loop rule guarantees the
-    /// event is user-authored.
-    pub(super) async fn on_engagement(
+    pub(super) async fn request_attributed_run(
         &mut self,
         ctx: &mut dyn Ctx,
-        payload: &[u8],
+        agent_id: String,
+        change_seq: u64,
         budget: &SiblingReadBudget,
     ) -> Result<(), Error> {
-        let Ok(event) = tagging_decode_event(payload) else {
-            self.note(ctx, "dropped undecodable engagement event".into());
-            return Ok(());
+        let Origin::Program(account) = ctx.env().origin else {
+            return Err(Error::Module(
+                "attributed model work requires a program call".into(),
+            ));
         };
-        let EngagementEvent {
-            source,
-            container,
-            content_seq: seq,
-            author,
-            tags,
-        } = event;
-        let is_page = self.pages.as_deref() == Some(source.as_str());
-        if source != self.chat && !is_page {
-            self.note(ctx, format!("dropped engagement from source {source}"));
-            return Ok(());
+        let Some(model) = self
+            .active_agent(&*ctx, &agent_id)
+            .await
+            .map_err(Error::Module)?
+        else {
+            return Err(Error::Module("model is not active".into()));
+        };
+        if model.account != account {
+            return Err(Error::Module("model belongs to another account".into()));
         }
-        let policy = if is_page {
-            // A structured page mention is itself the opt-in. Tagging routes
-            // it directly to this entity-owning module, so a fresh comment
-            // thread needs no pre-existing channel watch.
-            TurnPolicy::Mention
-        } else {
-            let Some(policy) = self.watch(&container).cloned() else {
-                return Ok(());
-            };
-            policy
+        let after = change_seq
+            .checked_sub(1)
+            .ok_or_else(|| Error::Module("attribution changes start at one".into()))?;
+        let bytes = ctx
+            .query(
+                &self.attribution,
+                &attribution::encode_query(&attribution::AttributionQuery::Changes {
+                    after,
+                    limit: 1,
+                }),
+            )
+            .await?;
+        let attribution::AttributionReply::Changes(changes) =
+            attribution::decode_reply(&bytes).map_err(Error::Module)?
+        else {
+            return Err(Error::Module("unexpected attribution reply".into()));
         };
-
-        let engaged = match self.engaged_agents(&*ctx, &policy, &tags, seq).await {
-            Ok(engaged) => engaged,
-            Err(reason) => {
-                self.note(ctx, format!("engagement skipped for {container}: {reason}"));
-                return Ok(());
-            }
+        let Some(entry) = changes.first() else {
+            return Err(Error::Module("attribution does not exist".into()));
         };
-        // the ACCOUNT this run speaks for is the one that engaged the agent,
-        // not the tagging plane that routed the event: it is the standing an
-        // agent's own posts are held to, and the cancel capability. a
-        // module/system/entity author leaves the routing origin, which chat
-        // admits everywhere anyway.
-        let requester = match &author {
-            Author::User(key) if !key.is_empty() => SagaOrigin::External(key.clone()),
-            _ => canonical_origin(&ctx.env().origin),
-        };
-        for agent_id in engaged {
-            let run_id = if is_page {
-                page_run_id_for(&container, seq, &agent_id)
-            } else {
-                run_id_for(&container, seq, &agent_id)
-            };
-            let dispatch_id = dispatch_id_for(&run_id);
-            match self.turn_taken(&*ctx, &dispatch_id).await {
-                // the turn claim: the first creation in consensus order won.
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(reason) => {
-                    self.note(ctx, format!("run skipped for {run_id}: {reason}"));
-                    continue;
+        let change = &entry.change;
+        let addressed = change.seq == change_seq && change.recipient == account;
+        if !addressed {
+            return Err(Error::Module(
+                "attribution belongs to another account".into(),
+            ));
+        }
+        let run_request = change.source.module == self.id && change.source.kind == "run_request";
+        if run_request {
+            if let RunsMsg::RequestJobRun {
+                agent_id: requested,
+                job_id,
+            } = decode_msg(&change.detail).map_err(Error::Module)?
+            {
+                if requested != agent_id {
+                    return Err(Error::Module("job request names another model".into()));
                 }
-            }
-            let agent = match self.active_agent(&*ctx, &agent_id).await {
-                Ok(Some(agent)) => agent,
-                Ok(None) => continue,
-                Err(reason) => {
-                    self.note(ctx, format!("run skipped for {run_id}: {reason}"));
-                    continue;
-                }
-            };
-            let prepared = if is_page {
-                self.prepare_page_dispatch(&*ctx, &agent, &run_id, &container, seq, budget)
-                    .await
-            } else {
-                self.prepare_dispatch(&*ctx, &agent, &run_id, &container, seq, &[], budget)
-                    .await
-            };
-            match prepared {
-                Ok(prepared) => self.stage_dispatch_run(
-                    ctx,
-                    &run_id,
-                    agent_id,
-                    if is_page {
-                        page_channel_id(&container)
-                    } else {
-                        container.clone()
-                    },
-                    seq,
-                    requester.clone(),
-                    prepared,
-                    Default::default(),
-                ),
-                // a failed preparation must not poison the posting block —
-                // same no-fail reasoning as the result intake.
-                Err(reason) => self.note(ctx, format!("run skipped for {run_id}: {reason}")),
+                return self.request_job_run(ctx, agent_id, job_id).await;
             }
         }
+        let run_id = format!("attributed/{change_seq}/{agent_id}");
+        if self
+            .turn_taken(&*ctx, &dispatch_id_for(&run_id))
+            .await
+            .map_err(Error::Module)?
+        {
+            return Ok(());
+        }
+        let (channel, anchor, prepared, demands) =
+            match (change.source.module.as_str(), change.source.kind.as_str()) {
+                (source, "message") if source == self.chat => {
+                    let bytes = ctx
+                        .query(
+                            &self.chat,
+                            &chat_encode_query(&ChatQuery::Message {
+                                message_id: change.source.object.clone(),
+                            }),
+                        )
+                        .await?;
+                    let ChatReply::Message(Some(message)) =
+                        chat_decode_reply(&bytes).map_err(Error::Module)?
+                    else {
+                        return Err(Error::Module(
+                            "attributed chat message is unavailable".into(),
+                        ));
+                    };
+                    let channel = message.channel_id.clone();
+                    let prepared = self
+                        .prepare_dispatch(
+                            &*ctx,
+                            &model,
+                            &run_id,
+                            &channel,
+                            message.seq,
+                            &[],
+                            budget,
+                        )
+                        .await
+                        .map_err(Error::Module)?;
+                    (channel, message.seq, prepared, BTreeMap::new())
+                }
+                (source, "comment") if Some(source) == self.pages.as_deref() => {
+                    let bytes = ctx
+                        .query(
+                            source,
+                            &pages::encode_query(&pages::PageQuery::GetComment {
+                                comment_id: change.source.object.clone(),
+                            }),
+                        )
+                        .await?;
+                    let pages::PageReply::Comment(Some(comment)) =
+                        pages::decode_reply(&bytes).map_err(Error::Module)?
+                    else {
+                        return Err(Error::Module(
+                            "attributed page comment is unavailable".into(),
+                        ));
+                    };
+                    let bytes = ctx
+                        .query(
+                            source,
+                            &pages::encode_query(&pages::PageQuery::CommentThread {
+                                thread_id: comment.thread_id.clone(),
+                            }),
+                        )
+                        .await?;
+                    let pages::PageReply::CommentThread(Some(thread)) =
+                        pages::decode_reply(&bytes).map_err(Error::Module)?
+                    else {
+                        return Err(Error::Module(
+                            "attributed comment thread is unavailable".into(),
+                        ));
+                    };
+                    let Some(index) = thread
+                        .comments
+                        .iter()
+                        .position(|item| item.id == comment.id)
+                    else {
+                        return Err(Error::Module("comment is not in its thread".into()));
+                    };
+                    let ordinal = index as u64 + 1;
+                    let prepared = self
+                        .prepare_page_dispatch(
+                            &*ctx,
+                            &model,
+                            &run_id,
+                            &comment.thread_id,
+                            ordinal,
+                            budget,
+                        )
+                        .await
+                        .map_err(Error::Module)?;
+                    (
+                        page_channel_id(&comment.thread_id),
+                        ordinal,
+                        prepared,
+                        BTreeMap::new(),
+                    )
+                }
+                (source, "run_request") if source == self.id => {
+                    let RunsMsg::RequestRun {
+                        agent_id: requested,
+                        channel_id,
+                        anchor_seq,
+                        demands,
+                        skills,
+                    } = decode_msg(&change.detail).map_err(Error::Module)?
+                    else {
+                        return Err(Error::Module("unexpected run request detail".into()));
+                    };
+                    if requested != agent_id {
+                        return Err(Error::Module("run request names another model".into()));
+                    }
+                    let skills = envelope::library_skills(&skills).map_err(Error::Module)?;
+                    let prepared = self
+                        .prepare_dispatch(
+                            &*ctx,
+                            &model,
+                            &run_id,
+                            &channel_id,
+                            anchor_seq,
+                            &skills,
+                            budget,
+                        )
+                        .await
+                        .map_err(Error::Module)?;
+                    (channel_id, anchor_seq, prepared, demands)
+                }
+                _ => {
+                    return Err(Error::Module(
+                        "this model workflow has no composer for the attribution source".into(),
+                    ));
+                }
+            };
+        self.stage_dispatch_run(
+            ctx,
+            &run_id,
+            agent_id,
+            channel,
+            anchor,
+            RunOrigin::Program(account),
+            prepared,
+            demands,
+        );
+        ctx.set_output(sdk::wire::encode(&serde_json::json!({"run_id": run_id})));
         Ok(())
     }
 }

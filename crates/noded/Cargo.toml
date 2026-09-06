@@ -25,6 +25,8 @@ testkit = ["dep:nettest"]
 verify = ["provider-host/verify"]
 
 [dependencies]
+# Committed-block receipt notifications for interactive program actions.
+tokio-tungstenite = "0.24"
 # the shared raw-http/port/poll test client — only pulled by the `testkit`
 # feature (the in-proc daemon's readiness probe), never in a normal build.
 nettest = { path = "../testing/nettest", optional = true }
@@ -53,7 +55,7 @@ gateway = { workspace = true }
 agent = { workspace = true }
 runs = { workspace = true }
 dispatch = { workspace = true }
-tagging = { workspace = true }
+attribution = { workspace = true }
 compute-service = { workspace = true }
 # the interactive-terminal wire: this node holds the rings, the ws topics and
 # the admission decisions; the agent daemon on the other end of `wire` holds the
@@ -147,7 +149,6 @@ sdk-testkit = { workspace = true }
 capability = { workspace = true }
 # the shared raw-http/port/poll harness helpers (daemon_e2e was a local copy).
 nettest = { path = "../testing/nettest" }
-tokio-tungstenite = "0.24"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }

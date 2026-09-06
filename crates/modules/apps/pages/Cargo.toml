@@ -21,7 +21,13 @@ index-guest = ["index_guest/guest"]
 # crate, pulled only when the guest build compiles this crate for wasm32.
 guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 sdk = { workspace = true }
-tagging = { workspace = true }
+# types-only: the attribution edge — every page and comment write reports its
+# object's relation set to the plane (pages translates its shapes there).
+attribution = { workspace = true }
+# the ONE resolver (`OfKey`, `Get`) that turns a signing key into the account
+# holding it: every external write resolves its party through it, and every
+# mention is validated against it (see `Pages::party_of_origin`).
+identity = { workspace = true }
 serde = { workspace = true }
 # the index CONTRACT (op-row envelope + the pure StateRead/Writes kit) — not
 # the engine: the default surface is pure types, wasm32-clean, and is all the

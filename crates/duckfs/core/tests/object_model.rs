@@ -69,7 +69,7 @@ fn file_tree_snapshot_round_trip() {
     let s = SnapshotObj {
         root: [2; 32],
         parent: None,
-        author: "system".into(),
+        author: duckfs_core::Actor::System,
         consensus_time: 9,
         height: 9,
         message: "m".into(),
@@ -341,7 +341,7 @@ fn encodings_match_the_hand_built_bytes() {
     let s = SnapshotObj {
         root: [2; 32],
         parent: Some([3; 32]),
-        author: "ext:aa".into(),
+        author: duckfs_core::Actor::Key(vec![0xaa]),
         consensus_time: 7,
         height: 9,
         message: "m".into(),
@@ -349,7 +349,8 @@ fn encodings_match_the_hand_built_bytes() {
     let mut want = [2u8; 32].to_vec();
     want.push(1); // has_parent
     want.extend_from_slice(&[3u8; 32]);
-    push_str(&mut want, b"ext:aa");
+    want.push(1); // Key actor
+    push_str(&mut want, &[0xaa]);
     want.extend_from_slice(&7u64.to_le_bytes());
     want.extend_from_slice(&9u64.to_le_bytes());
     push_str(&mut want, b"m");

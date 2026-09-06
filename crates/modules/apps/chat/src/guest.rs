@@ -18,9 +18,9 @@
 //! spelled out point by point — chat rides the identical seams:
 //!
 //! * the guest rebuilds the module FRESH per dispatch over the exact
-//!   production builder chain (`Chat::new("chat", store).with_tagging
-//!   ("tagging").with_identity("identity")`); its inner `pending` overlay is
-//!   per-dispatch, and
+//!   production builder chain (`Chat::new("chat", store).with_attribution
+//!   ("attribution").with_identity("identity")`); its inner `pending`
+//!   overlay is per-dispatch, and
 //!   cross-dispatch read-your-writes comes from the host's outer staged
 //!   overlay via `WitStore::get` (staged-over-committed).
 //! * each successful `execute` flushes the inner staging with the inner
@@ -33,8 +33,9 @@
 //!   byte-identical there too.
 //! * `RegisterHook`'s registry check (`ctx.module_root`) is a host-routed
 //!   SIBLING read inside the guest, resolved by the runtime's memoized
-//!   replay; hook fan-out and the tagging report ride `emit-msg` follow-ups
-//!   exactly like native.
+//!   replay, and so is every identity resolution (`OfKey`/`Get`) a write
+//!   makes; hook fan-out and the attribution reports ride `emit-msg`
+//!   follow-ups exactly like native.
 //!
 //! equivalence is pinned block-by-block (roots, replies, aborts,
 //! multi-dispatch blocks) by `wasm_chat_parity`.
@@ -44,13 +45,13 @@ use crate::Chat;
 /// the genesis-constant id this module registers under (the native twin's id:
 /// `Env::me` and follow-up routing must read identically to ported logic).
 const MODULE_ID: &str = "chat";
-/// the engagement plane every post is reported to — the production wiring in
-/// (`bin/node/src/host_state.rs`): `.with_tagging("tagging")`. the wiring is
-/// genesis config compiled into the guest; drift here would be a consensus
-/// fork.
-const TAGGING_ID: &str = "tagging";
-/// the sibling `CreateDmChannel` resolves a creator's key through (`OfKey`).
-/// genesis config compiled into the guest, like `TAGGING_ID`.
+/// the attribution plane every channel and message revision is reported to.
+/// the wiring is genesis config compiled into the guest; drift here would be
+/// a consensus fork.
+const ATTRIBUTION_ID: &str = "attribution";
+/// the sibling every external key resolves through (`OfKey`) and every named
+/// account is validated against (`Get`). genesis config compiled into the
+/// guest, like `ATTRIBUTION_ID`.
 const IDENTITY_ID: &str = "identity";
 
 use guest_adapter::WitStore;
@@ -62,6 +63,6 @@ guest_adapter::store_guest! {
     module: Chat,
     shape: guest_adapter::store_shape(),
     new: Chat::new(MODULE_ID, Box::new(WitStore))
-        .with_tagging(TAGGING_ID)
+        .with_attribution(ATTRIBUTION_ID)
         .with_identity(IDENTITY_ID),
 }

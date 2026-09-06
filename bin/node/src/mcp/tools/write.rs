@@ -3,7 +3,7 @@
 //!
 //! ## every write is one signed action
 //!
-//! each tool here builds exactly one `agent::AgentAction`, hands it to
+//! each tool here builds exactly one `runs::AgentAction`, hands it to
 //! [`Run::act`], and reports what came back. `act` signs a
 //! `RunsMsg::AgentAction` with this run's session key and submits it as an op
 //! frame; the runs module then decides, ON EVERY VALIDATOR, whether the agent
@@ -31,13 +31,13 @@
 //!
 //! ## the action vocabulary is the grant vocabulary
 //!
-//! the tools map one-for-one onto `agent::KNOWN_ACTIONS`. the tool plane must
+//! the tools map one-for-one onto `runs::KNOWN_ACTIONS`. the tool plane must
 //! never become a second, wider set of powers than the one an owner can read off
 //! the agent's record and reason about.
 
 use serde_json::{Value, json};
 
-use agent::{AgentAction, MAX_DUCKFS_WRITE_TEXT_BYTES};
+use runs::{AgentAction, MAX_DUCKFS_WRITE_TEXT_BYTES};
 use tasks::TaskStatus;
 
 use super::{Tool, arg_bool, arg_str, opt_u64, schema};
@@ -268,8 +268,8 @@ mod tests {
         // not anything an agent calls mid-run. chat.post_message is the tool-side
         // power, and it is deliberately a different grant.
         let described: Vec<&str> = tools().iter().map(|t| t.description).collect();
-        for action in agent::KNOWN_ACTIONS {
-            if action == agent::ACTION_CHAT_POST {
+        for action in runs::KNOWN_ACTIONS {
+            if action == runs::ACTION_CHAT_POST {
                 continue;
             }
             assert!(
@@ -289,6 +289,6 @@ mod tests {
             .into_iter()
             .find(|t| t.name == "ducktape_chat_post")
             .expect("the chat tool");
-        assert!(chat.description.contains(agent::ACTION_CHAT_POST_MESSAGE));
+        assert!(chat.description.contains(runs::ACTION_CHAT_POST_MESSAGE));
     }
 }

@@ -88,6 +88,22 @@ impl StagedStore {
         self.pending.insert(key, None);
     }
 
+    /// Save the overlay before an operation that may need to undo its writes.
+    /// Restoring this snapshot preserves writes accepted earlier in the block.
+    pub fn checkpoint(&self) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        self.pending.clone()
+    }
+
+    /// Restore a checkpoint without changing committed state.
+    pub fn restore(&mut self, checkpoint: BTreeMap<Vec<u8>, Option<Vec<u8>>>) {
+        self.pending = checkpoint;
+    }
+
+    /// Pending upserts and deletes, ordered by their logical keys.
+    pub fn staged_writes(&self) -> &BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+        &self.pending
+    }
+
     /// whether the overlay holds no staged writes — a [`commit`] would be a
     /// no-op that leaves the root byte-identical.
     ///

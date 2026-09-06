@@ -3,10 +3,9 @@ name = "runs"
 edition.workspace = true
 version.workspace = true
 
-# the collaboration loop's actor: channel watches (via the tagging plane),
-# run orchestration over the dispatch plane, context pinning, in-consensus
-# payload composition, and deterministic model-output validation. the agents
-# it runs live in the agent registry, read by query — never held here.
+# Model configuration and run orchestration over dispatch, context pinning,
+# payload composition, and deterministic model-output validation. Programmable
+# accounts execute model-requested actions through their bound agent program.
 [features]
 # the wasm-guest port (src/guest.rs): the dispatch shell over
 # guest-adapter. non-default and wasm-only — enabled solely by the
@@ -19,6 +18,9 @@ guest = ["dep:guest-adapter"]
 guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 sdk = { workspace = true }
 agent = { workspace = true }
+identity = { workspace = true }
+capability = { workspace = true }
+borsh = { workspace = true }
 # default-features = false on chat/tasks/pages/saga: only their consensus wire
 # types cross this edge, and the `runs` guest builds this crate for
 # wasm32 — the native-only submodules (chat's indexer/voice/tokio, tasks' and
@@ -28,7 +30,7 @@ agent = { workspace = true }
 # native binaries (which enable the default `native` features) whole.
 chat = { path = "../chat", default-features = false }
 saga = { path = "../../system/saga", default-features = false }
-tagging = { workspace = true }
+attribution = { workspace = true }
 dispatch = { workspace = true }
 tasks = { path = "../tasks", default-features = false }
 # the duckfs wire types (FilesQuery::Refs / FilesReply::Refs / RefsInfo) the v1
@@ -51,6 +53,7 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+valset = { workspace = true }
 # the host-side qmdb store handle the chat test fixtures inject.
 statesync = { workspace = true }
 # the shared programmable `TestCtx` (dev-only) — serves the dispatch sibling read.

@@ -11,20 +11,21 @@ use automations::{
 };
 use chat::Chat;
 use chat::{
-    AuthorRef, Block, ChatMsg, ChatQuery, ChatReply, MessageView, PostPolicy,
+    Block, ChatMsg, ChatQuery, ChatReply, MessageView, Party, PostPolicy,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 use host::{BlockContext, Host};
 use sdk::{Msg, Origin};
-use tasks::Tasks;
 use statesync::qmdb::QmdbStore;
+use tasks::Tasks;
 
 const AUTO: &str = "automations";
 const CHAT: &str = "chat";
 const TASKS: &str = "tasks";
-const INBOX: &str = "inbox";
+const IDENTITY: &str = "identity";
+const ATTRIBUTION: &str = "attribution";
 
 fn as_user(byte: u8, height: u64) -> BlockContext {
     BlockContext {
@@ -47,7 +48,6 @@ fn post(channel: &str, message_id: &str, text: &str) -> Msg {
         message_id: message_id.into(),
         blocks: vec![Block::paragraph(text)],
         thread: None,
-        as_agent: None,
     })
 }
 
@@ -104,21 +104,51 @@ async fn run_history(host: &Host, rule_id: &str) -> Vec<RunRecord> {
 /// genesis a real chat + tasks + automations host with channel "general"
 /// created, the automations hook registered on it, and one rule installed.
 async fn arena(context: deterministic::Context, rule_id: &str, action: Action) -> Host {
-    let chat = Chat::new(CHAT, Box::new(QmdbStore::init(context.child(CHAT), CHAT).await));
+    let chat = Chat::new(
+        CHAT,
+        Box::new(QmdbStore::init(context.child(CHAT), CHAT).await),
+    );
     let auto = Automations::new(
         AUTO,
         Box::new(QmdbStore::init(context.child(AUTO), AUTO).await),
         CHAT,
         TASKS,
-        INBOX,
+        IDENTITY,
+        ATTRIBUTION,
     );
     let mut host = Host::genesis(vec![
+        Box::new(identity::Identity::new(
+            "identity",
+            Box::new(sdk_testkit::MemStore::new()),
+            "test".into(),
+        )),
+        Box::new(attribution::AttributionModule::new(
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(chat),
-        Box::new(Tasks::new(TASKS, Box::new(sdk_testkit::MemStore::new()))),
+        Box::new(Tasks::new(
+            TASKS,
+            "identity",
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
         Box::new(auto),
     ])
     .expect("genesis");
 
+    host.submit_at(
+        as_user(1, 0),
+        Msg {
+            target: "identity".into(),
+            payload: identity::encode_msg(&identity::IdentityMsg::Create {
+                name: "Owner".into(),
+                scheme: identity::KeyScheme::Ed25519,
+            }),
+        },
+    )
+    .await
+    .expect("found owner");
     host.submit_at(
         as_user(1, 1),
         chat_msg(ChatMsg::CreateChannel {
@@ -171,7 +201,7 @@ fn squatted_message_id_downgrades_to_run_record() {
         let views = messages(&host, "general").await;
         assert_eq!(views.len(), 1, "only the user's post landed");
         assert_eq!(views[0].head.message_id, "auto-echo-general-1");
-        assert!(matches!(views[0].head.author, AuthorRef::User(_)));
+        assert!(matches!(views[0].head.author, Party::Key(_)));
 
         let recs = run_history(&host, "echo").await;
         assert_eq!(recs.len(), 1);
@@ -186,7 +216,7 @@ fn squatted_message_id_downgrades_to_run_record() {
         let views = messages(&host, "general").await;
         assert_eq!(views.len(), 3, "user post + rule reply");
         assert_eq!(views[2].head.message_id, "auto-echo-general-2");
-        assert_eq!(views[2].head.author, AuthorRef::Module(AUTO.into()));
+        assert_eq!(views[2].head.author, Party::Module(AUTO.into()));
         assert_eq!(
             views[2].head.blocks,
             vec![Block::paragraph("echo 2")],

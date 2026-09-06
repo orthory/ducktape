@@ -39,6 +39,14 @@ fn split_target(rest: &[u8]) -> Result<(String, &[u8]), host::Error> {
 }
 
 impl Guest for Component {
+    fn pending_items() -> Result<Vec<host::PendingItem>, host::Error> {
+        Ok(Vec::new())
+    }
+
+    fn acknowledge(_ack: host::Ack) -> Result<(), host::Error> {
+        Err(host::Error::Rejected("module has no outbound queue".into()))
+    }
+
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             backing: host::Backing::Map,
@@ -75,7 +83,7 @@ impl Guest for Component {
                         host::state_set(ROOT_KEY, &root);
                         Ok(())
                     }
-                    None => Err(host::Error::NotFound),
+                    None => Err(host::Error::UnknownModule(target)),
                 }
             }
             // 'f' + le-u64 count — perform `count` DISTINCT queries: the

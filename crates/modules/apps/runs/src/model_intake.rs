@@ -1,6 +1,6 @@
 use super::{
-    AgentEvent, Ctx, DispatchMsg, Error, Msg, OutputContract, RUN_DEADLINE_VIEWS, RUN_LEASE_VIEWS,
-    RUN_MAX_ATTEMPTS, Routing, RunsModule, agent_decode_event, dispatch_encode_msg, recipe_id_for,
+    Ctx, DispatchMsg, Error, ModelEvent, Msg, OutputContract, RUN_DEADLINE_VIEWS, RUN_LEASE_VIEWS,
+    RUN_MAX_ATTEMPTS, Routing, RunsModule, dispatch_encode_msg, recipe_id_for,
 };
 
 impl RunsModule {
@@ -12,13 +12,13 @@ impl RunsModule {
     /// which is exactly the atomicity the recipe seam needs (a squatted or
     /// oversized recipe id must fail the registration, not land a record
     /// without a recipe).
-    pub(super) fn on_agent_event(
+    pub(super) fn on_model_event(
         &mut self,
         ctx: &mut dyn Ctx,
-        payload: &[u8],
+        event: ModelEvent,
     ) -> Result<(), Error> {
-        match agent_decode_event(payload).map_err(Error::Module)? {
-            AgentEvent::Registered {
+        match event {
+            ModelEvent::Registered {
                 agent_id,
                 capability,
             } => {
@@ -48,7 +48,7 @@ impl RunsModule {
                 });
                 Ok(())
             }
-            AgentEvent::CapabilityChanged {
+            ModelEvent::CapabilityChanged {
                 agent_id,
                 capability,
             } => {
@@ -67,7 +67,7 @@ impl RunsModule {
                 });
                 Ok(())
             }
-            AgentEvent::Deregistered { agent_id } => {
+            ModelEvent::Deregistered { agent_id } => {
                 // retire the recipe with the agent: dispatch's own
                 // `RemoveRecipe` already lets an in-flight dispatch finish
                 // against the manifest it captured, so no run-liveness check

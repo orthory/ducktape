@@ -182,6 +182,7 @@ impl MockCtx {
                 consensus_time: 0,
                 origin: Origin::System,
                 me: "files".into(),
+                cause: sdk::Cause::Direct,
             },
         }
     }

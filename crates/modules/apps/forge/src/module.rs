@@ -1185,6 +1185,7 @@ mod tests {
             consensus_time,
             origin,
             me: "forge".into(),
+            cause: sdk::Cause::Direct,
         })
     }
 

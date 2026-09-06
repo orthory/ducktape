@@ -29,6 +29,9 @@ dispatch = { workspace = true }
 acl = { workspace = true }
 valset = { workspace = true }
 identity = { workspace = true }
+# the journal codec for a block's prepared internal work (`PreparedWork`),
+# the uniform record codec every module already persists with.
+borsh = { workspace = true }
 
 [dev-dependencies]
 # the fail-closed proof asserts the OPERATOR-facing line the boundary emits
@@ -55,7 +58,6 @@ pages = { workspace = true }
 chat = { workspace = true }
 inbox = { workspace = true }
 tasks = { workspace = true }
-tagging = { workspace = true }
 capability = { workspace = true }
 duckdns = { workspace = true }
 # the gateway/governance parity proofs stand the native modules (and their
@@ -75,9 +77,10 @@ saga = { workspace = true }
 # the agent/automations adapter-port parity proofs stand the native modules
 # (and their native saga / chat+tasks+inbox siblings) beside the wasm ports.
 agent = { workspace = true }
+attribution = { workspace = true }
 automations = { workspace = true }
 # the runs adapter-port parity proof drives the REAL collaboration loop —
-# chat-over-QmdbStore, pages-over-QmdbStore, tagging, saga, dispatch (native
+# chat-over-QmdbStore, pages-over-QmdbStore, attribution, saga, dispatch (native
 # by design), agent, tasks, files — through the native runs module and
 # its wasm port side by side. files needs an on-disk odb dir (tempfile).
 runs = { workspace = true }

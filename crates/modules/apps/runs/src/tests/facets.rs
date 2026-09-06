@@ -6,20 +6,9 @@ use super::*;
 /// run for agent "bot" at seq 2.
 fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
     let mut m = module().with_sink_forge("forge");
-    let mut ctx = CaptureCtx::new()
-        .with_origin(user(9))
-        .with_registry(registry);
-    exec(
-        &mut m,
-        &mut ctx,
-        &admin(&RunsMsg::WatchChannel {
-            channel_id: "general".into(),
-            policy: TurnPolicy::All,
-        }),
-    )
-    .unwrap();
+    m.models = registry.clone();
     commit(&mut m);
-    engage_post(&mut m, registry, 2, &[]);
+    request_post(&mut m, registry, 2, &[]);
     commit(&mut m);
     (m, run_id_for("general", 2, "bot"))
 }
@@ -482,7 +471,7 @@ fn raw_commit_message_does_not_inflate_the_job_finalize_receipt() {
     exec(&mut m, &mut ctx, &jobs_event("job-1", "agent/duck", "spec")).unwrap();
     commit(&mut m);
     let run_id = job_run_id_for("job-1", "duck", 3);
-    let response = agent::encode_response(&AgentResponse {
+    let response = crate::encode_response(&AgentResponse {
         reply_blocks: Vec::new(),
         actions: vec![AgentAction::CreateTask {
             task_id: "t1".into(),
@@ -1066,7 +1055,7 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
     // dispatch module: register a recipe, dispatch, and read the saga id
     // off the emitted trigger — the mirror must derive the same id.
     let mut d =
-        dispatch::DispatchModule::new("dispatch", "saga", Box::new(sdk_testkit::MemStore::new()));
+        dispatch::DispatchModule::new("dispatch", "saga", "identity", Box::new(sdk_testkit::MemStore::new()));
     let mut ctx = CaptureCtx::new().with_origin(Origin::Module("runs".into()));
     block_on(d.execute(
         &mut ctx,

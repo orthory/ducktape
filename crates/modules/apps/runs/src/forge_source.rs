@@ -12,7 +12,7 @@
 //! and dev-only conformance tests pin every mirror against the real forge
 //! codec so the wire cannot silently drift.
 
-use agent::{AgentRecord, CapRequest, SkillRef};
+use crate::{ModelRecord, CapRequest, SkillRef};
 use sdk::Ctx;
 use serde::{Deserialize, Serialize};
 
@@ -197,7 +197,7 @@ impl RunsModule {
     pub(crate) async fn forge_portable_inputs(
         &self,
         ctx: &dyn Ctx,
-        agent: &AgentRecord,
+        agent: &ModelRecord,
         item_ref: &ForgeItemRef<'_>,
         extra: &[SkillRef],
     ) -> Result<PortableInputs, String> {
@@ -449,7 +449,7 @@ mod tests {
             kind,
             title: "t".into(),
             state,
-            author: chat::AuthorRef::User(vec![1; 32]),
+            author: chat::Party::Key(vec![1; 32]),
             created_at: 1,
             updated_at: 2,
         };
@@ -476,7 +476,7 @@ mod tests {
                 kind,
                 title: "Fix the flaky gate".into(),
                 state: forge::ItemState::Open,
-                author: chat::AuthorRef::User(vec![1; 32]),
+                author: chat::Party::Key(vec![1; 32]),
                 created_at: 1,
                 updated_at: 2,
             },

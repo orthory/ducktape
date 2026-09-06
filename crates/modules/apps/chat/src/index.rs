@@ -54,10 +54,10 @@
 //! identical in the engine transaction and the native test harness.
 
 use index_guest::search::{self, DEFAULT_POSTING_CAP};
-use index_guest::{Fail, OpRow, OriginKind, OriginTag, StateRead, Writes, user_handle};
+use index_guest::{Fail, OpRow, StateRead, Writes, user_handle};
 use serde::{Deserialize, Serialize};
 
-use crate::{Block, ChatAssigned, ChatMsg, PostPolicy, Span, decode_assigned, decode_msg};
+use crate::{Block, ChatAssigned, ChatMsg, Party, PostPolicy, Span, decode_assigned, decode_msg};
 
 mod tags;
 pub use tags::{MAX_TAG_CHARS, MAX_TAGS_PER_MESSAGE, TagRow};
@@ -90,9 +90,10 @@ pub struct MsgRow {
     pub channel_id: String,
     pub seq: u64,
     pub message_id: String,
-    /// rendered author: `user:{id}`, `agent:{module}/{agent}`, `module:{id}`,
-    /// or `system` — display-grade, derived from the dispatch origin exactly
-    /// like chat derives authorship.
+    /// rendered author: `user:{id}`, `acct:{n}`, `module:{id}`, or `system`
+    /// — display-grade, derived from the dispatch origin. the origin is what
+    /// the feed row carries: an external key renders as that key even when
+    /// canonical chat resolved it to an account (see [`author`]).
     pub author: String,
     pub height: u64,
     pub time: u64,
@@ -143,9 +144,9 @@ pub struct ChannelRow {
     pub created_at: u64,
     /// `"open"` posting or members-only, rendered from the op.
     pub post_policy: PostPolicy,
-    /// the rendered creator handle for user-created channels; `None` for
-    /// module/system-minted ones.
-    pub owner: Option<String>,
+    /// the rendered creator handle — the channel's owner, whatever kind of
+    /// party created it (see [`author`]).
+    pub owner: String,
     pub archived: bool,
     /// module ids notified on every post.
     pub hooks: Vec<String>,
@@ -153,19 +154,19 @@ pub struct ChannelRow {
     pub huddle: Vec<HuddleEntry>,
 }
 
-/// one huddle participant: rendered user handle plus the hex node key peers
+/// one huddle participant: rendered party handle plus the hex node key peers
 /// route media to.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HuddleEntry {
-    pub user: String,
+    pub party: String,
     pub node: String,
     pub joined_at: u64,
 }
 
-/// one channel member, keyed by rendered handle.
+/// one channel member, keyed by rendered party handle.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemberRow {
-    pub user: String,
+    pub party: String,
     pub height: u64,
     pub time: u64,
 }
@@ -381,17 +382,15 @@ fn plain_text(blocks: &[Block]) -> String {
     out
 }
 
-/// render the author the way chat derives it: origin decides, `as_agent`
-/// refines a module origin into an agent author. pub: feed followers outside
-/// the fold (the desktop app folding the same op stream) must render
-/// authorship identically or rows drift between hydration and deltas.
-pub fn author(origin: &OriginTag, as_agent: Option<&str>) -> String {
-    let id = origin.id.as_deref().unwrap_or_default();
-    match (origin.kind, as_agent) {
-        (OriginKind::Module, Some(agent)) => format!("agent:{id}/{agent}"),
-        (OriginKind::Module, None) => format!("module:{id}"),
-        (OriginKind::External, _) => format!("user:{id}"),
-        (OriginKind::System, _) => "system".to_string(),
+/// Stable handle shared by canonical actor stamps, rosters and client deltas.
+/// A key's account resolution is performed by the module before stamping;
+/// the index never infers account membership from the raw origin.
+pub fn party_handle(party: &Party) -> String {
+    match party {
+        Party::Account(account) => format!("acct:{account}"),
+        Party::Key(key) => format!("user:{}", user_handle(key)),
+        Party::Module(module) => format!("module:{module}"),
+        Party::System => "system".to_string(),
     }
 }
 
@@ -500,14 +499,13 @@ fn decode_stamp(op: &OpRow) -> Result<ChatAssigned, Fail> {
 pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
     let msg = decode_msg(&op.payload).map_err(|e| Fail::new(FAIL_OP_DECODE, e))?;
     let mut out = Writes::new();
+    let actor = party_handle(decode_stamp(op)?.actor());
     match msg {
         ChatMsg::CreateChannel {
             channel_id,
             name,
             post_policy,
         } => {
-            let is_user = matches!(op.origin.kind, OriginKind::External);
-            let owner = is_user.then(|| op.origin.id.clone().unwrap_or_default());
             put_channel(
                 &mut out,
                 &ChannelRow {
@@ -515,7 +513,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                     name,
                     created_at: op.time,
                     post_policy,
-                    owner,
+                    owner: actor.clone(),
                     archived: false,
                     hooks: Vec::new(),
                     huddle: Vec::new(),
@@ -526,14 +524,12 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             counterpart: _,
             name,
         } => {
-            let ChatAssigned::DmChannel { channel_id } = decode_stamp(op)? else {
+            let ChatAssigned::DmChannel { channel_id, .. } = decode_stamp(op)? else {
                 return Err(Fail::new(
                     FAIL_ASSIGNED_DECODE,
                     "applied CreateDmChannel carried a non-DmChannel stamp",
                 ));
             };
-            let is_user = matches!(op.origin.kind, OriginKind::External);
-            let owner = is_user.then(|| op.origin.id.clone().unwrap_or_default());
             put_channel(
                 &mut out,
                 &ChannelRow {
@@ -541,7 +537,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                     name,
                     created_at: op.time,
                     post_policy: PostPolicy::MembersOnly,
-                    owner,
+                    owner: actor.clone(),
                     archived: false,
                     hooks: Vec::new(),
                     huddle: Vec::new(),
@@ -568,11 +564,10 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
         ChatMsg::PostMessage {
             channel_id,
             message_id,
-            blocks,
+            blocks: _,
             thread,
-            as_agent,
         } => {
-            let ChatAssigned::Posted { seq } = decode_stamp(op)? else {
+            let ChatAssigned::Posted { seq, blocks, .. } = decode_stamp(op)? else {
                 return Err(Fail::new(
                     FAIL_ASSIGNED_DECODE,
                     "applied PostMessage carried a non-Posted stamp",
@@ -611,7 +606,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let row = MsgRow {
                 seq,
                 message_id,
-                author: author(&op.origin, as_agent.as_deref()),
+                author: actor.clone(),
                 height: op.height,
                 time: op.time,
                 text,
@@ -634,10 +629,10 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
         ChatMsg::EditMessage {
             channel_id,
             seq,
-            blocks,
+            blocks: _,
             base_rev,
         } => {
-            let ChatAssigned::Edited { rev } = decode_stamp(op)? else {
+            let ChatAssigned::Edited { rev, blocks, .. } = decode_stamp(op)? else {
                 return Err(Fail::new(
                     FAIL_ASSIGNED_DECODE,
                     "applied EditMessage carried a non-Edited stamp",
@@ -699,7 +694,11 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut row) = read_row(read, &msg_key(&channel_id, seq))? else {
                 return Ok(out);
             };
-            let reactor = author(&op.origin, None);
+            let reactor = party_handle(
+                decode_stamp(op)?
+                    .participant()
+                    .map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?,
+            );
             let entry = row.reactions.iter_mut().find(|r| r.emoji == emoji);
             match entry {
                 Some(entry) => {
@@ -728,7 +727,11 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut row) = read_row(read, &msg_key(&channel_id, seq))? else {
                 return Ok(out);
             };
-            let reactor = author(&op.origin, None);
+            let reactor = party_handle(
+                decode_stamp(op)?
+                    .participant()
+                    .map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?,
+            );
             let Some(entry) = row.reactions.iter_mut().find(|r| r.emoji == emoji) else {
                 return Ok(out);
             };
@@ -766,17 +769,17 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
         }
         ChatMsg::SetMembership {
             channel_id,
-            user,
+            party,
             member,
         } => {
-            let handle = user_handle(&user);
+            let handle = party_handle(&party);
             let key = member_row_key(&channel_id, &handle);
             if member {
                 index_guest::put(
                     &mut out,
                     key,
                     encode_json(&MemberRow {
-                        user: handle,
+                        party: handle,
                         height: op.height,
                         time: op.time,
                     })?,
@@ -789,9 +792,13 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut row) = read_channel(read, &channel_id)? else {
                 return Ok(out);
             };
-            let user = op.origin.id.clone().unwrap_or_default();
+            let party = party_handle(
+                decode_stamp(op)?
+                    .participant()
+                    .map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?,
+            );
             let node = hex_lower(&node);
-            match row.huddle.iter_mut().find(|m| m.user == user) {
+            match row.huddle.iter_mut().find(|m| m.party == party) {
                 Some(existing) => {
                     if existing.node == node {
                         return Ok(out);
@@ -801,7 +808,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                     existing.node = node;
                 }
                 None => row.huddle.push(HuddleEntry {
-                    user,
+                    party,
                     node,
                     joined_at: op.time,
                 }),
@@ -812,16 +819,20 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut row) = read_channel(read, &channel_id)? else {
                 return Ok(out);
             };
-            let user = op.origin.id.clone().unwrap_or_default();
-            row.huddle.retain(|m| m.user != user);
+            let party = party_handle(
+                decode_stamp(op)?
+                    .participant()
+                    .map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?,
+            );
+            row.huddle.retain(|m| m.party != party);
             put_channel(&mut out, &row)?;
         }
-        ChatMsg::SweepHuddle { channel_id, user } => {
+        ChatMsg::SweepHuddle { channel_id, party } => {
             let Some(mut row) = read_channel(read, &channel_id)? else {
                 return Ok(out);
             };
-            let target = user_handle(&user);
-            row.huddle.retain(|m| m.user != target);
+            let target = party_handle(&party);
+            row.huddle.retain(|m| m.party != target);
             put_channel(&mut out, &row)?;
         }
     }
@@ -1110,6 +1121,7 @@ mod tag_tests;
 mod tests {
     use super::*;
     use crate::{encode_assigned, encode_msg};
+    use index_guest::OriginTag;
     use index_guest::apply_to_map;
     use std::collections::BTreeMap;
 
@@ -1121,18 +1133,38 @@ mod tests {
     /// explicit stamp through [`op_with`] instead.
     fn assigned_for(map: &Map, msg: &ChatMsg) -> Vec<u8> {
         match msg {
-            ChatMsg::PostMessage { channel_id, .. } => encode_assigned(&ChatAssigned::Posted {
+            ChatMsg::PostMessage {
+                channel_id, blocks, ..
+            } => encode_assigned(&ChatAssigned::Posted {
                 seq: read_u64(map, &seq_key(channel_id)) + 1,
+                actor: Party::Key(b"jess".to_vec()),
+                blocks: blocks.clone(),
             }),
             ChatMsg::EditMessage {
-                channel_id, seq, ..
+                channel_id,
+                seq,
+                blocks,
+                ..
             } => {
                 let row = read_row(map, &msg_key(channel_id, *seq))
                     .expect("row reads")
                     .expect("edited row exists");
-                encode_assigned(&ChatAssigned::Edited { rev: row.rev + 1 })
+                encode_assigned(&ChatAssigned::Edited {
+                    rev: row.rev + 1,
+                    actor: Party::Key(b"jess".to_vec()),
+                    blocks: blocks.clone(),
+                })
             }
-            _ => Vec::new(),
+            ChatMsg::AddReaction { .. }
+            | ChatMsg::RemoveReaction { .. }
+            | ChatMsg::JoinHuddle { .. }
+            | ChatMsg::LeaveHuddle { .. } => encode_assigned(&ChatAssigned::Participant {
+                actor: Party::Key(b"jess".to_vec()),
+                participant: Party::Key(b"jess".to_vec()),
+            }),
+            _ => encode_assigned(&ChatAssigned::Actor {
+                actor: Party::Key(b"jess".to_vec()),
+            }),
         }
     }
 
@@ -1153,7 +1185,6 @@ mod tests {
             message_id: id.into(),
             blocks: vec![Block::paragraph(text)],
             thread: None,
-            as_agent: None,
         }
     }
 
@@ -1168,6 +1199,77 @@ mod tests {
             ChatViewReply::Hits(hits) => hits,
             other => panic!("expected hits, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn canonical_actor_stamps_merge_keys_in_rosters_and_reactions() {
+        let mut map = Map::new();
+        let mut apply = |origin: &str, message: ChatMsg, assignment: ChatAssigned| {
+            let writes = fold_op(
+                &OpRow {
+                    height: 1,
+                    seq: 0,
+                    time: 1,
+                    origin: OriginTag::external(origin),
+                    payload: encode_msg(&message),
+                    assigned: encode_assigned(&assignment),
+                },
+                &map,
+            )
+            .unwrap();
+            apply_to_map(&mut map, writes);
+        };
+        let actor = || ChatAssigned::Actor {
+            actor: Party::Account(7),
+        };
+        apply(
+            "phone",
+            ChatMsg::CreateChannel {
+                channel_id: "g".into(),
+                name: "Room".into(),
+                post_policy: PostPolicy::Open,
+            },
+            actor(),
+        );
+        apply(
+            "phone",
+            post("g", "m", "text"),
+            ChatAssigned::Posted {
+                seq: 1,
+                actor: Party::Account(7),
+                blocks: vec![Block::paragraph("text")],
+            },
+        );
+        let participant = || ChatAssigned::Participant {
+            actor: Party::Account(7),
+            participant: Party::Account(7),
+        };
+        for key in ["phone", "laptop"] {
+            apply(
+                key,
+                ChatMsg::AddReaction {
+                    channel_id: "g".into(),
+                    seq: 1,
+                    emoji: "+1".into(),
+                },
+                participant(),
+            );
+            apply(
+                key,
+                ChatMsg::JoinHuddle {
+                    channel_id: "g".into(),
+                    node: vec![1; 32],
+                },
+                participant(),
+            );
+        }
+        let channel = read_channel(&map, "g").unwrap().unwrap();
+        assert_eq!(channel.owner, "acct:7");
+        assert_eq!(channel.huddle.len(), 1);
+        assert_eq!(channel.huddle[0].party, "acct:7");
+        let message = read_row(&map, &msg_key("g", 1)).unwrap().unwrap();
+        assert_eq!(message.author, "acct:7");
+        assert_eq!(message.reactions[0].reactors, vec!["acct:7"]);
     }
 
     #[test]
@@ -1196,7 +1298,15 @@ mod tests {
         let mut map = Map::new();
         let msg = post("general", "m42", "first post after the boundary");
         let writes = fold_op(
-            &op_with(9, &msg, encode_assigned(&ChatAssigned::Posted { seq: 42 })),
+            &op_with(
+                9,
+                &msg,
+                encode_assigned(&ChatAssigned::Posted {
+                    seq: 42,
+                    actor: Party::Key(b"jess".to_vec()),
+                    blocks: vec![Block::paragraph("first post after the boundary")],
+                }),
+            ),
             &map,
         )
         .expect("fold");
@@ -1302,30 +1412,60 @@ mod tests {
     }
 
     #[test]
-    fn agent_author_is_rendered() {
+    fn every_origin_kind_renders_its_own_author_handle() {
         let mut map = Map::new();
-        let writes = fold_op(
-            &OpRow {
-                height: 1,
-                seq: 0,
-                time: 1_001,
-                origin: OriginTag::module("agent"),
-                payload: encode_msg(&ChatMsg::PostMessage {
-                    channel_id: "g".into(),
-                    message_id: "m1".into(),
-                    blocks: vec![Block::paragraph("from the helper")],
-                    thread: None,
-                    as_agent: Some("helper".into()),
-                }),
-                assigned: encode_assigned(&ChatAssigned::Posted { seq: 1 }),
-            },
-            &map,
-        )
-        .expect("fold");
-        apply_to_map(&mut map, writes);
-
-        let hits = search(&map, serde_json::json!({"search": {"text": "helper"}}));
-        assert_eq!(hits[0].author, "agent:agent/helper");
+        for (seq, (origin, party, expected)) in [
+            (OriginTag::program(5), Party::Account(5), "acct:5"),
+            (
+                OriginTag::module("runs"),
+                Party::Module("runs".into()),
+                "module:runs",
+            ),
+            (OriginTag::system(), Party::System, "system"),
+            (
+                OriginTag::external("jess"),
+                Party::Key(b"jess".to_vec()),
+                "user:jess",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let seq = seq as u64 + 1;
+            let writes = fold_op(
+                &OpRow {
+                    height: seq,
+                    seq: 0,
+                    time: 1_000 + seq,
+                    origin,
+                    payload: encode_msg(&ChatMsg::PostMessage {
+                        channel_id: "g".into(),
+                        message_id: format!("m{seq}"),
+                        blocks: vec![Block::paragraph(format!("hello {seq}"))],
+                        thread: None,
+                    }),
+                    assigned: encode_assigned(&ChatAssigned::Posted {
+                        seq,
+                        actor: party,
+                        blocks: vec![Block::paragraph(format!("hello {seq}"))],
+                    }),
+                },
+                &map,
+            )
+            .expect("fold");
+            apply_to_map(&mut map, writes);
+            let hits = search(
+                &map,
+                serde_json::json!({"search": {"text": format!("hello {seq}")}}),
+            );
+            assert_eq!(hits[0].author, expected);
+        }
+        // a named party renders in the same vocabulary as an acting origin.
+        assert_eq!(party_handle(&Party::Account(5)), "acct:5");
+        assert_eq!(party_handle(&Party::Key(b"jess".to_vec())), "user:jess");
+        assert_eq!(party_handle(&Party::Key(vec![0xab, 0xcd])), "user:abcd");
+        assert_eq!(party_handle(&Party::Module("runs".into())), "module:runs");
+        assert_eq!(party_handle(&Party::System), "system");
     }
 
     #[test]
@@ -1391,7 +1531,7 @@ mod tests {
         assert_eq!(channels.len(), 2);
         assert_eq!(channels[0].channel.id, "general");
         assert_eq!(channels[0].head_seq, 1, "head_seq joins from the mirror");
-        assert_eq!(channels[0].channel.owner.as_deref(), Some("jess"));
+        assert_eq!(channels[0].channel.owner, "user:jess");
         assert_eq!(channels[1].head_seq, 0);
 
         fold(
@@ -1435,7 +1575,6 @@ mod tests {
                     message_id: format!("reply-{i}"),
                     blocks: vec![Block::paragraph(format!("reply {i}"))],
                     thread: Some(3),
-                    as_agent: None,
                 },
             );
         }
@@ -1595,7 +1734,6 @@ mod tests {
                     message_id: format!("r{i}"),
                     blocks: vec![Block::paragraph(format!("reply {i}"))],
                     thread: Some(1),
-                    as_agent: None,
                 },
             );
         }
@@ -1715,7 +1853,7 @@ mod tests {
         fold(&mut map, 1, &create("g", "General"));
         let membership = |user: &str, member: bool| ChatMsg::SetMembership {
             channel_id: "g".into(),
-            user: user.as_bytes().to_vec(),
+            party: Party::Key(user.as_bytes().to_vec()),
             member,
         };
         fold(&mut map, 2, &membership("alice", true));
@@ -1728,7 +1866,7 @@ mod tests {
             panic!("wrong reply shape")
         };
         assert_eq!(members.len(), 1);
-        assert_eq!(members[0].user, "bob");
+        assert_eq!(members[0].party, "user:bob");
 
         fold(
             &mut map,
@@ -1744,7 +1882,7 @@ mod tests {
             panic!("g exists")
         };
         assert_eq!(info.channel.huddle.len(), 1);
-        assert_eq!(info.channel.huddle[0].user, "jess");
+        assert_eq!(info.channel.huddle[0].party, "user:jess");
         assert_eq!(info.channel.huddle[0].node, "ab".repeat(32));
 
         fold(
@@ -1752,7 +1890,7 @@ mod tests {
             6,
             &ChatMsg::SweepHuddle {
                 channel_id: "g".into(),
-                user: b"jess".to_vec(),
+                party: Party::Key(b"jess".to_vec()),
             },
         );
         let ChatViewReply::Channel(Some(info)) =

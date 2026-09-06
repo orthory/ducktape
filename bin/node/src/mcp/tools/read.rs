@@ -21,14 +21,14 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
-use agent::{AgentQuery, CapRequest};
+use runs::{ModelQuery, CapRequest};
 use forge::ForgeQuery;
 use pages::PageQuery;
 use runs::RunsQuery;
 use tasks::{TaskQuery, WorkQuery};
 
 use super::{Tool, arg_str, opt_u64, schema};
-use crate::mcp::identity::{Run, TARGET_AGENT, TARGET_RUNS};
+use crate::mcp::identity::{Run, TARGET_MODEL, TARGET_RUNS};
 use crate::mcp::node::{NodeError, Result};
 
 const TARGET_CHAT: &str = "chat";
@@ -216,8 +216,8 @@ fn whoami(run: &Run, _args: &Value) -> Result<Value> {
 
 fn agents_list(run: &Run, args: &Value) -> Result<Value> {
     let limit = list_limit(args)?;
-    let reply = run.node.query(TARGET_AGENT, encode(&AgentQuery::Agents)?)?;
-    let (agents, total, truncated) = bounded(reply_array(&reply, "agents")?, limit);
+    let reply = run.node.query(TARGET_MODEL, encode(&runs::RunsQuery::Model { query: ModelQuery::Agents })?)?;
+    let (agents, total, truncated) = bounded(reply_array(reply.get("model").ok_or_else(|| NodeError::Transport("missing model reply".into()))?, "agents")?, limit);
     Ok(json!({
         "agents": agents,
         "total": total,
@@ -353,7 +353,7 @@ fn files_read(run: &Run, args: &Value) -> Result<Value> {
 
 /// duckfs grep's own prefix rule is a raw string prefix (`/shared/team` also
 /// matches `/shared/team-secrets/...`), but the cap this tool gates on is
-/// segment-boundary (see `AgentRecord::permits`'s doc on `DuckfsRead`). Passing
+/// segment-boundary (see `ModelRecord::permits`'s doc on `DuckfsRead`). Passing
 /// the gate on `prefix` does not make every hit `grep` returns covered by the
 /// cap, so each hit's own path is re-checked against the SAME predicate before
 /// it reaches the agent — closing the sibling-path leak without narrowing
@@ -386,7 +386,7 @@ fn files_grep(run: &Run, args: &Value) -> Result<Value> {
 
 /// drop every grep hit whose own path the record's duckfs_read cap does not
 /// segment-boundary cover — a no-op if the reply carries no `hits` array.
-fn retain_capped_hits(record: &agent::AgentRecord, reply: &mut Value) {
+fn retain_capped_hits(record: &runs::ModelRecord, reply: &mut Value) {
     let Some(hits) = reply.get_mut("hits").and_then(Value::as_array_mut) else {
         return;
     };
@@ -402,7 +402,7 @@ fn retain_capped_hits(record: &agent::AgentRecord, reply: &mut Value) {
 /// `hits`, #1755). Fall back to the last RETAINED hit's own path — still a
 /// valid resume point inside the cap — or drop `next` entirely when no hit
 /// survived filtering. A no-op if the reply carries no `next` cursor already.
-fn scrub_uncapped_cursor(record: &agent::AgentRecord, reply: &mut Value) {
+fn scrub_uncapped_cursor(record: &runs::ModelRecord, reply: &mut Value) {
     // no cursor (missing key, or an explicit `null` meaning "no more pages")
     // is nothing to scrub.
     let Some(next) = reply.get("next").and_then(Value::as_str) else {
@@ -589,7 +589,7 @@ mod tests {
             json!({"roots": {"channel_id": "c", "limit": 5}}),
         )
         .expect("the roots view literal is chat's view wire");
-        assert_eq!(encode(&AgentQuery::Agents).unwrap(), json!("agents"));
+        assert_eq!(encode(&ModelQuery::Agents).unwrap(), json!("agents"));
         assert_eq!(
             encode(&RunsQuery::PendingRuns).unwrap(),
             json!("pending_runs")
@@ -749,19 +749,19 @@ mod tests {
 
     /// a record capped to `duckfs_read = ["/shared/team"]`, shared by the grep
     /// cap tests below.
-    fn team_capped_record() -> agent::AgentRecord {
-        agent::AgentRecord {
+    fn team_capped_record() -> runs::ModelRecord {
+        runs::ModelRecord {
             agent_id: "bot".into(),
-            owner: saga::SagaOrigin::External(vec![9; 32]),
+            owner: runs::RunOrigin::External(vec![9; 32]),
             display_name: "BOT".into(),
             capability: "model-1".into(),
             allowed_actions: vec![],
-            status: agent::AgentStatus::Active,
-            role: agent::AgentRole::General,
+            status: runs::ModelStatus::Active,
+            role: runs::ModelRole::General,
             created_at: 0,
             updated_at: 0,
             recipe_hash: vec![],
-            caps: agent::ResourceCaps {
+            caps: runs::ResourceCaps {
                 duckfs_read: vec!["/shared/team".into()],
                 ..Default::default()
             },
@@ -848,12 +848,12 @@ mod tests {
     /// `prefix` is never widened before it reaches duckfs: a cap (and a call)
     /// naming one exact FILE, not a directory, must still see its own hit and
     /// keep a cursor that resumes at that same file — `retain_capped_hits`'s
-    /// `p == pre` exact-match arm (mirroring `AgentRecord::permits`) covers
+    /// `p == pre` exact-match arm (mirroring `ModelRecord::permits`) covers
     /// this without any prefix rewriting.
     #[test]
     fn a_cap_naming_one_exact_file_still_sees_its_own_hit_and_cursor() {
-        let record = agent::AgentRecord {
-            caps: agent::ResourceCaps {
+        let record = runs::ModelRecord {
+            caps: runs::ResourceCaps {
                 duckfs_read: vec!["/shared/team/a.txt".into()],
                 ..Default::default()
             },

@@ -18,10 +18,10 @@
 //! finalizes the board item with the validated response.
 
 use statesync::qmdb::QmdbStore;
-use agent::AgentModule;
-use agent::{
-    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, AgentMsg,
-    AgentQuery, AgentReply, AgentResponse, AgentStatus, ReplyBlock, decode_reply, encode_msg,
+use runs::AgentModule;
+use runs::{
+    ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, AgentAction, ModelMsg,
+    ModelQuery, ModelReply, AgentResponse, ModelStatus, ReplyBlock, decode_reply, encode_msg,
     encode_query, encode_response,
 };
 use runs::{RunsModule, dispatch_id_for, job_run_id_for, reply_message_id, run_id_for};
@@ -172,7 +172,7 @@ fn noop_block(n: u64) -> Msg {
 fn register_quackbot(actions: Vec<String>) -> Msg {
     Msg {
         target: "agent".into(),
-        payload: encode_msg(&AgentMsg::RegisterAgent {
+        payload: encode_msg(&ModelMsg::RegisterModel {
             agent_id: "quackbot".into(),
             display_name: "Quackbot".into(),
             capability: "mock-llm-1".into(),
@@ -447,7 +447,7 @@ fn claim_job(job_id: &str) -> Msg {
 fn register_duck() -> Msg {
     Msg {
         target: "agent".into(),
-        payload: encode_msg(&AgentMsg::RegisterAgent {
+        payload: encode_msg(&ModelMsg::RegisterModel {
             agent_id: "duck".into(),
             display_name: "Duck".into(),
             capability: "mock-llm-1".into(),
@@ -602,16 +602,16 @@ fn a_mention_flows_through_tagging_and_dispatch_and_lands_reply_and_task_next_bl
         let record = host
             .query(
                 "agent",
-                &encode_query(&AgentQuery::Agent {
+                &encode_query(&ModelQuery::Agent {
                     agent_id: "quackbot".into(),
                 }),
             )
             .await
             .unwrap();
-        let AgentReply::Agent(Some(record)) = decode_reply(&record).unwrap() else {
+        let ModelReply::Agent(Some(record)) = decode_reply(&record).unwrap() else {
             panic!("agent record expected");
         };
-        assert_eq!(record.status, AgentStatus::Active);
+        assert_eq!(record.status, ModelStatus::Active);
         assert_eq!(record.capability, "mock-llm-1");
 
         (host.root_hash(), oracle_op)

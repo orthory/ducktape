@@ -901,11 +901,24 @@ pub trait BlockSink {
     /// durably record a locally-submitted frame's bytes before the orderer
     /// may propose them.
     fn pin(&mut self, frame: &[u8]) -> impl std::future::Future<Output = Result<(), Error>>;
-    /// durably record a finalized frame about to be applied at `height`.
+    /// durably record a finalized frame about to be applied at `height`,
+    /// with the internal work the host prepared for the block from committed
+    /// state — the units a replay must run even after their sources retired
+    /// them.
     fn pre_apply(
         &mut self,
         height: u64,
         frame: &[u8],
+        prepared: &host::PreparedWork,
+    ) -> impl std::future::Future<Output = Result<(), Error>>;
+    /// durably record what a block's units observed of their siblings,
+    /// BEFORE its first module commits (the host's pre-commit witness): a
+    /// replay serves those observations verbatim instead of re-reading
+    /// siblings that have since moved past the block.
+    fn witness(
+        &mut self,
+        height: u64,
+        witness: &host::Witness,
     ) -> impl std::future::Future<Output = Result<(), Error>>;
     /// durably record a settled block's outcome.
     fn seal(&mut self, seal: &BlockSeal) -> impl std::future::Future<Output = Result<(), Error>>;
@@ -930,11 +943,36 @@ pub trait BlockSink {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NullSink;
 
+/// the host's pre-commit witness over this node's [`BlockSink`]: what a
+/// block's units observed reaches the journal before its first module
+/// commits.
+struct SinkWitness<'a, S: BlockSink> {
+    sink: &'a mut S,
+}
+
+#[async_trait::async_trait(?Send)]
+impl<S: BlockSink> host::CommitWitness for SinkWitness<'_, S> {
+    async fn record(&mut self, height: u64, witness: &host::Witness) -> Result<(), String> {
+        self.sink
+            .witness(height, witness)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 impl BlockSink for NullSink {
     async fn pin(&mut self, _frame: &[u8]) -> Result<(), Error> {
         Ok(())
     }
-    async fn pre_apply(&mut self, _height: u64, _frame: &[u8]) -> Result<(), Error> {
+    async fn pre_apply(
+        &mut self,
+        _height: u64,
+        _frame: &[u8],
+        _prepared: &host::PreparedWork,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    async fn witness(&mut self, _height: u64, _witness: &host::Witness) -> Result<(), Error> {
         Ok(())
     }
     async fn seal(&mut self, _seal: &BlockSeal) -> Result<(), Error> {
@@ -1685,7 +1723,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             // monotonicity floor together, so the next delivery below it is
             // refused rather than composed into the root out of order.
             self.applied_floor = Some(height);
-            self.sink.pre_apply(height, &frame).await?;
+            // the block's internal work, read from committed state BEFORE the
+            // frame mutates anything, rides the WAL record: a replay runs the
+            // same units after their sources have retired them.
+            let prepared = self.host.prepare_work(height).await.map_err(Error::Host)?;
+            self.sink.pre_apply(height, &frame, &prepared).await?;
             // an undecodable batch is a DETERMINISTIC whole-block no-op: every
             // honest node finalized the identical bytes and rejects them
             // identically (no fork), and a byzantine proposer cannot halt honest
@@ -1760,20 +1802,24 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             let started = std::time::Instant::now();
             let result = self
                 .host
-                .submit_block_ops(
+                .submit_block_prepared(
                     BlockContext {
                         height,
                         consensus_time: self.time_policy.stamp(height),
                         origin: Origin::System,
                     },
                     ops,
+                    prepared,
+                    &mut SinkWitness {
+                        sink: &mut self.sink,
+                    },
                 )
                 .await;
             // node-local apply cost of the WHOLE batch — the metrics plane's one
             // non-consensus signal, timed HERE in the effectful node layer (never
             // inside the clock-free host). shared by every member's record.
             let latency_us = started.elapsed().as_micros() as u64;
-            let outcome = match result {
+            let mut outcome = match result {
                 Ok(outcome) => outcome,
                 // a boundary fault is node-local: this registry is now
                 // indeterminate, so STOP — applying more finalized ops would
@@ -1781,9 +1827,9 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
                 Err(e @ host::SubmitError::Fatal(_)) => return Err(e.into()),
                 // submit_block folds a MEMBER rejection into its MemberOutcome
                 // and never errors the whole batch for one; a whole-batch
-                // Rejected can only come from a once-per-block System injection
-                // (`Advance` / `DeliverPending`) rejecting — a deterministic
-                // no-op. record it batch-level and keep draining.
+                // Rejected can only come from the once-per-block System
+                // injection (`Advance`) rejecting — a deterministic no-op.
+                // record it batch-level and keep draining.
                 Err(host::SubmitError::Rejected(e)) => {
                     self.drained.push(DrainedFrame {
                         id: batch_id,
@@ -1801,22 +1847,23 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
             };
             // N DrainedFrames per batch, all sharing the ONE post-batch root-hash.
             let batch_hash = outcome.root_hash;
-            self.events.extend(outcome.events);
+            self.events.extend(std::mem::take(&mut outcome.events));
             // the block-level seal disposition is DRAIN-based, not root-hash-based:
             // a block is Applied iff it ran real work — any member applied, or a
             // once-per-block System injection dispatched. this is identical live,
             // on forward replay, AND on a torn-heal's PARTIAL commit (which aborts
             // the already-durable mover, so its root-hash cannot be trusted). exactly
             // one seal per batch, below.
-            let has_system = !outcome.system_dispatches.is_empty();
-            // surface the injections' dispatch traces beside the member
-            // records: the replay paths (recovery, suffix catch-up) merge
-            // these AFTER the members' dispatches when re-executing this
-            // block, so a live node must hand its index consumer the same
-            // rows or live and replayed op indexes diverge.
+            let has_system = outcome.ran_internal_work();
+            // surface the internal work's dispatch traces (calls, deliveries,
+            // injections) beside the member records: the replay paths
+            // (recovery, suffix catch-up) merge these AFTER the members'
+            // dispatches when re-executing this block, so a live node must
+            // hand its index consumer the same rows or live and replayed op
+            // indexes diverge.
             if has_system {
                 self.system_dispatches
-                    .push((height, outcome.system_dispatches));
+                    .push((height, outcome.internal_dispatches()));
             }
             let mut any_applied = false;
             let (mut applied_count, mut rejected_count) = (0usize, 0usize);

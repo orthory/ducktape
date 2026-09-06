@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 sdk = { workspace = true }
 host = { workspace = true }
 node = { workspace = true }
@@ -19,5 +20,4 @@ futures = "0.3"
 directory = { workspace = true }
 commonware-cryptography = { workspace = true }
 modules = { workspace = true }
-async-trait = { workspace = true }
 sha2 = { workspace = true }

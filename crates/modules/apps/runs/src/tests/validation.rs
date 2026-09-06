@@ -74,22 +74,11 @@ fn responses_beyond_the_agents_grants_fail_the_run() {
 fn task_actions_without_a_configured_tasks_module_fail_the_run() {
     let registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])]);
     let mut m = RunsModule::new(
-        "runs", "chat", "saga", "tagging", "dispatch", "agent", None, None,
+        "runs", "chat", "saga", "attribution", "dispatch", "agent", None, None,
     );
-    let mut ctx = CaptureCtx::new()
-        .with_origin(user(9))
-        .with_registry(&registry);
-    exec(
-        &mut m,
-        &mut ctx,
-        &admin(&RunsMsg::WatchChannel {
-            channel_id: "general".into(),
-            policy: TurnPolicy::All,
-        }),
-    )
-    .unwrap();
+    m.models = registry.clone();
     commit(&mut m);
-    engage_post(&mut m, &registry, 2, &[]);
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     let run_id = run_id_for("general", 2, "bot");
 
@@ -132,7 +121,7 @@ fn task_actions_without_a_configured_tasks_module_fail_the_run() {
 /// instead of failing the whole run (#1664).
 #[test]
 fn duckfs_write_text_with_no_base_delivers_on_a_non_empty_filesystem() {
-    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, agent::ACTION_DUCKFS_WRITE_TEXT])]);
+    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, crate::ACTION_DUCKFS_WRITE_TEXT])]);
     registry
         .get_mut("bot")
         .unwrap()
@@ -140,8 +129,8 @@ fn duckfs_write_text_with_no_base_delivers_on_a_non_empty_filesystem() {
         .duckfs_write
         .push("/shared/agents/qa-fixer".into());
 
-    let mut m = watched(TurnPolicy::All, &registry).with_files_module("files");
-    engage_post(&mut m, &registry, 2, &[]);
+    let mut m = configured(&registry).with_files_module("files");
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     let run_id = run_id_for("general", 2, "bot");
 
@@ -203,7 +192,7 @@ fn duckfs_write_text_with_no_base_delivers_on_a_non_empty_filesystem() {
 /// the settle path never fails the whole run over it.
 #[test]
 fn duckfs_write_text_with_a_stale_base_degrades_without_failing_the_run() {
-    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, agent::ACTION_DUCKFS_WRITE_TEXT])]);
+    let mut registry = registry(&[("bot", &[ACTION_CHAT_POST, crate::ACTION_DUCKFS_WRITE_TEXT])]);
     registry
         .get_mut("bot")
         .unwrap()
@@ -211,8 +200,8 @@ fn duckfs_write_text_with_a_stale_base_degrades_without_failing_the_run() {
         .duckfs_write
         .push("/shared/agents/qa-fixer".into());
 
-    let mut m = watched(TurnPolicy::All, &registry).with_files_module("files");
-    engage_post(&mut m, &registry, 2, &[]);
+    let mut m = configured(&registry).with_files_module("files");
+    request_post(&mut m, &registry, 2, &[]);
     commit(&mut m);
     let run_id = run_id_for("general", 2, "bot");
 
@@ -290,15 +279,15 @@ fn a_squatted_reply_message_id_fails_the_run_instead_of_the_block() {
 #[test]
 fn a_full_thread_fails_the_run_instead_of_the_block() {
     let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    let mut m = watched(TurnPolicy::All, &registry);
+    let mut m = configured(&registry);
     // the anchor replies to a root that has hit the reply cap.
     let mut root = message(1, "root");
     root.head.reply_count = MAX_THREAD_REPLIES as u64;
-    let anchor = message_in("general", 2, AuthorRef::User(vec![1; 32]), "reply", Some(1));
+    let anchor = message_in("general", 2, Party::Key(vec![1; 32]), "reply", Some(1));
     let full = vec![root, anchor];
     let mut ctx = CaptureCtx::new()
         .at(2)
-        .with_tagging_origin()
+        .with_program_origin()
         .with_registry(&registry)
         .with_transcript("general", full.clone());
     exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
@@ -335,15 +324,15 @@ fn a_reply_and_a_post_message_into_one_near_full_thread_refuse_the_overflow() {
     // block; the mailbox re-injects it and it aborts again, forever. the
     // overflowing post must be refused at validation instead.
     let registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE])]);
-    let mut m = watched(TurnPolicy::All, &registry);
+    let mut m = configured(&registry);
     // one reply short of the cap: room for EXACTLY one more post.
     let mut root = message(1, "root");
     root.head.reply_count = MAX_THREAD_REPLIES as u64 - 1;
-    let anchor = message_in("general", 2, AuthorRef::User(vec![1; 32]), "reply", Some(1));
+    let anchor = message_in("general", 2, Party::Key(vec![1; 32]), "reply", Some(1));
     let nearly_full = vec![root, anchor];
     let mut ctx = CaptureCtx::new()
         .at(2)
-        .with_tagging_origin()
+        .with_program_origin()
         .with_registry(&registry)
         .with_transcript("general", nearly_full.clone());
     exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
@@ -440,18 +429,18 @@ fn a_failed_dispatch_outcome_posts_a_threaded_failure_reply_and_prunes_the_entry
     // the anchor is a thread reply, so the failure reply must join the
     // same thread a success reply would have.
     let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
-    let mut m = watched(TurnPolicy::All, &registry);
+    let mut m = configured(&registry);
     let mut thread_transcript = transcript(1);
     thread_transcript.push(message_in(
         "general",
         2,
-        AuthorRef::User(vec![1; 32]),
+        Party::Key(vec![1; 32]),
         "in thread",
         Some(1),
     ));
     let mut ctx = CaptureCtx::new()
         .at(2)
-        .with_tagging_origin()
+        .with_program_origin()
         .with_registry(&registry)
         .with_transcript("general", thread_transcript.clone());
     exec(&mut m, &mut ctx, &engagement("general", 2, vec![])).unwrap();
@@ -481,7 +470,7 @@ fn a_failed_dispatch_outcome_posts_a_threaded_failure_reply_and_prunes_the_entry
                 "⚠ BOT failed: worker exploded stack line two"
             )],
             thread: Some(1),
-            as_agent: Some("bot".into()),
+
         }],
         "one threaded ⚠ reply, authored as the agent"
     );
@@ -599,7 +588,7 @@ fn a_post_into_a_channel_the_requester_cannot_post_to_fails_the_run() {
 
     // the same post, by a requester who IS a member, lands.
     let (mut m, _registry, run_id) = awaiting_run(&[ACTION_CHAT_POST, ACTION_CHAT_POST_MESSAGE]);
-    let mut ctx = board(1);
+    let mut ctx = board(9);
     exec(
         &mut m,
         &mut ctx,

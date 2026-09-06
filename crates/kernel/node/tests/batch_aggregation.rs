@@ -63,7 +63,15 @@ impl BlockSink for SealRecorder {
     async fn pin(&mut self, _frame: &[u8]) -> Result<(), node::Error> {
         Ok(())
     }
-    async fn pre_apply(&mut self, _height: u64, _frame: &[u8]) -> Result<(), node::Error> {
+    async fn pre_apply(
+        &mut self,
+        _height: u64,
+        _frame: &[u8],
+        _prepared: &host::PreparedWork,
+    ) -> Result<(), node::Error> {
+        Ok(())
+    }
+    async fn witness(&mut self, _height: u64, _witness: &host::Witness) -> Result<(), node::Error> {
         Ok(())
     }
     fn seal(

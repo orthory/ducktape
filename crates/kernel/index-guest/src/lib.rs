@@ -190,7 +190,8 @@ pub fn decode_fold_tip(bytes: &[u8]) -> Option<(u64, u32)> {
 pub struct OriginTag {
     pub kind: OriginKind,
     /// external: the submitter identity rendered by the node layer (printable
-    /// name, else hex); module: the emitting module id; system: absent.
+    /// name, else hex); module: the emitting module id; program: the account
+    /// number in decimal; system: absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
 }
@@ -202,6 +203,8 @@ pub struct OriginTag {
 pub enum OriginKind {
     External,
     Module,
+    /// a program account acting through a host-run call unit.
+    Program,
     System,
 }
 
@@ -217,6 +220,13 @@ impl OriginTag {
         Self {
             kind: OriginKind::Module,
             id: Some(id.into()),
+        }
+    }
+
+    pub fn program(account: u64) -> Self {
+        Self {
+            kind: OriginKind::Program,
+            id: Some(account.to_string()),
         }
     }
 

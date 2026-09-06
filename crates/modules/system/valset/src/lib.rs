@@ -597,6 +597,7 @@ mod tests {
             consensus_time: 0,
             origin: sdk::Origin::Module(module_id.into()),
             me: "valset".into(),
+            cause: sdk::Cause::Direct,
         })
     }
 

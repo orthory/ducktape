@@ -30,7 +30,7 @@ use std::ops::Bound;
 use sdk::{Error, Origin, StagedStore, require_non_empty};
 
 use crate::{
-    Task, TaskMsg, TaskQuery, TaskReply, TaskStatus, actor_from_origin, check_record, stage_record,
+    Party, Task, TaskMsg, TaskQuery, TaskReply, TaskStatus, check_record, controls, stage_record,
 };
 
 /// max bytes of a `task_id`, matching the job board's [`crate::MAX_JOB_ID`].
@@ -81,14 +81,14 @@ fn record_key(task_id: &str) -> Vec<u8> {
     key
 }
 
-fn owner_count_key(owner: &str) -> Vec<u8> {
+fn owner_count_key(owner: &Party) -> Vec<u8> {
     let mut key = OWNER_COUNT_PREFIX.to_vec();
-    key.extend_from_slice(owner.as_bytes());
+    key.extend_from_slice(&sdk::wire::encode(owner));
     key
 }
 
 /// count of an owner's live tasks, reading through the staged overlay.
-async fn owner_count(staged: &StagedStore, owner: &str) -> Result<u64, Error> {
+async fn owner_count(staged: &StagedStore, owner: &Party) -> Result<u64, Error> {
     let Some(bytes) = staged.get(&owner_count_key(owner)).await? else {
         return Ok(0);
     };
@@ -100,7 +100,7 @@ async fn owner_count(staged: &StagedStore, owner: &str) -> Result<u64, Error> {
 }
 
 /// stage an owner's census (see [`OWNER_COUNT_PREFIX`] on the zero case).
-fn stage_owner_count(staged: &mut StagedStore, owner: &str, count: u64) {
+fn stage_owner_count(staged: &mut StagedStore, owner: &Party, count: u64) {
     let key = owner_count_key(owner);
     if count == 0 {
         staged.delete(key);
@@ -110,7 +110,7 @@ fn stage_owner_count(staged: &mut StagedStore, owner: &str, count: u64) {
 }
 
 /// read one task through the staged overlay (`None` == absent).
-async fn load(staged: &StagedStore, task_id: &str) -> Result<Option<Task>, Error> {
+pub(crate) async fn load(staged: &StagedStore, task_id: &str) -> Result<Option<Task>, Error> {
     let Some(bytes) = staged.get(&record_key(task_id)).await? else {
         return Ok(None);
     };
@@ -129,35 +129,30 @@ async fn load_index(staged: &StagedStore) -> Result<BTreeSet<String>, Error> {
     sdk::wire::decode(&bytes).map_err(|e| Error::Module(format!("task index decode: {e}")))
 }
 
-/// resolve the created task's owner. `override_owner` is [`TaskMsg::CreateTask::owner`]
-/// -- `None` keeps the original behavior (the dispatch origin's own actor
-/// string). `Some` is honored only from a module origin: a module vouching
-/// for a DIFFERENT principal's task on its own authority (automations
-/// attributing a rule's task to the rule's OWNER, see #1740). an external (or
-/// system) origin naming anyone but itself is refused outright -- an external
-/// caller may only ever own its own tasks.
-fn resolve_owner(origin: &Origin, override_owner: Option<Vec<u8>>) -> Result<String, Error> {
-    let Some(owner_key) = override_owner else {
-        return actor_from_origin(origin);
+/// Only trusted module code may assign another account's task.
+fn resolve_owner(actor: &Party, override_owner: Option<u64>) -> Result<Party, Error> {
+    let Some(account) = override_owner else {
+        return Ok(actor.clone());
     };
-    let is_module_origin = matches!(origin, Origin::Module(_));
-    if !is_module_origin {
-        let names_self = matches!(origin, Origin::External(bytes) if bytes == &owner_key);
-        if !names_self {
-            return Err(Error::Module(
-                "task owner override is honored only from a module origin".into(),
-            ));
-        }
+    let owns_named_account = *actor == Party::Account(account);
+    let may_assign = matches!(actor, Party::Module(_)) || owns_named_account;
+    if !may_assign {
+        return Err(Error::Module(
+            "task owner override requires a module origin or the named account".into(),
+        ));
     }
-    Ok(Origin::External(owner_key).actor_string())
+    if account == 0 {
+        return Err(Error::Module("task owner account must be nonzero".into()));
+    }
+    Ok(Party::Account(account))
 }
 
 async fn create(
     staged: &mut StagedStore,
     task_id: String,
     title: String,
-    owner_override: Option<Vec<u8>>,
-    origin: &Origin,
+    owner_override: Option<u64>,
+    actor: &Party,
     consensus_time: u64,
 ) -> Result<(), Error> {
     sdk::validate_id("task_id", &task_id, MAX_TASK_ID)?;
@@ -172,7 +167,7 @@ async fn create(
             "task board full: {MAX_TASKS} live tasks"
         )));
     }
-    let owner = resolve_owner(origin, owner_override)?;
+    let owner = resolve_owner(actor, owner_override)?;
     let owner_live = owner_count(staged, &owner).await?;
     if owner_live >= MAX_OPEN_TASKS_PER_OWNER as u64 {
         return Err(Error::Module(format!(
@@ -207,6 +202,7 @@ async fn update_status(
     staged: &mut StagedStore,
     task_id: String,
     status: TaskStatus,
+    actor: &Party,
     origin: &Origin,
     consensus_time: u64,
 ) -> Result<(), Error> {
@@ -214,8 +210,7 @@ async fn update_status(
     let mut task = load(staged, &task_id)
         .await?
         .ok_or_else(|| Error::Module(format!("task not found: {task_id}")))?;
-    let actor = actor_from_origin(origin)?;
-    let is_owner = task.owner == actor;
+    let is_owner = controls(&task.owner, actor, origin);
     if !is_owner {
         return Err(Error::Module(format!(
             "only the owner may update status: {task_id}"
@@ -239,19 +234,27 @@ async fn update_status(
 /// remove a task's record and free its board slot -- the only way the index
 /// (and [`MAX_TASKS`]) ever recedes. gated to the owner, the job board's
 /// `prune` shape.
-async fn delete(staged: &mut StagedStore, task_id: String, origin: &Origin) -> Result<(), Error> {
+async fn delete(
+    staged: &mut StagedStore,
+    task_id: String,
+    actor: &Party,
+    origin: &Origin,
+) -> Result<(), Error> {
     sdk::validate_id("task_id", &task_id, MAX_TASK_ID)?;
     let task = load(staged, &task_id)
         .await?
         .ok_or_else(|| Error::Module(format!("task not found: {task_id}")))?;
-    let actor = actor_from_origin(origin)?;
-    let is_owner = task.owner == actor;
+    let is_owner = controls(&task.owner, actor, origin);
     if !is_owner {
         return Err(Error::Module(format!(
             "only the owner may delete a task: {task_id}"
         )));
     }
 
+    let owner_live = owner_count(staged, &task.owner).await?;
+    let remaining = owner_live
+        .checked_sub(1)
+        .ok_or_else(|| Error::Module("task census underflow".into()))?;
     let mut index = load_index(staged).await?;
     index.remove(&task_id);
     if index.is_empty() {
@@ -263,13 +266,13 @@ async fn delete(staged: &mut StagedStore, task_id: String, origin: &Origin) -> R
     }
     staged.delete(record_key(&task_id));
 
-    let owner_live = owner_count(staged, &task.owner).await?;
-    stage_owner_count(staged, &task.owner, owner_live.saturating_sub(1));
+    stage_owner_count(staged, &task.owner, remaining);
     Ok(())
 }
 
 pub(crate) async fn execute(
     staged: &mut StagedStore,
+    actor: &Party,
     origin: &Origin,
     msg: TaskMsg,
     consensus_time: u64,
@@ -279,11 +282,11 @@ pub(crate) async fn execute(
             task_id,
             title,
             owner,
-        } => create(staged, task_id, title, owner, origin, consensus_time).await,
+        } => create(staged, task_id, title, owner, actor, consensus_time).await,
         TaskMsg::UpdateStatus { task_id, status } => {
-            update_status(staged, task_id, status, origin, consensus_time).await
+            update_status(staged, task_id, status, actor, origin, consensus_time).await
         }
-        TaskMsg::DeleteTask { task_id } => delete(staged, task_id, origin).await,
+        TaskMsg::DeleteTask { task_id } => delete(staged, task_id, actor, origin).await,
     }
 }
 
@@ -338,21 +341,21 @@ mod tests {
         StagedStore::new(Box::new(MemStore::new()))
     }
 
-    fn alice() -> Origin {
-        Origin::External(b"alice".to_vec())
+    fn alice() -> Party {
+        Party::Account(1)
     }
 
-    fn mallory() -> Origin {
-        Origin::External(b"mallory".to_vec())
+    fn mallory() -> Party {
+        Party::Account(2)
     }
 
     async fn create_as(
         staged: &mut StagedStore,
-        origin: &Origin,
+        actor: &Party,
         task_id: &str,
         title: &str,
     ) -> Result<(), Error> {
-        create(staged, task_id.into(), title.into(), None, origin, 1).await
+        create(staged, task_id.into(), title.into(), None, actor, 1).await
     }
 
     /// a board AT the cap refuses the next create BY NAME. the full index is
@@ -423,7 +426,7 @@ mod tests {
                 .await
                 .expect("create");
             let task = load(&staged, "t1").await.unwrap().expect("task exists");
-            assert_eq!(task.owner, alice().actor_string());
+            assert_eq!(task.owner, alice());
         });
     }
 
@@ -436,9 +439,16 @@ mod tests {
                 .await
                 .expect("create");
 
-            let refused = update_status(&mut staged, "t1".into(), TaskStatus::Done, &mallory(), 2)
-                .await
-                .expect_err("a stranger cannot restatus another owner's task");
+            let refused = update_status(
+                &mut staged,
+                "t1".into(),
+                TaskStatus::Done,
+                &mallory(),
+                &Origin::Program(2),
+                2,
+            )
+            .await
+            .expect_err("a stranger cannot restatus another owner's task");
             assert!(
                 refused.to_string().contains("only the owner"),
                 "unexpected error: {refused}"
@@ -449,9 +459,16 @@ mod tests {
                 "the refused update staged nothing"
             );
 
-            update_status(&mut staged, "t1".into(), TaskStatus::Done, &alice(), 2)
-                .await
-                .expect("the owner may update status");
+            update_status(
+                &mut staged,
+                "t1".into(),
+                TaskStatus::Done,
+                &alice(),
+                &Origin::Program(1),
+                2,
+            )
+            .await
+            .expect("the owner may update status");
             assert_eq!(
                 load(&staged, "t1").await.unwrap().unwrap().status,
                 TaskStatus::Done
@@ -469,7 +486,7 @@ mod tests {
                 .await
                 .expect("create");
 
-            let refused = delete(&mut staged, "t1".into(), &mallory())
+            let refused = delete(&mut staged, "t1".into(), &mallory(), &Origin::Program(2))
                 .await
                 .expect_err("a stranger cannot delete another owner's task");
             assert!(
@@ -478,7 +495,7 @@ mod tests {
             );
             assert!(load(&staged, "t1").await.unwrap().is_some());
 
-            delete(&mut staged, "t1".into(), &alice())
+            delete(&mut staged, "t1".into(), &alice(), &Origin::Program(1))
                 .await
                 .expect("the owner may delete");
             assert!(load(&staged, "t1").await.unwrap().is_none());
@@ -487,7 +504,7 @@ mod tests {
                 "the index slot is freed"
             );
             assert_eq!(
-                owner_count(&staged, &alice().actor_string()).await.unwrap(),
+                owner_count(&staged, &alice()).await.unwrap(),
                 0,
                 "the owner census recedes"
             );
@@ -526,8 +543,6 @@ mod tests {
         });
     }
 
-    /// a module origin may create a task attributed to a DIFFERENT owner --
-    /// automations' rule-owner plumbing (#1740) relies on exactly this.
     #[test]
     fn module_origin_may_override_the_owner() {
         block_on(async {
@@ -536,19 +551,17 @@ mod tests {
                 &mut staged,
                 "t1".into(),
                 "ship it".into(),
-                Some(b"alice".to_vec()),
-                &Origin::Module("automations".into()),
+                Some(1),
+                &Party::Module("automations".into()),
                 1,
             )
             .await
             .expect("a module may vouch for another owner");
             let task = load(&staged, "t1").await.unwrap().expect("task exists");
-            assert_eq!(task.owner, alice().actor_string(), "the override wins");
+            assert_eq!(task.owner, alice(), "the override wins");
         });
     }
 
-    /// an external origin naming anyone but ITSELF as the owner is refused --
-    /// only a module may vouch for a different principal.
     #[test]
     fn external_origin_cannot_name_a_different_owner() {
         block_on(async {
@@ -557,7 +570,7 @@ mod tests {
                 &mut staged,
                 "t1".into(),
                 "ship it".into(),
-                Some(b"alice".to_vec()),
+                Some(1),
                 &mallory(),
                 1,
             )
@@ -574,14 +587,35 @@ mod tests {
                 &mut staged,
                 "t2".into(),
                 "ship it too".into(),
-                Some(b"mallory".to_vec()),
+                Some(2),
                 &mallory(),
                 1,
             )
             .await
             .expect("naming yourself is always allowed");
             let task = load(&staged, "t2").await.unwrap().expect("task exists");
-            assert_eq!(task.owner, mallory().actor_string());
+            assert_eq!(task.owner, mallory());
+        });
+    }
+    #[test]
+    fn corrupt_owner_census_refuses_delete_before_any_staging() {
+        block_on(async {
+            let mut staged = staged();
+            create_as(&mut staged, &alice(), "task", "Work")
+                .await
+                .unwrap();
+            staged.stage(owner_count_key(&alice()), vec![0]);
+            staged.commit().await.unwrap();
+            let before = staged.root();
+            assert!(
+                delete(&mut staged, "task".into(), &alice(), &Origin::Program(1))
+                    .await
+                    .is_err()
+            );
+            assert!(staged.is_empty());
+            staged.commit().await.unwrap();
+            assert_eq!(staged.root(), before);
+            assert!(load(&staged, "task").await.unwrap().is_some());
         });
     }
 }

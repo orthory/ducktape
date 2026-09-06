@@ -29,6 +29,7 @@ fn ctx(origin: Origin, height: u64) -> TestCtx {
         consensus_time: height,
         origin,
         me: "files".into(),
+        cause: sdk::Cause::Direct,
     })
 }
 

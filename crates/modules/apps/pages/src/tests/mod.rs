@@ -113,6 +113,7 @@ fn ctx_as(origin: sdk::Origin) -> TestCtx {
         consensus_time: 7,
         origin,
         me: "pages".into(),
+        cause: sdk::Cause::Direct,
     })
 }
 async fn apply_commit_as(p: &mut Pages, m: &PageMsg, origin: sdk::Origin) {

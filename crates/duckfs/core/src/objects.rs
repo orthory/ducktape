@@ -235,7 +235,7 @@ impl TreeObj {
 pub struct SnapshotObj {
     pub root: ObjectId,
     pub parent: Option<ObjectId>,
-    pub author: String,
+    pub author: crate::Actor,
     pub consensus_time: u64,
     pub height: u64,
     pub message: String,
@@ -252,7 +252,7 @@ impl SnapshotObj {
             }
             None => out.push(0),
         }
-        push_string(&mut out, &self.author);
+        self.author.encode_into(&mut out);
         out.extend_from_slice(&self.consensus_time.to_le_bytes());
         out.extend_from_slice(&self.height.to_le_bytes());
         push_string(&mut out, &self.message);
@@ -268,7 +268,7 @@ impl SnapshotObj {
         } else {
             None
         };
-        let author = r.string()?;
+        let author = crate::Actor::decode(&mut r)?;
         let consensus_time = r.u64()?;
         let height = r.u64()?;
         let message = r.string()?;

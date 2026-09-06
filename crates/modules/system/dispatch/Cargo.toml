@@ -3,9 +3,12 @@ name = "dispatch"
 edition.workspace = true
 version.workspace = true
 
-# the task plane: recipe manifests (what-to-run), capability-routed dispatch
-# over saga, deterministic output-contract validation, and next-block result
-# delivery. 100% self-contained — no app-module imports, ever.
+# the queue plane: the call queue (calls a module queues on behalf of a
+# program account it executes, run by the host as Program-origin units) and the
+# mailbox (saga results and call completions, delivered by the host between
+# blocks) — plus the recipe manifests (what-to-run) and capability-routed
+# dispatch over saga that feed it. 100% self-contained — no app-module imports,
+# ever.
 [features]
 # the wasm-guest port (src/guest.rs): the store-backed dispatch shell over
 # guest-adapter. non-default and wasm-only — enabled solely by the
@@ -28,6 +31,14 @@ serde = { workspace = true }
 saga = { path = "../saga", default-features = false }
 # the shared capability-tag shape rule for Recipe.capability validation.
 capability = { workspace = true }
+# the program-account control record a Call is admitted against (identity's
+# wire types only; identity never depends on dispatch, so there is no cycle).
+identity = { workspace = true }
+# the store-record codec for the call and mailbox records: the sdk's causal
+# types derive it, so a record carrying them is one derive, not a mirror.
+borsh = { workspace = true }
+# the outcome digest a delivered call keeps in place of the outcome bytes.
+sha2 = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 

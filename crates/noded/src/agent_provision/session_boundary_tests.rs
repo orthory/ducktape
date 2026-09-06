@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg};
+use runs::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, ModelMsg};
 use capability::CapabilityMsg;
 use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
 use commonware_runtime::{Runner as _, Supervisor as _};
@@ -169,7 +169,7 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
             "saga",
             Box::new(sdk_testkit::MemStore::new()),
         )),
-        Box::new(agent::AgentModule::new(
+        Box::new(runs::AgentModule::new(
             "agent",
             Box::new(QmdbStore::init(context.child("agent"), "agent").await),
             "saga",
@@ -205,7 +205,7 @@ async fn mention_run(host: &mut Host) -> Event {
         },
         Msg {
             target: "agent".into(),
-            payload: agent::encode_msg(&AgentMsg::RegisterAgent {
+            payload: runs::encode_msg(&ModelMsg::RegisterModel {
                 agent_id: AGENT.into(),
                 display_name: "Quackbot".into(),
                 capability: CAPABILITY.into(),

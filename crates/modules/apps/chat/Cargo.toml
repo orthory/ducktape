@@ -32,12 +32,15 @@ guest-adapter = { path = "../../../guests/guest-adapter", optional = true }
 # the engine: the default surface is pure types, wasm32-clean, and is all the
 # native build sees. the engine shell rides the `index-guest` feature.
 index_guest = { workspace = true }
-# types-only: the tag-report edge (chat translates its shapes, the plane routes).
-tagging = { workspace = true }
-# the ONE resolver (`OfKey`) that turns a DM creator's signing key into its
-# account number — `CreateDmChannel` derives the channel id from the pair of
-# account numbers, so a squatter cannot mint another pair's DM (see
-# `Chat::resolve_dm_creator`).
+# types-only: the attribution edge — every channel and message write reports
+# its object's relation set to the plane (chat translates its shapes there).
+attribution = { workspace = true }
+# the canonical party bytes (`Party` in membership and creator keys); the
+# wire stays sdk::wire.
+borsh = { workspace = true }
+# the ONE resolver (`OfKey`, `Get`) that turns a signing key into the account
+# holding it: every external write resolves its party through it, and every
+# mention is validated against it (see `Chat::party_of_origin`).
 identity = { workspace = true }
 async-trait = { workspace = true }
 # NFC label normalization for the derived tag index (src/index/tags.rs) —
@@ -49,6 +52,8 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+pages = { workspace = true }
+futures = { workspace = true }
 host = { workspace = true }
 sdk-testkit = { workspace = true }
 # the tests drive the module the way a host does: construct the concrete

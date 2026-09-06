@@ -1,114 +1,9 @@
-//! the runs module — the collaboration loop's actor.
-//!
-//! a pure state-machine module (in the root-hash) holding channel watches and
-//! the correlation entries for still-pending dispatches. the agents it runs
-//! are NOT its state: the agent registry (`crates/modules/apps/agent`) is the record
-//! book, and this module reads it by query — staged same-block registrations
-//! included, through the host's live query routing. run LIFECYCLE is not here
-//! either: a run is a dispatched task, and its status, outcome, and history
-//! live in the dispatch module (and its saga) — per-dispatched-task, never
-//! agent-owned. what this module keeps per run is exactly what acting on the
-//! eventual `ResultEvent` needs (where the reply goes, which job to finalize,
-//! who may cancel), pruned when the result delivers.
-//!
-//! the module implements the platform's ordering-contract promises where they
-//! touch agents (docs/records/architecture/agent-collaboration-design.md §2, §3, §5):
-//!
-//! - **P2 — atomic causal cascades.** a user post, the tagging plane's
-//!   engagement delivery, the pending entry, and the dispatch commit in ONE
-//!   block; a watch and its plane subscription commit in one block; a
-//!   validated response's chat reply and task writes commit in the delivery
-//!   block. the registry hook extends this to registration: an agent's
-//!   registry record and its dispatch recipe land (or abort) as one unit.
-//! - **P4 — anchored generation.** the ENTIRE model input is composed in
-//!   consensus — transcript window, prompt framing, output contract — and
-//!   rides the dispatch as committed payload data (the structured envelope in
-//!   [`envelope`]; the agent's prompt rides as its committed hash, resolved
-//!   from the content-addressed blob store by the host), so any validator
-//!   holds the exact prompt input as ordered state, and the reply is never
-//!   presented as ordered before its anchor.
-//! - **P6 — callback adjacency.** on the dispatch plane this becomes
-//!   next-block delivery: the ResultEvent, the validated reply, the task
-//!   writes, and a job-backed run's finalize all commit in the one delivery
-//!   block.
-//!
-//! ## execute routing — payload namespaces, keyed by ORIGIN
-//!
-//! the dispatch origin is host-assigned and cannot be chosen by a submitter,
-//! so routing on it makes every privileged intake spoof-proof by
-//! construction:
-//!
-//! - `Origin::Module(tagging)` → an `EngagementEvent` (the engagement
-//!   intake): the tagging plane's routed report of a user post in a watched
-//!   channel, tags included;
-//! - `Origin::Module(dispatch)` → a `ResultEvent` (the dispatch plane's
-//!   next-block delivery — the ONLY result intake);
-//! - `Origin::Module(jobs)` → a [`JobsEvent`] (the jobs-board intake);
-//! - `Origin::Module(agent)` → an [`AgentEvent`] (the registry hook): the
-//!   registry's same-block notification that an agent landed, changed
-//!   capability, or left the registry, answered here by
-//!   registering/retuning/removing the agent's dispatch-plane recipe. unlike
-//!   every other module intake this one MAY error — it rides the registry
-//!   write's own block, and aborting that block is exactly the atomicity the
-//!   recipe seam needs;
-//! - `Origin::Module(saga)` → a dead-letter no-op. nothing here rides the
-//!   saga directly, but any submitter can point a saga trigger's `reply_to`
-//!   at this module — the tombstone keeps that callback from ever aborting
-//!   the saga's terminal block (the callback-poison rule);
-//! - `Origin::Module(chat)` → a dead-letter no-op (chat never notifies this
-//!   module directly; the tombstone keeps a stray follow-up from aborting a
-//!   posting block);
-//! - anything else → a [`RunsMsg`] (admin ops and explicit runs). an
-//!   external submitter shipping intake-shaped bytes lands HERE and fails the
-//!   `RunsMsg` decode — it can never fake an intake.
-//!
-//! ## the NO-FAIL arms (design §4)
-//!
-//! every privileged intake except the registry hook MUST NEVER return `Err`:
-//!
-//! - the result intake runs inside the delivery block; an `Err` would abort
-//!   it, the committed mailbox would re-inject next block, and every
-//!   subsequent block would abort (the permanent-abort loop the dispatch
-//!   module documents). malformed events and unknown dispatch ids are staged
-//!   no-ops (plus an observability event), and a response that fails
-//!   validation FAILS THE RUN, never the block. anything the emitted
-//!   follow-ups could make chat or tasks reject (a squatted reply message id,
-//!   an oversized reply, a duplicate task id, a full thread) is probed
-//!   deterministically first — an emitted follow-up must be valid by
-//!   construction.
-//! - the engagement intake runs in the same block as the user's post. an
-//!   `Err` here would abort the post (and every other subscriber's delivery),
-//!   so a malformed event or a failed context pin is equally a staged no-op.
-//! - the jobs intake runs in the same block as the job submit. jobs queries
-//!   are committed-only, so the just-staged job is invisible to
-//!   `JobsQuery::Get`; this path skips that blind probe and relies on the
-//!   documented single claiming-worker cascade rule before emitting its
-//!   `Claim`.
-//!
-//! ## agent identity
-//!
-//! this module posts replies `as_agent`, so chat's origin-derived authorship
-//! makes every agent's wire identity `{runs}/{agent_id}` — the module that
-//! ACTS for agents, not the registry that records them. mentions and
-//! engagement tags use the same ref (`EntityRef { module: runs, entity }`),
-//! so mentioning a reply's author round-trips into an engagement.
-//!
-//! ## the turn claim
-//!
-//! chat run ids and job run ids use disjoint `0x1f`-delimited keyspaces.
-//! creating a run that already exists (staged or committed) is a
-//! deterministic no-op, so however many paths race to claim a turn — the
-//! engagement and an explicit `RequestRun`, or two identical requests — the
-//! first in consensus order wins and the rest fall through silently.
-//!
-//! `root()` folds in every field of both maps, so any transition moves the
-//! root-hash. a joiner rebuilds this module from a peer via
-//! [`RunsModule::snapshot`] / [`RunsModule::install`]: the snapshot ships the
-//! committed maps in the exact canonical encoding `root()` hashes, and
-//! install re-derives the root from the decoded temporaries before adopting
-//! them — the consensus-agreed root, not the peer, is the trust anchor.
-
 // the wire surface: this module's shared types, flattened at the crate root.
+mod model;
+pub use model::*;
+mod model_config;
+pub use model_config::{validate_agent_id, MAX_AGENT_ID_LEN};
+
 mod interface;
 pub use interface::*;
 
@@ -118,14 +13,6 @@ mod envelope;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use agent::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentEvent, AgentQuery, AgentRecord,
-    AgentReply, AgentResponse, AgentStatus, DelegationRequest, MAX_ACTIONS_BYTES,
-    MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES,
-    MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
-    SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
-    encode_query as agent_encode_query,
-};
 use chat::{
     Block, ChannelAccess, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
@@ -141,14 +28,10 @@ use files::{
     decode_reply as files_decode_reply, encode_msg as files_encode_msg,
     encode_query as files_encode_query,
 };
-use saga::SagaOrigin;
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tagging::{
-    Author, EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
-    encode_msg as tagging_encode_msg,
-};
+use attribution::{AttributionMsg, Actor, ObjectRef, Reason, Relation};
 use tasks::{
     JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_job_event as jobs_decode_event,
     decode_job_reply as jobs_decode_reply, encode_job_msg as jobs_encode_msg,
@@ -374,9 +257,12 @@ pub(crate) fn truncate_on_boundary(s: &str, budget: usize, suffix: &str) -> Stri
 }
 
 mod admin;
-mod agent_intake;
+mod model_intake;
 mod dispatch_flow;
 mod engagement;
+mod action_requests;
+mod workflow;
+pub use workflow::model_program;
 mod facets;
 // the forge compose lane (M1): forge:<repo>:<n> channel detection, committed
 // tracker/refs mirrors, and the item-session workspace/sink composition.
@@ -411,6 +297,9 @@ use state::{
 /// result delivers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingState {
+    account: u64,
+    generation: u64,
+    cause: sdk::Cause,
     /// Explicit because delegated calls have their own idempotency-keyed run
     /// ids rather than pretending to be another chat turn.
     run_id: String,
@@ -439,7 +328,7 @@ struct PendingState {
     /// whose post engaged the agent — never the plane that carried the event.
     /// it is both a cancel capability alongside the owner and the chat standing
     /// an agent's own posts are held to (`requester_may_post`).
-    requester: SagaOrigin,
+    requester: RunOrigin,
     created_at: u64,
 }
 
@@ -461,6 +350,8 @@ struct DelegationState {
 struct PreparedDispatch {
     thread_root: Option<u64>,
     payload: Vec<u8>,
+    account: u64,
+    generation: u64,
 }
 
 // ---- the module -----------------------------------------------------------
@@ -472,9 +363,9 @@ pub struct RunsModule {
     /// dead-letter routing only: a saga callback pointed here by a foreign
     /// trigger's `reply_to` must be swallowed, never abort its block.
     saga: ModuleId,
-    /// the tagging plane — the engagement intake's trusted origin and the
+    /// the attribution plane — the engagement intake's trusted origin and the
     /// target of watch subscriptions.
-    tagging: ModuleId,
+    attribution: ModuleId,
     /// the dispatch plane — every run's recipe registry, executor, and
     /// lifecycle ledger.
     dispatch: ModuleId,
@@ -509,7 +400,12 @@ pub struct RunsModule {
     /// network the reader is on.
     chain_id: String,
     /// committed state — what `root()` and the root-hash commit to.
-    watches: BTreeMap<String, TurnPolicy>,
+    models: BTreeMap<String, ModelRecord>,
+    pending_models: BTreeMap<String, Option<ModelRecord>>,
+    action_requests: BTreeMap<String, action_requests::ActionRequest>,
+    pending_action_requests: BTreeMap<String, action_requests::ActionRequest>,
+    next_action_item: u64,
+    staged_next_action_item: Option<u64>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
     /// delivery; the dispatch module owns lifecycle and history.
     pending: BTreeMap<String, PendingState>,
@@ -527,7 +423,6 @@ pub struct RunsModule {
     /// (read-your-writes) but merged in — and reflected in `root()` — only at
     /// `commit_block`. a watch stages `None` for removal (unwatch); a pending
     /// entry stages `None` for its prune; a session stages `None` for its prune.
-    pending_watches: BTreeMap<String, Option<TurnPolicy>>,
     pending_overlay: BTreeMap<String, Option<PendingState>>,
     pending_sessions: BTreeMap<String, Option<AgentSession>>,
     pending_delegations: BTreeMap<String, Option<DelegationState>>,
@@ -550,7 +445,7 @@ impl RunsModule {
         id: impl Into<ModuleId>,
         chat: impl Into<ModuleId>,
         saga: impl Into<ModuleId>,
-        tagging: impl Into<ModuleId>,
+        attribution: impl Into<ModuleId>,
         dispatch: impl Into<ModuleId>,
         agent: impl Into<ModuleId>,
         tasks: Option<ModuleId>,
@@ -559,14 +454,14 @@ impl RunsModule {
         let id = id.into();
         let chat = chat.into();
         let saga = saga.into();
-        let tagging = tagging.into();
+        let attribution = attribution.into();
         let dispatch = dispatch.into();
         let agent = agent.into();
         let core = BTreeSet::from([
             id.clone(),
             chat.clone(),
             saga.clone(),
-            tagging.clone(),
+            attribution.clone(),
             dispatch.clone(),
             agent.clone(),
         ]);
@@ -589,7 +484,7 @@ impl RunsModule {
             id,
             chat,
             saga,
-            tagging,
+            attribution,
             dispatch,
             agent,
             tasks,
@@ -598,11 +493,15 @@ impl RunsModule {
             files: None,
             pages: None,
             chain_id: String::new(),
-            watches: BTreeMap::new(),
+            models: BTreeMap::new(),
+            pending_models: BTreeMap::new(),
+            action_requests: BTreeMap::new(),
+            pending_action_requests: BTreeMap::new(),
+            next_action_item: 0,
+            staged_next_action_item: None,
             pending: BTreeMap::new(),
             sessions: BTreeMap::new(),
             delegations: BTreeMap::new(),
-            pending_watches: BTreeMap::new(),
             pending_overlay: BTreeMap::new(),
             pending_sessions: BTreeMap::new(),
             pending_delegations: BTreeMap::new(),
@@ -622,7 +521,7 @@ impl RunsModule {
             forge != self.id
                 && forge != self.chat
                 && forge != self.saga
-                && forge != self.tagging
+                && forge != self.attribution
                 && forge != self.dispatch
                 && forge != self.agent
                 && Some(&forge) != self.tasks.as_ref()
@@ -680,12 +579,7 @@ impl RunsModule {
 
     // ---- staged-over-committed reads ---------------------------------------
 
-    fn watch(&self, channel_id: &str) -> Option<&TurnPolicy> {
-        match self.pending_watches.get(channel_id) {
-            Some(staged) => staged.as_ref(),
-            None => self.watches.get(channel_id),
-        }
-    }
+
 
     fn pending_entry(&self, dispatch_id: &str) -> Option<&PendingState> {
         match self.pending_overlay.get(dispatch_id) {
@@ -754,7 +648,7 @@ impl RunsModule {
     /// admin ops take a non-empty external key or a module as the submitter.
     /// the pre-consensus empty external default and the system origin (which
     /// any genesis path could wear) never administer watches.
-    fn admin_origin(origin: &Origin) -> Result<SagaOrigin, Error> {
+    fn admin_origin(origin: &Origin) -> Result<RunOrigin, Error> {
         match origin {
             Origin::External(key) if key.is_empty() => Err(Error::Module(
                 "runs admin ops require a non-empty submitter id".into(),
@@ -762,7 +656,7 @@ impl RunsModule {
             Origin::System => Err(Error::Module(
                 "runs admin ops require an external or module origin".into(),
             )),
-            other => Ok(canonical_origin(other)),
+            other => canonical_origin(other),
         }
     }
 
@@ -784,10 +678,12 @@ impl RunsModule {
     /// nodes.
     pub fn snapshot(&self) -> Vec<u8> {
         encode_committed(
-            &self.watches,
+            &self.action_requests,
+            self.next_action_item,
             &self.pending,
             &self.sessions,
             &self.delegations,
+            &self.models,
         )
     }
 
@@ -799,17 +695,21 @@ impl RunsModule {
     /// dropped — a snapshot describes a block boundary, and nothing
     /// half-applied may shadow it.
     pub fn install(&mut self, bytes: &[u8], expected: StateRoot) -> Result<(), Error> {
-        let (watches, pending, sessions, delegations) =
+        let (action_requests, next_action_item, pending, sessions, delegations, models) =
             decode_committed(bytes).map_err(Error::Module)?;
         sdk::verify_snapshot_root(
-            committed_root(&watches, &pending, &sessions, &delegations),
+            committed_root(&action_requests, next_action_item, &pending, &sessions, &delegations, &models),
             expected,
         )?;
-        self.watches = watches;
+        self.models = models;
+        self.pending_models.clear();
+        self.action_requests = action_requests;
+        self.next_action_item = next_action_item;
+        self.pending_action_requests.clear();
+        self.staged_next_action_item = None;
         self.pending = pending;
         self.sessions = sessions;
         self.delegations = delegations;
-        self.pending_watches.clear();
         self.pending_overlay.clear();
         self.pending_sessions.clear();
         self.pending_delegations.clear();

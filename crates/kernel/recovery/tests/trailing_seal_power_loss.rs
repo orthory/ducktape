@@ -324,8 +324,17 @@ impl<S: BlockSink> BlockSink for PowerLossSink<S> {
         &mut self,
         height: u64,
         frame: &[u8],
+        prepared: &host::PreparedWork,
     ) -> impl std::future::Future<Output = Result<(), node::Error>> {
-        self.inner.pre_apply(height, frame)
+        self.inner.pre_apply(height, frame, prepared)
+    }
+
+    fn witness(
+        &mut self,
+        height: u64,
+        witness: &host::Witness,
+    ) -> impl std::future::Future<Output = Result<(), node::Error>> {
+        self.inner.witness(height, witness)
     }
 
     fn seal(

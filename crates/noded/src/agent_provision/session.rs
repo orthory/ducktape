@@ -14,7 +14,7 @@
 //! and that node is the run's committed lease-holder, because it is the node
 //! executing the run. `runs` checks exactly that. no owner is at a keyboard to
 //! sign anything (an issue-mention run has nobody), and none is needed: the
-//! owner's grant is already committed as `AgentRecord { owner, allowed_actions,
+//! owner's grant is already committed as `ModelRecord { owner, allowed_actions,
 //! caps }`. the session adds proof of ORIGIN, not authority.
 //!
 //! The child receives only a random token for a host endpoint. That endpoint
@@ -31,6 +31,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use compute_service::WorkspaceSpec;
 use futures::channel::oneshot;
+use futures::{SinkExt as _, StreamExt as _};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -45,7 +46,7 @@ use crate::node_link::NodeLink;
 /// the module that owns the session registry.
 const RUNS_MODULE: &str = "runs";
 const ACTION_HEADER: &str = "x-ducktape-run-action";
-const MAX_ACTION_REQUEST_BYTES: usize = agent::MAX_ACTIONS_BYTES + agent::MAX_DELEGATIONS_BYTES;
+const MAX_ACTION_REQUEST_BYTES: usize = runs::MAX_ACTIONS_BYTES + runs::MAX_DELEGATIONS_BYTES;
 
 pub(super) const ENV_ACTION_URL: &str = "DUCKTAPE_RUN_ACTION_URL";
 pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
@@ -221,19 +222,163 @@ async fn run_action(
             "message is outside this run's action scope",
         );
     }
-    let msg = sdk::Msg {
-        target: RUNS_MODULE.into(),
-        payload: runs::encode_msg(&request.message),
-    };
-    // The frame lane is ordered by (origin, seq). Axum may serve requests
-    // concurrently even though normal MCP clients are serial, so keep frames
-    // from overtaking each other at the actor boundary.
-    let mut next_seq = state.seq.lock().await;
-    let frame = node::encode_frame(&state.signer, *next_seq, &msg);
-    *next_seq += 1;
-    match state.node.submit_frame(frame).await {
+    let result = submit_action(&state, request.message).await;
+    match result {
         Ok(()) => action_response(StatusCode::OK, "ok"),
         Err(error) => action_response(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+type ActionEvents =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The subscribe reply is a barrier: the node has registered its block receiver
+/// before this returns. Empty topics still receive the committed tip on every block.
+async fn action_events(node: &NodeLink) -> Result<ActionEvents, String> {
+    let base = node.base();
+    let ws_base = match base.strip_prefix("http://") {
+        Some(rest) => format!("ws://{rest}"),
+        None => match base.strip_prefix("https://") {
+            Some(rest) => format!("wss://{rest}"),
+            None => return Err("action node URL has no HTTP scheme".into()),
+        },
+    };
+    let (mut events, _) = tokio_tungstenite::connect_async(format!("{ws_base}/v1/ws"))
+        .await
+        .map_err(|error| format!("connect action receipt events: {error}"))?;
+    let subscription =
+        serde_json::json!({"op": "subscribe", "topics": [], "resume": {}}).to_string();
+    events
+        .send(tokio_tungstenite::tungstenite::Message::Text(subscription))
+        .await
+        .map_err(|error| format!("subscribe action receipt events: {error}"))?;
+    while let Some(frame) = events.next().await {
+        let frame = frame.map_err(|error| format!("action receipt event stream: {error}"))?;
+        let tokio_tungstenite::tungstenite::Message::Text(text) = frame else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("decode action receipt event: {error}"))?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("subscribed") => return Ok(events),
+            Some("error") => return Err(format!("action receipt subscription refused: {value}")),
+            _ => {}
+        }
+    }
+    Err("action receipt event stream closed before subscription".into())
+}
+
+async fn next_action_request(node: &NodeLink, run_id: &str) -> Result<String, String> {
+    let bytes = node
+        .query(
+            RUNS_MODULE,
+            &runs::encode_query(&runs::RunsQuery::AgentSessions),
+        )
+        .await?;
+    let runs::RunsReply::AgentSessions(sessions) = runs::decode_reply(&bytes)? else {
+        return Err("unexpected run session reply".into());
+    };
+    let Some(session) = sessions.iter().find(|session| session.run_id == run_id) else {
+        return Err("run session has closed".into());
+    };
+    Ok(runs::action_request_id(run_id, session.actions))
+}
+
+async fn action_result(
+    node: &NodeLink,
+    request_id: &str,
+) -> Result<Option<Result<(), String>>, String> {
+    let bytes = node
+        .query(
+            RUNS_MODULE,
+            &runs::encode_query(&runs::RunsQuery::ActionRequest {
+                request_id: request_id.into(),
+            }),
+        )
+        .await?;
+    let runs::RunsReply::ActionRequest(request) = runs::decode_reply(&bytes)? else {
+        return Err("unexpected action request reply".into());
+    };
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    match request.status {
+        runs::ActionStatus::AwaitingProgram | runs::ActionStatus::Claimed { .. } => Ok(None),
+        runs::ActionStatus::Rejected { reason } => Ok(Some(Err(reason))),
+        runs::ActionStatus::Completed { outcome, .. } => match outcome {
+            dispatch::CallOutcomeSummary::Applied { .. } => Ok(Some(Ok(()))),
+            dispatch::CallOutcomeSummary::Rejected { reason } => Ok(Some(Err(reason))),
+            dispatch::CallOutcomeSummary::Refused(reason) => {
+                Ok(Some(Err(format!("program action refused: {reason:?}"))))
+            }
+            dispatch::CallOutcomeSummary::Unrepresentable { .. } => Ok(Some(Err(
+                "program action outcome could not be represented".into(),
+            ))),
+        },
+    }
+}
+
+async fn await_action_result(
+    node: &NodeLink,
+    request_id: &str,
+    mut events: ActionEvents,
+) -> Result<(), String> {
+    if let Some(result) = action_result(node, request_id).await? {
+        return result;
+    }
+    let mut observed_height = None;
+    while let Some(frame) = events.next().await {
+        let frame = frame.map_err(|error| format!("action receipt event stream: {error}"))?;
+        let tokio_tungstenite::tungstenite::Message::Text(text) = frame else {
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("decode action receipt event: {error}"))?;
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("heartbeat") {
+            continue;
+        }
+        let Some(height) = value.get("height").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        if observed_height == Some(height) {
+            continue;
+        }
+        observed_height = Some(height);
+        if let Some(result) = action_result(node, request_id).await? {
+            return result;
+        }
+    }
+    Err("node disconnected before the program action completed".into())
+}
+
+async fn submit_action(state: &ActionState, message: runs::RunsMsg) -> Result<(), String> {
+    // Serialize both admission and completion so the next session slot cannot
+    // overtake an action whose actual target write is still pending.
+    let mut next_seq = state.seq.lock().await;
+    let pending = match &message {
+        runs::RunsMsg::AgentAction { run_id, .. } => {
+            let events = action_events(&state.node).await?;
+            let request_id = next_action_request(&state.node, run_id).await?;
+            Some((request_id, events))
+        }
+        runs::RunsMsg::DelegateRun { run_id, request_id, .. } => {
+            let events = action_events(&state.node).await?;
+            Some((runs::delegation_action_id(run_id, request_id), events))
+        }
+        _ => return Err("message is outside the run action scope".into()),
+    };
+    let msg = sdk::Msg {
+        target: RUNS_MODULE.into(),
+        payload: runs::encode_msg(&message),
+    };
+    let frame = node::encode_frame(&state.signer, *next_seq, &msg);
+    *next_seq = next_seq
+        .checked_add(1)
+        .ok_or_else(|| "action signer sequence exhausted".to_string())?;
+    state.node.submit_frame(frame).await?;
+    match pending {
+        Some((request_id, events)) => await_action_result(&state.node, &request_id, events).await,
+        None => Ok(()),
     }
 }
 

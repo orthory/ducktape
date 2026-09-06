@@ -1184,6 +1184,7 @@ mod tests {
             consensus_time: 1,
             origin: sdk::Origin::External(vec![1u8; 32]),
             me: "forge".into(),
+            cause: sdk::Cause::Direct,
         });
         futures::executor::block_on(async {
             <forge::Forge as sdk::Module>::execute(&mut forge, &mut ctx, &msg)

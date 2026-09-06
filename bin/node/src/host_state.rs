@@ -882,6 +882,7 @@ mod tests {
                 consensus_time: 0,
                 origin,
                 me: "modules".into(),
+                cause: sdk::Cause::Direct,
             })
             .on_query("valset", one_member.clone())
         };
@@ -960,6 +961,7 @@ mod tests {
             consensus_time: 0,
             origin: sdk::Origin::System,
             me: "modules".into(),
+            cause: sdk::Cause::Direct,
         });
         let reply = futures::executor::block_on(registry.query_with(&ctx, &req)).expect("status");
         let Ok(modules::ModulesReply::ModuleStatus { modules: roster }) =
