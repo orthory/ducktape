@@ -151,8 +151,8 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
 
         // genesis checkpoint: height 0 = nothing applied.
         let pos = node.sink_mut().oplog_pos().await;
-        let manifest =
-            Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1).expect("capture");
+        let manifest = Manifest::capture(node.host(), None, 0, 0, vec![], vec![], None, pos, 1)
+            .expect("capture");
         assert_eq!(manifest.root_hash, genesis_hash);
         node.sink_mut()
             .write_manifest(&manifest)
@@ -183,7 +183,8 @@ fn state_survives_a_crash_and_replays_to_the_sealed_tip() {
             vec![],
             None,
             pos,
-            2,)
+            2,
+        )
         .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest)
@@ -310,7 +311,8 @@ fn a_crash_mid_apply_rolls_the_unsealed_block_forward() {
             .await
             .expect("open recovery");
         let host = fresh_host();
-        let manifest = Manifest::capture(&host, None, 0, 0, vec![], vec![], None, 0, 1).expect("capture");
+        let manifest =
+            Manifest::capture(&host, None, 0, 0, vec![], vec![], None, 0, 1).expect("capture");
         recovery
             .write_manifest(&manifest)
             .await
@@ -432,7 +434,8 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
             vec![],
             None,
             pos,
-            2,)
+            2,
+        )
         .expect("capture");
         node.sink_mut()
             .write_manifest(&manifest)
@@ -469,7 +472,7 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
 
         let frames = node
             .sink_mut()
-            .read_finalized_frames(checkpoint_height, 3)
+            .read_finalized_frames(checkpoint_height, 3, usize::MAX)
             .await
             .expect("range read");
         assert_eq!(frames.len(), 2);
@@ -491,7 +494,7 @@ fn recovery_range_read_returns_sealed_suffix_and_reports_pruned_boundary() {
         // (the sync retention lease would otherwise be useless).
         let still_served = node
             .sink_mut()
-            .read_finalized_frames(0, 3)
+            .read_finalized_frames(0, 3, usize::MAX)
             .await
             .expect("frames below the checkpoint are served while retained");
         assert_eq!(still_served.len(), 3);
@@ -529,7 +532,7 @@ fn range_read_refuses_below_the_retained_floor() {
             .await
             .expect("seal");
         let err = pruned
-            .read_finalized_frames(0, 2)
+            .read_finalized_frames(0, 2, usize::MAX)
             .await
             .expect_err("range below the retained floor is refused");
         assert!(matches!(
@@ -542,7 +545,7 @@ fn range_read_refuses_below_the_retained_floor() {
         // at the floor itself the journal serves: the gap is real, not a
         // manifest-proxy refusal.
         let frames = pruned
-            .read_finalized_frames(1, 2)
+            .read_finalized_frames(1, 2, usize::MAX)
             .await
             .expect("the retained frame serves");
         assert_eq!(frames.len(), 1);

@@ -519,7 +519,7 @@ fn suffix_catchup_applies_verifies_and_journals_served_frames() {
         assert_eq!(dir_value(&host, "a").await.as_deref(), Some("1"));
         assert_eq!(dir_value(&host, "b").await.as_deref(), Some("2"));
         let journaled = recovery
-            .read_finalized_frames(0, 2)
+            .read_finalized_frames(0, 2, usize::MAX)
             .await
             .expect("read frames");
         assert_eq!(journaled.len(), 2);
@@ -634,7 +634,7 @@ fn suffix_catchup_is_noop_when_there_is_no_gap() {
         assert_eq!(host.root_hash(), before);
         assert!(
             recovery
-                .read_finalized_frames(5, 5)
+                .read_finalized_frames(5, 5, usize::MAX)
                 .await
                 .expect("empty range")
                 .is_empty()
