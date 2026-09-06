@@ -1074,3 +1074,46 @@ fn a_callee_whose_owner_cannot_read_the_channel_is_refused() {
     .unwrap();
     assert_eq!(ctx.dispatch_msgs().len(), 1);
 }
+
+#[test]
+fn the_run_authority_query_answers_the_ceiling_the_read_plane_must_apply() {
+    let authority_of = |m: &RunsModule, run_id: &str| {
+        let reply = block_on(m.query(&encode_query(&RunsQuery::RunAuthority {
+            run_id: run_id.into(),
+        })))
+        .unwrap();
+        match runs_decode_reply(&reply).unwrap() {
+            RunsReply::RunAuthority(view) => view,
+            other => panic!("unexpected reply: {other:?}"),
+        }
+    };
+
+    let (mut m, registry, caller_run) = with_open_delegating_session(2);
+    // an ordinary run is ceilinged by nothing but its agent's own record.
+    let plain = authority_of(&m, &caller_run).expect("the caller is in flight");
+    assert_eq!(plain.agent_id, "bot");
+    assert_eq!(plain.authority, None);
+
+    let mut ctx = session_ctx(
+        &registry,
+        &caller_run,
+        Origin::External(SESSION_KEY.to_vec()),
+    );
+    exec(
+        &mut m,
+        &mut ctx,
+        &delegate(&caller_run, "parser", "worker", "Implement the parser."),
+    )
+    .unwrap();
+    commit(&mut m);
+
+    // the delegated run carries the caller's frozen grant.
+    let callee_run = delegations(&m, &caller_run)[0].callee_run_id.clone();
+    let scoped = authority_of(&m, &callee_run).expect("the callee is in flight");
+    assert_eq!(scoped.agent_id, "worker");
+    let ceiling = scoped.authority.expect("a delegated run carries a ceiling");
+    assert_eq!(ceiling.allowed_actions, vec![ACTION_CHAT_POST.to_string()]);
+
+    // a run nobody is executing proves no ceiling — the read plane must refuse.
+    assert_eq!(authority_of(&m, "chat\u{1f}general\u{1f}9\u{1f}bot"), None);
+}

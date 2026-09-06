@@ -1,7 +1,7 @@
 use super::{
-    Ctx, Error, Event, Module, ModuleId, Msg, Origin, RunsModule, RunsQuery, RunsReply,
-    SiblingReadBudget, StateRoot, StateSyncHandle, WatchView, committed_root, decode_query,
-    encode_reply,
+    Ctx, Error, Event, Module, ModuleId, Msg, Origin, RunAuthorityView, RunsModule, RunsQuery,
+    RunsReply, SiblingReadBudget, StateRoot, StateSyncHandle, WatchView, committed_root,
+    decode_query, dispatch_id_for, encode_reply,
 };
 
 #[derive(Clone, Copy)]
@@ -232,6 +232,16 @@ impl Module for RunsModule {
                     .map(|state| state.view.clone())
                     .collect();
                 Ok(encode_reply(&RunsReply::Delegations(delegations)))
+            }
+            RunsQuery::RunAuthority { run_id } => {
+                let view = self.pending_entry(&dispatch_id_for(&run_id)).map(|entry| {
+                    Box::new(RunAuthorityView {
+                        run_id: entry.run_id.clone(),
+                        agent_id: entry.agent_id.clone(),
+                        authority: entry.authority.clone(),
+                    })
+                });
+                Ok(encode_reply(&RunsReply::RunAuthority(view)))
             }
         }
     }

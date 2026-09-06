@@ -123,7 +123,7 @@ use agent::{
     AgentReply, AgentResponse, AgentStatus, DelegationRequest, MAX_ACTIONS_BYTES,
     MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES,
     MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
-    ResourceCaps, SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
+    SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
     encode_query as agent_encode_query,
 };
 use chat::{
@@ -446,28 +446,6 @@ struct PendingState {
 impl PendingState {
     fn run_id(&self) -> String {
         self.run_id.clone()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct RunAuthority {
-    allowed_actions: Vec<String>,
-    caps: ResourceCaps,
-}
-
-impl RunAuthority {
-    fn from_record(record: &AgentRecord) -> Self {
-        Self {
-            allowed_actions: record.allowed_actions.clone(),
-            caps: record.caps.clone(),
-        }
-    }
-
-    fn apply(&self, record: &AgentRecord) -> AgentRecord {
-        let mut ceiling = record.clone();
-        ceiling.allowed_actions = self.allowed_actions.clone();
-        ceiling.caps = self.caps.clone();
-        ceiling.scoped_for_call(record)
     }
 }
 
