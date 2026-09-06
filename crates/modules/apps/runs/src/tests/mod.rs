@@ -446,6 +446,10 @@ impl Ctx for CaptureCtx {
                         archived: false,
                     }),
                 ))),
+                // runs never asks what a user MAY do — it posts under its own
+                // module authority — so the double refuses instead of
+                // inventing a standing.
+                ChatQuery::Access { .. } => Err(Error::QueryUnsupported),
             },
             // the board answers the SAME two reads the real module does: the
             // by-id `Get` the validator probes with, and a bounded `List` page.
