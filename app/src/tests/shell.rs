@@ -620,9 +620,16 @@ fn joining_a_huddle_opens_the_call_window() {
         .expect("the join ack handler exists")
         .1;
     let ack = ack.split_once("\non ").map_or(ack, |split| split.0);
+    // Through the summon, not an outright open: a window somehow still up (the
+    // reconciler took the seat away, the reader joined again before closing
+    // it) is raised rather than doubled and leaked.
     assert!(
-        ack.contains("task window open huddle"),
+        ack.contains("done -> show_huddle()"),
         "a join that opens no window is a call with nowhere to be"
+    );
+    assert!(
+        !ack.contains("task window open huddle"),
+        "the ack opens a window outright, doubling one that is still up"
     );
     // AND THE ACK LANDS THE JOINED STATE ITSELF. `huddle_joined` has no other
     // writer on the way in: it is answered off a chat load's roster, and an ack
