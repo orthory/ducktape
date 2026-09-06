@@ -304,8 +304,18 @@ pub struct FoldStatus {
 }
 
 enum DeploymentState {
-    Ready { code_hash: Option<Vec<u8>> },
-    Failed,
+    Ready {
+        code_hash: Option<Vec<u8>>,
+    },
+    /// `rejected_hash` is the sha256 of the guest bytes `converge_guest`
+    /// refused, when the refusal was the GUEST's fault (`is_guest_rejection`)
+    /// — `converge_module` short-circuits on a later attempt with the exact
+    /// same bytes instead of paying a cranelift compile for a mapper that
+    /// will fail for the identical reason every time. `None` for a module
+    /// with no guest, or a failure the engine caused rather than the bytes.
+    Failed {
+        rejected_hash: Option<[u8; 32]>,
+    },
 }
 
 /// one module's open database plus its guest's declared roles.
@@ -332,7 +342,7 @@ impl ModuleIndex {
             .unwrap_or_else(PoisonError::into_inner);
         match *guard {
             DeploymentState::Ready { .. } => Ok(guard),
-            DeploymentState::Failed => Err(Error::Poisoned),
+            DeploymentState::Failed { .. } => Err(Error::Poisoned),
         }
     }
 
@@ -527,10 +537,24 @@ impl IndexStore {
             .deployment
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        let candidate_hash = spec.guest.map(|bytes| sha2::Sha256::digest(bytes).into());
+        let unchanged_rejection = matches!(
+            &*deployment,
+            DeploymentState::Failed { rejected_hash } if *rejected_hash == candidate_hash
+        );
+        if unchanged_rejection {
+            // the exact bytes that failed last time, offered again (a stuck
+            // deployment reconverges every block until an operator ships
+            // different ones, per `converge_host_modules`): short-circuit
+            // rather than pay a cranelift compile that can only fail the
+            // same way again.
+            return Err(Error::View(
+                "index guest previously rejected; unchanged since".into(),
+            ));
+        }
         let (has_fold, has_view) = match converge_guest(&module.db, spec) {
             Ok(roles) => roles,
             Err(error) => {
-                *deployment = DeploymentState::Failed;
                 // a rejected GUEST (bad bytes, missing role/memory export)
                 // is this module's problem alone — `read_deployment` already
                 // refuses its own reads and writes until it reconverges. only
@@ -539,7 +563,10 @@ impl IndexStore {
                 // store-wide: every OTHER database went through those same
                 // calls clean, so one that didn't may be in a state no other
                 // module's fold or view can be trusted to see through.
-                if !is_guest_rejection(&error) {
+                let is_guest_rejection = is_guest_rejection(&error);
+                let rejected_hash = is_guest_rejection.then_some(candidate_hash).flatten();
+                *deployment = DeploymentState::Failed { rejected_hash };
+                if !is_guest_rejection {
                     self.poisoned.store(true, Ordering::Release);
                 }
                 return Err(error);
@@ -584,6 +611,21 @@ impl IndexStore {
 
     pub fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Relaxed)
+    }
+
+    /// whether `module`'s last converge left it `Failed` — its own reads and
+    /// writes refuse until it reconverges. lets a caller that reconverges
+    /// every block (a stuck deployment never becomes NOT-running) tell a
+    /// brand new rejection from the same one it already logged: `false` for
+    /// an unknown module id, since the actual converge call is what surfaces
+    /// `UnknownModule`.
+    pub fn is_module_failed(&self, module: &str) -> bool {
+        self.modules().get(module).is_some_and(|m| {
+            matches!(
+                *m.deployment.read().unwrap_or_else(PoisonError::into_inner),
+                DeploymentState::Failed { .. }
+            )
+        })
     }
 
     fn module(&self, module: &str) -> Result<Arc<ModuleIndex>> {

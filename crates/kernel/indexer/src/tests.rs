@@ -1325,6 +1325,53 @@ fn validate_guest_requires_memory_export_like_install_does() {
 }
 
 #[test]
+fn an_unchanged_rejection_short_circuits_without_recompiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    let spec = || IndexModule {
+        id: "chat",
+        guest: Some(NO_MEMORY_MAPPER),
+    };
+    let first = store.converge(&[spec()]).unwrap_err();
+    assert!(
+        first.to_string().contains("memory"),
+        "the first attempt reports the real reason: {first}"
+    );
+    // the identical candidate reconverged (`converge_host_modules` retries a
+    // stuck deployment every block): a second wasmtime compile of the same
+    // doomed bytes is wasted work, so this must be refused WITHOUT paying
+    // for it — proven by the distinct short-circuit message, since a real
+    // recompile would report "memory" again, not this one.
+    let second = store.converge(&[spec()]).unwrap_err();
+    assert!(
+        second.to_string().contains("previously rejected"),
+        "a repeat of the same rejected bytes must short-circuit: {second}"
+    );
+}
+
+#[test]
+fn a_changed_candidate_after_a_rejection_is_recompiled() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = bare_store(dir.path());
+    store
+        .converge(&[IndexModule {
+            id: "chat",
+            guest: Some(NO_MEMORY_MAPPER),
+        }])
+        .unwrap_err();
+    // different bytes after a rejection must NOT hit the short-circuit —
+    // only an EXACT repeat of the doomed candidate skips recompiling.
+    let different = store.converge(&[IndexModule {
+        id: "chat",
+        guest: Some(TESTMAP),
+    }]);
+    assert!(
+        different.is_ok(),
+        "a real fix must still converge: {different:?}"
+    );
+}
+
+#[test]
 fn a_rejected_mapper_leaves_every_other_module_folding() {
     let dir = tempfile::tempdir().unwrap();
     let store = IndexStore::open(

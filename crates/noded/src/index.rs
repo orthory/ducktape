@@ -66,9 +66,11 @@ pub fn converge_host_modules(index: &indexer::IndexStore, host: &host::Host) -> 
     index_host_modules(index, modules.iter().map(|module| module.id))?;
     for module in modules {
         // `converge`/`converge_deployment` below may move `module` (built
-        // into a one-element slice), so its id is captured first for the
-        // log line that can follow the match.
+        // into a one-element slice), so its id — and whether it was ALREADY
+        // failed before this attempt — are captured first for the log line
+        // that can follow the match.
         let module_id = module.id;
+        let was_failed = index.is_module_failed(module_id);
         let result = match host.module_code_hash(module_id) {
             Some(hash) => index.converge_deployment(&module, &hash),
             None => index.converge(&[module]),
@@ -76,6 +78,21 @@ pub fn converge_host_modules(index: &indexer::IndexStore, host: &host::Host) -> 
         let Err(error) = result else { continue };
         if index.is_poisoned() {
             return Err(format!("converge deployed index guests: {error}"));
+        }
+        // this loop runs every block for as long as a rejected mapper stays
+        // deployed (converge_host_modules is called per fold, not per
+        // deployment change), so `warn` fires ONLY on the transition into
+        // `Failed` — a repeat of the identical rejection is `debug`, per the
+        // "no info/warn more than once per block" logging rule.
+        if was_failed {
+            tracing::debug!(
+                target: "ducktape::index",
+                reason = "module_mapper_still_rejected",
+                module = module_id,
+                error = %error,
+                "module's index guest is still rejected, unchanged since the last attempt"
+            );
+            continue;
         }
         tracing::warn!(
             target: "ducktape::index",
