@@ -2623,6 +2623,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // an UNPROTECTED target used to accept a merge from anyone at all: a
+    // stranger with no standing on the PR must not be able to force it into
+    // the terminal `Merged` state, but the PR's author, one of its reviewers,
+    // or the repo owner still can.
+    #[test]
+    fn merging_onto_an_unprotected_target_requires_standing() {
+        let base = tmp_base("unprotected-merge");
+        let mut forge = Forge::init("forge", base.clone()).unwrap();
+        let digest = vec![9u8; 32];
+
+        let mut owner = ctx_with_origin(1, user_origin(1));
+        for repo in ["one", "two", "three"] {
+            exec_commit(
+                &mut forge,
+                &mut owner,
+                &ForgeMsg::PushRefs {
+                    repo: repo.into(),
+                    updates: vec![
+                        RefUpdate {
+                            ref_name: "release".into(),
+                            prev_oid: None,
+                            new_oid: Some(oid('a').as_bytes().to_vec()),
+                        },
+                        RefUpdate {
+                            ref_name: "feat".into(),
+                            prev_oid: None,
+                            new_oid: Some(oid('b').as_bytes().to_vec()),
+                        },
+                    ],
+                    pack_digest: Some(digest.clone()),
+                    cert: None,
+                },
+            );
+        }
+
+        let open_pr = |forge: &mut Forge, repo: &str, author: u8| {
+            let mut ctx = ctx_with_origin(2, user_origin(author));
+            exec_commit(
+                forge,
+                &mut ctx,
+                &ForgeMsg::OpenPr {
+                    repo: repo.into(),
+                    title: "fix it".into(),
+                    body: String::new(),
+                    source_branch: "feat".into(),
+                    target_branch: "release".into(),
+                },
+            );
+        };
+        let merge_of = |repo: &str| ForgeMsg::MergePr {
+            repo: repo.into(),
+            number: 1,
+            prev_target_oid: oid('a').to_string(),
+            expected_source_oid: oid('b').to_string(),
+            merge_oid: oid('c').to_string(),
+            pack_digest: hex(&digest),
+        };
+
+        // a stranger — not the author, not a reviewer, not the owner — is
+        // refused, and the PR stays open for a legitimate merge later.
+        open_pr(&mut forge, "one", 2);
+        let mut stranger = ctx_with_origin(3, user_origin(9));
+        let err = exec(&mut forge, &mut stranger, &merge_of("one"))
+            .expect_err("a stranger may not merge");
+        assert!(
+            err.to_string().contains("author, a reviewer, or the owner"),
+            "{err}"
+        );
+        futures::executor::block_on(forge.abort_block()).unwrap();
+
+        // the PR's own author merges it.
+        let mut author = ctx_with_origin(4, user_origin(2));
+        exec_commit(&mut forge, &mut author, &merge_of("one"));
+        assert_eq!(forge.state.repos["one"].refs["release"], oid('c'));
+
+        // a recorded reviewer (not the author, not the owner) merges a
+        // different PR after submitting a review on it.
+        open_pr(&mut forge, "two", 2);
+        let mut reviewer = ctx_with_origin(5, user_origin(3));
+        exec_commit(
+            &mut forge,
+            &mut reviewer,
+            &ForgeMsg::SubmitReview {
+                repo: "two".into(),
+                number: 1,
+                verdict: ReviewVerdict::Approve,
+                body: "ship it".into(),
+                commit_oid: oid('b').to_string(),
+                comments: vec![],
+            },
+        );
+        exec_commit(&mut forge, &mut reviewer, &merge_of("two"));
+        assert_eq!(forge.state.repos["two"].refs["release"], oid('c'));
+
+        // the repo owner (neither author nor reviewer) may always merge.
+        open_pr(&mut forge, "three", 2);
+        exec_commit(&mut forge, &mut owner, &merge_of("three"));
+        assert_eq!(forge.state.repos["three"].refs["release"], oid('c'));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     // SetItemState stays open ON PURPOSE — but it is still authenticated.
     #[test]
     fn any_member_closes_an_item_but_an_unauthenticated_origin_cannot() {

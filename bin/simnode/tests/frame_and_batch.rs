@@ -533,8 +533,18 @@ fn a_multi_module_script_converges_logically_while_qmdb_roots_split_on_block_str
         ("pages", create_page("p2"), "peer".into()),
         ("tasks", create_task("t1"), "peer".into()),
         ("tasks", create_task("t2"), "peer".into()),
-        ("inbox", deliver("bob", "hi"), "courier".into()),
-        ("inbox", deliver("bob", "yo"), "courier".into()),
+        // inbox delivers to the "courier" origin's OWN queue: inbox refuses
+        // an external `Deliver` anywhere else.
+        (
+            "inbox",
+            deliver(&harness::ext_actor("courier"), "hi"),
+            "courier".into(),
+        ),
+        (
+            "inbox",
+            deliver(&harness::ext_actor("courier"), "yo"),
+            "courier".into(),
+        ),
     ];
     let n = script.len() as u64;
 
