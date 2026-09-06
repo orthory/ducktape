@@ -510,16 +510,18 @@ fn suffix_catchup_applies_verifies_and_journals_served_frames() {
         let mut recovery = Recovery::open(context.child("post_catchup_ok"))
             .await
             .expect("open recovery");
-        let applied = apply_suffix_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None)
-            .await
-            .expect("catch up");
+        let store = consensus::ContentStore::new();
+        let applied =
+            apply_suffix_frames(&mut recovery, &mut host, 0, 2, frames.clone(), None, &store)
+                .await
+                .expect("catch up");
 
         assert_eq!(applied.applied, 2);
         assert_eq!(host.root_hash(), expected.root_hash());
         assert_eq!(dir_value(&host, "a").await.as_deref(), Some("1"));
         assert_eq!(dir_value(&host, "b").await.as_deref(), Some("2"));
         let journaled = recovery
-            .read_finalized_frames(0, 2)
+            .read_finalized_frames(0, 2, usize::MAX)
             .await
             .expect("read frames");
         assert_eq!(journaled.len(), 2);
@@ -561,9 +563,11 @@ fn suffix_catchup_reconciles_mixed_durability_state() {
             .write_manifest(&base_manifest)
             .await
             .expect("write base manifest");
-        let applied = apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
-            .await
-            .expect("catch up");
+        let store = consensus::ContentStore::new();
+        let applied =
+            apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None, &store)
+                .await
+                .expect("catch up");
 
         assert_eq!(applied.applied, 1);
         assert_eq!(
@@ -606,7 +610,8 @@ fn suffix_catchup_aborts_on_mismatched_served_seal() {
         let mut recovery = Recovery::open(context.child("post_catchup_mismatch"))
             .await
             .expect("open recovery");
-        let err = apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None)
+        let store = consensus::ContentStore::new();
+        let err = apply_suffix_frames(&mut recovery, &mut host, 0, 1, vec![served], None, &store)
             .await
             .expect_err("seal mismatch must abort");
 
@@ -626,7 +631,8 @@ fn suffix_catchup_is_noop_when_there_is_no_gap() {
         let mut recovery = Recovery::open(context.child("post_catchup_noop"))
             .await
             .expect("open recovery");
-        let applied = apply_suffix_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None)
+        let store = consensus::ContentStore::new();
+        let applied = apply_suffix_frames(&mut recovery, &mut host, 5, 5, Vec::new(), None, &store)
             .await
             .expect("noop catch up");
 
@@ -634,10 +640,120 @@ fn suffix_catchup_is_noop_when_there_is_no_gap() {
         assert_eq!(host.root_hash(), before);
         assert!(
             recovery
-                .read_finalized_frames(5, 5)
+                .read_finalized_frames(5, 5, usize::MAX)
                 .await
                 .expect("empty range")
                 .is_empty()
+        );
+    });
+}
+
+#[test]
+fn suffix_catchup_accepts_a_height_gap_from_a_discarded_view() {
+    let executor = commonware_runtime::deterministic::Runner::default();
+    executor.start(|context| async move {
+        let signer = ed25519::PrivateKey::from_seed(82);
+        let mut expected = fresh_directory_host();
+        // heights 1 and 3, skipping 2: the cutover ceiling discards a
+        // straggler view on every honest node, so a real suffix can skip a
+        // height without any block being omitted. strictly increasing, in
+        // range, is the whole shape a healthy suffix must hold — see the
+        // comment on `apply_suffix_frames`.
+        let served_1 =
+            served_directory_frame(&mut expected, &signer, 1, 0, dir_set("a", "1")).await;
+        let served_3 =
+            served_directory_frame(&mut expected, &signer, 3, 1, dir_set("b", "2")).await;
+
+        let mut host = fresh_directory_host();
+        let mut recovery = Recovery::open(context.child("post_catchup_gap"))
+            .await
+            .expect("open recovery");
+        let store = consensus::ContentStore::new();
+        let applied = apply_suffix_frames(
+            &mut recovery,
+            &mut host,
+            0,
+            3,
+            vec![served_1, served_3],
+            None,
+            &store,
+        )
+        .await
+        .expect("a skipped-view gap must not be refused");
+        assert_eq!(applied.applied, 2);
+        assert_eq!(host.root_hash(), expected.root_hash());
+    });
+}
+
+/// a `SyncClient` that always answers the manifest request with a fixed,
+/// canned manifest — enough to drive `catch_up_suffix_frames`'s trust gate
+/// without a real server.
+#[derive(Clone)]
+struct FixedManifestClient {
+    manifest: statesync::Manifest,
+    rotations: Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl statesync::SyncClient for FixedManifestClient {
+    fn request(
+        &self,
+        _req: statesync::SyncRequest,
+    ) -> impl std::future::Future<Output = Result<statesync::SyncResponse, statesync::SyncError>> + Send
+    {
+        let manifest = self.manifest.clone();
+        async move { Ok(statesync::SyncResponse::Manifest(manifest)) }
+    }
+}
+
+impl crate::blob_fetch::SourceRotate for FixedManifestClient {
+    fn rotate_source(&self) {
+        self.rotations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn catch_up_suffix_frames_refuses_an_unanchored_tip_and_rotates_source() {
+    let executor = commonware_runtime::deterministic::Runner::default();
+    executor.start(|context| async move {
+        let mut host = fresh_directory_host();
+        let mut recovery = Recovery::open(context.child("catchup_unanchored_tip"))
+            .await
+            .expect("open recovery");
+        let rotations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let client = FixedManifestClient {
+            // a served tip naming a participant set this node never trusted —
+            // the "3 keys plus the victim's" shape #1815 describes.
+            manifest: test_manifest_with_participants(1, test_root(1), None, vec![vec![9u8; 32]]),
+            rotations: rotations.clone(),
+        };
+        let founding_participants = vec![test_me()];
+        let anchor = crate::sync::serve::TrustAnchor {
+            epoch: 0,
+            participants: &founding_participants,
+        };
+        let store = consensus::ContentStore::new();
+        let err = crate::sync::catchup::catch_up_suffix_frames(
+            &client,
+            &mut recovery,
+            &mut host,
+            None,
+            0,
+            1,
+            b"ns",
+            anchor,
+            &store,
+        )
+        .await
+        .expect_err("a tip naming an unanchored participant set must be refused");
+        assert!(
+            matches!(err, crate::sync::catchup::SuffixCatchupError::Retry(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            rotations.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an unanchored tip must rotate away from the source that served it"
         );
     });
 }

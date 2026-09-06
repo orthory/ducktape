@@ -818,9 +818,20 @@ pub struct Recovery<E>
 where
     E: Context + BufferPooler + commonware_runtime::Supervisor,
 {
-    journal: OpJournal<E>,
+    /// `Arc`-wrapped so [`Recovery::frame_reader`] can hand a serve task its
+    /// own cheap handle: every journal method already synchronizes through
+    /// its own internal lock (`&self`, not `&mut self`), so cloning the `Arc`
+    /// is the whole cost of taking a Frames read off the consensus loop.
+    journal: std::sync::Arc<OpJournal<E>>,
     manifest_store: Meta<E>,
     cert_store: Meta<E>,
+    /// `height -> journal position of that height's [`Record::Block`]`,
+    /// covering every block currently retained. built once at [`Self::open`]
+    /// from a single full-journal scan, then kept current on every append
+    /// ([`Self::pre_apply`]) and prune ([`Self::prune_oplog`]) — the seek aid
+    /// that lets [`Self::read_finalized_frames`] jump straight to a height's
+    /// record instead of decoding the journal from its start on every call.
+    height_index: BTreeMap<u64, u64>,
     /// the out-of-band source of component BYTES for code-registry swaps.
     /// replay reconciles running module code against the committed registry
     /// before each re-applied block (`Host::realize_module_swaps`) — a block
@@ -887,12 +898,37 @@ where
         )
         .await
         .map_err(storage_err)?;
+        let height_index = Self::build_height_index(&journal).await?;
         Ok(Self {
-            journal,
+            journal: std::sync::Arc::new(journal),
             manifest_store,
             cert_store,
+            height_index,
             code_source: std::sync::Arc::new(host::NoCodeSource),
         })
+    }
+
+    /// scan the retained journal once (at boot) to map every retained
+    /// height to the journal position of its [`Record::Block`]. this is the
+    /// one place that still pays a full-journal decode — every later
+    /// [`Self::read_finalized_frames`] call seeks straight to a position
+    /// this index (as maintained by append/prune) already names.
+    async fn build_height_index(journal: &OpJournal<E>) -> Result<BTreeMap<u64, u64>, Error> {
+        let mut index = BTreeMap::new();
+        let reader = journal.reader().await;
+        let bounds = reader.bounds();
+        let stream = reader
+            .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
+            .await
+            .map_err(storage_err)?;
+        pin_mut!(stream);
+        while let Some(item) = stream.next().await {
+            let (pos, bytes) = item.map_err(storage_err)?;
+            if let Record::Block { height, .. } = Record::decode(&bytes)? {
+                index.insert(height, pos);
+            }
+        }
+        Ok(index)
     }
 
     /// wire the out-of-band component-byte source for code-registry swaps (the
@@ -992,82 +1028,175 @@ where
             .prune(pos)
             .await
             .map(|_| ())
-            .map_err(storage_err)
+            .map_err(storage_err)?;
+        self.height_index
+            .retain(|_, &mut record_pos| record_pos >= pos);
+        Ok(())
     }
 
-    /// read sealed recovery frames in `(after_height, up_to_height]`.
+    /// read at most `limit` sealed recovery frames in `(after_height,
+    /// up_to_height]`.
     ///
     /// This is the durable equivalent of a restart's replay suffix. The local
     /// checkpoint height is the retained suffix boundary: asking below it is a
     /// pruned-range condition, even if old journal bytes have not yet been
     /// physically removed.
+    ///
+    /// seeks straight to `after_height`'s successor via [`Self::height_index`]
+    /// and stops decoding once `limit` frames are collected — a caller no
+    /// longer pays for the retained journal's full size, only for the batch
+    /// it asked for.
     pub async fn read_finalized_frames(
         &self,
         after_height: u64,
         up_to_height: u64,
+        limit: usize,
     ) -> Result<Vec<JournalFrame>, Error> {
-        if after_height > up_to_height {
-            return Err(Error::Corrupt(format!(
-                "invalid frame range ({after_height}, {up_to_height}]"
-            )));
-        }
-        if after_height == up_to_height {
-            return Ok(Vec::new());
-        }
+        let manifest_height = self.manifest()?.and_then(|m| m.height);
+        read_finalized_frames_from(
+            &self.journal,
+            &self.height_index,
+            manifest_height,
+            after_height,
+            up_to_height,
+            limit,
+        )
+        .await
+    }
 
-        let mut records: Vec<Record> = Vec::new();
+    /// a cheap, self-contained handle for serving [`Self::read_finalized_frames`]
+    /// off whatever loop holds `&mut Recovery`: the journal's `Arc` clones in
+    /// O(1) (every journal method already synchronizes through its own
+    /// internal lock) and the height index is a bounded snapshot. a caller
+    /// hands this to a spawned task and moves on immediately, instead of
+    /// awaiting the decode inline.
+    pub fn frame_reader(&self) -> Result<FrameReader<E>, Error> {
+        Ok(FrameReader {
+            journal: std::sync::Arc::clone(&self.journal),
+            height_index: self.height_index.clone(),
+            manifest_height: self.manifest()?.and_then(|m| m.height),
+        })
+    }
+}
+
+/// [`Recovery::frame_reader`]'s handle: everything [`read_finalized_frames_from`]
+/// needs, owned independently of `Recovery` itself.
+pub struct FrameReader<E: Context> {
+    journal: std::sync::Arc<OpJournal<E>>,
+    height_index: BTreeMap<u64, u64>,
+    manifest_height: Option<u64>,
+}
+
+impl<E: Context> FrameReader<E> {
+    /// see [`Recovery::read_finalized_frames`].
+    pub async fn read_finalized_frames(
+        &self,
+        after_height: u64,
+        up_to_height: u64,
+        limit: usize,
+    ) -> Result<Vec<JournalFrame>, Error> {
+        read_finalized_frames_from(
+            &self.journal,
+            &self.height_index,
+            self.manifest_height,
+            after_height,
+            up_to_height,
+            limit,
+        )
+        .await
+    }
+}
+
+/// shared body of [`Recovery::read_finalized_frames`] and
+/// [`FrameReader::read_finalized_frames`]: seeks the journal to the position
+/// of the first retained record above `after_height` (via `height_index`)
+/// rather than decoding from the journal's start, and stops once `up_to_height`
+/// or `limit` frames have been collected.
+/// test-only tripwire: counts every record [`read_finalized_frames_from`]
+/// decodes, so a unit test can assert the height-index seek keeps that count
+/// near the requested batch instead of the whole retained journal (#1814).
+#[cfg(test)]
+static TEST_DECODED_RECORDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+async fn read_finalized_frames_from<E: Context>(
+    journal: &OpJournal<E>,
+    height_index: &BTreeMap<u64, u64>,
+    manifest_height: Option<u64>,
+    after_height: u64,
+    up_to_height: u64,
+    limit: usize,
+) -> Result<Vec<JournalFrame>, Error> {
+    if after_height > up_to_height {
+        return Err(Error::Corrupt(format!(
+            "invalid frame range ({after_height}, {up_to_height}]"
+        )));
+    }
+    if after_height == up_to_height || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    // the honest retention floor is the journal's own first retained block
+    // (the lowest key the height index carries). the latest MANIFEST height
+    // is only a proxy: it advances on every periodic checkpoint even when
+    // the physical prune is deferred (the sync retention lease), and
+    // refusing against it starves a slow syncer of frames that are still
+    // right here — the rebootstrap treadmill. an empty index has no floor of
+    // its own, so the manifest boundary remains the anchor there.
+    let Some(&first_retained) = height_index.keys().next() else {
+        if let Some(retained_start) = manifest_height
+            && after_height < retained_start
         {
-            let reader = self.journal.reader().await;
-            let bounds = reader.bounds();
-            let stream = reader
-                .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), bounds.start)
-                .await
-                .map_err(storage_err)?;
-            pin_mut!(stream);
-            while let Some(item) = stream.next().await {
-                let (_pos, bytes) = item.map_err(storage_err)?;
-                records.push(Record::decode(&bytes)?);
-            }
-        }
-
-        // the honest retention floor is the journal's own first retained
-        // block. the latest MANIFEST height is only a proxy: it advances on
-        // every periodic checkpoint even when the physical prune is deferred
-        // (the sync retention lease), and refusing against it starves a slow
-        // syncer of frames that are still right here — the rebootstrap
-        // treadmill. an empty journal has no floor of its own, so the
-        // manifest boundary remains the anchor there.
-        let first_retained = records.iter().find_map(|record| match record {
-            Record::Block { height, .. } => Some(*height),
-            _ => None,
-        });
-        let Some(retained_start) = first_retained else {
-            if let Some(retained_start) = self.manifest()?.and_then(|m| m.height)
-                && after_height < retained_start
-            {
-                return Err(Error::RangePruned {
-                    after_height,
-                    retained_start,
-                });
-            }
-            return Ok(Vec::new());
-        };
-        // report the lowest ANCHORABLE height: a client at `first - 1` can be
-        // served (its next frame is the first retained one), so that is the
-        // floor it can act on — and it matches the checkpoint the physical
-        // prune trails in the steady state.
-        let retained_start = retained_start.saturating_sub(1);
-        if after_height < retained_start {
             return Err(Error::RangePruned {
                 after_height,
                 retained_start,
             });
         }
+        return Ok(Vec::new());
+    };
+    // report the lowest ANCHORABLE height: a client at `first - 1` can be
+    // served (its next frame is the first retained one), so that is the
+    // floor it can act on — and it matches the checkpoint the physical
+    // prune trails in the steady state.
+    let retained_start = first_retained.saturating_sub(1);
+    if after_height < retained_start {
+        return Err(Error::RangePruned {
+            after_height,
+            retained_start,
+        });
+    }
 
-        let mut out = Vec::new();
-        let mut pending: Option<(u64, Vec<u8>)> = None;
-        for record in records {
-            match record {
+    // the seek target: the position of the first retained block strictly
+    // above `after_height`. nothing in range means nothing to decode.
+    let seek = height_index
+        .range((
+            std::ops::Bound::Excluded(after_height),
+            std::ops::Bound::Unbounded,
+        ))
+        .next();
+    let Some((&start_height, &start_pos)) = seek else {
+        return Ok(Vec::new());
+    };
+    if start_height > up_to_height {
+        return Ok(Vec::new());
+    }
+
+    let mut out = Vec::new();
+    let mut pending: Option<(u64, Vec<u8>)> = None;
+    {
+        let reader = journal.reader().await;
+        let stream = reader
+            .replay(NonZeroUsize::new(1 << 16).expect("nonzero"), start_pos)
+            .await
+            .map_err(storage_err)?;
+        pin_mut!(stream);
+        while out.len() < limit {
+            let Some(item) = stream.next().await else {
+                break;
+            };
+            let (_pos, bytes) = item.map_err(storage_err)?;
+            #[cfg(test)]
+            TEST_DECODED_RECORDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match Record::decode(&bytes)? {
                 Record::Block { height, frame } => {
                     if height <= after_height {
                         continue;
@@ -1115,13 +1244,13 @@ where
                 Record::Pinned { .. } | Record::Cutover { .. } => {}
             }
         }
-        if let Some((height, _)) = pending {
-            return Err(Error::Corrupt(format!(
-                "block {height} in requested range is missing its seal"
-            )));
-        }
-        Ok(out)
     }
+    if let Some((height, _)) = pending {
+        return Err(Error::Corrupt(format!(
+            "block {height} in requested range is missing its seal"
+        )));
+    }
+    Ok(out)
 }
 
 // the live sink: append and sync records as the ordered lane drives it. sync
@@ -1161,8 +1290,9 @@ where
         }
         .encode();
         async move {
-            self.journal.append(&record).await.map_err(storage_err)?;
+            let pos = self.journal.append(&record).await.map_err(storage_err)?;
             self.journal.sync().await.map_err(storage_err)?;
+            self.height_index.insert(height, pos);
             Ok(())
         }
     }
@@ -2400,5 +2530,57 @@ mod tests {
             cert: b"certificate".to_vec(),
         };
         assert_eq!(FloorCert::decode(&c.encode()).expect("roundtrip"), c);
+    }
+
+    /// #1814: `read_finalized_frames` must SEEK to the requested range via
+    /// `height_index`, not decode the retained journal from its start. a
+    /// journal of 200 blocks (400 records) asked for its last 3 frames
+    /// should decode a small handful of records, not anything close to 400.
+    #[test]
+    fn read_finalized_frames_seeks_instead_of_scanning_the_whole_journal() {
+        use commonware_runtime::{Runner as _, Supervisor as _};
+
+        let executor = commonware_runtime::deterministic::Runner::default();
+        executor.start(|context| async move {
+            let mut recovery = Recovery::open(context.child("seek_index"))
+                .await
+                .expect("open recovery");
+            const TOTAL: u64 = 200;
+            for height in 1..=TOTAL {
+                recovery
+                    .pre_apply(height, &[height as u8])
+                    .await
+                    .expect("wal record");
+                recovery
+                    .seal(&BlockSeal {
+                        height,
+                        disposition: Disposition::Applied,
+                        roots: vec![],
+                        root_hash: StateRoot([0u8; 32]),
+                    })
+                    .await
+                    .expect("seal");
+            }
+
+            TEST_DECODED_RECORDS.store(0, std::sync::atomic::Ordering::Relaxed);
+            let tail = recovery
+                .read_finalized_frames(TOTAL - 3, TOTAL, 10)
+                .await
+                .expect("tail read");
+            assert_eq!(tail.len(), 3);
+            assert_eq!(tail[0].height, TOTAL - 2);
+            assert_eq!(tail[2].height, TOTAL);
+
+            // the journal holds 2*TOTAL records (a Block + Seal per height);
+            // a scan from the journal's start would decode close to all of
+            // them. the height index instead lands the stream within a
+            // handful of records of the requested tail.
+            let decoded = TEST_DECODED_RECORDS.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                decoded <= 10,
+                "expected a bounded tail read, decoded {decoded} of {} records",
+                2 * TOTAL
+            );
+        });
     }
 }

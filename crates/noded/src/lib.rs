@@ -858,8 +858,12 @@ pub const LOCAL_CHAIN_ID: &str = "local";
 /// sandbox guest, or any peer on a widened `http_listen`, forge an op under
 /// this node's own consensus key.
 ///
-/// A request that DID sign acts as its key: the verified signer overrides the
-/// caller-supplied [`SubmitRequest::origin`], which is a claim (see there).
+/// `signed_req` gates this route at `Authority::Operator`: the only PoP that
+/// clears it is a signature by [`crate::AdminConfig::owner_key`] (the operator's
+/// own key), so a signed caller here has already proven it IS the operator, and
+/// that verified signer overrides the caller-supplied [`SubmitRequest::origin`],
+/// which is a claim (see there) — never a self-chosen key, which the gate never
+/// lets reach this handler at all (#1808).
 async fn submit(
     State(handle): State<NodeHandle>,
     signed: Option<axum::Extension<SignedBy>>,
