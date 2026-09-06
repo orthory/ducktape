@@ -71,6 +71,26 @@ fn a_capability_change_event_retunes_the_dispatch_recipe() {
 }
 
 #[test]
+fn a_deregistered_event_removes_the_dispatch_recipe() {
+    let mut m = module();
+    let mut ctx = CaptureCtx::new().with_agent_origin();
+    exec(
+        &mut m,
+        &mut ctx,
+        &agent_event(&AgentEvent::Deregistered {
+            agent_id: "bot".into(),
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        ctx.dispatch_msgs(),
+        vec![DispatchMsg::RemoveRecipe {
+            recipe_id: recipe_id_for("bot"),
+        }]
+    );
+}
+
+#[test]
 fn the_registry_hook_may_error_to_abort_the_registration_block() {
     let mut m = module();
 

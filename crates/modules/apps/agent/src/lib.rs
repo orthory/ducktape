@@ -235,6 +235,23 @@ impl AgentModule {
         Ok(self.load(ROSTER_KEY).await?.unwrap_or_default())
     }
 
+    /// how many roster entries `owner` already holds — the per-owner cap
+    /// check. no secondary index: the roster is already bounded by
+    /// [`MAX_REGISTERED_AGENTS`], so a full scan at registration time (the
+    /// only caller) stays cheap and needs no extra replicated state.
+    async fn count_owned(&self, roster: &[String], owner: &SagaOrigin) -> Result<usize, Error> {
+        let mut count = 0;
+        for agent_id in roster {
+            let Some(record) = self.agent(agent_id).await? else {
+                continue;
+            };
+            if &record.owner == owner {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     // ---- shared validation ----------------------------------------------------
 
     fn validate_non_empty(field: &str, value: &str) -> Result<(), Error> {
@@ -355,6 +372,34 @@ impl AgentModule {
         Ok(record)
     }
 
+    /// the governance module's follow-up after a passing proposal — the ONE
+    /// non-owner actor allowed to reach into another account's registration,
+    /// the same escape hatch a squatted-roster incident needs to recover
+    /// without a hard fork.
+    fn is_governance(origin: &Origin) -> bool {
+        matches!(origin, Origin::Module(module) if module == "governance")
+    }
+
+    /// deregistration's authority check: the recorded owner, or governance —
+    /// [`Self::owned_agent`] with the governance escape hatch added.
+    async fn deregistrable_agent(
+        &self,
+        ctx: &dyn Ctx,
+        agent_id: &str,
+    ) -> Result<AgentRecord, Error> {
+        let origin = &ctx.env().origin;
+        let Some(record) = self.agent(agent_id).await? else {
+            return Err(Error::Module(format!("unknown agent: {agent_id}")));
+        };
+        let is_owner = record.owner == canonical_origin(origin);
+        if !is_owner && !Self::is_governance(origin) {
+            return Err(Error::Module(format!(
+                "only the owner or governance may deregister agent {agent_id}"
+            )));
+        }
+        Ok(record)
+    }
+
     /// notify the registry hook — same block, so whatever the hook stages
     /// (the agent's dispatch recipe) commits or aborts WITH the registry
     /// write that caused it.
@@ -414,6 +459,12 @@ impl AgentModule {
                 if roster.len() >= MAX_REGISTERED_AGENTS {
                     return Err(Error::Module(format!(
                         "agent registry is full: {MAX_REGISTERED_AGENTS} agents"
+                    )));
+                }
+                let owner_agents = self.count_owned(&roster, &owner).await?;
+                if owner_agents >= MAX_AGENTS_PER_OWNER {
+                    return Err(Error::Module(format!(
+                        "owner already registered {MAX_AGENTS_PER_OWNER} agents: the per-owner cap"
                     )));
                 }
                 roster.insert(position, agent_id.clone());
@@ -509,7 +560,29 @@ impl AgentModule {
             AgentMsg::ResumeAgent { agent_id } => {
                 self.stage_status(ctx, agent_id, AgentStatus::Active, now).await
             }
+            AgentMsg::DeregisterAgent { agent_id } => self.on_deregister(ctx, agent_id).await,
         }
+    }
+
+    /// remove `agent_id` from the registry: the record and its roster slot
+    /// commit or abort together, same as registration. notifies the hook so
+    /// the dispatch-plane recipe is retired in the same block — the recipe
+    /// owner is `Origin::Module("runs")` (the hook target itself emits
+    /// `RegisterRecipe`), so runs' own `RemoveRecipe` follow-up is always
+    /// authorized regardless of who deregistered the agent here.
+    async fn on_deregister(&mut self, ctx: &mut dyn Ctx, agent_id: String) -> Result<(), Error> {
+        self.deregistrable_agent(ctx, &agent_id).await?;
+        let mut roster = self.roster().await?;
+        let Ok(position) = roster.binary_search(&agent_id) else {
+            // the roster is the one existence authority (see RegisterAgent):
+            // an id with a record but no roster slot cannot happen.
+            return Err(Error::Module(format!("unknown agent: {agent_id}")));
+        };
+        roster.remove(position);
+        self.store(ROSTER_KEY.to_vec(), &roster);
+        self.staged.delete(agent_key(&agent_id));
+        self.emit_hook(ctx, &AgentEvent::Deregistered { agent_id });
+        Ok(())
     }
 
     async fn stage_status(
@@ -1055,6 +1128,122 @@ mod tests {
         assert_eq!(get_agent(&m, "bot").unwrap().status, AgentStatus::Active);
     }
 
+    /// a stranger may not deregister someone else's agent; the owner may,
+    /// and doing so frees the roster slot and retires the dispatch recipe.
+    #[test]
+    fn deregister_is_owner_gated_and_frees_the_slot() {
+        let mut m = module();
+        let mut ctx = ctx_at(0, user(9));
+        exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
+        commit(&mut m);
+
+        let mut stranger_ctx = ctx_at(1, user(2));
+        let err = exec(
+            &mut m,
+            &mut stranger_ctx,
+            &admin(&AgentMsg::DeregisterAgent {
+                agent_id: "bot".into(),
+            }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Module(_)));
+        abort(&mut m);
+        assert!(
+            get_agent(&m, "bot").is_some(),
+            "the refused op staged nothing"
+        );
+
+        let mut owner_ctx = ctx_at(2, user(9));
+        exec(
+            &mut m,
+            &mut owner_ctx,
+            &admin(&AgentMsg::DeregisterAgent {
+                agent_id: "bot".into(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            hook_events(&owner_ctx),
+            vec![AgentEvent::Deregistered {
+                agent_id: "bot".into(),
+            }]
+        );
+        commit(&mut m);
+        assert!(get_agent(&m, "bot").is_none());
+        assert!(list_agents(&m).is_empty(), "the roster slot is freed");
+
+        // the freed slot is reusable — a fresh registration under the same
+        // id lands cleanly.
+        let mut ctx = ctx_at(3, user(1));
+        exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
+        commit(&mut m);
+        assert_eq!(
+            get_agent(&m, "bot").unwrap().owner,
+            canonical_origin(&user(1))
+        );
+    }
+
+    /// governance may deregister an agent it does not own — the escape hatch
+    /// a squatted-roster incident needs.
+    #[test]
+    fn governance_may_deregister_any_agent() {
+        let mut m = module();
+        let mut ctx = ctx_at(0, user(9));
+        exec(&mut m, &mut ctx, &admin(&register("bot", &[]))).unwrap();
+        commit(&mut m);
+
+        let mut governance_ctx = ctx_at(1, Origin::Module("governance".into()));
+        exec(
+            &mut m,
+            &mut governance_ctx,
+            &admin(&AgentMsg::DeregisterAgent {
+                agent_id: "bot".into(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        assert!(get_agent(&m, "bot").is_none());
+    }
+
+    /// the per-owner cap: one owner may not fill the registry alone, and the
+    /// refusal names the cap. deregistering one of the owner's agents frees
+    /// a slot the SAME owner can immediately reuse.
+    #[test]
+    fn the_per_owner_cap_refuses_the_next_registration_and_a_deregister_frees_it() {
+        let mut m = module();
+        for i in 0..MAX_AGENTS_PER_OWNER {
+            let mut ctx = ctx_at(0, user(9));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register(&format!("a{i:04}"), &[])),
+            )
+            .unwrap();
+        }
+        commit(&mut m);
+
+        let mut ctx = ctx_at(0, user(9));
+        let err = exec(&mut m, &mut ctx, &admin(&register("overflow", &[]))).unwrap_err();
+        assert!(
+            matches!(&err, Error::Module(msg) if msg.contains(&MAX_AGENTS_PER_OWNER.to_string())),
+            "the refusal must name the per-owner cap: {err:?}"
+        );
+        abort(&mut m);
+
+        exec(
+            &mut m,
+            &mut ctx,
+            &admin(&AgentMsg::DeregisterAgent {
+                agent_id: "a0000".into(),
+            }),
+        )
+        .unwrap();
+        commit(&mut m);
+        exec(&mut m, &mut ctx, &admin(&register("overflow", &[]))).unwrap();
+        commit(&mut m);
+        assert_eq!(list_agents(&m).len(), MAX_AGENTS_PER_OWNER);
+    }
+
     #[test]
     fn a_direct_saga_callback_is_a_dead_letter() {
         let mut m = module();
@@ -1131,14 +1320,23 @@ mod tests {
 
     /// the registry COUNT cap: the roster is one replicated record and the
     /// `All` engagement domain, so registration `MAX_REGISTERED_AGENTS + 1`
-    /// is refused loudly — and the refusal names the cap.
+    /// is refused loudly — and the refusal names the cap. spread the fill
+    /// across `MAX_REGISTERED_AGENTS / MAX_AGENTS_PER_OWNER` distinct owners
+    /// so the per-owner cap (a separate test) never fires first.
     #[test]
     fn the_registry_count_cap_refuses_the_next_registration() {
         let mut m = module();
-        let mut ctx = ctx_at(0, user(9));
+        let owners = MAX_REGISTERED_AGENTS / MAX_AGENTS_PER_OWNER;
         for i in 0..MAX_REGISTERED_AGENTS {
-            exec(&mut m, &mut ctx, &admin(&register(&format!("a{i:04}"), &[]))).unwrap();
+            let mut ctx = ctx_at(0, user((i % owners) as u8));
+            exec(
+                &mut m,
+                &mut ctx,
+                &admin(&register(&format!("a{i:04}"), &[])),
+            )
+            .unwrap();
         }
+        let mut ctx = ctx_at(0, user(owners as u8));
         let err = exec(&mut m, &mut ctx, &admin(&register("overflow", &[]))).unwrap_err();
         assert!(
             matches!(&err, Error::Module(msg) if msg.contains(&MAX_REGISTERED_AGENTS.to_string())),

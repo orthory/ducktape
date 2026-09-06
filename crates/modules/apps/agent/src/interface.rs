@@ -63,6 +63,14 @@ pub const MAX_AGENT_RECORD_BYTES: usize = 4 * 1024;
 /// fleet, and each still costs [`MAX_AGENT_RECORD_BYTES`] of replicated state.
 pub const MAX_REGISTERED_AGENTS: usize = 1024;
 
+/// hard cap on the COUNT of agents ONE owner may register. without this, a
+/// single account (one external key, or one module) fills the whole registry
+/// (`MAX_REGISTERED_AGENTS`) alone and locks out every other account — the
+/// global cap bounds total state, this one bounds one account's SHARE of it.
+/// small on purpose: a legitimate fleet operator still needs dozens, not
+/// hundreds, of distinct agent identities.
+pub const MAX_AGENTS_PER_OWNER: usize = 32;
+
 /// hard cap on the COUNT of skills one agent curates. an unbounded skill list
 /// is unbounded replicated state (it rides the record, hence every snapshot)
 /// AND an unbounded run context — every one of them costs at least an index
@@ -672,11 +680,16 @@ pub enum AgentMsg {
     PauseAgent { agent_id: String },
     /// owner-gated: resume engagement.
     ResumeAgent { agent_id: String },
+    /// owner- or governance-gated: remove the agent from the registry and
+    /// free its roster slot. notifies the hook target
+    /// ([`AgentEvent::Deregistered`]) in the same block, so the agent's
+    /// dispatch-plane recipe is retired atomically with the record.
+    DeregisterAgent { agent_id: String },
 }
 
 // ---- the registry hook ----------------------------------------------------------
 
-/// the registry's ONE follow-up shape, emitted to a genesis-configured hook
+/// the registry's follow-up shape, emitted to a genesis-configured hook
 /// target (the runs module) in the same block as the registry write that
 /// caused it. the hook keeps the agent's dispatch-plane recipe in lockstep:
 /// if the recipe registration is rejected (a squatted id), the whole block
@@ -696,6 +709,8 @@ pub enum AgentEvent {
         agent_id: String,
         capability: String,
     },
+    /// an agent left the registry; the hook retires its recipe.
+    Deregistered { agent_id: String },
 }
 
 // ---- queries ------------------------------------------------------------------
