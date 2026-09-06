@@ -24,6 +24,12 @@ use serde_json::{Value, json};
 
 /// the node we make the run's execution lease-holder (its Accept'd assignee).
 const NODE: &str = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn";
+/// `NODE`'s bytes as a `--with-valset` hex key (`n` is `0x6e`): `Accept` now
+/// gates on valset standing, so every spawn here seeds `NODE` as a genesis
+/// validator.
+fn node_hex() -> String {
+    "6e".repeat(32)
+}
 /// a different 32-byte node — never the lease-holder.
 const OTHER: &str = "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm";
 /// the 32-byte session key: bytes we can name as BOTH the open payload (a byte
@@ -81,9 +87,22 @@ fn stage_run(sim: &Sim, allowed: Value) -> (String, String) {
     (run_id, saga_id)
 }
 
+/// `NODE` announces itself as a "text" provider — `Accept`'s capability gate
+/// needs this on top of the valset standing `--with-valset` seeded, and it
+/// must land AFTER the trigger (`stage_run`) so the saga's provider pool was
+/// still empty at trigger time and stayed an unassigned announcement.
+fn announce_node_as_text_provider(sim: &Sim) {
+    sim.submit_ok(
+        "capability",
+        json!({ "announce": { "capabilities": ["text"], "resources": {} } }),
+        Some(NODE),
+    );
+}
+
 /// claim the run's execution lease as `NODE` (the first Accept in consensus
 /// order wins the assignee), then bind the session key from that lease-holder.
 fn claim_and_open(sim: &Sim, saga_id: &str, run_id: &str) {
+    announce_node_as_text_provider(sim);
     sim.submit_ok(
         "saga",
         json!({ "accept": { "saga_id": saga_id, "attempt": 0 } }),
@@ -112,7 +131,8 @@ fn post_action(run_id: &str) -> Value {
 #[test]
 fn a_session_spends_its_action_budget_to_the_exact_boundary() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let node_hex = node_hex();
+    let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
     let (run_id, saga_id) = stage_run(&sim, json!(["chat.post_message"]));
     claim_and_open(&sim, &saga_id, &run_id);
 
@@ -148,7 +168,8 @@ fn a_session_spends_its_action_budget_to_the_exact_boundary() {
 #[test]
 fn a_second_open_agent_session_on_the_same_run_is_refused() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let node_hex = node_hex();
+    let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
     let (run_id, saga_id) = stage_run(&sim, json!(["chat.post_message"]));
     claim_and_open(&sim, &saga_id, &run_id);
 
@@ -183,7 +204,8 @@ fn a_second_open_agent_session_on_the_same_run_is_refused() {
 #[test]
 fn only_the_bound_session_key_may_act_on_the_run() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let node_hex = node_hex();
+    let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
     let (run_id, saga_id) = stage_run(&sim, json!(["chat.post_message"]));
     claim_and_open(&sim, &saga_id, &run_id);
 
@@ -221,8 +243,10 @@ fn only_the_bound_session_key_may_act_on_the_run() {
 #[test]
 fn only_the_lease_holder_may_open_the_agent_session() {
     let storage = tempfile::tempdir().expect("storage dir");
-    let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let node_hex = node_hex();
+    let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
     let (run_id, saga_id) = stage_run(&sim, json!(["chat.post_message"]));
+    announce_node_as_text_provider(&sim);
 
     // NODE claims the lease; no session is opened yet.
     sim.submit_ok(
