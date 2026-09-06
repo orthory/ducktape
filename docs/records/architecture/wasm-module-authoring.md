@@ -5,8 +5,9 @@ How to write, build, and live-update a Ducktape wasm module. The runtime is
 the `ducktape:module` WIT world (`crates/module-sdk/wit/module.wit`, inside the
 module SDK a module pins by git revision, `crates/module-sdk`);
 the reference modules are `crates/guests/noop-wasm` (the smallest compliant
-module: two exports, no state, every op a no-op — the template a new module
-starts from and the admission fixture that touches nothing),
+module: three exports over the raw WIT world, no state, every op a no-op — the
+floor a module must meet and the admission fixture that touches nothing; a new
+module starts from the SDK instead, see "Out-of-tree modules" below),
 `crates/guests/hello-wasm` (a counter over host-owned state),
 `crates/guests/hello-wasm-replacement` (its live-update target), and
 `crates/guests/sibling-wasm` (the cross-module-read reference) — kernel test
