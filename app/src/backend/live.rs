@@ -1994,13 +1994,16 @@ pub async fn open_dm(
         let my_keys = mine.keys.into_iter().map(|key| key.pubkey);
         let peer_keys = account.keys.into_iter().map(|key| key.pubkey);
         let members: Vec<Vec<u8>> = my_keys.chain(peer_keys).collect();
+        // The DM op, not a plain `CreateChannel` naming a `dm-` id: the module
+        // reserves that shape and refuses it from anything but this op, which
+        // resolves the creator's own account and derives the very id computed
+        // above (`dm_channel_id(mine, peer)`), members-only by construction.
         signed_write(
             &client,
             "chat",
-            chat::encode_msg(&ChatMsg::CreateChannel {
-                channel_id: channel_id.clone(),
+            chat::encode_msg(&ChatMsg::CreateDmChannel {
+                counterpart: number,
                 name: peer_name.clone(),
-                post_policy: PostPolicy::MembersOnly,
             }),
             password.clone(),
         )

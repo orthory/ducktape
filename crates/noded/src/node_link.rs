@@ -15,7 +15,10 @@
 //! The `origin` field of `/v1/submit` is deliberately not sent: `bin/node`
 //! discards it and frames the op with the node key, which is exactly the
 //! identity a saga lease is held under. That equivalence is the whole reason a
-//! daemon needs no keypair of its own.
+//! daemon needs no keypair of its own — and it is exactly why `/v1/submit`
+//! takes the OPERATOR credential (`signed_req`'s `Authority::Operator`, #1808)
+//! rather than any acting key: `submit` below rides [`Self::post_json`], which
+//! attaches it on every call via [`Self::credentialed`].
 //!
 //! Two things stay host-local paths rather than `/v1` calls, because they are
 //! host resources and not node state: the guest images a run boots from, and

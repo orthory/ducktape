@@ -284,35 +284,72 @@ async fn the_operator_credential_does_not_travel_off_box() {
     assert_eq!(body_json(response).await["reason"], "signature_missing");
 }
 
-/// a SIGNED submit acts as its key: the verified signer overrides the
-/// caller-supplied `origin`, which is only ever a claim (#1312).
+/// `/v1/submit` re-signs the framed op with the NODE's own consensus key
+/// (`bin/node`'s ingress/park), so any caller reaching it mints an op as the
+/// VALIDATOR — the gate must therefore take only the operator (#1808): a
+/// self-minted key is refused before the actor ever sees it, and only the
+/// operator's OWN signature (never a claim in the body) names the origin.
 #[tokio::test]
-async fn a_signed_submit_is_authored_by_the_signer_not_the_claim() {
-    let (handle, cmd_rx, _events) = local_node();
-    spawn_fake_actor(cmd_rx, None);
+async fn submit_refuses_a_self_minted_key_and_the_operators_signature_wins_over_the_claim() {
+    let operator_key = commonware_cryptography::ed25519::PrivateKey::from_seed(9009);
+    let node = || {
+        let (handle, cmd_rx, events) = NodeHandle::channel();
+        let handle = handle.with_admin(AdminConfig {
+            operator_token: Some(OPERATOR.to_string()),
+            owner_key: Some(operator_key.public_key().as_ref().to_vec()),
+            ..Default::default()
+        });
+        (handle, cmd_rx, events)
+    };
+    let submit_body = serde_json::json!({
+        "target": "chat",
+        "payload": { "create_channel": { "channel_id": "general", "name": "General" } },
+        "origin": "somebody-else",
+    });
+    let sign_as = |signer: &commonware_cryptography::ed25519::PrivateKey,
+                   body: &serde_json::Value| {
+        let bytes = serde_json::to_vec(body).unwrap();
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/submit")
+            .header(header::CONTENT_TYPE, "application/json");
+        for (name, value) in
+            noded::signed_req::request_headers(signer, "POST", "/v1/submit", &[], &bytes)
+        {
+            req = req.header(name, value);
+        }
+        req.body(Body::from(bytes)).unwrap()
+    };
 
+    // a key nobody knows, signed correctly: refused before the actor runs.
+    let (handle, cmd_rx, _events) = node();
+    tokio::spawn(async move {
+        let mut cmds = cmd_rx;
+        if cmds.next().await.is_some() {
+            panic!("a self-minted submit reached the node actor");
+        }
+    });
     let response = noded::router(handle)
-        .oneshot(signed(
-            "POST",
-            "/v1/submit",
-            serde_json::json!({
-                "target": "chat",
-                "payload": { "create_channel": { "channel_id": "general", "name": "General" } },
-                "origin": "somebody-else",
-            }),
-        ))
+        .oneshot(sign_as(&caller(), &submit_body))
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(response).await["reason"], "not_operator");
 
+    // the operator's own key: admitted, and it names the origin — never the
+    // body's `origin` claim (#1312).
+    let (handle, cmd_rx, _events) = node();
+    spawn_fake_actor(cmd_rx, None);
+    let response = noded::router(handle)
+        .oneshot(sign_as(&operator_key, &submit_body))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    // the fake actor echoes the stamped origin through `from_utf8_lossy`, so
-    // the comparison is made on the same terms: what landed is the acting key,
-    // not the string the body claimed.
     let stamped = body_json(response).await["root_hash"]
         .as_str()
         .expect("origin echo")
         .to_string();
-    let acting = String::from_utf8_lossy(caller().public_key().as_ref()).into_owned();
+    let acting = String::from_utf8_lossy(operator_key.public_key().as_ref()).into_owned();
     assert_eq!(stamped, acting);
 }
 

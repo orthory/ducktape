@@ -286,6 +286,13 @@ struct IndexOpsResponse {
     next_after: Option<String>,
 }
 
+/// hard cap on how many payload bytes [`op_row_json`] will hex- or json-embed
+/// inline (#1809): ordinary duckfs traffic puts megabyte stage chunks in op
+/// payloads, and hex doubles that. a payload over this ships as
+/// `payload_bytes` + `payload_truncated` instead — the full bytes stay
+/// reachable by op id, this row just stops being the way to fetch them.
+const MAX_INLINE_PAYLOAD_BYTES: usize = 64 * 1024;
+
 /// one borsh op row as this lane's json projection.
 fn op_row_json(row: &indexer::OpRow) -> serde_json::Value {
     let mut out = serde_json::json!({
@@ -294,10 +301,15 @@ fn op_row_json(row: &indexer::OpRow) -> serde_json::Value {
         "time": row.time,
         "origin": row.origin,
     });
-    let payload_json: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
-    match payload_json {
-        Some(value) => out["payload"] = value,
-        None => out["payload_hex"] = serde_json::Value::String(hex_bytes(&row.payload)),
+    if row.payload.len() > MAX_INLINE_PAYLOAD_BYTES {
+        out["payload_bytes"] = serde_json::Value::from(row.payload.len());
+        out["payload_truncated"] = serde_json::Value::Bool(true);
+    } else {
+        let payload_json: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
+        match payload_json {
+            Some(value) => out["payload"] = value,
+            None => out["payload_hex"] = serde_json::Value::String(hex_bytes(&row.payload)),
+        }
     }
     if !row.assigned.is_empty() {
         let assigned_json: Option<serde_json::Value> = serde_json::from_slice(&row.assigned).ok();
@@ -326,6 +338,33 @@ fn index_error(err: indexer::Error) -> Response {
     error_response(status, &err.to_string())
 }
 
+/// acquire the shared [`NodeHandle::index_view_gate`] permit and run `work`
+/// on `spawn_blocking`'s pool — the one place every `Lane::Open` index read
+/// (`index_status`, `index_view`, and, since #1809, `index_ops`/`index_scan`/
+/// `blocks`) gets off the axum worker and behind the same concurrency cap.
+/// `try_acquire_owned` refuses immediately (429) once the gate is full rather
+/// than queuing the Nth caller behind the rest; a panicked blocking task
+/// answers 500 instead of dropping the connection silently.
+async fn gated_blocking<F, T>(handle: &NodeHandle, work: F) -> Result<T, Response>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let Ok(_permit) = handle.index_view_gate.clone().try_acquire_owned() else {
+        return Err(error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            INDEX_VIEW_AT_CAPACITY,
+        ));
+    };
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => Ok(value),
+        Err(_) => Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "index task panicked",
+        )),
+    }
+}
+
 /// GET /v1/index/status — each module's applied watermark (the op FEED, not
 /// the derived view), the poison flag, backfill floors, and every fold
 /// trigger's health (`pending` backlog + last drain error): the watermark
@@ -340,26 +379,18 @@ fn index_error(err: indexer::Error) -> Response {
 /// NOT FREE" note on `IndexStore::fold_status`), so a backlogged module makes
 /// this call as expensive as [`index_view`]'s wasm query. The route stays
 /// `Lane::Open`, so it gets the exact same treatment: the sampling loop runs
-/// off the axum worker on `spawn_blocking`, gated by the SAME
-/// [`NodeHandle::index_view_gate`] permit `index_view` uses (one pool for
-/// every unauthenticated read that can burn a worker thread, not a second
-/// cap to size) — the Nth concurrent caller past capacity 429s immediately
-/// rather than queuing behind the scan.
+/// off the axum worker on [`gated_blocking`], the same permit `index_view`
+/// uses (one pool for every unauthenticated read that can burn a worker
+/// thread, not a second cap to size) — the Nth concurrent caller past
+/// capacity 429s immediately rather than queuing behind the scan.
 pub(crate) async fn index_status(State(handle): State<NodeHandle>) -> Response {
     let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
-    let Ok(_permit) = handle.index_view_gate.clone().try_acquire_owned() else {
-        return error_response(StatusCode::TOO_MANY_REQUESTS, INDEX_VIEW_AT_CAPACITY);
-    };
-    let outcome = tokio::task::spawn_blocking(move || index_status_body(&store)).await;
-    match outcome {
+    match gated_blocking(&handle, move || index_status_body(&store)).await {
         Ok(Ok(body)) => Json(body).into_response(),
         Ok(Err(response)) => *response,
-        Err(_) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "index status task panicked",
-        ),
+        Err(response) => response,
     }
 }
 
@@ -414,23 +445,33 @@ fn index_status_body(store: &indexer::IndexStore) -> Result<serde_json::Value, B
 
 /// GET /v1/index/{module}/ops?after=&limit= — one page of the module's op
 /// log, oldest-first. rows are the stored envelopes verbatim; page forward by
-/// echoing `next_after` as the next call's `after`.
+/// echoing `next_after` as the next call's `after`. #1809: the synchronous
+/// fluent31 scan runs behind the same [`gated_blocking`] permit as
+/// `index_view`/`index_status` — it is the identical off-worker, capped-fan-in
+/// read on this `Lane::Open` surface.
 pub(crate) async fn index_ops(
     State(handle): State<NodeHandle>,
     Path(module): Path<String>,
     Query(params): Query<IndexScanParams>,
 ) -> Response {
-    let Some(store) = index_store(&handle) else {
+    let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
-    let page = match store.scan(
-        &module,
-        indexer::OP_PREFIX.as_bytes(),
-        params.after.as_deref().map(str::as_bytes),
-        params.limit.unwrap_or(INDEX_DEFAULT_LIMIT),
-    ) {
-        Ok(page) => page,
-        Err(err) => return index_error(err),
+    let after = params.after.clone();
+    let limit = params.limit.unwrap_or(INDEX_DEFAULT_LIMIT);
+    let outcome = gated_blocking(&handle, move || {
+        store.scan(
+            &module,
+            indexer::OP_PREFIX.as_bytes(),
+            after.as_deref().map(str::as_bytes),
+            limit,
+        )
+    })
+    .await;
+    let page = match outcome {
+        Ok(Ok(page)) => page,
+        Ok(Err(err)) => return index_error(err),
+        Err(response) => return response,
     };
     let mut ops = Vec::with_capacity(page.entries.len());
     for (_key, value) in &page.entries {
@@ -506,12 +547,6 @@ pub(crate) async fn index_view(
     let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
-    // `try_acquire_owned` refuses immediately once the gate is full — an
-    // unauthenticated caller's Nth request never queues behind the first
-    // `MAX_CONCURRENT_INDEX_VIEWS`, it just 429s.
-    let Ok(_permit) = handle.index_view_gate.clone().try_acquire_owned() else {
-        return error_response(StatusCode::TOO_MANY_REQUESTS, INDEX_VIEW_AT_CAPACITY);
-    };
     let req_bytes = serde_json::to_vec(&req).expect("a decoded json value re-serializes");
     let query_module = module.clone();
     // BEFORE the view, deliberately: the two reads take two MVCC snapshots, and
@@ -531,7 +566,10 @@ pub(crate) async fn index_view(
     // both reads run off the axum worker on `spawn_blocking`'s pool: fluent31's
     // `query` is synchronous wasm with no `.await` inside it, so awaiting it
     // directly here would hold this task's worker thread for the whole call.
-    let outcome = tokio::task::spawn_blocking(move || {
+    // `gated_blocking` refuses immediately once the gate is full — an
+    // unauthenticated caller's Nth request never queues behind the first
+    // `MAX_CONCURRENT_INDEX_VIEWS`, it just 429s.
+    let outcome = gated_blocking(&handle, move || {
         let folded = store.fold_tip(&query_module).ok().flatten();
         let view = store.view(&query_module, &req_bytes);
         (folded, view)
@@ -539,9 +577,7 @@ pub(crate) async fn index_view(
     .await;
     let (folded, view) = match outcome {
         Ok(pair) => pair,
-        Err(_) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, "index view task panicked");
-        }
+        Err(response) => return response,
     };
     let mut response = match view {
         Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -570,18 +606,25 @@ pub(crate) async fn index_scan(
     Path(module): Path<String>,
     Query(params): Query<IndexScanParams>,
 ) -> Response {
-    let Some(store) = index_store(&handle) else {
+    let Some(store) = index_store(&handle).cloned() else {
         return no_index_store_response();
     };
     let prefix = params.prefix.unwrap_or_default();
-    let page = match store.scan(
-        &module,
-        prefix.as_bytes(),
-        params.after.as_deref().map(str::as_bytes),
-        params.limit.unwrap_or(INDEX_DEFAULT_LIMIT),
-    ) {
-        Ok(page) => page,
-        Err(err) => return index_error(err),
+    let after = params.after.clone();
+    let limit = params.limit.unwrap_or(INDEX_DEFAULT_LIMIT);
+    let outcome = gated_blocking(&handle, move || {
+        store.scan(
+            &module,
+            prefix.as_bytes(),
+            after.as_deref().map(str::as_bytes),
+            limit,
+        )
+    })
+    .await;
+    let page = match outcome {
+        Ok(Ok(page)) => page,
+        Ok(Err(err)) => return index_error(err),
+        Err(response) => return response,
     };
     let entries = page
         .entries
@@ -627,16 +670,22 @@ pub struct BlocksParams {
 /// empty `ops`) at each ascension tip. it is a truthful record of what that
 /// node saw; a consumer that presents these rows as blocks-with-content owes
 /// its own filter.
+///
+/// #1809: `recent_block_rows` runs behind the same [`gated_blocking`] permit
+/// as every other synchronous store read on this `Lane::Open` surface.
 pub(crate) async fn blocks(
     State(handle): State<NodeHandle>,
     Query(params): Query<BlocksParams>,
 ) -> Response {
-    let Some(store) = handle.index.as_ref() else {
+    let Some(store) = handle.index.clone() else {
         return Json(serde_json::json!({ "blocks": [] })).into_response();
     };
-    let rows = match store.recent_block_rows(params.limit.unwrap_or(BLOCKS_DEFAULT_LIMIT)) {
-        Ok(rows) => rows,
-        Err(err) => return index_error(err),
+    let limit = params.limit.unwrap_or(BLOCKS_DEFAULT_LIMIT);
+    let outcome = gated_blocking(&handle, move || store.recent_block_rows(limit)).await;
+    let rows = match outcome {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(err)) => return index_error(err),
+        Err(response) => return response,
     };
     let mut blocks: Vec<Box<serde_json::value::RawValue>> = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -657,6 +706,48 @@ pub(crate) async fn blocks(
 
 #[cfg(test)]
 mod tests {
+    /// #1809: a payload over [`super::MAX_INLINE_PAYLOAD_BYTES`] ships as
+    /// `payload_bytes` + `payload_truncated` instead of a multi-megabyte hex
+    /// string — the full bytes stay reachable by op id, this row just stops
+    /// hexing them.
+    #[test]
+    fn op_row_json_truncates_an_oversized_payload() {
+        let row = indexer::OpRow {
+            height: 1,
+            seq: 0,
+            time: 1_000,
+            origin: indexer::OriginTag::external("jess"),
+            payload: vec![0u8; super::MAX_INLINE_PAYLOAD_BYTES + 1],
+            assigned: Vec::new(),
+        };
+        let json = super::op_row_json(&row);
+        assert_eq!(
+            json["payload_bytes"],
+            serde_json::json!(super::MAX_INLINE_PAYLOAD_BYTES + 1)
+        );
+        assert_eq!(json["payload_truncated"], serde_json::json!(true));
+        assert!(json.get("payload").is_none());
+        assert!(json.get("payload_hex").is_none());
+    }
+
+    /// an in-budget payload keeps embedding verbatim — the truncation branch
+    /// must not swallow ordinary rows.
+    #[test]
+    fn op_row_json_embeds_a_small_payload_verbatim() {
+        let row = indexer::OpRow {
+            height: 1,
+            seq: 0,
+            time: 1_000,
+            origin: indexer::OriginTag::external("jess"),
+            payload: br#"{"hello":"world"}"#.to_vec(),
+            assigned: Vec::new(),
+        };
+        let json = super::op_row_json(&row);
+        assert_eq!(json["payload"], serde_json::json!({"hello": "world"}));
+        assert!(json.get("payload_bytes").is_none());
+        assert!(json.get("payload_truncated").is_none());
+    }
+
     /// THE WATERMARK MUST BE READ BEFORE THE VIEW. The two reads take two MVCC
     /// snapshots, and the ORDER is the whole correctness argument: read the tip
     /// first and it can only be older than the rows served (the caller waits
