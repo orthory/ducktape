@@ -87,6 +87,19 @@ enum WelcomeDoor
   create
   login
 
+// SETTINGS' GROUPS, as the one thing the screen branches on. Settings was a
+// single reflowing grid of eight cards, so one topic (identity, its keys, the
+// seat that signs with them) landed in whichever column the width happened to
+// give it, and the destructive act sat at the bottom of the same list as the
+// theme switch. Each variant is one group of settings, and the danger zone is
+// a place you go rather than a card you scroll past.
+enum SettingsPane
+  general
+  network
+  account
+  security
+  danger
+
 enum NodeTab
   overview
   permissions

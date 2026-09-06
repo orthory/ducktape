@@ -913,9 +913,12 @@ preset ui_settings_scroll
 // pane. The mount is the REAL id path the handler names
 // (`#workspace-tabs/content/settings/settings-body`) — a scaffold that merely
 // imitated that path would stay green while the shipping app stayed dead.
+// The viewport is deliberately short. Settings is a tab strip over one group
+// at a time now, so no single pane is the nine-card scroll the old grid was —
+// 260px is what makes the pane under test taller than its window.
 test settings_keyboard_scroll_contract
   preset ui_settings_scroll
-  viewport 1120 460
+  viewport 1120 260
   mount
     WorkspaceTabs wall_now=wall_now #workspace-tabs
       with
@@ -1028,11 +1031,17 @@ test settings_keyboard_scroll_contract
       bell:
         space w=1.0 h=1.0
   target body = #workspace-tabs/content/settings/settings-body
+  target account_tab = #workspace-tabs/content/settings/settings-body/settings-account-tab
   // The scroll handlers qualify their targets with the console window
   // (`window=window_target(console_win)`), so the test first tells the app
   // the harness window IS the console — the same fact `task window open`
   // delivers in the real flow.
   dispatch console_opened(window)
+  // Settings opens on General, whose three cards fit a 460px viewport with
+  // nothing to scroll. The pane this scenario is about is Account: it is the
+  // long one, and it is the one holding the rename field the caret half of
+  // the arbitration needs.
+  click account_tab
   expect body.content_height > body.visible_height
   expect body.scroll_y ~= 0.0
   key escape
@@ -1626,3 +1635,4 @@ test the_huddle_controls_survive_the_narrowest_panel
   expect leave.x + leave.width <= panel.x + panel.width
   expect share.width ~= 32.0
   capture huddle_sharing_light
+
