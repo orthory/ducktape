@@ -1025,6 +1025,12 @@ pub(crate) async fn git_upload_pack(
                 );
                 return error_response(StatusCode::NOT_FOUND, "no such repo");
             }
+            Ok(Err(UploadPackError::WantNotAdvertised(hex))) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("want {hex} is not one of this repo's advertised refs"),
+                );
+            }
             Ok(Err(UploadPackError::Other(msg))) => {
                 return error_response(StatusCode::INTERNAL_SERVER_ERROR, &msg);
             }
@@ -1084,11 +1090,14 @@ pub(crate) async fn git_upload_pack(
 /// message (`repository.c`'s "could not find repository at '%s'"), so it is
 /// NEVER surfaced to the client or put in the log ring's warn line; the
 /// handler answers a fixed 404 and logs this variant's detail at `debug`
-/// only. `Other` covers everything past a successfully opened repo (a bad
-/// want oid, a pack-write failure) and is not path-bearing.
+/// only. `WantNotAdvertised` is a refusal, not a server error: the client
+/// asked for an oid this node does not currently advertise as a branch tip.
+/// `Other` covers everything past those two (a bad want oid, a pack-write
+/// failure) and is not path-bearing.
 #[derive(Debug)]
 enum UploadPackError {
     RepoUnavailable(git2::Error),
+    WantNotAdvertised(String),
     Other(String),
 }
 
@@ -1099,18 +1108,31 @@ enum UploadPackError {
 /// closure (forge's `pack_closure_many` — ONE packing implementation for the
 /// module's snapshot pack and this fetch lane). returns the pack plus the
 /// first usable common base, which the handler ACKs.
+///
+/// every want must equal one of this repo's current branch tips — the same
+/// anti-amplifier `forge::build_objects` enforces on the peer lane ("that
+/// guard is the whole anti-amplifier"): a caller may only ask for history
+/// this node still advertises, never an arbitrary walk of its object
+/// database by oid.
 fn build_upload_pack(
     repo_dir: &std::path::Path,
     want_hexes: &[String],
     have_hexes: &[String],
 ) -> Result<(Vec<u8>, Option<String>), UploadPackError> {
     let repo = git2::Repository::open(repo_dir).map_err(UploadPackError::RepoUnavailable)?;
+    let tips: Vec<git2::Oid> = forge::list_branches(&repo)
+        .map_err(|e| UploadPackError::Other(format!("read refs: {e}")))?
+        .into_iter()
+        .map(|(_, oid)| oid)
+        .collect();
     let mut oids = Vec::with_capacity(want_hexes.len());
     for hex in want_hexes {
-        oids.push(
-            git2::Oid::from_str(hex)
-                .map_err(|e| UploadPackError::Other(format!("bad want oid {hex}: {e}")))?,
-        );
+        let oid = git2::Oid::from_str(hex)
+            .map_err(|e| UploadPackError::Other(format!("bad want oid {hex}: {e}")))?;
+        if !tips.contains(&oid) {
+            return Err(UploadPackError::WantNotAdvertised(hex.clone()));
+        }
+        oids.push(oid);
     }
     // only haves this repo KNOWS as commits can bound the walk — a have from
     // history this node never saw simply doesn't help (and never errors).
@@ -1358,6 +1380,11 @@ mod upload_pack_tests {
         let first = origin
             .commit(Some("refs/heads/dev"), &sig, &sig, "one", &tree1, &[])
             .unwrap();
+        // keep `first` an advertised tip (a second branch) after `dev` moves
+        // to `second` below — the want-guard only packs an advertised tip.
+        origin
+            .reference("refs/heads/base", first, true, "test")
+            .unwrap();
 
         let blob_b = origin.blob(b"two").unwrap();
         let mut tb = origin.treebuilder(Some(&tree1)).unwrap();
@@ -1436,6 +1463,44 @@ mod upload_pack_tests {
 
         let over = parse_pkt_lines(&over_cap).unwrap_err();
         assert!(over.contains("too many pkt-lines in request"), "{over}");
+    }
+
+    /// a want naming an oid still in the ODB but no longer any branch's tip
+    /// (the branch moved past it, or was force-pushed away) is refused, not
+    /// packed — the anti-amplifier guard `build_upload_pack` shares with the
+    /// peer lane's `forge::build_objects`. the current tip still packs fine.
+    #[test]
+    fn a_want_off_every_advertised_tip_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let sig = git2::Signature::now("test", "test@example.com").unwrap();
+
+        let blob = repo.blob(b"one").unwrap();
+        let mut tb = repo.treebuilder(None).unwrap();
+        tb.insert("a.txt", blob, 0o100644).unwrap();
+        let tree = repo.find_tree(tb.write().unwrap()).unwrap();
+        let orphaned = repo
+            .commit(Some("refs/heads/main"), &sig, &sig, "one", &tree, &[])
+            .unwrap();
+        let orphaned_commit = repo.find_commit(orphaned).unwrap();
+        let tip = repo
+            .commit(
+                Some("refs/heads/main"),
+                &sig,
+                &sig,
+                "two",
+                &tree,
+                &[&orphaned_commit],
+            )
+            .unwrap();
+
+        let err = build_upload_pack(dir.path(), &[orphaned.to_string()], &[]).unwrap_err();
+        assert!(
+            matches!(err, UploadPackError::WantNotAdvertised(hex) if hex == orphaned.to_string())
+        );
+
+        build_upload_pack(dir.path(), &[tip.to_string()], &[])
+            .expect("a want for the current tip still packs");
     }
 
     /// an absent repo dir maps to the path-bearing git2 error variant, not
