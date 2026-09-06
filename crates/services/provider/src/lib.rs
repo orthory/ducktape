@@ -994,17 +994,37 @@ impl CliProvider {
                     )
                 })?
                 .join(file),
-            Some(ContextLocation::WorkspaceParent(file)) => workdir
-                .parent()
-                .ok_or_else(|| {
+            // Namespaced under the run's own slug (`workdir`'s basename), NOT
+            // written directly at `workdir.parent()`: that parent is the node-wide
+            // runs root shared by every run of this tag, so two runs alive at once
+            // would write the SAME path and each overwrite the other's soul (#1692).
+            // The slug is already this run's unique identity — it IS the workdir's
+            // name — so keying on it costs no new randomness and stays stable
+            // across the two calls (`assemble_assets_for_run` and `deliver_context`)
+            // that must agree on this path for one run.
+            //
+            // The guest never sees this host detail: `stage_whole` copies a file
+            // asset by its OWN BASENAME to the asset image root, so the CLI still
+            // finds it at `../<file>` relative to its workdir regardless of which
+            // host directory it was staged from.
+            Some(ContextLocation::WorkspaceParent(file)) => {
+                let parent = workdir.parent().ok_or_else(|| {
                     format!(
                         "{}: context.path names the parent of the run's workdir, but \
                          {} has none",
                         self.spec.tag,
                         workdir.display()
                     )
-                })?
-                .join(file),
+                })?;
+                let slug = workdir.file_name().ok_or_else(|| {
+                    format!(
+                        "{}: run workdir {} has no name to key its context document by",
+                        self.spec.tag,
+                        workdir.display()
+                    )
+                })?;
+                parent.join(RUN_RUNTIME_DIR).join(slug).join(file)
+            }
         };
         Ok(Some(dir))
     }
@@ -1640,15 +1660,18 @@ fn canonical_mount_path(path: &Path, purpose: &str) -> Result<PathBuf, String> {
 
 /// removes a run's context document on drop — every exit path (success, error,
 /// timeout, panic). only built for a doc OUTSIDE the workdir (`workspace-parent:`):
-/// it sits beside the checkout, where nothing else would ever clean it up, and a
-/// stale soul left there would silently join the NEXT run whose checkout lands in
-/// the same parent. a `config-home:` doc needs no guard of its own: it is inside
-/// the run's [`RunHome`], which removes the whole directory when the run ends.
+/// it sits beside the checkout, in this run's own slug-named directory under
+/// `RUN_RUNTIME_DIR` (see [`Provider::context_target`]), where nothing else
+/// would ever clean it up. Removing the whole directory rather than just the
+/// file means the slug directory itself does not linger empty. a `config-home:`
+/// doc needs no guard of its own: it is inside the run's [`RunHome`], which
+/// removes the whole directory when the run ends.
 struct ContextGuard(PathBuf);
 
 impl Drop for ContextGuard {
     fn drop(&mut self) {
-        if let Err(error) = std::fs::remove_file(&self.0) {
+        let dir = self.0.parent().unwrap_or(&self.0);
+        if let Err(error) = std::fs::remove_dir_all(dir) {
             // Its twin, `RunHome::drop`, has always been a `tracing::warn` —
             // this one printed to raw stderr, which reaches neither the app's
             // Logs tab nor `RUST_LOG`.
@@ -3713,12 +3736,17 @@ format = "text"
     #[tokio::test]
     async fn a_workspace_parent_context_spec_writes_the_soul_beside_the_checkout_and_cleans_it_up()
     {
-        // the doc lands at the parent of the run's checkout — where the CLI's own
-        // convention finds it, OUTSIDE the tree `commit` scans, and layered UNDER
-        // a repository's own instructions file rather than overwriting it.
+        // the doc lands under a slug-named directory beside the run's checkout —
+        // still OUTSIDE the tree `commit` scans, layered UNDER a repository's own
+        // instructions file, and namespaced per run (#1692) rather than at the
+        // shared parent every run of this tag lands in.
         let root = scratch("soul-parent");
         // the mock CLI prints the delivered file, a separator, then its stdin.
-        let script = fake_cli(&root, "soul.sh", "cat ../SOUL.md; echo ---; cat");
+        let script = fake_cli(
+            &root,
+            "soul.sh",
+            &format!("cat ../{RUN_RUNTIME_DIR}/checkout/SOUL.md; echo ---; cat"),
+        );
         let provider = sh_provider(
             spec_with("soul", "[context]\npath = \"workspace-parent:SOUL.md\"\n"),
             script,
@@ -3740,9 +3768,65 @@ format = "text"
         // and the file is gone: it lives outside the workdir, where nothing else
         // would ever clean it up and a stale soul would join the next run.
         assert!(
-            !root.join("SOUL.md").exists(),
-            "the context doc is removed when the run ends"
+            !root.join(RUN_RUNTIME_DIR).join("checkout").exists(),
+            "the context doc's per-run directory is removed when the run ends"
         );
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_workspace_parent_runs_never_share_a_soul() {
+        // #1692: two runs of the same tag share `workdir.parent()` — the node's
+        // whole runs root — so a shared host path for the context doc would let
+        // whichever run writes second clobber the first's soul before either
+        // child reads it, and whichever run's guard drops first delete it out
+        // from under the other. Namespacing the doc under each run's own slug
+        // (see `Provider::context_target`) means neither happens.
+        let root = scratch("soul-parent-concurrent");
+        let script_a = fake_cli(
+            &root,
+            "soul-a.sh",
+            &format!("cat ../{RUN_RUNTIME_DIR}/run-a/SOUL.md; echo ---; cat"),
+        );
+        let script_b = fake_cli(
+            &root,
+            "soul-b.sh",
+            &format!("cat ../{RUN_RUNTIME_DIR}/run-b/SOUL.md; echo ---; cat"),
+        );
+        let provider_a = sh_provider(
+            spec_with("soul", "[context]\npath = \"workspace-parent:SOUL.md\"\n"),
+            script_a,
+            "soul-parent-concurrent-scratch-a",
+        );
+        let provider_b = sh_provider(
+            spec_with("soul", "[context]\npath = \"workspace-parent:SOUL.md\"\n"),
+            script_b,
+            "soul-parent-concurrent-scratch-b",
+        );
+        let ctx_a = RunContext {
+            workdir_override: Some(root.join("run-a")),
+            context_doc: Some("# soul A\n".to_string()),
+            ..RunContext::default()
+        };
+        let ctx_b = RunContext {
+            workdir_override: Some(root.join("run-b")),
+            context_doc: Some("# soul B\n".to_string()),
+            ..RunContext::default()
+        };
+
+        // both runs execute concurrently, sharing `root` as their workdir parent —
+        // exactly the shape #1692 describes.
+        let (out_a, out_b) = tokio::join!(
+            provider_a.run("PROMPT-A", &ctx_a),
+            provider_b.run("PROMPT-B", &ctx_b),
+        );
+
+        // each child saw ITS OWN soul, never the other's.
+        assert_eq!(out_a.expect("run A succeeds"), "# soul A\n---\nPROMPT-A");
+        assert_eq!(out_b.expect("run B succeeds"), "# soul B\n---\nPROMPT-B");
+        // and one run's guard dropping did not remove the other's still-live
+        // per-run directory.
+        assert!(!root.join(RUN_RUNTIME_DIR).join("run-a").exists());
+        assert!(!root.join(RUN_RUNTIME_DIR).join("run-b").exists());
     }
 
     #[tokio::test]
@@ -5517,6 +5601,24 @@ printf '%s\n' "$PATH"
             let run = microvm_run_dir(&slot).expect("run dir");
             let socket = microvm_socket_dir(&slot).expect("socket dir");
             assert!(run.path().is_dir() && socket.path().is_dir());
+            // #1693: the run directory (holding manifest.bin and the run's
+            // workspace/asset images once boot writes them) must not be
+            // world- or group-readable — a bare `create_dir_all` under a
+            // normal umask lands 0755.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(run.path())
+                    .expect("run dir metadata")
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "{} is readable by group/other: {mode:o}",
+                    run.path().display()
+                );
+            }
             (run.path().to_path_buf(), socket.path().to_path_buf())
             // both guards drop here, as they do on every `?` in `microvm_boot`
             // before the VM exists.
