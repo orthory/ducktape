@@ -522,3 +522,41 @@ fn sweep_removes_expired_entries_and_keeps_fresh_ones() {
     );
     assert!(map.contains_key(&fresh), "a fresh entry survives the sweep");
 }
+
+// ---------------------------------------------------------------------------
+// `UnreachableLatch`: the "peer unreachable" warn (#1768) — a forever-retry
+// loop latched like `noded::log::Latch` (first hit, then every Nth, carrying
+// the count), but per-peer and reset on recovery.
+// ---------------------------------------------------------------------------
+
+use crate::reachability_plane::UnreachableLatch;
+
+#[test]
+fn a_peer_latches_first_then_every_nth_and_counts_the_rest() {
+    let mut latch = UnreachableLatch::default();
+    let peer = b"peer-a";
+    // the first failure must be visible immediately, not on the 100th retry.
+    assert_eq!(latch.hit(peer), Some(1));
+    for _ in 2..100 {
+        assert_eq!(latch.hit(peer), None, "no flood while still latched");
+    }
+    // ...and the count is what tells you it is WEDGED, not merely flaky.
+    assert_eq!(latch.hit(peer), Some(100));
+
+    // a distinct peer latches independently: one noisy peer must never mask
+    // another's first warn.
+    assert_eq!(latch.hit(b"peer-b"), Some(1));
+}
+
+#[test]
+fn a_recovered_peer_gets_a_fresh_first_warn() {
+    let mut latch = UnreachableLatch::default();
+    let peer = b"peer-a";
+    assert_eq!(latch.hit(peer), Some(1));
+    assert_eq!(latch.hit(peer), None);
+
+    // the peer is reachable again — its next failure is a fresh first-warn,
+    // not silently folded into the old streak's count.
+    latch.clear(peer);
+    assert_eq!(latch.hit(peer), Some(1));
+}

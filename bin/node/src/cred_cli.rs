@@ -27,7 +27,7 @@ use std::path::Path;
 
 use commonware_cryptography::Signer as _;
 
-use crate::account_cli::resolve_account;
+use crate::account_cli::resolve_account_authority;
 use crate::cli_args::NodeAddr;
 use crate::config;
 use crate::userkey_cli::load_user_signer;
@@ -73,10 +73,13 @@ pub(crate) enum CredCmd {
     Grant {
         /// the credential name
         name: String,
-        /// an account number or a display name. The grant reaches exactly the
-        /// runs this account's keys sign (`agent sched --host-node`, which names
-        /// this credential in the committed work), on the node each run is
-        /// pinned to, until that run ends. Nobody else's work.
+        /// an account NUMBER. A display name is refused: it is freely
+        /// rewritable and not unique, so it cannot name who this credential
+        /// trusts (look the number up with `ducktape account show`). The
+        /// grant reaches exactly the runs this account's keys sign (`agent
+        /// sched --host-node`, which names this credential in the committed
+        /// work), on the node each run is pinned to, until that run ends.
+        /// Nobody else's work.
         account: String,
     },
     /// rescind a lend (owner-signed). In flight sessions keep working until their
@@ -84,7 +87,8 @@ pub(crate) enum CredCmd {
     Revoke {
         /// the credential name
         name: String,
-        /// the account to stop lending to — the same account `grant` named
+        /// the account NUMBER to stop lending to — the same account `grant`
+        /// named (a display name is refused; see `grant`'s help)
         account: String,
     },
     /// read a TEE gateway's enclave measurement out of its quote, so it can be
@@ -292,7 +296,7 @@ fn cmd_grant(ctx: &VerbCtx, name: String, account: String, stdin: &mut impl BufR
     let resolved = ctx.workspace()?;
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
-    let grantee = resolve_account(&base, &account)?;
+    let grantee = resolve_account_authority(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
         chain_id: resolved.service.chain_id.clone(),
         owner_account,
@@ -323,7 +327,7 @@ fn cmd_revoke(
     let resolved = ctx.workspace()?;
     let user = load_user_signer(&ctx.key_path()?, stdin)?;
     let owner_account = query_owner_account(&base, user.public_key().as_ref())?;
-    let grantee = resolve_account(&base, &account)?;
+    let grantee = resolve_account_authority(&base, &account)?;
     let statement = gateway::CredentialGrantStatement {
         chain_id: resolved.service.chain_id.clone(),
         owner_account,

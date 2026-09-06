@@ -287,8 +287,10 @@ pub fn encode_frame(signer: &PrivateKey, seq: u64, msg: &Msg) -> Vec<u8> {
 /// and the proof (exactly one valid encoding per frame — this is what makes
 /// an appended continuation section unrepresentable; every scheme's proof is
 /// self-delimiting so the boundary is the preimage's own end), an origin
-/// malformed for its scheme, or a proof that does not bind the whole
-/// preimage. the ordered drain treats any rejection as a deterministic no-op:
+/// malformed for its scheme — which INCLUDES a secp key spelled any way but
+/// the canonical 33-byte compressed SEC1 form, so one private key can never
+/// enter a block as two distinct origins — or a proof that does not bind the
+/// whole preimage. the ordered drain treats any rejection as a deterministic no-op:
 /// every honest validator rejects the identical forged frame identically.
 /// the verified `origin` becomes the block's `Origin::External(pubkey)` — raw
 /// key bytes, scheme not surfaced (a key's bytes cannot collide across
@@ -2006,6 +2008,22 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
     /// the current root-hash of the wrapped host.
     pub fn root_hash(&self) -> StateRoot {
         self.host.root_hash()
+    }
+
+    /// the `consensus_time` a block at `height` carries, under this node's
+    /// [`ConsensusTimePolicy`] — the same derivation
+    /// [`OrderedNode::drain_delivered`] stamps into every applied block's
+    /// `Env`. lets a status projection report the exact clock modules compare
+    /// `expires_at` against, whatever the policy (a block height on the
+    /// validator lane, a millisecond epoch on the sim lane).
+    pub fn stamp_consensus_time(&self, height: u64) -> u64 {
+        self.time_policy.stamp(height)
+    }
+
+    /// the [`ConsensusTimePolicy`] this node stamps blocks under — lets a
+    /// status projection report which UNIT `consensus_time` is expressed in.
+    pub fn consensus_time_policy(&self) -> ConsensusTimePolicy {
+        self.time_policy
     }
 
     /// take the events accumulated by applied blocks since the last call. the

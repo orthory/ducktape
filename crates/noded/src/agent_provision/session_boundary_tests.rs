@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, AgentMsg};
+use capability::CapabilityMsg;
 use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
 use commonware_runtime::{Runner as _, Supervisor as _};
 use dispatch::DispatchModule;
@@ -54,7 +55,9 @@ use statesync::qmdb::QmdbStore;
 /// against — so there is nothing to line up by hand.
 const AGENT: &str = "quackbot";
 const CAPABILITY: &str = "mock-llm-1";
-const WORKER_NODE: &[u8] = b"worker-node";
+/// 32 bytes: `Accept`'s standing gate requires a real valset-shaped key, and
+/// this is seeded into that valset (see `genesis`).
+const WORKER_NODE: &[u8] = &[0x77; 32];
 const CHANNEL: &str = "general";
 
 /// a provider that answers instantly and RECORDS the run context it was handed —
@@ -127,15 +130,39 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
         Box::new(QmdbStore::init(context.child("chat"), "chat").await),
     )
     .with_tagging("tagging");
+    // `Accept`'s standing gate needs a real valset to admit a claim against,
+    // and a tagged saga (this run's agent carries `CAPABILITY`) needs the
+    // capability registry too — see PR #1738. `WORKER_NODE` is the only node
+    // that ever claims a lease in this test, so it is the only genesis
+    // validator.
+    let mut valset = valset::Valset::new(
+        "valset",
+        Box::new(sdk_testkit::MemStore::new()),
+        "governance",
+    );
+    valset
+        .seed(WORKER_NODE.to_vec())
+        .await
+        .expect("seed valset");
+    valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(chat),
         Box::new(TaggingModule::new(
             "tagging",
             Box::new(sdk_testkit::MemStore::new()),
         )),
-        Box::new(SagaModule::new(
+        Box::new(valset),
+        Box::new(capability::CapabilityRegistry::new(
+            "capability",
+            Box::new(sdk_testkit::MemStore::new()),
+            Some("valset".into()),
+        )),
+        Box::new(SagaModule::with_assignment(
             "saga",
             Box::new(sdk_testkit::MemStore::new()),
+            "valset",
+            "capability",
+            saga::LeasePolicy::Open,
         )),
         Box::new(DispatchModule::new(
             "dispatch",
@@ -327,6 +354,25 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             ),
         );
 
+        // WORKER_NODE announces itself as a `CAPABILITY` provider — Accept's
+        // capability gate needs this on top of the valset standing seeded in
+        // `genesis`, since the run's saga carries the agent's own capability
+        // tag. it lands AFTER the trigger `mention_run` staged, so the pool
+        // above still saw an empty provider pool and stayed an unassigned
+        // announcement.
+        host.submit_at(
+            at(5, Origin::External(WORKER_NODE.to_vec())),
+            Msg {
+                target: "capability".into(),
+                payload: capability::encode_msg(&CapabilityMsg::Announce {
+                    capabilities: vec![CAPABILITY.into()],
+                    resources: Default::default(),
+                }),
+            },
+        )
+        .await
+        .expect("capability announce block");
+
         // the announcement is an OFFER: the pool claims it with Accept, and the
         // saga re-emits the request naming the winner. the lease this creates is
         // the SAME committed lease `runs` authorizes the bind against.
@@ -335,7 +381,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             other => panic!("the pool must CLAIM a servable announcement, got {other:?}"),
         };
         let assigned: Vec<Event> = host
-            .submit_at(at(5, Origin::External(WORKER_NODE.to_vec())), accept)
+            .submit_at(at(6, Origin::External(WORKER_NODE.to_vec())), accept)
             .await
             .expect("accept block")
             .events

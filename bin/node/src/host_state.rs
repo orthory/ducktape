@@ -767,7 +767,7 @@ mod tests {
     /// accident. Update it ONLY as the deliberate half of a flag day (see
     /// [`production_genesis_root_hash_is_pinned`]).
     const GENESIS_ROOT_HASH: &str =
-        "1a6448dc072a9345e435cff8c314b6951d0136ba77725e0246709af9b0484cd7";
+        "5dc103d7aacb17922049b33dc3619a4fa4e868860209ab60a79e5f409c9f0458";
 
     /// The bindings [`GENESIS_ROOT_HASH`] is taken over. They are constants
     /// because they are NOT: each rides its module's genesis `__config`

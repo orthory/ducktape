@@ -88,14 +88,20 @@ pub(crate) enum AccountCmd {
         #[arg(long, value_name = "TEXT")]
         label: Option<String>,
     },
-    /// print one account: this key's by default, else by number or member key
+    /// print one account: this key's by default, else by number, member key,
+    /// or display name
     Show {
         /// the account number
-        #[arg(long, value_name = "N", conflicts_with = "pubkey")]
+        #[arg(long, value_name = "N", conflicts_with_all = ["pubkey", "name"])]
         number: Option<u64>,
         /// a member key (hex) of the account to show
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", conflicts_with = "name")]
         pubkey: Option<String>,
+        /// a display name to look up — DISPLAY ONLY: a name is not unique and
+        /// is freely rewritable, so this refuses when more than one account
+        /// currently carries it rather than guessing.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
     },
     /// the keys associated with this account
     #[command(subcommand)]
@@ -239,7 +245,11 @@ pub(crate) fn run(args: AccountArgs) -> AccountResult {
         AccountCmd::Create { name, eth: false } => cmd_create(&ctx, name, &mut stdin),
         AccountCmd::Create { name, eth: true } => cmd_create_eth(&ctx, &auth, name),
         AccountCmd::Login { label } => cmd_login(&ctx, &auth, label, &mut stdin),
-        AccountCmd::Show { number, pubkey } => cmd_show(&ctx, number, pubkey),
+        AccountCmd::Show {
+            number,
+            pubkey,
+            name,
+        } => cmd_show(&ctx, number, pubkey, name),
         AccountCmd::Key(KeyCmd::List) => cmd_key_list(&ctx),
         AccountCmd::Key(KeyCmd::Approve) => cmd_key_approve(&ctx),
         AccountCmd::Key(KeyCmd::Add {
@@ -279,14 +289,24 @@ fn cmd_create(ctx: &VerbCtx, name: String, stdin: &mut impl BufRead) -> AccountR
     Ok(())
 }
 
-fn cmd_show(ctx: &VerbCtx, number: Option<u64>, pubkey: Option<String>) -> AccountResult {
+fn cmd_show(
+    ctx: &VerbCtx,
+    number: Option<u64>,
+    pubkey: Option<String>,
+    name: Option<String>,
+) -> AccountResult {
     let base = ctx.http_base()?;
-    let query = match (number, pubkey) {
-        (Some(number), _) => IdentityQuery::Get { number },
-        (None, Some(hex)) => IdentityQuery::OfKey {
+    let query = match (number, pubkey, name) {
+        (Some(number), _, _) => IdentityQuery::Get { number },
+        (None, Some(hex), _) => IdentityQuery::OfKey {
             key: config::unhex(&hex).map_err(|e| format!("--pubkey hex: {e}"))?,
         },
-        (None, None) => IdentityQuery::OfKey {
+        // display only — `resolve_account` refuses an ambiguous name instead
+        // of guessing; never route this into an authority decision.
+        (None, None, Some(name)) => IdentityQuery::Get {
+            number: resolve_account(&base, &name)?,
+        },
+        (None, None, None) => IdentityQuery::OfKey {
             key: active_pubkey(ctx)?,
         },
     };
@@ -662,26 +682,64 @@ fn consented_add_key(
     ))
 }
 
-/// How long a minted consent stays spendable, in blocks — `consensus_time` is
-/// a block height and a validator network heartbeats about once a second, so
-/// this is roughly a day. A device pairing is minutes of work; the day is the
-/// slack for a phone in another timezone. There is no revoke op, so this
-/// number IS the revocation window: it stays short enough that a mis-issued
-/// ticket ages out before anyone remembers it exists.
-const CONSENT_TTL: u64 = 86_400;
+/// How long a minted consent stays spendable on the validator/replica lanes,
+/// in blocks — `consensus_time` IS the block height there, and a validator
+/// network heartbeats about once a second, so this is roughly a day. A device
+/// pairing is minutes of work; the day is the slack for a phone in another
+/// timezone. There is no revoke op, so this number IS the revocation window:
+/// it stays short enough that a mis-issued ticket ages out before anyone
+/// remembers it exists.
+const CONSENT_TTL_HEIGHT_UNITS: u64 = 86_400;
 
-/// the `expires_at` a consent minted right now carries: the node's committed
-/// height plus [`CONSENT_TTL`].
+/// How long a minted consent stays spendable on the sim lane, in
+/// milliseconds. [`identity::MAX_CONSENT_TTL`] is the module's hard ceiling
+/// on `expires_at - now` in WHATEVER UNIT the network's `ConsensusTimePolicy`
+/// uses — on the sim lane's millisecond epoch clock that ceiling is only
+/// ~10 minutes, not the ~7 days it is on the validator/replica lanes, so
+/// there is no "roughly a day" to mint here: pin to the ceiling itself, the
+/// longest pairing window the module will accept.
+const CONSENT_TTL_MILLIS_UNITS: u64 = identity::MAX_CONSENT_TTL;
+
+/// the `expires_at` a consent minted right now carries: this node's current
+/// `consensus_time` — NOT its height, the two diverge on the sim lane's
+/// millisecond epoch clock — plus a TTL scaled to whichever unit
+/// `consensus_time` turns out to be.
 fn consent_expiry(base: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    Ok(head_height(base)? + CONSENT_TTL)
+    let (consensus_time, unit) = consensus_clock(base)?;
+    Ok(expiry_from_clock(consensus_time, unit))
 }
 
-/// this node's committed height, from `/v1/status`.
-fn head_height(base: &str) -> Result<u64, Box<dyn std::error::Error>> {
+/// the pure derivation `consent_expiry` reduces to once it has the node's
+/// clock reading: `consensus_time + a TTL scaled to that clock's unit`. split
+/// out so the two [`noded::ConsensusTimeUnit`] shapes are unit-testable
+/// without a node to dial.
+fn expiry_from_clock(consensus_time: u64, unit: noded::ConsensusTimeUnit) -> u64 {
+    let ttl = match unit {
+        noded::ConsensusTimeUnit::Height => CONSENT_TTL_HEIGHT_UNITS,
+        noded::ConsensusTimeUnit::Millis => CONSENT_TTL_MILLIS_UNITS,
+    };
+    consensus_time + ttl
+}
+
+/// this node's current `consensus_time` and the unit it is expressed in, from
+/// `/v1/status`. the identity module compares `expires_at` against exactly
+/// this value (`ctx.env().consensus_time`), so a consent must be minted from
+/// it — reading `height` instead is only correct under `HeightIsTime`.
+fn consensus_clock(
+    base: &str,
+) -> Result<(u64, noded::ConsensusTimeUnit), Box<dyn std::error::Error>> {
     let status = node_http::get_json(base, "/v1/status").map_err(|failure| failure.to_string())?;
-    status["height"]
+    let consensus_time = status["consensus_time"]
         .as_u64()
-        .ok_or_else(|| "node status carries no height".into())
+        .ok_or_else(|| "node status carries no consensus_time".to_string())?;
+    let unit: noded::ConsensusTimeUnit = status
+        .get("consensus_time_unit")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| format!("node status consensus_time_unit: {e}"))?
+        .unwrap_or_default();
+    Ok((consensus_time, unit))
 }
 
 fn identity_msg(msg: &IdentityMsg) -> sdk::Msg {
@@ -877,9 +935,14 @@ pub(crate) fn all_accounts(base: &str) -> Result<Vec<AccountView>, Box<dyn std::
     }
 }
 
-/// Resolve an account named on the command line: a decimal number is used as
-/// is (never dialing), anything else is a display name matched over every
-/// account — ambiguity and absence are loud errors.
+/// Resolve an account named on the command line, for DISPLAY only: a decimal
+/// number is used as is (never dialing), anything else is a display name
+/// matched over every account — ambiguity and absence are loud errors. A
+/// name is `AccountView.name` -- attacker-chosen, non-unique, and rewritable
+/// at will by a free `SetName` frame — so this resolver is safe only where
+/// the result decides what to PRINT, never what to grant. An authority
+/// decision (`cred grant`/`revoke`, `node work admit`) MUST go through
+/// [`resolve_account_authority`] instead.
 pub(crate) fn resolve_account(base: &str, input: &str) -> Result<u64, Box<dyn std::error::Error>> {
     if let Ok(number) = input.parse::<u64>() {
         gateway::validate_account_number(number)?;
@@ -900,6 +963,49 @@ pub(crate) fn resolve_account(base: &str, input: &str) -> Result<u64, Box<dyn st
             .into())
         }
     }
+}
+
+/// Resolve an account NUMBER for an AUTHORITY decision — `cred
+/// grant`/`revoke` (who may draw on a lent credential) and `node work admit`
+/// (whose workload this node runs). A display NAME is refused outright, never
+/// matched: `AccountView.name` is `SetName`-rewritable by its own holder at no
+/// cost and gated by nothing but membership, so a name-based match lets a
+/// renamed squatter's account collect an authority grant meant for someone
+/// else (the rename can happen and reverse around the exact moment the
+/// operator runs the granting command). The refusal lists the numbers the
+/// name currently matches, if any, so the operator can pick the right one
+/// without racing a mid-flight rename.
+pub(crate) fn resolve_account_authority(
+    base: &str,
+    input: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    if let Ok(number) = input.parse::<u64>() {
+        gateway::validate_account_number(number)?;
+        return Ok(number);
+    }
+    let accounts = all_accounts(base)?;
+    Err(authority_name_refusal(input, &accounts).into())
+}
+
+/// the refusal an authority resolver gives for a NAME: never a match, just
+/// the numbers (if any) currently carrying it, so the operator can pick the
+/// right one without racing a mid-flight rename. pure over an already-fetched
+/// account list, so it is unit-testable without a node to dial.
+fn authority_name_refusal(input: &str, accounts: &[AccountView]) -> String {
+    let numbers: Vec<String> = accounts
+        .iter()
+        .filter(|a| a.name == input)
+        .map(|a| a.number.to_string())
+        .collect();
+    let holders = if numbers.is_empty() {
+        "no account currently carries it".to_string()
+    } else {
+        format!("account(s) {} currently carry it", numbers.join(", "))
+    };
+    format!(
+        "{input:?} is a display name, not an account number — names are freely rewritable \
+         and not unique, so an authority grant must name a NUMBER ({holders})"
+    )
 }
 
 /// the active key's pubkey WITHOUT unlocking it: the encrypted file carries it
@@ -1106,6 +1212,44 @@ mod tests {
         assert!(ssh_frame(Vec::new(), "not armored").is_err());
     }
 
+    /// every key this CLI mints a consent over is 33-byte compressed SEC1 —
+    /// the one spelling the chain admits. `--eth` derives it by RECOVERY from
+    /// the reveal touch, `--passkey` reads it off the page's registration
+    /// result, and `--pubkey <hex>` is gated on the same well-formedness the
+    /// decoder applies, so no path can put an uncompressed point on an account.
+    #[test]
+    fn every_pubkey_the_cli_derives_is_canonical_compressed_sec1() {
+        use keyscheme::testkit::{eth_key, eth_sign_message, passkey, passkey_pubkey};
+
+        let wallet = eth_key(5);
+        let reveal = authpage::reveal_message();
+        let revealed = authpage::wallet_pubkey(
+            &reveal,
+            &Outcome::Eth {
+                address: "0x0".into(),
+                signature: eth_sign_message(&wallet, &reveal),
+                message: reveal.clone(),
+            },
+        )
+        .expect("the reveal touch answers with the wallet's key");
+        assert_eq!(revealed.len(), 33);
+        assert!(KeyScheme::Secp256k1.pubkey_wellformed(&revealed));
+
+        let registered = passkey_pubkey(&passkey(4));
+        assert_eq!(registered.len(), 33);
+        assert!(KeyScheme::Secp256r1.pubkey_wellformed(&registered));
+
+        // and the hand-typed path: the uncompressed spelling of that very
+        // wallet key is not something `key add --pubkey` will mint a ticket for.
+        let uncompressed = wallet
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        assert_eq!(uncompressed.len(), 65);
+        assert!(!KeyScheme::Secp256k1.pubkey_wellformed(&uncompressed));
+    }
+
     /// a login's frame: the page's assertion (faked exactly as an
     /// authenticator signs it) becomes the `AddKey` this device submits AS
     /// ITS OWN ORIGIN — `key join`'s shape with a passkey's consent inside.
@@ -1274,5 +1418,78 @@ mod tests {
     fn resolve_account_takes_a_number_offline_and_refuses_zero() {
         assert_eq!(resolve_account("http://127.0.0.1:9", "12").unwrap(), 12);
         assert!(resolve_account("http://127.0.0.1:9", "0").is_err());
+    }
+
+    /// the authority resolver takes the same numbers as the display resolver
+    /// — never dials for the number case, so this stays offline exactly like
+    /// the display resolver's test above.
+    #[test]
+    fn resolve_account_authority_takes_a_number_offline_and_refuses_zero() {
+        assert_eq!(
+            resolve_account_authority("http://127.0.0.1:9", "12").unwrap(),
+            12
+        );
+        assert!(resolve_account_authority("http://127.0.0.1:9", "0").is_err());
+    }
+
+    /// issue #1764: an authority decision (`cred grant`, `node work admit`)
+    /// must never resolve a NAME to an account — `SetName` is free, unbound
+    /// and gated by nothing but membership, so a name is attacker-chosen and
+    /// non-unique. the refusal names the numbers (if any) currently holding
+    /// it, so the operator can pick the right one instead of the resolver
+    /// guessing (and instead of racing a squatter's rename).
+    #[test]
+    fn authority_name_refusal_lists_current_holders_and_never_picks_one() {
+        let account = |number: u64, name: &str| AccountView {
+            number,
+            name: name.into(),
+            keys: Vec::new(),
+            avatar: None,
+            bio: None,
+            updated_at: 0,
+        };
+        let accounts = vec![account(3, "alice"), account(5, "alice"), account(7, "bob")];
+
+        let refusal = authority_name_refusal("alice", &accounts);
+        assert!(refusal.contains("NUMBER"), "{refusal}");
+        assert!(refusal.contains('3'), "{refusal}");
+        assert!(refusal.contains('5'), "{refusal}");
+        assert!(!refusal.contains('7'), "{refusal}");
+
+        // a squatter who hasn't taken the name yet still gets refused, never
+        // silently treated as "no match, carry on" — the caller's `?` turns
+        // this into a hard error regardless of who currently holds it.
+        let no_holder = authority_name_refusal("mallory", &accounts);
+        assert!(no_holder.contains("no account currently carries it"));
+    }
+
+    /// issue #1763: on the validator/replica lanes `consensus_time` IS the
+    /// block height, so a consent mints ~a day of blocks past it — the
+    /// pre-fix behavior, byte for byte.
+    #[test]
+    fn expiry_from_clock_under_height_is_time() {
+        assert_eq!(
+            expiry_from_clock(1_000, noded::ConsensusTimeUnit::Height),
+            1_000 + CONSENT_TTL_HEIGHT_UNITS
+        );
+    }
+
+    /// on the sim lane `consensus_time` is a millisecond epoch clock miles
+    /// past any block height (`SIM_EPOCH_MS` alone is ~1.75e12) — mixing the
+    /// two units is exactly bug #1763 (every consent minted "already
+    /// expired"). the fix mints from the clock reading itself, plus a TTL
+    /// pinned to the identity module's own hard ceiling in this unit (see
+    /// `CONSENT_TTL_MILLIS_UNITS`'s doc) rather than the height-lane's day.
+    #[test]
+    fn expiry_from_clock_under_millisecond_epoch() {
+        let sim_epoch_ms = 1_750_000_000_000_u64;
+        let expiry = expiry_from_clock(sim_epoch_ms, noded::ConsensusTimeUnit::Millis);
+        assert_eq!(expiry, sim_epoch_ms + identity::MAX_CONSENT_TTL);
+        // never the height-lane TTL: at this scale it would still be almost
+        // instantly expired against the module's much smaller ms ceiling.
+        assert_ne!(expiry, sim_epoch_ms + CONSENT_TTL_HEIGHT_UNITS);
+        // and always within the module's ceiling, or `identity` refuses the
+        // consent as outliving `MAX_CONSENT_TTL` even though it isn't stale.
+        assert!(expiry - sim_epoch_ms <= identity::MAX_CONSENT_TTL);
     }
 }
