@@ -2023,7 +2023,7 @@ async fn forward_messages(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|ct| ct.starts_with("application/octet-stream"));
         if sealed_outer {
-            return relay_sealed(upstream, keys, binding, permit).await;
+            return relay_sealed(upstream, keys, binding, permit, state).await;
         }
         if upstream.status().is_success() {
             return response(
@@ -2053,6 +2053,10 @@ async fn forward_messages(
                         "run broker response byte budget exhausted",
                     ))
                 } else {
+                    // charge the lifetime budget too (#1669): the codex path
+                    // charges its output.len(), this path never did — a long
+                    // streamed answer never counted against MAX_TOTAL_BYTES.
+                    state.bytes.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     Ok(bytes)
                 }
             }
@@ -2078,6 +2082,7 @@ async fn relay_sealed(
     keys: airlock::handshake::SessionKeys,
     binding: Vec<u8>,
     permit: tokio::sync::OwnedSemaphorePermit,
+    state: Arc<AnthropicBrokerState>,
 ) -> Response<Body> {
     use airlock::bodyseal::OpenedItem;
     let status =
@@ -2117,6 +2122,8 @@ async fn relay_sealed(
         let mut seen = 0usize;
         for data in pending {
             seen = seen.saturating_add(data.len());
+            // #1669: charge the lifetime budget same as the plain stream path.
+            state.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
             if tx.send(Ok(data)).await.is_err() {
                 return;
             }
@@ -2145,6 +2152,7 @@ async fn relay_sealed(
                                     .await;
                                 return;
                             }
+                            state.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
                             if tx.send(Ok(Bytes::from(data))).await.is_err() {
                                 return;
                             }
@@ -2687,6 +2695,53 @@ mod tests {
         );
 
         accept_task.abort();
+    }
+
+    /// #1669 regression: the plain (non-sealed) streamed response's bytes must
+    /// count against `state.bytes` — the codex path already charges its
+    /// `output.len()`, this path never did. Proven by seeding the lifetime
+    /// counter just under `MAX_TOTAL_BYTES`, draining a small streamed
+    /// response, and showing the NEXT request's existing pre-request check
+    /// now refuses it — that check is unchanged; only the charge is new.
+    #[tokio::test]
+    async fn anthropic_streamed_response_bytes_count_against_the_lifetime_budget() {
+        let (url, _seen, upstream) =
+            mock_upstream(StatusCode::OK, "text/event-stream", "0123456789").await;
+        let state = Arc::new(AnthropicBrokerState {
+            run_bearer: "bearer".into(),
+            auth: tokio::sync::Mutex::new(AnthropicAuth::ApiKey("host-secret".into())),
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(UPSTREAM_IDLE_TIMEOUT)
+                .build()
+                .unwrap(),
+            messages_url: url,
+            requests: AtomicU32::new(0),
+            // seeded just under the cap — the mock's 10-byte body tips it over.
+            bytes: AtomicU64::new(MAX_TOTAL_BYTES - 5),
+            concurrent: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str("Bearer bearer").unwrap(),
+        );
+
+        let resp1 =
+            forward_messages(State(state.clone()), headers.clone(), Bytes::from_static(b"{}"))
+                .await;
+        assert_eq!(resp1.status(), StatusCode::OK);
+        // drain the body — the byte charge happens as the stream is polled.
+        let body1 = to_bytes(resp1.into_body(), 1024).await.unwrap();
+        assert_eq!(&body1[..], b"0123456789".as_slice());
+
+        let resp2 = forward_messages(State(state), headers, Bytes::from_static(b"{}")).await;
+        assert_eq!(
+            resp2.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the streamed response's bytes must have counted against the lifetime budget"
+        );
+        upstream.abort();
     }
 
     #[tokio::test]
