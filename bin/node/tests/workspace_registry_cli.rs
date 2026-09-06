@@ -544,10 +544,10 @@ fn a_member_join_refuses_a_genesis_that_is_not_the_networks() {
     );
 }
 
-/// a bundle missing a component is named by the file the operator has to go
-/// look for — not by a hash mismatch three boots later.
+/// An empty founding directory cannot define a module set. The diagnostic
+/// names the supplied directory without inventing a required catalog entry.
 #[test]
-fn init_names_the_missing_component() {
+fn init_refuses_an_empty_module_directory() {
     let tmp = tempfile::tempdir().unwrap();
     let empty = tmp.path().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
@@ -559,5 +559,7 @@ fn init_names_the_missing_component() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("acl.component.wasm"));
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("holds no module components"), "{error}");
+    assert!(error.contains(empty.to_str().unwrap()), "{error}");
 }
