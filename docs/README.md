@@ -52,7 +52,8 @@ nothing cites is deleted, not archived.
 ## Vendored patches
 
 Each directory under `patches/` carries a note stating what the patch changes
-and when it can be dropped: `PATCH.md` for `block` and `blst` (their
-`README.md` is the upstream crate's own), `README.md` for `cosmic-text`.
+and when it can be dropped: `PATCH.md` for `block`, `README.md` for
+`cosmic-text`. The wasm32 `blst` patch lives under
+`crates/module-sdk/stubs/blst/` and carries its own `PATCH.md`.
 
 `docs/superpowers/` is gitignored planning scratch; nothing under it ships.

@@ -1,6 +1,6 @@
 //! the adapter-port equivalence proof for the runs cutover — the FINAL
 //! portable module: the `runs` guest component (the NATIVE `runs` crate
-//! compiled to wasm behind `guest-adapter`) and the native `RunsModule`
+//! compiled to wasm behind `ducktape-module-sdk`) and the native `RunsModule`
 //! answer the SAME op sequence with IDENTICAL query replies, emit IDENTICAL
 //! event traces (WorkerRequests included), land IDENTICAL follow-ups on every
 //! sibling, and their roots move in lockstep. the roots THEMSELVES differ:

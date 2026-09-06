@@ -2107,6 +2107,11 @@ impl<O: Orderer, S: BlockSink> OrderedNode<O, S> {
         (&mut self.sink, &self.host)
     }
 
+    /// Readiness preflight against the running module's retained state shape.
+    pub fn check_module_replacement(&mut self, id: &str, bytes: &[u8]) -> Result<(), sdk::Error> {
+        self.host.check_module_replacement(id, bytes)
+    }
+
     /// borrow the wrapped host (queries, module_root inspection, ...).
     pub fn host(&self) -> &Host {
         &self.host

@@ -42,9 +42,9 @@
 //! `chain_id` key, `noded::compose`'s `odb_genesis_config` resolves it against
 //! the network's bindings and hands it to `WasmModule::over_odb`, which
 //! serves it alongside [`REFS_KEY`] on the state lane — every dispatch reads
-//! it back through [`guest_adapter::genesis_chain_id`].
+//! it back through [`ducktape_module_sdk::genesis_chain_id`].
 
-use guest_adapter::{Guest, WitCtx, block_on, host};
+use ducktape_module_sdk::{Guest, WitCtx, block_on, host};
 use sdk::Error;
 
 use crate::state::{
@@ -102,7 +102,7 @@ fn load() -> Result<(ForgeState, BlockScratch), host::Error> {
 /// the block boundary (dropping the scratch) or discards both on abort.
 fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
     let (mut state, before) = load()?;
-    let chain_id = guest_adapter::genesis_chain_id("forge")?;
+    let chain_id = ducktape_module_sdk::genesis_chain_id("forge")?;
     let mut ctx = WitCtx::new();
     block_on(state.apply(&mut ctx, &payload, Some(CHAT_MODULE), &chain_id))
         .map_err(to_wit_error)?;
@@ -123,6 +123,14 @@ fn execute(payload: Vec<u8>) -> Result<(), host::Error> {
 struct Component;
 
 impl Guest for Component {
+    fn initialize(_params: Vec<u8>) -> Result<(), host::Error> {
+        Ok(())
+    }
+
+    fn finalize_block() -> Result<(), host::Error> {
+        Ok(())
+    }
+
     /// an odb port: the host wraps this component over the git substrate it
     /// provides for the module's id, seeding the `chain_id` genesis-config
     /// key [`pushcert::signer`](crate::pushcert::signer) checks a push
@@ -130,7 +138,7 @@ impl Guest for Component {
     fn shape() -> host::ModuleShape {
         host::ModuleShape {
             config: vec![sdk::genesis_config::CHAIN_ID.into()],
-            ..guest_adapter::odb_shape()
+            ..ducktape_module_sdk::odb_shape()
         }
     }
 
@@ -148,4 +156,4 @@ impl Guest for Component {
     }
 }
 
-guest_adapter::export_module!(Component);
+ducktape_module_sdk::export_module!(Component);

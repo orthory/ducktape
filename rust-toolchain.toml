@@ -17,12 +17,11 @@
 #     One arch per host, but a toolchain file cannot be host-conditional, so
 #     both are listed; dropping them breaks that build under this pin.
 #
-# Caveat on the reproducibility this buys: guest-builder compiles in a
-# `tempfile::tempdir()` scratch workspace, outside this file's directory
-# search. It inherits the pin only because rustup exports RUSTUP_TOOLCHAIN to
-# proxied children — `ops/wasm-repro-check.sh` runs `target/debug/guest-builder`
-# directly rather than through `cargo run`, so that is the one path where the
-# scratch build can escape this pin if rustup is not in its ancestry.
+# guest-builder compiles in a scratch workspace under target/ by default,
+# inside this file's directory search. A `--scratch` elsewhere (the mac smoke
+# workflow's runner temp) inherits the pin only because rustup exports
+# RUSTUP_TOOLCHAIN to proxied children, i.e. while guest-builder runs through
+# `cargo run`.
 [toolchain]
 channel = "1.96.1"
 components = ["rustfmt", "clippy"]

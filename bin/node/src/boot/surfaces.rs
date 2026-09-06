@@ -172,12 +172,12 @@ pub(crate) fn bind(config: BindConfig<'_>) -> Result<Surfaces, Box<dyn std::erro
     // /v1/index/* lanes light up through the handle below. an open failure
     // is fatal-with-remedy rather than a silent no-index run: the tier is
     // rebuildable, so the fix is always "delete <storage>/index". opened
-    // BARE over the genesis set: the index guests are the network's, carried
-    // by its genesis, and a joiner fetches that off the mesh after these
+    // BARE before hydration: the module set and index guests are the
+    // network's, carried by its genesis, which a joiner fetches after these
     // surfaces are up — the boot's genesis hydration
     // (`host_state::hydrate_genesis`) converges them. a module the registry
     // admitted after genesis gets its database when the host composes.
-    let index = noded::open_index_store(storage, topology::PRODUCTION)?;
+    let index = noded::open_index_store::<&str>(storage, &[])?;
     // this node's operator credential: minted fresh each boot and written 0600
     // beside node.toml, exactly like the service link token. Minted on EVERY
     // boot, `DUCKTAPE_ADMIN=off` included — it is no longer the admin

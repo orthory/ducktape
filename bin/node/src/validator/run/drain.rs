@@ -341,7 +341,7 @@ impl ValidatorRuntime<'_> {
                 height,
                 record,
                 &dispatches,
-                &node.host().module_roots(),
+                node.host(),
             );
         }
         for d in drained {
@@ -1449,6 +1449,7 @@ impl ValidatorRuntime<'_> {
             signer,
             label,
             code_signaller,
+            index,
             blob_client,
             blobs,
             fetch_done_tx,
@@ -1519,9 +1520,11 @@ impl ValidatorRuntime<'_> {
             let Some(bytes) = blobs.get_chunk(digest) else {
                 return CodeVerdict::Absent;
             };
-            let realizable = wasm_host::WasmModule::declared_shape(&bytes)
-                .map_err(|e| e.to_string())
-                .and_then(|shape| noded::compose::check_realizable(module_id, &shape));
+            let realizable = noded::compose::validate_deployment(module_id, &bytes, index)
+                .and_then(|()| {
+                    node.check_module_replacement(module_id, &bytes)
+                        .map_err(|error| error.to_string())
+                });
             match realizable {
                 Ok(()) => CodeVerdict::Loadable,
                 // the first line only: a wasmtime error carries a multi-line

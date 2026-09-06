@@ -1,6 +1,6 @@
 //! the wasm port of this module, built the ADAPTER way:
 //! the NATIVE `saga` crate is compiled to wasm32 unmodified and adapted to
-//! the `ducktape:module` world through `guest-adapter`, so the module's logic
+//! the `ducktape:module` world through `ducktape-module-sdk`, so the module's logic
 //! is single-sourced (a behavior change in the native crate IS the wasm
 //! change).
 //!
@@ -60,14 +60,14 @@ const MODULE_ID: &str = "saga";
 const VALSET_ID: &str = "valset";
 const CAPABILITY_ID: &str = "capability";
 
-use guest_adapter::WitStore;
+use ducktape_module_sdk::WitStore;
 
 // store-backed port: no snapshot — the host owns the real qmdb store and the
-// module is rebuilt fresh per dispatch (see `guest_adapter::store_guest!`).
-guest_adapter::store_guest! {
+// module is rebuilt fresh per dispatch (see `ducktape_module_sdk::store_guest!`).
+ducktape_module_sdk::store_guest! {
     id: MODULE_ID,
     module: SagaModule,
-    shape: guest_adapter::store_shape(),
+    shape: ducktape_module_sdk::store_shape(),
     new: SagaModule::with_assignment(
         MODULE_ID,
         Box::new(WitStore),
