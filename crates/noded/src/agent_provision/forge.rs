@@ -269,6 +269,11 @@ fn run_git_program(
 /// could traverse (`..`), read as a git flag (leading `-`), or escape the
 /// repo base. consensus already normalized these (norm_repo/norm_branch/hex
 /// oids), so a failure here means a corrupt envelope, not a policy gate.
+///
+/// the branch check carries a SECOND wall (#1836): every run-owned push
+/// target lives under `agent/` — a composer that ever named anything else
+/// (a PR's own, attacker-chosen source branch included) would be a defect
+/// this refusal catches before a single git command runs.
 fn validate_coords(repo: &str, commit: &str, branch: &str) -> Result<(), String> {
     let repo_ok = !repo.is_empty()
         && repo != "."
@@ -285,15 +290,21 @@ fn validate_coords(repo: &str, commit: &str, branch: &str) -> Result<(), String>
             "forge pinned commit {commit:?} is not a 40-hex sha1 oid"
         ));
     }
-    let branch_ok = !branch.is_empty()
+    let branch_is_safe = !branch.is_empty()
         && !branch.starts_with('-')
         && !branch.starts_with('/')
         && branch
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'));
-    if !branch_ok {
+    if !branch_is_safe {
         return Err(format!(
             "forge work branch {branch:?} is not a safe branch name"
+        ));
+    }
+    let branch_is_agent_scoped = branch.starts_with("agent/") && branch.len() > "agent/".len();
+    if !branch_is_agent_scoped {
+        return Err(format!(
+            "forge work branch {branch:?} is outside the agent/ namespace"
         ));
     }
     Ok(())

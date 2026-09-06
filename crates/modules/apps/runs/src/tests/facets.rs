@@ -2,8 +2,38 @@ use super::*;
 
 // ---- faceted delivery -------------------------------------------------------
 
+/// the canonical PR sink `forge_wrapper`'s tests echo — repo `app`,
+/// `agent/x` onto `main`. real dispatch composes the requested sink INTO
+/// `PendingState` at stage time (#1835); a fixture built via a plain "general"
+/// chat channel commits `Chain` instead (no forge trigger), so anything
+/// exercising `emit_sink`'s OWN gates via an echoed PR sink must commit a
+/// matching one first — see [`commit_sink`].
+fn canonical_forge_sink() -> WireSink {
+    WireSink::Pr {
+        repo: "app".into(),
+        source_branch: "agent/x".into(),
+        target_branch: "main".into(),
+        title: String::new(),
+        body: String::new(),
+    }
+}
+
+/// commit `sink` into a pending fixture run directly — mirrors what a real
+/// forge/dispatch compose would have committed at stage time (#1835): the
+/// dispatch-commitment gate compares an echoed result sink against exactly
+/// this field, so a fixture testing `emit_sink`'s OWN gates (forge_push,
+/// branch state, duplicate-PR, …) must commit the SAME sink its `RunnerResult`
+/// later echoes.
+fn commit_sink(m: &mut RunsModule, run_id: &str, sink: WireSink) {
+    m.pending
+        .get_mut(&dispatch_id_for(run_id))
+        .expect("pending fixture run")
+        .sink = sink;
+}
+
 /// a module wired with the forge sink, one watch on "general", one engaged
-/// run for agent "bot" at seq 2.
+/// run for agent "bot" at seq 2, with the canonical PR sink committed
+/// (#1835) so a test's echoed `forge_wrapper`/inline PR sink is accepted.
 fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
     let mut m = module().with_sink_forge("forge");
     let mut ctx = CaptureCtx::new()
@@ -21,7 +51,9 @@ fn awaiting_run_with_forge(registry: &Registry) -> (RunsModule, String) {
     commit(&mut m);
     engage_post(&mut m, registry, 2, &[]);
     commit(&mut m);
-    (m, run_id_for("general", 2, "bot"))
+    let run_id = run_id_for("general", 2, "bot");
+    commit_sink(&mut m, &run_id, canonical_forge_sink());
+    (m, run_id)
 }
 
 #[test]
@@ -162,6 +194,20 @@ fn pr_sink_emits_open_pr_only_with_the_forge_push_cap() {
 fn pr_sink_with_empty_required_fields_degrades_without_emitting_forge_op() {
     let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
     let (mut m, run_id) = awaiting_run_with_forge(&registry);
+    // this echo's repo/target_branch differ from the canonical committed
+    // sink — re-commit a matching (equally malformed) one so the test
+    // exercises `emit_sink`'s OWN incomplete-sink gate, not #1835's.
+    commit_sink(
+        &mut m,
+        &run_id,
+        WireSink::Pr {
+            repo: String::new(),
+            source_branch: "agent/x".into(),
+            target_branch: String::new(),
+            title: String::new(),
+            body: String::new(),
+        },
+    );
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -302,6 +348,20 @@ fn pr_sink_with_source_equal_to_target_degrades_without_aborting() {
     // forge rejects an OpenPr whose source and target are the same branch —
     // degrade with a breadcrumb, never emit the aborting op.
     let (mut m, granted, run_id) = forge_push_run();
+    // this echo's target_branch differs from the canonical committed sink's
+    // ("main") — re-commit a matching one so the test exercises
+    // `emit_sink`'s OWN source==target gate, not #1835's.
+    commit_sink(
+        &mut m,
+        &run_id,
+        WireSink::Pr {
+            repo: "app".into(),
+            source_branch: "agent/x".into(),
+            target_branch: "agent/x".into(),
+            title: String::new(),
+            body: String::new(),
+        },
+    );
     let mut ctx = CaptureCtx::new()
         .at(8)
         .with_dispatch_origin()
@@ -329,6 +389,106 @@ fn pr_sink_with_source_equal_to_target_degrades_without_aborting() {
             "run {run_id} pr sink skipped: source and target are the same branch"
         )),
         "the breadcrumb names the malformed pair: {:?}",
+        breadcrumbs(&ctx)
+    );
+    assert_eq!(
+        ctx.chat_msgs().len(),
+        1,
+        "the run still delivers its message"
+    );
+}
+
+#[test]
+fn an_echoed_pr_sink_on_a_chain_run_is_refused() {
+    // #1835: the run's dispatch committed NO sink (a plain chat trigger
+    // requests Chain) — an executing node cannot manufacture a PR sink
+    // after the fact by echoing one in its result. delivered as chain, with
+    // the reason in the breadcrumb; the message still delivers normally.
+    let (mut m, registry, run_id) = awaiting_run(&[ACTION_CHAT_POST]);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&registry)
+        .with_transcript("general", transcript(2));
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(runner_wrapper(
+                "done",
+                serde_json::json!({
+                    "sink": {
+                        "mode": "pr",
+                        "repo": "infra",
+                        "source_branch": "release-1.2",
+                        "target_branch": "main",
+                        "title": "",
+                    }
+                }),
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.msgs.iter().all(|m| m.target != "forge"),
+        "an echoed sink that was never committed at dispatch must never open a PR"
+    );
+    assert!(
+        breadcrumbs(&ctx)
+            .iter()
+            .any(|note| note.contains(&format!("run {run_id} sink_mismatch"))),
+        "the breadcrumb names the mismatch: {:?}",
+        breadcrumbs(&ctx)
+    );
+    assert_eq!(
+        ctx.chat_msgs().len(),
+        1,
+        "the run still delivers its message, just with the sink refused"
+    );
+}
+
+#[test]
+fn a_receipt_whose_output_commit_is_not_the_branch_tip_is_refused() {
+    // #1835: a receipt cannot name a commit the push lane never landed —
+    // `output_commit` must equal forge's COMMITTED tip of the source
+    // branch, not merely be a well-formed oid.
+    let (mut m, granted, run_id) = forge_push_run();
+    let stale_oid = "1a".repeat(20);
+    let real_tip = "2b".repeat(20);
+    let mut ctx = CaptureCtx::new()
+        .at(8)
+        .with_dispatch_origin()
+        .with_registry(&granted)
+        .with_transcript("general", transcript(2))
+        // the branch IS born, but its committed tip differs from the
+        // receipt's claimed output_commit.
+        .with_forge_tip("app", "agent/x", &real_tip)
+        .with_forge_ref("app", "main");
+    exec(
+        &mut m,
+        &mut ctx,
+        &result_event(
+            &run_id,
+            Ok(forge_wrapper(
+                "done",
+                Some("agent/x"),
+                Some(&stale_oid),
+                false,
+                None,
+            )),
+        ),
+    )
+    .unwrap();
+    assert!(
+        ctx.msgs.iter().all(|m| m.target != "forge"),
+        "a receipt naming a commit that is not the branch's committed tip must never open a PR"
+    );
+    assert!(
+        breadcrumbs(&ctx).contains(&format!(
+            "run {run_id} pr sink skipped: output_commit is not forge's committed tip of agent/x"
+        )),
+        "the breadcrumb names the tip mismatch: {:?}",
         breadcrumbs(&ctx)
     );
     assert_eq!(
