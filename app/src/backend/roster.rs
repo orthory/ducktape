@@ -82,22 +82,7 @@ pub(crate) async fn read_accounts(client: &RpcClient) -> Result<Vec<AccountView>
 /// The directory an account list binds: every key of an account resolves to
 /// that account — its number and its name.
 pub(crate) fn directory_of(accounts: &[AccountView]) -> NameDirectory {
-    NameDirectory::new(
-        accounts
-            .iter()
-            .flat_map(|account| {
-                account.keys.iter().map(move |key| {
-                    (
-                        hex_encode(&key.pubkey),
-                        BoundAccount {
-                            number: account.number,
-                            name: account.name.clone(),
-                        },
-                    )
-                })
-            })
-            .collect(),
-    )
+    NameDirectory::from_accounts(accounts)
 }
 
 /// A test's directory, seated the way a roster read seats it.
@@ -108,17 +93,18 @@ pub(crate) fn seed_names(directory: NameDirectory) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = directory;
 }
 
-/// Whether `me` (a key hex) holds a seat among `members`: their own key, or
-/// any key of the account it is bound to — a member seated with their passkey
-/// is seated on their device too. Reads the directory as last read, the way
-/// the optimistic mint does; a cold directory answers by key alone.
+/// Whether the account or exact key represented by `me` holds a seat.
 pub(crate) fn seated_in(members: &[ChatMember], me: &str) -> bool {
+    let Ok(key) = hex_decode(me) else {
+        return false;
+    };
     let names = names();
-    let my_account = names.account_of(me);
     members.iter().any(|member| {
-        let same_key = member.key == me;
-        let same_account = my_account.is_some() && names.account_of(&member.key) == my_account;
-        same_key || same_account
+        let handle = match member.key.starts_with("acct:") || member.key.starts_with("user:") {
+            true => member.key.clone(),
+            false => format!("user:{}", member.key),
+        };
+        names.owns_handle(&handle, &key)
     })
 }
 

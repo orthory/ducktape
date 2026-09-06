@@ -520,10 +520,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                 },
             )?;
         }
-        ChatMsg::CreateDmChannel {
-            counterpart: _,
-            name,
-        } => {
+        ChatMsg::CreateDmChannel { counterpart, name } => {
             let ChatAssigned::DmChannel { channel_id, .. } = decode_stamp(op)? else {
                 return Err(Fail::new(
                     FAIL_ASSIGNED_DECODE,
@@ -533,7 +530,7 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             put_channel(
                 &mut out,
                 &ChannelRow {
-                    id: channel_id,
+                    id: channel_id.clone(),
                     name,
                     created_at: op.time,
                     post_policy: PostPolicy::MembersOnly,
@@ -543,6 +540,17 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
                     huddle: Vec::new(),
                 },
             )?;
+            for handle in [actor.clone(), party_handle(&Party::Account(counterpart))] {
+                index_guest::put(
+                    &mut out,
+                    member_row_key(&channel_id, &handle),
+                    encode_json(&MemberRow {
+                        party: handle,
+                        height: op.height,
+                        time: op.time,
+                    })?,
+                );
+            }
         }
         ChatMsg::RenameChannel { channel_id, name } => {
             let Some(mut row) = read_channel(read, &channel_id)? else {
@@ -833,7 +841,11 @@ pub fn fold_op(op: &OpRow, read: &impl StateRead) -> Result<Writes, Fail> {
             let Some(mut row) = read_channel(read, &channel_id)? else {
                 return Ok(out);
             };
-            let target = party_handle(decode_stamp(op)?.participant().map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?);
+            let target = party_handle(
+                decode_stamp(op)?
+                    .participant()
+                    .map_err(|e| Fail::new(FAIL_ASSIGNED_DECODE, e))?,
+            );
             row.huddle.retain(|m| m.party != target);
             put_channel(&mut out, &row)?;
         }
@@ -1157,7 +1169,8 @@ mod tests {
                     blocks: blocks.clone(),
                 })
             }
-            ChatMsg::SweepHuddle { .. } | ChatMsg::AddReaction { .. }
+            ChatMsg::SweepHuddle { .. }
+            | ChatMsg::AddReaction { .. }
             | ChatMsg::RemoveReaction { .. }
             | ChatMsg::JoinHuddle { .. }
             | ChatMsg::LeaveHuddle { .. } => encode_assigned(&ChatAssigned::Participant {
@@ -1201,6 +1214,40 @@ mod tests {
             ChatViewReply::Hits(hits) => hits,
             other => panic!("expected hits, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dm_creation_seats_the_two_canonical_accounts_in_the_index() {
+        let mut map = Map::new();
+        let channel_id = "dm-1-2".to_owned();
+        let writes = fold_op(
+            &op_with(
+                1,
+                &ChatMsg::CreateDmChannel {
+                    counterpart: 2,
+                    name: "Bob".into(),
+                },
+                encode_assigned(&ChatAssigned::DmChannel {
+                    channel_id: channel_id.clone(),
+                    actor: Party::Account(1),
+                }),
+            ),
+            &map,
+        )
+        .unwrap();
+        apply_to_map(&mut map, writes);
+        for handle in ["acct:1", "acct:2"] {
+            let row: MemberRow = serde_json::from_slice(
+                map.get(member_row_key(&channel_id, handle).as_bytes())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(row.party, handle);
+        }
+        assert_eq!(
+            map.keys().filter(|key| key.starts_with(b"member/")).count(),
+            2
+        );
     }
 
     #[test]
@@ -1273,6 +1320,43 @@ mod tests {
         let message = read_row(&map, &msg_key("g", 1)).unwrap().unwrap();
         assert_eq!(message.author, "acct:7");
         assert_eq!(message.reactions[0].reactors, vec!["acct:7"]);
+    }
+
+    #[test]
+    fn self_sweep_folds_the_actual_historic_participant() {
+        let mut map = Map::new();
+        fold(
+            &mut map,
+            1,
+            &ChatMsg::CreateChannel {
+                channel_id: "g".into(),
+                name: "Room".into(),
+                post_policy: PostPolicy::Open,
+            },
+        );
+        fold(
+            &mut map,
+            2,
+            &ChatMsg::JoinHuddle {
+                channel_id: "g".into(),
+                node: vec![1; 32],
+                node_proof: Vec::new(),
+            },
+        );
+        let sweep = op_with(
+            3,
+            &ChatMsg::SweepHuddle {
+                channel_id: "g".into(),
+                party: Party::Account(7),
+            },
+            encode_assigned(&ChatAssigned::Participant {
+                actor: Party::Account(7),
+                participant: Party::Key(b"jess".to_vec()),
+            }),
+        );
+        let writes = fold_op(&sweep, &map).unwrap();
+        apply_to_map(&mut map, writes);
+        assert!(read_channel(&map, "g").unwrap().unwrap().huddle.is_empty());
     }
 
     #[test]

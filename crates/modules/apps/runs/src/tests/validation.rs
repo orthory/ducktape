@@ -74,7 +74,14 @@ fn responses_beyond_the_agents_grants_fail_the_run() {
 fn task_actions_without_a_configured_tasks_module_fail_the_run() {
     let registry = registry(&[("bot", &[ACTION_CHAT_POST, ACTION_TASKS_CREATE])]);
     let mut m = RunsModule::new(
-        "runs", "chat", "saga", "attribution", "dispatch", "agent", None, None,
+        "runs",
+        "chat",
+        "saga",
+        "attribution",
+        "dispatch",
+        "agent",
+        None,
+        None,
     );
     m.models = registry.clone();
     commit(&mut m);
@@ -470,7 +477,6 @@ fn a_failed_dispatch_outcome_posts_a_threaded_failure_reply_and_prunes_the_entry
                 "⚠ BOT failed: worker exploded stack line two"
             )],
             thread: Some(1),
-
         }],
         "one threaded ⚠ reply, authored as the agent"
     );

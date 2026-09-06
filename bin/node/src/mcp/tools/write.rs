@@ -1,39 +1,7 @@
-//! the write plane: the things an agent may do — now provable, and enforced
-//! where it counts.
-//!
-//! ## every write is one signed action
-//!
-//! each tool here builds exactly one `runs::AgentAction`, hands it to
-//! [`Run::act`], and reports what came back. `act` signs a
-//! `RunsMsg::AgentAction` with this run's session key and submits it as an op
-//! frame; the runs module then decides, ON EVERY VALIDATOR, whether the agent
-//! was allowed to do it.
-//!
-//! there is deliberately NO permission check in this file. the gate lives in
-//! consensus, in `runs`, reusing the same validator the response path uses —
-//! one definition of "what an agent may do", checked in one place. a courtesy
-//! pre-check here would be a second implementation of that rule, and the two
-//! would eventually disagree. when they disagreed, the one that mattered would
-//! be the other one.
-//!
-//! ## what the session key buys
-//!
-//! a frame's origin is its VERIFIED public key. so an `AgentAction` op is proof
-//! that this agent's run made it: consensus can (and does) check that the origin
-//! is the session key bound to this run, that the run is still in flight, and
-//! that the action fits the agent's committed grant. the write then lands as a
-//! MODULE-origin effect, which is what earns it `AuthorRef::Agent` attribution —
-//! chat and pages only accept `as_agent` from a module.
-//!
-//! none of that is available on the frameless lane, where the caller's origin is
-//! discarded and the op is re-signed by the node (see `node`'s module doc). that
-//! is why this file has no `submit` calls in it at all.
-//!
-//! ## the action vocabulary is the grant vocabulary
-//!
-//! the tools map one-for-one onto `runs::KNOWN_ACTIONS`. the tool plane must
-//! never become a second, wider set of powers than the one an owner can read off
-//! the agent's record and reason about.
+//! Each write tool proposes one action through its run's scoped host endpoint.
+//! Runs validates the session, lease and model grant. The account's program
+//! executes the prepared target message, and the endpoint waits for its committed
+//! outcome before returning. The private session signer stays on the host.
 
 use serde_json::{Value, json};
 

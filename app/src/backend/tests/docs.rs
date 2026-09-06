@@ -261,6 +261,7 @@ fn block_moves_follow_visible_sibling_order() {
         id: id.into(),
         parent: parent.map(str::to_string),
         page: "page".into(),
+        author: pages::Party::System,
         kind,
         text: id.into(),
         marks: Vec::new(),
@@ -377,6 +378,7 @@ async fn a_pages_text_op_folds_and_a_structural_one_reloads() {
 fn a_page_search_hit_names_the_page_it_came_from() {
     let row = |page_id: &str, text: &str| pages::index::PageBlockRow {
         block_id: format!("block-{text}"),
+        author: pages::Party::System,
         page_id: page_id.into(),
         parent: Some(page_id.into()),
         kind: BlockKind::Paragraph,

@@ -333,6 +333,7 @@ pub struct Forge {
     /// where issue/PR discussion-channel follow-ups go (`emit_msg` target).
     /// `None` (tests / minimal deployments without chat) emits nothing.
     chat_target: Option<String>,
+    attribution_target: Option<String>,
     /// this network's chain id — the wasm tenant's genesis-config twin
     /// (`crate::guest`'s `shape().config`, #1773). empty for a native `Forge`
     /// that never carries a push certificate (every unit test but the
@@ -463,6 +464,7 @@ impl Forge {
                 staged_tracker: None,
             },
             chat_target: None,
+            attribution_target: None,
             chain_id: String::new(),
             snapshot_cache: std::cell::RefCell::new(None),
         };
@@ -479,8 +481,14 @@ impl Forge {
         self
     }
 
+    /// publish source relationships in the same unit as the accepted mutation.
+    pub fn with_attribution(mut self, target: impl Into<String>) -> Self {
+        self.attribution_target = Some(target.into());
+        self
+    }
+
     /// this network's chain id — the genesis-config parameter a push
-    /// certificate's nonce is checked against (`pushcert::signer`, #1773).
+    /// certificate's nonce is checked against (`pushcert::signer`).
     pub fn with_chain_id(mut self, chain_id: impl Into<String>) -> Self {
         self.chain_id = chain_id.into();
         self
@@ -980,6 +988,7 @@ impl Module for Forge {
                 ctx,
                 &msg.payload,
                 self.chat_target.as_deref(),
+                self.attribution_target.as_deref(),
                 &self.chain_id,
             )
             .await
@@ -1752,6 +1761,7 @@ mod tests {
             Ok(identity::encode_reply(&IdentityReply::Account(Some(
                 identity::AccountView {
                     number,
+                    control: identity::Control::Keys,
                     name: "acct".into(),
                     keys: Vec::new(),
                     avatar: None,
@@ -2926,7 +2936,7 @@ mod tests {
         };
 
         // the pre-consensus probe and the system origin are refused; a MODULE
-        // is an authenticated principal and is not (see `author_from_origin`).
+        // is authenticated and is allowed as a tracker author.
         for origin in [sdk::Origin::External(Vec::new()), sdk::Origin::System] {
             let mut probe = ctx_with_origin(2, origin.clone());
             assert!(
@@ -3320,7 +3330,7 @@ mod tests {
         let mut forge = Forge::init("forge", base.clone()).unwrap();
         let mut tracker = Tracker::default();
         assert!(tracker.is_empty());
-        tracker.claim_owner("demo", vec![4u8; 32]);
+        tracker.claim_owner("demo", chat::Party::Key(vec![4u8; 32]));
         assert!(
             !tracker.is_empty(),
             "an owner alone makes the tracker non-empty"
@@ -3342,7 +3352,7 @@ mod tests {
         let reopened = Forge::init("forge", base.clone()).unwrap();
         assert_eq!(
             reopened.state.tracker.owner("demo"),
-            Some(user_key(1).as_slice()),
+            Some(&chat::Party::Key(user_key(1))),
             "the owner is re-adopted from the persisted tracker"
         );
         let _ = std::fs::remove_dir_all(&base);

@@ -209,11 +209,7 @@ pub async fn files_preview(
 }
 
 /// The text preview: the first 64 KiB, branded binary on a control byte.
-async fn files_text(
-    rpc: &RpcClient,
-    path: String,
-    generation: i64,
-) -> Result<FsPreview, String> {
+async fn files_text(rpc: &RpcClient, path: String, generation: i64) -> Result<FsPreview, String> {
     let reply = rpc
         .files_get("read", &[("path", path.as_str()), ("len", "65536")])
         .await?;
@@ -293,7 +289,11 @@ pub(crate) async fn files_read_all(rpc: &RpcClient, path: &str) -> Result<Option
         let reply = rpc
             .files_get(
                 "read",
-                &[("path", path), ("offset", offset.as_str()), ("len", page_len.as_str())],
+                &[
+                    ("path", path),
+                    ("offset", offset.as_str()),
+                    ("len", page_len.as_str()),
+                ],
             )
             .await?;
         let page = base64_decode(reply["b64"].as_str().unwrap_or_default()).unwrap_or_default();
@@ -601,21 +601,24 @@ pub fn fs_child(path: String, name: String) -> String {
     format!("{dir}/{name}")
 }
 
-/// Why the viewer may not write an entry under `dir`, in the MODULE's own
-/// words — empty when she may. This is `check_authority`, the rule the files
-/// module runs on every change, asked before the round trip with the owner
-/// spelled the way a signed frame's origin spells it (`ext:<key>`); the app
-/// never grows a second reading of which paths are whose. A device with no
-/// key has nothing to sign with, and the signer says so when it is asked.
+/// Preview the files module's authority rule using the cached account and
+/// actual signing key. The module resolves identity again when the write lands.
 pub fn files_write_gate(dir: String, me: String) -> String {
     if me.is_empty() {
         return String::new();
     }
-    let owner = format!("ext:{me}");
+    let key = match public_key(&me, "user key") {
+        Ok(key) => key,
+        Err(reason) => return reason,
+    };
+    let authority = duckfs_core::Authority::External {
+        key,
+        account: names().account_of(&me),
+    };
     let entry = fs_child(dir, "entry".into());
-    let authority = duckfs_core::paths::canonical(&entry)
-        .and_then(|segments| duckfs_core::paths::check_authority(&owner, &segments));
-    match authority {
+    let checked = duckfs_core::paths::canonical(&entry)
+        .and_then(|segments| duckfs_core::paths::check_authority(&authority, &segments));
+    match checked {
         Ok(()) => String::new(),
         Err(reason) => reason.trim_start_matches("files: ").to_string(),
     }

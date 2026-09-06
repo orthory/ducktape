@@ -115,8 +115,54 @@ fn spawn_session_actor(
                         .push(runs::decode_msg(&payload).expect("a runs op"));
                     let _ = reply.send(bind.map(|()| committed_block()).map_err(Into::into));
                 }
-                NodeCommand::Query { req, reply, .. } => {
-                    let _ = reply.send(files_reply(&BTreeMap::new(), false, &req));
+                NodeCommand::Query {
+                    target, req, reply, ..
+                } => {
+                    let result = if target == "runs" {
+                        let result = match runs::decode_query(&req).unwrap() {
+                            runs::RunsQuery::AgentSessions => {
+                                runs::RunsReply::AgentSessions(vec![runs::AgentSession {
+                                    run_id: consensus_run_id(),
+                                    agent_id: "quackbot".into(),
+                                    session_key: Vec::new(),
+                                    holder: Vec::new(),
+                                    opened_at: 0,
+                                    actions: 0,
+                                }])
+                            }
+                            runs::RunsQuery::ActionRequest { request_id } => {
+                                assert_eq!(
+                                    seen_actions.lock().unwrap().len(),
+                                    1,
+                                    "receipt follows admitted action"
+                                );
+                                runs::RunsReply::ActionRequest(Some(runs::ActionRequestView {
+                                    request_id,
+                                    account: 2,
+                                    generation: 0,
+                                    run_id: consensus_run_id(),
+                                    target: "tasks".into(),
+                                    payload: serde_json::Value::Null,
+                                    status: runs::ActionStatus::Completed {
+                                        call: sdk::CallId {
+                                            requester: "agent".into(),
+                                            invocation: "2/1".into(),
+                                            step: 1,
+                                        },
+                                        outcome: dispatch::CallOutcomeSummary::Applied {
+                                            output_digest: [0; 32],
+                                            assigned: Vec::new(),
+                                        },
+                                    },
+                                }))
+                            }
+                            query => panic!("unexpected session query {query:?}"),
+                        };
+                        Ok(runs::encode_reply(&result))
+                    } else {
+                        files_reply(&BTreeMap::new(), false, &req)
+                    };
+                    let _ = reply.send(result);
                 }
                 NodeCommand::SubmitFrame { frame, reply } => {
                     let (origin, msg) = node::decode_frame(&frame).expect("a valid action frame");

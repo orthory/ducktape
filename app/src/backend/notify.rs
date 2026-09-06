@@ -230,31 +230,14 @@ fn active_channel() -> String {
 /// arrival. Everything this reads is either in the op or in a warm cache — no
 /// query runs here, for the reason the decoder's other reads are cached
 /// (a `/v1/query` inside the fold freezes every subscriber).
-pub(crate) fn notify_chat_op(payload: &[u8], origin_id: Option<&str>, names: &NameDirectory) {
-    let Ok(::chat::ChatMsg::PostMessage {
-        channel_id, blocks, ..
-    }) = ::chat::decode_msg(payload)
-    else {
-        return;
-    };
-    let Some(author_key) = origin_id else {
-        return;
-    };
+pub(crate) fn notify_chat_op(
+    payload: &[u8],
+    assigned: Option<&serde_json::Value>,
+    names: &NameDirectory,
+) {
     let me = rpc::cached_user_key();
-    let my_keys = me
-        .as_deref()
-        .map(|key| names.account_keys_of(key))
-        .unwrap_or_default();
-    let arrival = Arrival {
-        room: room_name(&channel_id),
-        in_my_dm: in_my_dm(&channel_id),
-        channel_id,
-        author: ::chat::client::author_display(&format!("user:{author_key}"), names),
-        body: ::chat::client::message_body(&blocks),
-        mentions_me: ::chat::client::mentions_reach(&blocks, &my_keys),
-        authored_by_me: me
-            .as_deref()
-            .is_some_and(|key| hex_encode(key).eq_ignore_ascii_case(author_key)),
+    let Some(arrival) = chat_arrival(payload, assigned, names, me.as_deref()) else {
+        return;
     };
     let screen = OnScreen {
         app_focused: platform::app_is_frontmost(),
@@ -264,6 +247,35 @@ pub(crate) fn notify_chat_op(payload: &[u8], origin_id: Option<&str>, names: &Na
         return;
     };
     platform::post(&notice);
+}
+
+/// Notification identity comes from the source's canonical post assignment,
+/// including its account-resolved mentions, just like the settled timeline.
+pub(crate) fn chat_arrival(
+    payload: &[u8],
+    assigned: Option<&serde_json::Value>,
+    names: &NameDirectory,
+    me: Option<&[u8]>,
+) -> Option<Arrival> {
+    let ::chat::ChatMsg::PostMessage { channel_id, .. } = ::chat::decode_msg(payload).ok()? else {
+        return None;
+    };
+    let ::chat::ChatAssigned::Posted { actor, blocks, .. } =
+        serde_json::from_value(assigned?.clone()).ok()?
+    else {
+        return None;
+    };
+    let handle = ::chat::index::party_handle(&actor);
+    let parties = me.map(|key| names.parties_of(key)).unwrap_or_default();
+    Some(Arrival {
+        room: room_name(&channel_id),
+        in_my_dm: in_my_dm(&channel_id),
+        channel_id,
+        author: ::chat::client::author_display(&handle, names),
+        body: ::chat::client::message_body(&blocks),
+        mentions_me: ::chat::client::mentions_reach(&blocks, &parties),
+        authored_by_me: me.is_some_and(|key| names.owns_handle(&handle, key)),
+    })
 }
 
 // ============================================================================
@@ -380,6 +392,75 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_uses_canonical_program_author_and_account_mentions() {
+        let key = [7; 32];
+        let names = NameDirectory::from_accounts(&[
+            identity::AccountView {
+                number: 1,
+                name: "Reader".into(),
+                control: identity::Control::Keys,
+                keys: vec![identity::KeyView {
+                    scheme: identity::KeyScheme::Ed25519,
+                    pubkey: key.to_vec(),
+                    label: None,
+                    added_at: 0,
+                }],
+                avatar: None,
+                bio: None,
+                updated_at: 0,
+            },
+            identity::AccountView {
+                number: 2,
+                name: "Reporter".into(),
+                control: identity::Control::Program {
+                    controller: 1,
+                    executor: "agent".into(),
+                    generation: 0,
+                    standing: identity::ProgramStanding::Active,
+                },
+                keys: Vec::new(),
+                avatar: None,
+                bio: None,
+                updated_at: 0,
+            },
+        ]);
+        let payload = ::chat::encode_msg(&::chat::ChatMsg::PostMessage {
+            channel_id: "notifications-test".into(),
+            message_id: "m".into(),
+            blocks: vec![::chat::Block::paragraph("unresolved input")],
+            thread: None,
+        });
+        let blocks = vec![::chat::Block::Paragraph(vec![::chat::Span {
+            text: "Hello Reader".into(),
+            marks: vec![::chat::Mark::Mention(::chat::Party::Account(1))],
+        }])];
+        let assigned = serde_json::to_value(::chat::ChatAssigned::Posted {
+            seq: 1,
+            actor: ::chat::Party::Account(2),
+            blocks: blocks.clone(),
+        })
+        .unwrap();
+        let arrival = chat_arrival(&payload, Some(&assigned), &names, Some(&key)).unwrap();
+        assert_eq!(arrival.author, "Reporter");
+        assert_eq!(arrival.body, "Hello Reader");
+        assert!(arrival.mentions_me);
+        assert!(!arrival.authored_by_me);
+        assert!(chat_arrival(&payload, None, &names, Some(&key)).is_none());
+        let mine = serde_json::to_value(::chat::ChatAssigned::Posted {
+            seq: 2,
+            actor: ::chat::Party::Account(1),
+            blocks,
+        })
+        .unwrap();
+        let own = chat_arrival(&payload, Some(&mine), &names, Some(&key)).unwrap();
+        assert!(own.authored_by_me);
+        assert!(
+            notice_reason(&own).is_none(),
+            "the source account is authoritative across devices"
+        );
+    }
 
     fn arrival() -> Arrival {
         Arrival {

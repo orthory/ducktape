@@ -235,7 +235,7 @@ component AgentsScreen(rows:[AgentRow], connected:bool, answered:bool)
           p=22.0
         EmptyPlate
           with
-            message="No agents registered — a registered agent appears here with its capability and grants."
+            message="No model agents configured — models appear here with their capability and grants."
     if connected && !empty(rows)
       scroll #agents-body
         with

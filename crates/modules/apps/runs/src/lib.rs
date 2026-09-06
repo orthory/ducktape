@@ -2,7 +2,7 @@
 mod model;
 pub use model::*;
 mod model_config;
-pub use model_config::{validate_agent_id, MAX_AGENT_ID_LEN};
+pub use model_config::{MAX_AGENT_ID_LEN, validate_agent_id};
 
 mod interface;
 pub use interface::*;
@@ -13,6 +13,7 @@ mod envelope;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use attribution::{Actor, AttributionMsg, ObjectRef, Reason, Relation};
 use chat::{
     Block, ChannelAccess, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
@@ -20,8 +21,8 @@ use chat::{
 };
 use dispatch::{
     DispatchMsg, DispatchQuery, DispatchReply, MAX_PAYLOAD_BYTES, OutputContract, ResultEvent,
-    Routing, decode_reply as dispatch_decode_reply, decode_result_event,
-    encode_msg as dispatch_encode_msg, encode_query as dispatch_encode_query,
+    Routing, decode_reply as dispatch_decode_reply, encode_msg as dispatch_encode_msg,
+    encode_query as dispatch_encode_query,
 };
 use files::{
     Change as FilesChange, Content as FilesContent, EntryInfo, FilesMsg, FilesQuery, FilesReply,
@@ -31,7 +32,6 @@ use files::{
 use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSyncHandle};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use attribution::{AttributionMsg, Actor, ObjectRef, Reason, Relation};
 use tasks::{
     JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, decode_job_event as jobs_decode_event,
     decode_job_reply as jobs_decode_reply, encode_job_msg as jobs_encode_msg,
@@ -203,7 +203,7 @@ pub fn post_message_id(run_id: &str, slot: &str) -> String {
 }
 
 /// the dispatch-plane recipe an agent's runs execute under — registered
-/// (module-owned) by the registry hook in the same block as the agent itself.
+/// owned by runs and registered atomically with its model configuration.
 pub(crate) fn recipe_id_for(agent_id: &str) -> String {
     format!("agent/{agent_id}")
 }
@@ -258,9 +258,12 @@ pub(crate) fn truncate_on_boundary(s: &str, budget: usize, suffix: &str) -> Stri
 
 mod admin;
 mod model_intake;
+use model_intake::ModelChange;
+mod action_requests;
+mod action_storage;
 mod dispatch_flow;
 mod engagement;
-mod action_requests;
+mod receipts;
 mod workflow;
 pub use workflow::model_program;
 mod facets;
@@ -363,14 +366,12 @@ pub struct RunsModule {
     /// dead-letter routing only: a saga callback pointed here by a foreign
     /// trigger's `reply_to` must be swallowed, never abort its block.
     saga: ModuleId,
-    /// the attribution plane — the engagement intake's trusted origin and the
-    /// target of watch subscriptions.
+    /// Source reports and authenticated model workflow triggers.
     attribution: ModuleId,
     /// the dispatch plane — every run's recipe registry, executor, and
     /// lifecycle ledger.
     dispatch: ModuleId,
-    /// the agent registry — the record book this module reads by query, and
-    /// the registry hook's trusted origin.
+    /// Executor of the account's programmable workflow.
     agent: ModuleId,
     tasks: Option<ModuleId>,
     jobs: Option<ModuleId>,
@@ -402,8 +403,7 @@ pub struct RunsModule {
     /// committed state — what `root()` and the root-hash commit to.
     models: BTreeMap<String, ModelRecord>,
     pending_models: BTreeMap<String, Option<ModelRecord>>,
-    action_requests: BTreeMap<String, action_requests::ActionRequest>,
-    pending_action_requests: BTreeMap<String, action_requests::ActionRequest>,
+    receipts: receipts::Receipts,
     next_action_item: u64,
     staged_next_action_item: Option<u64>,
     /// in-flight correlation entries keyed by dispatch id — pruned on
@@ -495,8 +495,7 @@ impl RunsModule {
             chain_id: String::new(),
             models: BTreeMap::new(),
             pending_models: BTreeMap::new(),
-            action_requests: BTreeMap::new(),
-            pending_action_requests: BTreeMap::new(),
+            receipts: receipts::Receipts::default(),
             next_action_item: 0,
             staged_next_action_item: None,
             pending: BTreeMap::new(),
@@ -579,8 +578,6 @@ impl RunsModule {
 
     // ---- staged-over-committed reads ---------------------------------------
 
-
-
     fn pending_entry(&self, dispatch_id: &str) -> Option<&PendingState> {
         match self.pending_overlay.get(dispatch_id) {
             Some(staged) => staged.as_ref(),
@@ -647,7 +644,7 @@ impl RunsModule {
 
     /// admin ops take a non-empty external key or a module as the submitter.
     /// the pre-consensus empty external default and the system origin (which
-    /// any genesis path could wear) never administer watches.
+    /// any genesis path could wear) cannot administer model work.
     fn admin_origin(origin: &Origin) -> Result<RunOrigin, Error> {
         match origin {
             Origin::External(key) if key.is_empty() => Err(Error::Module(
@@ -676,9 +673,15 @@ impl RunsModule {
     /// serialize the COMMITTED continuation state (never the staged overlay)
     /// into the canonical encoding `root()` commits to. deterministic across
     /// nodes.
+    #[cfg(any(test, all(feature = "guest", target_arch = "wasm32")))]
+    fn with_receipt_store(mut self, store: Box<dyn sdk::MerkleStore>) -> Self {
+        self.receipts = receipts::Receipts::hosted(store);
+        self
+    }
+
     pub fn snapshot(&self) -> Vec<u8> {
         encode_committed(
-            &self.action_requests,
+            &self.receipts.snapshot(),
             self.next_action_item,
             &self.pending,
             &self.sessions,
@@ -698,14 +701,20 @@ impl RunsModule {
         let (action_requests, next_action_item, pending, sessions, delegations, models) =
             decode_committed(bytes).map_err(Error::Module)?;
         sdk::verify_snapshot_root(
-            committed_root(&action_requests, next_action_item, &pending, &sessions, &delegations, &models),
+            committed_root(
+                &action_requests,
+                next_action_item,
+                &pending,
+                &sessions,
+                &delegations,
+                &models,
+            ),
             expected,
         )?;
+        self.receipts.install(action_requests)?;
         self.models = models;
         self.pending_models.clear();
-        self.action_requests = action_requests;
         self.next_action_item = next_action_item;
-        self.pending_action_requests.clear();
         self.staged_next_action_item = None;
         self.pending = pending;
         self.sessions = sessions;

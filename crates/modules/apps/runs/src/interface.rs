@@ -131,6 +131,9 @@ pub struct DelegationView {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
+// Messages are decoded one at a time; keeping configuration inline preserves
+// the same direct construction API as the other module operations.
+#[allow(clippy::large_enum_variant)]
 pub enum RunsMsg {
     /// Configure model work for an existing keyless program account.
     ConfigureModel {
@@ -362,7 +365,9 @@ pub enum RunsQuery {
         query: crate::ModelQuery,
     },
     /// Stored proposal data, without querying its program's status.
-    ActionPlan { request_id: String },
+    ActionPlan {
+        request_id: String,
+    },
     ActionRequest {
         request_id: String,
     },
@@ -456,10 +461,14 @@ pub struct ActionRequestView {
 
 /// A caller knows its session slot before admission and can await this exact receipt.
 pub fn action_request_id(run_id: &str, slot: u32) -> String {
-    format!("{run_id}/session/{slot}")
+    format!("session/{}/{slot}", crate::dispatch_id_for(run_id))
 }
 
 /// Stable correlation for a named peer call, including an exact retry.
 pub fn delegation_action_id(run_id: &str, request_id: &str) -> String {
-    format!("{run_id}/delegate/{request_id}")
+    format!(
+        "delegate/{}/{}",
+        crate::dispatch_id_for(run_id),
+        crate::dispatch_id_for(request_id)
+    )
 }

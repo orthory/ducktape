@@ -8,12 +8,12 @@ use iced::futures::StreamExt as _;
 use super::*;
 use crate::{ForgeTab, MembersFilter, MessageAction, ShellTab};
 
-mod review;
-mod repos;
 mod docs;
 mod messages;
-mod status;
+mod repos;
+mod review;
 mod shell;
+mod status;
 mod wire;
 
 fn stage(staged: Vec<ForgeDraftComment>, line: &str, body: &str) -> Vec<ForgeDraftComment> {
@@ -59,7 +59,7 @@ const SEARCH_LANES: &[(&str, &str, &str)] = &[
     (
         "/v1/index/pages/view",
         "pages",
-        r#"{"hits":[{"block_id":"block-1","page_id":"page-1","parent":"page-1","kind":"paragraph","text":"needle in a page","height":1,"time":1}]}"#,
+        r#"{"hits":[{"block_id":"block-1","author":"system","page_id":"page-1","parent":"page-1","kind":"paragraph","text":"needle in a page","height":1,"time":1}]}"#,
     ),
     (
         "list_repos",
@@ -461,7 +461,7 @@ async fn node_with_a_broken_page_list() -> String {
                 true => ("500 Internal Server Error", "pages index unavailable"),
                 false => (
                     "200 OK",
-                    r#"{"hits":[{"block_id":"block-1","page_id":"page-1","parent":"page-1","kind":"paragraph","text":"Tail paragraph after the list","height":1,"time":1}]}"#,
+                    r#"{"hits":[{"block_id":"block-1","author":"system","page_id":"page-1","parent":"page-1","kind":"paragraph","text":"Tail paragraph after the list","height":1,"time":1}]}"#,
                 ),
             };
             let response = format!(

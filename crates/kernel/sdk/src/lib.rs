@@ -269,17 +269,15 @@ pub fn require_non_empty(field: &str, value: &str) -> Result<(), Error> {
 }
 
 /// the field separator inside composite module keys (dispatch keys and saga
-/// ids, tagging scope keys): the ASCII unit separator. rejected inside a
+/// ids, attribution source keys): the ASCII unit separator. rejected inside a
 /// caller-chosen id by [`validate_id`] so a crafted id can never forge another
 /// composite key.
 pub const KEY_SEP: char = '\x1f';
 
 /// validate a caller-chosen id: non-empty, within `max_bytes`, and free of the
 /// reserved [`KEY_SEP`] — the shared guard for keys that compose with
-/// [`KEY_SEP`]. shared by dispatch and tagging. NOT agent's `validate_agent_id`,
-/// which is a deliberately separate DNS-label admission rule (an agent id must
-/// round-trip as `<id>@agents.duck`), kept distinct so neither rule can
-/// silently move the other.
+/// [`KEY_SEP`]. Modules with a narrower identifier vocabulary, such as runs'
+/// model slugs, apply their own admission rule as well.
 pub fn validate_id(field: &str, value: &str, max_bytes: usize) -> Result<(), Error> {
     if value.is_empty() {
         return Err(Error::Module(format!("{field} must be non-empty")));

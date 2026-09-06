@@ -197,7 +197,8 @@ impl RunsModule {
                 holder: session.holder,
             },
             message,
-        )?;
+        )
+        .await?;
         effects.inner.set_output(sdk::wire::encode(
             &serde_json::json!({"request_id": request_id}),
         ));
@@ -304,9 +305,7 @@ impl RunsModule {
                 .map_err(Error::Module)?;
             ctx.emit_msg(msg);
         } else {
-            // MODULE origin, exactly like the settle path's — which is what lets
-            // chat refine `as_agent` into `Party::Agent { module, agent_id }`:
-            // the attribution the frameless lane could not produce at all.
+            // Capture the prepared intent; the account program executes it later.
             self.emit_response(ctx, &run_id, &entry, lane, validated)
                 .await;
         }
@@ -363,9 +362,14 @@ impl RunsModule {
             request_id,
             request,
         });
-        if let Some(existing) = self.action_request(&id) {
-            let exact = existing.view.payload == sdk::wire::decode::<serde_json::Value>(&payload).map_err(Error::Module)?;
-            if !exact { return Err(Error::Module("request_id was already used for a different agent call".into())); }
+        if let Some(existing) = self.action_request(&id).await? {
+            let exact = existing.view.payload
+                == sdk::wire::decode::<serde_json::Value>(&payload).map_err(Error::Module)?;
+            if !exact {
+                return Err(Error::Module(
+                    "request_id was already used for a different agent call".into(),
+                ));
+            }
             ctx.set_output(sdk::wire::encode(&serde_json::json!({"request_id": id})));
             return Ok(());
         }
@@ -379,7 +383,8 @@ impl RunsModule {
                 target: self.id.clone(),
                 payload,
             },
-        )?;
+        )
+        .await?;
         self.pending_sessions.insert(
             run_id,
             Some(AgentSession {

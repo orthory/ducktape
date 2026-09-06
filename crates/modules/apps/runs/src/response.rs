@@ -7,15 +7,15 @@ use files::paths::canonical as canonical_duckfs_path;
 
 use super::facets::{WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of};
 use super::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, ModelRecord, AgentResponse, BTreeSet,
-    Block, ChatMsg, ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus,
-    DispatchMsg, EntryInfo, Error, FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply,
-    MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, Msg,
-    Origin, PendingState, ReplyBlock, ResultEvent, RunsModule, RunOrigin, TaskMsg, TaskQuery,
-    TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg, chat_encode_query,
-    decode_result_event, dispatch_encode_msg, dispatch_id_for, files_decode_reply,
-    files_encode_msg, files_encode_query, page_thread_id, reply_message_id, tasks_decode_reply,
-    tasks_encode_msg, tasks_encode_query,
+    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentResponse, BTreeSet, Block, ChatMsg,
+    ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus, DispatchMsg,
+    EntryInfo, Error, FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply,
+    MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES,
+    ModelRecord, Msg, Origin, PendingState, ReplyBlock, ResultEvent, RunOrigin, RunsModule,
+    TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg,
+    chat_encode_query, dispatch_encode_msg, dispatch_id_for, files_decode_reply, files_encode_msg,
+    files_encode_query, page_thread_id, reply_message_id, tasks_decode_reply, tasks_encode_msg,
+    tasks_encode_query,
 };
 use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
 
@@ -254,12 +254,8 @@ impl RunsModule {
     pub(super) async fn on_result_event(
         &mut self,
         ctx: &mut dyn Ctx,
-        payload: &[u8],
+        event: ResultEvent,
     ) -> Result<(), Error> {
-        let Ok(event) = decode_result_event(payload) else {
-            self.note(ctx, "dropped undecodable dispatch result event".into());
-            return Ok(());
-        };
         let Some(entry) = self.pending_entry(&event.dispatch_id).cloned() else {
             self.note(
                 ctx,
@@ -1019,7 +1015,6 @@ impl RunsModule {
                 text,
                 anchor: None,
                 mentions: Vec::new(),
-
             }),
         })
     }
@@ -1034,13 +1029,28 @@ impl RunsModule {
         channel_id: &str,
         known: &mut BTreeMap<String, bool>,
     ) -> Result<bool, String> {
-        if let Some(answer) = known.get(channel_id) { return Ok(*answer); }
-        let bytes = ctx.query(&self.chat, &chat_encode_query(&ChatQuery::Access {
-            channel_id: channel_id.into(), party: chat::Party::Account(entry.account),
-        })).await.map_err(|error| error.to_string())?;
-        let ChatReply::Access(access) = chat_decode_reply(&bytes).map_err(|error| error.to_string())? else { return Err("unexpected chat access reply".into()); };
+        if let Some(answer) = known.get(channel_id) {
+            return Ok(*answer);
+        }
+        let bytes = ctx
+            .query(
+                &self.chat,
+                &chat_encode_query(&ChatQuery::Access {
+                    channel_id: channel_id.into(),
+                    party: chat::Party::Account(entry.account),
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let ChatReply::Access(access) =
+            chat_decode_reply(&bytes).map_err(|error| error.to_string())?
+        else {
+            return Err("unexpected chat access reply".into());
+        };
         let requester_allowed = match &entry.requester {
-            RunOrigin::External(key) => !key.is_empty() && self.may_post(ctx, key, channel_id).await?,
+            RunOrigin::External(key) => {
+                !key.is_empty() && self.may_post(ctx, key, channel_id).await?
+            }
             RunOrigin::Program(_) | RunOrigin::Module(_) | RunOrigin::System => true,
         };
         let may_post = access.may_post && requester_allowed;
@@ -1293,7 +1303,6 @@ impl RunsModule {
                 message_id: reply_message_id(run_id),
                 blocks: vec![Block::paragraph(text)],
                 thread: entry.thread_root,
-
             }),
         })
     }
@@ -1328,13 +1337,8 @@ impl RunsModule {
         }
     }
 
-    /// hand a VALIDATED response its follow-ups: the chat reply (authored as
-    /// the agent, threaded like its anchor — or, for a run invoked from a page
-    /// comment, a reply IN that comment thread), the agent's own chat posts, and
-    /// the task writes — all drained in this same delivery block (P2, P6). every
-    /// one rides this MODULE's origin, which is what lets chat and pages refine
-    /// `as_agent` into `Party::Agent { module, agent_id }` — authorship no
-    /// external submitter can forge.
+    /// Prepare validated chat, page and task intents. The result/session
+    /// boundary records them for the account's program to execute.
     pub(super) async fn emit_response(
         &self,
         ctx: &mut dyn Ctx,
@@ -1360,7 +1364,6 @@ impl RunsModule {
                         message_id: reply_message_id(run_id),
                         blocks: to_chat_blocks(&response.reply_blocks),
                         thread: entry.thread_root,
-
                     }),
                 });
             }
@@ -1378,7 +1381,6 @@ impl RunsModule {
                         message_id: post_message_id(run_id, &lane.slot(index)),
                         blocks: vec![Block::paragraph(text)],
                         thread,
-
                     }),
                 },
                 AgentAction::CreateTask { task_id, title } => Msg {

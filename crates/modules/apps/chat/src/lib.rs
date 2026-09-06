@@ -915,6 +915,8 @@ impl Chat {
             PostPolicy::MembersOnly,
             created_at,
         )?;
+        self.store(member_key(&channel_id, party), &true);
+        self.store(member_key(&channel_id, &Party::Account(counterpart)), &true);
         self.bump_creator_count(party).await?;
         Ok((channel_id, report))
     }
@@ -1038,6 +1040,8 @@ impl Chat {
         let head = MessageHead {
             message_id: message_id.clone(),
             author,
+            origin: authority.origin.clone(),
+            content_origin: authority.origin.clone(),
             blocks,
             created_at: now,
             rev: 0,
@@ -1101,6 +1105,7 @@ impl Chat {
         self.store(rev_key(channel_id, seq, head.rev), &head);
         let rev = head.rev + 1;
         let new_head = MessageHead {
+            content_origin: authority.origin.clone(),
             blocks,
             rev,
             revision: head
@@ -1385,8 +1390,13 @@ impl Chat {
         }
         let (namespace, preimage) = match &authority.origin {
             Origin::External(key) => (HUDDLE_JOIN_NS, huddle_join_preimage(channel_id, key)),
-            Origin::Program(account) => (PROGRAM_HUDDLE_JOIN_NS, program_huddle_join_preimage(channel_id, *account)),
-            Origin::Module(_) | Origin::System => return Err(Error::Module("only people may join a huddle".into())),
+            Origin::Program(account) => (
+                PROGRAM_HUDDLE_JOIN_NS,
+                program_huddle_join_preimage(channel_id, *account),
+            ),
+            Origin::Module(_) | Origin::System => {
+                return Err(Error::Module("only people may join a huddle".into()));
+            }
         };
         if !keyscheme::KeyScheme::Ed25519.verify(&node, namespace, &preimage, &node_proof) {
             return Err(Error::Module("huddle_node_proof_invalid".into()));
@@ -1464,9 +1474,7 @@ impl Chat {
             return Err(Error::Module("only people may sweep a huddle".into()));
         }
         if target == party {
-            return self
-                .stage_leave_huddle(authority, channel_id)
-                .await;
+            return self.stage_leave_huddle(authority, channel_id).await;
         }
         let mut channel = self.require_channel(channel_id).await?;
         let owns_entry = authority.owns(target);
@@ -1751,7 +1759,11 @@ impl Chat {
                 self.stage_membership(&*ctx, &authority, &channel_id, member_party, member)
                     .await
             }
-            ChatMsg::JoinHuddle { channel_id, node, node_proof } => {
+            ChatMsg::JoinHuddle {
+                channel_id,
+                node,
+                node_proof,
+            } => {
                 let participant = self
                     .stage_join_huddle(&authority, &channel_id, node, node_proof, now)
                     .await?;
@@ -1773,8 +1785,13 @@ impl Chat {
                 channel_id,
                 party: target,
             } => {
-                let participant = self.stage_sweep_huddle(&authority, &channel_id, &target).await?;
-                ctx.set_assigned(encode_assigned(&ChatAssigned::Participant {actor: party.clone(), participant}));
+                let participant = self
+                    .stage_sweep_huddle(&authority, &channel_id, &target)
+                    .await?;
+                ctx.set_assigned(encode_assigned(&ChatAssigned::Participant {
+                    actor: party.clone(),
+                    participant,
+                }));
                 Ok(())
             }
         }

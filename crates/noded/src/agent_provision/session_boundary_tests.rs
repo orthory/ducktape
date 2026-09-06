@@ -29,20 +29,19 @@
 use crate::NodeHandle;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
-use runs::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, ModelMsg};
+use attribution::AttributionModule;
 use capability::CapabilityMsg;
 use chat::{Block, Chat, ChatMsg, Mark, PostPolicy, Span};
 use commonware_runtime::{Runner as _, Supervisor as _};
-use dispatch::DispatchModule;
 use compute_service::{DeliverFn, DispatchPool, SpawnFn};
+use dispatch::DispatchModule;
 use futures::StreamExt as _;
 use host::worker::{WorkOutcome, Worker as _};
 use host::{BlockContext, Host};
+use runs::{ACTION_CHAT_POST, ACTION_TASKS_CREATE, ModelMsg};
 use saga::SagaModule;
 use sdk::{Event, Msg, Origin};
-use tagging::TaggingModule;
 use tasks::Tasks;
 
 use super::plane_tests::{committed_block, files_reply};
@@ -66,6 +65,7 @@ const CHANNEL: &str = "general";
 /// mid-run write.
 struct RecordingProvider {
     seen: Arc<std::sync::Mutex<Option<provider_host::RunContext>>>,
+    ready: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
@@ -73,18 +73,16 @@ impl provider_host::Provider for RecordingProvider {
     fn capability(&self) -> &str {
         CAPABILITY
     }
-    async fn run(
-        &self,
-        _prompt: &str,
-        ctx: &provider_host::RunContext,
-    ) -> Result<String, String> {
+    async fn run(&self, _prompt: &str, ctx: &provider_host::RunContext) -> Result<String, String> {
         *self.seen.lock().unwrap() = Some(ctx.clone());
+        self.ready.notify_one();
         Ok(r#"{"reply_blocks":[],"actions":[]}"#.to_string())
     }
 }
 
 fn provider_set(
     seen: Arc<std::sync::Mutex<Option<provider_host::RunContext>>>,
+    ready: Arc<tokio::sync::Notify>,
 ) -> Arc<provider_host::ProviderSet> {
     let spec = provider_host::CapabilitySpec::parse(
         &format!(
@@ -106,7 +104,7 @@ format = "text"
     .expect("the mock capability spec parses");
     Arc::new(provider_host::ProviderSet::assemble(
         provider_host::SpecSet::from_specs(vec![spec]),
-        vec![Box::new(RecordingProvider { seen })],
+        vec![Box::new(RecordingProvider { seen, ready })],
     ))
 }
 
@@ -119,17 +117,18 @@ fn at(height: u64, origin: Origin) -> BlockContext {
 }
 
 fn alice() -> Origin {
-    Origin::External(b"alice".to_vec())
+    Origin::External(vec![1; 32])
 }
 
-/// the genesis set the collaboration loop runs on — chat + the tagging plane +
+/// the genesis set the collaboration loop runs on — chat + the attribution plane +
 /// the dispatch plane + the registry + runs.
 async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
     let chat = Chat::new(
         "chat",
         Box::new(QmdbStore::init(context.child("chat"), "chat").await),
     )
-    .with_tagging("tagging");
+    .with_identity("identity")
+    .with_attribution("attribution");
     // `Accept`'s standing gate needs a real valset to admit a claim against,
     // and a tagged saga (this run's agent carries `CAPABILITY`) needs the
     // capability registry too — see PR #1738. `WORKER_NODE` is the only node
@@ -147,10 +146,15 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
     valset.finish_seed().await.expect("seed valset");
     Host::genesis(vec![
         Box::new(chat),
-        Box::new(TaggingModule::new(
-            "tagging",
+        Box::new(identity::Identity::new(
+            "identity",
             Box::new(sdk_testkit::MemStore::new()),
+            "session-boundary".into(),
         )),
+        Box::new(
+            AttributionModule::new("attribution", Box::new(sdk_testkit::MemStore::new()))
+                .with_subscribers(["agent"]),
+        ),
         Box::new(valset),
         Box::new(capability::CapabilityRegistry::new(
             "capability",
@@ -167,25 +171,34 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
         Box::new(DispatchModule::new(
             "dispatch",
             "saga",
+            "identity",
             Box::new(sdk_testkit::MemStore::new()),
         )),
-        Box::new(runs::AgentModule::new(
+        Box::new(agent::AgentModule::new(
             "agent",
-            Box::new(QmdbStore::init(context.child("agent"), "agent").await),
-            "saga",
-            Some("runs".into()),
+            Box::new(sdk_testkit::MemStore::new()),
+            agent::Siblings {
+                identity: "identity".into(),
+                attribution: "attribution".into(),
+                dispatch: "dispatch".into(),
+            },
         )),
         Box::new(runs::RunsModule::new(
             "runs",
             "chat",
             "saga",
-            "tagging",
+            "attribution",
             "dispatch",
             "agent",
             Some("tasks".into()),
             Some("tasks".into()),
         )),
-        Box::new(Tasks::new("tasks", Box::new(sdk_testkit::MemStore::new()))),
+        Box::new(Tasks::new(
+            "tasks",
+            "identity",
+            "attribution",
+            Box::new(sdk_testkit::MemStore::new()),
+        )),
     ])
     .expect("genesis")
 }
@@ -194,7 +207,36 @@ async fn genesis(context: commonware_runtime::tokio::Context) -> Host {
 /// pending entry, the dispatch, and its saga trigger, and emits the announcement
 /// event the pool claims.
 async fn mention_run(host: &mut Host) -> Event {
-    let ops: Vec<Msg> = vec![
+    let operations = [
+        Msg {
+            target: "identity".into(),
+            payload: identity::encode_msg(&identity::IdentityMsg::Create {
+                name: "Alice".into(),
+                scheme: identity::KeyScheme::Ed25519,
+            }),
+        },
+        Msg {
+            target: "agent".into(),
+            payload: agent::encode_msg(&agent::AgentMsg::Provision {
+                name: "Quackbot".into(),
+                program: runs::model_program(AGENT),
+            }),
+        },
+        Msg {
+            target: "runs".into(),
+            payload: runs::encode_msg(&runs::RunsMsg::ConfigureModel {
+                operation: ModelMsg::RegisterModel {
+                    account: 2,
+                    agent_id: AGENT.into(),
+                    display_name: "Quackbot".into(),
+                    capability: CAPABILITY.into(),
+                    allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
+                    recipe_hash: None,
+                    caps: None,
+                    skills: None,
+                },
+            }),
+        },
         Msg {
             target: "chat".into(),
             payload: chat::encode_msg(&ChatMsg::CreateChannel {
@@ -204,60 +246,43 @@ async fn mention_run(host: &mut Host) -> Event {
             }),
         },
         Msg {
-            target: "agent".into(),
-            payload: runs::encode_msg(&ModelMsg::RegisterModel {
-                agent_id: AGENT.into(),
-                display_name: "Quackbot".into(),
-                capability: CAPABILITY.into(),
-                allowed_actions: vec![ACTION_CHAT_POST.into(), ACTION_TASKS_CREATE.into()],
-                recipe_hash: None,
-                caps: None,
-                skills: None,
-            }),
-        },
-        Msg {
-            target: "runs".into(),
-            payload: runs::encode_msg(&runs::RunsMsg::WatchChannel {
-                channel_id: CHANNEL.into(),
-                policy: runs::TurnPolicy::Mention,
-            }),
-        },
-        Msg {
             target: "chat".into(),
             payload: chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: CHANNEL.into(),
                 message_id: "m1".into(),
-                blocks: vec![Block::Paragraph(vec![
-                    Span::plain("hey "),
-                    Span {
-                        text: format!("@{AGENT}"),
-                        marks: vec![Mark::Mention(chat::AuthorRef::Agent {
-                            module: "runs".into(),
-                            agent_id: AGENT.into(),
-                        })],
-                    },
-                    Span::plain(" pick this up"),
-                ])],
                 thread: None,
-                as_agent: None,
+                blocks: vec![Block::Paragraph(vec![Span {
+                    text: "Please help".into(),
+                    marks: vec![Mark::Mention(chat::Party::Account(2))],
+                }])],
             }),
         },
     ];
-    let mut last = None;
-    for (i, op) in ops.into_iter().enumerate() {
-        last = Some(
-            host.submit_at(at(i as u64 + 1, alice()), op)
+    let mut height = 0;
+    let mut events = Vec::new();
+    for operation in operations {
+        height += 1;
+        events.extend(
+            host.submit_at(at(height, alice()), operation)
                 .await
-                .expect("setup block"),
+                .unwrap()
+                .events,
         );
     }
-    let mut requests: Vec<Event> = last
-        .expect("the post block")
-        .events
+    while host.has_pending_work().await.unwrap() {
+        height += 1;
+        events.extend(
+            host.submit_block(at(height, Origin::System), Vec::new())
+                .await
+                .unwrap()
+                .events,
+        );
+    }
+    let mut requests: Vec<_> = events
         .into_iter()
-        .filter(|e| saga::decode_worker_request(&e.payload).is_ok())
+        .filter(|event| saga::decode_worker_request(&event.payload).is_ok())
         .collect();
-    assert_eq!(requests.len(), 1, "the post announces exactly one run");
+    assert_eq!(requests.len(), 1);
     requests.remove(0)
 }
 
@@ -317,7 +342,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
         let announce = mention_run(&mut host).await;
         // THE ID CONSENSUS KNOWS. nothing below is allowed to invent it; every
         // assertion measures against this.
-        let run_id = runs::run_id_for(CHANNEL, 1, AGENT);
+        let run_id = pending_runs(&host).await.into_iter().next().unwrap().run_id;
         assert!(
             pending_runs(&host).await.iter().any(|p| p.run_id == run_id),
             "the run is in flight, keyed by the id runs minted"
@@ -326,6 +351,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
         // ---- the real pool, the real provisioner ----------------------------
         let (handle, mut rx, _hub) = NodeHandle::channel();
         let seen = Arc::new(std::sync::Mutex::new(None));
+        let ready = Arc::new(tokio::sync::Notify::new());
         // the pool RETURNS its claim/no-op op to the caller and pushes only the
         // run's terminal result down the deliver lane; the node submits both. we
         // never read the lane — the run's result is another test's subject.
@@ -340,7 +366,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             })
         });
         let pool = DispatchPool::with_limit(
-            provider_set(seen.clone()),
+            provider_set(seen.clone(), ready.clone()),
             WORKER_NODE.to_vec(),
             spawn,
             deliver,
@@ -361,7 +387,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
         // above still saw an empty provider pool and stayed an unassigned
         // announcement.
         host.submit_at(
-            at(5, Origin::External(WORKER_NODE.to_vec())),
+            at(100, Origin::External(WORKER_NODE.to_vec())),
             Msg {
                 target: "capability".into(),
                 payload: capability::encode_msg(&CapabilityMsg::Announce {
@@ -381,7 +407,7 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             other => panic!("the pool must CLAIM a servable announcement, got {other:?}"),
         };
         let assigned: Vec<Event> = host
-            .submit_at(at(6, Origin::External(WORKER_NODE.to_vec())), accept)
+            .submit_at(at(101, Origin::External(WORKER_NODE.to_vec())), accept)
             .await
             .expect("accept block")
             .events
@@ -405,14 +431,11 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
 
         // serve the run's actor traffic until its session bind reaches consensus.
         let bound = loop {
-            let cmd = tokio::time::timeout(Duration::from_secs(10), rx.next())
-                .await
-                .expect("the run makes its actor calls within budget")
-                .expect("the actor lane stays open");
+            let cmd = rx.next().await.expect("the actor lane stays open");
             if let Some(runs::RunsMsg::OpenAgentSession {
                 run_id,
                 session_key,
-            }) = serve(&mut host, 6, cmd).await
+            }) = serve(&mut host, 102, cmd).await
             {
                 break (run_id, session_key);
             }
@@ -445,17 +468,12 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
         // mid-run write name a run that does not exist. the bind is the LAST
         // actor call a provision makes, so the model call is still landing — wait
         // for the context it was handed rather than racing it.
-        let ctx = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let seen = seen.lock().unwrap().clone();
-                if let Some(ctx) = seen {
-                    break ctx;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the provisioned run reaches the provider within budget");
+        ready.notified().await;
+        let ctx = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider context recorded");
         assert_eq!(
             ctx.env.get("DUCKTAPE_RUN_ID").map(String::as_str),
             Some(run_id.as_str()),

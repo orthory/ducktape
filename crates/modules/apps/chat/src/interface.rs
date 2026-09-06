@@ -230,6 +230,12 @@ pub struct Channel {
 pub struct MessageHead {
     pub message_id: String,
     pub author: Party,
+    /// Authenticated origin of the original post. Account resolution never
+    /// erases the exact signing key needed by consumers with key-owned rights.
+    pub origin: sdk::Origin,
+    /// Actual authenticated writer of the current body, updated on edits.
+    /// A consumer executing the content must use this proof for key-only rights.
+    pub content_origin: sdk::Origin,
     pub blocks: Vec<Block>,
     pub created_at: u64,
     /// edit revision; 0 = original post. indexes the immutable content
@@ -535,6 +541,21 @@ pub fn decode_assigned(b: &[u8]) -> Result<ChatAssigned, String> {
     sdk::wire::decode(b)
 }
 
+/// the bytes a `JoinHuddle`'s `node_proof` signs: `channel_id ‖ user`, each
+/// length-prefixed so no delimiter collision lets one field's tail bleed into
+/// the next's head. Signed and verified under [`HUDDLE_JOIN_NS`].
+pub fn huddle_join_preimage(channel_id: &str, user: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    sdk::codec::push_str(&mut out, channel_id);
+    sdk::codec::push_bytes(&mut out, user);
+    out
+}
+
+/// A node's possession proof for an authenticated program account's join.
+pub fn program_huddle_join_preimage(channel_id: &str, account: sdk::AccountNumber) -> Vec<u8> {
+    huddle_join_preimage(channel_id, &account.to_be_bytes())
+}
+
 #[cfg(test)]
 mod interface_tests {
     use super::*;
@@ -568,19 +589,4 @@ mod interface_tests {
         assert_eq!(channel_id, "g");
         assert!(decode_msg(br#"{"post_message":{"channel_id":"g","message_id":"m1","blocks":[],"thread":null,"as_agent":"bot"}}"#).is_err());
     }
-}
-
-/// the bytes a `JoinHuddle`'s `node_proof` signs: `channel_id ‖ user`, each
-/// length-prefixed so no delimiter collision lets one field's tail bleed into
-/// the next's head. Signed and verified under [`HUDDLE_JOIN_NS`].
-pub fn huddle_join_preimage(channel_id: &str, user: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    sdk::codec::push_str(&mut out, channel_id);
-    sdk::codec::push_bytes(&mut out, user);
-    out
-}
-
-/// A node's possession proof for an authenticated program account's join.
-pub fn program_huddle_join_preimage(channel_id: &str, account: sdk::AccountNumber) -> Vec<u8> {
-    huddle_join_preimage(channel_id, &account.to_be_bytes())
 }

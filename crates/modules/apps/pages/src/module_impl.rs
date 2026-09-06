@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// a deleted object whose client-minted id is later reused. Authorship lives in
 /// the source record, so a large subtree needs no extra per-object store reads.
 const SOURCE_REVISION_KEY: &[u8] = b"\0attribution-revision";
+/// Bound source/recipient work per guest dispatch, leaving fuel and read
+/// headroom for attribution's counters, history writes and subscribers.
+const ATTRIBUTION_BATCH_READ_BUDGET: usize = 128;
 
 fn actor_of(party: &Party) -> Actor {
     match party {
@@ -28,6 +31,62 @@ fn authored_relations(author: &Party) -> Vec<Relation> {
             detail: Vec::new(),
         }],
         Party::Key(_) | Party::Module(_) | Party::System => Vec::new(),
+    }
+}
+
+fn source_relations(kind: &str, value: Option<&[u8]>) -> Result<Vec<Relation>, Error> {
+    let relations = match (kind, value) {
+        ("comment", Some(bytes)) => {
+            let comment: super::Comment = sdk::wire::decode(bytes).map_err(Error::Module)?;
+            if comment.deleted {
+                Vec::new()
+            } else {
+                let mut relations = authored_relations(&comment.author);
+                let mentions: BTreeSet<_> = comment.mentions.into_iter().collect();
+                relations.extend(mentions.into_iter().map(|recipient| Relation {
+                    recipient,
+                    reason: Reason::Mention,
+                    detail: Vec::new(),
+                }));
+                relations
+            }
+        }
+        ("block", Some(bytes)) => {
+            let block: super::Block = sdk::wire::decode(bytes).map_err(Error::Module)?;
+            let mut relations = authored_relations(&block.author);
+            let mentions: BTreeSet<_> = block
+                .marks
+                .iter()
+                .filter_map(|mark| match mark.kind {
+                    super::InlineMark::Mention(account) => Some(account),
+                    _ => None,
+                })
+                .collect();
+            relations.extend(mentions.into_iter().map(|recipient| Relation {
+                recipient,
+                reason: Reason::Mention,
+                detail: Vec::new(),
+            }));
+            let is_page = block.kind == super::BlockKind::Page;
+            if is_page && let Party::Account(recipient) = block.author {
+                relations.push(Relation {
+                    recipient,
+                    reason: Reason::Ownership,
+                    detail: Vec::new(),
+                });
+            }
+            relations
+        }
+        (_, None) => Vec::new(),
+        _ => unreachable!("source kinds are closed above"),
+    };
+    Ok(relations)
+}
+
+fn attribution_batch(target: &str, updates: Vec<AttributionUpdate>) -> Msg {
+    Msg {
+        target: target.into(),
+        payload: attribution::encode_msg(&AttributionMsg::AttributeBatch { updates }),
     }
 }
 
@@ -144,7 +203,24 @@ impl Pages {
         if changed.is_empty() {
             return Ok(Vec::new());
         }
+        // Reading the pre-op view reuses the canonical keys already read by
+        // the mutation/purge. Restore the successful view even on read failure.
+        let after = self.staged.checkpoint();
+        self.staged.restore(before.clone());
+        let prior = async {
+            let mut prior = Vec::with_capacity(changed.len());
+            for (key, value) in changed {
+                let previous = self.staged.get(&key).await?;
+                prior.push((key, previous, value));
+            }
+            Ok::<_, Error>(prior)
+        }
+        .await;
+        self.staged.restore(after);
+        let changed = prior?;
         let mut updates = Vec::new();
+        let mut batch_recipients = BTreeSet::new();
+        let mut reports = Vec::new();
         let revision = self
             .staged
             .get(SOURCE_REVISION_KEY)
@@ -155,7 +231,7 @@ impl Pages {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| Error::Module("pages: attribution revision exhausted".into()))?;
-        for (key, value) in changed {
+        for (key, previous, value) in changed {
             let key = String::from_utf8(key)
                 .map_err(|_| Error::Module("pages: corrupt logical key".into()))?;
             let (kind, id) = match key.strip_prefix("\0cc:") {
@@ -163,52 +239,25 @@ impl Pages {
                 None if !key.starts_with('\0') => ("block", key.as_str()),
                 None => continue,
             };
-            let relations = match (kind, value) {
-                ("comment", Some(bytes)) => {
-                    let comment: super::Comment =
-                        sdk::wire::decode(&bytes).map_err(Error::Module)?;
-                    if comment.deleted {
-                        Vec::new()
-                    } else {
-                        let mut relations = authored_relations(&comment.author);
-                        let mentions: BTreeSet<_> = comment.mentions.into_iter().collect();
-                        relations.extend(mentions.into_iter().map(|recipient| Relation {
-                            recipient,
-                            reason: Reason::Mention,
-                            detail: Vec::new(),
-                        }));
-                        relations
-                    }
-                }
-                ("block", Some(bytes)) => {
-                    let block: super::Block = sdk::wire::decode(&bytes).map_err(Error::Module)?;
-                    let mut relations = authored_relations(&block.author);
-                    let mentions: BTreeSet<_> = block
-                        .marks
-                        .iter()
-                        .filter_map(|mark| match mark.kind {
-                            super::InlineMark::Mention(account) => Some(account),
-                            _ => None,
-                        })
-                        .collect();
-                    relations.extend(mentions.into_iter().map(|recipient| Relation {
-                        recipient,
-                        reason: Reason::Mention,
-                        detail: Vec::new(),
-                    }));
-                    let is_page = block.kind == super::BlockKind::Page;
-                    if is_page && let Party::Account(recipient) = block.author {
-                        relations.push(Relation {
-                            recipient,
-                            reason: Reason::Ownership,
-                            detail: Vec::new(),
-                        });
-                    }
-                    relations
-                }
-                (_, None) => Vec::new(),
-                _ => unreachable!("source kinds are closed above"),
-            };
+            let relations = source_relations(kind, value.as_deref())?;
+            let recipients: BTreeSet<_> = source_relations(kind, previous.as_deref())?
+                .into_iter()
+                .chain(relations.iter().cloned())
+                .map(|relation| relation.recipient)
+                .collect();
+            let additional_recipients = recipients.difference(&batch_recipients).count();
+            let estimated_reads =
+                updates.len() + 1 + batch_recipients.len() + additional_recipients;
+            let exceeds_budget =
+                !updates.is_empty() && estimated_reads > ATTRIBUTION_BATCH_READ_BUDGET;
+            if exceeds_budget {
+                reports.push(attribution_batch(
+                    &attribution,
+                    std::mem::take(&mut updates),
+                ));
+                batch_recipients.clear();
+            }
+            batch_recipients.extend(recipients);
             updates.push(AttributionUpdate {
                 object: ObjectRef {
                     kind: kind.into(),
@@ -225,10 +274,8 @@ impl Pages {
         }
         self.staged
             .stage(SOURCE_REVISION_KEY.to_vec(), sdk::wire::encode(&revision));
-        Ok(vec![Msg {
-            target: attribution,
-            payload: attribution::encode_msg(&AttributionMsg::AttributeBatch { updates }),
-        }])
+        reports.push(attribution_batch(&attribution, updates));
+        Ok(reports)
     }
 }
 

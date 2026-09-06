@@ -63,7 +63,7 @@ impl RunsModule {
                 self.reject_action_request(ctx, request_id, reason).await
             }
             RunsMsg::PublishActionRequest { request_id } => {
-                self.publish_action_request(ctx, request_id)
+                self.publish_action_request(ctx, request_id).await
             }
             RunsMsg::EnableJobWorker { enabled } => {
                 Self::admin_origin(&ctx.env().origin)?;

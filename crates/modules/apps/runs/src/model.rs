@@ -655,11 +655,9 @@ impl AgentAction {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelMsg {
-    /// register an agent under the submitter's origin (a non-empty external
-    /// key or a module — the owner capability). a duplicate `agent_id` is an
-    /// error. registration also notifies the configured hook target
-    /// ([`ModelEvent::Registered`]) in the same block, so the agent's
-    /// dispatch-plane recipe lands (or aborts) atomically with the record.
+    /// Configure model work for a keyless account, authorized by that account
+    /// or its current controller. The model and its dispatch recipe commit
+    /// atomically. A duplicate configuration slug is an error.
     RegisterModel {
         account: sdk::AccountNumber,
         agent_id: String,
@@ -675,9 +673,8 @@ pub enum ModelMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skills: Option<Vec<SkillRef>>,
     },
-    /// owner-gated partial update; `None` fields keep their current value. a
-    /// capability change also notifies the hook target
-    /// ([`ModelEvent::CapabilityChanged`]) in the same block.
+    /// Partial update authorized by the account or its current controller.
+    /// None fields retain their values; capability and recipe change atomically.
     UpdateModel {
         agent_id: String,
         display_name: Option<String>,
@@ -691,41 +688,12 @@ pub enum ModelMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skills: Option<Vec<SkillRef>>,
     },
-    /// owner-gated: stop the agent from engaging new runs.
+    /// Stop admitting new model work.
     PauseModel { agent_id: String },
-    /// owner-gated: resume engagement.
+    /// Resume model work.
     ResumeModel { agent_id: String },
-    /// owner- or governance-gated: remove the agent from the registry and
-    /// free its roster slot. notifies the hook target
-    /// ([`ModelEvent::Deregistered`]) in the same block, so the agent's
-    /// dispatch-plane recipe is retired atomically with the record.
+    /// Remove the configuration and retire its dispatch recipe atomically.
     DeregisterModel { agent_id: String },
-}
-
-// ---- the registry hook ----------------------------------------------------------
-
-/// the registry's follow-up shape, emitted to a genesis-configured hook
-/// target (the runs module) in the same block as the registry write that
-/// caused it. the hook keeps the agent's dispatch-plane recipe in lockstep:
-/// if the recipe registration is rejected (a squatted id), the whole block
-/// aborts and the staged registry write vanishes with it — the agent and its
-/// recipe stay ONE atomic unit without the registry referencing the dispatch
-/// plane.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum ModelEvent {
-    /// a new agent landed; the hook registers its recipe.
-    Registered {
-        agent_id: String,
-        capability: String,
-    },
-    /// an existing agent's capability changed; the hook retunes its recipe.
-    CapabilityChanged {
-        agent_id: String,
-        capability: String,
-    },
-    /// an agent left the registry; the hook retires its recipe.
-    Deregistered { agent_id: String },
 }
 
 // ---- queries ------------------------------------------------------------------
@@ -756,12 +724,6 @@ pub fn encode_model_msg(m: &ModelMsg) -> Vec<u8> {
     sdk::wire::encode(m)
 }
 pub fn decode_model_msg(b: &[u8]) -> Result<ModelMsg, String> {
-    sdk::wire::decode(b)
-}
-pub fn encode_model_event(e: &ModelEvent) -> Vec<u8> {
-    sdk::wire::encode(e)
-}
-pub fn decode_model_event(b: &[u8]) -> Result<ModelEvent, String> {
     sdk::wire::decode(b)
 }
 pub fn encode_response(r: &AgentResponse) -> Vec<u8> {

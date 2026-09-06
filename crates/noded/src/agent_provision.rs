@@ -37,12 +37,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use runs::is_skill_mount_name;
 use compute_service::{
     ProvisionedWorkspace, RoMount, SkillDoc, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
     assemble_context_doc, parse_skill_md,
 };
 use duckfs_client::checkout::{CheckoutOptions, checkout_with};
+use runs::is_skill_mount_name;
 
 use crate::node_link::NodeLink;
 

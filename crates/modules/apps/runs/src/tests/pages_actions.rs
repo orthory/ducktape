@@ -43,8 +43,19 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
     let run_id = page_run_id_for("thread-1", 1, "bot");
     let budget = SiblingReadBudget::default();
     let model = registry.get("bot").unwrap();
-    let prepared = block_on(m.prepare_page_dispatch(&engage_ctx, model, &run_id, "thread-1", 1, &budget)).unwrap();
-    m.stage_dispatch_run(&mut engage_ctx, &run_id, "bot".into(), page_channel_id("thread-1"), 1, RunOrigin::Program(2), prepared, BTreeMap::new());
+    let prepared =
+        block_on(m.prepare_page_dispatch(&engage_ctx, model, &run_id, "thread-1", 1, &budget))
+            .unwrap();
+    m.stage_dispatch_run(
+        &mut engage_ctx,
+        &run_id,
+        "bot".into(),
+        page_channel_id("thread-1"),
+        1,
+        RunOrigin::Program(2),
+        prepared,
+        BTreeMap::new(),
+    );
     commit(&mut m);
 
     let run_id = page_run_id_for("thread-1", 1, "bot");
@@ -72,7 +83,6 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
         text,
         anchor,
         mentions,
-
         ..
     } = &replies[0]
     else {
@@ -83,7 +93,6 @@ fn pages_triggered_run_replies_in_the_same_comment_thread() {
     assert_eq!(text, "Reviewed.");
     assert!(mentions.is_empty());
     assert!(anchor.is_none());
-
 }
 
 // ---- the pages effects lane (M2) ---------------------------------------------
@@ -161,7 +170,6 @@ fn a_pages_comment_effect_lands_agent_authored_with_deterministic_ids() {
         text,
         anchor,
         mentions,
-
     } = &msgs[0]
     else {
         panic!("expected AddComment, got {:?}", msgs[0]);

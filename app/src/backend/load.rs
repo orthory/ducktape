@@ -354,7 +354,7 @@ pub(crate) async fn load_channel_members(
     Ok(members
         .into_iter()
         .map(|member| {
-            let id = member_id(&member.user);
+            let id = member_id(&member.party);
             ChatMember {
                 label: names.member_label(id),
                 key: id.to_string(),
@@ -829,13 +829,14 @@ fn page_comment(ordinal: usize, comment: pages::Comment, names: &NameDirectory) 
 
 /// A page comment's author, named the way every other surface names one: a
 /// person by the account the directory binds to their key, else by handle.
-fn page_author_name(author: &pages::AuthorRef, names: &NameDirectory) -> String {
-    match author {
-        pages::AuthorRef::User(key) => author_display(&format!("user:{}", hex_encode(key)), names),
-        pages::AuthorRef::Agent { agent_id, .. } => format!("@{agent_id}"),
-        pages::AuthorRef::Module(module) => module.clone(),
-        pages::AuthorRef::System => "system".into(),
-    }
+fn page_author_name(author: &pages::Party, names: &NameDirectory) -> String {
+    let handle = match author {
+        pages::Party::Account(account) => format!("acct:{account}"),
+        pages::Party::Key(key) => format!("user:{}", hex_encode(key)),
+        pages::Party::Module(module) => format!("module:{module}"),
+        pages::Party::System => "system".into(),
+    };
+    author_display(&handle, names)
 }
 
 pub(crate) async fn load_pages_data(

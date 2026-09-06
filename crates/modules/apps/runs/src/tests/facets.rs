@@ -1054,8 +1054,12 @@ fn saga_id_mirror_matches_the_dispatch_modules_derivation() {
     // pin the executing-node lookup's saga-id mirror against the REAL
     // dispatch module: register a recipe, dispatch, and read the saga id
     // off the emitted trigger — the mirror must derive the same id.
-    let mut d =
-        dispatch::DispatchModule::new("dispatch", "saga", "identity", Box::new(sdk_testkit::MemStore::new()));
+    let mut d = dispatch::DispatchModule::new(
+        "dispatch",
+        "saga",
+        "identity",
+        Box::new(sdk_testkit::MemStore::new()),
+    );
     let mut ctx = CaptureCtx::new().with_origin(Origin::Module("runs".into()));
     block_on(d.execute(
         &mut ctx,

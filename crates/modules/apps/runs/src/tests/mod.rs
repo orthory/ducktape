@@ -3,15 +3,13 @@ use crate::facets::{WireSink, decode_run_result};
 use crate::response::{
     FAILURE_EXCERPT_BYTES, agent_response_from_text, failure_excerpt, parse_strict_response,
 };
+use crate::{ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS};
 use crate::{decode_reply as runs_decode_reply, encode_msg, encode_query};
-use crate::{
-    ACTION_CHAT_POST_MESSAGE, ACTION_TASKS_CREATE, ACTION_TASKS_UPDATE_STATUS,
-};
 use base64::Engine as _;
-use chat::{Party, Channel, MessageHead, decode_msg as chat_decode_msg};
+use chat::{Channel, MessageHead, Party, decode_msg as chat_decode_msg};
 use dispatch::{
     DispatchStatus, DispatchView, decode_msg as dispatch_decode_msg,
-    encode_reply as dispatch_encode_reply, encode_result_event,
+    encode_reply as dispatch_encode_reply,
 };
 use files::{
     decode_msg as files_decode_msg, decode_query as files_decode_query,
@@ -408,11 +406,29 @@ impl Ctx for CaptureCtx {
             .insert((target.to_string(), req.to_vec()));
         match target {
             "identity" => {
-                let query: identity::IdentityQuery = identity::decode_query(req).map_err(Error::Module)?;
-                let number = match query { identity::IdentityQuery::Get { number } => number, identity::IdentityQuery::OfKey { .. } => 1, _ => return Err(Error::QueryUnsupported) };
-                Ok(identity::encode_reply(&identity::IdentityReply::Account(Some(identity::AccountView {
-                    number, name: "fixture".into(), control: identity::Control::Program { controller: 1, executor: "agent".into(), generation: 0, standing: identity::ProgramStanding::Active }, keys: Vec::new(), avatar: None, bio: None, updated_at: 0,
-                }))))
+                let query: identity::IdentityQuery =
+                    identity::decode_query(req).map_err(Error::Module)?;
+                let number = match query {
+                    identity::IdentityQuery::Get { number } => number,
+                    identity::IdentityQuery::OfKey { .. } => 1,
+                    _ => return Err(Error::QueryUnsupported),
+                };
+                Ok(identity::encode_reply(&identity::IdentityReply::Account(
+                    Some(identity::AccountView {
+                        number,
+                        name: "fixture".into(),
+                        control: identity::Control::Program {
+                            controller: 1,
+                            executor: "agent".into(),
+                            generation: 0,
+                            standing: identity::ProgramStanding::Active,
+                        },
+                        keys: Vec::new(),
+                        avatar: None,
+                        bio: None,
+                        updated_at: 0,
+                    }),
+                )))
             }
             "chat" => match chat::decode_query(req).map_err(Error::Module)? {
                 ChatQuery::MessagesRange {
@@ -463,7 +479,11 @@ impl Ctx for CaptureCtx {
                 // a transcript answers open standing, mirroring the "Channel"
                 // arm's hardcoded `PostPolicy::Open`.
                 ChatQuery::Access { channel_id, party } => {
-                    let user = match party { chat::Party::Key(key) => key, chat::Party::Account(_) => vec![9; 32], _ => Vec::new() };
+                    let user = match party {
+                        chat::Party::Key(key) => key,
+                        chat::Party::Account(_) => vec![9; 32],
+                        _ => Vec::new(),
+                    };
                     let may_post = if self.members_only.contains(&channel_id) {
                         self.members
                             .get(&channel_id)
@@ -524,7 +544,9 @@ impl Ctx for CaptureCtx {
                                         ),
                                     }
                                 } else {
-                                    DispatchStatus::Delivered { delivery: sdk::DeliveryOutcome::Applied }
+                                    DispatchStatus::Delivered {
+                                        delivery: sdk::DeliveryOutcome::Applied,
+                                    }
                                 },
                                 outcome: (!awaiting).then(|| Ok(Vec::new())),
                                 dispatch_id,
@@ -785,6 +807,18 @@ fn message_in(
         seq,
         head: MessageHead {
             message_id: format!("{channel}-m{seq}"),
+            content_origin: match &author {
+                chat::Party::Key(key) => sdk::Origin::External(key.clone()),
+                chat::Party::Account(account) => sdk::Origin::Program(*account),
+                chat::Party::Module(module) => sdk::Origin::Module(module.clone()),
+                chat::Party::System => sdk::Origin::System,
+            },
+            origin: match &author {
+                chat::Party::Key(key) => sdk::Origin::External(key.clone()),
+                chat::Party::Account(account) => sdk::Origin::Program(*account),
+                chat::Party::Module(module) => sdk::Origin::Module(module.clone()),
+                chat::Party::System => sdk::Origin::System,
+            },
             author,
             blocks: vec![Block::paragraph(text)],
             created_at: 0,
@@ -816,18 +850,24 @@ fn admin(m: &RunsMsg) -> Msg {
 }
 
 fn engagement(channel: &str, seq: u64, _tags: Vec<()>) -> Msg {
-    admin(&RunsMsg::RequestRun { agent_id: "bot".into(), channel_id: channel.into(), anchor_seq: seq, demands: BTreeMap::new(), skills: Vec::new() })
+    admin(&RunsMsg::RequestRun {
+        agent_id: "bot".into(),
+        channel_id: channel.into(),
+        anchor_seq: seq,
+        demands: BTreeMap::new(),
+        skills: Vec::new(),
+    })
 }
 
 /// the dispatch plane's next-block delivery for a run.
 fn result_event(run_id: &str, outcome: Result<Vec<u8>, String>) -> Msg {
     Msg {
         target: "runs".into(),
-        payload: encode_result_event(&ResultEvent {
+        payload: dispatch::encode_delivery(&dispatch::Delivery::Result(ResultEvent {
             dispatch_id: dispatch_id_for(run_id),
             recipe_id: recipe_id_for("bot"),
             outcome,
-        }),
+        })),
     }
 }
 
@@ -849,7 +889,13 @@ fn exec(m: &mut RunsModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error>
     // These unit probes exercise composition and validation with configured
     // models. The real host suite owns queue timing and program authority.
     m.models = ctx.agents.clone();
-    let previous: BTreeSet<_> = m.pending_action_requests.keys().cloned().collect();
+    let previous: BTreeSet<_> = m
+        .receipts
+        .staged()
+        .keys()
+        .filter(|key| key.starts_with("action/body/"))
+        .cloned()
+        .collect();
     if ctx.env.origin == Origin::Module("jobs".into()) {
         let origin = std::mem::replace(&mut ctx.env.origin, Origin::Program(2));
         let result = block_on(m.on_jobs_event(ctx, &op.payload));
@@ -857,9 +903,19 @@ fn exec(m: &mut RunsModule, ctx: &mut CaptureCtx, op: &Msg) -> Result<(), Error>
         return result;
     }
     block_on(m.execute(ctx, op))?;
-    let prepared: Vec<_> = m.pending_action_requests.iter()
-        .filter(|(id, _)| !previous.contains(*id))
-        .map(|(_, request)| Msg { target: request.view.target.clone(), payload: sdk::wire::encode(&request.view.payload) }).collect();
+    let prepared: Vec<_> = m
+        .receipts
+        .staged()
+        .iter()
+        .filter(|(id, _)| id.starts_with("action/body/") && !previous.contains(*id))
+        .map(|(_, bytes)| {
+            let request: super::action_requests::ActionRequest = sdk::wire::decode(bytes).unwrap();
+            Msg {
+                target: request.view.target,
+                payload: sdk::wire::encode(&request.view.payload),
+            }
+        })
+        .collect();
     for message in prepared {
         if let Ok(RunsMsg::ExecuteDelegation { .. }) = decode_msg(&message.payload) {
             let origin = std::mem::replace(&mut ctx.env.origin, Origin::Program(2));
@@ -1020,14 +1076,41 @@ fn configured(registry: &Registry) -> RunsModule {
     module
 }
 
-fn request_post(m: &mut RunsModule, registry: &Registry, seq: u64, requested: &[&str]) -> CaptureCtx {
-    let mut ctx = CaptureCtx::new().at(seq).with_registry(registry).with_transcript("general", transcript(seq));
-    let ids: Vec<String> = if requested.is_empty() { registry.keys().cloned().collect() } else { requested.iter().map(|id| (*id).into()).collect() };
+fn request_post(
+    m: &mut RunsModule,
+    registry: &Registry,
+    seq: u64,
+    requested: &[&str],
+) -> CaptureCtx {
+    let mut ctx = CaptureCtx::new()
+        .at(seq)
+        .with_registry(registry)
+        .with_transcript("general", transcript(seq));
+    let ids: Vec<String> = if requested.is_empty() {
+        registry.keys().cloned().collect()
+    } else {
+        requested.iter().map(|id| (*id).into()).collect()
+    };
     for id in ids {
-        let Some(model) = registry.get(&id) else { continue; };
-        if model.status != ModelStatus::Active { continue; }
+        let Some(model) = registry.get(&id) else {
+            continue;
+        };
+        if model.status != ModelStatus::Active {
+            continue;
+        }
         ctx.env.origin = Origin::Program(model.account);
-        exec(m, &mut ctx, &admin(&RunsMsg::RequestRun { agent_id: id, channel_id: "general".into(), anchor_seq: seq, demands: BTreeMap::new(), skills: Vec::new() })).unwrap();
+        exec(
+            m,
+            &mut ctx,
+            &admin(&RunsMsg::RequestRun {
+                agent_id: id,
+                channel_id: "general".into(),
+                anchor_seq: seq,
+                demands: BTreeMap::new(),
+                skills: Vec::new(),
+            }),
+        )
+        .unwrap();
     }
     ctx
 }
@@ -1100,6 +1183,7 @@ mod delivery;
 mod facets;
 mod job_runs;
 mod pages_actions;
+mod receipts;
 mod registry;
 mod sessions;
 mod state;

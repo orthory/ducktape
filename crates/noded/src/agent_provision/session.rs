@@ -334,8 +334,10 @@ async fn await_action_result(
         };
         let value: serde_json::Value = serde_json::from_str(&text)
             .map_err(|error| format!("decode action receipt event: {error}"))?;
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("heartbeat") {
-            continue;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("heartbeat") => {}
+            Some("error") => return Err(format!("action receipt stream refused: {value}")),
+            _ => continue,
         }
         let Some(height) = value.get("height").and_then(serde_json::Value::as_u64) else {
             continue;
@@ -361,7 +363,9 @@ async fn submit_action(state: &ActionState, message: runs::RunsMsg) -> Result<()
             let request_id = next_action_request(&state.node, run_id).await?;
             Some((request_id, events))
         }
-        runs::RunsMsg::DelegateRun { run_id, request_id, .. } => {
+        runs::RunsMsg::DelegateRun {
+            run_id, request_id, ..
+        } => {
             let events = action_events(&state.node).await?;
             Some((runs::delegation_action_id(run_id, request_id), events))
         }

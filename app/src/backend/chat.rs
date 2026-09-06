@@ -14,7 +14,7 @@ pub fn reaction_applied(
     let Some(key) = rpc::cached_user_key() else {
         return messages;
     };
-    let reactor = format!("user:{}", hex_encode(&key));
+    let reactor = names().handle_of(&key);
     chat::client::optimistic_reaction(messages, seq, emoji, added, reactor)
 }
 
@@ -135,6 +135,43 @@ pub async fn unarchive_channel(
     .await
 }
 
+/// A membership row retains its exact party; user-entered keys are resolved
+/// to their account only when adding a new seat.
+pub(crate) fn member_party(value: &str) -> Result<::chat::Party, String> {
+    let value = value.trim();
+    if let Some(number) = value.strip_prefix("acct:") {
+        let number = number
+            .parse::<u64>()
+            .map_err(|_| "member must name acct:<number> or a public key".to_string())?;
+        return Ok(::chat::Party::Account(number));
+    }
+    public_key(
+        value.strip_prefix("user:").unwrap_or(value),
+        "member public key",
+    )
+    .map(::chat::Party::Key)
+}
+
+async fn member_to_add(rpc: &RpcClient, value: &str) -> Result<::chat::Party, String> {
+    let party = member_party(value)?;
+    let ::chat::Party::Key(key) = party else {
+        return Ok(party);
+    };
+    let reply: identity::IdentityReply = rpc
+        .query(
+            "identity",
+            &identity::IdentityQuery::OfKey { key: key.clone() },
+        )
+        .await?;
+    let identity::IdentityReply::Account(account) = reply else {
+        return Err("the identity module returned the wrong reply".to_string());
+    };
+    Ok(match account {
+        Some(account) => ::chat::Party::Account(account.number),
+        None => ::chat::Party::Key(key),
+    })
+}
+
 pub async fn add_channel_member(
     rpc: String,
     password: String,
@@ -143,14 +180,14 @@ pub async fn add_channel_member(
 ) -> Result<bool, AppError> {
     async {
         let channel_id = required_id(channel_id, "channel")?;
-        let user = public_key(&member_key, "member public key")?;
         let rpc = rpc_client(&rpc)?;
+        let party = member_to_add(&rpc, &member_key).await?;
         signed_write(
             &rpc,
             "chat",
             chat::encode_msg(&ChatMsg::SetMembership {
                 channel_id: channel_id.clone(),
-                user,
+                party,
                 member: true,
             }),
             password,
@@ -169,14 +206,14 @@ pub async fn remove_channel_member(
 ) -> Result<bool, AppError> {
     async {
         let channel_id = required_id(channel_id, "channel")?;
-        let user = public_key(&member_key, "member public key")?;
+        let party = member_party(&member_key)?;
         let rpc = rpc_client(&rpc)?;
         signed_write(
             &rpc,
             "chat",
             chat::encode_msg(&ChatMsg::SetMembership {
                 channel_id: channel_id.clone(),
-                user,
+                party,
                 member: false,
             }),
             password,
@@ -216,15 +253,7 @@ pub struct HuddleParticipant {
     pub node: String,
 }
 
-/// Render the on-chain huddle roster, marking the row this device holds.
-///
-/// `HuddleEntry.user` is the kernel's BARE user id (`op.origin.id`) — the
-/// same vocabulary `MemberRow` speaks — and NOT `MsgRow.author`'s
-/// `user:{hex}`. This function compared against the prefixed form for as
-/// long as it existed, so `is_you` never matched a real roster row and the
-/// LIVE pill/leave/timer surface was unreachable; the fixture that covered
-/// it had invented prefixed entries. Match the wire, prefix only to reuse
-/// the author renderer for the label.
+/// Render canonical account or historical key seats from the huddle index.
 pub(crate) fn huddle_roster(
     members: &[chat::index::HuddleEntry],
     reader: ChatReader<'_>,
@@ -232,19 +261,18 @@ pub(crate) fn huddle_roster(
     members
         .iter()
         .map(|member| {
-            let handle = format!("user:{}", member.user);
+            let handle = member.party.clone();
             let label = author_display(&handle, reader.names);
             HuddleParticipant {
                 initials: initials_of(&label),
-                // The module refuses non-User authors ("only external users
-                // may join a huddle"), so every roster row is a person.
+                // Joining requires an external signer with a node proof.
                 is_agent: false,
                 // The reader's ACCOUNT, not one key: a seat taken with the
                 // person's passkey or wallet is still their own seat, and a
                 // roster that could not recognise it wiped itself on load.
                 is_you: reader.is_me(&handle),
                 joined_at: number_i64(member.joined_at),
-                key: member.user.clone(),
+                key: member.party.clone(),
                 node: member.node.clone(),
                 label,
             }
@@ -413,12 +441,8 @@ pub async fn send_message(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: required_id(message_id, "message")?,
-                blocks: parse_message_with_mentions(
-                    &body,
-                    &mention_candidates(&members),
-                ),
+                blocks: parse_message_with_mentions(&body, &mention_candidates(&members)),
                 thread: None,
-                as_agent: None,
             }),
             password,
         )
@@ -562,12 +586,8 @@ pub async fn send_reply(
             chat::encode_msg(&ChatMsg::PostMessage {
                 channel_id: channel_id.clone(),
                 message_id: message_id.clone(),
-                blocks: parse_message_with_mentions(
-                    &body,
-                    &mention_candidates(&members),
-                ),
+                blocks: parse_message_with_mentions(&body, &mention_candidates(&members)),
                 thread: Some(root_seq),
-                as_agent: None,
             }),
             password,
         )
@@ -611,10 +631,7 @@ pub async fn edit_message(
             chat::encode_msg(&ChatMsg::EditMessage {
                 channel_id: channel_id.clone(),
                 seq,
-                blocks: parse_message_with_mentions(
-                    &body,
-                    &mention_candidates(&members),
-                ),
+                blocks: parse_message_with_mentions(&body, &mention_candidates(&members)),
                 base_rev: Some(base_rev),
             }),
             password,
@@ -869,7 +886,6 @@ pub async fn post_block_comment(
                 text,
                 anchor: None,
                 mentions: Vec::new(),
-                as_agent: None,
             }),
             password,
         )

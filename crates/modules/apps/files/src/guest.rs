@@ -588,7 +588,7 @@ mod tests {
                         controller: 1,
                         executor: "executor".into(),
                         generation: 0,
-                        standing: standing.clone(),
+                        standing,
                     },
                     keys: Vec::new(),
                     avatar: None,
@@ -651,7 +651,7 @@ mod tests {
             (identity::ProgramStanding::Suspended, "/home/acct:7/result"),
         ] {
             let payload = commit_inline(path, b"refused");
-            let mut native_ctx = program_ctx(standing.clone());
+            let mut native_ctx = program_ctx(standing);
             let mut guest_ctx = program_ctx(standing);
             let native_error = futures::executor::block_on(crate::adapter::apply_op(
                 &mut native,

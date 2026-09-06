@@ -21,10 +21,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
-use runs::{ModelQuery, CapRequest};
 use forge::ForgeQuery;
 use pages::PageQuery;
 use runs::RunsQuery;
+use runs::{CapRequest, ModelQuery};
 use tasks::{TaskQuery, WorkQuery};
 
 use super::{Tool, arg_str, opt_u64, schema};
@@ -200,6 +200,7 @@ pub(super) fn tools() -> Vec<Tool> {
 fn whoami(run: &Run, _args: &Value) -> Result<Value> {
     let record = run.record()?;
     Ok(json!({
+        "account": record.account,
         "agent_id": record.agent_id,
         "display_name": record.display_name,
         "owner": record.owner,
@@ -216,8 +217,21 @@ fn whoami(run: &Run, _args: &Value) -> Result<Value> {
 
 fn agents_list(run: &Run, args: &Value) -> Result<Value> {
     let limit = list_limit(args)?;
-    let reply = run.node.query(TARGET_MODEL, encode(&runs::RunsQuery::Model { query: ModelQuery::Agents })?)?;
-    let (agents, total, truncated) = bounded(reply_array(reply.get("model").ok_or_else(|| NodeError::Transport("missing model reply".into()))?, "agents")?, limit);
+    let reply = run.node.query(
+        TARGET_MODEL,
+        encode(&runs::RunsQuery::Model {
+            query: ModelQuery::Agents,
+        })?,
+    )?;
+    let (agents, total, truncated) = bounded(
+        reply_array(
+            reply
+                .get("model")
+                .ok_or_else(|| NodeError::Transport("missing model reply".into()))?,
+            "agents",
+        )?,
+        limit,
+    );
     Ok(json!({
         "agents": agents,
         "total": total,
@@ -751,6 +765,7 @@ mod tests {
     /// cap tests below.
     fn team_capped_record() -> runs::ModelRecord {
         runs::ModelRecord {
+            account: 2,
             agent_id: "bot".into(),
             owner: runs::RunOrigin::External(vec![9; 32]),
             display_name: "BOT".into(),

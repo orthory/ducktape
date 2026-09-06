@@ -51,7 +51,7 @@ fn put_origin(out: &mut Vec<u8>, origin: &RunOrigin) {
 }
 
 pub(super) fn encode_committed(
-    action_requests: &BTreeMap<String, crate::action_requests::ActionRequest>,
+    action_requests: &crate::receipts::Records,
     next_action_item: u64,
     pending: &BTreeMap<String, PendingState>,
     sessions: &BTreeMap<String, AgentSession>,
@@ -114,7 +114,7 @@ pub(super) fn encode_committed(
 /// and `install()` so the verification a snapshot must pass is definitionally
 /// the same algorithm the live module answers with.
 pub(super) fn committed_root(
-    action_requests: &BTreeMap<String, crate::action_requests::ActionRequest>,
+    action_requests: &crate::receipts::Records,
     next_action_item: u64,
     pending: &BTreeMap<String, PendingState>,
     sessions: &BTreeMap<String, AgentSession>,
@@ -355,7 +355,7 @@ fn validate_decoded_session(
 }
 
 type Committed = (
-    BTreeMap<String, crate::action_requests::ActionRequest>,
+    crate::receipts::Records,
     u64,
     BTreeMap<String, PendingState>,
     BTreeMap<String, AgentSession>,

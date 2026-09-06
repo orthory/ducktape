@@ -51,7 +51,6 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
             message_id: reply_message_id(&run_id),
             blocks: vec![Block::paragraph("on it")],
             thread: None,
-
         }],
         "the reply posts as the AGENT, under the run's message id"
     );
@@ -198,10 +197,7 @@ fn invalid_responses_fail_the_run_and_surface_a_threaded_failure_reply() {
         let posts = ctx.chat_msgs();
         assert_eq!(posts.len(), 1, "exactly one failure reply ({fragment})");
         let ChatMsg::PostMessage {
-            message_id,
-            blocks,
-
-            ..
+            message_id, blocks, ..
         } = &posts[0]
         else {
             panic!("expected a post");
@@ -623,7 +619,6 @@ fn a_post_message_action_lands_agent_authored_under_a_deterministic_id() {
             message_id: post_message_id(&run_id, "0"),
             blocks: vec![Block::paragraph("progress: halfway")],
             thread: None,
-
         }
     );
     assert_ne!(
@@ -744,7 +739,9 @@ fn dispatch_view_reads_through_testkit_on_query() {
                 dispatch_id,
                 recipe_id: "agent/x".into(),
                 receiver,
-                status: DispatchStatus::Delivered { delivery: sdk::DeliveryOutcome::Applied },
+                status: DispatchStatus::Delivered {
+                    delivery: sdk::DeliveryOutcome::Applied,
+                },
                 outcome: Some(Ok(Vec::new())),
                 created_at: 0,
                 updated_at: 0,

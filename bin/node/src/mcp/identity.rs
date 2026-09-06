@@ -26,7 +26,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use runs::{ModelRecord, CapRequest};
+use runs::{CapRequest, ModelRecord};
 use serde_json::json;
 
 use crate::mcp::node::{Node, NodeError, Result};
@@ -43,13 +43,9 @@ const ENV_PROVIDER_CONTROL_URL: &str = "DUCKTAPE_PROVIDER_CONTROL_URL";
 const ENV_PROVIDER_CONTROL_TOKEN: &str = "DUCKTAPE_PROVIDER_CONTROL_TOKEN";
 const PROVIDER_CONTROL_HEADER: &str = "x-ducktape-provider-control";
 
-/// the agent-registry module id. the node's genesis registers it under this
-/// name (`bin/noded/src/main.rs`), as it does every module the tools speak to.
+/// Model configuration and run requests belong to the runs module.
 pub const TARGET_MODEL: &str = "runs";
-/// the runs module id — the target of every `AgentAction`, and the only module
-/// this binary ever WRITES to. chat, tasks and pages are written by runs, in
-/// consensus, on the agent's behalf; that indirection is what earns the write
-/// its `AuthorRef::Agent` attribution.
+/// Scoped action proposals go to runs; the user program performs their writes.
 pub const TARGET_RUNS: &str = "runs";
 
 /// The narrow host signer endpoint for this live run. Its random token can ask
@@ -191,17 +187,21 @@ impl Run {
                  agent and cannot write"
             ))
         })?;
-        let reply = self
-            .node
-            .query(TARGET_MODEL, json!({"model": {"query": {"agent": {"agent_id": agent_id}}}}))?;
+        let reply = self.node.query(
+            TARGET_MODEL,
+            json!({"model": {"query": {"agent": {"agent_id": agent_id}}}}),
+        )?;
         // ModelReply::Agent(Option<ModelRecord>) — snake_case externally
         // tagged, so the record sits under "agent" and is null for an id the
         // registry does not hold.
-        let record = reply.get("model").and_then(|model| model.get("agent")).ok_or_else(|| {
-            NodeError::Transport(format!(
-                "the agent registry answered a shape this server does not understand: {reply}"
-            ))
-        })?;
+        let record = reply
+            .get("model")
+            .and_then(|model| model.get("agent"))
+            .ok_or_else(|| {
+                NodeError::Transport(format!(
+                    "the agent registry answered a shape this server does not understand: {reply}"
+                ))
+            })?;
         if record.is_null() {
             return Err(NodeError::Rejected(format!(
                 "the agent registry holds no agent {agent_id:?}"
@@ -503,6 +503,7 @@ mod tests {
 
     fn standing_record() -> ModelRecord {
         let mut record = runs::ModelRecord {
+            account: 2,
             agent_id: "worker".into(),
             owner: runs::RunOrigin::External(vec![9; 32]),
             display_name: "Worker".into(),
@@ -544,7 +545,7 @@ mod tests {
         let run = bound_run(
             "run-1".into(),
             vec![
-                json!({"agent": standing}),
+                json!({"model": {"agent": standing}}),
                 json!({"run_authority": {
                     "run_id": "run-1", "agent_id": "worker", "authority": ceiling
                 }}),
@@ -569,7 +570,7 @@ mod tests {
         let run = bound_run(
             "run-1".into(),
             vec![
-                json!({"agent": standing_record()}),
+                json!({"model": {"agent": standing_record()}}),
                 json!({"run_authority": {
                     "run_id": "run-1", "agent_id": "worker", "authority": null
                 }}),
@@ -586,7 +587,10 @@ mod tests {
         // the standing record, which is exactly the escalation.
         let run = bound_run(
             "run-1".into(),
-            vec![json!({"agent": standing_record()}), json!({"nope": 1})],
+            vec![
+                json!({"model": {"agent": standing_record()}}),
+                json!({"nope": 1}),
+            ],
         );
         assert!(run.record().is_err());
 
@@ -594,7 +598,7 @@ mod tests {
         let gone = bound_run(
             "run-1".into(),
             vec![
-                json!({"agent": standing_record()}),
+                json!({"model": {"agent": standing_record()}}),
                 json!({"run_authority": null}),
             ],
         );

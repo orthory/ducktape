@@ -72,7 +72,13 @@ impl RunsModule {
 
     async fn execute_result(&mut self, ctx: &mut dyn Ctx, payload: &[u8]) -> Result<(), Error> {
         let budget = SiblingReadBudget::default();
-        let event = dispatch::decode_result_event(payload).map_err(Error::Module)?;
+        let dispatch::Delivery::Result(event) =
+            dispatch::decode_delivery(payload).map_err(Error::Module)?
+        else {
+            return Err(Error::Module(
+                "runs received a program call completion it did not request".into(),
+            ));
+        };
         let entry = self.pending_entry(&event.dispatch_id).cloned();
         let mut effects = super::action_requests::EffectsCtx {
             inner: ctx,
@@ -83,7 +89,7 @@ impl RunsModule {
                 inner: &mut effects,
                 budget: &budget,
             },
-            payload,
+            event,
         )
         .await?;
         let messages = std::mem::take(&mut effects.messages);
@@ -100,10 +106,11 @@ impl RunsModule {
             }
             self.stage_action_request(
                 &entry,
-                format!("{}/result/{index}", entry.run_id),
+                format!("result/{}/{index}", super::dispatch_id_for(&entry.run_id)),
                 super::action_requests::RequestScope::Result,
                 message,
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -159,7 +166,7 @@ impl Module for RunsModule {
     /// the snapshot encoding.
     fn root(&self) -> StateRoot {
         committed_root(
-            &self.action_requests,
+            &self.receipts.snapshot(),
             self.next_action_item,
             &self.pending,
             &self.sessions,
@@ -195,10 +202,13 @@ impl Module for RunsModule {
                 };
                 Ok(encode_reply(&RunsReply::Model(reply)))
             }
-            RunsQuery::ActionRequest { request_id } | RunsQuery::ActionPlan { request_id } => Ok(encode_reply(&RunsReply::ActionRequest(
-                self.action_request(&request_id)
-                    .map(|request| request.view.clone()),
-            ))),
+            RunsQuery::ActionRequest { request_id } | RunsQuery::ActionPlan { request_id } => {
+                Ok(encode_reply(&RunsReply::ActionRequest(
+                    self.action_request(&request_id)
+                        .await?
+                        .map(|request| request.view.clone()),
+                )))
+            }
             RunsQuery::PendingRuns => {
                 let runs = Self::visible_ids(&self.pending, &self.pending_overlay)
                     .into_iter()
@@ -246,11 +256,11 @@ impl Module for RunsModule {
     }
 
     async fn pending_items(&self) -> Result<Vec<sdk::PendingItem>, Error> {
-        Ok(self.action_deliveries())
+        self.action_deliveries().await
     }
 
     async fn acknowledge(&mut self, ctx: &mut dyn Ctx, ack: &sdk::Ack) -> Result<(), Error> {
-        self.acknowledge_action(ctx, ack)
+        self.acknowledge_action(ctx, ack).await
     }
 
     async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
@@ -273,8 +283,7 @@ impl Module for RunsModule {
                 }
             }
         }
-        self.action_requests
-            .append(&mut self.pending_action_requests);
+        self.receipts.commit().await?;
         if let Some(next) = self.staged_next_action_item.take() {
             self.next_action_item = next;
         }
@@ -319,7 +328,7 @@ impl Module for RunsModule {
 
     async fn abort_block(&mut self) -> Result<(), Error> {
         self.pending_models.clear();
-        self.pending_action_requests.clear();
+        self.receipts.abort();
         self.staged_next_action_item = None;
         self.pending_overlay.clear();
         self.pending_sessions.clear();

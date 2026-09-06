@@ -6,10 +6,13 @@ use super::*;
 fn a_model_registration_registers_the_dispatch_recipe() {
     let mut m = module();
     let mut ctx = CaptureCtx::new().with_agent_origin();
-    m.on_model_event(&mut ctx, ModelEvent::Registered {
+    m.apply_model_change(
+        &mut ctx,
+        ModelChange::Registered {
             agent_id: "bot".into(),
             capability: "model-1".into(),
-        })
+        },
+    )
     .unwrap();
 
     let recipes = ctx.dispatch_msgs();
@@ -44,10 +47,13 @@ fn a_model_registration_registers_the_dispatch_recipe() {
 fn a_capability_change_event_retunes_the_dispatch_recipe() {
     let mut m = module();
     let mut ctx = CaptureCtx::new().with_agent_origin();
-    m.on_model_event(&mut ctx, ModelEvent::CapabilityChanged {
+    m.apply_model_change(
+        &mut ctx,
+        ModelChange::CapabilityChanged {
             agent_id: "bot".into(),
             capability: "model-2".into(),
-        })
+        },
+    )
     .unwrap();
     assert_eq!(
         ctx.dispatch_msgs(),
@@ -66,9 +72,12 @@ fn a_capability_change_event_retunes_the_dispatch_recipe() {
 fn a_model_removal_removes_the_dispatch_recipe() {
     let mut m = module();
     let mut ctx = CaptureCtx::new().with_agent_origin();
-    m.on_model_event(&mut ctx, ModelEvent::Deregistered {
+    m.apply_model_change(
+        &mut ctx,
+        ModelChange::Deregistered {
             agent_id: "bot".into(),
-        })
+        },
+    )
     .unwrap();
     assert_eq!(
         ctx.dispatch_msgs(),
@@ -87,11 +96,15 @@ fn the_model_recipe_update_may_error_to_abort_the_registration_block() {
     // seam (the registry record must never land without its recipe).
     let oversized = "x".repeat(dispatch::MAX_ID_BYTES);
     let mut ctx = CaptureCtx::new().with_agent_origin();
-    let err = m.on_model_event(&mut ctx, ModelEvent::Registered {
-            agent_id: oversized,
-            capability: "model-1".into(),
-        })
-    .unwrap_err();
+    let err = m
+        .apply_model_change(
+            &mut ctx,
+            ModelChange::Registered {
+                agent_id: oversized,
+                capability: "model-1".into(),
+            },
+        )
+        .unwrap_err();
     assert!(matches!(err, Error::Module(reason) if reason.contains("recipe id")));
 
     // malformed bytes from the registry origin error the same way — the

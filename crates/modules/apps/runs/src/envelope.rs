@@ -26,8 +26,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::{ModelRecord, LoadMode, MAX_SKILLS_PER_AGENT, SKILL_LIBRARY_PREFIX, SkillRef};
-use chat::{Party, Block, MessageView};
+use crate::{LoadMode, MAX_SKILLS_PER_AGENT, ModelRecord, SKILL_LIBRARY_PREFIX, SkillRef};
+use chat::{Block, MessageView, Party};
 use files::paths::canonical as canonical_duckfs_path;
 use serde::Serialize;
 
@@ -484,11 +484,23 @@ mod tests {
             seq,
             head: MessageHead {
                 message_id: format!("m{seq}"),
+                content_origin: match &author {
+                    chat::Party::Key(key) => sdk::Origin::External(key.clone()),
+                    chat::Party::Account(account) => sdk::Origin::Program(*account),
+                    chat::Party::Module(module) => sdk::Origin::Module(module.clone()),
+                    chat::Party::System => sdk::Origin::System,
+                },
+                origin: match &author {
+                    chat::Party::Key(key) => sdk::Origin::External(key.clone()),
+                    chat::Party::Account(account) => sdk::Origin::Program(*account),
+                    chat::Party::Module(module) => sdk::Origin::Module(module.clone()),
+                    chat::Party::System => sdk::Origin::System,
+                },
                 author,
                 blocks: vec![Block::paragraph(text)],
                 created_at: 0,
                 rev: 0,
-            revision: 1,
+                revision: 1,
                 edited_at: None,
                 base_rev: None,
                 deleted: false,
@@ -827,11 +839,7 @@ mod tests {
         let agent = bot();
         let transcript = vec![
             message(1, Party::Key(vec![1; 32]), "hello \"quoted\"\nline"),
-            message(
-                2,
-                Party::Account(2),
-                "earlier reply",
-            ),
+            message(2, Party::Account(2), "earlier reply"),
         ];
         let a = render_payload("runs", &agent, &run_id("general", 2), &transcript, plain());
         let b = render_payload("runs", &agent, &run_id("general", 2), &transcript, plain());
@@ -873,16 +881,8 @@ mod tests {
         let agent = bot();
         let transcript = vec![
             message(1, Party::Key(vec![1; 32]), "question"),
-            message(
-                2,
-                Party::Account(2),
-                "my own reply",
-            ),
-            message(
-                3,
-                Party::Account(3),
-                "someone else",
-            ),
+            message(2, Party::Account(2), "my own reply"),
+            message(3, Party::Account(3), "someone else"),
         ];
         let payload = render_payload("runs", &agent, &run_id("general", 3), &transcript, plain());
         let conversation = parse(&payload)["conversation"]

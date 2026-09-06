@@ -619,7 +619,6 @@ fn a_granted_action_emits_a_module_origin_follow_up_carrying_as_agent() {
         comment_id,
         target,
         text,
-
         ..
     } = &msgs[0]
     else {
@@ -768,7 +767,6 @@ fn post_message_needs_its_own_grant_and_chat_post_does_not_widen_into_it() {
         message_id,
         blocks,
         thread,
-
     } = &msgs[0]
     else {
         panic!("expected PostMessage, got {:?}", msgs[0]);
@@ -939,8 +937,14 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
     let (m, ..) = with_open_session(&[ACTION_CHAT_POST], &[]);
 
     // an orphaned session: the same session, but the pending section is empty.
-    let orphaned =
-        crate::state::encode_committed(&m.action_requests, m.next_action_item, &BTreeMap::new(), &m.sessions, &m.delegations, &m.models);
+    let orphaned = crate::state::encode_committed(
+        &m.receipts.snapshot(),
+        m.next_action_item,
+        &BTreeMap::new(),
+        &m.sessions,
+        &m.delegations,
+        &m.models,
+    );
     let err = module().install(&orphaned, StateRoot::ZERO).unwrap_err();
     assert!(
         matches!(&err, Error::Module(reason) if reason.contains("names no in-flight run")),
@@ -959,7 +963,14 @@ fn a_forged_snapshot_session_is_rejected_by_the_decoder() {
             (run_id.clone(), s)
         })
         .collect();
-    let forged = crate::state::encode_committed(&m.action_requests, m.next_action_item, &m.pending, &stunted, &m.delegations, &m.models);
+    let forged = crate::state::encode_committed(
+        &m.receipts.snapshot(),
+        m.next_action_item,
+        &m.pending,
+        &stunted,
+        &m.delegations,
+        &m.models,
+    );
     let err = module().install(&forged, StateRoot::ZERO).unwrap_err();
     assert!(
         matches!(&err, Error::Module(reason) if reason.contains("32-byte ed25519 key")),

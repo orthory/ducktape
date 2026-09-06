@@ -39,6 +39,8 @@ async fn settle(network: &mut Network, run: &runs::PendingRun, outcome: Result<V
     }
     network.submit(provider(), msg("saga", &saga::SagaMsg::OracleResult { saga_id, attempt: 0, outcome, usage: None })).await;
     network.drain().await;
+    let state = network.host.query("dispatch", &dispatch::encode_query(&dispatch::DispatchQuery::Dispatch { receiver: "runs".into(), dispatch_id: run.dispatch_id.clone() })).await.unwrap();
+    assert!(!network.runs().await.iter().any(|pending| pending.run_id == run.run_id), "run failed to settle: {}", String::from_utf8_lossy(&state));
 }
 
 async fn job(network: &Network, id: &str) -> tasks::Job {
@@ -77,13 +79,16 @@ fn job_submission_commits_before_its_program_requests_model_work() {
         assert_eq!(run.job_id.as_deref(), Some("one"));
         settle(&mut network, &run, Ok(response(Some("from-job"))), false).await;
         assert_eq!(job(&network, "one").await.status, tasks::JobStatus::Done);
-        assert_eq!(network.task("from-job").await.unwrap().owner, tasks::Party::Account(2));
+        let detail = network.host.query("runs", &runs::encode_query(&runs::RunsQuery::RecentRuns)).await.unwrap();
+        let task = network.task("from-job").await;
+        assert!(task.is_some(), "job {:?}, runs {}", job(&network, "one").await, String::from_utf8_lossy(&detail));
+        assert_eq!(task.unwrap().owner, tasks::Party::Account(2));
         assert!(network.runs().await.is_empty());
     });
 }
 
 #[test]
-fn unknown_model_jobs_stay_pending_and_worker_failures_finalize_with_detail() {
+fn unknown_model_jobs_stay_pending_and_cancellation_finalizes_with_detail() {
     block_on(async {
         let mut network = job_network().await;
         job_submit(&mut network, "unknown", "missing").await;
@@ -92,12 +97,13 @@ fn unknown_model_jobs_stay_pending_and_worker_failures_finalize_with_detail() {
         job_submit(&mut network, "failed", "builder").await;
         network.drain().await;
         let run = network.runs().await.pop().unwrap();
-        settle(&mut network, &run, Err("model provider refused".into()), false).await;
+        network.submit(member(), msg("runs", &runs::RunsMsg::CancelRun { run_id: run.run_id.clone() })).await;
+        network.drain().await;
         let failed = job(&network, "failed").await;
-        assert_eq!(failed.status, tasks::JobStatus::Done);
+        assert_eq!(failed.status, tasks::JobStatus::Failed);
         let result = failed.result.unwrap();
         assert!(!result.ok);
-        assert!(result.payload.contains("model provider refused"));
+        assert!(result.payload.contains("cancelled"));
     });
 }
 

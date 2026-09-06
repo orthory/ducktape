@@ -87,8 +87,14 @@ static NOBODY_KNOWN: NameDirectory = NameDirectory::empty();
 
 impl NameDirectory {
     pub fn new(accounts: BTreeMap<String, BoundAccount>) -> Self {
-        let by_account = accounts.values().map(|account| (account.number, account.name.clone())).collect();
-        Self { accounts, by_account }
+        let by_account = accounts
+            .values()
+            .map(|account| (account.number, account.name.clone()))
+            .collect();
+        Self {
+            accounts,
+            by_account,
+        }
     }
 
     /// A directory that knows no one — the cold state before a network has
@@ -118,8 +124,13 @@ impl NameDirectory {
 
     /// A member's label: the bound name, else the shortened key.
     pub fn member_label(&self, key_hex: &str) -> String {
-        let handle = if key_hex.contains(':') { key_hex.to_string() } else { format!("user:{key_hex}") };
-        self.of_handle(&handle).map_or_else(|| short_label(key_hex), str::to_string)
+        let handle = if key_hex.contains(':') {
+            key_hex.to_string()
+        } else {
+            format!("user:{key_hex}")
+        };
+        self.of_handle(&handle)
+            .map_or_else(|| short_label(key_hex), str::to_string)
     }
 
     /// EVERY key of the account THIS key belongs to, the key itself included —
@@ -142,12 +153,22 @@ impl NameDirectory {
     }
 
     /// Full account records also name keyless programs.
-    pub fn from_accounts<'a>(accounts: impl IntoIterator<Item = &'a identity::AccountView>) -> Self {
+    pub fn from_accounts<'a>(
+        accounts: impl IntoIterator<Item = &'a identity::AccountView>,
+    ) -> Self {
         let mut names = Self::empty();
         for account in accounts {
-            names.by_account.insert(account.number, account.name.clone());
+            names
+                .by_account
+                .insert(account.number, account.name.clone());
             for key in &account.keys {
-                names.accounts.insert(hex_encode(&key.pubkey), BoundAccount { number: account.number, name: account.name.clone() });
+                names.accounts.insert(
+                    hex_encode(&key.pubkey),
+                    BoundAccount {
+                        number: account.number,
+                        name: account.name.clone(),
+                    },
+                );
             }
         }
         names
@@ -160,9 +181,13 @@ impl NameDirectory {
         }
     }
 
-    pub fn parties_of(&self, key: &[u8]) -> Vec<Party> { vec![self.party_of(key)] }
+    pub fn parties_of(&self, key: &[u8]) -> Vec<Party> {
+        vec![self.party_of(key)]
+    }
 
-    pub fn handle_of(&self, key: &[u8]) -> String { index::party_handle(&self.party_of(key)) }
+    pub fn handle_of(&self, key: &[u8]) -> String {
+        index::party_handle(&self.party_of(key))
+    }
 
     /// An Account record belongs to its current keys; a historic Key record
     /// belongs only to that actual key, even when account membership changes.
@@ -174,12 +199,14 @@ impl NameDirectory {
 
     fn of_handle(&self, handle: &str) -> Option<&str> {
         match handle.split_once(':') {
-            Some(("acct", number)) => self.by_account.get(&number.parse::<u64>().ok()?).map(String::as_str),
+            Some(("acct", number)) => self
+                .by_account
+                .get(&number.parse::<u64>().ok()?)
+                .map(String::as_str),
             Some(("user", key)) => self.name_of(key),
             _ => None,
         }
     }
-
 }
 
 /// A reader's view of the timeline: the key the reader signs with — the
@@ -207,12 +234,14 @@ impl<'a> ChatReader<'a> {
     }
 
     /// The reader's canonical actor for a new write.
-    fn handle(&self) -> Option<String> { self.key.map(|key| self.names.handle_of(key)) }
-
-    pub fn is_me(&self, handle: &str) -> bool {
-        self.key.is_some_and(|key| self.names.owns_handle(handle, key))
+    fn handle(&self) -> Option<String> {
+        self.key.map(|key| self.names.handle_of(key))
     }
 
+    pub fn is_me(&self, handle: &str) -> bool {
+        self.key
+            .is_some_and(|key| self.names.owns_handle(handle, key))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -614,12 +643,26 @@ pub fn delta_from_op(
             channel_id,
             seq,
             emoji,
-        } => reaction_delta(channel_id, seq, emoji, true, decode_stamp(assigned)?.participant()?, reader),
+        } => reaction_delta(
+            channel_id,
+            seq,
+            emoji,
+            true,
+            decode_stamp(assigned)?.participant()?,
+            reader,
+        ),
         ChatMsg::RemoveReaction {
             channel_id,
             seq,
             emoji,
-        } => reaction_delta(channel_id, seq, emoji, false, decode_stamp(assigned)?.participant()?, reader),
+        } => reaction_delta(
+            channel_id,
+            seq,
+            emoji,
+            false,
+            decode_stamp(assigned)?.participant()?,
+            reader,
+        ),
         ChatMsg::RegisterHook { .. } | ChatMsg::UnregisterHook { .. } => return Ok(None),
         ChatMsg::SetMembership {
             channel_id,
@@ -1471,7 +1514,9 @@ pub fn author_handle(author: &Party) -> String {
 /// the plain handle rendering of [`author_name`]. The reader's own writing is
 /// named exactly like anyone else's — by their account, never by a pronoun.
 pub fn author_display(author: &str, names: &NameDirectory) -> String {
-    names.of_handle(author).map_or_else(|| author_name(author), str::to_string)
+    names
+        .of_handle(author)
+        .map_or_else(|| author_name(author), str::to_string)
 }
 
 /// The display name for a rendered author string (`user:{id}`,
@@ -2345,10 +2390,25 @@ mod tests {
         // row's body never changes (the settle REPLACES the row and moves
         // `seq`), and every fresh send mints a fresh id — the field that does
         // move the seed.
-        let minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), ChatReader::nobody());
-        let re_minted = optimistic_message(Vec::new(), "hello".into(), "op1".into(), ChatReader::nobody());
+        let minted = optimistic_message(
+            Vec::new(),
+            "hello".into(),
+            "op1".into(),
+            ChatReader::nobody(),
+        );
+        let re_minted = optimistic_message(
+            Vec::new(),
+            "hello".into(),
+            "op1".into(),
+            ChatReader::nobody(),
+        );
         assert_eq!(minted[0].render_rev, re_minted[0].render_rev);
-        let other = optimistic_message(Vec::new(), "hello".into(), "op2".into(), ChatReader::nobody());
+        let other = optimistic_message(
+            Vec::new(),
+            "hello".into(),
+            "op2".into(),
+            ChatReader::nobody(),
+        );
         assert_ne!(minted[0].render_rev, other[0].render_rev);
     }
 
@@ -2382,9 +2442,27 @@ mod tests {
         let unbound = format!("user:{}", hex_encode(&[0xef; 32]));
         let my_passkey = format!("user:{}", hex_encode(&[0x11; 32]));
         let names = NameDirectory::new(BTreeMap::from([
-            (hex_encode(&me), BoundAccount { number: 1, name: "alice".into() }),
-            (hex_encode(&[0x11; 32]), BoundAccount { number: 1, name: "alice".into() }),
-            (hex_encode(&[0xcd; 32]), BoundAccount { number: 2, name: "bob".into() }),
+            (
+                hex_encode(&me),
+                BoundAccount {
+                    number: 1,
+                    name: "alice".into(),
+                },
+            ),
+            (
+                hex_encode(&[0x11; 32]),
+                BoundAccount {
+                    number: 1,
+                    name: "alice".into(),
+                },
+            ),
+            (
+                hex_encode(&[0xcd; 32]),
+                BoundAccount {
+                    number: 2,
+                    name: "bob".into(),
+                },
+            ),
         ]));
 
         // The reader's own writing carries their account name, like anyone's.
@@ -2394,7 +2472,10 @@ mod tests {
         assert_eq!(author_display(&unbound, &names), author_name(&unbound));
         assert!(author_name(&unbound).starts_with("user efefefef"));
         // No directory at all (the boot race) names everyone by handle.
-        assert_eq!(author_display(&mine, ChatReader::nobody().names), author_name(&mine));
+        assert_eq!(
+            author_display(&mine, ChatReader::nobody().names),
+            author_name(&mine)
+        );
         // An agent is never in the directory.
         assert_eq!(author_display("acct:5", &names), "account 5");
 
@@ -2410,7 +2491,10 @@ mod tests {
         // itself, or another key the same account holds.
         let reader = ChatReader::new(Some(&me), &names);
         assert!(reacted_by_reader(std::slice::from_ref(&mine), reader));
-        assert!(!reacted_by_reader(std::slice::from_ref(&my_passkey), reader));
+        assert!(!reacted_by_reader(
+            std::slice::from_ref(&my_passkey),
+            reader
+        ));
         assert!(reacted_by_reader(&["acct:1".into()], reader));
         assert!(!reacted_by_reader(std::slice::from_ref(&theirs), reader));
         assert!(!reacted_by_reader(&[mine], ChatReader::nobody()));
@@ -2698,10 +2782,7 @@ mod tests {
         let mentions = MentionCandidates::new(&directory(), &[]);
         let blocks = parse_message_with_mentions("ping @orthory about it", &mentions);
         // both of that account's keys, so the mention reaches the PERSON.
-        assert_eq!(
-            mention_parties(&blocks),
-            vec![Party::Account(2)]
-        );
+        assert_eq!(mention_parties(&blocks), vec![Party::Account(2)]);
         let Block::Paragraph(spans) = &blocks[0] else {
             panic!("paragraph expected");
         };
@@ -2845,7 +2926,10 @@ mod tests {
         let names = NameDirectory::default();
         let me = [0xab; 32];
         let someone_else = [0xcd; 32];
-        assert!(reacted_by_reader(&reactors, ChatReader::new(Some(&me), &names)));
+        assert!(reacted_by_reader(
+            &reactors,
+            ChatReader::new(Some(&me), &names)
+        ));
         assert!(!reacted_by_reader(
             &reactors,
             ChatReader::new(Some(&someone_else), &names)

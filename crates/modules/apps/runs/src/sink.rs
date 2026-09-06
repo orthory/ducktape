@@ -270,7 +270,10 @@ impl RunsModule {
                     );
                     return None;
                 }
-                match self.forge_branch_born(&*ctx, &forge, repo, source_branch).await {
+                match self
+                    .forge_branch_born(&*ctx, &forge, repo, source_branch)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         self.note(
@@ -351,7 +354,10 @@ impl RunsModule {
                 // "updated PR #n" breadcrumb stays honest even when the
                 // target was since deleted. born-in-committed-refs also
                 // implies the name normalizes (forge validates on push).
-                match self.forge_branch_born(&*ctx, &forge, repo, target_branch).await {
+                match self
+                    .forge_branch_born(&*ctx, &forge, repo, target_branch)
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => {
                         self.note(
@@ -524,7 +530,10 @@ mod tests {
     #[test]
     fn bound_item_title_never_degrades_to_a_generic_message() {
         let issue = "Use Forge issue titles for auto-published Agent PRs";
-        assert_eq!(derive_pr_title(Some(issue), "Apply agent changes", "run-1"), issue);
+        assert_eq!(
+            derive_pr_title(Some(issue), "Apply agent changes", "run-1"),
+            issue
+        );
     }
 
     #[test]
@@ -534,7 +543,10 @@ mod tests {
             "Useful response"
         );
         assert_eq!(derive_pr_title(None, "", "run-1"), "agent run run-1");
-        assert_eq!(derive_pr_title(None, "  \n\t\n", "run-1"), "agent run run-1");
+        assert_eq!(
+            derive_pr_title(None, "  \n\t\n", "run-1"),
+            "agent run run-1"
+        );
     }
 
     #[test]
@@ -579,7 +591,10 @@ mod tests {
         // guard keeps a regression from handing forge a rejectable op.
         let receipt = crate::facets::WorkspaceReceipt::default();
         let body = derive_pr_body(&"x".repeat(FORGE_BODY_BYTE_CAP), "r1", &receipt, "unknown");
-        assert!(body.len() <= FORGE_BODY_BYTE_CAP, "body stays inside forge's cap");
+        assert!(
+            body.len() <= FORGE_BODY_BYTE_CAP,
+            "body stays inside forge's cap"
+        );
         assert!(body.ends_with("---\nrun: r1\noutput: none\nnode: unknown"));
     }
 

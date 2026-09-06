@@ -10,9 +10,9 @@
 use chat::Chat;
 use chat::client::dm_channel_id;
 use chat::{
-    Party, Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS,
-    MAX_CHANNELS_PER_CREATOR, MAX_HOOKS_PER_CHANNEL, MAX_QUERY_LIMIT, Mark, PostPolicy, Span,
-    decode_event, decode_reply, encode_msg, encode_query, huddle_join_preimage,
+    Block, ChatEvent, ChatMsg, ChatQuery, ChatReply, HUDDLE_JOIN_NS, MAX_CHANNELS_PER_CREATOR,
+    MAX_HOOKS_PER_CHANNEL, MAX_QUERY_LIMIT, Mark, Party, PostPolicy, Span, decode_event,
+    decode_reply, encode_msg, encode_query, huddle_join_preimage,
 };
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
@@ -2650,21 +2650,6 @@ fn a_participant_opens_their_derived_dm_and_both_get_seated() {
             )
             .await
             .unwrap();
-        // seat both ends, exactly like `app::open_dm`'s follow-up writes.
-        for byte in [1u8, 2u8] {
-            module
-                .execute(
-                    &mut ctx_with_origin(11, user(1))
-                        .on_query("identity", identity_stub(pairs.clone())),
-                    &module_msg(ChatMsg::SetMembership {
-                        channel_id: expected_id.clone(),
-                        party: chat::Party::Account(byte as u64),
-                        member: true,
-                    }),
-                )
-                .await
-                .unwrap();
-        }
         module.commit_block().await.unwrap();
 
         let ChatReply::Channel(Some(channel)) = query(
@@ -2694,6 +2679,10 @@ fn a_participant_opens_their_derived_dm_and_both_get_seated() {
             alice_access.may_post && bob_access.may_post,
             "both ends must be seated"
         );
+        let ChatReply::Access(outsider_access) = query(&module, read_access(3)).await else {
+            panic!("access")
+        };
+        assert!(!outsider_access.may_post);
     });
 }
 

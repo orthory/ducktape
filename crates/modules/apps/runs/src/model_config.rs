@@ -353,9 +353,9 @@ impl RunsModule {
                     skills,
                 };
                 self.stage_model(record)?;
-                self.on_model_event(
+                self.apply_model_change(
                     ctx,
-                    ModelEvent::Registered {
+                    ModelChange::Registered {
                         agent_id,
                         capability,
                     },
@@ -378,9 +378,9 @@ impl RunsModule {
                 if let Some(capability) = capability {
                     validate_tag(&capability).map_err(Error::Module)?;
                     if capability != record.capability {
-                        self.on_model_event(
+                        self.apply_model_change(
                             ctx,
-                            ModelEvent::CapabilityChanged {
+                            ModelChange::CapabilityChanged {
                                 agent_id: agent_id.clone(),
                                 capability: capability.clone(),
                             },
@@ -416,7 +416,7 @@ impl RunsModule {
             ModelMsg::DeregisterModel { agent_id } => {
                 self.controlled_model(ctx, &agent_id).await?;
                 self.pending_models.insert(agent_id.clone(), None);
-                self.on_model_event(ctx, ModelEvent::Deregistered { agent_id })
+                self.apply_model_change(ctx, ModelChange::Deregistered { agent_id })
             }
         }
     }

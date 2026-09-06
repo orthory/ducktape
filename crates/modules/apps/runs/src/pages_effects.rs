@@ -1,32 +1,14 @@
-//! the pages effects lane (M2): `pages.comment` / `pages.set_checked` applied
-//! at the run boundary from the winning attempt (X2), alongside the chat/task
-//! follow-ups — but with PER-ACTION degrade: a pages action that fails its
-//! grant, cap, target resolution, payload validation, or any freshness probe
-//! is dropped with a breadcrumb while the run still DELIVERS (reply, other
-//! effects, finalize). that is deliberately narrower than the task lane's
-//! all-or-nothing validation — a page annotation is garnish, never worth
-//! failing a delivery over — and mirrors the PR sink's degrade discipline.
-//!
-//! every emitted op must be valid BY CONSTRUCTION (the no-fail rule: a
-//! follow-up pages would reject aborts the whole delivery block, forever).
-//! pages can reject an `AddComment`/`SetChecked` on: a missing/non-todo
-//! block, an oversized text, a squatted thread or comment id (both are
-//! client-mintable by anyone), a target-mismatched thread, and a full
-//! target (thread cap). each reject path is probed against committed pages
-//! state here first — the same discipline as chat's `probe_reply_postable`
-//! and the forge sink's branch probes.
-//!
-//! attribution: `AddComment` carries `as_agent` (pages refines the
-//! `Module("runs")` origin into `Party::Agent`, exactly like chat);
-//! `SetChecked` stores no author — a `Block` has no author field — so it is
-//! origin-gated only.
+//! Prepare page annotations under the model's grant. Invalid or stale page
+//! effects produce diagnostics while other valid result facets can proceed.
+//! The account's program later executes each prepared message, and pages stamps
+//! the actual account actor under its normal write gate.
 
 use std::collections::BTreeMap;
 
 use crate::CapRequest;
 
 use super::response::allows;
-use super::{AgentAction, ModelRecord, Ctx, Lane, Msg, PendingState, RunsModule};
+use super::{AgentAction, Ctx, Lane, ModelRecord, Msg, PendingState, RunsModule};
 use pages::{
     MAX_COMMENT_ID_BYTES, MAX_COMMENT_TARGET_BYTES, MAX_COMMENT_TEXT_BYTES, MAX_THREAD_ID_BYTES,
     MAX_THREADS_PER_TARGET, PageMsg, PageQuery, PageReply, encode_msg as pages_encode_msg,
@@ -205,9 +187,7 @@ impl RunsModule {
                         text: body.clone(),
                         anchor: None,
                         mentions: Vec::new(),
-                        // pages refines Module("runs") + as_agent into
-                        // Party::Agent — the same wire chat replies use.
-
+                        // The program call supplies the authenticated account actor.
                     }),
                 })
             }

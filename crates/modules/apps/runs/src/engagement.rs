@@ -52,17 +52,16 @@ impl RunsModule {
             ));
         }
         let run_request = change.source.module == self.id && change.source.kind == "run_request";
-        if run_request {
-            if let RunsMsg::RequestJobRun {
+        if run_request
+            && let RunsMsg::RequestJobRun {
                 agent_id: requested,
                 job_id,
             } = decode_msg(&change.detail).map_err(Error::Module)?
-            {
-                if requested != agent_id {
-                    return Err(Error::Module("job request names another model".into()));
-                }
-                return self.request_job_run(ctx, agent_id, job_id).await;
+        {
+            if requested != agent_id {
+                return Err(Error::Module("job request names another model".into()));
             }
+            return self.request_job_run(ctx, agent_id, job_id).await;
         }
         let run_id = format!("attributed/{change_seq}/{agent_id}");
         if self

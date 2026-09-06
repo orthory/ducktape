@@ -98,7 +98,7 @@ pub enum StagedRef {
 
 /// one repo's state: the committed branch map (feeds `root()`) plus node-local
 /// staging / catch-up scaffolding.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RepoState {
     /// write-through mirror of the COMMITTED born branches — `short_name ->
     /// head`. sorted (`BTreeMap`) so the root preimage composes

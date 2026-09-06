@@ -248,45 +248,45 @@ pub fn node_log_timeline<'a>(
         (true, false) => "No lines match this filter.",
     };
     let timeline: iced::Element<'_, NodeLogTimelineEvent> = log_timeline(
-            &state.timeline,
-            &state.visible,
-            node_log_timeline_config(),
-            "Node log",
-            |line| line.cursor.clone(),
-            |line| line.line.clone(),
-            |_, line, _selected| {
-                let parts = split_log_line(line.line.clone());
-                let level_color = match parts.level.as_str() {
-                    "ERROR" => DARK.palette.destructive,
-                    "WARN" => DARK.palette.warning,
-                    "INFO" => DARK.palette.success,
-                    "DEBUG" | "TRACE" => DARK.palette.muted_foreground,
-                    _ => Color::TRANSPARENT,
-                };
-                row![
-                    // 24 mono chars at size 11 (Geist Mono, 0.6 em advance)
-                    // need ~158 px; 150 let the tail paint over the level.
-                    text(parts.time)
-                        .size(11)
-                        .font(mono)
-                        .color(DARK.palette.muted_foreground)
-                        .width(170),
-                    text(parts.level)
-                        .size(11)
-                        .font(mono)
-                        .color(level_color)
-                        .width(48),
-                    text(parts.message)
-                        .size(11)
-                        .font(mono)
-                        .color(DARK.palette.foreground),
-                ]
-                .spacing(6)
-                .align_y(iced::Alignment::Center)
-                .into()
-            },
-            |event| event,
-            &DARK,
+        &state.timeline,
+        &state.visible,
+        node_log_timeline_config(),
+        "Node log",
+        |line| line.cursor.clone(),
+        |line| line.line.clone(),
+        |_, line, _selected| {
+            let parts = split_log_line(line.line.clone());
+            let level_color = match parts.level.as_str() {
+                "ERROR" => DARK.palette.destructive,
+                "WARN" => DARK.palette.warning,
+                "INFO" => DARK.palette.success,
+                "DEBUG" | "TRACE" => DARK.palette.muted_foreground,
+                _ => Color::TRANSPARENT,
+            };
+            row![
+                // 24 mono chars at size 11 (Geist Mono, 0.6 em advance)
+                // need ~158 px; 150 let the tail paint over the level.
+                text(parts.time)
+                    .size(11)
+                    .font(mono)
+                    .color(DARK.palette.muted_foreground)
+                    .width(170),
+                text(parts.level)
+                    .size(11)
+                    .font(mono)
+                    .color(level_color)
+                    .width(48),
+                text(parts.message)
+                    .size(11)
+                    .font(mono)
+                    .color(DARK.palette.foreground),
+            ]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into()
+        },
+        |event| event,
+        &DARK,
     );
     let body = iced::widget::stack![
         timeline,
@@ -423,7 +423,10 @@ pub fn split_log_line(line: String) -> LogParts {
     let timestamped =
         first.contains(':') && first.chars().next().is_some_and(|c| c.is_ascii_digit());
     let (time, level_field) = match timestamped {
-        true => (trim_time_to_millis(first), fields.next().unwrap_or_default()),
+        true => (
+            trim_time_to_millis(first),
+            fields.next().unwrap_or_default(),
+        ),
         false => (String::new(), first),
     };
     if !LEVELS.contains(&level_field) {
@@ -1045,7 +1048,7 @@ async fn module_code_by_id(client: &RpcClient) -> BTreeMap<String, serde_json::V
         .collect()
 }
 
-/// One registered agent, rendered from its registry record and live-run fact.
+/// One configured model, rendered with its live-run fact.
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct AgentRow {
     pub id: String,
@@ -1053,10 +1056,10 @@ pub struct AgentRow {
     pub initials: String,
     pub capability: String,
     pub status: String,
-    /// the external key shortened for display, else the origin's variant tag.
+    /// The current controller of the model's programmable account.
     pub owner_handle: String,
     /// this agent holds a RUN in flight right now — the runs module's pending
-    /// register, NOT `status`. `AgentStatus` is only Active|Paused and Active
+    /// register, NOT `status`. `ModelStatus` is only Active|Paused and Active
     /// is the registration default, so it says "not paused", never "working".
     pub live: bool,
     pub skill_count: i64,
@@ -1069,71 +1072,67 @@ pub struct AgentsData {
     pub agents: Vec<AgentRow>,
 }
 
-/// The owner origin rendered as a handle. An external origin carries raw key
-/// bytes; a module/system origin reads as its own name.
-fn agent_owner_handle(owner: &serde_json::Value) -> String {
-    let Some(tagged) = owner.as_object() else {
-        return owner.as_str().unwrap_or_default().to_string();
-    };
-    let Some((variant, payload)) = tagged.iter().next() else {
-        return String::new();
-    };
-    if variant != "external" {
-        return payload.as_str().unwrap_or(variant.as_str()).to_string();
-    }
-    short_label(&hex_encode(&json_bytes(payload)))
-}
-
-/// Load the agent roster from the canonical registry.
+/// Load model configurations with current account controllers and run activity.
+/// The model's registration origin does not change when control transfers.
 pub async fn load_agents(rpc: String, generation: i64) -> Result<AgentsData, HydrationError> {
     async {
         let client = rpc_client(&rpc)?;
-        let reply: serde_json::Value = client.query("agent", &serde_json::json!("agents")).await?;
-        let working = agents_with_a_run_in_flight(&client).await;
-        let agents = reply["agents"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let reply: runs::RunsReply = client
+            .query(
+                "runs",
+                &runs::RunsQuery::Model {
+                    query: runs::ModelQuery::Agents,
+                },
+            )
+            .await?;
+        let runs::RunsReply::Model(runs::ModelReply::Agents(records)) = reply else {
+            return Err("the runs module returned the wrong model roster reply".into());
+        };
+        let (accounts, working) =
+            tokio::join!(read_accounts(&client), agents_with_a_run_in_flight(&client));
+        let controllers: BTreeMap<u64, u64> = accounts?
             .into_iter()
-            .map(|record| {
-                let status = tagged_name(&record["status"]);
-                let owner_handle = agent_owner_handle(&record["owner"]);
-                let name = record["display_name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string();
-                let caps = &record["caps"];
-                let has_subagent_grant = caps["subagent_budget"].as_i64().unwrap_or(0) > 0;
-                let cap_count = [
-                    "forge_read",
-                    "forge_push",
-                    "duckfs_read",
-                    "duckfs_write",
-                    "tools",
-                    "secrets",
-                    "pages_write",
-                ]
-                .into_iter()
-                .map(|field| caps[field].as_array().map_or(0, Vec::len))
-                .sum::<usize>()
-                    + usize::from(has_subagent_grant);
-                let id = record["agent_id"].as_str().unwrap_or_default().to_string();
-                AgentRow {
-                    live: working.contains(&id),
-                    initials: initials_of(&name),
-                    capability: record["capability"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    skill_count: count_i64(record["skills"].as_array().map_or(0, Vec::len)),
-                    cap_count: count_i64(cap_count),
-                    id,
-                    name,
-                    status,
-                    owner_handle,
-                }
+            .filter_map(|account| match account.control {
+                identity::Control::Program { controller, .. }
+                | identity::Control::Revoked { controller } => Some((account.number, controller)),
+                identity::Control::Keys => None,
             })
             .collect();
+        let names = names();
+        let agents = records
+            .into_iter()
+            .map(|record| {
+                let status = match record.status {
+                    runs::ModelStatus::Active => "active",
+                    runs::ModelStatus::Paused => "paused",
+                }
+                .to_string();
+                let controller = controllers
+                    .get(&record.account)
+                    .ok_or_else(|| "the model account has no program controller".to_string())?;
+                let owner_handle = author_display(&format!("acct:{controller}"), &names);
+                let caps = &record.caps;
+                let cap_count = caps.forge_read.len()
+                    + caps.forge_push.len()
+                    + caps.duckfs_read.len()
+                    + caps.duckfs_write.len()
+                    + caps.tools.len()
+                    + caps.secrets.len()
+                    + caps.pages_write.len()
+                    + usize::from(caps.subagent_budget > 0);
+                Ok(AgentRow {
+                    live: working.contains(&record.agent_id),
+                    initials: initials_of(&record.display_name),
+                    capability: record.capability,
+                    skill_count: count_i64(record.skills.len()),
+                    cap_count: count_i64(cap_count),
+                    id: record.agent_id,
+                    name: record.display_name,
+                    status,
+                    owner_handle,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(AgentsData { generation, agents })
     }
     .await
@@ -1238,15 +1237,12 @@ pub async fn set_agent_status(
     async {
         let agent_id = required_id(agent_id, "agent")?;
         let rpc = rpc_client(&rpc)?;
-        // `AgentMsg` is snake_case-tagged serde over `sdk::wire` (plain JSON);
-        // the app does not depend on the agent crate, so the two owner-gated
-        // verbs are written as their wire form.
-        let verb = match paused {
-            true => "pause_agent",
-            false => "resume_agent",
+        let operation = match paused {
+            true => runs::ModelMsg::PauseModel { agent_id },
+            false => runs::ModelMsg::ResumeModel { agent_id },
         };
-        let payload = serde_json::json!({ verb: { "agent_id": agent_id } });
-        signed_write(&rpc, "agent", encode_wire(&payload), password).await
+        let payload = runs::encode_msg(&runs::RunsMsg::ConfigureModel { operation });
+        signed_write(&rpc, "runs", payload, password).await
     }
     .await
     .map_err(app_error)?;

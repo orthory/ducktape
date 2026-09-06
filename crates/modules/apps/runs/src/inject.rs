@@ -937,7 +937,14 @@ mod tests {
     #[test]
     fn a_rendered_page_link_carries_the_network_it_was_rendered_on() {
         let on_a_network = RunsModule::new(
-            "runs", "chat", "saga", "attribution", "dispatch", "agent", None, None,
+            "runs",
+            "chat",
+            "saga",
+            "attribution",
+            "dispatch",
+            "agent",
+            None,
+            None,
         )
         .with_chain_id("dognet#d0cdf950");
         assert_eq!(on_a_network.net_query(), TEST_NET);
@@ -951,7 +958,14 @@ mod tests {
         );
         // an unwired chain id (dev tools, tests) renders the hand-typed form.
         let nowhere = RunsModule::new(
-            "runs", "chat", "saga", "attribution", "dispatch", "agent", None, None,
+            "runs",
+            "chat",
+            "saga",
+            "attribution",
+            "dispatch",
+            "agent",
+            None,
+            None,
         );
         assert_eq!(nowhere.net_query(), "");
         let bare = render_pages_section(
@@ -970,6 +984,8 @@ mod tests {
             head: MessageHead {
                 message_id: "m1".into(),
                 author: chat::Party::Key(vec![1; 32]),
+                origin: sdk::Origin::External(vec![1; 32]),
+                content_origin: sdk::Origin::External(vec![1; 32]),
                 blocks: vec![
                     ChatBlock::paragraph("see [Plan](duck://page/plan)"),
                     ChatBlock::Code {
@@ -979,7 +995,7 @@ mod tests {
                 ],
                 created_at: 0,
                 rev: 0,
-            revision: 1,
+                revision: 1,
                 edited_at: None,
                 base_rev: None,
                 deleted: false,

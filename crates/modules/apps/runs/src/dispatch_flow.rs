@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 
 use super::{
-    ModelRecord, ModelStatus, CONTEXT_WINDOW, ChannelAccess, ChatQuery,
-    ChatReply, Ctx, DispatchMsg, DispatchQuery, DispatchReply, FilesQuery, FilesReply,
-    MAX_PAYLOAD_BYTES, MessageView, ModuleId, Msg, PendingState, PreparedDispatch, RunsModule,
-    RunOrigin, SiblingReadBudget, SkillRef, 
-    chat_decode_reply, chat_encode_query, dispatch_decode_reply, dispatch_encode_msg,
-    dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply, files_encode_query,
-    inject, recipe_id_for,
+    CONTEXT_WINDOW, ChannelAccess, ChatQuery, ChatReply, Ctx, DispatchMsg, DispatchQuery,
+    DispatchReply, FilesQuery, FilesReply, MAX_PAYLOAD_BYTES, MessageView, ModelRecord,
+    ModelStatus, ModuleId, Msg, PendingState, PreparedDispatch, RunOrigin, RunsModule,
+    SiblingReadBudget, SkillRef, chat_decode_reply, chat_encode_query, dispatch_decode_reply,
+    dispatch_encode_msg, dispatch_encode_query, dispatch_id_for, envelope, files_decode_reply,
+    files_encode_query, inject, recipe_id_for,
 };
 use crate::facets::WireSink;
 
@@ -299,11 +298,27 @@ impl RunsModule {
         extra: &[SkillRef],
         budget: &SiblingReadBudget,
     ) -> Result<PreparedDispatch, String> {
-        let generation = self.active_generation(ctx, agent.account).await.map_err(|e| e.to_string())?;
+        let generation = self
+            .active_generation(ctx, agent.account)
+            .await
+            .map_err(|e| e.to_string())?;
 
-        let bytes = ctx.query(&self.chat, &chat_encode_query(&ChatQuery::Access { channel_id: channel_id.into(), party: chat::Party::Account(agent.account) })).await.map_err(|error| error.to_string())?;
-        let ChatReply::Access(access) = chat_decode_reply(&bytes)? else { return Err("unexpected program channel access reply".into()); };
-        if !access.may_read { return Err("program may not read the requested channel".into()); }
+        let bytes = ctx
+            .query(
+                &self.chat,
+                &chat_encode_query(&ChatQuery::Access {
+                    channel_id: channel_id.into(),
+                    party: chat::Party::Account(agent.account),
+                }),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let ChatReply::Access(access) = chat_decode_reply(&bytes)? else {
+            return Err("unexpected program channel access reply".into());
+        };
+        if !access.may_read {
+            return Err("program may not read the requested channel".into());
+        }
         let (thread_root, transcript) = self.pin_context(ctx, channel_id, anchor_seq).await?;
         let mut portable = match super::forge_source::parse_forge_channel(channel_id) {
             Some(item_ref) => {
@@ -385,7 +400,10 @@ impl RunsModule {
         ordinal: u64,
         budget: &SiblingReadBudget,
     ) -> Result<PreparedDispatch, String> {
-        let generation = self.active_generation(ctx, agent.account).await.map_err(|e| e.to_string())?;
+        let generation = self
+            .active_generation(ctx, agent.account)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let pages = self
             .pages

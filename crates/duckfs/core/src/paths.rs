@@ -1,5 +1,5 @@
 //! path normalization and authority (task 4): NFC-normalized absolute paths,
-//! segment/depth/byte caps, and the `/home/<module-id>/**` write-authority
+//! segment/depth/byte caps, and the `/home/<principal>/**` write-authority
 //! rule over authenticated account, key, module, and system authority.
 
 use unicode_normalization::UnicodeNormalization;
@@ -83,8 +83,8 @@ pub fn is_namespace_root(segments: &[String]) -> bool {
     matches!(segments, [only] if only == "home" || only == "shared")
 }
 
-/// decide whether `owner` may write to the already-canonicalized `segments`.
-/// `system` writes anywhere; `/home/<o>/**` is writable only by `o`, and the
+/// Decide whether authenticated `authority` may write the canonical `segments`.
+/// System writes anywhere; a home uses its actor label or actual signer key, and the
 /// home root itself (`/home` or `/home/<o>`) is never a writable file — only
 /// paths strictly under it; `/shared/**` (≥ 2 segments) is writable by anyone;
 /// everything else (including the filesystem root) is rejected. authority never

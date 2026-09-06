@@ -12,7 +12,7 @@
 //! and dev-only conformance tests pin every mirror against the real forge
 //! codec so the wire cannot silently drift.
 
-use crate::{ModelRecord, CapRequest, SkillRef};
+use crate::{CapRequest, ModelRecord, SkillRef};
 use sdk::Ctx;
 use serde::{Deserialize, Serialize};
 
@@ -132,8 +132,8 @@ enum ItemReplyMirror {
 /// decode a `GetItem` reply: `Ok(None)` is a missing item, `Err` an
 /// unexpected reply shape.
 fn decode_item_reply(bytes: &[u8]) -> Result<Option<ForgeItem>, String> {
-    let ItemReplyMirror::Item(item) = serde_json::from_slice(bytes)
-        .map_err(|e| format!("undecodable forge item reply: {e}"))?;
+    let ItemReplyMirror::Item(item) =
+        serde_json::from_slice(bytes).map_err(|e| format!("undecodable forge item reply: {e}"))?;
     Ok(item)
 }
 
@@ -157,8 +157,8 @@ enum ItemsReplyMirror {
 /// decode a `ListItems` reply into item summaries (ascending by number — the
 /// tracker's listing order).
 fn decode_items_reply(bytes: &[u8]) -> Result<Vec<ForgeItemSummary>, String> {
-    let ItemsReplyMirror::Items(items) = serde_json::from_slice(bytes)
-        .map_err(|e| format!("undecodable forge items reply: {e}"))?;
+    let ItemsReplyMirror::Items(items) =
+        serde_json::from_slice(bytes).map_err(|e| format!("undecodable forge items reply: {e}"))?;
     Ok(items)
 }
 
@@ -180,8 +180,8 @@ enum RefsReplyMirror {
 
 /// decode a `ListRefs` reply into born branches with their tips.
 fn decode_refs_reply(bytes: &[u8]) -> Result<Vec<ForgeRefHead>, String> {
-    let RefsReplyMirror::Refs(refs) = serde_json::from_slice(bytes)
-        .map_err(|e| format!("undecodable forge refs reply: {e}"))?;
+    let RefsReplyMirror::Refs(refs) =
+        serde_json::from_slice(bytes).map_err(|e| format!("undecodable forge refs reply: {e}"))?;
     Ok(refs)
 }
 
@@ -232,11 +232,7 @@ impl RunsModule {
         };
         // 4. the pinned base commit + branch_born, from COMMITTED refs.
         let refs = self.forge_refs(ctx, &forge, repo).await?;
-        let tip = |name: &str| {
-            refs.iter()
-                .find(|r| r.name == name)
-                .map(|r| r.head.clone())
-        };
+        let tip = |name: &str| refs.iter().find(|r| r.name == name).map(|r| r.head.clone());
         let (commit, branch_born) = match tip(&branch) {
             // the branch is born: the session continues — fork ITS tip.
             Some(tip) => (tip, true),
