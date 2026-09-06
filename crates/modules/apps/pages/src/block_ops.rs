@@ -1,6 +1,6 @@
 use super::{
-    Block, BlockKind, MAX_PAGE_DEPTH, Origin, PageError, PageMsg, Pages, author_from_origin,
-    to_page_err,
+    Block, BlockKind, MAX_BLOCK_ID_BYTES, MAX_PAGE_DEPTH, Origin, PageError, PageMsg, Pages,
+    author_from_origin, id_is_index_safe, to_page_err,
 };
 use crate::text_ranges::{edit_between, rebase_marks, set_span_mark, utf16_len, validate_marks};
 
@@ -31,6 +31,9 @@ impl Pages {
                 after,
                 block,
             } => {
+                if block.id.len() > MAX_BLOCK_ID_BYTES || !id_is_index_safe(&block.id) {
+                    return Err(PageError::IdTooLarge);
+                }
                 // global uniqueness: the id must be absent from the WHOLE
                 // store, not just this page — that is what makes a bare block
                 // id addressable (and referenceable) without page context.

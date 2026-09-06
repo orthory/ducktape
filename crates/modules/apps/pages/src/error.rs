@@ -97,6 +97,12 @@ pub(super) enum PageError {
     TooManyComments,
     /// a target already holds [`MAX_THREADS_PER_TARGET`] threads.
     TooManyThreads,
+    /// the enumeration index already holds [`crate::MAX_PAGES`] pages.
+    TooManyPages,
+    /// a target's aggregate thread+comment work already sits at
+    /// [`MAX_COMMENT_WORK_PER_TARGET`] — the shared removal-work budget for
+    /// that target is spent, however many comments any single thread holds.
+    TooMuchCommentWork,
 }
 
 impl core::fmt::Display for PageError {
@@ -138,6 +144,8 @@ impl core::fmt::Display for PageError {
             PageError::IdTooLarge => "comment id or target too large",
             PageError::TooManyComments => "too many comments in thread",
             PageError::TooManyThreads => "too many threads on target",
+            PageError::TooManyPages => "too many pages",
+            PageError::TooMuchCommentWork => "target's comment/thread work exceeds the removal budget",
         };
         f.write_str(s)
     }
