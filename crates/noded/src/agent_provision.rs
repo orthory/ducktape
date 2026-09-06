@@ -37,6 +37,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use agent::is_skill_mount_name;
 use compute_service::{
     ProvisionedWorkspace, RoMount, SkillDoc, WorkspaceProvisioner, WorkspaceSource, WorkspaceSpec,
     assemble_context_doc, parse_skill_md,
@@ -189,18 +190,14 @@ fn run_slug(run_id: &str) -> String {
 }
 
 /// a W6 skill mount subpath is consensus-supplied data used as ONE host
-/// directory name — never a path. the envelope validates only non-emptiness
-/// (a `..` or `a/b` name would otherwise escape the ro root), so the trust
-/// boundary is HERE: a bounded charset, with `.`/`..` refused outright (both
-/// pass the charset alone).
+/// directory name — never a path. `agent::validate_skills` now enforces this
+/// exact shape at consensus time too, so a bad name is refused before it is
+/// ever committed; this call stays as the trust boundary of last resort (an
+/// older committed record, or a bug in the consensus-side check, must not
+/// let a `..` or `a/b` name escape the ro root). ONE predicate,
+/// [`agent::is_skill_mount_name`], gates both sides so they cannot drift.
 fn mount_dir_name(subpath: &str) -> Result<(), String> {
-    let safe = !subpath.is_empty()
-        && subpath != "."
-        && subpath != ".."
-        && subpath
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if safe {
+    if is_skill_mount_name(subpath) {
         Ok(())
     } else {
         Err(format!(
@@ -686,6 +683,37 @@ mod tests {
         }
         for good in ["skill", "my-skill_v2", "..dots.ok..", "A.B"] {
             assert!(mount_dir_name(good).is_ok(), "{good:?} must be admitted");
+        }
+    }
+
+    #[test]
+    fn mount_dir_name_agrees_with_the_consensus_side_predicate() {
+        // `agent::validate_skills` and this provisioner gate the SAME name
+        // shape through ONE function (`agent::is_skill_mount_name`) — this
+        // pins that `mount_dir_name` is nothing but a call into it, so the
+        // two can never drift apart again.
+        for name in [
+            "..",
+            ".",
+            "",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "name with space",
+            "name\0nul",
+            "skill",
+            "my-skill_v2",
+            "..dots.ok..",
+            "A.B",
+            "code review",
+            "qa",
+        ] {
+            assert_eq!(
+                mount_dir_name(name).is_ok(),
+                is_skill_mount_name(name),
+                "{name:?}: mount_dir_name and is_skill_mount_name disagree"
+            );
         }
     }
 
