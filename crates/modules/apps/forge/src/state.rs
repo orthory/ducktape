@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use chat::AuthorRef;
 use identity::{IdentityQuery, IdentityReply};
 use sdk::{Ctx, Error, Origin, StateRoot};
 use sha2::{Digest, Sha256};
@@ -371,7 +372,8 @@ impl ForgeState {
 
                 // the PR must be an open PR; pull its branches.
                 let (source, target) = self.tracker_view().pr_branches(&name, number)?;
-                self.require_merge_owner(&name, &target, &principal)?;
+                let actor = author_from_origin(&ctx.env().origin)?;
+                self.require_merge_authorized(&name, &target, number, &actor, &principal)?;
 
                 // double CAS on COMMITTED refs: the target must not have moved
                 // under the merger, and the merge must have been computed
@@ -595,19 +597,42 @@ impl ForgeState {
         }
     }
 
-    /// refuse a merge onto a PROTECTED target branch from anyone but the repo
-    /// owner. `MergePr` is a SECOND raw ref-move door: `merge_oid` is
-    /// client-computed and its parentage is unverifiable in consensus, and
-    /// `OpenPr` lets any member open a PR onto `main` — so gating `PushRefs`
-    /// alone would close nothing.
-    fn require_merge_owner(&self, name: &str, target: &str, principal: &[u8]) -> Result<(), Error> {
-        if !is_protected_branch(target) {
-            return Ok(());
+    /// gate a `MergePr`. `MergePr` is a SECOND raw ref-move door: `merge_oid`
+    /// is client-computed and its parentage is unverifiable in consensus, and
+    /// `OpenPr` lets any member open a PR onto any target — so gating
+    /// `PushRefs` alone would close nothing.
+    ///
+    /// a PROTECTED target keeps the stricter, unchanged rule: the repo owner
+    /// only. every other target opens to whoever forge already vouches for on
+    /// this PR — its author, one of its reviewers, or the repo owner — so a
+    /// stranger with no standing on the PR cannot force a terminal `Merged`
+    /// onto someone else's branch.
+    fn require_merge_authorized(
+        &self,
+        name: &str,
+        target: &str,
+        number: u64,
+        actor: &AuthorRef,
+        principal: &[u8],
+    ) -> Result<(), Error> {
+        let owner = self.tracker_view().owner(name);
+        let is_owner = owner == Some(principal);
+        if is_protected_branch(target) {
+            return if is_owner {
+                Ok(())
+            } else {
+                Err(Error::Module(format!(
+                    "forge: only the owner of repo {name:?} may merge onto protected branch \
+                     {target:?}"
+                )))
+            };
         }
-        if self.tracker_view().owner(name) != Some(principal) {
+        let (author, reviewers) = self.tracker_view().pr_participants(name, number)?;
+        let may_merge = actor == &author || reviewers.contains(actor) || is_owner;
+        if !may_merge {
             return Err(Error::Module(format!(
-                "forge: only the owner of repo {name:?} may merge onto protected branch \
-                 {target:?}"
+                "forge: only pull request #{number}'s author, a reviewer, or the owner of repo \
+                 {name:?} may merge it"
             )));
         }
         Ok(())

@@ -35,6 +35,15 @@ pub const MAX_PATH_BYTES: usize = 512;
 pub const MAX_REFS_PER_PUSH: usize = 32;
 /// reviews per PR; further submissions are rejected.
 pub const MAX_REVIEWS_PER_ITEM: usize = 256;
+/// OPEN issues + PRs a repo may hold at once (they share one number space, so
+/// one ceiling covers both). closing or merging an item frees its slot —
+/// there is no delete op, so this is the whole of the defense against an
+/// unbounded number of live items.
+pub const MAX_OPEN_ITEMS_PER_REPO: usize = 4096;
+/// one actor's share of [`MAX_OPEN_ITEMS_PER_REPO`]: no single account may
+/// hold more than this many OPEN items in one repo, so the repo cap cannot be
+/// filled by one account crowding out everyone else.
+pub const MAX_OPEN_ITEMS_PER_ACTOR: usize = 256;
 
 /// an item's lifecycle state. `Merged` is PR-only and terminal.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
