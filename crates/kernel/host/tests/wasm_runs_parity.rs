@@ -840,6 +840,19 @@ fn rejections_match_and_leave_no_trace() {
         let mut native = native_host(&context, native_files).await;
         let mut wasm = wasm_host_(&context, wasm_files).await;
 
+        // an open "general" channel so alice's own chat standing admits the
+        // RequestRun rejection case below past the #1630 admission gate —
+        // it must fail on the UNKNOWN AGENT it names, not on access.
+        roundtrip(
+            &mut native,
+            &mut wasm,
+            1,
+            alice(),
+            create_channel("general"),
+            false,
+        )
+        .await;
+
         // every distinct refusal family the runs module implements on its
         // root-op surface: admin-origin gates, field validation, the reserved
         // separator, unknown agents/runs, the session lane's key/lease/ACL
@@ -960,7 +973,7 @@ fn rejections_match_and_leave_no_trace() {
         ];
 
         for (height, (origin, m, needle)) in rejects.into_iter().enumerate() {
-            let height = height as u64 + 1;
+            let height = height as u64 + 2;
             reject_roundtrip(&mut native, &mut wasm, height, origin, m, needle).await;
         }
     });
