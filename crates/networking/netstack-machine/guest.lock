@@ -123,7 +123,7 @@ dependencies = [
 [[package]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#faa5aead2e21dabc473448aa564a2813524f81bd"
+source = "git+https://github.com/orthory/ducktape#a783f9ccd6b1a0c2977799462eafd8d9376970dd"
 dependencies = [
  "cc",
  "glob",
@@ -790,17 +790,17 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#faa5aead2e21dabc473448aa564a2813524f81bd"
+source = "git+https://github.com/orthory/ducktape#a783f9ccd6b1a0c2977799462eafd8d9376970dd"
 
 [[package]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#faa5aead2e21dabc473448aa564a2813524f81bd"
+source = "git+https://github.com/orthory/ducktape#a783f9ccd6b1a0c2977799462eafd8d9376970dd"
 
 [[package]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#faa5aead2e21dabc473448aa564a2813524f81bd"
+source = "git+https://github.com/orthory/ducktape#a783f9ccd6b1a0c2977799462eafd8d9376970dd"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -959,9 +959,10 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "nat-traversal"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#faa5aead2e21dabc473448aa564a2813524f81bd"
+source = "git+https://github.com/orthory/ducktape#a783f9ccd6b1a0c2977799462eafd8d9376970dd"
 dependencies = [
  "arrayvec",
+ "blake3",
  "borsh",
  "commonware-codec",
  "commonware-cryptography",
@@ -973,7 +974,7 @@ dependencies = [
 [[package]]
 name = "netstack-machine"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#faa5aead2e21dabc473448aa564a2813524f81bd"
+source = "git+https://github.com/orthory/ducktape#a783f9ccd6b1a0c2977799462eafd8d9376970dd"
 dependencies = [
  "borsh",
  "commonware-codec",
@@ -1763,7 +1764,7 @@ dependencies = [
 [[package]]
 name = "wireguard"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#faa5aead2e21dabc473448aa564a2813524f81bd"
+source = "git+https://github.com/orthory/ducktape#a783f9ccd6b1a0c2977799462eafd8d9376970dd"
 dependencies = [
  "borsh",
  "commonware-codec",
