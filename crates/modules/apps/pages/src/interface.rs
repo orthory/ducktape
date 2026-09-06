@@ -230,12 +230,28 @@ pub enum PageMsg {
 
 // write-time caps for comments (consensus constants) — enforced before staging.
 pub const MAX_COMMENT_TEXT_BYTES: usize = 64 * 1024;
-// One target index read + one thread read leave this many comment records
-// inside the subtree-removal work budget. An otherwise-empty target with one
-// full thread stays directly removable; larger targets can first shed the
-// thread because its last-live delete also stays below the wasm read ceiling.
+/// per-thread ceiling: a single thread's own comment count never overruns
+/// the target-level budget below by itself.
 pub const MAX_COMMENTS_PER_THREAD: usize = 3_498;
+/// per-target ceiling on distinct threads: a coarse early-exit ahead of the
+/// aggregate cap below (any target already past [`MAX_COMMENT_WORK_PER_TARGET`]
+/// hits that check first).
 pub const MAX_THREADS_PER_TARGET: usize = 1024;
+/// AGGREGATE cap on a target's thread+comment work: `AddComment` refuses a
+/// new thread or a reply once `threads_on_target + comments_on_target` would
+/// reach this. This is what `preflight_subtree_removal` (store.rs) actually
+/// charges a target's owning block for — thread_ids.len() (one per thread)
+/// plus every thread's comment_ids.len() — so capping the SUM (not just one
+/// thread, or thread *count*) is what keeps that charge bounded regardless of
+/// how many accounts open threads on the target. Sized to leave headroom in the
+/// removal work budget (`MAX_TRAVERSAL_WORK`, 3500) for the block record
+/// itself and its own children: 1 (block) + 3000 (this cap) = 3001, leaving
+/// 499 for children —
+/// comments alone can never push a target's owning block over budget. A page
+/// author's own block already carrying more than 499 children was already
+/// exempt from this fix's guarantee (an existing, unrelated limit on wide
+/// blocks, not something comments can trigger).
+pub const MAX_COMMENT_WORK_PER_TARGET: usize = 3_000;
 /// per-request target cap on the index tier's grouped thread read.
 pub const MAX_QUERY_TARGETS: usize = 512;
 pub const MAX_SPAN_MARKS_PER_BLOCK: usize = 4096;
