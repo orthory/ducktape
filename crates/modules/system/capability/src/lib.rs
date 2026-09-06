@@ -914,11 +914,6 @@ mod tests {
         );
     }
 
-    /// a node that announced while it had standing and then lost it (left
-    /// the valset, was revoked, or its resident grant expired) is dropped by
-    /// the READ side — nothing removes its stale roster record, but the
-    /// query re-checks standing every time (issue #1723). a node that still
-    /// holds standing is unaffected.
     #[test]
     fn an_empty_roster_answers_without_valset_but_cannot_announce() {
         let mut registry = CapabilityRegistry::new(
@@ -934,6 +929,8 @@ mod tests {
         );
     }
 
+    /// A node that loses standing is excluded from provider queries even if
+    /// its announcement remains stored. Nodes with standing still appear.
     #[test]
     fn providers_excludes_a_node_that_lost_standing_after_announcing() {
         let mut c = CapabilityRegistry::new(
