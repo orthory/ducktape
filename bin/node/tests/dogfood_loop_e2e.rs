@@ -34,10 +34,11 @@
 //!
 //! It used to end with an ordering proof: the provider script itself advanced
 //! the work branch through the node's loopback forge remote, so the host's push
-//! rejected and the provisioner had to rebase. A run's container has no route
-//! to its own node — the egress firewall allows this run's broker port and
-//! nothing else — so a provider CANNOT race a push any more, and a scenario
-//! that cannot happen is not a regression this suite can hold. The property
+//! rejected and the provisioner had to rebase. A run's guest has no route to
+//! its own node — it gets no tap device at all, and its vsock tunnels reach
+//! only its broker port and the run RPC — so a provider CANNOT race a push
+//! any more, and a scenario that cannot happen is not a regression this suite
+//! can hold. The property
 //! itself is covered where it lives, against the provisioner:
 //! `crates/noded/src/agent_provision/forge_tests.rs`'s
 //! `a_concurrent_advance_is_rebased_under_the_runs_work_and_pushed` (plus the

@@ -167,7 +167,7 @@ on workspace_connected(next)
   return if next.generation != connect_generation
   rpc = next.rpc
   connected_rpc = next.rpc
-  network_name = network_label(account_name, connected_rpc)
+  network_name = network_label(network_chain_id, connected_rpc)
   status = next.status
   block_height = next.height
   channels = next.channels
@@ -360,6 +360,13 @@ on live_updated(next)
           from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", dm_peers_generation)
           try request -> done request
           done -> dm_peers_load_selected _
+        // An identity op moves the name directory, and every chat label on
+        // screen is rendered through it — so the chat plane is re-read the
+        // way a resync reads it, names first.
+        flow
+          from done load_request(plane_live_hit(next.kind, next.module, "identity"), connected_rpc, "", hydration_generation)
+          try request -> done request
+          done -> names_moved_selected _
         flow
           from done load_request(agents_plane_hit(next.kind, next.module), connected_rpc, "", agents_generation)
           try request -> done request
@@ -872,6 +879,13 @@ on dm_peers_load_selected(request)
   return if obsolete_request
   run replace lane=dm_peers_load load_dm_peers(request.rpc, request.generation) -> dm_peers_loaded _ | dm_peers_failed _
 
+on names_moved_selected(request)
+  let obsolete_request = request.rpc != connected_rpc || request.generation != hydration_generation
+  return if obsolete_request
+  hydration_generation = hydration_generation + 1
+  hydration_retry_attempt = 0
+  run replace lane=live_resync live_resync_load(connected_rpc, active_channel, active_page, resync_planes(true, false), false, hydration_generation, pages_fold_serial, 0) -> live_resynced _ | live_resync_failed _
+
 on forge_load_selected(request)
   let obsolete_request = request.rpc != connected_rpc || request.generation != forge_generation
   let unmounted = shell_tab != ShellTab.forge
@@ -971,6 +985,14 @@ subscribe
   // on purpose: both chords have to work on the launch window too.
   keyboard modifiers -> modifier_state_changed _
   keyboard press status=ignored when cmd_held -> command_chord_pressed _
+  // ⌘C FOR THE CHAT'S COPY RANGE, armed by the range itself AND by the tab it
+  // belongs to. A reader with nothing selected has no such route at all —
+  // which is why this is not an arm on the quit/close chord, whose route is
+  // armed by ⌘ alone and so runs on every screen. The tab term is the same
+  // rule applied twice: a range left standing in chat must not tax a keystroke
+  // typed in Pages, Forge or the console. `status=ignored` keeps a focused
+  // field's own copy.
+  keyboard press status=ignored when (copy_anchor_seq > 0 && shell_tab == ShellTab.chat) -> copy_chord_pressed _
   // WHICH window ⌘W closes. The OS says which one has focus; guessing (the
   // console, the last opened) would close a window nobody was looking at.
   window focused with-id -> window_focused _
@@ -1041,6 +1063,7 @@ on tray_quit
 // for anything else.
 on modifier_state_changed(mods)
   cmd_held = command_held(mods)
+  shift_held = shift_held(mods)
 
 // THE LAUNCH WINDOW'S OWN CHROME. It is undecorated (app.ice), so the rail at
 // the top of `HubColumn` carries what the OS strip used to: a press anywhere

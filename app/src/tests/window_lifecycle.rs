@@ -148,10 +148,15 @@ fn the_quit_route_is_armed_by_the_modifier_stream() {
         CORE_STATE.contains("cmd_held = false"),
         "cmd_held is no longer plain state"
     );
+    // ARMING, AND NOTHING ELSE. Both lines are the same cheap fact off the
+    // same stream — ⌘ arms the quit/close chord, ⇧ is read by the chat's
+    // shift-click, and a press carries no modifiers of its own. A THIRD kind
+    // of statement here is the thing this guards: the stream fires on every
+    // modifier transition, so work done in it is work done constantly.
     let armed = handler("modifier_state_changed");
     assert_eq!(
         armed.trim(),
-        "cmd_held = command_held(mods)",
+        "cmd_held = command_held(mods)\n  shift_held = shift_held(mods)",
         "the arming handler does more than arm: {armed}"
     );
 }

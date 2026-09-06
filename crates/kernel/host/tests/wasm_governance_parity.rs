@@ -548,7 +548,9 @@ async fn same_ops_inner(context: &deterministic::Context) {
             GovAction::UpdateModule {
                 name: "hello-replacement".into(),
                 module_id: "hello".into(),
-                activation_height: 500,
+                // execute lands at height 16 below; 16 + 484 = 500, matching
+                // the pending.activation_height assertion further down.
+                activation_lead: 484,
                 code_hash: vec![0xBB; 32],
             },
             500,
@@ -735,7 +737,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 GovAction::UpdateModule {
                     name: "n".into(),
                     module_id: String::new(),
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: vec![0xBB; 32],
                 },
                 5,
@@ -749,7 +751,7 @@ async fn rejections_inner(context: &deterministic::Context) {
                 GovAction::UpdateModule {
                     name: "n".into(),
                     module_id: "hello".into(),
-                    activation_height: 500,
+                    activation_lead: 500,
                     code_hash: vec![0xBB; 8],
                 },
                 5,

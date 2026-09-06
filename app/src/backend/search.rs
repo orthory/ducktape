@@ -367,7 +367,7 @@ async fn search_forge_items(rpc: &str, needle: &str) -> Option<Vec<ExplorerHit>>
     // ever carries enough repos for the burst to matter, bound it with a
     // semaphore or chunk the iterator — do not go back to serial.
     let client = &client;
-    let names = account_names(client).await;
+    let names = names();
     let loaded = iced::futures::future::join_all(repos.iter().map(|repo| async move {
         client
             .query::<_, serde_json::Value>(

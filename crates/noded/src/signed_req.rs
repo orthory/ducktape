@@ -76,20 +76,17 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use commonware_codec::DecodeExt as _;
-use commonware_cryptography::{Signer as _, Verifier as _, ed25519};
-use sha2::{Digest as _, Sha256};
+use commonware_cryptography::{Verifier as _, ed25519};
 
 use crate::NodeHandle;
 
-/// PoP signing namespace for the mutating data plane.
-pub const DATA_REQ_NS: &[u8] = b"ducktape-data-req-v1";
-
-/// hex ed25519 public key (32 bytes) of the acting identity.
-pub const KEY_HEADER: &str = "x-ducktape-key";
-/// decimal unix seconds the request was signed at.
-pub const TS_HEADER: &str = "x-ducktape-ts";
-/// hex ed25519 signature (64 bytes) over the canonical request bytes.
-pub const SIG_HEADER: &str = "x-ducktape-sig";
+/// the CLIENT half — the namespace, the header trio, the canonical message
+/// and the signing — lives with the kernel's frame codec so every signer in
+/// the tree links the one spelling the daemon verifies against.
+pub use ::node::signed_req::{
+    DATA_REQ_NS, KEY_HEADER, SIG_HEADER, TS_HEADER, now_secs, request_headers, request_message,
+    sign_request,
+};
 
 /// the header trio one namespace's PoP travels in. control and data use
 /// different names so a control credential can never be replayed onto a data
@@ -118,14 +115,6 @@ pub const FRESHNESS_SECS: u64 = 30;
 /// filter string. Spelled here because the middleware runs OUTSIDE the route's
 /// layers and so cannot read the limit they install.
 const DEFAULT_JSON_BODY_BYTES: usize = 2 * 1024 * 1024;
-
-/// wall-clock seconds since the Unix epoch (saturating before 1970).
-pub(crate) fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PopError {
@@ -186,74 +175,6 @@ pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
-}
-
-/// the canonical bytes a data-plane request's PoP signs / verifies: method,
-/// path+query, the TARGET NODE's consensus key, the timestamp, and the sha256
-/// of the BODY. the body digest is what the control plane's message omits, and
-/// it is the difference that matters here: these routes carry the payload the
-/// mutation applies, so a signature that did not cover it would authenticate a
-/// caller while leaving an attacker free to swap what they wrote.
-///
-/// PUBLIC so a client signs the exact bytes the node verifies — one source of
-/// truth, never a reconstruction.
-pub fn request_message(
-    method: &str,
-    path_and_query: &str,
-    node_key: &[u8],
-    ts: u64,
-    body: &[u8],
-) -> Vec<u8> {
-    let digest = Sha256::digest(body);
-    let digest = digest.as_slice();
-    let mut m = Vec::with_capacity(method.len() + path_and_query.len() + node_key.len() + 45);
-    m.extend_from_slice(method.as_bytes());
-    m.push(0x1f);
-    m.extend_from_slice(path_and_query.as_bytes());
-    m.push(0x1f);
-    m.extend_from_slice(node_key);
-    m.push(0x1f);
-    m.extend_from_slice(&ts.to_be_bytes());
-    m.push(0x1f);
-    m.extend_from_slice(digest);
-    m
-}
-
-/// sign one data-plane request with an acting key, bound to the target node.
-pub fn sign_request(
-    signer: &ed25519::PrivateKey,
-    method: &str,
-    path_and_query: &str,
-    node_key: &[u8],
-    ts: u64,
-    body: &[u8],
-) -> ed25519::Signature {
-    signer.sign(
-        DATA_REQ_NS,
-        &request_message(method, path_and_query, node_key, ts, body),
-    )
-}
-
-/// the three headers a client attaches to a mutating request, ready to set
-/// verbatim. every in-tree writer goes through THIS — a second place that
-/// spells the trio is a second place to get the binding wrong.
-pub fn request_headers(
-    signer: &ed25519::PrivateKey,
-    method: &str,
-    path_and_query: &str,
-    node_key: &[u8],
-    body: &[u8],
-) -> [(&'static str, String); 3] {
-    let ts = now_secs();
-    let sig = sign_request(signer, method, path_and_query, node_key, ts, body);
-    [
-        (
-            KEY_HEADER,
-            duckfs_core::to_hex(signer.public_key().as_ref()),
-        ),
-        (TS_HEADER, ts.to_string()),
-        (SIG_HEADER, duckfs_core::to_hex(sig.as_ref())),
-    ]
 }
 
 /// the mark [`signed_write_guard`] puts on a request that arrived from a
@@ -674,6 +595,7 @@ pub(crate) fn acting_origin(signed: Option<&SignedBy>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use commonware_cryptography::Signer as _;
 
     fn key(seed: u64) -> ed25519::PrivateKey {
         ed25519::PrivateKey::from_seed(seed)
