@@ -184,7 +184,7 @@ pub fn pin(args: PinArgs) -> Result<(), CliError> {
 pub fn unpin(args: UnpinArgs) -> Result<(), CliError> {
     use duckfs_client::api::{ApiError, NodeApi};
 
-    let node = signing_node(&args.addr, Path::new("."), args.key)?;
+    let node = signing_node(&args.addr, Path::new("."), args.key, args.trust_node)?;
     node.unpin(&args.name).map_err(|e| match e {
         ApiError::NotFound => CliError::failed("pin not found"),
         ApiError::Rejected(m) => CliError::failed(m),

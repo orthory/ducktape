@@ -199,6 +199,10 @@ pub(crate) struct UnpinArgs {
     /// the user key that signs the write (default: the active wallet)
     #[arg(long, value_name = "PATH")]
     pub key: Option<std::path::PathBuf>,
+    /// re-pin this node's identity to whatever it answers with now — the
+    /// only way an already-trusted key changes (see `known_nodes`)
+    #[arg(long)]
+    pub trust_node: bool,
 }
 
 /// `main` installs a subscriber only for `node run`, so a one-shot verb would
