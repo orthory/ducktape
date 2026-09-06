@@ -87,6 +87,13 @@ pub const MAX_ACCOUNTS: u64 = 65_536;
 /// record past the cap is refused loudly and deterministically instead of
 /// poisoning the sync wire.
 pub const MAX_ACCOUNT_RECORD_BYTES: usize = 512 * 1024;
+/// keys one account may associate. the byte cap alone would allow ~11k of
+/// them (a key entry is the pubkey plus its meta, well under 128 bytes), and
+/// EVERY `OfKey`/`All` reader decodes the whole set -- so the association is
+/// bounded by count too: 32 keys x ~128 bytes is ~4 KiB, three orders of
+/// magnitude under [`MAX_ACCOUNT_RECORD_BYTES`]. a person's devices, wallets
+/// and passkeys fit; a scripted key farm does not.
+pub const MAX_KEYS_PER_ACCOUNT: usize = 32;
 
 /// per-account record key: prefix + 0 + the number, little-endian.
 fn acct_key(number: AccountNumber) -> Vec<u8> {
@@ -475,6 +482,12 @@ impl Identity {
             )));
         }
         let mut record = self.stored_account(number).await?;
+        let full = record.keys.len() >= MAX_KEYS_PER_ACCOUNT;
+        if full {
+            return Err(Error::Module(format!(
+                "account key cap reached ({MAX_KEYS_PER_ACCOUNT})"
+            )));
+        }
         let authorizer_scheme = record
             .keys
             .get(&authorizer.key)
