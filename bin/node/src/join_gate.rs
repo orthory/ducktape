@@ -254,9 +254,13 @@ pub fn decode_intro_ack(b: &[u8]) -> Result<IntroAck, String> {
 /// gating member's wall clock before [`verify_intro`] refuses the intro as
 /// stale — a captured sealed datagram is opaque and needs no key material to
 /// replay, so this is the only thing bounding how long a replay repoints the
-/// inviter's tunnel endpoint. The joiner re-signs a fresh intro every poll,
-/// so 60 s is plenty of slack for clock skew and network delay.
-pub const INTRO_FRESHNESS_SECS: u64 = 60;
+/// inviter's tunnel endpoint. The joiner builds its intro ONCE per race and
+/// retransmits the SAME signed bytes for up to the join race window
+/// (`reachability::INVITE_JOIN_WINDOW_MS`, 90 s) — every retransmit inside
+/// that race must still verify, so this MUST exceed the whole window plus
+/// clock skew, not just one retransmit interval. Twice the race window is
+/// comfortable slack.
+pub const INTRO_FRESHNESS_SECS: u64 = 2 * (reachability::INVITE_JOIN_WINDOW_MS / 1_000);
 
 /// the reason token a stale or future-dated intro is refused with.
 pub const INTRO_STALE: &str = "intro_stale";
@@ -520,13 +524,21 @@ mod tests {
         let joiner = ed25519::PrivateKey::from_seed(2);
         let token = mint_for(&issuer);
 
-        let stale = intro_request(&joiner, BINDING, &token, WG_KEY, NOW - 120);
+        let beyond = INTRO_FRESHNESS_SECS + 1;
+        let stale = intro_request(&joiner, BINDING, &token, WG_KEY, NOW - beyond);
         let err = verify_intro(&stale, BINDING, NOW).expect_err("refused");
         assert_eq!(err, INTRO_STALE);
 
-        let future = intro_request(&joiner, BINDING, &token, WG_KEY, NOW + 120);
+        let future = intro_request(&joiner, BINDING, &token, WG_KEY, NOW + beyond);
         let err = verify_intro(&future, BINDING, NOW).expect_err("refused");
         assert_eq!(err, INTRO_STALE);
+
+        // inside the bound (e.g. a retransmit late in the join race) still
+        // verifies — this is exactly what makes the window wide enough for
+        // the once-signed intro this joiner retransmits for the whole race.
+        let late_in_race =
+            intro_request(&joiner, BINDING, &token, WG_KEY, NOW - INTRO_FRESHNESS_SECS);
+        assert!(verify_intro(&late_in_race, BINDING, NOW).is_ok());
 
         let fresh = intro_request(&joiner, BINDING, &token, WG_KEY, NOW);
         assert!(verify_intro(&fresh, BINDING, NOW).is_ok());
