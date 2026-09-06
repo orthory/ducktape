@@ -86,6 +86,11 @@ struct CredEntry {
     refresh_gate: tokio::sync::Mutex<()>,
 }
 
+/// Replay-set key: the credential name plus the session's own ephemeral pk
+/// (base64), so a set is never shared across two different sessions of the
+/// same credential.
+type ReplayKey = (String, String);
+
 struct AppState {
     seal_kp: SealKeypair,
     sess_sk: SigningKey,
@@ -106,15 +111,23 @@ struct AppState {
     /// The boundary is [`AppState::grant_check`], which decides who may open a
     /// session at all.
     budgets: Mutex<HashMap<String, u32>>,
-    /// Per-name sealed-request nonces already served — replay dedupe. It lives
-    /// with the session whose replays it catches: a `/session` open refills the
-    /// budget and CLEARS this set, and an entry only ever lands beside a spent
-    /// request (the nonce is recorded after the AEAD opened the blob and after
-    /// the budget spend), so it holds at most `max_requests` entries per name.
-    /// Both orderings are the bound — recording an unauthenticated 12-byte
-    /// prefix let anyone holding a bearer grow this map for free, forever.
-    /// Dies with the process like every key.
-    seen_nonces: Mutex<HashMap<String, std::collections::HashSet<Vec<u8>>>>,
+    /// Sealed-request nonces already served — replay dedupe, keyed by
+    /// `(sub, eph)`: the credential name PLUS the session's own ephemeral pk,
+    /// not the name alone. A bearer minted for one session stays live for the
+    /// full TTL regardless of how many other `/session` calls that credential
+    /// name sees, so the set a bearer's replays are checked against must only
+    /// ever be cleared by that SAME session's own token expiring — never by a
+    /// later, unrelated `/session` open (which mints a fresh `eph` and so gets
+    /// its own, empty entry here). An entry lands beside a spent request (the
+    /// nonce is recorded after the AEAD opened the blob and after the budget
+    /// spend), so each session's entry holds at most `max_requests` nonces;
+    /// recording an unauthenticated 12-byte prefix would let anyone holding a
+    /// bearer grow this map for free, forever.
+    /// ponytail: entries for a forgotten session are pruned only on
+    /// credential removal, not on token expiry, so a credential lent to many
+    /// short sessions accumulates one small entry per session for the life of
+    /// the process; add TTL-keyed eviction if that growth ever matters.
+    seen_nonces: Mutex<HashMap<ReplayKey, std::collections::HashSet<Vec<u8>>>>,
     /// The co-hosted-lending grant gate (see [`GrantCheck`]). `None` on gateways
     /// that never lend, where every known credential opens without a grant check.
     grant_check: Option<GrantCheck>,
@@ -685,7 +698,7 @@ fn adopt_credential(st: &AppState, name: &str, kind: CredentialKind, payload: Cr
 fn forget_credential(st: &AppState, name: &str) {
     st.creds.lock().unwrap().remove(name);
     st.budgets.lock().unwrap().remove(name);
-    st.seen_nonces.lock().unwrap().remove(name);
+    st.seen_nonces.lock().unwrap().retain(|(sub, _eph), _| sub != name);
 }
 
 async fn session(
@@ -740,15 +753,15 @@ async fn session(
         eph: req.client_eph_pk_b64.clone(),
         seal: req.body_seal,
     };
-    // The replay window opens with the budget it is bounded by: this refill is
-    // what makes another `max_requests` sealed bodies spendable, so the set of
-    // nonces those must be distinct from starts empty here. What a clearing
-    // lets through is a blob resealed under THIS session's request key, which
-    // is derived from the caller's own ephemeral secret — so replaying a
-    // captured one means opening a session under the victim's ephemeral pk,
-    // which is a grant-gated act that spends budget of its own.
+    // The budget is shared per credential NAME and refills on every open, by
+    // design (see [`AppState::budgets`]). The replay set is NOT shared: it is
+    // keyed by `(sub, eph)`, and `req.client_eph_pk_b64` is freshly random per
+    // open, so this call only ever touches a brand-new, empty entry of its
+    // own — it must never clear another session's entry, because that
+    // session's already-issued bearer stays valid (and replayable against
+    // whatever it already recorded) for the rest of its TTL regardless of
+    // what this call does.
     st.budgets.lock().unwrap().insert(req.sub.clone(), st.cfg.max_requests);
-    st.seen_nonces.lock().unwrap().remove(&req.sub);
     let token = token::issue(&st.sess_sk, &claims);
     let sealed = handshake::seal_token(&keys.session, token.as_bytes());
     Ok(Json(SessionResponse { sealed_token_b64: BASE64.encode(sealed) }))
@@ -842,7 +855,7 @@ async fn proxy_inner(
     let binding = bodyseal::request_binding(&body);
     let body = match (&seal_keys, sealed_request) {
         (Some(keys), true) => Bytes::from(
-            bodyseal::open_request(keys, &body)
+            bodyseal::open_request(keys, &bodyseal::request_aad(method.as_str(), path_and_query), &body)
                 .map_err(|e| AppErr(StatusCode::BAD_REQUEST, format!("airlock: {e}")))?,
         ),
         (Some(_), false) if !body.is_empty() => {
@@ -891,15 +904,17 @@ async fn proxy_inner(
     // Replay dedupe, LAST of the three admission steps and deliberately so: the
     // AEAD proved the blob is this session's request, and the spend above paid
     // for it, so one entry here always costs one request of the budget — which
-    // is the whole of this set's bound, since `/session` clears it as it
-    // refills. Recording the nonce first made an unauthenticated 12-byte body a
-    // free, permanent allocation for any bearer holder.
+    // is the whole of this session's entry's bound, since it only ever grows
+    // while THIS bearer (this `sub`+`eph` pair) is spending it, and only a
+    // credential removal or process restart clears it. Recording the nonce
+    // first made an unauthenticated 12-byte body a free, permanent allocation
+    // for any bearer holder.
     if sealed_request {
         let fresh = st
             .seen_nonces
             .lock()
             .unwrap()
-            .entry(claims.sub.clone())
+            .entry((claims.sub.clone(), claims.eph.clone()))
             .or_default()
             .insert(binding.clone());
         if !fresh {
@@ -1108,8 +1123,12 @@ mod tests {
         })
     }
 
-    fn recorded_nonces(st: &AppState, name: &str) -> usize {
-        st.seen_nonces.lock().unwrap().get(name).map_or(0, |set| set.len())
+    fn recorded_nonces(st: &AppState, sub: &str, eph_b64: &str) -> usize {
+        st.seen_nonces
+            .lock()
+            .unwrap()
+            .get(&(sub.to_string(), eph_b64.to_string()))
+            .map_or(0, |set| set.len())
     }
 
     fn sealed_headers(token: &str) -> HeaderMap {
@@ -1129,8 +1148,10 @@ mod tests {
 
     /// The replay set costs a request of the budget to grow and nothing else:
     /// a body the AEAD refuses records NOTHING (that write was free for anyone
-    /// holding a bearer, and permanent), and a `/session` refill clears the set
-    /// it bounds.
+    /// holding a bearer, and permanent). Reopening the SAME session (same
+    /// `eph`) must NOT clear it — the whole point of this set is that a
+    /// bearer's own already-spent nonces stay recorded for as long as that
+    /// bearer is live.
     #[tokio::test]
     async fn the_replay_set_only_grows_with_authenticated_spent_requests() {
         let st = test_state("a", 8);
@@ -1161,28 +1182,116 @@ mod tests {
         // Garbage under the seal header: refused, and it leaves no trace.
         let status = post_sealed(&st, &token, vec![7u8; 32]).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(recorded_nonces(&st, "a"), 0, "an unauthenticated body must record nothing");
+        assert_eq!(
+            recorded_nonces(&st, "a", &eph_b64),
+            0,
+            "an unauthenticated body must record nothing"
+        );
         assert_eq!(st.budgets.lock().unwrap()["a"], 8, "and must cost nothing");
 
         // Authentic sealed bodies each record one nonce and spend one request.
+        let aad = bodyseal::request_aad("POST", "/v1/messages");
         let blobs: Vec<Vec<u8>> =
-            (0..3u8).map(|i| bodyseal::seal_request(&keys, &[i; 16])).collect();
+            (0..3u8).map(|i| bodyseal::seal_request(&keys, &aad, &[i; 16])).collect();
         for blob in &blobs {
             let status = post_sealed(&st, &token, blob.clone()).await;
             assert_eq!(status, StatusCode::BAD_GATEWAY, "admitted, then the upstream is dead");
         }
-        assert_eq!(recorded_nonces(&st, "a"), 3);
+        assert_eq!(recorded_nonces(&st, "a", &eph_b64), 3);
         assert_eq!(st.budgets.lock().unwrap()["a"], 5);
 
         // The same blob again is the replay this set exists to catch.
         let status = post_sealed(&st, &token, blobs[0].clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(recorded_nonces(&st, "a"), 3, "a replay adds nothing");
+        assert_eq!(recorded_nonces(&st, "a", &eph_b64), 3, "a replay adds nothing");
 
-        // Reopening the session refills the budget — and clears the set that
-        // bounds it, which is what keeps the two in step.
+        // Reopening the SAME session refills the budget but must NOT clear
+        // the nonces recorded under this `eph` — the original token is still
+        // live and its already-spent nonces must stay blocked.
         assert!(open(&st).await.is_ok(), "the session reopens");
-        assert_eq!(recorded_nonces(&st, "a"), 0);
+        assert_eq!(
+            recorded_nonces(&st, "a", &eph_b64),
+            3,
+            "a same-session reopen must not erase this bearer's replay history"
+        );
         assert_eq!(st.budgets.lock().unwrap()["a"], 8);
+        let status = post_sealed(&st, &token, blobs[0].clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "the original token's replay must still be refused after a reopen"
+        );
+    }
+
+    /// Regression for the reported bug: a SECOND, unrelated `/session` open
+    /// for the same credential (a different borrower's session, or the
+    /// broker's own automatic re-handshake on a 401) must not let a captured
+    /// sealed request be replayed under the FIRST session's still-live
+    /// bearer.
+    #[tokio::test]
+    async fn a_second_session_open_does_not_revive_the_first_sessions_replays() {
+        let st = test_state("a", 8);
+        let (eph_a, keys_a) = handshake::client_handshake(&st.seal_kp.public_bytes());
+        let eph_a_b64 = BASE64.encode(eph_a);
+
+        // Session A opens and spends one sealed request.
+        assert!(
+            session(
+                State(st.clone()),
+                HeaderMap::new(),
+                Json(SessionRequest {
+                    sub: "a".into(),
+                    client_eph_pk_b64: eph_a_b64.clone(),
+                    body_seal: true,
+                    work: WorkRef::Direct,
+                }),
+            )
+            .await
+            .is_ok(),
+            "session A opens"
+        );
+        let claims_a = Claims {
+            sub: "a".into(),
+            iat: now_secs(),
+            exp: now_secs() + 3600,
+            eph: eph_a_b64.clone(),
+            seal: true,
+        };
+        let token_a = token::issue(&st.sess_sk, &claims_a);
+        let blob_a = bodyseal::seal_request(
+            &keys_a,
+            &bodyseal::request_aad("POST", "/v1/messages"),
+            b"request from A",
+        );
+        let status = post_sealed(&st, &token_a, blob_a.clone()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "admitted, then the upstream is dead");
+
+        // Session B opens against the SAME credential with its own (any)
+        // ephemeral key — e.g. the broker's automatic reauth on a 401.
+        let (eph_b, _keys_b) = handshake::client_handshake(&st.seal_kp.public_bytes());
+        assert!(
+            session(
+                State(st.clone()),
+                HeaderMap::new(),
+                Json(SessionRequest {
+                    sub: "a".into(),
+                    client_eph_pk_b64: BASE64.encode(eph_b),
+                    body_seal: true,
+                    work: WorkRef::Direct,
+                }),
+            )
+            .await
+            .is_ok(),
+            "session B opens"
+        );
+
+        // Replaying A's already-spent blob under A's still-valid bearer must
+        // still be refused as a replay, not admitted (BAD_GATEWAY).
+        let status = post_sealed(&st, &token_a, blob_a).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "session B's open must not have wiped session A's replay set"
+        );
     }
 }
