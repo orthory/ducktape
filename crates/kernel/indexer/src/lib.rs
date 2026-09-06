@@ -147,6 +147,13 @@ const FOLD_DRAIN_POLL_MAX: Duration = Duration::from_millis(50);
 /// hard cap on one scan page; larger asks are clamped, mirroring the module
 /// query convention (chat's MAX_QUERY_LIMIT) rather than erroring.
 pub const MAX_SCAN_LIMIT: usize = 1024;
+/// hard cap on one scan page's total key+value bytes (#1809): `MAX_SCAN_LIMIT`
+/// bounds ROW COUNT, but ordinary duckfs traffic puts megabyte stage chunks in
+/// op payloads, so a full-width page of those is gigabytes. [`collect_page`]
+/// stops adding rows once the running total would exceed this, always
+/// keeping at least the first row so a single oversized row still pages
+/// (never wedges) — the cursor resumes from there like any other partial page.
+pub const MAX_INDEX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 /// background fsync cadence for the index databases. the tier is rebuildable,
 /// so a bounded loss window buys memory-speed block application; fluent31
 /// recovery truncates a torn tail, never corrupts.
@@ -1427,14 +1434,21 @@ fn scan_bounds(prefix: &[u8], after: Option<&[u8]>) -> (Vec<u8>, Option<Vec<u8>>
 /// drain up to `limit` (clamped) pairs out of an iterator into a [`Page`].
 fn collect_page(iter: fluent31::DbIterator, limit: usize) -> Result<Page> {
     let limit = limit.clamp(1, MAX_SCAN_LIMIT);
-    let mut entries = Vec::new();
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut has_more = false;
+    let mut page_bytes = 0usize;
     for kv in iter {
         let (key, value) = kv?;
         if entries.len() == limit {
             has_more = true;
             break;
         }
+        let row_bytes = key.len() + value.len();
+        if !entries.is_empty() && page_bytes + row_bytes > MAX_INDEX_PAGE_BYTES {
+            has_more = true;
+            break;
+        }
+        page_bytes += row_bytes;
         entries.push((key, value));
     }
     let next_after = (has_more && !entries.is_empty())
