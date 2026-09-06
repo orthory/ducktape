@@ -575,6 +575,21 @@ impl core::fmt::Display for SnapshotError {
 
 impl std::error::Error for SnapshotError {}
 
+/// one roster entry's decided realization, resolved by
+/// [`Host::realize_module_swaps`]'s first phase and applied by its second — the
+/// staging that makes the boundary all-or-nothing.
+enum Realization {
+    /// a running module moves to already-fetched, hash-verified bytes.
+    Swap { module_id: ModuleId, bytes: Vec<u8> },
+    /// an ADMISSION: the instantiated module takes its registry seat.
+    Seat(Box<dyn Module>),
+    /// another plane's component — latch the decision, register nothing.
+    Foreign {
+        module_id: ModuleId,
+        code_hash: Vec<u8>,
+    },
+}
+
 /// the deterministic state machine: a module registry + dispatch + drain.
 #[derive(Default)]
 pub struct Host {
@@ -796,10 +811,17 @@ impl Host {
     /// activation is past `height` seats its first code; one registered but
     /// never activated is nothing to realize.
     ///
-    /// FAIL-CLOSED: a designated hash whose bytes this node lacks, or bytes whose
-    /// sha256 does not match the committed hash, is a hard error (the node cannot
-    /// honestly apply `height` without the agreed code) — it returns `Err` with no
-    /// partial swap applied. ABSENT registry → nothing to reconcile, `Ok(())`.
+    /// FAIL-CLOSED and ALL-OR-NOTHING: a designated hash whose bytes this node
+    /// lacks, or bytes whose sha256 does not match the committed hash, is a hard
+    /// error (the node cannot honestly apply `height` without the agreed code) —
+    /// it returns `Err` with no partial swap applied. That is why realization is
+    /// two phases: the whole roster RESOLVES first (fetch, verify, instantiate —
+    /// every fallible step, touching nothing), and only a fully-resolved roster
+    /// APPLIES. A half-applied roster would leave this node running code the
+    /// registry designates for `height` over state still at `height - 1` — and,
+    /// for an admission, publishing a root-hash no block ever sealed — while the
+    /// drain turns the `Err` into a retryable code stall that never applies
+    /// `height`. ABSENT registry → nothing to reconcile, `Ok(())`.
     ///
     /// The one thing that is NOT an admission is code that speaks another
     /// world ([`Admitted::ForeignAbi`]): the registry is id-generic and other
@@ -814,6 +836,9 @@ impl Host {
         let Some(modules) = self.module_status().await else {
             return Ok(());
         };
+        // PHASE 1 — RESOLVE. every fallible step happens here, against an
+        // untouched registry: a miss anywhere returns Err having mutated nothing.
+        let mut realizations: Vec<Realization> = Vec::new();
         for m in modules {
             let Some(target) = modules::code_at(&m, height) else {
                 continue; // registered, never activated — nothing to realize.
@@ -866,7 +891,10 @@ impl Host {
                 )));
             }
             match current {
-                Some(_) => self.swap_module_code(&m.module_id, &bytes)?,
+                Some(_) => realizations.push(Realization::Swap {
+                    module_id: m.module_id.clone(),
+                    bytes,
+                }),
                 None => {
                     // the admission path: registration changes root-hash by
                     // construction (the registry set is what `root_hash`
@@ -881,7 +909,10 @@ impl Host {
                     };
                     let Admitted::Module(module) = factory.instantiate(&m.module_id, &bytes).await?
                     else {
-                        self.skip_foreign_admission(&m.module_id, target);
+                        realizations.push(Realization::Foreign {
+                            module_id: m.module_id.clone(),
+                            code_hash: target.to_vec(),
+                        });
                         continue;
                     };
                     if module.id() != m.module_id {
@@ -891,8 +922,27 @@ impl Host {
                             m.module_id,
                         )));
                     }
+                    realizations.push(Realization::Seat(module));
+                }
+            }
+        }
+
+        // PHASE 2 — APPLY the resolved roster. `swap_code` is the one call left
+        // that can fail: it compiles bytes this phase already matched against the
+        // consensus-committed hash, so a failure here is code every honest node
+        // rejects identically, not a per-node byte miss.
+        for realization in realizations {
+            match realization {
+                Realization::Swap { module_id, bytes } => {
+                    self.swap_module_code(&module_id, &bytes)?
+                }
+                Realization::Seat(module) => {
                     self.registry.insert(module.id(), module);
                 }
+                Realization::Foreign {
+                    module_id,
+                    code_hash,
+                } => self.skip_foreign_admission(&module_id, &code_hash),
             }
         }
         Ok(())
