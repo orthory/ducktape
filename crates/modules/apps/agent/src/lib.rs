@@ -3233,6 +3233,7 @@ mod tests {
             .into_iter()
             .map(|report| match report {
                 AttributionMsg::Attribute { object, .. } => object.object,
+                AttributionMsg::AttributeBatch { .. } => panic!("reports are separate objects"),
                 AttributionMsg::Subscribe {} => panic!("a report, not a subscription"),
             })
             .collect();

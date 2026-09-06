@@ -349,7 +349,15 @@ fn snapshot_reopen_and_guest_reentry_keep_source_revisions() {
     block_on(async {
         let base = Directory::new("durable");
         let copy = Directory::new("snapshot-copy");
-        let mut forge = Forge::init("forge", base.0.clone())
+        let commit = forge::testkit::history(
+            "attribution-durable",
+            &[(1, "hello.txt", "on chain", "commit")],
+        )
+        .pop()
+        .unwrap();
+        let blobs = blobstore::BlobHandle::default();
+        let digest = blobs.put_chunk(commit.pack);
+        let mut forge = Forge::with_blobs("forge", base.0.clone(), blobs)
             .unwrap()
             .with_attribution("attribution");
         let mut first = test_ctx(Origin::Program(3));
@@ -358,6 +366,27 @@ fn snapshot_reopen_and_guest_reentry_keep_source_revisions() {
             .await
             .unwrap();
         assert_eq!(revision(&first), 1);
+        let mut ref_ctx = test_ctx(Origin::Program(3));
+        forge
+            .execute(
+                &mut ref_ctx,
+                &message(
+                    "forge",
+                    &ForgeMsg::PushRefs {
+                        repo: "demo".into(),
+                        updates: vec![RefUpdate {
+                            ref_name: "main".into(),
+                            prev_oid: None,
+                            new_oid: Some(commit.head.clone()),
+                        }],
+                        pack_digest: Some(digest.to_vec()),
+                        cert: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revision(&ref_ctx), 2);
         forge.commit_block().await.unwrap();
         let root = forge.root();
         let snapshot = forge.snapshot().unwrap();
@@ -376,10 +405,18 @@ fn snapshot_reopen_and_guest_reentry_keep_source_revisions() {
                 .execute(&mut ctx, &message("forge", &issue("two")))
                 .await
                 .unwrap();
-            assert_eq!(revision(&ctx), 2);
+            assert_eq!(revision(&ctx), 3);
             module.commit_block().await.unwrap();
         }
         assert_eq!(reopened.root(), installed.root());
+        for path in [&base.0, &copy.0] {
+            let git = git2::Repository::open(path.join("demo")).unwrap();
+            let head = git.refname_to_id("refs/heads/main").unwrap();
+            assert_eq!(head.as_bytes(), commit.head.as_slice());
+            let tree = git.find_commit(head).unwrap().tree().unwrap();
+            let entry = tree.get_name("hello.txt").unwrap();
+            assert_eq!(git.find_blob(entry.id()).unwrap().content(), b"on chain");
+        }
 
         let mut state = forge::state::ForgeState::default();
         let mut ctx = test_ctx(Origin::Program(3));

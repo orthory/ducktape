@@ -26,9 +26,7 @@ fn env_at(origin: Origin, height: u64) -> sdk::Env {
         consensus_time: 0,
         origin,
         me: "modules".into(),
-    },
         cause: sdk::Cause::Direct,
-  cause: sdk::Cause::Direct,
     }
 }
 

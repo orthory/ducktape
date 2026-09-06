@@ -49,6 +49,7 @@ fn ed_pub(k: &Ed) -> Vec<u8> {
 /// sibling the parity proof exercises for real.
 fn account_view(founder: &Ed) -> AccountView {
     AccountView {
+        control: identity::Control::Keys,
         number: ACCOUNT,
         name: "founder".into(),
         keys: vec![KeyView {

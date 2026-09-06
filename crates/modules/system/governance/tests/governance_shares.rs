@@ -50,6 +50,7 @@ impl IdentityStub {
             accounts.insert(
                 number,
                 AccountView {
+                    control: identity::Control::Keys,
                     number,
                     name: format!("account-{number}"),
                     keys: keys
@@ -110,6 +111,7 @@ impl Module for IdentityStub {
             IdentityQuery::KeyGen { key } => {
                 IdentityReply::Gen(u64::from(self.by_key.contains_key(&key)))
             }
+            IdentityQuery::Controlled { .. } => IdentityReply::Accounts(Vec::new()),
         };
         Ok(identity_encode_reply(&reply))
     }

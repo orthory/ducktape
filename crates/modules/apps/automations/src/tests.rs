@@ -357,11 +357,19 @@ fn posted(channel: &str, seq: u64, author: Party, mentions: Vec<u64>) -> Msg {
 }
 
 fn message(channel: &str, seq: u64, author: Party, blocks: Vec<Block>) -> MessageView {
+    let origin = match &author {
+        Party::Account(account) => Origin::Program(*account),
+        Party::Key(key) => Origin::External(key.clone()),
+        Party::Module(id) => Origin::Module(id.clone()),
+        Party::System => Origin::System,
+    };
     MessageView {
         channel_id: channel.into(),
         seq,
         head: MessageHead {
             message_id: format!("{channel}-m{seq}"),
+            origin: origin.clone(),
+            content_origin: origin,
             author,
             blocks,
             created_at: 0,
