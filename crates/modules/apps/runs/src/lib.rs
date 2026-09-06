@@ -123,11 +123,11 @@ use agent::{
     AgentReply, AgentResponse, AgentStatus, DelegationRequest, MAX_ACTIONS_BYTES,
     MAX_ACTIONS_PER_RUN, MAX_DELEGATION_INSTRUCTION_BYTES, MAX_DELEGATIONS_BYTES,
     MAX_DELEGATIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, RESERVED_ID_SEPARATOR, ReplyBlock,
-    ResourceCaps, SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
+    SkillRef, decode_event as agent_decode_event, decode_reply as agent_decode_reply,
     encode_query as agent_encode_query,
 };
 use chat::{
-    Block, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
+    Block, ChannelAccess, ChatMsg, ChatQuery, ChatReply, MAX_THREAD_REPLIES, MessageView,
     decode_reply as chat_decode_reply, encode_msg as chat_encode_msg,
     encode_query as chat_encode_query,
 };
@@ -146,7 +146,7 @@ use sdk::{Ctx, Error, Event, Module, ModuleId, Msg, Origin, StateRoot, StateSync
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tagging::{
-    EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
+    Author, EngagementEvent, EntityRef, TaggingMsg, decode_event as tagging_decode_event,
     encode_msg as tagging_encode_msg,
 };
 use tasks::{
@@ -435,7 +435,10 @@ struct PendingState {
     job_id: Option<String>,
     /// the claim height this job-backed run is bound to; chat runs use 0.
     job_claim_height: u64,
-    /// the run-creating origin — a cancel capability alongside the owner.
+    /// the ACCOUNT the run speaks for: the explicit requester, or the author
+    /// whose post engaged the agent — never the plane that carried the event.
+    /// it is both a cancel capability alongside the owner and the chat standing
+    /// an agent's own posts are held to (`requester_may_post`).
     requester: SagaOrigin,
     created_at: u64,
 }
@@ -443,28 +446,6 @@ struct PendingState {
 impl PendingState {
     fn run_id(&self) -> String {
         self.run_id.clone()
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct RunAuthority {
-    allowed_actions: Vec<String>,
-    caps: ResourceCaps,
-}
-
-impl RunAuthority {
-    fn from_record(record: &AgentRecord) -> Self {
-        Self {
-            allowed_actions: record.allowed_actions.clone(),
-            caps: record.caps.clone(),
-        }
-    }
-
-    fn apply(&self, record: &AgentRecord) -> AgentRecord {
-        let mut ceiling = record.clone();
-        ceiling.allowed_actions = self.allowed_actions.clone();
-        ceiling.caps = self.caps.clone();
-        ceiling.scoped_for_call(record)
     }
 }
 

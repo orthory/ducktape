@@ -52,7 +52,6 @@ pub(super) const ENV_ACTION_TOKEN: &str = "DUCKTAPE_RUN_ACTION_TOKEN";
 
 /// An opened, host-owned signer and its narrow child-facing endpoint.
 pub(super) struct RunSession {
-    pub(super) run_id: String,
     pub(super) action_url: String,
     pub(super) action_token: String,
     shutdown: Option<oneshot::Sender<()>>,
@@ -188,7 +187,6 @@ async fn start_action_server(
             .await;
     });
     Ok(RunSession {
-        run_id,
         action_url: format!("http://127.0.0.1:{}/v1/run-action", address.port()),
         action_token: token,
         shutdown: Some(shutdown),
