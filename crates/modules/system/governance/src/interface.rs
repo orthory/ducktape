@@ -134,7 +134,11 @@ pub enum GovMsg {
     Vote { proposal_id: String, approve: bool },
     /// tally and settle. anyone may trigger it after the deadline, or early
     /// once the proposal's frozen rule can no longer be reversed. passing
-    /// membership actions emit their valset op as a follow-up in the same block.
+    /// membership actions emit their valset op as a follow-up in the same
+    /// block. only executable inside a bounded window: past
+    /// `deadline + EXECUTION_GRACE` the proposal is refused and reaped as
+    /// Rejected on the spot instead of tallying a frozen electorate that may
+    /// no longer hold standing.
     Execute { proposal_id: String },
     /// redeem an invite: no ballot — MINTING was the admission decision. the
     /// op carries the token's fields plus the joiner key and its

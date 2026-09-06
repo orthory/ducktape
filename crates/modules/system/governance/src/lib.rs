@@ -117,6 +117,14 @@ use valset::{
 /// horizon. views advance about once per finalized op, so this is generous.
 const MAX_VOTING_PERIOD: u64 = 1_000_000_000;
 
+/// how long a decided-but-unexecuted proposal stays enactable past its
+/// `deadline`. `Execute` tallies against the electorate FROZEN at `Propose`,
+/// so an unbounded window lets a since-removed electorate enact a mandate
+/// long after it lost standing (the whole point of a deadline). Past
+/// `deadline + EXECUTION_GRACE` the proposal is dead: refused on `Execute`
+/// and settled `Rejected` on the spot, same as any other reap.
+const EXECUTION_GRACE: u64 = 100_000;
+
 /// Keep every share value and total exact in the JavaScript operator client.
 const MAX_SAFE_SHARES: u64 = 9_007_199_254_740_991;
 /// The frozen electorate copies the complete allocation into each proposal.
@@ -383,15 +391,21 @@ impl Governance {
         )
     }
 
-    /// settle every OPEN roster entry already past its OWN voting deadline as
-    /// Rejected — nobody executed it in time — and evict it from `roster`.
-    /// this is the only way an unexecuted proposal frees its slot
-    /// deterministically without a network-wide per-block tick, so it runs at
-    /// `Propose`, right where both the roster cap and the per-submitter cap
-    /// are about to be checked. returns how many of the SURVIVING open
-    /// proposals belong to `proposer`, computed in the same pass so the caps
-    /// cost one roster walk together (bounded by [`MAX_PROPOSALS`] point
-    /// reads, the same cost class as `GovQuery::Proposals`).
+    /// settle every OPEN roster entry already past its EXECUTION deadline
+    /// (`deadline + EXECUTION_GRACE`) as Rejected — nobody executed it in
+    /// time, or nobody ever will again — and evict it from `roster`. this is
+    /// the one place an unexecuted or now-stale-electorate proposal expires
+    /// deterministically without a network-wide per-block tick, so `Propose`,
+    /// `Vote`, and `Execute` all run it before acting: `Propose` right where
+    /// the roster cap and the per-submitter cap are about to be checked,
+    /// `Vote`/`Execute` so expiry never depends on someone else proposing.
+    /// when `Execute` calls this on the very proposal it targets, reaping it
+    /// here IS the bounded-execution-window refusal — the subsequent "no
+    /// such open proposal" check catches it. returns how many of the
+    /// SURVIVING open proposals belong to `proposer`, computed in the same
+    /// pass so the caps cost one roster walk together (bounded by
+    /// [`MAX_PROPOSALS`] point reads, the same cost class as
+    /// `GovQuery::Proposals`).
     async fn reap_expired(
         &mut self,
         now: u64,
@@ -406,7 +420,8 @@ impl Governance {
                 .proposal(&id)
                 .await?
                 .ok_or_else(|| Error::Module(format!("missing proposal record: {id}")))?;
-            let expired = proposal.status == ProposalStatus::Open && now >= proposal.deadline;
+            let execution_deadline = proposal.deadline.saturating_add(EXECUTION_GRACE);
+            let expired = proposal.status == ProposalStatus::Open && now >= execution_deadline;
             if expired {
                 proposal.status = ProposalStatus::Rejected;
                 self.store_proposal(&id, &proposal)?;
@@ -419,6 +434,14 @@ impl Governance {
             i += 1;
         }
         Ok(open_by_proposer)
+    }
+
+    /// [`Self::reap_expired`] against the whole roster, for callers that
+    /// don't need the per-submitter count `Propose` uses.
+    async fn reap_roster(&mut self, now: u64) -> Result<(), Error> {
+        let mut roster = self.roster().await?;
+        self.reap_expired(now, &[], &mut roster).await?;
+        self.stage_roster(&roster)
     }
 
     /// persist a just-tallied proposal (status already terminal — Passed or
@@ -925,6 +948,7 @@ impl Governance {
         proposal_id: String,
         approve: bool,
     ) -> Result<(), Error> {
+        self.reap_roster(ctx.env().consensus_time).await?;
         let mut proposal = self
             .proposal(&proposal_id)
             .await?
@@ -970,6 +994,24 @@ impl Governance {
             return Err(Error::Module("proposal is settled".into()));
         }
 
+        let now = ctx.env().consensus_time;
+        // the bounded execution window: a frozen electorate cannot enact its
+        // mandate forever, only until `deadline + EXECUTION_GRACE` — past
+        // that it is settled Rejected right here (an `Ok` write, not a
+        // refusal that would roll it back) instead of tallying a membership
+        // snapshot that may no longer hold standing.
+        let execution_deadline = proposal.deadline.saturating_add(EXECUTION_GRACE);
+        let past_execution_window = now >= execution_deadline;
+        if past_execution_window {
+            proposal.status = ProposalStatus::Rejected;
+            return self.settle(&proposal_id, &proposal).await;
+        }
+
+        // opportunistic hygiene: reap every OTHER roster entry already past
+        // its own execution window too, so expiry never depends on someone
+        // else calling `Propose`.
+        self.reap_roster(now).await?;
+
         let electorate = &proposal.electorate;
         let mut yes = 0u64;
         let mut no = 0u64;
@@ -994,7 +1036,7 @@ impl Governance {
                 (passes, irreversible)
             }
         };
-        if ctx.env().consensus_time < proposal.deadline && !decidable_early {
+        if now < proposal.deadline && !decidable_early {
             return Err(Error::Module(format!(
                 "not decidable yet: voting open until {} (yes={yes}, no={no}, total={total})",
                 proposal.deadline
