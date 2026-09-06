@@ -757,13 +757,21 @@ pub(super) async fn park(
         // ceiling (and, on promotion, a `view_base`) no validator agrees on.
         node_r.watch_module("valset");
         replica_scheme = Some(replica_verifier(&namespace, &rec.participants));
+        let pending_boot = derive_pending_boot(ckpt, &rec);
         replica_orchestrator = Some(replica_orchestrator_at(
             rec.epoch,
             rec.view_base,
             &rec.participants,
             &rec.residents,
-            derive_pending_boot(ckpt, &rec),
+            pending_boot,
         ));
+        // the orchestrator's own re-armed ceiling (#1821): the node's fold
+        // must stop at the SAME view the orchestrator schedules a cutover
+        // at, or a certificate above it would get admitted before the
+        // cutover the orchestrator is waiting on ever fires.
+        if let Some(ceiling) = pending_boot {
+            node_r.set_view_ceiling(ceiling);
+        }
         replica_prev_ckpt = (ckpt.height, ckpt.oplog_pos);
         replica_epoch = rec.epoch;
         replica_view_base = rec.view_base;
@@ -2392,6 +2400,12 @@ pub(super) async fn park(
                                 &m.residents,
                                 m.pending_cutover_view,
                             ));
+                            // the served boundary's own armed cutover
+                            // (#1821): the same ceiling the orchestrator
+                            // above just resumed with.
+                            if let Some(ceiling) = m.pending_cutover_view {
+                                node_r.set_view_ceiling(ceiling);
+                            }
                             replica_epoch = m.epoch;
                             replica_view_base = m.view_base;
                             replica_watermark = Some(tip.saturating_sub(m.view_base));
