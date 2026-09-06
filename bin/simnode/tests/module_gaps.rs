@@ -310,7 +310,10 @@ fn a_task_id_collision_aborts_the_entire_triggering_block() {
         message["message"].is_null(),
         "the aborted post left no message: {message}"
     );
-    let tasks = sim.query("tasks", serde_json::json!({ "task": { "list": { "limit": 256 } } }));
+    let tasks = sim.query(
+        "tasks",
+        serde_json::json!({ "task": { "list": { "limit": 256 } } }),
+    );
     assert_eq!(
         tasks["task"]["tasks"].as_array().map(Vec::len),
         Some(0),
@@ -620,9 +623,15 @@ fn a_direct_tagging_op_cannot_be_driven_from_outside_a_module() {
 #[test]
 fn an_out_of_acl_agent_action_is_refused_at_the_module_layer() {
     let storage = tempfile::tempdir().expect("storage dir");
+    // the "executing node" below claims the saga via `Accept`, which now
+    // gates on valset standing plus (for a tagged saga) an announced
+    // capability — so it needs `--with-valset` genesis naming its own key
+    // (`6e` is the byte `n`, matching the ASCII origin used everywhere below)
+    // and a capability announce before it can claim anything.
+    let node_hex = "6e".repeat(32);
     // NO --echo-oracle: with no worker the run never settles, so it stays in
     // flight while we bind a session and act through it.
-    let sim = Sim::spawn(storage.path(), &["--auto"]);
+    let sim = Sim::spawn(storage.path(), &["--auto", "--with-valset", &node_hex]);
 
     // an agent granted NOTHING: allowed_actions is empty.
     sim.submit_ok(
@@ -663,8 +672,15 @@ fn an_out_of_acl_agent_action_is_refused_at_the_module_layer() {
 
     // claim the run's execution lease: the first Accept in consensus order wins
     // the assignee. over /v1/submit the sim stamps our named origin verbatim, so
-    // the "executing node" is a key we choose.
+    // the "executing node" is a key we choose — the same one seeded into
+    // valset above. it also announces "text" so Accept's capability gate
+    // admits it (the run's saga carries the agent's own capability tag).
     let node = "n".repeat(32);
+    sim.submit_ok(
+        "capability",
+        serde_json::json!({ "announce": { "capabilities": ["text"], "resources": {} } }),
+        Some(&node),
+    );
     sim.submit_ok(
         "saga",
         serde_json::json!({ "accept": { "saga_id": saga_id, "attempt": 0 } }),
