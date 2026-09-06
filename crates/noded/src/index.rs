@@ -50,6 +50,14 @@ pub fn open_index_store<S: AsRef<str>>(
 /// Install the mapper belonging to each running deployment. Called after
 /// composition and before a sealed block reaches the derived tier, so genesis,
 /// live admission, code replacement and recovery all use the same path.
+///
+/// A converge failure the index store itself scoped to one module (a
+/// rejected mapper — `index.is_poisoned()` still reads false) is logged and
+/// skipped: that module's own reads and writes stay refused until it
+/// reconverges, but every OTHER module — this loop's remaining entries, and
+/// the block the caller applies right after this returns — must keep
+/// indexing. Only a converge failure that poisoned the whole store (the
+/// engine itself, not the candidate bytes) aborts here.
 pub fn converge_host_modules(index: &indexer::IndexStore, host: &host::Host) -> Result<(), String> {
     let modules: Vec<indexer::IndexModule<'_>> = host
         .module_index_guests()
@@ -57,11 +65,26 @@ pub fn converge_host_modules(index: &indexer::IndexStore, host: &host::Host) -> 
         .collect();
     index_host_modules(index, modules.iter().map(|module| module.id))?;
     for module in modules {
-        let result = match host.module_code_hash(module.id) {
+        // `converge`/`converge_deployment` below may move `module` (built
+        // into a one-element slice), so its id is captured first for the
+        // log line that can follow the match.
+        let module_id = module.id;
+        let result = match host.module_code_hash(module_id) {
             Some(hash) => index.converge_deployment(&module, &hash),
             None => index.converge(&[module]),
         };
-        result.map_err(|error| format!("converge deployed index guests: {error}"))?;
+        let Err(error) = result else { continue };
+        if index.is_poisoned() {
+            return Err(format!("converge deployed index guests: {error}"));
+        }
+        tracing::warn!(
+            target: "ducktape::index",
+            reason = "module_mapper_rejected",
+            module = module_id,
+            error = %error,
+            "module's index guest failed to converge — its fold and views stay \
+             refused until it reconverges; every other module keeps indexing"
+        );
     }
     Ok(())
 }

@@ -330,7 +330,10 @@ pub async fn wasm_module(
     Ok(module)
 }
 
-/// Readiness covers the whole deployment, including the optional mapper.
+/// Readiness covers the whole deployment, including the optional mapper —
+/// `IndexStore::validate_guest` refuses exactly what its eventual
+/// `converge`/install would, so a mapper that is Loadable here activates
+/// cleanly, never failing every validator's converge at the swap height.
 pub fn validate_deployment(
     id: &str,
     bytes: &[u8],

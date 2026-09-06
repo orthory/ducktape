@@ -57,11 +57,14 @@
 //! [`IndexStore::get`] / [`IndexStore::view`]) — fluent31's `Db` is
 //! `Send + Sync`, so the http layer reads concurrently with both writers.
 //!
-//! failure policy: a host-write error POISONS the store (writes refuse, reads
+//! failure policy: a host-write error POISONS THE STORE (writes refuse, reads
 //! keep serving) rather than skipping a block — a silent gap would break the
-//! watermark's contiguity promise. A failed mapper replacement also poisons
-//! writes and refuses reads of that module until it is reconverged; readers
-//! must not see a partially replaced deployment. A guest-fold error never poisons: the
+//! watermark's contiguity promise. A rejected mapper (bad bytes, missing a
+//! required role or export) instead poisons ONLY ITS OWN MODULE — deployment
+//! goes `Failed`, its fold and views refuse until it is reconverged — because
+//! every other module's database went through convergence clean; the
+//! store-wide flag is reserved for the engine itself leaving a database in a
+//! state no caller declared. A guest-fold error never poisons either: the
 //! engine retains the events and retries, and the backlog is observable.
 //!
 //! when canonical state advances WITHOUT the op stream — state-sync installs
@@ -193,6 +196,21 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// whether a converge failure is the GUEST's fault — bad bytes, or missing
+/// the role/memory export readiness requires — rather than the engine's.
+/// [`Error::View`] is `converge_guest`'s own readiness rejection;
+/// `fluent31::Error::Wasm` is a compile or install-time rejection of the
+/// same candidate bytes. Everything else (`Io`, `Corruption`, `Conflict`,
+/// `Closed`, `Background`, `ProvenanceMismatch`, `Gone`, `JournalGap`) is the
+/// engine leaving the database in a state no caller declared, which is a
+/// store-wide concern.
+fn is_guest_rejection(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::View(_) | Error::Engine(fluent31::Error::Wasm(_))
+    )
+}
 
 // ============================================================================
 // the block-ops input — plain data, mapped by the node layer from its block
@@ -513,7 +531,17 @@ impl IndexStore {
             Ok(roles) => roles,
             Err(error) => {
                 *deployment = DeploymentState::Failed;
-                self.poisoned.store(true, Ordering::Release);
+                // a rejected GUEST (bad bytes, missing role/memory export)
+                // is this module's problem alone — `read_deployment` already
+                // refuses its own reads and writes until it reconverges. only
+                // the engine itself misbehaving (an io/corruption/background
+                // failure out of the db calls `converge_guest` makes) is
+                // store-wide: every OTHER database went through those same
+                // calls clean, so one that didn't may be in a state no other
+                // module's fold or view can be trusted to see through.
+                if !is_guest_rejection(&error) {
+                    self.poisoned.store(true, Ordering::Release);
+                }
                 return Err(error);
             }
         };
@@ -524,7 +552,11 @@ impl IndexStore {
         Ok(())
     }
 
-    /// Compile candidate mapper bytes without installing them or changing data.
+    /// Compile candidate mapper bytes without installing them or changing
+    /// data. Readiness must cover exactly what `converge`'s eventual
+    /// `install_module` will require — fluent31's own gate (pinned, cannot
+    /// expose the check itself) also requires a `memory` export, so a mapper
+    /// missing one must be refused HERE, not at activation.
     pub fn validate_guest(&self, bytes: &[u8]) -> Result<()> {
         let roles = self.blocks.wasm_entries(bytes)?;
         let maps_or_queries = roles
@@ -534,6 +566,9 @@ impl IndexStore {
             return Err(Error::View(
                 "index guest must export on_apply or query".into(),
             ));
+        }
+        if !exports_memory(bytes)? {
+            return Err(Error::View("index guest must export `memory`".into()));
         }
         Ok(())
     }
@@ -1031,6 +1066,23 @@ impl IndexStore {
     ) -> Result<fluent31::Subscription> {
         Ok(self.db(module)?.subscribe(lo, hi)?)
     }
+}
+
+/// whether candidate module bytes export a `memory` — the other half of
+/// fluent31's `install_module` gate (rev 76ba1867,
+/// `crates/fluent31/src/wasm/mod.rs:181-203`), which readiness must match:
+/// a mapper exporting a role entry point but no memory compiles fine here
+/// and then fails at activation, taking the module down at that block.
+/// fluent31 does not expose this check itself, so it is replicated against
+/// a throwaway engine — read-only export inspection, never executed.
+fn exports_memory(bytes: &[u8]) -> Result<bool> {
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, bytes)
+        .map_err(|error| Error::View(format!("compile: {error}")))?;
+    let exports_memory = module
+        .get_export("memory")
+        .is_some_and(|export| export.memory().is_some());
+    Ok(exports_memory)
 }
 
 /// map a view invocation's engine error onto the tier's surface: a guest
