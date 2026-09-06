@@ -42,6 +42,8 @@ pub(crate) enum FsCmd {
     Commit(CommitArgs),
     /// pin a snapshot so gc keeps it
     Pin(PinArgs),
+    /// release a pin (the owner or `system` only)
+    Unpin(UnpinArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -180,6 +182,17 @@ pub(crate) struct PinArgs {
     pub key: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, clap::Args)]
+pub(crate) struct UnpinArgs {
+    /// the pin name to release
+    pub name: String,
+    #[command(flatten)]
+    pub addr: NodeAddr,
+    /// the user key that signs the write (default: the active wallet)
+    #[arg(long, value_name = "PATH")]
+    pub key: Option<std::path::PathBuf>,
+}
+
 /// `main` installs a subscriber only for `node run`, so a one-shot verb would
 /// drop the engine's events on the floor — and the one that matters most (the
 /// walk skipping a fifo it must never open) would be invisible exactly where a
@@ -210,6 +223,7 @@ pub(crate) fn run(cmd: FsCmd) -> u8 {
         FsCmd::Status(a) => work_cmds::status(a),
         FsCmd::Commit(a) => work_cmds::commit(a),
         FsCmd::Pin(a) => work_cmds::pin(a),
+        FsCmd::Unpin(a) => work_cmds::unpin(a),
     };
     match outcome {
         Ok(()) => 0,
