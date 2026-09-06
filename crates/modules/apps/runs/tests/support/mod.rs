@@ -107,7 +107,8 @@ impl Network {
                     Some("tasks".into()),
                     Some("tasks".into()),
                 )
-                .with_pages_module("pages"),
+                .with_pages_module("pages")
+                .with_sink_forge("forge"),
             ),
         ])
         .unwrap();

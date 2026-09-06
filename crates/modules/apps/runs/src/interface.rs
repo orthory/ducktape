@@ -154,6 +154,9 @@ pub enum RunsMsg {
     CompleteActionRequest {
         request_id: String,
         call: sdk::CallId,
+        /// The program's decoded call binding. Output-derived links are
+        /// accepted only when their bytes match dispatch's committed digest.
+        result: agent::CallResult,
     },
     RejectActionRequest {
         request_id: String,

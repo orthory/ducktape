@@ -460,6 +460,8 @@ pub struct RunsModule {
     /// this block's staged history records — merged into the ring only at
     /// `commit_block` (an aborted block must leave no ghost record).
     pending_history: Vec<RunRecord>,
+    /// Verified PR allocations update existing history only at commit.
+    pending_pr_links: BTreeMap<String, u64>,
 }
 
 impl RunsModule {
@@ -532,6 +534,7 @@ impl RunsModule {
             pending_delegations: BTreeMap::new(),
             history: VecDeque::new(),
             pending_history: Vec::new(),
+            pending_pr_links: BTreeMap::new(),
         }
     }
 
@@ -752,6 +755,7 @@ impl RunsModule {
         // boundary this node never executed, so its history starts empty.
         self.history.clear();
         self.pending_history.clear();
+        self.pending_pr_links.clear();
         Ok(())
     }
 
@@ -790,6 +794,7 @@ impl RunsModule {
         }
         self.history = history;
         self.pending_history.clear();
+        self.pending_pr_links.clear();
         Ok(())
     }
 }

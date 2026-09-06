@@ -49,6 +49,11 @@ attribution reads ActionPlan, claims its future target call, executes that
 message as the program account, and completes the proposal against the
 dispatch ledger. Controllers can replace the program.
 
+A new PR sink has no history link until its program supplies the actual
+Forge output and runs verifies it against dispatch's committed output digest.
+The allocated repository and number determine the link; queued or rejected
+actions cannot predict one. Existing PR links come from committed Forge state.
+
 ConfigureModel records an existing program account's capability tag, allowed
 actions, caps and skills, atomically with its dispatch recipe. Its current
 identity controller governs later changes. ModelRecord.owner records the

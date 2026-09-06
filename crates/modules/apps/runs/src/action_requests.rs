@@ -47,6 +47,13 @@ fn call_matches_action(view: &dispatch::CallView, request: &ActionRequestView) -
         && view.payload_digest == digest
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenedPr {
+    number: u64,
+    repo: String,
+}
+
 /// Capture target intents while retaining the original deterministic query surface.
 pub(super) struct EffectsCtx<'a> {
     pub inner: &'a mut dyn Ctx,
@@ -269,14 +276,20 @@ impl RunsModule {
         ctx: &mut dyn Ctx,
         id: String,
         call: CallId,
+        result: agent::CallResult,
     ) -> Result<(), Error> {
         let Some(mut request) = self.action_request(&id).await? else {
             return Err(Error::Module("unknown action request".into()));
         };
         let completing = self.request_call(ctx, &request)?;
-        if let ActionStatus::Completed { call: previous, .. } = &request.view.status {
+        if let ActionStatus::Completed {
+            call: previous,
+            outcome,
+        } = &request.view.status
+        {
             let exact_retry = previous == &call && completing.invocation == call.invocation;
             if exact_retry {
+                self.stage_completed_pr_link(&request, outcome, result)?;
                 ctx.set_output(sdk::wire::encode(&request.view.status));
                 return Ok(());
             }
@@ -316,9 +329,62 @@ impl RunsModule {
             dispatch::CallStatus::Completed { outcome }
             | dispatch::CallStatus::Delivered { outcome, .. } => outcome,
         };
+        self.stage_completed_pr_link(&request, &outcome, result)?;
         request.view.status = ActionStatus::Completed { call, outcome };
         ctx.set_output(sdk::wire::encode(&request.view.status));
         self.stage_action_marker(&request).await?;
+        Ok(())
+    }
+
+    /// The program supplies decoded output, but only dispatch's authenticated
+    /// digest can turn it into a history link. No number is inferred from the
+    /// tracker before the action executes.
+    pub(super) fn stage_completed_pr_link(
+        &mut self,
+        request: &ActionRequest,
+        outcome: &dispatch::CallOutcomeSummary,
+        result: agent::CallResult,
+    ) -> Result<(), Error> {
+        let is_result_forge = matches!(request.scope, RequestScope::Result)
+            && self.forge.as_ref() == Some(&request.view.target);
+        if !is_result_forge {
+            return Ok(());
+        }
+        let Some(repo) = request
+            .view
+            .payload
+            .get("open_pr")
+            .and_then(|operation| operation.get("repo"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(());
+        };
+        let agent::CallResult::Applied { output, .. } = result else {
+            return Ok(());
+        };
+        let dispatch::CallOutcomeSummary::Applied { output_digest, .. } = outcome else {
+            return Err(Error::Module(
+                "a rejected PR action cannot supply an opened PR".into(),
+            ));
+        };
+        let output = canonical_action_payload(output);
+        let digest: [u8; 32] = Sha256::digest(sdk::wire::encode(&output)).into();
+        let output_matches_digest = &digest == output_digest;
+        if !output_matches_digest {
+            return Err(Error::Module(
+                "reported PR output does not match the committed action".into(),
+            ));
+        }
+        let opened: OpenedPr = serde_json::from_value(output)
+            .map_err(|error| Error::Module(format!("invalid committed PR output: {error}")))?;
+        let invalid_allocation = opened.repo != repo || opened.number == 0;
+        if invalid_allocation {
+            return Err(Error::Module(
+                "committed PR output names another repository or invalid number".into(),
+            ));
+        }
+        self.pending_pr_links
+            .insert(request.view.run_id.clone(), opened.number);
         Ok(())
     }
 

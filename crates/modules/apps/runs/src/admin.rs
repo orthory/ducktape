@@ -56,8 +56,13 @@ impl RunsModule {
                 self.claim_action_request(ctx, request_id, target_step)
                     .await
             }
-            RunsMsg::CompleteActionRequest { request_id, call } => {
-                self.complete_action_request(ctx, request_id, call).await
+            RunsMsg::CompleteActionRequest {
+                request_id,
+                call,
+                result,
+            } => {
+                self.complete_action_request(ctx, request_id, call, result)
+                    .await
             }
             RunsMsg::RejectActionRequest { request_id, reason } => {
                 self.reject_action_request(ctx, request_id, reason).await

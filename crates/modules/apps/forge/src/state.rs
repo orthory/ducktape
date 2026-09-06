@@ -365,7 +365,10 @@ impl ForgeState {
                 if let Some(chat) = chat_target {
                     ctx.emit_msg(tracker::create_channel_msg(chat, &name, number));
                 }
-                ctx.set_output(sdk::wire::encode(&CreatedItem { number, repo: &name }));
+                ctx.set_output(sdk::wire::encode(&CreatedItem {
+                    number,
+                    repo: &name,
+                }));
                 Ok(())
             }
             ForgeMsg::OpenPr {
@@ -415,7 +418,10 @@ impl ForgeState {
                 if let Some(chat) = chat_target {
                     ctx.emit_msg(tracker::create_channel_msg(chat, &name, number));
                 }
-                ctx.set_output(sdk::wire::encode(&CreatedItem { number, repo: &name }));
+                ctx.set_output(sdk::wire::encode(&CreatedItem {
+                    number,
+                    repo: &name,
+                }));
                 Ok(())
             }
             ForgeMsg::EditItem {

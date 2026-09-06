@@ -94,6 +94,80 @@ fn acknowledge(module: &mut RunsModule, item: u64, outcome: sdk::DeliveryOutcome
 }
 
 #[test]
+fn a_verified_pr_link_is_staged_and_abort_discards_it() {
+    let (mut module, _, entry) = hosted();
+    module = module.with_sink_forge("forge");
+    let id = "pr-rollback".to_string();
+    block_on(module.stage_action_request(
+        &entry,
+        id.clone(),
+        crate::action_requests::RequestScope::Result,
+        Msg {
+            target: "forge".into(),
+            payload: sdk::wire::encode(&serde_json::json!({"open_pr":{"repo":"demo"}})),
+        },
+    ))
+    .unwrap();
+    let request = block_on(module.action_request(&id)).unwrap().unwrap();
+    module.pending_history.push(RunRecord {
+        run_id: entry.run_id.clone(),
+        agent_id: entry.agent_id.clone(),
+        channel_id: entry.channel_id.clone(),
+        anchor_seq: entry.anchor_seq,
+        outcome: RunOutcome::Delivered,
+        degraded: false,
+        created_at: 1,
+        delivered_at: 2,
+        executing_node: "node".into(),
+        output_ref: None,
+        pr_number: None,
+    });
+    commit(&mut module);
+    let output = serde_json::json!({"number":7,"repo":"demo"});
+    let outcome = dispatch::CallOutcomeSummary::Applied {
+        output_digest: Sha256::digest(sdk::wire::encode(&output)).into(),
+        assigned: Vec::new(),
+    };
+    let result = agent::CallResult::Applied {
+        output,
+        assigned: serde_json::Value::Null,
+    };
+    module
+        .stage_completed_pr_link(&request, &outcome, result.clone())
+        .unwrap();
+    assert_eq!(
+        recent_runs(&module)[0].pr_number,
+        None,
+        "completion is still uncommitted"
+    );
+    abort(&mut module);
+    commit(&mut module);
+    assert_eq!(
+        recent_runs(&module)[0].pr_number,
+        None,
+        "abort left no link behind"
+    );
+    module
+        .stage_completed_pr_link(&request, &outcome, result.clone())
+        .unwrap();
+    module
+        .stage_completed_pr_link(&request, &outcome, result)
+        .unwrap();
+    assert_eq!(
+        recent_runs(&module)[0].pr_number,
+        None,
+        "an exact repeat still waits for commit"
+    );
+    commit(&mut module);
+    assert_eq!(recent_runs(&module)[0].pr_number, Some(7));
+    assert_eq!(
+        recent_runs(&module).len(),
+        1,
+        "retries do not append duplicate history"
+    );
+}
+
+#[test]
 fn reordered_json_has_the_same_durable_proposal_bytes() {
     let original =
         br#"{"task":{"create_task":{"task_id":"same","title":"Same task","owner":null}}}"#;

@@ -887,12 +887,11 @@ fn pr_sink_uses_verified_issue_title_and_keeps_response_prose_in_the_body() {
             target_branch: "main".into(),
         }
     );
-    // the delivered-runs ring observes the same delivery: the forge
-    // output ref and the number the fresh OpenPr gets (issue #7 → PR #8).
+    // The pushed ref is committed, but the proposed PR has no number yet.
     commit(&mut m);
     let rec = &recent_runs(&m)[0];
     assert_eq!(rec.output_ref, Some(format!("agent/x@{oid}")));
-    assert_eq!(rec.pr_number, Some(8));
+    assert_eq!(rec.pr_number, None);
     assert_eq!(rec.executing_node, "ab".repeat(32));
 }
 
@@ -1088,10 +1087,9 @@ fn pr_sink_guard_ignores_closed_prs_issues_and_other_sources() {
         1,
         "no open PR matches the source — OpenPr fires"
     );
-    // the ring records the number the fresh OpenPr gets: committed max
-    // item number (issue 6) + 1.
+    // A later program call decides whether to open a PR and allocates its id.
     commit(&mut m);
-    assert_eq!(recent_runs(&m)[0].pr_number, Some(7));
+    assert_eq!(recent_runs(&m)[0].pr_number, None);
 }
 
 #[test]

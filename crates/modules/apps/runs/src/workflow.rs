@@ -94,6 +94,7 @@ pub fn model_program(agent_id: &str) -> Program {
                 "complete_action_request",
                 [
                     ("request_id", request()),
+                    ("result", reference(&["effect"])),
                     (
                         "call",
                         object([

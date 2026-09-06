@@ -323,6 +323,15 @@ impl Module for RunsModule {
                 self.history.pop_front();
             }
         }
+        for (run_id, number) in std::mem::take(&mut self.pending_pr_links) {
+            if let Some(record) = self
+                .history
+                .iter_mut()
+                .find(|record| record.run_id == run_id)
+            {
+                record.pr_number = Some(number);
+            }
+        }
         Ok(())
     }
 
@@ -334,6 +343,7 @@ impl Module for RunsModule {
         self.pending_sessions.clear();
         self.pending_delegations.clear();
         self.pending_history.clear();
+        self.pending_pr_links.clear();
         Ok(())
     }
 }
