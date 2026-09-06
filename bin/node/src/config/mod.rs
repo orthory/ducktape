@@ -23,12 +23,18 @@ pub use workspace_config::*;
 /// compile-validate every deployment `genesis` carries — the same check a
 /// validator runs before arming a live swap (`noded::compose::validate_deployment`:
 /// `declared_shape` + `check_realizable` + the mapper's `on_apply`/`query`
-/// export) — before a founder or a dev shape writes a single byte. Discovery
+/// export) — before a founder writes a single byte. Discovery
 /// (`Genesis::compose`) only checks filenames, ids, and the Borsh/mapper
 /// framing; this is the first point that actually loads each component and
 /// mapper through wasmtime, so a zero-byte or truncated artifact refuses
-/// `node init` (or `resolve_dev_shape`) instead of minting an unbootable
-/// network.
+/// `node init` instead of minting an unbootable network.
+///
+/// called only from `cmd_init`, not from `resolve_dev_shape`: the dev shape
+/// never writes a genesis or descriptor file (its `GenesisSource::FoundingSet`
+/// is re-hashed from the staged directory on every resolve, i.e. every dev
+/// boot), and `compose()` a moment later already compiles the same set again
+/// — validating here too would pay a full module-set compile on every boot
+/// for nothing durable to protect.
 pub fn validate_founding_set(
     source: &std::path::Path,
     genesis: &workspace_config::Genesis,
