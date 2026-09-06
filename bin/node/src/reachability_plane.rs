@@ -180,7 +180,7 @@ where
         return true;
     };
     let nonce = msg.nonce.clone();
-    let verified = match join_gate::verify_intro(&msg, binding) {
+    let verified = match join_gate::verify_intro(&msg, binding, nat_traversal::now_secs()) {
         Ok(v) => v,
         Err(_) => return true,
     };

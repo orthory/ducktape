@@ -41,7 +41,13 @@ fn intro_bytes() -> (Vec<u8>, ed25519::PublicKey, reachability::WireGuardKeypair
     let joiner = ed25519::PrivateKey::from_seed(2);
     let token = mint_invite_token(&issuer, BINDING, u64::MAX);
     let wg = joiner_wg_keypair();
-    let msg = join_gate::intro_request(&joiner, BINDING, &token, wg.public_key().0);
+    let msg = join_gate::intro_request(
+        &joiner,
+        BINDING,
+        &token,
+        wg.public_key().0,
+        nat_traversal::now_secs(),
+    );
     (join_gate::encode_intro(&msg), joiner.public_key(), wg)
 }
 
@@ -190,6 +196,7 @@ async fn an_expired_token_neither_installs_nor_tunnels() {
         BINDING,
         &token,
         wg.public_key().0,
+        nat_traversal::now_secs(),
     ));
 
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<reachability::ReachabilityCommand>(8);
@@ -260,7 +267,8 @@ fn a_sealed_intro_hides_the_token_and_opens_only_for_the_member() {
         .open_sealed(&sealed)
         .expect("the member opens its own sealed intro");
     let msg = join_gate::decode_intro(&opened).expect("decodes after open");
-    let verified = join_gate::verify_intro(&msg, BINDING).expect("verifies end to end");
+    let verified = join_gate::verify_intro(&msg, BINDING, nat_traversal::now_secs())
+        .expect("verifies end to end");
     assert_eq!(verified.joiner, joiner_pk);
     assert_eq!(verified.wg_public_key, wg_pub);
 }
