@@ -38,6 +38,7 @@ fn model_run_session_and_request_state_round_trip() {
         &mut module,
         &mut open,
         &admin(&RunsMsg::OpenAgentSession {
+            attempt: 0,
             run_id: run_id.clone(),
             session_key: vec![7; 32],
         }),

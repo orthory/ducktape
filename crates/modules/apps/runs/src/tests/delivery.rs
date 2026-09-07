@@ -50,7 +50,7 @@ fn a_valid_response_emits_the_reply_and_actions_and_prunes_the_entry() {
             channel_id: "general".into(),
             message_id: reply_message_id(&run_id),
             blocks: vec![Block::paragraph("on it")],
-            thread: None,
+            thread: Some(2),
         }],
         "the reply posts as the AGENT, under the run's message id"
     );

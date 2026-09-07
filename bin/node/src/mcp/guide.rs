@@ -62,7 +62,9 @@ intersection of both agents' grants, and the root run's peer-call budget bounds 
 concurrent live calls across the whole recursive tree. Completed calls release \
 their slot. Reuse a request_id only for the same call.
 
-You can write while you work — post progress to a channel, tick off a todo as \
+Use ducktape_reply(text) to post progress or ask a question in the originating \
+chat thread while you work. Ducktape selects the thread and posts as your program \
+account; a temporary run key authenticates the request. You can also tick off a todo as \
 you finish it — rather than saving everything for your final answer. Your final \
 answer still follows whatever output contract your prompt gave you; these tools \
 do not replace it.",

@@ -166,6 +166,7 @@ fn page_and_block_mentions_start_model_work_and_reply_under_program_authority() 
                     msg(
                         "runs",
                         &runs::RunsMsg::OpenAgentSession {
+                            attempt: 0,
                             run_id: run.run_id.clone(),
                             session_key: vec![10; 32],
                         },

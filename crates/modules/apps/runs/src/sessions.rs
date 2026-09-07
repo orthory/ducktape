@@ -38,6 +38,7 @@ impl RunsModule {
         &mut self,
         ctx: &mut dyn Ctx,
         run_id: String,
+        attempt: u32,
         session_key: Vec<u8>,
     ) -> Result<(), Error> {
         if session_key.len() != SESSION_KEY_LEN {
@@ -61,33 +62,31 @@ impl RunsModule {
         let Some(entry) = self.pending_entry(&dispatch_id).cloned() else {
             return Err(Error::Module(format!("run is not in flight: {run_id}")));
         };
-        // THE AUTHORIZATION: the run's own committed lease.
-        let holder = self
-            .lease_holder(&*ctx, &dispatch_id)
+        let lease = self
+            .execution_lease(&*ctx, &dispatch_id)
             .await
             .map_err(Error::Module)?;
-        if submitter != holder {
+        let requested = crate::ExecutionLease {
+            holder: submitter,
+            attempt,
+        };
+        if requested != lease {
             return Err(Error::Module(format!(
-                "only the node holding the run's execution lease may open its agent session: {run_id}"
+                "only the node holding the run's current execution lease and attempt may open its agent session: {run_id}"
             )));
         }
-        // one session per LEASE, first binding wins. re-opening under the same
-        // lease is REFUSED rather than overwriting: the live session's key is
-        // the authority the agent is currently acting under, and a silent
-        // replace would let a squatting opener revoke it mid-run and take over
-        // its remaining budget. but a lease that MOVED leaves a session whose
-        // holder no longer executes anything (its acting ops refuse from that
-        // moment on, see `session_holds_lease`) — and the node genuinely
-        // running the work now must be able to open its own, or the run has no
-        // write lane at all for the rest of its life.
-        let bound_to_this_lease = self
-            .session(&run_id)
-            .is_some_and(|open| open.holder == holder);
-        if bound_to_this_lease {
+        let previous = self.session(&run_id);
+        let already_bound = previous.is_some_and(|open| open.lease == lease);
+        if already_bound {
+            let same_key = previous.is_some_and(|open| open.session_key == session_key);
+            if same_key {
+                return Ok(());
+            }
             return Err(Error::Module(format!(
                 "run already has an open agent session: {run_id}"
             )));
         }
+        let actions = previous.map_or(0, |open| open.actions);
         // the agent id comes from the run's COMMITTED entry, never from the
         // payload — identity is never a submitter's to assert.
         self.pending_sessions.insert(
@@ -96,9 +95,9 @@ impl RunsModule {
                 run_id,
                 agent_id: entry.agent_id,
                 session_key,
-                holder,
+                lease,
                 opened_at: ctx.env().consensus_time,
-                actions: 0,
+                actions,
             }),
         );
         Ok(())
@@ -137,7 +136,7 @@ impl RunsModule {
             &entry,
             request_id.clone(),
             super::action_requests::RequestScope::Session {
-                holder: session.holder,
+                lease: session.lease,
             },
             message,
         )
@@ -320,7 +319,7 @@ impl RunsModule {
             &entry,
             id.clone(),
             super::action_requests::RequestScope::Session {
-                holder: session.holder.clone(),
+                lease: session.lease.clone(),
             },
             sdk::Msg {
                 target: self.id.clone(),
@@ -593,11 +592,11 @@ impl RunsModule {
         run_id: &str,
         session: &AgentSession,
     ) -> Result<(), Error> {
-        let holder = self
-            .lease_holder(ctx, &dispatch_id_for(run_id))
+        let lease = self
+            .execution_lease(ctx, &dispatch_id_for(run_id))
             .await
             .map_err(Error::Module)?;
-        if holder != session.holder {
+        if lease != session.lease {
             return Err(Error::Module(format!(
                 "the run's execution lease has moved; its agent session is no longer authoritative: {run_id}"
             )));
@@ -605,13 +604,14 @@ impl RunsModule {
         Ok(())
     }
 
-    /// the node key holding the run's execution lease. dispatch names the saga
-    /// carrying the work (only while still `AwaitingResult` — a delivered run
-    /// runs nowhere), and saga owns the live lease: its `assignee` IS the holder.
-    /// a missing dispatch, a terminal dispatch, and a saga with no committed
-    /// lease are all refusals — none names a node that could be executing this
-    /// run right now.
-    async fn lease_holder(&self, ctx: &dyn Ctx, dispatch_id: &str) -> Result<Vec<u8>, String> {
+    /// The holder and attempt of a pending saga named by an awaiting dispatch.
+    /// A terminal saga invalidates the session even before dispatch records
+    /// completion; a new attempt invalidates it even on the same node.
+    async fn execution_lease(
+        &self,
+        ctx: &dyn Ctx,
+        dispatch_id: &str,
+    ) -> Result<crate::ExecutionLease, String> {
         let reply = ctx
             .query(
                 &self.dispatch,
@@ -639,9 +639,18 @@ impl RunsModule {
             .await
             .map_err(|e| format!("saga lookup failed: {e}"))?;
         match saga_decode_reply(&reply) {
-            Ok(SagaReply::Saga(Some(saga))) => saga
-                .assignee
-                .ok_or_else(|| "the run holds no execution lease".to_string()),
+            Ok(SagaReply::Saga(Some(saga))) => {
+                if saga.status.is_terminal() {
+                    return Err("the run holds no execution lease".into());
+                }
+                let holder = saga
+                    .assignee
+                    .ok_or_else(|| "the run holds no execution lease".to_string())?;
+                Ok(crate::ExecutionLease {
+                    holder,
+                    attempt: saga.attempt,
+                })
+            }
             Ok(SagaReply::Saga(None)) => Err("the run holds no execution lease".into()),
             _ => Err("unexpected saga reply for a saga lookup".into()),
         }

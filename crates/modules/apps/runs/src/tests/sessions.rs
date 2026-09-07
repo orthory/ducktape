@@ -41,7 +41,16 @@ fn session_ctx(registry: &Registry, run_id: &str, origin: Origin) -> CaptureCtx 
 
 fn open(run_id: &str, key: &[u8]) -> Msg {
     admin(&RunsMsg::OpenAgentSession {
+        attempt: 0,
         run_id: run_id.into(),
+        session_key: key.to_vec(),
+    })
+}
+
+fn open_attempt(run_id: &str, attempt: u32, key: &[u8]) -> Msg {
+    admin(&RunsMsg::OpenAgentSession {
+        run_id: run_id.into(),
+        attempt,
         session_key: key.to_vec(),
     })
 }
@@ -1018,15 +1027,12 @@ fn a_moved_lease_strands_the_old_session_and_lets_the_new_holder_open_one() {
     let live = sessions(&m);
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].session_key, NEW_SESSION_KEY.to_vec());
-    assert_eq!(live[0].holder, NEW_ASSIGNEE.to_vec());
+    assert_eq!(live[0].lease.holder, NEW_ASSIGNEE.to_vec());
 
-    // and the new holder cannot re-open on top of its own live session.
+    // The same binding may be delivered twice without resetting its counters.
     let mut ctx = reassigned(Origin::External(NEW_ASSIGNEE.to_vec()));
-    let err = exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap_err();
-    assert!(
-        matches!(&err, Error::Module(reason) if reason.contains("already has an open agent session")),
-        "{err:?}"
-    );
+    exec(&mut m, &mut ctx, &open(&run_id, &NEW_SESSION_KEY)).unwrap();
+    assert_eq!(sessions(&m), live);
 }
 
 #[test]
@@ -1126,4 +1132,206 @@ fn the_run_authority_query_answers_the_ceiling_the_read_plane_must_apply() {
 
     // a run nobody is executing proves no ceiling — the read plane must refuse.
     assert_eq!(authority_of(&m, "chat\u{1f}general\u{1f}9\u{1f}bot"), None);
+}
+
+#[test]
+fn live_replies_resolve_the_original_thread_with_only_the_reply_grant() {
+    for (parent, expected_root) in [(None, 3), (Some(1), 1)] {
+        let registry = registry(&[("bot", &[ACTION_CHAT_POST])]);
+        let mut m = configured(&registry);
+        let mut messages = transcript(2);
+        messages.push(message_in(
+            "general",
+            3,
+            Party::Key(vec![1; 32]),
+            "work here",
+            parent,
+        ));
+        let mut ctx = CaptureCtx::new()
+            .at(3)
+            .with_program_origin()
+            .with_registry(&registry)
+            .with_transcript("general", messages.clone());
+        exec(&mut m, &mut ctx, &engagement("general", 3, vec![])).unwrap();
+        commit(&mut m);
+        let run = run_id_for("general", 3, "bot");
+        let mut ctx = session_ctx(&registry, &run, Origin::External(ASSIGNEE.to_vec()));
+        exec(&mut m, &mut ctx, &open(&run, &SESSION_KEY)).unwrap();
+        commit(&mut m);
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
+            .with_transcript("general", messages);
+        exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: "Working on it".into(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.chat_msgs(),
+            vec![ChatMsg::PostMessage {
+                channel_id: "general".into(),
+                message_id: post_message_id(&run, "s0"),
+                thread: Some(expected_root),
+                blocks: vec![Block::paragraph("Working on it")],
+            }]
+        );
+    }
+}
+
+#[test]
+fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
+    for (grants, text, expected) in [
+        (
+            vec![ACTION_CHAT_POST_MESSAGE],
+            "hello",
+            "not allowed to chat.post",
+        ),
+        (vec![ACTION_CHAT_POST], "  ", "non-empty text"),
+    ] {
+        let (mut m, registry, run) = with_open_session(&grants, &[]);
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(&run, AgentAction::Reply { text: text.into() }),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Module(ref reason) if reason.contains(expected)),
+            "{error:?}"
+        );
+        assert_eq!(sessions(&m)[0].actions, 0);
+    }
+    for (channel, anchor) in [("", 0), ("runs:pages:p1", 2)] {
+        let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+        let entry = m.pending.get_mut(&dispatch_id_for(&run)).unwrap();
+        entry.channel_id = channel.into();
+        entry.anchor_seq = anchor;
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: "hello".into(),
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Module(ref reason) if reason.contains("no originating chat thread")),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn same_node_retries_rotate_keys_and_preserve_the_run_budget_and_snapshot() {
+    let (mut m, registry, run) = with_open_session(&[ACTION_PAGES_COMMENT], &["p1"]);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    exec(&mut m, &mut ctx, &act(&run, comment("b-p"))).unwrap();
+    commit(&mut m);
+    let retried =
+        |origin| session_ctx(&registry, &run, origin).with_lease_attempt(&run, &ASSIGNEE, 1);
+    let mut old = retried(Origin::External(SESSION_KEY.to_vec()));
+    assert!(exec(&mut m, &mut old, &act(&run, comment("b-p"))).is_err());
+    let mut holder = retried(Origin::External(ASSIGNEE.to_vec()));
+    assert!(
+        exec(&mut m, &mut holder, &open(&run, &CHILD_SESSION_KEY)).is_err(),
+        "a stale attempt cannot bind under a fresh lease"
+    );
+    exec(
+        &mut m,
+        &mut holder,
+        &open_attempt(&run, 1, &CHILD_SESSION_KEY),
+    )
+    .unwrap();
+    commit(&mut m);
+    assert_eq!(sessions(&m)[0].actions, 1);
+    assert_eq!(sessions(&m)[0].lease.attempt, 1);
+    assert!(exec(&mut m, &mut old, &act(&run, comment("b-p"))).is_err());
+    let root = m.root();
+    let mut joiner = module().with_pages_module("pages");
+    joiner.install(&m.snapshot(), root).unwrap();
+    assert_eq!(sessions(&joiner), sessions(&m));
+    for _ in 1..MAX_ACTIONS_PER_SESSION {
+        let mut ctx = retried(Origin::External(CHILD_SESSION_KEY.to_vec()));
+        exec(&mut joiner, &mut ctx, &act(&run, comment("b-p"))).unwrap();
+        commit(&mut joiner);
+    }
+    exec(
+        &mut joiner,
+        &mut holder,
+        &open_attempt(&run, 1, &CHILD_SESSION_KEY),
+    )
+    .unwrap();
+    let mut ctx = retried(Origin::External(CHILD_SESSION_KEY.to_vec()));
+    let error = exec(&mut joiner, &mut ctx, &act(&run, comment("b-p"))).unwrap_err();
+    assert!(
+        matches!(error, Error::Module(ref reason) if reason.contains("spent its budget")),
+        "{error:?}"
+    );
+    assert_eq!(sessions(&joiner)[0].actions, MAX_ACTIONS_PER_SESSION);
+}
+
+#[test]
+fn returning_to_a_previous_holder_does_not_revive_its_old_key() {
+    let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+    for (holder, attempt, key) in [
+        (NEW_ASSIGNEE, 1, CHILD_SESSION_KEY),
+        (ASSIGNEE, 2, [0x55; 32]),
+    ] {
+        let mut ctx = session_ctx(&registry, &run, Origin::External(holder.to_vec()))
+            .with_lease_attempt(&run, &holder, attempt);
+        exec(&mut m, &mut ctx, &open_attempt(&run, attempt, &key)).unwrap();
+        commit(&mut m);
+        ctx.env.origin = Origin::External(SESSION_KEY.to_vec());
+        assert!(
+            exec(
+                &mut m,
+                &mut ctx,
+                &act(
+                    &run,
+                    AgentAction::Reply {
+                        text: "stale".into()
+                    }
+                )
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn terminal_saga_fences_the_key_before_dispatch_records_completion() {
+    let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
+        .with_saga_assignee(
+            &crate::sink::saga_id_for_dispatch("runs", &dispatch_id_for(&run)),
+            &ASSIGNEE,
+        );
+    let error = exec(
+        &mut m,
+        &mut ctx,
+        &act(
+            &run,
+            AgentAction::Reply {
+                text: "too late".into(),
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, Error::Module(ref reason) if reason.contains("no execution lease")),
+        "{error:?}"
+    );
+    ctx.env.origin = Origin::External(ASSIGNEE.to_vec());
+    assert!(exec(&mut m, &mut ctx, &open(&run, &SESSION_KEY)).is_err());
+    assert_eq!(sessions(&m)[0].actions, 0);
 }

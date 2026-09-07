@@ -283,8 +283,12 @@ impl RunsModule {
             // "non-empty submitter" has.
             RunsMsg::OpenAgentSession {
                 run_id,
+                attempt,
                 session_key,
-            } => self.open_agent_session(ctx, run_id, session_key).await,
+            } => {
+                self.open_agent_session(ctx, run_id, attempt, session_key)
+                    .await
+            }
             RunsMsg::AgentAction { run_id, action } => self.agent_action(ctx, run_id, action).await,
             RunsMsg::ExecuteDelegation {
                 run_id,

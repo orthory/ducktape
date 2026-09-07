@@ -21,6 +21,19 @@ use super::{
 };
 use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
 
+struct ChatPost<'a> {
+    channel_id: &'a str,
+    text: &'a str,
+    thread: Option<u64>,
+    message_id: String,
+}
+
+#[derive(Default)]
+struct ChatPosts {
+    staged: BTreeMap<(String, u64), u64>,
+    standing: BTreeMap<String, bool>,
+}
+
 // ---- response normalization ---------------------------------------------------------
 // the dispatch-plane oracle returns the model's RAW text (opinion-free, Text
 // contract); shaping it into an [`AgentResponse`] is deterministic string
@@ -679,12 +692,8 @@ impl RunsModule {
         // at apply, and the block aborts — forever (the mailbox re-injects it).
         // counted in EMISSION order: the run's own reply first, then the
         // actions by index, exactly as `emit_response` emits them.
-        let mut staged_replies: BTreeMap<(String, u64), u64> = BTreeMap::new();
-        // the requester's post standing per channel a `chat.post_message`
-        // action names — see `requester_may_post`. one response may carry many
-        // posts into the same channel and the answer cannot change mid-pass,
-        // so each channel is asked exactly once.
-        let mut post_standing: BTreeMap<String, bool> = BTreeMap::new();
+        // Cache the requester's standing per channel; it cannot change mid-pass.
+        let mut posts = ChatPosts::default();
 
         if !response.reply_blocks.is_empty() {
             if matches!(lane, Lane::DelegatedSettle) {
@@ -726,8 +735,9 @@ impl RunsModule {
                         .await?;
                 } else {
                     self.probe_reply_postable(ctx, run_id, entry).await?;
-                    if let Some(root) = entry.thread_root {
-                        *staged_replies
+                    if let Some(root) = entry.reply_thread() {
+                        *posts
+                            .staged
                             .entry((entry.channel_id.clone(), root))
                             .or_default() += 1;
                     }
@@ -761,53 +771,42 @@ impl RunsModule {
                     }
                     update.validate()?;
                 }
-                // an agent SPEAKING — its own channel, its own moment — as
-                // opposed to reply_blocks, which only answer where the agent was
-                // engaged. that is the wider power, so it rides its own grant
-                // (`chat.post_message`): holding `chat.post` must NEVER widen
-                // into it, or every already-registered agent would have been
-                // silently handed the wider one.
+                AgentAction::Reply { text } => {
+                    let chat_origin =
+                        entry.anchor_seq != 0 && page_source(&entry.channel_id).is_none();
+                    if !chat_origin {
+                        return Err("this run has no originating chat thread".into());
+                    }
+                    self.probe_chat_action(
+                        ctx,
+                        entry,
+                        ChatPost {
+                            channel_id: &entry.channel_id,
+                            text,
+                            thread: entry.reply_thread(),
+                            message_id: post_message_id(run_id, &lane.slot(index)),
+                        },
+                        &mut posts,
+                    )
+                    .await?;
+                }
                 AgentAction::PostMessage {
                     channel_id,
                     text,
                     thread,
                 } => {
-                    if text.trim().is_empty() {
-                        return Err("chat.post_message requires a non-empty text".into());
-                    }
-                    // the whole actions vec is already bounded by
-                    // MAX_ACTIONS_BYTES above, and every post writes its OWN
-                    // message record, so no number of posts can push one head
-                    // past chat's MAX_MESSAGE_HEAD_BYTES.
-                    self.probe_channel_exists(ctx, channel_id).await?;
-                    if !self
-                        .requester_may_post(ctx, entry, channel_id, &mut post_standing)
-                        .await?
-                    {
-                        return Err(format!(
-                            "the run's requester may not post to channel: {channel_id}"
-                        ));
-                    }
-                    // the thread cap is the one check a sibling post can move
-                    // out from under: fold in what this response already staged
-                    // into the same thread, then count this post as staged.
-                    let thread_key = thread.map(|root| (channel_id.clone(), root));
-                    let already_staged = thread_key
-                        .as_ref()
-                        .and_then(|key| staged_replies.get(key))
-                        .copied()
-                        .unwrap_or(0);
-                    self.probe_post_lands(
+                    self.probe_chat_action(
                         ctx,
-                        channel_id,
-                        &post_message_id(run_id, &lane.slot(index)),
-                        *thread,
-                        already_staged,
+                        entry,
+                        ChatPost {
+                            channel_id,
+                            text,
+                            thread: *thread,
+                            message_id: post_message_id(run_id, &lane.slot(index)),
+                        },
+                        &mut posts,
                     )
                     .await?;
-                    if let Some(key) = thread_key {
-                        *staged_replies.entry(key).or_default() += 1;
-                    }
                 }
                 AgentAction::CreateTask { task_id, title } => {
                     if task_id.is_empty() || title.is_empty() {
@@ -849,6 +848,40 @@ impl RunsModule {
         Ok(response)
     }
 
+    async fn probe_chat_action(
+        &self,
+        ctx: &dyn Ctx,
+        entry: &PendingState,
+        post: ChatPost<'_>,
+        posts: &mut ChatPosts,
+    ) -> Result<(), String> {
+        if post.text.trim().is_empty() {
+            return Err("chat posts require a non-empty text".into());
+        }
+        self.probe_channel_exists(ctx, post.channel_id).await?;
+        let may_post = self
+            .requester_may_post(ctx, entry, post.channel_id, &mut posts.standing)
+            .await?;
+        if !may_post {
+            return Err(format!(
+                "the run's requester may not post to channel: {}",
+                post.channel_id
+            ));
+        }
+        let thread_key = post.thread.map(|root| (post.channel_id.to_string(), root));
+        let staged = thread_key
+            .as_ref()
+            .and_then(|key| posts.staged.get(key))
+            .copied()
+            .unwrap_or(0);
+        self.probe_post_lands(ctx, post.channel_id, &post.message_id, post.thread, staged)
+            .await?;
+        if let Some(key) = thread_key {
+            *posts.staged.entry(key).or_default() += 1;
+        }
+        Ok(())
+    }
+
     /// prove a reply under the run's message id could land in chat RIGHT NOW
     /// — the no-fail rule again: an emitted post must be valid by
     /// construction, so anything chat would reject is probed first. the run's
@@ -869,7 +902,7 @@ impl RunsModule {
             ctx,
             &entry.channel_id,
             &reply_message_id(run_id),
-            entry.thread_root,
+            entry.reply_thread(),
             0,
         )
         .await
@@ -1350,7 +1383,7 @@ impl RunsModule {
                 channel_id: entry.channel_id.clone(),
                 message_id: reply_message_id(run_id),
                 blocks: vec![Block::paragraph(text)],
-                thread: entry.thread_root,
+                thread: entry.reply_thread(),
             }),
         })
     }
@@ -1411,7 +1444,7 @@ impl RunsModule {
                         channel_id: entry.channel_id.clone(),
                         message_id: reply_message_id(run_id),
                         blocks: to_chat_blocks(&response.reply_blocks),
-                        thread: entry.thread_root,
+                        thread: entry.reply_thread(),
                     }),
                 });
             }
@@ -1419,6 +1452,15 @@ impl RunsModule {
         for (index, action) in response.actions.into_iter().enumerate() {
             let msg = match action {
                 AgentAction::UpdateModule(_) => continue,
+                AgentAction::Reply { text } => Msg {
+                    target: self.chat.clone(),
+                    payload: chat_encode_msg(&ChatMsg::PostMessage {
+                        channel_id: entry.channel_id.clone(),
+                        message_id: post_message_id(run_id, &lane.slot(index)),
+                        blocks: vec![Block::paragraph(text)],
+                        thread: entry.reply_thread(),
+                    }),
+                },
                 AgentAction::PostMessage {
                     channel_id,
                     text,

@@ -42,8 +42,8 @@ pub use pool::{
     SharedCredentialResolver, SpawnFn, SpawnKind, max_concurrent_runs_from_env,
 };
 pub use provision::{
-    ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner, WorkspaceReceipt,
-    WorkspaceSpec,
+    AgentExecution, ProvisionedWorkspace, RoMount, SharedProvisioner, WorkspaceProvisioner,
+    WorkspaceReceipt, WorkspaceSpec,
 };
 pub use soul::{
     MAX_ALWAYS_BYTES, MAX_DESCRIPTION_CHARS, MAX_INDEXED_SKILLS, SKILL_LIBRARY_PREFIX, SkillDoc,

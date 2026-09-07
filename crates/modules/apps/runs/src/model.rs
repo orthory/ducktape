@@ -116,8 +116,8 @@ pub const RESERVED_ID_SEPARATOR: char = '\u{1f}';
 
 // ---- the action vocabulary ---------------------------------------------------
 
-/// permission to post reply blocks into chat — the run's ANSWER, in the channel
-/// and thread it was engaged from. deliberately NOT the permission to post
+/// Permission to post live and final replies in the channel and thread
+/// where the agent was engaged. Does not permit posting
 /// wherever it likes: see [`ACTION_CHAT_POST_MESSAGE`].
 pub const ACTION_CHAT_POST: &str = "chat.post";
 /// permission to post a message to an ARBITRARY channel
@@ -568,6 +568,11 @@ pub struct AgentResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAction {
+    /// Reply in the originating chat thread under the run's program account.
+    /// The destination comes from committed run state, not the model's payload.
+    Reply {
+        text: String,
+    },
     /// Result-only: paths are resolved in the run's host-pushed forge commit.
     UpdateModule(crate::ModuleUpdateSpec),
     /// post a message to a named channel ([`ACTION_CHAT_POST_MESSAGE`]) — the
@@ -626,6 +631,7 @@ impl AgentAction {
     /// the vocabulary name this action needs in the agent's `allowed_actions`.
     pub fn vocabulary_name(&self) -> &'static str {
         match self {
+            AgentAction::Reply { .. } => ACTION_CHAT_POST,
             AgentAction::UpdateModule(_) => ACTION_MODULES_UPDATE,
             AgentAction::PostMessage { .. } => ACTION_CHAT_POST_MESSAGE,
             AgentAction::CreateTask { .. } => ACTION_TASKS_CREATE,

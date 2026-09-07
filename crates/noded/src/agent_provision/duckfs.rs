@@ -124,7 +124,13 @@ pub(super) async fn provision(
     // the workspace EXISTS now, so ask consensus to bind the run's agent session
     // — never before: a bind for a run that failed to materialize would spend an
     // op on a run that never starts.
-    let session = super::session::open(&node, spec).await;
+    let session = match super::session::open(&node, spec).await {
+        Ok(session) => session,
+        Err(error) => {
+            super::cleanup_dirs(dir.clone(), ro_dir.clone()).await;
+            return Err(error);
+        }
+    };
     let env = super::run_env(
         &dir,
         ro_dir.as_deref(),
@@ -166,9 +172,7 @@ impl NodedWorkspace {
     fn receipt_spec(&self) -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: String::new(),
-            consensus_run_id: None,
-            agent_id: None,
-            agent_display_name: None,
+            agent: None,
             source: self.source.clone(),
             ro_mounts: Vec::new(),
             // receipts never assemble a document, so the grant is moot here.
@@ -227,17 +231,6 @@ impl ProvisionedWorkspace for NodedWorkspace {
     }
 
     async fn cleanup(&self) {
-        // W5: idempotent, best-effort. an already-gone dir is success; any
-        // other error is swallowed — cleanup must never fail the run. the
-        // skill ro root is the run's debris too.
-        let dir = self.dir.clone();
-        let ro_dir = self.ro_dir.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::fs::remove_dir_all(&dir);
-            if let Some(ro) = &ro_dir {
-                let _ = std::fs::remove_dir_all(ro);
-            }
-        })
-        .await;
+        super::cleanup_dirs(self.dir.clone(), self.ro_dir.clone()).await;
     }
 }

@@ -362,6 +362,11 @@ struct PendingState {
 }
 
 impl PendingState {
+    fn reply_thread(&self) -> Option<u64> {
+        let has_anchor = self.anchor_seq != 0;
+        self.thread_root.or(has_anchor.then_some(self.anchor_seq))
+    }
+
     fn run_id(&self) -> String {
         self.run_id.clone()
     }

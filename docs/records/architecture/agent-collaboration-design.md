@@ -66,7 +66,19 @@ The compute service receives a committed work payload and returns an oracle
 result. A host-owned ephemeral signer authenticates that run's interactive
 AgentAction or DelegateRun requests against its session, lease and grant.
 It is never an identity key of the program account. The scoped HTTP endpoint
-subscribes before admission and waits for the actual target receipt.
+subscribes before admission and waits for the actual target receipt. Each
+execution attempt binds a fresh public key under its lease holder's node key.
+The private key stays on that host; the guest receives a scoped endpoint token.
+A retry replaces the binding and retains the run's action counter. Terminal
+sagas and changed attempts refuse old keys and queued proposals. An attributed
+run whose binding fails does not start its provider.
+
+`ducktape_reply(text)` proposes `AgentAction::Reply` using the model's
+`chat.post` grant. Runs resolves the channel and thread from committed run
+state: a root mention starts a thread, and a mention inside a thread stays in
+that thread. Both live progress and the final reply execute as the program
+account. Posting to an explicit destination with `ducktape_chat_post` requires
+`chat.post_message`.
 
 ## 4. Failure and persistence
 

@@ -68,6 +68,8 @@ const ROUND_TRIP: Duration = Duration::from_secs(120);
 /// workspace, so it rides the run's own commit into the branch — readable from
 /// any node, forever, instead of from a host path the container cannot see.
 const HEAD_FILE: &str = ".dogfood-run";
+const MCP_FILE: &str = ".dogfood-mcp";
+const PROGRESS: &str = "Working on the requested change";
 /// the neutral guest cwd every sandboxed run gets
 /// (`sandbox_host::guest_paths::GUEST_WORKSPACE`), which is the point: the
 /// operator's real layout never reaches the workload.
@@ -82,9 +84,9 @@ const ISSUE_TITLE: &str = "prove the dogfood loop";
 
 /// one script-backed provider standing in for a coding agent.
 ///
-/// It runs INSIDE the run's microVM, so `sh`, `cat` and `printf` are the whole
-/// of its dependencies and its only writable surface is the workspace it was
-/// handed. It records `pwd|HEAD` into [`HEAD_FILE`] — which the host commits —
+/// It runs inside the microVM and calls the real `ducktape mcp` tool through
+/// the scoped action tunnel before returning its final result. Its writable
+/// surface is the workspace it was handed. It records `pwd|HEAD` into [`HEAD_FILE`] — which the host commits —
 /// and answers on stdout.
 ///
 /// The behaviour rides the spec's ARGV, not a staged `provider.sh`: a microVM
@@ -130,7 +132,7 @@ impl DogfoodProvider {
         }
     }
 
-    /// Everything this executor needs of its image: `sh`, `cat`, `printf`.
+    /// The shell posts live progress through the same MCP tool exposed to models.
     ///
     /// `.git/HEAD` is read RAW rather than through `git rev-parse`. The run
     /// workspace is a self-contained clone (`.git` rides the workspace image),
@@ -139,9 +141,19 @@ impl DogfoodProvider {
     /// detached: a branch checkout would hold `ref: refs/…` instead, and the
     /// assertions below would name it.
     fn argv() -> String {
-        format!(
-            r#"["-c", "set -e; cat > /dev/null; printf '%s|%s\\n' \"$(pwd)\" \"$(cat .git/HEAD)\" > {HEAD_FILE}; printf '%s\\n' '{REPLY_TITLE}'"]"#
-        )
+        let requests = [
+            serde_json::json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+                "name":"ducktape_reply","arguments":{"text":PROGRESS}
+            }}),
+        ]
+        .map(|request| request.to_string())
+        .join("\n");
+        let script = format!(
+            "set -e\ncat > /dev/null\nprintf '%s\\n' '{requests}' | ducktape mcp > {MCP_FILE}\nprintf '%s|%s\\n' \"$(pwd)\" \"$(cat .git/HEAD)\" > {HEAD_FILE}\nprintf '%s\\n' '{REPLY_TITLE}'"
+        );
+        serde_json::to_string(&["-c", &script]).expect("provider argv")
     }
 
     fn env(&self) -> Vec<(String, String)> {
@@ -161,6 +173,14 @@ impl DogfoodProvider {
 /// the `pwd|HEAD` [`HEAD_FILE`] the run at `commit` committed, read out of a
 /// clone of the branch — committed evidence, from a node that executed nothing.
 fn run_evidence(checkout: &Path, commit: &str) -> (String, String) {
+    let responses = git_stdout(checkout, &["show", &format!("{commit}:{MCP_FILE}")]);
+    let reply = responses
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("MCP response"))
+        .find(|response| response["id"] == 1)
+        .expect("the VM called ducktape_reply");
+    assert_ne!(reply["result"]["isError"], true, "{reply}");
+    assert!(reply.get("error").is_none(), "{reply}");
     let line = git_stdout(checkout, &["show", &format!("{commit}:{HEAD_FILE}")]);
     let (cwd, head) = line
         .split_once('|')
@@ -292,10 +312,44 @@ fn seq_of(cluster: &Cluster, idx: usize, channel: &str, message_id: &str) -> u64
     )
 }
 
-fn wait_for_reply(cluster: &Cluster, idx: usize, channel: &str, run_id: &str) -> String {
-    cluster.await_committed(idx, "the agent reply to post", ROUND_TRIP, || {
-        find_message(cluster, idx, channel, &runs::reply_message_id(run_id)).map(|(_, text)| text)
-    })
+fn wait_for_reply(
+    cluster: &Cluster,
+    idx: usize,
+    channel: &str,
+    run_id: &str,
+    anchor: u64,
+) -> String {
+    let message = |id: String| {
+        cluster.await_committed(idx, "the agent thread reply to post", ROUND_TRIP, || {
+            let bytes = cluster.query(
+                idx,
+                "chat",
+                &chat::encode_query(&ChatQuery::Message {
+                    message_id: id.clone(),
+                }),
+            )?;
+            let ChatReply::Message(message) = chat::decode_reply(&bytes).ok()? else {
+                return None;
+            };
+            message
+        })
+    };
+    let progress = message(runs::post_message_id(run_id, "s0"));
+    let reply = message(runs::reply_message_id(run_id));
+    let account = common::model_account(cluster, idx, AGENT_ID);
+    for post in [&progress, &reply] {
+        assert_eq!(post.channel_id, channel);
+        assert_eq!(post.head.thread, Some(anchor));
+        assert_eq!(post.head.author, Party::Account(account));
+        assert_eq!(post.head.origin, sdk::Origin::Program(account));
+    }
+    assert!(
+        progress.seq < reply.seq,
+        "live progress precedes the final result"
+    );
+    assert_eq!(progress.head.blocks, vec![Block::paragraph(PROGRESS)]);
+    assert_eq!(reply.head.blocks, vec![Block::paragraph(REPLY_TITLE)]);
+    REPLY_TITLE.into()
 }
 
 /// the committed tip of `branch` in the dogfood repo, from ListRefs.
@@ -551,7 +605,13 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
         AGENT_ID,
     );
     assert_eq!(
-        wait_for_reply(&cluster, 0, &issue_channel, &run_1),
+        wait_for_reply(
+            &cluster,
+            0,
+            &issue_channel,
+            &run_1,
+            seq_of(&cluster, 0, &issue_channel, "m1")
+        ),
         REPLY_TITLE,
         "run 1 replies in the issue channel"
     );
@@ -608,7 +668,13 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
         AGENT_ID,
     );
     assert_eq!(
-        wait_for_reply(&cluster, 0, &pr_channel, &run_2),
+        wait_for_reply(
+            &cluster,
+            0,
+            &pr_channel,
+            &run_2,
+            seq_of(&cluster, 0, &pr_channel, "m2")
+        ),
         REPLY_TITLE,
         "run 2 replies in the PR channel"
     );
@@ -656,7 +722,13 @@ fn issue_and_pr_mentions_keep_separate_work_branches_and_continue_the_pr_session
         AGENT_ID,
     );
     assert_eq!(
-        wait_for_reply(&cluster, 0, &pr_channel, &run_3),
+        wait_for_reply(
+            &cluster,
+            0,
+            &pr_channel,
+            &run_3,
+            seq_of(&cluster, 0, &pr_channel, "m3")
+        ),
         REPLY_TITLE,
         "run 3 replies in the same PR channel"
     );

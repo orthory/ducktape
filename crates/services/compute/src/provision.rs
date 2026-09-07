@@ -31,7 +31,7 @@ use crate::workspace_source::WorkspaceSource;
 pub struct PortablePlan {
     pub source: WorkspaceSource,
     /// the run's CONSENSUS id, verbatim from the (required) envelope field —
-    /// see [`WorkspaceSpec::consensus_run_id`]. always present: a run the
+    /// see [`WorkspaceSpec::agent`]. always present: a run the
     /// session lane cannot name is a run whose mid-run writes silently vanish.
     pub consensus_run_id: String,
     pub sink: Sink,
@@ -45,6 +45,15 @@ pub struct PortablePlan {
     pub library_readable: bool,
 }
 
+/// Committed model identity and the exact host execution attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentExecution {
+    pub run_id: String,
+    pub attempt: u32,
+    pub agent_id: String,
+    pub display_name: String,
+}
+
 /// what the pool hands the provisioner for one run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSpec {
@@ -54,20 +63,10 @@ pub struct WorkspaceSpec {
     /// carries the attempt on purpose (a re-lease spawns a new attempt while
     /// the old one may still be running, and the two must never share a
     /// checkout dir). hashing it resolves nothing in consensus — the id a run
-    /// is named by there is [`Self::consensus_run_id`].
+    /// is named by there is [`Self::agent`].
     pub run_id: String,
-    /// the id `runs` resolves the run by — the key of its pending map, and the
-    /// run the agent session lane binds to. carried from the composer through
-    /// the envelope (a REQUIRED field) because the host cannot derive it (see
-    /// [`Self::run_id`]). `None` ONLY on a RECEIPT-ONLY spec, which carries
-    /// source coords alone and names no run; every EXECUTION spec the pool
-    /// builds has it, and `session::open` degrades to the read-only plane if it
-    /// somehow does not.
-    pub consensus_run_id: Option<String>,
-    pub agent_id: Option<String>,
-    /// the committed registry display name (Forge authorship / attribution).
-    /// `None` ONLY on a receipt-only spec; every execution spec carries it.
-    pub agent_display_name: Option<String>,
+    /// Present for agent execution; receipt-only materialization has no identity.
+    pub agent: Option<AgentExecution>,
     /// the pinned source the provisioner materializes — a duckfs subtree or a
     /// forge repo@commit on a work branch, verbatim from the plan.
     pub source: WorkspaceSource,
@@ -541,9 +540,12 @@ mod tests {
     fn spec() -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: "s1:0".into(),
-            consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
-            agent_id: Some("bot".into()),
-            agent_display_name: Some("Bot".into()),
+            agent: Some(AgentExecution {
+                run_id: CONSENSUS_RUN_ID.into(),
+                attempt: 0,
+                agent_id: "bot".into(),
+                display_name: "Bot".into(),
+            }),
             source: WorkspaceSource::Duckfs {
                 source_prefix: "/shared/agent-workspaces/bot".into(),
                 source_snapshot: Some("aa".repeat(32)),
@@ -556,9 +558,12 @@ mod tests {
     fn forge_spec() -> WorkspaceSpec {
         WorkspaceSpec {
             run_id: "s1:0".into(),
-            consensus_run_id: Some(CONSENSUS_RUN_ID.into()),
-            agent_id: Some("bot".into()),
-            agent_display_name: Some("Bot".into()),
+            agent: Some(AgentExecution {
+                run_id: CONSENSUS_RUN_ID.into(),
+                attempt: 0,
+                agent_id: "bot".into(),
+                display_name: "Bot".into(),
+            }),
             source: WorkspaceSource::Forge {
                 repo: "app".into(),
                 item_title: "Fix the gate".into(),
