@@ -1874,29 +1874,11 @@ where
     ) -> Result<Recovered, Error> {
         // shared past the `&mut self` journal borrows below (see the field doc).
         let code_source = std::sync::Arc::clone(&self.code_source);
+        // the checkpoint's roots. the ADOPTED baseline — every module the
+        // manifest never captured — is seeded below, after the durable floors
+        // that place the disk cohort exist (a floor is a RECORD; the adopted
+        // baseline is an inference, and the record wins).
         let mut expected: BTreeMap<ModuleId, StateRoot> = manifest.roots.iter().cloned().collect();
-        // the disk cohort: per-block-durable substrates, which recover
-        // themselves by reopening their own store (see the forward pre-scan
-        // below). read once — the seed and the pre-scan must agree on it.
-        let disk_cohort = host.block_durable_ids();
-        // a module the composer adopted EMPTY (admitted after the checkpoint,
-        // so the manifest never captured it) has no root above; its pre-root
-        // is what it holds right now, so the block that activates it — and
-        // may carry its first op — is found `at_pre`, never torn.
-        //
-        // that premise holds ONLY for the in-memory cohort. a per-block-durable
-        // module's seat is never empty: it reopens its own canonical store,
-        // already at the crash tip's root. seeding THAT as its pre-root makes
-        // the activating block look `at_pre`, and the torn branch would
-        // re-commit the block into a store that already holds it — moving its
-        // op-log root and fail-stopping the boot at the final recompose. so the
-        // disk cohort is left UNSEEDED here and placed by its own durable floor.
-        for (id, root) in host.module_roots() {
-            if disk_cohort.contains(&id) {
-                continue;
-            }
-            expected.entry(id).or_insert(root);
-        }
         let mut tip_height: Option<u64> = manifest.height;
         let mut tip_hash = manifest.root_hash;
         let mut epoch = manifest.epoch;
@@ -1943,6 +1925,7 @@ where
         // recovery never heals from a nearest/approximate record. a mis-read
         // root could only mis-seed a floor and trip the final root-hash
         // recompose (fail-stop), never fork.
+        let disk_cohort = host.block_durable_ids();
         let mut disk_floor: BTreeMap<ModuleId, u64> = BTreeMap::new();
         if !disk_cohort.is_empty() {
             for record in &records {
@@ -1978,6 +1961,30 @@ where
             trailing::trailing_wal_height(&records, manifest.height),
             &mut disk_floor,
         );
+
+        // the ADOPTED baseline. a module the manifest never captured was
+        // ADMITTED above the checkpoint, so the block that activates it — and
+        // may carry its first op — must be found `at_pre`, never torn: its
+        // pre-root is what a FRESHLY SEATED substrate holds. that is the live
+        // root at boot for the in-memory cohort (reinstalled from the
+        // checkpoint, or adopted empty), and for a per-block-durable module
+        // whose own commit for the admission block died with the crash.
+        //
+        // the exception is the per-block-durable module a RECORD already
+        // places — a durable floor above, from the pre-scan's exact post-root
+        // match or a verified height-cursor claim. its seat reopened its own
+        // canonical store, durably at or past the admission block, and seeding
+        // THAT live root as a pre-root made the activating block look `at_pre`:
+        // the torn branch then re-committed the block into a store that already
+        // held it, moving its op-log root and fail-stopping the boot at the
+        // final recompose. the floor places it instead — `ahead`/durable, as it
+        // places every other per-block-durable module.
+        for (id, root) in host.module_roots() {
+            if disk_floor.contains_key(&id) {
+                continue;
+            }
+            expected.entry(id).or_insert(root);
+        }
 
         for record in records {
             match record {
