@@ -53,8 +53,10 @@ fn v1_finalization(n: u64, proposal: &Proposal<consensus::Digest>) -> Vec<u8> {
         .take(quorum)
         .map(|s| s.sign(Subject::Finalize { proposal }).expect("signer signs"))
         .collect();
+    let attestations = commonware_utils::iter::NonEmpty::try_new(attestations.into_iter())
+        .expect("a quorum is never empty");
     let certificate = schemes[0]
-        .assemble::<_, N3f1>(attestations, &Sequential)
+        .assemble(attestations, &Sequential)
         .expect("quorum assembles");
     Finalization::<simplex_ed25519::Scheme, consensus::Digest> {
         proposal: proposal.clone(),

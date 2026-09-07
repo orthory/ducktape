@@ -31,7 +31,7 @@ use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519::PrivateKey};
 use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
 
-use statesync::qmdb::{QmdbStore, RemoteQmdbResolver};
+use statesync::qmdb::{QmdbStore, RemoteQmdbSource};
 use statesync::{
     ManifestEntry, PayloadKind, SyncClient, SyncError, SyncRequest, SyncResponse, SyncServer,
     decode_response, encode_request, fetch_manifest, fetch_snapshot,
@@ -278,7 +278,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
             // --- resolver lane: kv, chat ---------------------------------------
             let kv_entry = manifest.entry("kv").unwrap();
             let kv_root = kv_entry.root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "kv");
+            let resolver = RemoteQmdbSource::new(client.clone(), boundary, "kv");
             let target = pinned_target(kv_entry);
             assert_eq!(
                 StateRoot(target.root.0),
@@ -306,7 +306,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
 
             let chat_entry = manifest.entry("chat").unwrap();
             let chat_root = chat_entry.root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "chat");
+            let resolver = RemoteQmdbSource::new(client.clone(), boundary, "chat");
             let target = pinned_target(chat_entry);
             assert_eq!(StateRoot(target.root.0), chat_root);
             let join_chat = Chat::new(
@@ -343,7 +343,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
             // valset rides the resolver lane like kv/chat (store-backed).
             let valset_entry = manifest.entry("valset").unwrap();
             let valset_root = valset_entry.root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "valset");
+            let resolver = RemoteQmdbSource::new(client.clone(), boundary, "valset");
             let target = pinned_target(valset_entry);
             assert_eq!(StateRoot(target.root.0), valset_root);
             let join_valset = Valset::new(
@@ -366,7 +366,7 @@ fn joiner_rebuilds_every_module_over_the_wire_and_matches_the_root_hash() {
             // port): no byte snapshot, the store's proven op range.
             let saga_entry = manifest.entry("saga").unwrap();
             let saga_root = saga_entry.root;
-            let resolver = RemoteQmdbResolver::new(client.clone(), boundary, "saga");
+            let resolver = RemoteQmdbSource::new(client.clone(), boundary, "saga");
             let target = pinned_target(saga_entry);
             assert_eq!(StateRoot(target.root.0), saga_root);
             let join_saga = SagaModule::new(
