@@ -187,6 +187,13 @@ struct ValidatorRuntime<'a> {
     /// the digests the modules registry currently names — shared with the
     /// code plane's push admission gate, so both sides of #1833 read one set.
     code_registry: crate::code_plane::CodeRegistry,
+    /// the digests OPEN module proposals name, and the governance root they
+    /// were read at. MEMOISED because that read instantiates governance's
+    /// guest — the readiness pump's own registry read costs ~20 ms a tick and
+    /// this is the same class — while only a governance state change can move
+    /// the set. `None` until the first read, and on a net with no governance
+    /// module (no root to key on).
+    proposed_code: Option<(sdk::StateRoot, std::collections::HashSet<[u8; 32]>)>,
     reach_cmd: Option<tokio::sync::mpsc::Sender<reachability::ReachabilityCommand>>,
     relay_tx: super::MeshSender,
     gate_outcomes: GateOutcomes,
@@ -539,6 +546,7 @@ pub(super) async fn run(state: ValidatorLoopState<'_>) {
         blob_peers,
         blob_client,
         code_registry,
+        proposed_code: None,
         reach_cmd,
         relay_tx,
         gate_outcomes,
