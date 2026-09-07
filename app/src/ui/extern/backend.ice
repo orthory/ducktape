@@ -107,7 +107,6 @@ extern crate::backend
   OptimisticMutationError(message:str, committed:bool, operation_id:str, scope_id:str, thread_seq:i64, body:str)
   HydrationError(generation:i64, message:str)
   box-style raised_style()
-  svg-style icon_tint(tone:str)
   pure icon(name:&str) -> bytes
   connect(rpc:str, attempt:i64, generation:i64) -> WorkspaceData ! HydrationError
   stream live_events(rpc:str) -> LiveUpdate

@@ -13,10 +13,10 @@ resolver = "2"
 members = ["governance", "members", "agents"]
 
 [workspace.dependencies]
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5" }
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5", default-features = false }
-ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5" }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f6367837501b5521cbd1ab3b0b503d4c593bd7e9" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f6367837501b5521cbd1ab3b0b503d4c593bd7e9" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f6367837501b5521cbd1ab3b0b503d4c593bd7e9", default-features = false }
+ui-lang-guest = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f6367837501b5521cbd1ab3b0b503d4c593bd7e9" }
 # No renderer: a view builds a node tree, never a picture, so it needs only
 # iced's types. The desktop app draws the tree with its own renderer.
 iced = { version = "=0.14.0", default-features = false, features = ["advanced"] }
