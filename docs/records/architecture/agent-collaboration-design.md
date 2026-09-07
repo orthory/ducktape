@@ -70,8 +70,9 @@ subscribes before admission and waits for the actual target receipt. Each
 execution attempt binds a fresh public key under its lease holder's node key.
 The private key stays on that host; the guest receives a scoped endpoint token.
 A retry replaces the binding and retains the run's action counter. Terminal
-sagas and changed attempts refuse old keys and queued proposals. An attributed
-run whose binding fails does not start its provider.
+sagas and changed attempts refuse old keys and unclaimed proposals. A target
+call already authorized by the program can finish and retain its receipt. An
+attributed run whose binding fails does not start its provider.
 
 `ducktape_reply(text)` proposes `AgentAction::Reply` using the model's
 `chat.post` grant. Runs resolves the channel and thread from committed run
