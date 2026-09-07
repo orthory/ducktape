@@ -152,9 +152,9 @@ fn matches_module_action<'a>(
 
 /// `module update|register <id> <component.wasm> [--index <index.wasm>] [--after N]`: check the
 /// registry's static rules, drive the governance proposal that schedules the
-/// swap at its execute height + N, then stage the bytes at this node (fan-out
-/// to every validator, holdouts reported) and read the registry back for its
-/// verdict.
+/// swap at its execute height + N, read the registry back for its verdict, and
+/// stage the bytes at this node last (fan-out to every validator, holdouts
+/// reported).
 fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     config::validate_module_id(&args.id)?;
     // the static half of the registry's lead rule, checked before anything is
@@ -242,7 +242,21 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         Err(error) => return Err(ceremony_failed(rpc_addr, &args.id, &code_hash, error)),
     };
 
-    // 3. stage + fan-out, now that the digest is referenced. the token lives
+    // 3. the registry's verdict on the ceremony, read BEFORE the bytes move.
+    match outcome {
+        // this run's ballot did not decide: there is no schedule to read yet,
+        // and it stages anyway so its peers hold the bytes when one does.
+        CeremonyOutcome::AwaitingBallots => {}
+        // the read has to happen here, not after the fan-out: a swap's whole
+        // activation lead can elapse while a large artifact streams to every
+        // member, and the read would then name an ACTIVE module rather than
+        // the schedule this run just made. `?` because a passed proposal the
+        // registry REFUSED leaves nothing to distribute either — no swap
+        // names these bytes, so every peer would refuse the push.
+        CeremonyOutcome::Passed => confirm_scheduled(rpc_addr, &args.id, &code_hash)?,
+    }
+
+    // 4. stage + fan-out, now that the digest is referenced. the token lives
     //    in the node's workspace — its `storage_dir` in the dev shape, which
     //    is NOT the config file's directory.
     let reply = stage_component(http_base, &resolved.service.workspace, &bytes)?;
@@ -260,11 +274,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
     let members = crate::cli::read_members(rpc_addr)?;
     note_non_member_holdouts(&reply, &members);
     report_validator_holdouts(&reply, &members, &me_hex);
-
-    match outcome {
-        CeremonyOutcome::AwaitingBallots => Ok(()),
-        CeremonyOutcome::Passed => confirm_scheduled(rpc_addr, &args.id, &code_hash),
-    }
+    Ok(())
 }
 
 /// a passed proposal only ASKED the registry; the CLI's success line is the
