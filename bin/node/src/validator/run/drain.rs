@@ -1,5 +1,7 @@
 //! Finalized-block drain, checkpoint, and epoch-cutover handling.
 
+use std::collections::HashSet;
+
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
 use commonware_p2p::{Recipients, Sender as _};
@@ -1457,6 +1459,47 @@ impl ValidatorRuntime<'_> {
         }
     }
 
+    /// the digests OPEN `RegisterModule`/`UpdateModule` proposals name, read
+    /// from governance ONLY when its root has moved since the last read.
+    ///
+    /// the walk instantiates governance's guest — the same cost class as the
+    /// registry read this pump already pays each tick (~20 ms measured on a
+    /// three-node e2e cluster), on the loop that also answers `/v1` and the
+    /// RPC lane. paying it again every tick buys nothing: governance's root is
+    /// exactly the change gate for this set, since no ballot opens, closes or
+    /// moves without it.
+    ///
+    /// a net with no governance module (no root) names no proposed code, and
+    /// neither does a reply that is not the listing: an EMPTY set, never a
+    /// skipped refresh — the registry half drives readiness on its own.
+    async fn proposed_code_blobs(
+        node: &super::ValidatorNode,
+        cache: &mut Option<(sdk::StateRoot, HashSet<[u8; 32]>)>,
+    ) -> HashSet<[u8; 32]> {
+        let Some(root) = node.host().module_root("governance") else {
+            *cache = None;
+            return HashSet::new();
+        };
+        if let Some((read_at, digests)) = cache.as_ref()
+            && *read_at == root
+        {
+            return digests.clone();
+        }
+        let req = governance::encode_query(&governance::GovQuery::Proposals);
+        let reply = node.host().query("governance", &req).await;
+        let Ok(Ok(governance::GovReply::Proposals(proposals))) =
+            reply.as_deref().map(governance::decode_reply)
+        else {
+            // a read that failed or answered something else names nothing
+            // THIS tick and is retried on the next — never cached, because
+            // no root change would invalidate that emptiness.
+            return HashSet::new();
+        };
+        let digests = crate::code_plane::code_blobs_proposed(&proposals);
+        *cache = Some((root, digests.clone()));
+        digests
+    }
+
     // CODE READINESS: the byte-receipt half of a pending modreg swap.
     // a current boundary member checks the committed pending swaps against
     // its LOCAL blob store: verified-resident bytes earn one truthful
@@ -1477,6 +1520,7 @@ impl ValidatorRuntime<'_> {
             blob_client,
             blobs,
             code_registry,
+            proposed_code,
             fetch_done_tx,
             fetch_done_rx,
             ..
@@ -1517,12 +1561,26 @@ impl ValidatorRuntime<'_> {
         else {
             return;
         };
+        // an OPEN RegisterModule/UpdateModule ballot names its bytes too
+        // (#1861). the registry cannot name a brand-new artifact until that
+        // ballot passes, yet the validators deciding it are exactly the ones
+        // that must hold the bytes — naming only the registry deadlocks every
+        // `register`. read beside the registry, but only when governance's
+        // ROOT has moved: the walk instantiates governance's guest, and doing
+        // that on every tick as well as the registry read put this loop past
+        // the RPC lane's 10 s deadline. nothing but a governance state change
+        // can move the set, and the root is exactly that.
+        let proposed = Self::proposed_code_blobs(node, proposed_code).await;
         // the code plane's push admission gate reads THIS set (#1833): a
         // digest nothing here names any more is refused before any staging.
         // reclaim rides the same registry-change point — whatever fell out
-        // (a cancelled/replaced pending swap) is forgotten. Activation history
-        // remains referenced because checkpoint restore and replay use it.
-        for digest in code_registry.update(crate::code_plane::code_blobs_referenced(&modules)) {
+        // (a cancelled/replaced pending swap, or a closed proposal) is
+        // forgotten, so an unreferenced blob does not outlive the record that
+        // once justified it. activation history stays referenced because
+        // checkpoint restore and replay use it.
+        let mut referenced = crate::code_plane::code_blobs_referenced(&modules);
+        referenced.extend(proposed);
+        for digest in code_registry.update(referenced) {
             blobs.forget(&digest);
         }
         if !orchestrator
