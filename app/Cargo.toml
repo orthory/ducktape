@@ -9,6 +9,10 @@ authors = ["Ducktape contributors"]
 [package.metadata.ice.bundle]
 icon = "assets/icon.svg"
 category = "public.app-category.productivity"
+# the module-owned views `make views` stages, carried into the bundle beside
+# the executable (basename kept: `views/<module>_view.wasm`), where
+# `module_view::views_dir` looks first. Relative to this manifest.
+resources = ["../target/views"]
 
 # macOS terminates the process the instant a huddle opens a device whose reason
 # the bundle does not state; these are the sentences its prompt shows. Screen
@@ -18,7 +22,7 @@ camera = "Ducktape uses the camera for video in huddles."
 microphone = "Ducktape uses the microphone for voice in huddles."
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1015d279a4b6c34a9df3cfe3b5e4c2ba6b6d3a2d", version = "=0.1.0" }
 
 [dependencies]
 # the network's node -> announced-provider registry, behind the Shell's host
@@ -125,9 +129,15 @@ zeroize.workspace = true
 # fractional scale and the text-input-v3 protocol every Wayland input method
 # speaks. winit picks Wayland when `WAYLAND_DISPLAY` is set, X11 otherwise.
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "wayland", "x11"] }
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", default-features = false, features = ["log-timeline", "terminal"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
+ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1015d279a4b6c34a9df3cfe3b5e4c2ba6b6d3a2d", default-features = false, features = ["log-timeline", "terminal"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1015d279a4b6c34a9df3cfe3b5e4c2ba6b6d3a2d" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1015d279a4b6c34a9df3cfe3b5e4c2ba6b6d3a2d", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
+# The module-owned views (`src/module_view.rs`): the wire a view's tree and
+# events cross on, and the runtime that executes the view's component. The
+# same wasmtime pin as the node — a view is not consensus, but one runtime
+# in one binary is one set of semantics to reason about.
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1015d279a4b6c34a9df3cfe3b5e4c2ba6b6d3a2d" }
+wasmtime.workspace = true
 
 # The native notification leg (`src/backend/notify.rs`): being @mentioned or
 # DM'd raises a real macOS banner, not just the in-app bell. objc2 0.5 and
@@ -151,4 +161,4 @@ commonware-cryptography.workspace = true
 iced_test = "=0.14.0"
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "f18bfe648b26f1d032f6a33ba441fdf66305e764", version = "=0.1.0", default-features = false, features = ["test-runtime"] }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "1015d279a4b6c34a9df3cfe3b5e4c2ba6b6d3a2d", version = "=0.1.0", default-features = false, features = ["test-runtime"] }

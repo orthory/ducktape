@@ -7,7 +7,8 @@
 //! and for a brand-new artifact the open proposal is the only thing that names
 //! it (#1861). A holdout receipt is a diagnostic — the swap's readiness quorum,
 //! not the fan-out, is what holds activation. `status` reads the modules
-//! registry. Nothing here runs inside the node.
+//! registry. `pack` prepares the same artifact offline, including in a run's
+//! guest. Nothing here runs inside the node.
 
 use std::path::PathBuf;
 
@@ -22,12 +23,26 @@ type CommandResult = Result<(), Box<dyn std::error::Error>>;
 /// the `module` family's verbs.
 #[derive(Debug, clap::Subcommand)]
 pub enum ModuleCmd {
+    /// package a component and optional mapper offline; print the deployment SHA-256
+    Pack(PackArgs),
     /// schedule a code swap for a registered module
     Update(StageArgs),
     /// register a new module id with its first code
     Register(StageArgs),
     /// the modules registry: active code and any pending swap per module
     Status(StatusArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct PackArgs {
+    #[arg(value_name = "COMPONENT.WASM")]
+    pub component: PathBuf,
+    /// Optional mapper included in the deployment; omission removes it on activation.
+    #[arg(long, value_name = "INDEX.WASM")]
+    pub index: Option<PathBuf>,
+    /// Write the canonical deployment artifact here.
+    #[arg(long, value_name = "ARTIFACT")]
+    pub out: PathBuf,
 }
 
 /// `<id> <component.wasm> [--index <index.wasm>] [--after N]` — shared by update and register.
@@ -55,10 +70,30 @@ pub struct StageArgs {
 /// dispatch one `module` verb.
 pub fn run(cmd: ModuleCmd) -> CommandResult {
     match cmd {
+        ModuleCmd::Pack(args) => cmd_pack(args),
         ModuleCmd::Update(args) => cmd_update(args),
         ModuleCmd::Register(args) => cmd_register(args),
         ModuleCmd::Status(args) => cmd_status(args),
     }
+}
+
+fn read_artifact(
+    component: &std::path::Path,
+    index: Option<&std::path::Path>,
+) -> Result<module_artifact::ModuleArtifact, String> {
+    let component =
+        std::fs::read(component).map_err(|e| format!("read {}: {e}", component.display()))?;
+    let index = index
+        .map(|path| std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display())))
+        .transpose()?;
+    Ok(module_artifact::ModuleArtifact { component, index })
+}
+
+fn cmd_pack(args: PackArgs) -> CommandResult {
+    let artifact = read_artifact(&args.component, args.index.as_deref())?;
+    std::fs::write(&args.out, artifact.encode())?;
+    println!("{}", hex_bytes(&artifact.hash()));
+    Ok(())
 }
 
 /// which staging verb is running — the only difference between the two is
@@ -171,14 +206,7 @@ fn cmd_stage_and_schedule(args: StageArgs, verb: Verb) -> CommandResult {
         )
         .into());
     }
-    let component = std::fs::read(&args.component)
-        .map_err(|e| format!("read {}: {e}", args.component.display()))?;
-    let index = args
-        .index
-        .as_ref()
-        .map(|path| std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display())))
-        .transpose()?;
-    let bytes = module_artifact::ModuleArtifact { component, index }.encode();
+    let bytes = read_artifact(&args.component, args.index.as_deref())?.encode();
     let cfg_path = args.selector.config_path()?;
     let resolved = config::resolve(&cfg_path)?;
     let node = crate::cli::DrivenNode::of(&resolved, verb.name())?;

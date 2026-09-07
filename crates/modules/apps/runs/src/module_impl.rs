@@ -193,6 +193,13 @@ impl Module for RunsModule {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
+            RunsQuery::NodeWork { .. } => Err(Error::QueryUnsupported),
+            RunsQuery::NextModuleUpdate => Ok(encode_reply(&RunsReply::ModuleUpdate(
+                self.next_module_update().await?,
+            ))),
+            RunsQuery::ModuleUpdate { sequence } => Ok(encode_reply(&RunsReply::ModuleUpdate(
+                self.module_update(sequence).await?,
+            ))),
             RunsQuery::Model { query } => {
                 let reply = match query {
                     crate::ModelQuery::Agents => crate::ModelReply::Agents(self.model_records()),
@@ -265,6 +272,14 @@ impl Module for RunsModule {
 
     async fn query_with(&self, ctx: &dyn Ctx, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
+            RunsQuery::NodeWork {
+                node_key,
+                height,
+                consensus_time,
+            } => Ok(encode_reply(&RunsReply::NodeWork(
+                self.deployment_work(ctx, &node_key, height, consensus_time)
+                    .await?,
+            ))),
             RunsQuery::ActionRequest { request_id } => Ok(encode_reply(&RunsReply::ActionRequest(
                 self.action_view(ctx, &request_id).await?,
             ))),

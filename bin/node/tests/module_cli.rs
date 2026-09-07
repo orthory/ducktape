@@ -26,6 +26,49 @@ fn ducktape(args: &[&str]) -> (bool, String) {
 }
 
 #[test]
+fn pack_prepares_the_deployment_offline_with_or_without_a_mapper() {
+    use sha2::Digest as _;
+    let scratch = tempfile::tempdir().unwrap();
+    let component = fixture("hello");
+    let index = scratch.path().join("index.wasm");
+    let artifact = scratch.path().join("module.artifact");
+    std::fs::write(&index, b"mapper bytes").unwrap();
+    for mapper in [None, Some(index.as_path())] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ducktape"));
+        command
+            .env("DUCKTAPE_HOME", scratch.path().join("no-node-workspace"))
+            .args(["module", "pack", &component, "--out"])
+            .arg(&artifact);
+        if let Some(mapper) = mapper {
+            command.arg("--index").arg(mapper);
+        }
+        let result = command.output().unwrap();
+        assert!(result.status.success(), "{:?}", result);
+        let bytes = std::fs::read(&artifact).unwrap();
+        let decoded = module_artifact::ModuleArtifact::decode(&bytes).unwrap();
+        assert_eq!(decoded.component, std::fs::read(&component).unwrap());
+        assert_eq!(decoded.index, mapper.map(|_| b"mapper bytes".to_vec()));
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            format!("{:x}", sha2::Sha256::digest(&bytes)),
+        );
+    }
+    let saved = std::fs::read(&artifact).unwrap();
+    std::fs::remove_file(&index).unwrap();
+    let (ok, out) = ducktape(&[
+        "module",
+        "pack",
+        &component,
+        "--index",
+        index.to_str().unwrap(),
+        "--out",
+        artifact.to_str().unwrap(),
+    ]);
+    assert!(!ok, "{out}");
+    assert_eq!(std::fs::read(&artifact).unwrap(), saved);
+}
+
+#[test]
 fn status_against_no_node_says_the_node_is_not_running() {
     let ws = tempfile::tempdir().expect("tempdir");
     // a dev-shape node.toml with rpc_listen and no node behind it

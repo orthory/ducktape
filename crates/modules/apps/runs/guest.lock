@@ -3,6 +3,18 @@
 version = 4
 
 [[package]]
+name = "acl"
+version = "0.1.0"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
+dependencies = [
+ "async-trait",
+ "borsh",
+ "sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aead"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15,7 +27,7 @@ dependencies = [
 [[package]]
 name = "agent"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "attribution",
@@ -69,7 +81,7 @@ dependencies = [
 [[package]]
 name = "attribution"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "borsh",
@@ -174,7 +186,7 @@ dependencies = [
 [[package]]
 name = "blst"
 version = "0.3.16"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "cc",
  "glob",
@@ -215,7 +227,7 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 [[package]]
 name = "capability"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "borsh",
@@ -275,7 +287,7 @@ dependencies = [
 [[package]]
 name = "chat"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "attribution",
@@ -727,7 +739,7 @@ dependencies = [
 [[package]]
 name = "dispatch"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "borsh",
@@ -743,7 +755,7 @@ dependencies = [
 [[package]]
 name = "duckfs-core"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "base64",
  "serde",
@@ -755,7 +767,7 @@ dependencies = [
 [[package]]
 name = "ducktape-module-sdk"
 version = "0.0.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "sdk",
@@ -908,7 +920,7 @@ checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 [[package]]
 name = "files"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "duckfs-core",
 ]
@@ -1039,17 +1051,17 @@ dependencies = [
 [[package]]
 name = "getrandom"
 version = "0.2.17"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 
 [[package]]
 name = "getrandom"
 version = "0.3.4"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 
 [[package]]
 name = "getrandom"
 version = "0.4.3"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "rand_core 0.10.1",
 ]
@@ -1059,6 +1071,23 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "governance"
+version = "0.1.0"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
+dependencies = [
+ "acl",
+ "async-trait",
+ "borsh",
+ "commonware-codec",
+ "commonware-cryptography",
+ "identity",
+ "modules",
+ "sdk",
+ "serde",
+ "valset",
+]
 
 [[package]]
 name = "group"
@@ -1147,7 +1176,7 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 [[package]]
 name = "identity"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "borsh",
@@ -1161,7 +1190,7 @@ dependencies = [
 [[package]]
 name = "index-guest"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "borsh",
  "serde",
@@ -1230,7 +1259,7 @@ dependencies = [
 [[package]]
 name = "keyscheme"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "base64",
  "borsh",
@@ -1289,6 +1318,26 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "modules"
+version = "0.1.0"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
+dependencies = [
+ "async-trait",
+ "borsh",
+ "sdk",
+ "serde",
+ "valset",
+]
+
+[[package]]
+name = "node-work"
+version = "0.1.0"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "num-bigint"
@@ -1373,7 +1422,7 @@ dependencies = [
 [[package]]
 name = "pages"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "attribution",
@@ -1714,7 +1763,7 @@ dependencies = [
 [[package]]
 name = "runs"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "agent",
  "async-trait",
@@ -1726,7 +1775,10 @@ dependencies = [
  "dispatch",
  "ducktape-module-sdk",
  "files",
+ "governance",
  "identity",
+ "modules",
+ "node-work",
  "pages",
  "saga",
  "sdk",
@@ -1734,6 +1786,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tasks",
+ "valset",
 ]
 
 [[package]]
@@ -1755,7 +1808,7 @@ dependencies = [
 [[package]]
 name = "saga"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "borsh",
@@ -1777,7 +1830,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sdk"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "borsh",
@@ -2009,7 +2062,7 @@ dependencies = [
 [[package]]
 name = "tasks"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "attribution",
@@ -2220,7 +2273,7 @@ checksum = "a156c684c91ea7d62626509bce3cb4e1d9ed5c4d978f7b4352658f96a4c26b4a"
 [[package]]
 name = "valset"
 version = "0.1.0"
-source = "git+https://github.com/orthory/ducktape#87264f3bc68e94893505e526736af2353e461e61"
+source = "git+https://github.com/orthory/ducktape#66cdc915d789d6e61d776f10770f69a90941b59c"
 dependencies = [
  "async-trait",
  "borsh",

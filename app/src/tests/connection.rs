@@ -105,8 +105,11 @@ fn the_zero_hit_plate_speaks_for_the_query_it_was_sent() {
         "if connected && empty(page_search_hits) && search_answer_stands(page_search_query, page_search_draft, page_searching)"
     ));
     let overlays = inlined(include_str!("../ui/screens/overlays.ice"));
-    assert!(overlays
-        .contains("if search_phase == SearchPhase.done && empty(chat_hits) && empty(page_hits)"));
+    assert!(
+        overlays.contains(
+            "if search_phase == SearchPhase.done && empty(chat_hits) && empty(page_hits)"
+        )
+    );
 
     // THE PLATE IS OPAQUE. It is a sibling stack LAYER — over the live document
     // or over "No page selected" — and `EmptyPlate` is `bg=transparent`, so
@@ -754,13 +757,10 @@ fn every_data_screen_answers_a_dead_node_with_not_connected() {
     assert_eq!(
         screens,
         [
-            "AgentsScreen",
             "ChatScreen",
             "ExplorerScreen",
             "FilesScreen",
             "ForgeScreen",
-            "GovernanceScreen",
-            "MembersScreen",
             "NodeScreen",
             "PagesScreen",
             "SettingsScreen",
@@ -811,8 +811,6 @@ fn a_disconnected_screen_stands_its_registers_down_too() {
     const EXEMPT: [&str; 2] = ["NodeScreen", "SettingsScreen"];
 
     for source in [
-        include_str!("../ui/screens/governance.ice"),
-        include_str!("../ui/screens/roster.ice"),
         include_str!("../ui/screens/storage.ice"),
         include_str!("../ui/screens/forge.ice"),
     ] {
@@ -898,10 +896,9 @@ fn every_header_subtitle_is_gated_on_the_connection() {
         })
         .collect();
     sites.sort_unstable();
+    // Approvals', Members' and Agents' subtitles are their module views' now,
+    // gated the same way in `crates/views/*`.
     let mut expected = [
-        "proposals_summary(connected, rows)",
-        "members_summary(connected, rows)",
-        "agents_summary(connected, rows)",
         "members_summary(connected, members_rows)",
         "fs_counts_summary(connected, listed, entries)",
     ];
@@ -1078,13 +1075,6 @@ fn a_disconnected_console_reports_no_counts_at_all() {
         backend::fs_counts_summary(app.connected, true, &app.fs_entries),
         "1 file · 0 dirs"
     );
-    // The two registers this boot leaves EMPTY are silent while connected too —
-    // an all-zero subtitle repeats, in digits, the plate that already said
-    // "No agents registered" / "No proposals yet". `a_subtitle_that_is_all_zeros_
-    // says_nothing_at_all` (backend/tests.rs) is where the speaking case is
-    // proved with real rows; here they are empty on purpose.
-    assert_eq!(backend::agents_summary(app.connected, &app.agents_rows), "");
-    assert_eq!(backend::proposals_summary(app.connected, &app.gov_rows), "");
 
     // The node goes down. Everything above was a reading; none of it is one now.
     app.connected = false;
@@ -1092,14 +1082,6 @@ fn a_disconnected_console_reports_no_counts_at_all() {
         (
             "Members",
             backend::members_summary(app.connected, &app.members_rows),
-        ),
-        (
-            "Agents",
-            backend::agents_summary(app.connected, &app.agents_rows),
-        ),
-        (
-            "Approvals",
-            backend::proposals_summary(app.connected, &app.gov_rows),
         ),
         (
             "Files",

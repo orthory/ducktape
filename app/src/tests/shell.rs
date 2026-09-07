@@ -827,7 +827,10 @@ fn ready_events_rehydrate_without_rewinding_the_tip() {
 /// unreachable.
 #[test]
 fn approvals_tells_a_first_run_apart_from_a_finished_one() {
-    let source = inlined(include_str!("../ui/screens/governance.ice"));
+    // The screen is the `governance` module view's source now.
+    let source = inlined(include_str!(
+        "../../../crates/views/governance/src/ui/app.ice"
+    ));
     let arms: Vec<&str> = source
         .lines()
         .filter(|line| line.trim_start().starts_with("if ") && line.contains("answered"))
@@ -855,8 +858,8 @@ fn approvals_tells_a_first_run_apart_from_a_finished_one() {
     );
     assert!(
         !first_run
-            .split("EmptyPlate")
-            .nth(1)
+            .split("if connected && open_proposals(rows) <= 0")
+            .next()
             .unwrap_or("")
             .contains("finalized"),
         "the first-run plate must not claim decisions were finalized"
@@ -999,21 +1002,6 @@ fn interaction_state_stays_with_the_screen_that_owns_it() {
             .map(str::trim)
             .filter(|line| !line.is_empty())
             .collect()
-    }
-
-    let members = component(SCREENS.as_str(), "MembersScreen");
-    let members_state = local_state(members);
-    for field in [
-        "filter:MembersFilter = MembersFilter.all",
-        "selected = \"\"",
-    ] {
-        assert!(
-            members_state.contains(&field),
-            "MembersScreen owns `{field}`"
-        );
-    }
-    for handler in ["on pick_members_filter(next)", "on open_member(key)"] {
-        assert!(members.contains(handler), "MembersScreen owns `{handler}`");
     }
 
     let explorer = component(SCREENS.as_str(), "ExplorerScreen");

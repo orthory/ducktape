@@ -104,7 +104,7 @@ fn kind_cap(kind: u8) -> Option<u64> {
     (kind == KIND_MODULE_CODE).then_some(MAX_MODULE_CODE_BYTES)
 }
 
-/// the digests the modules registry currently NAMES: an active `code_hash`
+/// the digests the modules registry currently NAMES: an activation's code hash
 /// or a pending `ScheduledSwap`'s hash, for any module. `receive_push` admits
 /// a digest only when this set names it — the count of published artifacts
 /// was otherwise unbounded (only their concurrency was bounded), letting any
@@ -134,8 +134,8 @@ impl CodeRegistry {
     }
 
     /// replace the tracked set with a fresh registry read; returns the
-    /// digests that fell out — a cancelled/replaced swap, or a module's
-    /// `code_hash` that moved on — nothing else names them any more, so the
+    /// digests that fell out — a cancelled/replaced pending swap whose code
+    /// was never activated. Nothing else names them any more, so the
     /// caller may `forget` their blobs.
     pub(crate) fn update(&self, fresh: HashSet<[u8; 32]>) -> Vec<[u8; 32]> {
         let mut live = self.0.write().expect("code registry lock");
@@ -145,11 +145,12 @@ impl CodeRegistry {
     }
 }
 
-/// the digests a [`modules::ModuleCode`] snapshot NAMES: every module's active
-/// `code_hash` plus any pending `ScheduledSwap`'s hash. the one walk the
-/// drain's readiness pump and [`CodeRegistry::update`] share — a module
-/// registered but never activated contributes nothing (`active_code_hash` is
-/// empty), and a malformed hash (never CODE_HASH_LEN bytes, which the
+/// the digests a [`modules::ModuleCode`] snapshot NAMES: every recorded
+/// activation plus any pending `ScheduledSwap`'s hash. Checkpoint restore and
+/// journal replay still need code from before the latest activation. This is
+/// the walk the drain's readiness pump and [`CodeRegistry::update`] share.
+/// A module never activated contributes only its pending hash. A malformed
+/// hash (never CODE_HASH_LEN bytes, which the
 /// registry itself enforces on write) is simply not a match for anything.
 pub(crate) fn code_blobs_referenced(modules: &[modules::ModuleCode]) -> HashSet<[u8; 32]> {
     modules
@@ -160,7 +161,11 @@ pub(crate) fn code_blobs_referenced(modules: &[modules::ModuleCode]) -> HashSet<
                 .pending
                 .as_ref()
                 .and_then(|p| p.code_hash.as_slice().try_into().ok());
-            [active, pending].into_iter().flatten()
+            let history = m
+                .history
+                .iter()
+                .filter_map(|activation| activation.code_hash.as_slice().try_into().ok());
+            [active, pending].into_iter().flatten().chain(history)
         })
         .collect()
 }
@@ -1107,8 +1112,9 @@ mod tests {
         assert!(!registry.is_referenced(&digest));
     }
 
-    /// a digest the registry drops (a cancelled/replaced swap, or code that
-    /// moved on) is reported by `update` so the caller can `forget` it — and
+    /// a digest the registry drops (a cancelled/replaced pending swap, or a
+    /// closed proposal) is reported by `update` so the caller can `forget` it
+    /// — and
     /// once forgotten it is no longer resident, exactly as an unreferenced
     /// push would find it.
     #[test]
@@ -1135,6 +1141,39 @@ mod tests {
             blobs.has_chunk(&kept),
             "a still-referenced blob must survive"
         );
+    }
+
+    #[test]
+    fn activation_history_retains_replay_code_but_cancelled_pending_code_is_released() {
+        let old = [1; 32];
+        let active = [2; 32];
+        let cancelled = [3; 32];
+        let registry = CodeRegistry::default();
+        registry.update(HashSet::from([old, active, cancelled]));
+        let modules = vec![modules::ModuleCode {
+            module_id: "hello".into(),
+            active_code_hash: active.to_vec(),
+            pending: None,
+            history: vec![
+                modules::Activation {
+                    height: 10,
+                    code_hash: old.to_vec(),
+                },
+                modules::Activation {
+                    height: 20,
+                    code_hash: active.to_vec(),
+                },
+            ],
+        }];
+        assert_eq!(
+            registry.update(code_blobs_referenced(&modules)),
+            vec![cancelled]
+        );
+        assert!(
+            registry.is_referenced(&old),
+            "an earlier checkpoint must still find its code"
+        );
+        assert!(registry.is_referenced(&active));
     }
 
     /// a sender that streams `head` and then drops the connection.

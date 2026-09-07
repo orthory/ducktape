@@ -25,6 +25,7 @@ testkit = ["dep:nettest"]
 verify = ["provider-host/verify"]
 
 [dependencies]
+node-work = { workspace = true }
 # Committed-block receipt notifications for interactive program actions.
 tokio-tungstenite = "0.24"
 module-artifact = { workspace = true }
@@ -153,3 +154,4 @@ http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 # isolated storage roots for the admin-token, git-lane and testkit tests.
 tempfile = "3"
+syn = { version = "2", features = ["full"] }

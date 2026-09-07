@@ -441,18 +441,12 @@ view
               fs_cancel_edit -> fs_cancel_edit
               fs_save_edit -> fs_save_edit
         members:
-          MembersScreen #members
-            with
-              rows=members_rows
-              admin=members_is_admin(members_rows)
-              connected
-              answered=members_answered
-            events
-              copy_to_clipboard -> copy_to_clipboard _ _
-              agent_set_status -> agent_set_status _ _
-              gov_propose -> gov_propose _ _
+          extern members_view(dark, connected, members_is_admin(members_rows), members_answered, members_rows) #members -> members_view_event _
         agents:
-          AgentsScreen rows=agents_rows connected answered=agents_answered #agents
+          // the agents view declares no intents, so nothing ever arrives on
+          // this route; the extern needs one and the roster handler is the
+          // honest destination
+          extern agents_view(dark, connected, agents_answered, agents_rows) #agents -> members_view_event _
         forge:
           ForgeScreen review_draft<->forge_review_draft comment_draft<->forge_comment_draft discussion_editor<->forge_discussion_editor #forge
             with
@@ -518,17 +512,11 @@ view
               note_composer_event -> forge_composer_event _
               open_message_link -> open_message_link _
               copy_to_clipboard -> copy_to_clipboard _ _
+        // Approvals is a MODULE-OWNED VIEW: the register the app holds goes
+        // in as props, and what the reader does comes back as an intent the
+        // handler below signs — the guest sees no key and no endpoint.
         governance:
-          GovernanceScreen #governance
-            with
-              rows=gov_rows
-              voting=gov_voting
-              admin=members_is_admin(members_rows)
-              connected
-              answered=gov_answered
-            events
-              gov_vote -> gov_vote _ _
-              gov_execute -> gov_execute _
+          extern governance_view(dark, connected, members_is_admin(members_rows), gov_answered, gov_voting, gov_rows) #governance -> governance_view_event _
         node:
           NodeScreen wall_now=wall_now node_log_filter<->node_log_filter #node
             with

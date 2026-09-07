@@ -231,13 +231,20 @@ mod tests {
         // enforces. every KNOWN_ACTION that an agent can *invoke* has a tool, and
         // every tool names its action so a denied agent can say what it lacks.
         //
-        // chat.post is the exception and belongs to no tool: it authorizes the
+        // chat.post belongs to no tool: it authorizes the
         // run's REPLY BLOCKS (its final answer), which the runs module posts —
         // not anything an agent calls mid-run. chat.post_message is the tool-side
-        // power, and it is deliberately a different grant.
+        // power, and it is deliberately a different grant. modules.update also
+        // requires a final response: its source is bound after the host push.
         let described: Vec<&str> = tools().iter().map(|t| t.description).collect();
         for action in runs::KNOWN_ACTIONS {
-            if action == runs::ACTION_CHAT_POST {
+            let final_only = matches!(action, runs::ACTION_CHAT_POST | runs::ACTION_MODULES_UPDATE);
+            if final_only {
+                assert!(
+                    !described
+                        .iter()
+                        .any(|description| description.contains(&format!("{action} ")))
+                );
                 continue;
             }
             assert!(

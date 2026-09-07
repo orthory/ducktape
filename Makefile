@@ -16,7 +16,7 @@ APP_DEST ?= $(HOME)/Applications
 BIN_DEST ?= $(HOME)/.cargo/bin
 UNAME_S := $(shell uname -s)
 
-.PHONY: all app app-release dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
+.PHONY: all app app-release views dev dev-clear demo-seed demo-app demo-clear dogfood-forge node coordinator coordinator-smoke install install-app install-node install-coordinator test clean wasm-modules wasm-modules-check wasm-embed-check wasm-repro-check wasm-rebuild-check labs-gate audit
 
 ## build every workspace crate (the default target)
 all:
@@ -30,7 +30,7 @@ all:
 ## quits the app and leaves the node and services running; `make dev-clear`
 ## stops that background runtime without deleting its state, while
 ## `make demo-clear` removes the workspace entirely.
-dev:
+dev: views
 	@bash ops/dev.sh
 
 ## stop the demo node and compute/agent/airlock services left by `make dev`.
@@ -86,7 +86,6 @@ coordinator:
 coordinator-smoke:
 	$(CARGO) test $(LOCKED) -p coordinator-bin
 
-ifeq ($(UNAME_S),Darwin)
 # Build cargo-ice from the same ducktape-ui rev as the app. A global cargo-ice
 # can parse a different language than the compiler in app/Cargo.toml.
 #
@@ -109,6 +108,22 @@ $(ICE_BIN):
 	CARGO_TARGET_DIR="$(CURDIR)/target/cargo-ice-build" $(CARGO) install cargo-ice \
 		--git "$(ICE_GIT)" --rev "$(ICE_REV)" --locked --root "$(ICE_ROOT)"
 
+## build every module-owned view (crates/views) as an `ice:view` component
+## and stage it under target/views, where a built desktop app loads it from
+## (`DUCKTAPE_VIEWS_DIR` overrides; `make install-app` installs them beside the
+## binary). Needs wasm-tools like `wasm-modules`. The views workspace pins the
+## same ducktape-ui rev as the app, and this refuses when they differ: a view
+## compiled by another language revision than the host that renders it is a
+## wire nobody tested.
+views: $(ICE_BIN)
+	@test "$$(sed -n 's/.*ducktape-ui.git", rev = "\([^"]*\)".*/\1/p' crates/views/Cargo.toml | head -n1)" = "$(ICE_REV)" || \
+	  { echo "crates/views/Cargo.toml pins a different ducktape-ui rev than app/Cargo.toml" >&2; exit 1; }
+	@test "$$(wasm-tools --version)" = "wasm-tools $$(cat wasm-tools.version)" || \
+	  { echo "install wasm-tools at the version in wasm-tools.version" >&2; exit 1; }
+	"$(ICE_BIN)" bundle --manifest-path crates/views/Cargo.toml -p governance-view -p members-view -p agents-view \
+		--target wasm32-unknown-unknown --out target/views
+
+ifeq ($(UNAME_S),Darwin)
 ## build Ducktape.app and its DMG under target/ice-bundle. Ad-hoc signed
 ## unless the environment says otherwise — `cargo-ice bundle` reads these
 ## itself, and this recipe inherits the environment, so nothing is forwarded
@@ -127,7 +142,7 @@ $(ICE_BIN):
 ##                          before the upload — Apple rejects an ad-hoc
 ##                          signature.
 ## The release recipe is app/README.md § "Release build".
-app: $(ICE_BIN)
+app: $(ICE_BIN) views
 	"$(ICE_BIN)" bundle -p ducktape-app
 
 ## `make app-release` for a build that leaves this machine: refuses unless a
@@ -161,8 +176,8 @@ ICON_DEST ?= $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/icons/
 ## install the ducktape operator CLI and the desktop app without requiring root
 install: install-node install-app
 
-## build the desktop app binary
-app:
+## build the desktop app binary and the views it loads
+app: views
 	$(CARGO) build $(LOCKED) --release -p ducktape-app
 
 ## install the desktop app and REGISTER THE duck:// SCHEME with the desktop.
@@ -175,6 +190,8 @@ app:
 install-app: app
 	mkdir -p "$(BIN_DEST)" "$(DESKTOP_DEST)" "$(ICON_DEST)"
 	install -m 0755 target/release/ducktape-app "$(BIN_DEST)/ducktape-app"
+	mkdir -p "$(BIN_DEST)/views"
+	install -m 0644 target/views/*.wasm "$(BIN_DEST)/views/"
 	install -m 0644 app/assets/icon.svg "$(ICON_DEST)/ducktape.svg"
 	sed 's|@EXEC@|$(BIN_DEST)/ducktape-app|' app/packaging/dev.ducktape.app.desktop \
 		> "$(DESKTOP_DEST)/dev.ducktape.app.desktop"
