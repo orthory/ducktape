@@ -271,17 +271,7 @@ extern crate::backend
   pure plural(count:i64, one:&str, many:&str) -> str
   pure members_summary(connected:bool, rows:&[MemberRow]) -> str
   pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
-  pure proposals_summary(connected:bool, rows:&[ProposalRow]) -> str
-  QuorumSeat(filled:bool)
-  pure quorum_dots(approvals:i64, required:i64) -> [QuorumSeat]
-  pure tally_label(approvals:i64, required:i64) -> str
   pure reading_pair(left:&str, right:&str) -> str
-  pure tally_tone(approvals:i64, required:i64) -> str
-  pure tally_note(approvals:i64, required:i64) -> str
-  pure approve_label(approvals:i64, required:i64) -> str
-  pure proposal_kind_tone(action:&str) -> str
-  pure settled_proposals(rows:&[ProposalRow]) -> [ProposalRow]
-  pure pending_label(rows:&[ProposalRow]) -> str
   pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
   pure relative_time(unix_seconds:i64, wall_now:i64) -> str
   sync current_wall_seconds() -> i64

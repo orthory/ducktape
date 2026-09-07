@@ -200,6 +200,12 @@ enum ForgeReviewVerdict
   approve
   request_changes
 
+// What a `governance` module view asks of the app: the two writes the
+// Approvals screen makes, routed to the handlers that sign them.
+enum GovIntent
+  vote
+  execute
+
 enum MembersFilter
   all
   humans

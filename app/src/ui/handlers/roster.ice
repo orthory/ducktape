@@ -198,15 +198,18 @@ on governance_failed(cause)
   return if cause.generation != gov_generation
   gov_answered = true
 
-on gov_vote(proposal_id, approve)
-  return if !connected || !empty(gov_voting)
-  gov_voting = proposal_id
-  run every governance_vote(connected_rpc, password, gov_voting, approve) -> gov_acted _ | gov_act_failed _
-
-on gov_execute(proposal_id)
-  return if !connected || !empty(gov_voting)
-  gov_voting = proposal_id
-  run every governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
+// The Approvals view's intents. The guest names a proposal and an answer;
+// the endpoint, the key and the write are this handler's, exactly as they
+// were when the screen was native. An intent that names no proposal — a
+// malformed one — is refused by the empty-id guard like an empty vote.
+on governance_view_event(event)
+  return if !connected || !empty(gov_voting) || empty(gov_event_proposal(event))
+  gov_voting = gov_event_proposal(event)
+  match gov_intent(event)
+    GovIntent.vote
+      run every governance_vote(connected_rpc, password, gov_voting, gov_event_approves(event)) -> gov_acted _ | gov_act_failed _
+    GovIntent.execute
+      run every governance_execute(connected_rpc, password, gov_voting) -> gov_acted _ | gov_act_failed _
 
 // The quorum-gated membership actions the roster detail panel offers. They
 // share `gov_voting` with vote/execute: one governance write is in flight.
