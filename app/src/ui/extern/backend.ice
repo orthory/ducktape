@@ -176,9 +176,11 @@ extern crate::backend
   // only off macOS, where no status item exists to live in, once no window
   // is left.
   pure last_window_closed_exits(console:window-id?, onboarding:window-id?) -> bool
-  // "Open Ducktape" as a discriminant: nothing tracked means there is nothing
-  // to raise, so the row must open a window instead of focusing a fresh id.
-  pure tray_open_action(console:window-id?, onboarding:window-id?) -> WindowSummon
+  // "Open Ducktape" as a discriminant. Nothing tracked no longer means "never
+  // connected": a connected network reopens the CONSOLE (reconnecting from
+  // `rpc`), never the launch window, which would reset `hub_step` back to the
+  // picker (#1782).
+  pure tray_open_action(network_open:bool, window_tracked:bool) -> TrayOpen
   // The same decision for the call's window: the LIVE pill and the tray's
   // huddle row both mean "put it in front of me", whether or not one is up.
   pure huddle_summon(huddle:window-id?) -> WindowSummon
@@ -271,17 +273,7 @@ extern crate::backend
   pure plural(count:i64, one:&str, many:&str) -> str
   pure members_summary(connected:bool, rows:&[MemberRow]) -> str
   pure agents_summary(connected:bool, rows:&[AgentRow]) -> str
-  pure proposals_summary(connected:bool, rows:&[ProposalRow]) -> str
-  QuorumSeat(filled:bool)
-  pure quorum_dots(approvals:i64, required:i64) -> [QuorumSeat]
-  pure tally_label(approvals:i64, required:i64) -> str
   pure reading_pair(left:&str, right:&str) -> str
-  pure tally_tone(approvals:i64, required:i64) -> str
-  pure tally_note(approvals:i64, required:i64) -> str
-  pure approve_label(approvals:i64, required:i64) -> str
-  pure proposal_kind_tone(action:&str) -> str
-  pure settled_proposals(rows:&[ProposalRow]) -> [ProposalRow]
-  pure pending_label(rows:&[ProposalRow]) -> str
   pure expires_in_blocks(deadline_height:i64, height:i64, wall_now:i64) -> str
   pure relative_time(unix_seconds:i64, wall_now:i64) -> str
   sync current_wall_seconds() -> i64

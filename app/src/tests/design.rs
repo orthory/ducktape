@@ -671,7 +671,6 @@ fn semantic_recipes_own_action_focus_and_status_colors() {
         "add_channel_member_submit",
         "fs_mkdir_submit",
         "fs_new_file_submit",
-        "gov_execute",
         "account_rename_submit",
     ] {
         let kit_components = inlined(include_str!("../ui/components/kit.ice"));
@@ -1221,7 +1220,9 @@ fn every_current_row_marker_rests_on_one_selection_token() {
         "ui/components/shell.ice",
         "ui/screens/chat.ice",
         "ui/screens/forge.ice",
-        "ui/screens/governance.ice",
+        // The Approvals screen ships as a module-owned view; its source is
+        // held to the same conventions as the native ones.
+        "../../crates/views/governance/src/ui/app.ice",
         "ui/screens/overlays.ice",
         "ui/screens/pages.ice",
         "ui/screens/roster.ice",
@@ -1290,9 +1291,9 @@ fn the_chat_surface_holds_to_its_measured_geometry() {
 
     // ONE LINE MEASURE. Unbounded, the body ran ~130 characters at the default
     // window and ~320 maximized — past every readability bound there is.
-    assert!(components.contains(
-        "col w=fill max-w=760.0\n    RichBody blocks=message.blocks size=13.5"
-    ));
+    assert!(
+        components.contains("col w=fill max-w=760.0\n    RichBody blocks=message.blocks size=13.5")
+    );
     assert!(components.contains("col w=fill gap=5.0\n    for block in blocks"));
 
     // GROUPING RHYTHM: 11px inside an author run, 25px across one (11 + the
@@ -1408,11 +1409,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ),
         ("screens/roster.ice", "for member in rows"),
         ("screens/roster.ice", "for agent in rows"),
-        ("screens/governance.ice", "for proposal in rows"),
-        (
-            "screens/governance.ice",
-            "for proposal in settled_proposals(rows)",
-        ),
         ("screens/node.ice", "for peer in node_peers"),
         ("components/huddle.ice", "for tile in rows"),
         ("components/node.ice", "for entry in rows"),
@@ -1440,10 +1436,6 @@ fn every_repeated_component_mount_is_culled_or_argued() {
         ("components/chat.ice", "for reaction in message.reactions"),
         // One review's inline comments, bounded by the review that holds them.
         ("components/forge.ice", "for comment in review.comments"),
-        (
-            "components/kit.ice",
-            "for seat in quorum_dots(proposal.approvals, proposal.required_yes)",
-        ),
         (
             "components/shell.ice",
             "for item in shell_nav(tab, approvals, agent_live)",

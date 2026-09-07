@@ -267,8 +267,9 @@ pub fn filter_members(rows: &[MemberRow], filter: crate::MembersFilter) -> Vec<M
         .collect()
 }
 
-/// One governance proposal, rendered.
-#[derive(Clone, Debug, Hash, PartialEq)]
+/// One governance proposal, rendered. Serialized as-is for the `governance`
+/// module view, which draws the register the app holds.
+#[derive(Clone, Debug, Hash, PartialEq, serde::Serialize)]
 pub struct ProposalRow {
     pub id: String,
     pub action: String,

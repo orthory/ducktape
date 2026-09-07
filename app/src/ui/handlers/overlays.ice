@@ -129,7 +129,6 @@ on content_scroll_key(event)
   parallel
     task widget scroll-by #workspace-tabs/content/settings/settings-body 0.0 content_scroll window=window_target(console_win)
     task widget scroll-by #workspace-tabs/content/node/node-body 0.0 content_scroll window=window_target(console_win)
-    task widget scroll-by #workspace-tabs/content/governance/approvals-body 0.0 content_scroll window=window_target(console_win)
     task widget scroll-by #workspace-tabs/content/members/members-body 0.0 content_scroll window=window_target(console_win)
     task widget scroll-by #workspace-tabs/content/agents/agents-body 0.0 content_scroll window=window_target(console_win)
 
