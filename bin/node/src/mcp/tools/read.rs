@@ -23,6 +23,8 @@ use serde_json::{Value, json};
 
 use forge::ForgeQuery;
 use pages::PageQuery;
+// the ONE duckfs reply filter, shared with the sandboxed run's read lane.
+use provider_host::duckfs_cap;
 use runs::RunsQuery;
 use runs::{CapRequest, ModelQuery};
 use tasks::{TaskQuery, WorkQuery};
@@ -378,17 +380,15 @@ fn files_read(run: &Run, args: &Value) -> Result<Value> {
 /// source, but it would also silently empty a legitimate call whose `prefix`
 /// names one exact file rather than a directory (grep only matches a file
 /// candidate with `child == prefix || child.starts_with(prefix)`, and no
-/// file path ends in `/`). `ModelRecord::retain_capped_rows` and
-/// `ModelRecord::scrub_uncapped_cursor` already re-check every hit and the
-/// resume cursor against the cap regardless of what duckfs scanned, so nothing
-/// outside the cap can reach the agent either way — a `next` cursor is a resume
-/// path, not a hit.
+/// file path ends in `/`). `duckfs_cap`'s two filters already re-check every
+/// hit and the resume cursor against the cap regardless of what duckfs scanned,
+/// so nothing outside the cap can reach the agent either way — a `next` cursor
+/// is a resume path, not a hit.
 ///
-/// Those two live on the RECORD, beside `permits` itself, because this is not
-/// the only gate in front of the raw route any more: a sandboxed run's node
-/// tunnel is a cap-checked read lane (`provider-host`'s `read_lane`) that
-/// filters the same replies, and the lane and this tool plane must decide
-/// identically.
+/// They live in `provider-host` rather than here because this is not the only
+/// gate in front of the raw route any more: a sandboxed run's node tunnel is a
+/// cap-checked read lane (`provider-host`'s `read_lane`) that filters the same
+/// replies, and the lane and this tool plane must decide identically.
 fn files_grep(run: &Run, args: &Value) -> Result<Value> {
     let prefix = arg_str(args, "prefix")?;
     let pattern = arg_str(args, "pattern")?;
@@ -397,8 +397,8 @@ fn files_grep(run: &Run, args: &Value) -> Result<Value> {
     let mut reply = run
         .node
         .files("grep", &[("pattern", pattern), ("prefix", prefix)])?;
-    record.retain_capped_rows(&mut reply, "hits");
-    record.scrub_uncapped_cursor(&mut reply, "hits");
+    duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
+    duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
     Ok(reply)
 }
 
@@ -766,7 +766,7 @@ mod tests {
             ],
             "next": null,
         });
-        record.retain_capped_rows(&mut reply, "hits");
+        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
         let paths: Vec<&str> = reply["hits"]
             .as_array()
             .unwrap()
@@ -790,8 +790,8 @@ mod tests {
             ],
             "next": "/shared/team-secrets/creds.txt",
         });
-        record.retain_capped_rows(&mut reply, "hits");
-        record.scrub_uncapped_cursor(&mut reply, "hits");
+        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
+        duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
         assert_eq!(reply["next"], json!("/shared/team/a.txt"));
     }
 
@@ -806,8 +806,8 @@ mod tests {
             ],
             "next": "/shared/team-secrets/creds.txt",
         });
-        record.retain_capped_rows(&mut reply, "hits");
-        record.scrub_uncapped_cursor(&mut reply, "hits");
+        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
+        duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
         assert_eq!(reply["hits"].as_array().unwrap().len(), 0);
         assert_eq!(reply["next"], Value::Null);
     }
@@ -822,8 +822,8 @@ mod tests {
             ],
             "next": "/shared/team/b.txt",
         });
-        record.retain_capped_rows(&mut reply, "hits");
-        record.scrub_uncapped_cursor(&mut reply, "hits");
+        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
+        duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
         assert_eq!(reply["next"], json!("/shared/team/b.txt"));
     }
 
@@ -847,8 +847,8 @@ mod tests {
             ],
             "next": "/shared/team/a.txt",
         });
-        record.retain_capped_rows(&mut reply, "hits");
-        record.scrub_uncapped_cursor(&mut reply, "hits");
+        duckfs_cap::retain_capped_rows(&record, &mut reply, "hits");
+        duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, "hits");
         assert_eq!(
             reply["hits"].as_array().unwrap().len(),
             1,

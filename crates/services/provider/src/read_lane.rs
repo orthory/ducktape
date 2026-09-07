@@ -17,8 +17,7 @@
 //!   `CapRequest::DuckfsRead` for the path it names — the SAME predicate, on
 //!   the same record, that `bin/node`'s MCP read tools gate on. A prefix query
 //!   (`find`, `grep`) additionally has its rows and its resume cursor filtered
-//!   through [`runs::ModelRecord::retain_capped_rows`] /
-//!   [`runs::ModelRecord::scrub_uncapped_cursor`], because duckfs' own prefix
+//!   through [`crate::duckfs_cap`], because duckfs' own prefix
 //!   rule is a raw string prefix and the cap is segment-boundary. A files read
 //!   route that names no path to check at all is refused: there is no way to
 //!   cap-check it, so it is not the lane's to pass.
@@ -261,8 +260,8 @@ impl Lane {
             // hand it back untouched rather than inventing one.
             return Response::from_parts(parts, Body::from(bytes));
         };
-        record.retain_capped_rows(&mut reply, rows);
-        record.scrub_uncapped_cursor(&mut reply, rows);
+        crate::duckfs_cap::retain_capped_rows(&record, &mut reply, rows);
+        crate::duckfs_cap::scrub_uncapped_cursor(&record, &mut reply, rows);
         (parts.status, axum::Json(reply)).into_response()
     }
 
@@ -506,15 +505,15 @@ mod tests {
 
     /// the lane and the MCP tool plane are two doors onto the SAME duckfs
     /// reads, and a second hand-rolled copy of the cap filter in either one is
-    /// how they drift into disagreeing. Both must reach for the methods on
-    /// `ModelRecord`, and neither may define its own.
+    /// how they drift into disagreeing. Both must reach for `duckfs_cap`, and
+    /// neither may define its own.
     #[test]
     fn the_lane_and_the_mcp_tools_share_one_cap_filter() {
         // every needle is ASSEMBLED, never written whole: this test reads its
         // OWN file, and a literal here would match itself and pass on nothing.
         let filters = [
-            format!("retain_capped_{}(&mut reply,", "rows"),
-            format!("scrub_uncapped_{}(&mut reply,", "cursor"),
+            format!("duckfs_cap::retain_capped_{}(", "rows"),
+            format!("duckfs_cap::scrub_uncapped_{}(", "cursor"),
         ];
         let copies = [
             format!("fn retain_{}", "capped"),

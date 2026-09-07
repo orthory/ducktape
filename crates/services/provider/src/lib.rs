@@ -205,6 +205,9 @@ pub(crate) use sandbox_host::sandbox;
 pub use sandbox_host::{GuestAsset, GuestLayout};
 #[cfg(unix)]
 pub(crate) use sandbox_host::{firecracker_api, guest_manifest, microvm};
+// the duckfs read cap applied to a reply: shared by this crate's read lane and
+// `bin/node`'s MCP read tools, so the two gate identically.
+pub mod duckfs_cap;
 mod read_lane;
 mod spec;
 mod variants;

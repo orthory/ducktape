@@ -5,7 +5,6 @@
 use borsh::{BorshDeserialize, BorshSerialize};
 pub use sdk::Origin as RunOrigin;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 // ---- consensus constants ----------------------------------------------------
 
@@ -413,55 +412,6 @@ impl ModelRecord {
     /// the tool plane then refuses to open.
     pub fn library_readable(&self) -> bool {
         self.permits(&CapRequest::DuckfsRead(SKILL_LIBRARY_PREFIX))
-    }
-
-    /// drop every row of `reply[rows]` whose own `path` this record's
-    /// `duckfs_read` cap does not cover — a no-op when the reply carries no
-    /// such array.
-    ///
-    /// duckfs' own prefix rule is a RAW string prefix (`/shared/team` also
-    /// matches `/shared/team-secrets/...`) while [`Self::permits`] is
-    /// segment-boundary, so passing the gate on a call's `prefix` argument does
-    /// NOT make every row it returns covered. Both readers of a duckfs prefix
-    /// query — the `ducktape mcp` tool plane and a sandboxed run's read lane —
-    /// filter through this method, so the two cannot drift apart.
-    pub fn retain_capped_rows(&self, reply: &mut Value, rows: &str) {
-        let Some(list) = reply.get_mut(rows).and_then(Value::as_array_mut) else {
-            return;
-        };
-        list.retain(|row| {
-            row.get("path")
-                .and_then(Value::as_str)
-                .is_some_and(|path| self.permits(&CapRequest::DuckfsRead(path)))
-        });
-    }
-
-    /// replace a `next` resume cursor the cap does not cover: such a cursor
-    /// names a path in a sibling tree the agent may not read at all (the same
-    /// leak [`Self::retain_capped_rows`] closes for the rows themselves — a
-    /// page that ran out of budget mid-scan of an out-of-cap sibling hands that
-    /// sibling's path back as its cursor).
-    ///
-    /// The fallback is the last RETAINED row's own path — still a valid resume
-    /// point, inside the cap — or no cursor at all when no row survived
-    /// filtering. A no-op when the reply carries no cursor already.
-    pub fn scrub_uncapped_cursor(&self, reply: &mut Value, rows: &str) {
-        // no cursor (missing key, or an explicit `null` meaning "no more
-        // pages") is nothing to scrub.
-        let Some(next) = reply.get("next").and_then(Value::as_str) else {
-            return;
-        };
-        if self.permits(&CapRequest::DuckfsRead(next)) {
-            return;
-        }
-        let fallback = reply
-            .get(rows)
-            .and_then(Value::as_array)
-            .and_then(|list| list.last())
-            .and_then(|row| row.get("path"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        reply["next"] = fallback;
     }
 
     /// The callee as it may execute for this caller. Agents remain peers: a
