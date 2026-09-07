@@ -35,10 +35,10 @@ pub(super) fn is_pages_action(action: &AgentAction) -> bool {
 /// be neither index-safe nor length-bounded — pages would reject it and the
 /// emitted op would abort the delivery block. the 64-char hex hash is short,
 /// escape-free, and still fully replay-deterministic.
-fn page_thread_id(run_id: &str, slot: &str) -> String {
+pub(super) fn page_thread_id(run_id: &str, slot: &str) -> String {
     format!("agent/{}/thread/{slot}", crate::dispatch_id_for(run_id))
 }
-fn page_comment_id(run_id: &str, slot: &str) -> String {
+pub(super) fn page_comment_id(run_id: &str, slot: &str) -> String {
     format!("agent/{}/comment/{slot}", crate::dispatch_id_for(run_id))
 }
 
@@ -138,7 +138,7 @@ impl RunsModule {
         action: &AgentAction,
         already_staged: usize,
     ) -> Result<Msg, String> {
-        let name = action.vocabulary_name();
+        let name = action.vocabulary_name().expect("concrete pages action");
         if !allows(agent, name) {
             return Err(format!("agent {} is not allowed to {name}", agent.agent_id));
         }

@@ -651,14 +651,15 @@ async fn execute(
     let sink = plan.sink;
     let spec = WorkspaceSpec {
         run_id: format!("{}:{}", job.saga_id, job.attempt),
-        // the CONSENSUS id, straight from the envelope — the only id that
-        // resolves the run back in `runs`. it is deliberately NOT derived from
-        // the saga id above: that one exists to key the on-disk workspace dir.
-        // Some on every execution spec (the envelope field is required); the
-        // Option is for the receipt-only specs the provisioners mint.
-        consensus_run_id: Some(plan.consensus_run_id),
-        agent_id: ctx.agent_id.clone(),
-        agent_display_name: Some(plan.agent_display_name),
+        agent: Some(crate::AgentExecution {
+            run_id: plan.consensus_run_id,
+            attempt: job.attempt,
+            agent_id: ctx
+                .agent_id
+                .clone()
+                .ok_or("agent execution has no model identity")?,
+            display_name: plan.agent_display_name,
+        }),
         // the tagged source (duckfs subtree or forge repo@commit) crosses to
         // the provisioner verbatim — the pool never interprets it.
         source: plan.source,
@@ -3100,7 +3101,7 @@ format = "text"
         });
         let (pool, mut rx) = pool_with_provisioner(providers, provisioner);
 
-        let eff = effect_with_payload("s1", 0, Some(b"me"), &forge_envelope_payload());
+        let eff = effect_with_payload("s1", 7, Some(b"me"), &forge_envelope_payload());
         pool.run(&eff).await.unwrap();
         let _ = next_result(&mut rx).await;
 
@@ -3109,9 +3110,16 @@ format = "text"
             .unwrap()
             .clone()
             .expect("the spec was captured");
-        assert_eq!(spec.run_id, "s1:0");
-        assert_eq!(spec.agent_id.as_deref(), Some("bot"));
-        assert_eq!(spec.agent_display_name.as_deref(), Some("BOT"));
+        assert_eq!(spec.run_id, "s1:7");
+        assert_eq!(spec.agent.as_ref().unwrap().attempt, 7);
+        assert_eq!(
+            spec.agent.as_ref().map(|agent| agent.agent_id.as_str()),
+            Some("bot")
+        );
+        assert_eq!(
+            spec.agent.as_ref().map(|agent| agent.display_name.as_str()),
+            Some("BOT")
+        );
         assert_eq!(
             spec.source,
             crate::workspace_source::WorkspaceSource::Forge {

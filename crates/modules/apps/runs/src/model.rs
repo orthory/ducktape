@@ -116,8 +116,8 @@ pub const RESERVED_ID_SEPARATOR: char = '\u{1f}';
 
 // ---- the action vocabulary ---------------------------------------------------
 
-/// permission to post reply blocks into chat — the run's ANSWER, in the channel
-/// and thread it was engaged from. deliberately NOT the permission to post
+/// Permission to post live and final replies in the channel and thread
+/// where the agent was engaged. Does not permit posting
 /// wherever it likes: see [`ACTION_CHAT_POST_MESSAGE`].
 pub const ACTION_CHAT_POST: &str = "chat.post";
 /// permission to post a message to an ARBITRARY channel
@@ -134,8 +134,9 @@ pub const ACTION_TASKS_UPDATE_STATUS: &str = "tasks.update_status";
 /// permission to anchor a comment to a page or block
 /// ([`AgentAction::AddPageComment`]).
 pub const ACTION_PAGES_COMMENT: &str = "pages.comment";
-/// permission to flip a todo block's checked state
-/// ([`AgentAction::SetPageChecked`]).
+/// Permission to add a comment to a job.
+pub const ACTION_JOBS_COMMENT: &str = "jobs.comment";
+/// Permission to flip a todo block's checked state ([`AgentAction::SetPageChecked`]).
 pub const ACTION_PAGES_SET_CHECKED: &str = "pages.set_checked";
 /// permission to write a small UTF-8 text file under a granted duckfs prefix
 /// ([`AgentAction::DuckfsWriteText`]).
@@ -151,8 +152,9 @@ pub const MAX_DUCKFS_WRITE_TEXT_BYTES: usize = 4 * 1024;
 /// always means something.
 ///
 /// Each action requires an explicit grant in the model configuration.
-pub const KNOWN_ACTIONS: [&str; 8] = [
+pub const KNOWN_ACTIONS: [&str; 9] = [
     ACTION_CHAT_POST,
+    ACTION_JOBS_COMMENT,
     ACTION_CHAT_POST_MESSAGE,
     ACTION_TASKS_CREATE,
     ACTION_TASKS_UPDATE_STATUS,
@@ -564,10 +566,55 @@ pub struct AgentResponse {
     pub commit_message: Option<String>,
 }
 
+/// A conversational destination. Omission on Reply selects the committed source.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReplyDestination {
+    Chat {
+        channel_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread: Option<u64>,
+    },
+    Page {
+        target: String,
+    },
+    PageThread {
+        thread_id: String,
+    },
+    Job {
+        job_id: String,
+    },
+}
+
+impl From<ReplyDestination> for serde_json::Value {
+    fn from(destination: ReplyDestination) -> Self {
+        serde_json::to_value(destination).expect("reply destinations serialize")
+    }
+}
+
+impl ReplyDestination {
+    /// Explicit chat destinations require the wider posting grant.
+    pub fn required_action(&self) -> &'static str {
+        match self {
+            Self::Chat { .. } => ACTION_CHAT_POST_MESSAGE,
+            Self::Page { .. } | Self::PageThread { .. } => ACTION_PAGES_COMMENT,
+            Self::Job { .. } => ACTION_JOBS_COMMENT,
+        }
+    }
+}
+
 /// one validated cross-module write an agent's response may request.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAction {
+    /// Reply under the run's program account. By default the destination comes
+    /// from committed source context; explicit destinations use their own grants.
+    Reply {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Interpreted by the replaceable Runs module, not the host tool binary.
+        destination: Option<serde_json::Value>,
+    },
     /// Result-only: paths are resolved in the run's host-pushed forge commit.
     UpdateModule(crate::ModuleUpdateSpec),
     /// post a message to a named channel ([`ACTION_CHAT_POST_MESSAGE`]) — the
@@ -623,16 +670,17 @@ pub enum AgentAction {
 }
 
 impl AgentAction {
-    /// the vocabulary name this action needs in the agent's `allowed_actions`.
-    pub fn vocabulary_name(&self) -> &'static str {
+    /// The fixed grant, or None for Reply whose grant depends on its destination.
+    pub fn vocabulary_name(&self) -> Option<&'static str> {
         match self {
-            AgentAction::UpdateModule(_) => ACTION_MODULES_UPDATE,
-            AgentAction::PostMessage { .. } => ACTION_CHAT_POST_MESSAGE,
-            AgentAction::CreateTask { .. } => ACTION_TASKS_CREATE,
-            AgentAction::UpdateTaskStatus { .. } => ACTION_TASKS_UPDATE_STATUS,
-            AgentAction::AddPageComment { .. } => ACTION_PAGES_COMMENT,
-            AgentAction::SetPageChecked { .. } => ACTION_PAGES_SET_CHECKED,
-            AgentAction::DuckfsWriteText { .. } => ACTION_DUCKFS_WRITE_TEXT,
+            AgentAction::Reply { .. } => None,
+            AgentAction::UpdateModule(_) => Some(ACTION_MODULES_UPDATE),
+            AgentAction::PostMessage { .. } => Some(ACTION_CHAT_POST_MESSAGE),
+            AgentAction::CreateTask { .. } => Some(ACTION_TASKS_CREATE),
+            AgentAction::UpdateTaskStatus { .. } => Some(ACTION_TASKS_UPDATE_STATUS),
+            AgentAction::AddPageComment { .. } => Some(ACTION_PAGES_COMMENT),
+            AgentAction::SetPageChecked { .. } => Some(ACTION_PAGES_SET_CHECKED),
+            AgentAction::DuckfsWriteText { .. } => Some(ACTION_DUCKFS_WRITE_TEXT),
         }
     }
 }

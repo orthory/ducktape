@@ -1,5 +1,5 @@
-//! The per-run agent session signer. One fresh ed25519 keypair is bound to the
-//! run in consensus, but its private half stays in this host process.
+//! The agent session signer. Each execution attempt binds a fresh ed25519
+//! public key in consensus; its private half stays in this host process.
 //!
 //! why a key at all: an agent's mid-run writes have to be attributable, and the
 //! frameless `/v1/submit` lane cannot carry attribution — its `origin` is a
@@ -12,20 +12,18 @@
 //! the BIND is self-authorizing: `RunsMsg::OpenAgentSession` is submitted through
 //! the node's ORDINARY submit lane, whose op is framed with the node's own key —
 //! and that node is the run's committed lease-holder, because it is the node
-//! executing the run. `runs` checks exactly that. no owner is at a keyboard to
-//! sign anything (an issue-mention run has nobody), and none is needed: the
-//! owner's grant is already committed as `ModelRecord { owner, allowed_actions,
-//! caps }`. the session adds proof of ORIGIN, not authority.
+//! executing the run. `runs` checks the holder and attempt against the live
+//! saga; retries fence old keys and retain the run's action counter. The
+//! model's grant is already committed as `ModelRecord { owner, allowed_actions,
+//! caps }`; opening the session requires no additional controller signature.
 //!
 //! The child receives only a random token for a host endpoint. That endpoint
 //! accepts `AgentAction` and `DelegateRun` for exactly this run, signs them, and
 //! dies with the provisioned workspace. A shell can therefore exercise the
 //! committed agent grant but can never recover a general-purpose frame signer.
 //!
-//! a failed open is NOT a failed run (W-degrade): the run proceeds with no
-//! session vars set, which is precisely the pre-session behaviour — a read-only
-//! tool plane. loudly, in the `[oracle]` voice, so a node that is somehow not the
-//! assignee is visible rather than mysterious.
+//! A refused bind fails provisioning. An agent run never starts with a
+//! silently disabled write plane.
 
 use commonware_codec::DecodeExt as _;
 use commonware_cryptography::{Signer as _, ed25519};
@@ -84,72 +82,43 @@ struct ActionRequest {
     message: runs::RunsMsg,
 }
 
-/// mint a session keypair for `spec` and bind its public half to the run.
-///
-/// `None` — no session, no env vars — when the run has no agent (a workspace
-/// nobody acts for), when the envelope named no consensus run id (a pre-field
-/// composer: there is no run to bind TO), or when the bind did not commit.
-/// never an `Err`: a session is an ADDITIVE capability, and refusing to
-/// provision a workspace because the tool plane could not be opened would fail
-/// runs that used to work.
-pub(super) async fn open(node: &NodeLink, spec: &WorkspaceSpec) -> Option<RunSession> {
-    let agent = spec.agent_id.as_ref()?;
-    // the CONSENSUS id or nothing. `spec.run_id` is `{saga_id}:{attempt}` — a
-    // host-local dir key that names no run in `runs`, so binding on it would
-    // open a session against a run that does not exist. an absent id is a
-    // pre-field envelope: degrade to the read-only plane, loudly, exactly as a
-    // refused bind does.
-    let Some(run_id) = spec.consensus_run_id.clone() else {
-        tracing::warn!(
-            target: "ducktape::agent",
-            event = "agent_session_unavailable",
-            run_id = spec.run_id.as_str(),
-            agent_id = agent.as_str(),
-            reason = "missing_consensus_run_id",
-            "agent session unavailable"
-        );
-        return None;
+/// Generate a host-private key and bind its public half to this execution.
+/// An attributed run must open its session before the provider starts.
+pub(super) async fn open(
+    node: &NodeLink,
+    spec: &WorkspaceSpec,
+) -> Result<Option<RunSession>, String> {
+    let Some(agent) = &spec.agent else {
+        return Ok(None);
     };
-    // mint from OS randomness, with the same ed25519 types `node::encode_frame`
-    // signs with — no second crypto stack, no hand-rolled key. every 32-byte
-    // string is a valid seed (the scheme clamps), so the decode cannot fail;
-    // this mirrors the node's own `load_or_generate_identity`.
     let mut seed = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
     let key = ed25519::PrivateKey::decode(seed.as_slice()).expect("32 random bytes decode");
     let payload = runs::encode_msg(&runs::RunsMsg::OpenAgentSession {
-        run_id: run_id.clone(),
+        run_id: agent.run_id.clone(),
+        attempt: agent.attempt,
         session_key: key.public_key().as_ref().to_vec(),
     });
-    match submit(node, payload).await {
-        Ok(()) => match start_action_server(node.clone(), key, run_id.clone()).await {
-            Ok(session) => Some(session),
-            Err(detail) => {
-                tracing::warn!(
-                    target: "ducktape::agent",
-                    event = "agent_session_unavailable",
-                    run_id = run_id.as_str(),
-                    agent_id = agent.as_str(),
-                    reason = "signer_endpoint_failed",
-                    detail = detail.as_str(),
-                    "agent session unavailable"
-                );
-                None
-            }
-        },
-        Err(detail) => {
+    submit(node, payload).await.map_err(|error| {
+        tracing::warn!(
+            target: "ducktape::agent", event = "agent_session_unavailable",
+            run_id = agent.run_id.as_str(), agent_id = agent.agent_id.as_str(),
+            attempt = agent.attempt, reason = "bind_rejected", detail = %error,
+            "agent session unavailable"
+        );
+        format!("open agent session: {error}")
+    })?;
+    start_action_server(node.clone(), key, agent.run_id.clone())
+        .await
+        .inspect_err(|error| {
             tracing::warn!(
-                target: "ducktape::agent",
-                event = "agent_session_unavailable",
-                run_id = run_id.as_str(),
-                agent_id = agent.as_str(),
-                reason = "bind_rejected",
-                detail = detail.as_str(),
+                target: "ducktape::agent", event = "agent_session_unavailable",
+                run_id = agent.run_id.as_str(), agent_id = agent.agent_id.as_str(),
+                attempt = agent.attempt, reason = "signer_endpoint_failed", detail = %error,
                 "agent session unavailable"
             );
-            None
-        }
-    }
+        })
+        .map(Some)
 }
 
 async fn start_action_server(

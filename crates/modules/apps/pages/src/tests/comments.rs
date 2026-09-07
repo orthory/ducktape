@@ -967,3 +967,30 @@ fn add_comment_on_a_nonexistent_target_is_refused() {
         assert!(p.staged.is_empty(), "a rejected comment op stages nothing");
     });
 }
+
+#[test]
+fn reply_metadata_excludes_comment_bodies() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut p = pages_on!(context, "pages");
+        seed_page(&mut p, "p1").await;
+        apply_commit(
+            &mut p,
+            &add("t", "c", "b1", &"x".repeat(MAX_COMMENT_TEXT_BYTES)),
+        )
+        .await;
+        let bytes = p
+            .query(&encode_query(&PageQuery::CommentThreadHead {
+                thread_id: "t".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            decode_reply(&bytes).unwrap(),
+            PageReply::CommentThreadHead(Some(CommentThreadHead {
+                target: "b1".into(),
+                comment_count: 1
+            }))
+        );
+        assert!(bytes.len() < 128);
+    });
+}

@@ -77,6 +77,18 @@ impl ResolutionParity {
         let pages::PageReply::CommentThread(Some(view)) = decode_reply(&bytes).unwrap() else {
             panic!("thread")
         };
+        let query = encode_query(&PageQuery::CommentThreadHead {
+            thread_id: id.into(),
+        });
+        let bytes = self.native.query("pages", &query).await.unwrap();
+        assert_eq!(bytes, self.wasm.query("pages", &query).await.unwrap());
+        assert_eq!(
+            decode_reply(&bytes).unwrap(),
+            pages::PageReply::CommentThreadHead(Some(pages::CommentThreadHead {
+                target: view.thread.target.clone(),
+                comment_count: view.thread.comment_ids.len() as u64,
+            }))
+        );
         view.thread
     }
 

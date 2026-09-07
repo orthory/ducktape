@@ -13,7 +13,7 @@ pub(super) enum Publication {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum RequestScope {
-    Session { holder: Vec<u8> },
+    Session { lease: ExecutionLease },
     Result,
 }
 
@@ -151,11 +151,11 @@ impl RunsModule {
         }
         match &request.scope {
             RequestScope::Result => Ok(()),
-            RequestScope::Session { holder } => {
+            RequestScope::Session { lease } => {
                 let Some(session) = self.session(&request.view.run_id) else {
                     return Err(Error::Module("run session closed".into()));
                 };
-                if &session.holder != holder {
+                if &session.lease != lease {
                     return Err(Error::Module("run execution lease changed".into()));
                 }
                 self.session_holds_lease(ctx, &request.view.run_id, session)

@@ -434,9 +434,11 @@ fn the_id_the_provisioner_binds_is_the_id_runs_resolves_the_run_by() {
             let cmd = rx.next().await.expect("the actor lane stays open");
             if let Some(runs::RunsMsg::OpenAgentSession {
                 run_id,
+                attempt,
                 session_key,
             }) = serve(&mut host, 102, cmd).await
             {
+                assert_eq!(attempt, 0);
                 break (run_id, session_key);
             }
         };

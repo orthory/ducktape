@@ -230,9 +230,8 @@ pub fn node_http_base(http_listen: Option<&str>) -> Option<String> {
 
 /// the tool plane's PATH entry: the directory holding the CURRENTLY-RUNNING
 /// binary. `ducktape mcp` ships beside `noded`/`node`, and the runner CLI
-/// (codex/claude) spawns the MCP server by BARE command name from OUTSIDE the
-/// agent's sandbox — so putting this one dir on the child's PATH is the whole
-/// of how `ducktape mcp` resolves.
+/// (codex/claude) spawns the MCP server by bare command name. The sandbox
+/// stages its commands as a read-only guest asset and translates this PATH entry.
 ///
 /// a failing `current_exe` (an exotic platform, a deleted/replaced binary)
 /// degrades to NO entry rather than failing the run: the agent still runs,
@@ -251,8 +250,8 @@ fn tool_path_entries() -> Vec<PathBuf> {
 ///
 /// `DUCKTAPE_NODE` is deliberately the SAME variable `ducktape fs` reads — one
 /// name for "the node this process talks to", so every Ducktape tool a run
-/// spawns (the `ducktape mcp` server the runner CLI starts, outside the agent's
-/// sandbox, included) finds the node without a second convention. a node with
+/// spawns, including the MCP server inside the guest, finds the node through
+/// its read tunnel without a second convention. A node with
 /// no http surface has nothing to name, so the var is simply absent.
 ///
 /// `DUCKTAPE_RUN_AGENT` is the run's IDENTITY, and ONLY that. the grant —
@@ -265,16 +264,9 @@ fn tool_path_entries() -> Vec<PathBuf> {
 /// are the write half of the tool plane. The endpoint signs only the two Runs
 /// messages scoped to this live run; the private key never enters child env.
 ///
-/// `DUCKTAPE_RUN_ID` is [`WorkspaceSpec::consensus_run_id`] — the CONSENSUS run
-/// id, the only id space `runs` resolves, and it is exported for every
-/// provisioned run whether or not a session was opened (identity, never a
-/// grant: the MCP read plane fetches the run's ceiling by it). it is
-/// deliberately NOT
-/// `spec.run_id` (`{saga_id}:{attempt}`, the on-disk dir key): the MCP server
-/// stamps this var onto every `RunsMsg::AgentAction` the agent submits, so a
-/// host-local id here would make every mid-run write name a run that does not
-/// exist — which is exactly how the write plane came to be dead-on-arrival.
-///
+/// `DUCKTAPE_RUN_ID` comes from [`WorkspaceSpec::agent`]: the committed model
+/// run ID used for both the read ceiling and interactive writes. The host's
+/// `WorkspaceSpec::run_id` names the on-disk attempt directory instead.
 fn run_env(
     dir: &Path,
     ro_dir: Option<&Path>,
@@ -292,15 +284,9 @@ fn run_env(
     if let Some(url) = node_url {
         env.insert("DUCKTAPE_NODE".into(), url.to_string());
     }
-    if let Some(agent) = &spec.agent_id {
-        env.insert("DUCKTAPE_RUN_AGENT".into(), agent.clone());
-    }
-    // the consensus run id is IDENTITY, not a credential, so it rides every
-    // provisioned run — with or without a session. the read plane needs it to
-    // fetch the run's admission ceiling, and a delegated run whose session was
-    // never opened must still be ceilinged.
-    if let Some(run_id) = &spec.consensus_run_id {
-        env.insert("DUCKTAPE_RUN_ID".into(), run_id.clone());
+    if let Some(agent) = &spec.agent {
+        env.insert("DUCKTAPE_RUN_AGENT".into(), agent.agent_id.clone());
+        env.insert("DUCKTAPE_RUN_ID".into(), agent.run_id.clone());
     }
     if let Some(session) = session {
         env.insert(session::ENV_ACTION_URL.into(), session.action_url.clone());
@@ -544,6 +530,16 @@ impl WorkspaceProvisioner for NodedProvisioner {
     }
 }
 
+async fn cleanup_dirs(dir: PathBuf, ro_dir: Option<PathBuf>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = std::fs::remove_dir_all(dir);
+        if let Some(ro) = ro_dir {
+            let _ = std::fs::remove_dir_all(ro);
+        }
+    })
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,9 +721,12 @@ mod tests {
         // not a credential: no grant crosses in the env.
         let spec = WorkspaceSpec {
             run_id: "s1:0".into(),
-            consensus_run_id: Some("chat\u{1f}general\u{1f}2\u{1f}bot".into()),
-            agent_id: Some("bot".into()),
-            agent_display_name: Some("Bot".into()),
+            agent: Some(compute_service::AgentExecution {
+                run_id: "chat\u{1f}general\u{1f}2\u{1f}bot".into(),
+                attempt: 0,
+                agent_id: "bot".into(),
+                display_name: "Bot".into(),
+            }),
             source: WorkspaceSource::Duckfs {
                 source_prefix: "/shared/agent-workspaces/bot".into(),
                 source_snapshot: None,
@@ -738,7 +737,7 @@ mod tests {
         let env = run_env(Path::new("/tmp/ws"), None, None, &spec, None);
         assert_eq!(
             env.get("DUCKTAPE_RUN_ID").map(String::as_str),
-            spec.consensus_run_id.as_deref()
+            spec.agent.as_ref().map(|agent| agent.run_id.as_str())
         );
         // the write half is absent without a session, and no grant rides along.
         assert!(!env.contains_key(session::ENV_ACTION_URL));
@@ -746,7 +745,7 @@ mod tests {
 
         // a receipt-only spec names no run, so it exports none.
         let receipt = WorkspaceSpec {
-            consensus_run_id: None,
+            agent: None,
             ..spec
         };
         assert!(

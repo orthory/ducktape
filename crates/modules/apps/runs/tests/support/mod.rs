@@ -319,6 +319,7 @@ impl Network {
             msg(
                 "runs",
                 &runs::RunsMsg::OpenAgentSession {
+                    attempt: 0,
                     run_id: run.run_id.clone(),
                     session_key: vec![9; 32],
                 },
