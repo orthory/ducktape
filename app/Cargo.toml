@@ -22,7 +22,7 @@ camera = "Ducktape uses the camera for video in huddles."
 microphone = "Ducktape uses the microphone for voice in huddles."
 
 [build-dependencies]
-ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5", version = "=0.1.0" }
+ui-lang-build = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "eca0c8786d0b14e375c3310bfef24a470ad474bd", version = "=0.1.0" }
 
 [dependencies]
 # the network's node -> announced-provider registry, behind the Shell's host
@@ -129,14 +129,14 @@ zeroize.workspace = true
 # fractional scale and the text-input-v3 protocol every Wayland input method
 # speaks. winit picks Wayland when `WAYLAND_DISPLAY` is set, X11 otherwise.
 iced = { version = "=0.14.0", default-features = false, features = ["advanced", "highlighter", "image-without-codecs", "lazy", "markdown", "svg", "tokio", "wgpu", "wayland", "x11"] }
-ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5", default-features = false, features = ["log-timeline", "terminal"] }
-ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5" }
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
+ui-lang-components = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "eca0c8786d0b14e375c3310bfef24a470ad474bd", default-features = false, features = ["log-timeline", "terminal"] }
+ui-lang = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "eca0c8786d0b14e375c3310bfef24a470ad474bd" }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "eca0c8786d0b14e375c3310bfef24a470ad474bd", version = "=0.1.0", default-features = false, features = ["full-runtime"] }
 # The module-owned views (`src/module_view.rs`): the wire a view's tree and
 # events cross on, and the runtime that executes the view's component. The
 # same wasmtime pin as the node — a view is not consensus, but one runtime
 # in one binary is one set of semantics to reason about.
-ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5" }
+ui-lang-wire = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "eca0c8786d0b14e375c3310bfef24a470ad474bd" }
 wasmtime.workspace = true
 
 # The native notification leg (`src/backend/notify.rs`): being @mentioned or
@@ -161,4 +161,4 @@ commonware-cryptography.workspace = true
 iced_test = "=0.14.0"
 simnode = { path = "../bin/simnode" }
 tempfile.workspace = true
-ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "9b7fa7b33623418afc6ffd358380773bab9051c5", version = "=0.1.0", default-features = false, features = ["test-runtime"] }
+ui-lang-runtime = { git = "https://github.com/byeongsu-hong/ducktape-ui.git", rev = "eca0c8786d0b14e375c3310bfef24a470ad474bd", version = "=0.1.0", default-features = false, features = ["test-runtime"] }
