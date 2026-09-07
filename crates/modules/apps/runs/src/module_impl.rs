@@ -193,6 +193,12 @@ impl Module for RunsModule {
 
     async fn query(&self, req: &[u8]) -> Result<Vec<u8>, Error> {
         match decode_query(req).map_err(Error::Module)? {
+            RunsQuery::NextModuleUpdate => Ok(encode_reply(&RunsReply::ModuleUpdate(
+                self.next_module_update().await?,
+            ))),
+            RunsQuery::ModuleUpdate { sequence } => Ok(encode_reply(&RunsReply::ModuleUpdate(
+                self.module_update(sequence).await?,
+            ))),
             RunsQuery::Model { query } => {
                 let reply = match query {
                     crate::ModelQuery::Agents => crate::ModelReply::Agents(self.model_records()),

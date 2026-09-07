@@ -137,7 +137,7 @@ submit runs "$(jq -nc --argjson account "$MODEL_ACCOUNT" '{
     account:$account, agent_id:"dogfood", display_name:"Dogfood Duck",
     capability:"<your provider tag>",
     allowed_actions:["chat.post","chat.post_message","tasks.create","tasks.update_status",
-                     "pages.comment","pages.set_checked"],
+                     "pages.comment","pages.set_checked","modules.update"],
     caps:{forge_read:["ducktape"],forge_push:["ducktape"],pages_write:["*"],
           duckfs_read:["/shared/skills"]},
     skills:[{name:"dogfood",source_prefix:"/shared/skills/dogfood",load:"always"}]
@@ -267,3 +267,81 @@ only an existing verified PR or a successfully committed allocation.
 - **Usage starts at the indexer's deploy boundary**: the ledger doesn't
   rebuild history, so runs before the indexer first ran are absent. "All
   time" means "since this deploy".
+
+## Deploy a component from a chat run
+
+The node process runs the module deployment executor alongside its API. There
+is no separate executor binary. A model with `modules.update` in
+`allowed_actions` can ask its program to deploy an existing module from the
+run's committed forge output. Each validator stages and validates those bytes
+locally, then proposes, votes and executes with its own node key. This is
+automatic under validator-ballot governance; a network using governance shares
+receives a rejected deployment because node keys cannot cast account ballots.
+
+Register the target module first, for example:
+
+```sh
+ducktape module register hello crates/kernel/host/tests/fixtures/hello.component.wasm \
+  --after 50 --config "$WORKSPACE/node.toml"
+```
+
+Commit a prebuilt replacement component to the run's repository. The guest has
+host tunnels for its granted services, but no general network access for
+fetching a Rust toolchain or dependencies. The executor reads committed Wasm;
+it does not build source. The existing replacement fixture is
+`crates/kernel/host/tests/fixtures/hello-replacement.component.wasm`.
+
+The model's final JSON response can include:
+
+```json
+{
+  "reply_blocks": [{"kind":"paragraph","text":"Replacement committed; deployment requested."}],
+  "commit_message": "Update hello to count by one hundred",
+  "actions": [{"update_module": {
+    "module_id": "hello",
+    "component": "hello.component.wasm",
+    "index": null,
+    "code_hash": "<canonical artifact SHA-256 in lowercase hex>",
+    "after": 50
+  }}]
+}
+```
+
+`component` and optional `index` are paths within the output commit. The host
+binds the repository, output branch and exact commit before passing the action
+to the program. The hash covers the canonical `ModuleArtifact`, including its
+length prefixes and optional mapper, rather than the component file alone:
+
+```sh
+python3 - hello.component.wasm <<'PYHASH'
+import hashlib, pathlib, struct, sys
+component = pathlib.Path(sys.argv[1]).read_bytes()
+artifact = struct.pack("<I", len(component)) + component
+if len(sys.argv) == 3:
+    mapper = pathlib.Path(sys.argv[2]).read_bytes()
+    artifact += b"\x01" + struct.pack("<I", len(mapper)) + mapper
+else:
+    artifact += b"\x00"
+print(hashlib.sha256(artifact).hexdigest())
+PYHASH
+```
+
+Pass a mapper path as the second Python argument to include it. `index: null`
+removes an existing mapper when the component activates. Activation is at the
+governance execute height plus `after`, with readiness required from every
+validator. A pending swap keeps the dev node's otherwise quiet heartbeat
+running until it activates or expires.
+
+The run's program reply acknowledges the request. Observe actual deployment
+through the durable queue, using the `query` function above:
+
+```sh
+query runs '{"next_module_update":null}'
+query runs '{"module_update":{"sequence":0}}'
+```
+
+A record contains the requesting program account, run, pinned forge source,
+artifact spec and `requested`, `activated` or `rejected` status. Completed
+records remain queryable across restarts. An expired swap or rejected proposal
+releases the queue for the next request; it does not automatically create a new
+proposal. Read the rejected reason before requesting another deployment.

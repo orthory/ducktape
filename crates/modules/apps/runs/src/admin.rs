@@ -38,6 +38,21 @@ impl RunsModule {
         budget: &SiblingReadBudget,
     ) -> Result<(), Error> {
         match decode_msg(&msg.payload).map_err(Error::Module)? {
+            RunsMsg::RequestModuleUpdate {
+                request_id,
+                run_id,
+                source,
+                update,
+            } => {
+                self.request_module_update(ctx, request_id, run_id, source, update)
+                    .await
+            }
+            RunsMsg::ReconcileModuleUpdate { sequence } => {
+                self.reconcile_module_update(ctx, sequence).await
+            }
+            RunsMsg::RefuseModuleUpdate { sequence, reason } => {
+                self.refuse_module_update(ctx, sequence, reason).await
+            }
             RunsMsg::ConfigureModel { operation } => self.configure_model(ctx, operation).await,
             RunsMsg::RequestJobRun { agent_id, job_id } => {
                 self.request_job_run(ctx, agent_id, job_id).await

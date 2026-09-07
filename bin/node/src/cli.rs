@@ -15,6 +15,9 @@ use crate::config;
 use crate::work_admission::{self, AdmitTarget, WorkAdmission};
 use config::{hex_bytes, unhex};
 
+/// The operator ceremony's voting horizon, shared with automatic node execution.
+pub(crate) const GOVERNANCE_VOTING_PERIOD: u64 = 1_000_000;
+
 type CommandResult = Result<(), Box<dyn std::error::Error>>;
 
 /// route one operator verb to its handler — ONE visible dispatch, nothing in
@@ -1488,7 +1491,7 @@ pub(super) fn drive_proposal_ceremony(
                     // a far horizon in consensus-time units (heights advance
                     // about one per finalized op): admission must not expire
                     // under a slow second ballot.
-                    voting_period: 1_000_000,
+                    voting_period: GOVERNANCE_VOTING_PERIOD,
                 },
             )?;
             await_proposal(
@@ -1771,7 +1774,7 @@ fn cmd_member_remove(args: PubkeyArgs) -> Result<(), Box<dyn std::error::Error>>
                     action: wanted,
                     // a far horizon in consensus-time units: removal must not
                     // expire under a slow second ballot.
-                    voting_period: 1_000_000,
+                    voting_period: GOVERNANCE_VOTING_PERIOD,
                 },
             )?;
             await_proposal(

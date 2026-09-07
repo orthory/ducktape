@@ -282,6 +282,7 @@ mod action_requests;
 mod action_storage;
 mod dispatch_flow;
 mod engagement;
+mod module_updates;
 mod receipts;
 mod workflow;
 pub use workflow::model_program;

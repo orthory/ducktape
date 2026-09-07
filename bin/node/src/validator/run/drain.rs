@@ -1296,16 +1296,33 @@ impl ValidatorRuntime<'_> {
             now.duration_since(self.last_flush).unwrap_or_default() >= self.cadence.block_time;
         let ops_pending = self.node.pending_batch_len() > 0;
         let orderer_idle = self.node.orderer().pending_len() == 0;
-        match heartbeat_action(
-            self.heartbeat_disabled,
-            ops_pending,
-            heartbeat_due,
-            orderer_idle,
-        ) {
+        let pause_heartbeat = self.heartbeat_may_pause().await;
+        match heartbeat_action(pause_heartbeat, ops_pending, heartbeat_due, orderer_idle) {
             HeartbeatAction::Idle => {}
             HeartbeatAction::Restamp => self.last_flush = now,
             HeartbeatAction::BeatNop => self.beat_nop(now).await,
         }
+    }
+
+    async fn heartbeat_may_pause(&self) -> bool {
+        if !self.heartbeat_disabled {
+            return false;
+        }
+        let request = modules::encode_query(&modules::ModulesQuery::ModuleStatus);
+        let Ok(bytes) = self.node.host().query(host::MODULES_ID, &request).await else {
+            return false;
+        };
+        let Ok(modules::ModulesReply::ModuleStatus { modules }) = modules::decode_reply(&bytes)
+        else {
+            return false;
+        };
+        let height = self.node.finalized_view().unwrap_or(0);
+        !modules.iter().any(|module| {
+            module
+                .pending
+                .as_ref()
+                .is_some_and(|pending| !pending.stale_at(height))
+        })
     }
 
     /// the BUSY block path — event-driven, no interval anywhere. the run loop

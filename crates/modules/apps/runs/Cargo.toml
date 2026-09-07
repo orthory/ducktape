@@ -20,6 +20,9 @@ sdk = { workspace = true }
 agent = { workspace = true }
 identity = { workspace = true }
 capability = { workspace = true }
+governance = { workspace = true }
+modules = { workspace = true }
+valset = { workspace = true }
 borsh = { workspace = true }
 # default-features = false on chat/tasks/pages/saga: only their consensus wire
 # types cross this edge, and the `runs` guest builds this crate for
@@ -53,7 +56,6 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-valset = { workspace = true }
 # the host-side qmdb store handle the chat test fixtures inject.
 statesync = { workspace = true }
 # the shared programmable `TestCtx` (dev-only) — serves the dispatch sibling read.

@@ -140,6 +140,9 @@ pub const ACTION_PAGES_SET_CHECKED: &str = "pages.set_checked";
 /// permission to write a small UTF-8 text file under a granted duckfs prefix
 /// ([`AgentAction::DuckfsWriteText`]).
 pub const ACTION_DUCKFS_WRITE_TEXT: &str = "duckfs.write_text";
+
+/// Deploy the component committed by this run after its program accepts the request.
+pub const ACTION_MODULES_UPDATE: &str = "modules.update";
 /// maximum UTF-8 text payload accepted by [`AgentAction::DuckfsWriteText`].
 pub const MAX_DUCKFS_WRITE_TEXT_BYTES: usize = 4 * 1024;
 
@@ -148,7 +151,7 @@ pub const MAX_DUCKFS_WRITE_TEXT_BYTES: usize = 4 * 1024;
 /// always means something.
 ///
 /// Each action requires an explicit grant in the model configuration.
-pub const KNOWN_ACTIONS: [&str; 7] = [
+pub const KNOWN_ACTIONS: [&str; 8] = [
     ACTION_CHAT_POST,
     ACTION_CHAT_POST_MESSAGE,
     ACTION_TASKS_CREATE,
@@ -156,6 +159,7 @@ pub const KNOWN_ACTIONS: [&str; 7] = [
     ACTION_PAGES_COMMENT,
     ACTION_PAGES_SET_CHECKED,
     ACTION_DUCKFS_WRITE_TEXT,
+    ACTION_MODULES_UPDATE,
 ];
 
 // ---- runtime identity ---------------------------------------------------------
@@ -564,6 +568,8 @@ pub struct AgentResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentAction {
+    /// Result-only: paths are resolved in the run's host-pushed forge commit.
+    UpdateModule(crate::ModuleUpdateSpec),
     /// post a message to a named channel ([`ACTION_CHAT_POST_MESSAGE`]) — the
     /// agent SPEAKING, as opposed to `reply_blocks`, which is the agent
     /// ANSWERING where it was engaged. `thread` makes it a reply under that
@@ -620,6 +626,7 @@ impl AgentAction {
     /// the vocabulary name this action needs in the agent's `allowed_actions`.
     pub fn vocabulary_name(&self) -> &'static str {
         match self {
+            AgentAction::UpdateModule(_) => ACTION_MODULES_UPDATE,
             AgentAction::PostMessage { .. } => ACTION_CHAT_POST_MESSAGE,
             AgentAction::CreateTask { .. } => ACTION_TASKS_CREATE,
             AgentAction::UpdateTaskStatus { .. } => ACTION_TASKS_UPDATE_STATUS,

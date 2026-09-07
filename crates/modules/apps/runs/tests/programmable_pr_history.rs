@@ -78,6 +78,14 @@ async fn awaiting_pr(
     directory: &Directory,
     program: agent::Program,
 ) -> (Network, runs::PendingRun) {
+    awaiting_pr_with_actions(directory, program, Vec::new()).await
+}
+
+async fn awaiting_pr_with_actions(
+    directory: &Directory,
+    program: agent::Program,
+    actions: Vec<runs::AgentAction>,
+) -> (Network, runs::PendingRun) {
     let mut network = Network::new().await;
     network.host.register(Box::new(
         forge::Forge::init("forge", &directory.0)
@@ -101,6 +109,7 @@ async fn awaiting_pr(
                             runs::ACTION_TASKS_CREATE.into(),
                             runs::ACTION_CHAT_POST.into(),
                             runs::ACTION_CHAT_POST_MESSAGE.into(),
+                            runs::ACTION_MODULES_UPDATE.into(),
                         ]),
                         recipe_hash: None,
                         skills: None,
@@ -249,7 +258,10 @@ async fn awaiting_pr(
     ));
     let result = sdk::wire::encode(&serde_json::json!({
         "ducktape_runner_result": 1,
-        "response_text": "Implemented the requested change.",
+        "response_text": serde_json::json!({
+            "reply_blocks": [{"id":"reply", "kind":"paragraph", "text":"Implemented the requested change."}],
+            "actions": actions,
+        }).to_string(),
         "sink": {"mode":"pr", "repo":"demo", "source_branch":"agent/item-1", "target_branch":"dev"},
         "workspace_receipt": {"source_prefix":"forge:demo", "source_snapshot":null, "output_snapshot":null, "commit_height":null, "rebased":false, "no_changes":false, "branch":"agent/item-1", "output_commit":"1a".repeat(20)}
     }));
@@ -319,6 +331,98 @@ fn history_links_the_actual_program_allocation_after_another_item_wins_the_next_
         assert_eq!(opened.summary.author, chat::Party::Account(2));
         assert_eq!(opened.source_branch.as_deref(), Some("agent/item-1"));
         assert_eq!(opened.target_branch.as_deref(), Some("dev"));
+    });
+}
+
+async fn next_update(network: &Network) -> Option<runs::ModuleUpdateView> {
+    let bytes = network
+        .host
+        .query(
+            "runs",
+            &runs::encode_query(&runs::RunsQuery::NextModuleUpdate),
+        )
+        .await
+        .unwrap();
+    let runs::RunsReply::ModuleUpdate(update) = runs::decode_reply(&bytes).unwrap() else {
+        panic!("module update reply");
+    };
+    update
+}
+
+fn replacement_action() -> runs::AgentAction {
+    runs::AgentAction::UpdateModule(runs::ModuleUpdateSpec {
+        module_id: "hello".into(),
+        component: "hello.component.wasm".into(),
+        index: None,
+        code_hash: "ab".repeat(32),
+        after: 50,
+    })
+}
+
+#[test]
+fn a_deployment_waits_for_the_program_and_pins_the_host_pushed_commit() {
+    block_on(async {
+        let directory = Directory::new("deployment");
+        let (mut network, run) = awaiting_pr_with_actions(
+            &directory,
+            runs::model_program("builder"),
+            vec![replacement_action()],
+        )
+        .await;
+        assert!(
+            next_update(&network).await.is_none(),
+            "model output alone cannot deploy"
+        );
+        network.drain().await;
+        let update = next_update(&network)
+            .await
+            .expect("program queued deployment");
+        assert_eq!(update.request.account, 2);
+        assert_eq!(update.request.run_id, run.run_id);
+        assert_eq!(update.request.source.repo, "demo");
+        assert_eq!(update.request.source.branch, "agent/item-1");
+        assert_eq!(update.request.source.commit, "1a".repeat(20));
+        assert_eq!(update.status, runs::ModuleUpdateStatus::Requested);
+        let receipt = network
+            .action(&format!("result/{}/0", run.dispatch_id))
+            .await;
+        assert!(
+            matches!(
+                receipt.status,
+                runs::ActionStatus::Completed {
+                    outcome: dispatch::CallOutcomeSummary::Applied { .. },
+                    ..
+                }
+            ),
+            "{receipt:?}"
+        );
+        network.drain().await;
+        assert_eq!(
+            next_update(&network).await,
+            Some(update),
+            "draining twice cannot enqueue twice"
+        );
+    });
+}
+
+#[test]
+fn a_program_without_a_deployment_route_queues_no_upgrade() {
+    block_on(async {
+        let directory = Directory::new("deployment-refused");
+        let mut program = runs::model_program("builder");
+        for step in &mut program.steps {
+            let agent::Step::Call { module, msg, .. } = step else {
+                continue;
+            };
+            let deployment_target = module == "runs" && matches!(msg, agent::Value::Ref(_));
+            if deployment_target {
+                *step = agent::Step::Finish;
+            }
+        }
+        let (mut network, _) =
+            awaiting_pr_with_actions(&directory, program, vec![replacement_action()]).await;
+        network.drain().await;
+        assert!(next_update(&network).await.is_none());
     });
 }
 

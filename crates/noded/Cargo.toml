@@ -43,6 +43,7 @@ topology = { workspace = true }
 wasm-host = { workspace = true }
 valset = { workspace = true }
 modules = { workspace = true }
+governance = { workspace = true }
 kv = { workspace = true }
 files = { workspace = true }
 chat = { workspace = true }
@@ -153,3 +154,4 @@ http-body-util = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 # isolated storage roots for the admin-token, git-lane and testkit tests.
 tempfile = "3"
+syn = { version = "2", features = ["full"] }
