@@ -65,6 +65,38 @@ enum BlobError {
     Invalid(String),
 }
 
+fn blob_entry<'repo>(
+    repo: &'repo git2::Repository,
+    mut tree: git2::Tree<'repo>,
+    path: &str,
+) -> Result<git2::TreeEntry<'static>, BlobError> {
+    let mut parts = path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let entry = tree
+            .get_name(part)
+            .map(|entry| entry.to_owned())
+            .ok_or_else(|| {
+                BlobError::Invalid("blob file is absent from the committed tree".into())
+            })?;
+        let last = parts.peek().is_none();
+        if last {
+            return Ok(entry);
+        }
+        let directory = entry.kind() == Some(git2::ObjectType::Tree);
+        if !directory {
+            return Err(BlobError::Invalid(
+                "blob path crosses a non-directory".into(),
+            ));
+        }
+        // A replicated commit can arrive before all of its tree objects. That
+        // is retryable local absence, not evidence that its path is invalid.
+        tree = repo
+            .find_tree(entry.id())
+            .map_err(|error| BlobError::Unavailable(error.to_string()))?;
+    }
+    Err(BlobError::Invalid("blob path is empty".into()))
+}
+
 fn read_blob(base: &std::path::Path, source: &ForgeBlob) -> Result<Vec<u8>, BlobError> {
     let exact =
         source.commit.len() == 40 && source.commit.bytes().all(|byte| byte.is_ascii_hexdigit());
@@ -86,9 +118,7 @@ fn read_blob(base: &std::path::Path, source: &ForgeBlob) -> Result<Vec<u8>, Blob
     let tree = commit
         .tree()
         .map_err(|error| BlobError::Unavailable(error.to_string()))?;
-    let entry = tree
-        .get_path(std::path::Path::new(&source.path))
-        .map_err(|_| BlobError::Invalid("blob file is absent from the committed tree".into()))?;
+    let entry = blob_entry(&repo, tree, &source.path)?;
     let regular = matches!(entry.filemode(), 0o100644 | 0o100755);
     if !regular {
         return Err(BlobError::Invalid("blob must be a regular git file".into()));
@@ -297,6 +327,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn incomplete_replication_retries_but_an_absent_path_is_invalid() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(root.path().join("demo")).unwrap();
+        let mut bytes = b"40000 nested\0".to_vec();
+        bytes.extend_from_slice(&[42; 20]);
+        let oid = repo
+            .odb()
+            .unwrap()
+            .write(git2::ObjectType::Tree, &bytes)
+            .unwrap();
+        let tree = repo.find_tree(oid).unwrap();
+        assert!(matches!(
+            blob_entry(&repo, tree.clone(), "nested/artifact"),
+            Err(BlobError::Unavailable(_))
+        ));
+        assert!(matches!(
+            blob_entry(&repo, tree, "absent/artifact"),
+            Err(BlobError::Invalid(_))
+        ));
+    }
+
     #[tokio::test]
     async fn opaque_work_and_both_staging_continuations_use_the_node_key() {
         use futures::StreamExt as _;
@@ -321,8 +373,25 @@ mod tests {
             payload: b"refused".to_vec(),
         };
         let blob = source(oid, b"any artifact format");
+        // A process can stop after writing a prefix but before its continuation.
+        let mut partial = handle
+            .blobs
+            .stage(blob.hash, b"any artifact format".len() as u64)
+            .unwrap();
+        partial.append(b"any art").unwrap();
+        drop(partial);
         let directives = [
             (Directive::Submit(success.clone()), success.clone()),
+            (
+                Directive::StageBlob {
+                    blob: blob.clone(),
+                    on_ready: success.clone(),
+                    on_invalid: invalid.clone(),
+                },
+                success.clone(),
+            ),
+            // A crash after publication but before the acknowledgement repeats
+            // staging. The same opaque continuation remains safe to retry.
             (
                 Directive::StageBlob {
                     blob: blob.clone(),

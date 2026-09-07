@@ -277,8 +277,8 @@ run's committed forge output. The runs Wasm projects each validator's next
 directive from committed state.
 The native bridge stages a hash-pinned forge file or submits the directive's
 opaque message with its own node key. Module loadability is checked by the
-registry's readiness process before activation. This is automatic under validator-ballot governance; a network using governance shares
-receives a rejected deployment because node keys cannot cast account ballots.
+registry's readiness process before activation. This is automatic under
+validator-ballot governance; a network using governance shares receives a rejected deployment because node keys cannot cast account ballots.
 
 Register the target module first, for example:
 
@@ -287,7 +287,8 @@ ducktape module register hello crates/kernel/host/tests/fixtures/hello.component
   --after 50 --config "$WORKSPACE/node.toml"
 ```
 
-Commit a prebuilt replacement component to the run's repository. The guest has
+Commit a preassembled artifact containing the replacement component to the run's
+repository. The guest has
 host tunnels for its granted services, but no general network access for
 fetching a Rust toolchain or dependencies. The executor reads committed Wasm;
 it does not build source. The existing replacement fixture is

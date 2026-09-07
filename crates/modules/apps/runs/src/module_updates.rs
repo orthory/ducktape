@@ -1,4 +1,4 @@
-//! Programs queue immutable forge deployments; node executors own staging and ballots.
+//! Programs queue immutable forge deployments; module policy drives node work.
 use super::*;
 use crate::facets::{RunnerResult, WireSink};
 

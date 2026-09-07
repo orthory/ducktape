@@ -154,7 +154,7 @@ pub enum RunsMsg {
     ReconcileModuleUpdate {
         sequence: u64,
     },
-    /// A validator reports an artifact it cannot load before casting a ballot.
+    /// A validator reports an invalid deployment before its proposal exists.
     RefuseModuleUpdate {
         sequence: u64,
         reason: String,
