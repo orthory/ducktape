@@ -9,15 +9,14 @@ use super::facets::{
     WireSink, WireStatus, decode_run_result, encode_delivery_receipt, output_ref_of,
 };
 use super::{
-    ACTION_CHAT_POST, ACTION_PAGES_COMMENT, AgentAction, AgentResponse, BTreeSet, Block, ChatMsg,
-    ChatQuery, ChatReply, Ctx, DelegationResult, DelegationState, DelegationStatus, DispatchMsg,
-    EntryInfo, Error, FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply,
-    MAX_ACTIONS_BYTES, MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES,
-    ModelRecord, Msg, Origin, PendingState, ReplyBlock, ResultEvent, RunOrigin, RunsModule,
-    TaskMsg, TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg,
-    chat_encode_query, dispatch_encode_msg, dispatch_id_for, files_decode_reply, files_encode_msg,
-    files_encode_query, page_source, reply_message_id, tasks_decode_reply, tasks_encode_msg,
-    tasks_encode_query,
+    AgentAction, AgentResponse, BTreeSet, Block, ChatMsg, ChatQuery, ChatReply, Ctx,
+    DelegationResult, DelegationState, DelegationStatus, DispatchMsg, EntryInfo, Error,
+    FilesChange, FilesContent, FilesMsg, FilesQuery, FilesReply, MAX_ACTIONS_BYTES,
+    MAX_ACTIONS_PER_RUN, MAX_REPLY_BLOCKS_BYTES, MAX_THREAD_REPLIES, ModelRecord, Msg, Origin,
+    PendingState, ReplyBlock, ReplyDestination, ResultEvent, RunOrigin, RunsModule, TaskMsg,
+    TaskQuery, TaskReply, TaskStatus, chat_decode_reply, chat_encode_msg, chat_encode_query,
+    dispatch_encode_msg, dispatch_id_for, files_decode_reply, files_encode_msg, files_encode_query,
+    reply_message_id, tasks_decode_reply, tasks_encode_msg, tasks_encode_query,
 };
 use super::{Lane, RunOutcome, RunRecord, post_message_id, sink};
 
@@ -29,9 +28,12 @@ struct ChatPost<'a> {
 }
 
 #[derive(Default)]
-struct ChatPosts {
+struct ReplyPosts {
     staged: BTreeMap<(String, u64), u64>,
     standing: BTreeMap<String, bool>,
+    page_threads: BTreeMap<String, (String, usize)>,
+    page_targets: BTreeMap<String, usize>,
+    jobs: BTreeMap<String, usize>,
 }
 
 // ---- response normalization ---------------------------------------------------------
@@ -47,19 +49,14 @@ pub(crate) const REPLY_KIND_CODE: &str = "code";
 
 /// the model's raw answer as a NORMALIZED [`AgentResponse`]: the wire shape
 /// when it parses (unknown kinds and empty texts drop), a plain paragraph
-/// reply as the fallback for prose. job runs never carry reply blocks — there
-/// is no channel to deliver them to.
-pub(super) fn agent_response_from_text(text: &str, job_run: bool) -> AgentResponse {
+/// reply as the fallback for prose. Routing belongs to the committed source.
+pub(super) fn agent_response_from_text(text: &str) -> AgentResponse {
     let parsed = parse_strict_response(text).unwrap_or_else(|| AgentResponse {
-        reply_blocks: if job_run {
-            Vec::new()
-        } else {
-            vec![paragraph_block(non_empty_text(text))]
-        },
+        reply_blocks: vec![paragraph_block(non_empty_text(text))],
         actions: Vec::new(),
         commit_message: None,
     });
-    normalize_response(parsed, text, job_run)
+    normalize_response(parsed, text)
 }
 
 /// decode the strict-output contract's [`AgentResponse`] from a provider's
@@ -147,11 +144,7 @@ fn to_page_comment_text(blocks: &[ReplyBlock]) -> String {
         .join("\n\n")
 }
 
-fn page_reply_comment_id(run_id: &str) -> String {
-    format!("agent/{}/reply", crate::dispatch_id_for(run_id))
-}
-
-fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool) -> AgentResponse {
+fn normalize_response(mut response: AgentResponse, raw_text: &str) -> AgentResponse {
     // The host consumed this from the raw provider response before assembling
     // the runner result. It is not a consensus-delivery facet, and retaining
     // it here could needlessly inflate a job's bounded finalize payload.
@@ -183,11 +176,8 @@ fn normalize_response(mut response: AgentResponse, raw_text: &str, job_run: bool
             }
         })
         .collect();
-    if job_run {
-        response.reply_blocks.clear();
-        return response;
-    }
-    if response.reply_blocks.is_empty() {
+    let empty_response = response.reply_blocks.is_empty() && response.actions.is_empty();
+    if empty_response {
         response
             .reply_blocks
             .push(paragraph_block(non_empty_text(raw_text)));
@@ -389,7 +379,7 @@ impl RunsModule {
                 .fail_delegated_run(ctx, run_id, entry, "run reported a failed status".into())
                 .await;
         }
-        let response = agent_response_from_text(&result.response_text, false);
+        let response = agent_response_from_text(&result.response_text);
         let response = match self
             .validate_response(&*ctx, run_id, entry, Lane::DelegatedSettle, response)
             .await
@@ -553,7 +543,7 @@ impl RunsModule {
                 .fail_run(ctx, run_id, entry, "run reported a failed status".into())
                 .await;
         }
-        let response = agent_response_from_text(&result.response_text, entry.job_id.is_some());
+        let response = agent_response_from_text(&result.response_text);
         let response = match self
             .validate_response(&*ctx, run_id, entry, Lane::Settle, response)
             .await
@@ -693,7 +683,7 @@ impl RunsModule {
         // counted in EMISSION order: the run's own reply first, then the
         // actions by index, exactly as `emit_response` emits them.
         // Cache the requester's standing per channel; it cannot change mid-pass.
-        let mut posts = ChatPosts::default();
+        let mut posts = ReplyPosts::default();
 
         if !response.reply_blocks.is_empty() {
             if matches!(lane, Lane::DelegatedSettle) {
@@ -706,42 +696,16 @@ impl RunsModule {
                     ));
                 }
             } else {
-                let page_run = page_source(&entry.channel_id).is_some();
-                let action = if page_run {
-                    ACTION_PAGES_COMMENT
-                } else {
-                    ACTION_CHAT_POST
-                };
-                if !allows(&agent, action) {
-                    return Err(format!(
-                        "agent {} is not allowed to {action}",
-                        entry.agent_id
-                    ));
-                }
-                let reply_bytes = if page_run {
-                    to_page_comment_text(&response.reply_blocks).into_bytes()
-                } else {
-                    serde_json::to_vec(&to_chat_blocks(&response.reply_blocks))
-                        .expect("blocks are serializable")
-                };
-                if reply_bytes.len() > MAX_REPLY_BLOCKS_BYTES {
-                    return Err(format!(
-                        "reply blocks are {} bytes; the cap is {MAX_REPLY_BLOCKS_BYTES}",
-                        reply_bytes.len()
-                    ));
-                }
-                if page_run {
-                    self.page_reply_msg(ctx, run_id, entry, &response.reply_blocks)
-                        .await?;
-                } else {
-                    self.probe_reply_postable(ctx, run_id, entry).await?;
-                    if let Some(root) = entry.reply_thread() {
-                        *posts
-                            .staged
-                            .entry((entry.channel_id.clone(), root))
-                            .or_default() += 1;
-                    }
-                }
+                self.reply_msg(
+                    ctx,
+                    run_id,
+                    entry,
+                    "reply",
+                    &response.reply_blocks,
+                    None,
+                    &mut posts,
+                )
+                .await?;
             }
         }
 
@@ -760,8 +724,10 @@ impl RunsModule {
             if super::pages_effects::is_pages_action(action) || is_duckfs_action(action) {
                 continue;
             }
-            let name = action.vocabulary_name();
-            if !allows(&agent, name) {
+            let missing_grant = action
+                .vocabulary_name()
+                .filter(|name| !allows(&agent, name));
+            if let Some(name) = missing_grant {
                 return Err(format!("agent {} is not allowed to {name}", entry.agent_id));
             }
             match action {
@@ -771,21 +737,14 @@ impl RunsModule {
                     }
                     update.validate()?;
                 }
-                AgentAction::Reply { text } => {
-                    let chat_origin =
-                        entry.anchor_seq != 0 && page_source(&entry.channel_id).is_none();
-                    if !chat_origin {
-                        return Err("this run has no originating chat thread".into());
-                    }
-                    self.probe_chat_action(
+                AgentAction::Reply { text, destination } => {
+                    self.reply_msg(
                         ctx,
+                        run_id,
                         entry,
-                        ChatPost {
-                            channel_id: &entry.channel_id,
-                            text,
-                            thread: entry.reply_thread(),
-                            message_id: post_message_id(run_id, &lane.slot(index)),
-                        },
+                        &lane.slot(index),
+                        &[paragraph_block(text.clone())],
+                        destination.as_ref(),
                         &mut posts,
                     )
                     .await?;
@@ -853,7 +812,7 @@ impl RunsModule {
         ctx: &dyn Ctx,
         entry: &PendingState,
         post: ChatPost<'_>,
-        posts: &mut ChatPosts,
+        posts: &mut ReplyPosts,
     ) -> Result<(), String> {
         if post.text.trim().is_empty() {
             return Err("chat posts require a non-empty text".into());
@@ -880,32 +839,6 @@ impl RunsModule {
             *posts.staged.entry(key).or_default() += 1;
         }
         Ok(())
-    }
-
-    /// prove a reply under the run's message id could land in chat RIGHT NOW
-    /// — the no-fail rule again: an emitted post must be valid by
-    /// construction, so anything chat would reject is probed first. the run's
-    /// own channel is where its anchor came from, so only the post itself needs
-    /// probing.
-    ///
-    /// the reply is always the FIRST post a response stages (`emit_response`
-    /// emits it before any action, and a failure reply is the only post its run
-    /// makes), so it never has a sibling to account for: it probes at zero
-    /// already-staged, and its caller counts it for the actions that follow.
-    async fn probe_reply_postable(
-        &self,
-        ctx: &dyn Ctx,
-        run_id: &str,
-        entry: &PendingState,
-    ) -> Result<(), String> {
-        self.probe_post_lands(
-            ctx,
-            &entry.channel_id,
-            &reply_message_id(run_id),
-            entry.reply_thread(),
-            0,
-        )
-        .await
     }
 
     /// THE chat-post probe, shared by the run's reply and by a
@@ -986,84 +919,198 @@ impl RunsModule {
         Ok(())
     }
 
-    /// Build a Pages reply only after proving every rejection surface: thread
-    /// and target still exist, reply id is free, thread has room, and the
-    /// agent holds pages_write for the owning page.
-    async fn page_reply_msg(
+    /// Resolve and validate one conversational write. The session, final and
+    /// failure paths all use this route; only the program executes its result.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "source, deterministic slot and batch reservations are independent inputs"
+    )]
+    async fn reply_msg(
         &self,
         ctx: &dyn Ctx,
         run_id: &str,
         entry: &PendingState,
+        slot: &str,
         blocks: &[ReplyBlock],
+        destination: Option<&ReplyDestination>,
+        posts: &mut ReplyPosts,
     ) -> Result<Msg, String> {
-        let pages = self
-            .pages
-            .as_deref()
-            .ok_or_else(|| "pages module is not configured".to_string())?;
-        let source =
-            page_source(&entry.channel_id).ok_or_else(|| "run is not a pages run".to_string())?;
-        let thread_id = match source {
-            super::PageSource::CommentThread(thread_id) => thread_id,
-            super::PageSource::Block(block_id) => {
-                let agent = self
-                    .agent_for_run(ctx, entry)
-                    .await?
-                    .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-                return self
-                    .pages_action_msg(
-                        ctx,
-                        pages,
-                        &agent,
-                        run_id,
-                        "reply",
-                        &AgentAction::AddPageComment {
-                            target: block_id.to_string(),
-                            body: to_page_comment_text(blocks),
-                        },
-                        0,
-                    )
-                    .await;
-            }
-        };
-        let reply = ctx
-            .query(
-                pages,
-                &pages::encode_query(&pages::PageQuery::CommentThread {
-                    thread_id: thread_id.to_string(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("pages thread lookup failed: {e}"))?;
-        let view = match pages::decode_reply(&reply) {
-            Ok(pages::PageReply::CommentThread(Some(view))) => view,
-            _ => return Err(format!("pages thread is missing: {thread_id}")),
-        };
-        if view.thread.comment_ids.len() >= pages::MAX_COMMENTS_PER_THREAD {
-            return Err(format!("pages comment thread is full: {thread_id}"));
-        }
-        let target_reply = ctx
-            .query(
-                pages,
-                &pages::encode_query(&pages::PageQuery::GetBlock {
-                    block_id: view.thread.target.clone(),
-                }),
-            )
-            .await
-            .map_err(|e| format!("pages target lookup failed: {e}"))?;
-        let target = match pages::decode_reply(&target_reply) {
-            Ok(pages::PageReply::Block(Some(block))) => block,
-            _ => return Err(format!("pages target is missing: {}", view.thread.target)),
+        let resolved = match destination {
+            Some(destination) => destination.clone(),
+            None => entry.reply_destination()?,
         };
         let agent = self
             .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        self.check_pages_write(&agent, &target.page)?;
-        let comment_id = page_reply_comment_id(run_id);
-        if comment_id.len() > pages::MAX_COMMENT_ID_BYTES || !pages::id_is_index_safe(&comment_id) {
-            return Err("derived pages reply id is invalid".into());
+        let action = match (&resolved, destination) {
+            (ReplyDestination::Chat { .. }, None) => crate::ACTION_CHAT_POST,
+            _ => resolved.required_action(),
+        };
+        let permitted = allows(&agent, action);
+        if !permitted {
+            return Err(format!(
+                "agent {} is not allowed to {action}",
+                entry.agent_id
+            ));
         }
-        let existing = ctx
+        let text = to_page_comment_text(blocks);
+        let empty_text = text.trim().is_empty();
+        if empty_text {
+            return Err("replies require non-empty text".into());
+        }
+        let bytes = serde_json::to_vec(blocks).expect("reply blocks serialize");
+        let oversized_reply = bytes.len() > MAX_REPLY_BLOCKS_BYTES;
+        if oversized_reply {
+            return Err(format!(
+                "reply blocks are {} bytes; the cap is {MAX_REPLY_BLOCKS_BYTES}",
+                bytes.len()
+            ));
+        }
+        match resolved {
+            ReplyDestination::Chat { channel_id, thread } => {
+                let message_id = match slot {
+                    "reply" => reply_message_id(run_id),
+                    _ => post_message_id(run_id, slot),
+                };
+                self.probe_chat_action(
+                    ctx,
+                    entry,
+                    ChatPost {
+                        channel_id: &channel_id,
+                        text: &text,
+                        thread,
+                        message_id: message_id.clone(),
+                    },
+                    posts,
+                )
+                .await?;
+                Ok(Msg {
+                    target: self.chat.clone(),
+                    payload: chat_encode_msg(&ChatMsg::PostMessage {
+                        channel_id,
+                        message_id,
+                        blocks: to_chat_blocks(blocks),
+                        thread,
+                    }),
+                })
+            }
+            ReplyDestination::Page { target } => {
+                let thread_slot = match destination {
+                    None => "reply",
+                    Some(_) => slot,
+                };
+                let thread_id = super::pages_effects::page_thread_id(run_id, thread_slot);
+                self.page_reply_msg(
+                    ctx,
+                    &agent,
+                    run_id,
+                    slot,
+                    &thread_id,
+                    Some(&target),
+                    text,
+                    posts,
+                )
+                .await
+            }
+            ReplyDestination::PageThread { thread_id } => {
+                self.page_reply_msg(ctx, &agent, run_id, slot, &thread_id, None, text, posts)
+                    .await
+            }
+            ReplyDestination::Job { job_id } => {
+                self.job_reply_msg(ctx, &job_id, run_id, slot, text, posts)
+                    .await
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "page target resolution shares deterministic reply coordinates and batch reservations"
+    )]
+    async fn page_reply_msg(
+        &self,
+        ctx: &dyn Ctx,
+        agent: &ModelRecord,
+        run_id: &str,
+        slot: &str,
+        thread_id: &str,
+        new_target: Option<&str>,
+        text: String,
+        posts: &mut ReplyPosts,
+    ) -> Result<Msg, String> {
+        let pages = self
+            .pages
+            .as_deref()
+            .ok_or("pages module is not configured")?;
+        let comment_id = super::pages_effects::page_comment_id(run_id, slot);
+        let valid_ids = pages::id_is_index_safe(thread_id)
+            && thread_id.len() <= pages::MAX_THREAD_ID_BYTES
+            && pages::id_is_index_safe(&comment_id)
+            && comment_id.len() <= pages::MAX_COMMENT_ID_BYTES;
+        if !valid_ids {
+            return Err("invalid pages reply coordinates".into());
+        }
+        let oversized_comment = text.len() > pages::MAX_COMMENT_TEXT_BYTES;
+        if oversized_comment {
+            return Err("pages reply exceeds the comment byte cap".into());
+        }
+        let (target, count) = match posts.page_threads.get(thread_id) {
+            Some(staged) => staged.clone(),
+            None => {
+                let bytes = ctx
+                    .query(
+                        pages,
+                        &pages::encode_query(&pages::PageQuery::CommentThread {
+                            thread_id: thread_id.into(),
+                        }),
+                    )
+                    .await
+                    .map_err(|e| e.to_string())?;
+                match pages::decode_reply(&bytes).map_err(|e| e.to_string())? {
+                    pages::PageReply::CommentThread(Some(view)) => {
+                        (view.thread.target, view.thread.comment_ids.len())
+                    }
+                    pages::PageReply::CommentThread(None) => {
+                        let target = new_target
+                            .ok_or_else(|| format!("pages thread is missing: {thread_id}"))?;
+                        let bytes = ctx
+                            .query(
+                                pages,
+                                &pages::encode_query(&pages::PageQuery::TargetThreadCount {
+                                    target: target.into(),
+                                }),
+                            )
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let pages::PageReply::TargetThreadCount(count) =
+                            pages::decode_reply(&bytes).map_err(|e| e.to_string())?
+                        else {
+                            return Err("unexpected pages thread count reply".into());
+                        };
+                        let staged = posts.page_targets.entry(target.into()).or_default();
+                        let full = count as usize + *staged >= pages::MAX_THREADS_PER_TARGET;
+                        if full {
+                            return Err("pages target is full".into());
+                        }
+                        *staged += 1;
+                        (target.into(), 0)
+                    }
+                    _ => return Err("unexpected pages thread reply".into()),
+                }
+            }
+        };
+        let wrong_target = new_target.is_some_and(|expected| expected != target);
+        if wrong_target {
+            return Err("pages reply thread belongs to another target".into());
+        }
+        let full_thread = count >= pages::MAX_COMMENTS_PER_THREAD;
+        if full_thread {
+            return Err("pages comment thread is full".into());
+        }
+        let block = self.page_block(ctx, pages, &target).await?;
+        self.check_pages_write(agent, &block.page)?;
+        let bytes = ctx
             .query(
                 pages,
                 &pages::encode_query(&pages::PageQuery::GetComment {
@@ -1071,31 +1118,76 @@ impl RunsModule {
                 }),
             )
             .await
-            .map_err(|e| format!("pages comment lookup failed: {e}"))?;
-        match pages::decode_reply(&existing) {
-            Ok(pages::PageReply::Comment(None)) => {}
-            Ok(pages::PageReply::Comment(Some(_))) => {
-                return Err(format!("pages reply id already taken: {comment_id}"));
-            }
-            _ => return Err("unexpected pages reply for a comment lookup".into()),
+            .map_err(|e| e.to_string())?;
+        match pages::decode_reply(&bytes).map_err(|e| e.to_string())? {
+            pages::PageReply::Comment(None) => {}
+            pages::PageReply::Comment(Some(_)) => return Err("pages reply id already taken".into()),
+            _ => return Err("unexpected pages comment reply".into()),
         }
-        let text = to_page_comment_text(blocks);
-        if text.len() > pages::MAX_COMMENT_TEXT_BYTES {
-            return Err(format!(
-                "pages reply is {} bytes; the cap is {}",
-                text.len(),
-                pages::MAX_COMMENT_TEXT_BYTES
-            ));
-        }
+        posts
+            .page_threads
+            .insert(thread_id.into(), (target.clone(), count + 1));
         Ok(Msg {
-            target: pages.to_string(),
+            target: pages.into(),
             payload: pages::encode_msg(&pages::PageMsg::AddComment {
-                thread_id: thread_id.to_string(),
+                thread_id: thread_id.into(),
                 comment_id,
-                target: view.thread.target,
+                target,
                 text,
                 anchor: None,
                 mentions: Vec::new(),
+            }),
+        })
+    }
+
+    async fn job_reply_msg(
+        &self,
+        ctx: &dyn Ctx,
+        job_id: &str,
+        run_id: &str,
+        slot: &str,
+        text: String,
+        posts: &mut ReplyPosts,
+    ) -> Result<Msg, String> {
+        let jobs = self
+            .jobs
+            .as_deref()
+            .ok_or("jobs module is not configured")?;
+        let oversized_comment = text.len() > tasks::MAX_JOB_COMMENT_TEXT_BYTES;
+        if oversized_comment {
+            return Err("job reply exceeds the comment byte cap".into());
+        }
+        let bytes = ctx
+            .query(
+                jobs,
+                &super::jobs_encode_query(&super::JobsQuery::Get {
+                    job_id: job_id.into(),
+                }),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let super::JobsReply::Job(Some(job)) =
+            super::jobs_decode_reply(&bytes).map_err(|e| e.to_string())?
+        else {
+            return Err(format!("job is missing: {job_id}"));
+        };
+        let comment_id = post_message_id(run_id, slot);
+        let duplicate = job.comments.iter().any(|comment| comment.id == comment_id);
+        if duplicate {
+            return Err("job reply id already taken".into());
+        }
+        let staged = posts.jobs.entry(job_id.into()).or_default();
+        let full = job.comments.len() + *staged >= tasks::MAX_JOB_COMMENTS;
+        if full {
+            return Err("job discussion is full".into());
+        }
+        *staged += 1;
+        Ok(Msg {
+            target: jobs.into(),
+            payload: super::jobs_encode_msg(&super::JobsMsg::Comment {
+                job_id: job_id.into(),
+                comment_id,
+                text,
             }),
         })
     }
@@ -1240,7 +1332,7 @@ impl RunsModule {
         else {
             unreachable!("only the duckfs action reaches this lane");
         };
-        let name = action.vocabulary_name();
+        let name = action.vocabulary_name().expect("concrete write action");
         if !allows(agent, name) {
             return Err(format!("agent {} is not allowed to {name}", agent.agent_id));
         }
@@ -1320,10 +1412,6 @@ impl RunsModule {
         entry: &PendingState,
         reason: &str,
     ) {
-        if entry.job_id.is_some() {
-            // job runs have no channel; the finalize payload carries the error.
-            return;
-        }
         match self.failure_reply(&*ctx, run_id, entry, reason).await {
             Ok(msg) => ctx.emit_msg(msg),
             Err(why) => self.note(ctx, format!("run {run_id} failure not surfaced: {why}")),
@@ -1342,50 +1430,22 @@ impl RunsModule {
             .agent_for_run(ctx, entry)
             .await?
             .ok_or_else(|| format!("agent is not registered: {}", entry.agent_id))?;
-        let page_run = page_source(&entry.channel_id).is_some();
-        // posting the failure is a reply like any success — ungranted
-        // agents keep the old silent-fail.
-        let action = if page_run {
-            ACTION_PAGES_COMMENT
-        } else {
-            ACTION_CHAT_POST
-        };
-        if !allows(&agent, action) {
-            return Err(format!(
-                "agent {} is not allowed to {action}",
-                entry.agent_id
-            ));
-        }
         let name = if agent.display_name.is_empty() {
             agent.agent_id.as_str()
         } else {
             agent.display_name.as_str()
         };
         let text = format!("⚠ {name} failed: {}", failure_excerpt(reason));
-        if page_run {
-            return self
-                .page_reply_msg(
-                    ctx,
-                    run_id,
-                    entry,
-                    &[ReplyBlock {
-                        kind: REPLY_KIND_PARAGRAPH.into(),
-                        text,
-                        lang: None,
-                    }],
-                )
-                .await;
-        }
-        self.probe_reply_postable(ctx, run_id, entry).await?;
-        Ok(Msg {
-            target: self.chat.clone(),
-            payload: chat_encode_msg(&ChatMsg::PostMessage {
-                channel_id: entry.channel_id.clone(),
-                message_id: reply_message_id(run_id),
-                blocks: vec![Block::paragraph(text)],
-                thread: entry.reply_thread(),
-            }),
-        })
+        self.reply_msg(
+            ctx,
+            run_id,
+            entry,
+            "reply",
+            &[paragraph_block(text)],
+            None,
+            &mut ReplyPosts::default(),
+        )
+        .await
     }
 
     /// does `task_id` name a live task RIGHT NOW — this block's staged creates
@@ -1428,39 +1488,47 @@ impl RunsModule {
         lane: Lane,
         response: AgentResponse,
     ) {
+        let mut posts = ReplyPosts::default();
         if !response.reply_blocks.is_empty() {
-            if page_source(&entry.channel_id).is_some() {
-                match self
-                    .page_reply_msg(&*ctx, run_id, entry, &response.reply_blocks)
-                    .await
-                {
-                    Ok(msg) => ctx.emit_msg(msg),
-                    Err(why) => self.note(ctx, format!("run {run_id} page reply skipped: {why}")),
-                }
-            } else {
-                ctx.emit_msg(Msg {
-                    target: self.chat.clone(),
-                    payload: chat_encode_msg(&ChatMsg::PostMessage {
-                        channel_id: entry.channel_id.clone(),
-                        message_id: reply_message_id(run_id),
-                        blocks: to_chat_blocks(&response.reply_blocks),
-                        thread: entry.reply_thread(),
-                    }),
-                });
+            match self
+                .reply_msg(
+                    &*ctx,
+                    run_id,
+                    entry,
+                    "reply",
+                    &response.reply_blocks,
+                    None,
+                    &mut posts,
+                )
+                .await
+            {
+                Ok(msg) => ctx.emit_msg(msg),
+                Err(why) => self.note(ctx, format!("run {run_id} reply skipped: {why}")),
             }
         }
         for (index, action) in response.actions.into_iter().enumerate() {
             let msg = match action {
                 AgentAction::UpdateModule(_) => continue,
-                AgentAction::Reply { text } => Msg {
-                    target: self.chat.clone(),
-                    payload: chat_encode_msg(&ChatMsg::PostMessage {
-                        channel_id: entry.channel_id.clone(),
-                        message_id: post_message_id(run_id, &lane.slot(index)),
-                        blocks: vec![Block::paragraph(text)],
-                        thread: entry.reply_thread(),
-                    }),
-                },
+                AgentAction::Reply { text, destination } => {
+                    match self
+                        .reply_msg(
+                            &*ctx,
+                            run_id,
+                            entry,
+                            &lane.slot(index),
+                            &[paragraph_block(text)],
+                            destination.as_ref(),
+                            &mut posts,
+                        )
+                        .await
+                    {
+                        Ok(msg) => msg,
+                        Err(why) => {
+                            self.note(ctx, format!("run {run_id} reply skipped: {why}"));
+                            continue;
+                        }
+                    }
+                }
                 AgentAction::PostMessage {
                     channel_id,
                     text,

@@ -125,3 +125,97 @@ fn reusing_a_pruned_job_id_creates_a_fresh_program_invocation_and_run() {
         assert_eq!(network.task("second-episode").await.unwrap().owner, tasks::Party::Account(2));
     });
 }
+
+#[test]
+fn job_runs_post_live_and_final_replies_under_the_program_account() {
+    block_on(async {
+        let mut network = job_network().await;
+        network
+            .submit(
+                member(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::ConfigureModel {
+                        operation: runs::ModelMsg::UpdateModel {
+                            agent_id: "builder".into(),
+                            display_name: None,
+                            capability: None,
+                            allowed_actions: Some(
+                                runs::KNOWN_ACTIONS
+                                    .iter()
+                                    .map(|action| (*action).into())
+                                    .collect(),
+                            ),
+                            recipe_hash: None,
+                            caps: None,
+                            skills: None,
+                        },
+                    },
+                ),
+            )
+            .await;
+        job_submit(&mut network, "discussion", "builder").await;
+        network.drain().await;
+        let run = network
+            .runs()
+            .await
+            .into_iter()
+            .find(|run| run.job_id.as_deref() == Some("discussion"))
+            .unwrap();
+        let saga_id = saga(&network, &run).await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "saga",
+                    &saga::SagaMsg::Accept {
+                        saga_id,
+                        attempt: 0,
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                provider(),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::OpenAgentSession {
+                        run_id: run.run_id.clone(),
+                        attempt: 0,
+                        session_key: vec![10; 32],
+                    },
+                ),
+            )
+            .await;
+        network
+            .submit(
+                sdk::Origin::External(vec![10; 32]),
+                msg(
+                    "runs",
+                    &runs::RunsMsg::AgentAction {
+                        run_id: run.run_id.clone(),
+                        action: runs::AgentAction::Reply {
+                            text: "Working on this job.".into(),
+                            destination: None,
+                        },
+                    },
+                ),
+            )
+            .await;
+        network.drain().await;
+        let progress = job(&network, "discussion").await;
+        assert_eq!(progress.status, tasks::JobStatus::Processing);
+        assert_eq!(progress.comments.len(), 1);
+        assert_eq!(progress.comments[0].author, tasks::Party::Account(2));
+        assert_eq!(progress.comments[0].text, "Working on this job.");
+        let mut result: serde_json::Value = sdk::wire::decode(&response(None)).unwrap();
+        result["response_text"] = "Finished this job.".into();
+        settle(&mut network, &run, Ok(sdk::wire::encode(&result)), true).await;
+        let finished = job(&network, "discussion").await;
+        assert_eq!(finished.status, tasks::JobStatus::Done);
+        assert_eq!(finished.comments.len(), 2);
+        assert_eq!(finished.comments[1].author, tasks::Party::Account(2));
+        assert_eq!(finished.comments[1].text, "Finished this job.");
+    });
+}

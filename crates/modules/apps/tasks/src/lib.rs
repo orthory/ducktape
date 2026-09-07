@@ -46,9 +46,9 @@ mod job_board;
 mod task_board;
 
 pub use job_board::{
-    ATTEMPTS_EXHAUSTED_RESULT, MAX_ATTEMPTS, MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS,
-    MAX_LIVE_JOBS_PER_SUBMITTER, MAX_PAYLOAD, MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS,
-    MIN_LEASE_VIEWS,
+    ATTEMPTS_EXHAUSTED_RESULT, MAX_ATTEMPTS, MAX_JOB_COMMENT_TEXT_BYTES, MAX_JOB_COMMENTS,
+    MAX_JOB_ID, MAX_JOBS, MAX_KIND, MAX_LEASE_VIEWS, MAX_LIVE_JOBS_PER_SUBMITTER, MAX_PAYLOAD,
+    MAX_SPEC, MAX_WORKER_MODULE_ID, MAX_WORKERS, MIN_LEASE_VIEWS,
 };
 pub use task_board::{MAX_LIST_LIMIT, MAX_OPEN_TASKS_PER_OWNER, MAX_TASK_ID, MAX_TASKS};
 
@@ -374,7 +374,8 @@ impl Tasks {
     async fn on_job(&mut self, ctx: &mut dyn Ctx, msg: JobsMsg) -> Result<(), Error> {
         let actor = actor_from_origin(ctx, &self.identity).await?;
         let job_id = match &msg {
-            JobsMsg::Submit { job_id, .. }
+            JobsMsg::Comment { job_id, .. }
+            | JobsMsg::Submit { job_id, .. }
             | JobsMsg::Claim { job_id, .. }
             | JobsMsg::Finalize { job_id, .. }
             | JobsMsg::Release { job_id }

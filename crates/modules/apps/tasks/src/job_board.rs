@@ -50,8 +50,8 @@ use sdk::{Ctx, Error, ModuleId, Msg, Origin, StagedStore};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Claim, Job, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, Party, controls,
-    encode_job_event, stage_record,
+    Claim, Job, JobComment, JobResult, JobStatus, JobsEvent, JobsMsg, JobsQuery, JobsReply, Party,
+    controls, encode_job_event, stage_record,
 };
 
 /// max bytes of a `job_id` (non-empty).
@@ -62,6 +62,9 @@ pub const MAX_KIND: usize = 64;
 pub const MAX_SPEC: usize = 64 * 1024;
 /// max bytes of a finalize `payload`.
 pub const MAX_PAYLOAD: usize = 64 * 1024;
+/// Bounded discussion per job, retained until the job is pruned.
+pub const MAX_JOB_COMMENTS: usize = 64;
+pub const MAX_JOB_COMMENT_TEXT_BYTES: usize = 4096;
 /// max distinct live job ids on the board.
 pub const MAX_JOBS: usize = 65536;
 /// max live job records ONE submitter may hold at once, well under
@@ -320,6 +323,7 @@ async fn submit(
             attempt: 0,
             claim: None,
             result: None,
+            comments: Vec::new(),
             created_at_height: height,
             updated_at_height: height,
         },
@@ -358,6 +362,40 @@ async fn claim(
         worker,
         claimed_at_height: height,
         lease_views: lease_views.clamp(MIN_LEASE_VIEWS, MAX_LEASE_VIEWS),
+    });
+    job.updated_at_height = height;
+    stage_job(staged, &job)
+}
+
+async fn comment(
+    staged: &mut StagedStore,
+    job_id: String,
+    comment_id: String,
+    text: String,
+    actor: &Party,
+    height: u64,
+) -> Result<(), Error> {
+    sdk::validate_id("comment_id", &comment_id, MAX_JOB_ID)?;
+    let valid_text = !text.trim().is_empty() && text.len() <= MAX_JOB_COMMENT_TEXT_BYTES;
+    if !valid_text {
+        return Err(Error::Module(
+            "job comments require non-empty text within the byte cap".into(),
+        ));
+    }
+    let mut job = require(staged, &job_id).await?;
+    let full = job.comments.len() >= MAX_JOB_COMMENTS;
+    if full {
+        return Err(Error::Module("job discussion is full".into()));
+    }
+    let duplicate = job.comments.iter().any(|comment| comment.id == comment_id);
+    if duplicate {
+        return Err(Error::Module("job comment id already exists".into()));
+    }
+    job.comments.push(JobComment {
+        id: comment_id,
+        author: actor.clone(),
+        text,
+        height,
     });
     job.updated_at_height = height;
     stage_job(staged, &job)
@@ -536,6 +574,11 @@ pub(crate) async fn execute(
     let env = ctx.env();
     let (origin, height) = (env.origin.clone(), env.height);
     match msg {
+        JobsMsg::Comment {
+            job_id,
+            comment_id,
+            text,
+        } => comment(staged, job_id, comment_id, text, actor, height).await,
         JobsMsg::Submit { job_id, kind, spec } => {
             let workers = load_workers(staged).await?;
             let event = submit(staged, job_id, kind, spec, actor, height).await?;

@@ -74,12 +74,25 @@ sagas and changed attempts refuse old keys and unclaimed proposals. A target
 call already authorized by the program can finish and retain its receipt. An
 attributed run whose binding fails does not start its provider.
 
-`ducktape_reply(text)` proposes `AgentAction::Reply` using the model's
-`chat.post` grant. Runs resolves the channel and thread from committed run
-state: a root mention starts a thread, and a mention inside a thread stays in
-that thread. Both live progress and the final reply execute as the program
-account. Posting to an explicit destination with `ducktape_chat_post` requires
-`chat.post_message`.
+`ducktape_reply(text, destination?)` proposes `AgentAction::Reply`. Without a
+destination, Runs resolves it from committed source context: the original chat
+thread, the Pages comment thread, a shared reply thread on the mentioned block,
+or the job discussion. Live, final and failure replies use the same resolver
+and execute as the program account. An action-only final response keeps its
+actions without inventing another source reply.
+
+An explicit destination selects `chat` (channel_id, optional thread), `page`
+(target), `page_thread` (thread_id), or `job` (job_id). Source chat replies require
+`chat.post`; explicit chat destinations require `chat.post_message`. Pages
+replies require `pages.comment` and the owning page in `pages_write`. Job replies
+require `jobs.comment`. Existing task, Pages and DuckFS tools let the model choose
+other writes within its grants. A destination never supplies the author.
+
+The job board stores bounded, immutable comments with their authenticated actor
+and commit height, and exposes them through its point read and index. Comments
+do not claim, finalize or reopen a job. Runs forwards only job claims and
+finalization as lifecycle operations; comments are proposals the program must
+execute like every other conversational write.
 
 ## 4. Failure and persistence
 

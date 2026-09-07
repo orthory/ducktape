@@ -98,7 +98,10 @@ impl RunsModule {
         };
         for (index, message) in messages.into_iter().enumerate() {
             let job_lifecycle = self.jobs.as_ref() == Some(&message.target)
-                && tasks::decode_job_msg(&message.payload).is_ok();
+                && matches!(
+                    tasks::decode_job_msg(&message.payload),
+                    Ok(tasks::JobsMsg::Claim { .. } | tasks::JobsMsg::Finalize { .. })
+                );
             let lifecycle = message.target == self.dispatch || job_lifecycle;
             if lifecycle {
                 effects.inner.emit_msg(message);

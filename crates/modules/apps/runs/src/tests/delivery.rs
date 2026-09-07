@@ -565,14 +565,13 @@ fn parse_strict_response_tolerates_the_shapes_llms_actually_emit() {
 }
 
 #[test]
-fn a_fenced_job_response_still_yields_actions_only() {
-    // job runs drop reply_blocks; the fenced-parse path must still recover
-    // the actions inside the fence.
+fn a_fenced_response_retains_reply_blocks_and_actions() {
+    // Parsing preserves both facets; delivery resolves the source.
     let raw = "```json\n{\"reply_blocks\":[{\"kind\":\"paragraph\",\"text\":\"noise\"}],\"actions\":[{\"create_task\":{\"task_id\":\"t1\",\"title\":\"did it\"}}]}\n```";
-    let parsed = agent_response_from_text(raw, true);
+    let parsed = agent_response_from_text(raw);
     assert!(
-        parsed.reply_blocks.is_empty(),
-        "job runs post no chat reply"
+        parsed.reply_blocks[0].text == "noise",
+        "source routing must not discard the answer"
     );
     assert_eq!(parsed.actions.len(), 1, "the fenced action is recovered");
 }

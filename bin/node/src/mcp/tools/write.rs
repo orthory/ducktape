@@ -5,7 +5,7 @@
 
 use serde_json::{Value, json};
 
-use runs::{AgentAction, MAX_DUCKFS_WRITE_TEXT_BYTES};
+use runs::{AgentAction, MAX_DUCKFS_WRITE_TEXT_BYTES, ReplyDestination};
 use tasks::TaskStatus;
 
 use super::{Tool, arg_bool, arg_str, opt_u64, schema};
@@ -16,10 +16,13 @@ pub(super) fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "ducktape_reply",
-            description: "Reply in this run's originating chat thread as the agent's program account. \
-                          Use it for progress, questions or updates while working. Requires chat.post \
-                          and a live run session. Ducktape resolves the channel and thread.",
-            schema: || schema(&[("text", "string", true, "The reply text.")]),
+            description: "Reply to this run's source as the agent's program account: a chat thread, \
+                          Pages block/comment thread, or job discussion. Omit destination to answer \
+                          where you were called; supply it to choose somewhere else. Chat replies \
+                          require chat.post; explicit chat destinations require chat.post_message. \
+                          Pages requires pages.comment and pages_write; jobs requires jobs.comment. \
+                          Use for progress, questions or updates during a live run.",
+            schema: reply_schema,
             handler: reply,
         },
         Tool {
@@ -106,9 +109,33 @@ pub(super) fn tools() -> Vec<Tool> {
     ]
 }
 
+fn reply_schema() -> Value {
+    let mut value = schema(&[("text", "string", true, "The reply text.")]);
+    value["properties"]["destination"] = json!({
+        "description": "Omit to reply to the committed source; set to choose a destination.",
+        "oneOf": [
+            {"type":"object","properties":{"kind":{"const":"chat"},"channel_id":{"type":"string"},"thread":{"type":"integer","minimum":1}},"required":["kind","channel_id"],"additionalProperties":false},
+            {"type":"object","properties":{"kind":{"const":"page"},"target":{"type":"string"}},"required":["kind","target"],"additionalProperties":false},
+            {"type":"object","properties":{"kind":{"const":"page_thread"},"thread_id":{"type":"string"}},"required":["kind","thread_id"],"additionalProperties":false},
+            {"type":"object","properties":{"kind":{"const":"job"},"job_id":{"type":"string"}},"required":["kind","job_id"],"additionalProperties":false}
+        ]
+    });
+    value
+}
+
+fn reply_destination(args: &Value) -> Result<Option<ReplyDestination>> {
+    let Some(destination) = args.get("destination") else {
+        return Ok(None);
+    };
+    serde_json::from_value(destination.clone())
+        .map(Some)
+        .map_err(|error| NodeError::Rejected(format!("invalid reply destination: {error}")))
+}
+
 fn reply(run: &Run, args: &Value) -> Result<Value> {
     run.act(AgentAction::Reply {
         text: arg_str(args, "text")?,
+        destination: reply_destination(args)?,
     })
 }
 
@@ -203,6 +230,29 @@ fn status_wire_name(status: TaskStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_destinations_are_typed_and_cannot_supply_an_author() {
+        assert_eq!(reply_destination(&json!({"text":"hello"})).unwrap(), None);
+        for destination in [
+            json!({"kind":"chat","channel_id":"general","thread":1}),
+            json!({"kind":"page","target":"spec"}),
+            json!({"kind":"page_thread","thread_id":"review"}),
+            json!({"kind":"job","job_id":"build"}),
+        ] {
+            let parsed = reply_destination(&json!({"destination":destination.clone()}))
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), destination);
+        }
+        for destination in [
+            json!({"kind":"chat","channel_id":"general","author":1}),
+            json!({"kind":"job","thread_id":"wrong"}),
+            json!({"kind":"missing"}),
+        ] {
+            assert!(reply_destination(&json!({"destination":destination})).is_err());
+        }
+    }
 
     #[test]
     fn task_status_parses_exactly_the_three_wire_names() {

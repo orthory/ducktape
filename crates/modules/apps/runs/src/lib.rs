@@ -362,6 +362,32 @@ struct PendingState {
 }
 
 impl PendingState {
+    fn reply_destination(&self) -> Result<ReplyDestination, String> {
+        if let Some(job_id) = &self.job_id {
+            return Ok(ReplyDestination::Job {
+                job_id: job_id.clone(),
+            });
+        }
+        match page_source(&self.channel_id) {
+            Some(PageSource::Block(target)) => Ok(ReplyDestination::Page {
+                target: target.into(),
+            }),
+            Some(PageSource::CommentThread(thread_id)) => Ok(ReplyDestination::PageThread {
+                thread_id: thread_id.into(),
+            }),
+            None => {
+                let has_source = !self.channel_id.is_empty() && self.anchor_seq != 0;
+                if !has_source {
+                    return Err("this run has no reply destination".into());
+                }
+                Ok(ReplyDestination::Chat {
+                    channel_id: self.channel_id.clone(),
+                    thread: self.reply_thread(),
+                })
+            }
+        }
+    }
+
     fn reply_thread(&self) -> Option<u64> {
         let has_anchor = self.anchor_seq != 0;
         self.thread_root.or(has_anchor.then_some(self.anchor_seq))

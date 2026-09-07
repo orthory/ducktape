@@ -303,6 +303,7 @@ impl CaptureCtx {
                     lease_views: JOB_RUN_LEASE_VIEWS,
                 }),
                 result: None,
+                comments: Vec::new(),
                 created_at_height: height,
                 updated_at_height: height,
             },
@@ -1163,7 +1164,7 @@ fn awaiting_run(actions: &[&str]) -> (RunsModule, Registry, String) {
 }
 /// the canned registry for the jobs lane: "duck" with task grants.
 fn job_registry() -> Registry {
-    registry(&[("duck", &[ACTION_TASKS_CREATE])])
+    registry(&[("duck", &[ACTION_TASKS_CREATE, crate::ACTION_JOBS_COMMENT])])
 }
 fn saga_view(key: &[u8], attempt: u32, status: saga::SagaStatus) -> saga::SagaView {
     saga::SagaView {
@@ -1186,7 +1187,6 @@ fn saga_view(key: &[u8], attempt: u32, status: saga::SagaStatus) -> saga::SagaVi
         updated_at: 0,
     }
 }
-
 
 mod composition;
 mod delivery;

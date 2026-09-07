@@ -63,7 +63,7 @@ fn a_job_submit_claims_and_dispatches_with_the_spec_payload() {
             .contains("Return ONLY a JSON object")
     );
     assert!(
-        conversation.contains("chat replies are not delivered for job runs"),
+        conversation.contains("replies are delivered to this job discussion"),
         "job framing rides along"
     );
 
@@ -240,19 +240,24 @@ fn a_failed_job_result_finalizes_with_error_detail() {
     );
     assert_eq!(
         ctx.job_msgs(),
-        vec![JobsMsg::Finalize {
-            job_id: "job-1".into(),
-            ok: false,
-            payload: "model unavailable".into(),
-        }]
+        vec![
+            JobsMsg::Finalize {
+                job_id: "job-1".into(),
+                ok: false,
+                payload: "model unavailable".into(),
+            },
+            JobsMsg::Comment {
+                job_id: "job-1".into(),
+                comment_id: post_message_id(&run_id, "reply"),
+                text: "⚠ DUCK failed: model unavailable".into(),
+            }
+        ]
     );
 }
 
 #[test]
-fn a_job_response_with_reply_blocks_normalizes_to_actions_only() {
-    // job runs have no channel: normalization CLEARS reply blocks. a
-    // response left with neither blocks nor actions fails the run and
-    // finalizes the job as failed.
+fn a_job_response_posts_to_its_discussion_and_finalizes_successfully() {
+    // A text-only answer belongs to the job discussion and its result receipt.
     let registry = job_registry();
     let mut m = module();
     let mut ctx = CaptureCtx::new()
@@ -278,12 +283,15 @@ fn a_job_response_with_reply_blocks_normalizes_to_actions_only() {
 
     assert!(ctx.chat_msgs().is_empty(), "no chat post for a job run");
     let finalize = ctx.job_msgs();
-    assert_eq!(finalize.len(), 1);
+    assert_eq!(finalize.len(), 2);
+    assert!(
+        matches!(&finalize[1], JobsMsg::Comment { job_id, text, .. } if job_id == "job-1" && text == "chatty")
+    );
     let JobsMsg::Finalize { ok, payload, .. } = &finalize[0] else {
         panic!("expected a finalize");
     };
-    assert!(!*ok, "an empty normalized response fails the job run");
-    assert!(payload.contains("neither reply blocks nor actions"));
+    assert!(*ok, "a text-only answer completes the job");
+    assert!(payload.contains("chatty"));
     assert_eq!(get_pending(&m, &run_id), None);
 }
 

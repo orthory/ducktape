@@ -27,7 +27,7 @@ use pages::PageQuery;
 use provider_host::duckfs_cap;
 use runs::RunsQuery;
 use runs::{CapRequest, ModelQuery};
-use tasks::{TaskQuery, WorkQuery};
+use tasks::{JobsQuery, TaskQuery, WorkQuery};
 
 use super::{Tool, arg_str, opt_u64, schema};
 use crate::mcp::identity::{Run, TARGET_MODEL, TARGET_RUNS};
@@ -66,7 +66,7 @@ pub(super) fn tools() -> Vec<Tool> {
             name: "ducktape_runs",
             description: "List in-flight run correlations and this node's recent terminal run \
                           observations. Recent runs are a bounded derived cache and can be empty \
-                          after a snapshot join; Chat is the durable record of an agent's answer. \
+                          after a snapshot join; replies are recorded at their source destination. \
                           Live agent sessions and session keys are deliberately not exposed.",
             schema: bounded_list_schema,
             handler: runs_list,
@@ -102,6 +102,25 @@ pub(super) fn tools() -> Vec<Tool> {
                           as after to continue.",
             schema: tasks_list_schema,
             handler: tasks_list,
+        },
+        Tool {
+            name: "ducktape_job",
+            description: "Read a job's specification, execution status, result and bounded discussion, including each comment's authenticated author.",
+            schema: || schema(&[("job_id", "string", true, "The job to read.")]),
+            handler: job_get,
+        },
+        Tool {
+            name: "ducktape_page_thread",
+            description: "Read a Pages comment thread and its comments before replying to it.",
+            schema: || {
+                schema(&[(
+                    "thread_id",
+                    "string",
+                    true,
+                    "The Pages comment thread to read.",
+                )])
+            },
+            handler: page_thread_get,
         },
         Tool {
             name: "ducktape_pages",
@@ -287,6 +306,20 @@ fn tasks_list(run: &Run, args: &Value) -> Result<Value> {
         after: page_cursor(args)?,
     });
     run.node.query(TARGET_TASKS, encode(&query)?)
+}
+
+fn job_get(run: &Run, args: &Value) -> Result<Value> {
+    let query = WorkQuery::Job(JobsQuery::Get {
+        job_id: arg_str(args, "job_id")?,
+    });
+    run.node.query(TARGET_TASKS, encode(&query)?)
+}
+
+fn page_thread_get(run: &Run, args: &Value) -> Result<Value> {
+    let query = PageQuery::CommentThread {
+        thread_id: arg_str(args, "thread_id")?,
+    };
+    run.node.query(TARGET_PAGES, encode(&query)?)
 }
 
 fn pages_list(run: &Run, args: &Value) -> Result<Value> {

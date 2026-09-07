@@ -1167,6 +1167,7 @@ fn live_replies_resolve_the_original_thread_with_only_the_reply_grant() {
                 &run,
                 AgentAction::Reply {
                     text: "Working on it".into(),
+                    destination: None,
                 },
             ),
         )
@@ -1198,7 +1199,13 @@ fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
         let error = exec(
             &mut m,
             &mut ctx,
-            &act(&run, AgentAction::Reply { text: text.into() }),
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: text.into(),
+                    destination: None,
+                },
+            ),
         )
         .unwrap_err();
         assert!(
@@ -1207,11 +1214,11 @@ fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
         );
         assert_eq!(sessions(&m)[0].actions, 0);
     }
-    for (channel, anchor) in [("", 0), ("runs:pages:p1", 2)] {
+    {
         let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
         let entry = m.pending.get_mut(&dispatch_id_for(&run)).unwrap();
-        entry.channel_id = channel.into();
-        entry.anchor_seq = anchor;
+        entry.channel_id.clear();
+        entry.anchor_seq = 0;
         let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
         let error = exec(
             &mut m,
@@ -1220,12 +1227,13 @@ fn live_reply_requires_a_reply_grant_and_a_nonempty_chat_response() {
                 &run,
                 AgentAction::Reply {
                     text: "hello".into(),
+                    destination: None,
                 },
             ),
         )
         .unwrap_err();
         assert!(
-            matches!(error, Error::Module(ref reason) if reason.contains("no originating chat thread")),
+            matches!(error, Error::Module(ref reason) if reason.contains("no reply destination")),
             "{error:?}"
         );
     }
@@ -1299,7 +1307,8 @@ fn returning_to_a_previous_holder_does_not_revive_its_old_key() {
                 &act(
                     &run,
                     AgentAction::Reply {
-                        text: "stale".into()
+                        text: "stale".into(),
+                        destination: None,
                     }
                 )
             )
@@ -1323,6 +1332,7 @@ fn terminal_saga_fences_the_key_before_dispatch_records_completion() {
             &run,
             AgentAction::Reply {
                 text: "too late".into(),
+                destination: None,
             },
         ),
     )
@@ -1334,4 +1344,95 @@ fn terminal_saga_fences_the_key_before_dispatch_records_completion() {
     ctx.env.origin = Origin::External(ASSIGNEE.to_vec());
     assert!(exec(&mut m, &mut ctx, &open(&run, &SESSION_KEY)).is_err());
     assert_eq!(sessions(&m)[0].actions, 0);
+}
+
+#[test]
+fn explicit_reply_destinations_enforce_their_own_grants_and_caps() {
+    for (destination, expected) in [
+        (
+            crate::ReplyDestination::Chat {
+                channel_id: "general".into(),
+                thread: Some(1),
+            },
+            "chat.post_message",
+        ),
+        (
+            crate::ReplyDestination::Page {
+                target: "b-p".into(),
+            },
+            "pages.comment",
+        ),
+        (
+            crate::ReplyDestination::Job {
+                job_id: "job-1".into(),
+            },
+            "jobs.comment",
+        ),
+    ] {
+        let (mut m, registry, run) = with_open_session(&[ACTION_CHAT_POST], &[]);
+        let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+        let error = exec(
+            &mut m,
+            &mut ctx,
+            &act(
+                &run,
+                AgentAction::Reply {
+                    text: "hello".into(),
+                    destination: Some(destination),
+                },
+            ),
+        )
+        .unwrap_err();
+        assert!(format!("{error}").contains(expected), "{error}");
+        assert_eq!(sessions(&m)[0].actions, 0);
+        assert!(
+            ctx.chat_msgs().is_empty() && ctx.page_msgs().is_empty() && ctx.job_msgs().is_empty()
+        );
+    }
+    let (mut m, registry, run) = with_open_session(&[ACTION_PAGES_COMMENT], &["other"]);
+    let mut ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()));
+    let error = exec(
+        &mut m,
+        &mut ctx,
+        &act(
+            &run,
+            AgentAction::Reply {
+                text: "hello".into(),
+                destination: Some(crate::ReplyDestination::Page {
+                    target: "b-p".into(),
+                }),
+            },
+        ),
+    )
+    .unwrap_err();
+    assert!(format!("{error}").contains("pages_write"));
+    assert_eq!(sessions(&m)[0].actions, 0);
+}
+
+#[test]
+fn a_reply_batch_counts_page_comments_before_emitting_any() {
+    let (m, registry, run) = with_open_session(&[ACTION_PAGES_COMMENT], &["p1"]);
+    let mut thread = dummy_thread_view("review");
+    thread.thread.target = "b-p".into();
+    thread.thread.comment_ids = (0..pages::MAX_COMMENTS_PER_THREAD - 1)
+        .map(|i| format!("comment-{i}"))
+        .collect();
+    let ctx = session_ctx(&registry, &run, Origin::External(SESSION_KEY.to_vec()))
+        .with_page_thread(thread);
+    let reply = AgentAction::Reply {
+        text: "hello".into(),
+        destination: Some(crate::ReplyDestination::PageThread {
+            thread_id: "review".into(),
+        }),
+    };
+    let entry = m.pending_entry(&dispatch_id_for(&run)).unwrap();
+    let response = AgentResponse {
+        reply_blocks: Vec::new(),
+        actions: vec![reply.clone(), reply],
+        commit_message: None,
+    };
+    let error =
+        block_on(m.validate_response(&ctx, &run, entry, Lane::Settle, response)).unwrap_err();
+    assert!(error.contains("thread is full"), "{error}");
+    assert!(ctx.page_msgs().is_empty());
 }

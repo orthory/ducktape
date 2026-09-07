@@ -238,6 +238,7 @@ async fn awaiting_pr_with_actions(
                     run_id: run.run_id.clone(),
                     action: runs::AgentAction::Reply {
                         text: "Working on this issue".into(),
+                        destination: None,
                     },
                 },
             ),
