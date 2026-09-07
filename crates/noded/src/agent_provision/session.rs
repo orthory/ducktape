@@ -313,7 +313,8 @@ async fn await_action_result(
 
 /// Sign and submit one action, then wait for its committed receipt. The
 /// receipt id is derived from the run and the caller's request_id exactly as
-/// runs derives it, so a replayed request_id resolves to the same receipt.
+/// runs derives it, so a replayed request_id resolves to the same receipt; the
+/// response names it `receipt_id` beside the receipt itself.
 async fn submit_action(
     state: &ActionState,
     message: runs::RunsMsg,
@@ -339,7 +340,7 @@ async fn submit_action(
         .ok_or_else(|| "action signer sequence exhausted".to_string())?;
     state.node.submit_frame(frame).await?;
     let receipt = await_action_result(&state.node, &receipt_id, events).await?;
-    Ok(serde_json::json!({"request_id": receipt_id, "receipt": receipt}))
+    Ok(serde_json::json!({"receipt_id": receipt_id, "receipt": receipt}))
 }
 
 fn action_json(status: StatusCode, value: serde_json::Value) -> Response<Body> {

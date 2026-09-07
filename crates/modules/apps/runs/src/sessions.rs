@@ -157,7 +157,7 @@ impl RunsModule {
                     "request_id was already used for a different action".into(),
                 ));
             }
-            ctx.set_output(sdk::wire::encode(&serde_json::json!({"request_id": id})));
+            ctx.set_output(sdk::wire::encode(&serde_json::json!({"receipt_id": id})));
             return Ok(());
         }
         if session.actions >= MAX_ACTIONS_PER_SESSION {
@@ -189,7 +189,7 @@ impl RunsModule {
                 ..session
             }),
         );
-        ctx.set_output(sdk::wire::encode(&serde_json::json!({"request_id": id})));
+        ctx.set_output(sdk::wire::encode(&serde_json::json!({"receipt_id": id})));
         Ok(())
     }
 

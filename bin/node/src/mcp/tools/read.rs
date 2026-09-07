@@ -86,11 +86,11 @@ pub(super) fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "ducktape_receipt",
-            description: "Read the committed receipt of one write by the request_id \
+            description: "Read the committed receipt of one write by the receipt_id \
                           ducktape_action returned: its operation, result, target, payload and \
                           status (awaiting the program, claimed, completed with the target's \
                           outcome, or rejected with the reason).",
-            schema: || schema(&[("id", "string", true, "The receipt id ducktape_action returned as request_id.")]),
+            schema: || schema(&[("id", "string", true, "The receipt_id ducktape_action returned.")]),
             handler: receipt,
         },
     ]
