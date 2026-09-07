@@ -69,17 +69,16 @@ pub(crate) async fn run(
     // protocol violation that makes the peer actor kill the connection
     // (a permanent connect/kill loop that drops every rpc). so a
     // mesh-member-but-not-validator must register every channel and
-    // black-hole the consensus lanes it does not consume.
-    for epoch in 0..EPOCH_CHANNEL_BANK {
-        let (vote, cert, res, payload, fetch) = engine_channels(epoch);
-        for ch in [vote, cert, res, payload, fetch] {
-            let (_tx, mut rx) = network.register(ch, quota);
-            let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
-            context
-                .child(label)
-                .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
-        }
-    }
+    // black-hole the consensus lanes it does not consume. the five engine
+    // lanes are fixed, so that is five registrations and no consumer at all:
+    // each lane's demux drops what arrives, whatever epoch it claims.
+    // the demux tasks outlive the handle — this observer seats no engine, so
+    // nothing ever reads them.
+    drop(crate::mesh_lanes::EngineLanes::register(
+        &context,
+        &mut network,
+        quota,
+    ));
     let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota);
     // the submit-relay lane: a sync-only resident holds no standing,
     // relays no writes, and answers nothing — but an unregistered

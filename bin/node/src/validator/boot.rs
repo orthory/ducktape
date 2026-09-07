@@ -386,7 +386,6 @@ pub(super) async fn catch_up<C>(
     context: &commonware_runtime::tokio::Context,
     index: &indexer::IndexStore,
     recovery: &mut Recovery<commonware_runtime::tokio::Context>,
-    channel_bank: &mut super::LaneBank,
     metrics: &noded::NodeMetrics,
     signer: &ed25519::PrivateKey,
     namespace: &[u8],
@@ -470,7 +469,6 @@ where
         context,
         index,
         recovery,
-        channel_bank,
         metrics,
         signer,
         namespace,
@@ -499,7 +497,6 @@ async fn rebootstrap<C>(
     context: &commonware_runtime::tokio::Context,
     index: &indexer::IndexStore,
     recovery: &mut Recovery<commonware_runtime::tokio::Context>,
-    channel_bank: &mut super::LaneBank,
     metrics: &noded::NodeMetrics,
     signer: &ed25519::PrivateKey,
     namespace: &[u8],
@@ -624,20 +621,6 @@ where
         "validator_rebootstrap",
     )
     .await;
-    // the seat's own lanes, checked only AFTER the checkpoint is durable: the
-    // boundary can be epochs past the one the stale checkpoint named, and the
-    // pre-registered bank was banked for that stale epoch. refusing here is
-    // recoverable — the next boot banks from the checkpoint just written.
-    if !channel_bank.covers(boundary.epoch) {
-        fatal!(
-            label,
-            "re-bootstrap boundary epoch {} is outside the pre-registered channel bank \
-             ({}) — restart; boot re-banks from the checkpoint just written",
-            boundary.epoch,
-            crate::constants::EPOCH_CHANNEL_BANK
-        );
-    }
-    channel_bank.blackhole_below(boundary.epoch, context);
     let member_keys: Vec<ed25519::PublicKey> = boundary
         .participants
         .iter()

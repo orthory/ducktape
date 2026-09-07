@@ -123,9 +123,9 @@ pub fn digest_of(bytes: &[u8]) -> Digest {
 /// in-process `simulated::Network` for the real encrypted-TCP mesh WITHOUT
 /// touching one byte of ordering or wire framing.
 ///
-/// - Real arm: `bin/node`'s discovery registrations — a pre-registered channel
-///   bank slot + the `authenticated::discovery` oracle (implemented at the
-///   bin/node boundary, where the per-epoch slot is consumed).
+/// - Real arm: `bin/node`'s discovery registrations — the five FIXED engine
+///   lanes retargeted at this epoch + the `authenticated::discovery` oracle
+///   (implemented at the bin/node boundary, where the retarget happens).
 /// - Sim arm: [`SimMesh`] over commonware `simulated::Network`, behind feature
 ///   `sim` — promotion of the wiring `consensus/tests` already use, not
 ///   invention.
@@ -201,7 +201,8 @@ mod sim_carrier {
 
     impl<E: Clock> SimMesh<E> {
         /// register this validator's five engine channels (0..=4) from the shared
-        /// oracle — the sim analog of `bin/node`'s pre-registered channel bank.
+        /// oracle — the sim analog of `bin/node`'s five fixed engine lanes.
+        /// One engine per sim node, so the sim arm needs no epoch demux.
         pub async fn register(oracle: &Oracle<Pk, E>, me: Pk, quota: Quota) -> Self {
             let control = oracle.control(me.clone());
             let vote = control.register(0, quota).await.expect("register vote");

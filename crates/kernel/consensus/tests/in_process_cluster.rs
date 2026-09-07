@@ -143,7 +143,7 @@ async fn build_cluster(
     // register each validator's mesh carrier: the sim arm bundles the five channel
     // pairs (vote/cert/resolver/payload/fetch) + the oracle's provider/blocker,
     // registered up front (before any engine starts) exactly as the production boot
-    // path pre-registers its channel bank.
+    // path registers its five fixed engine lanes.
     let quota = Quota::per_second(NZU32!(128));
     let mut carriers: HashMap<ed25519::PublicKey, SimMesh<deterministic::Context>> = HashMap::new();
     for v in participants.iter() {

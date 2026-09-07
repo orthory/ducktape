@@ -1,6 +1,6 @@
 //! phase 6a of the joiner/replica role: everything that must register with
-//! the mesh BEFORE `network.start()` — the per-epoch engine-channel bank
-//! (cert/payload/black-holed lanes), the statesync channel pair, the
+//! the mesh BEFORE `network.start()` — the five fixed engine lanes
+//! (cert/payload drained, the rest dropped), the statesync channel pair, the
 //! reachability plane's STANDBY wiring (+ the tunnel-first join race, which
 //! carries the GATE itself: the raced sealed intro is the gate request and
 //! the acked `Admitted` is the authoritative admission),
@@ -22,7 +22,6 @@ use crate::first_contact_join;
 use crate::join_gate;
 use crate::reachability_plane::{ReachLaneHandback, wire_reachability_plane};
 use crate::util::fatal;
-use crate::validator::{DrainingSlot, LaneBank, LaneSlot, ReclaimableLane};
 
 use super::OverlayCtx;
 
@@ -37,9 +36,10 @@ use super::OverlayCtx;
 pub(super) struct ReplicaChannels {
     pub(super) context: commonware_runtime::tokio::Context,
     pub(super) replica_store: ContentStore,
-    /// the engine-lane bank: reclaimable drainers while parked, the seat
-    /// epoch's engine transport at promotion (the baton carries it on).
-    pub(super) lane_bank: LaneBank,
+    /// the five fixed engine lanes: the certificate/payload drains feed the
+    /// parked fold driver, and promotion retargets all five at the seat
+    /// epoch's engine (the baton carries them on).
+    pub(super) lanes: crate::mesh_lanes::EngineLanes,
     pub(super) head_wake: futures::channel::mpsc::Receiver<()>,
     pub(super) cert_bridge: futures::channel::mpsc::Receiver<Vec<u8>>,
     pub(super) sync_tx: lookup::Sender<ed25519::PublicKey, OverlayCtx>,
@@ -114,21 +114,21 @@ pub(super) async fn wire(
     // secondary). no consensus coordinates yet; the park loop tracks
     // later generations as it observes them. engine lanes are NOT
     // black-holed like the sync-only resident — the replica pipeline
-    // (phase 2) consumes them:
-    // - CERT lanes bridge their raw bytes to the fold driver, which
+    // (phase 2) consumes two of them:
+    // - the CERT lane bridges its raw bytes to the fold driver, which
     //   decodes finalizations and verifies them against the epoch's
     //   quorum (the phase-1 gate). pre-standing, the same bytes fire
     //   the park loop's wake (a byte's arrival is the old nudge).
-    // - PAYLOAD lanes drain store-only into the shared content store
+    // - the PAYLOAD lane drains store-only into the shared content store
     //   (content-addressing is the verification), so a finalization's
     //   bytes are usually already local when its certificate lands.
-    // - vote/resolver/fetch lanes stay black-holed. the follower runs
-    //   WITHOUT a payload resolver: a gossip-missed payload surfaces
+    // - vote/resolver/fetch stay untargeted, which drops. the follower
+    //   runs WITHOUT a payload resolver: a gossip-missed payload surfaces
     //   as Unresolvable and backfills over the Frames lane (the
-    //   backstop that must exist anyway). a banked-but-unread lane is
-    //   NOT an option — validators' resolvers send fetch requests to
-    //   every tracked peer, and an unread backlog jams the very
-    //   connection the sync client rides.
+    //   backstop that must exist anyway). leaving a lane unREAD is NOT an
+    //   option — validators' resolvers send fetch requests to every
+    //   tracked peer — but the demux reads every lane whether or not
+    //   anything consumes it.
     let mut mesh_window = crate::mesh_window::MeshWindowTracker::new(
         &mesh_participants.iter().cloned().collect::<Vec<_>>(),
         label.clone(),
@@ -141,87 +141,32 @@ pub(super) async fn wire(
     // linkage (the planner backfills the gap), so the drain never
     // blocks the peer connection.
     let (cert_bridge_tx, cert_bridge) = futures::channel::mpsc::channel::<Vec<u8>>(256);
-    // the engine-lane bank, based at the checkpoint epoch (a fresh join
-    // has none — base 0). epochs BELOW the base are registered and
-    // permanently black-holed, exactly the validator wiring's trick: a
-    // lagging peer still gossips there, and an unregistered channel is a
-    // protocol violation that would kill its connection. the bank itself
-    // holds RECLAIMABLE drainers — promotion revokes the seat epoch's
-    // five and hands the lanes to its engine.
-    let bank_base = manifest.as_ref().map(|m| m.epoch).unwrap_or(0);
-    for epoch in 0..bank_base {
-        let (vote, cert, res, payload, fetch) = engine_channels(epoch);
-        for ch in [vote, cert, res, payload, fetch] {
-            let (_tx, mut rx) = network.register(ch, quota);
-            let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
-            context
-                .child(label)
-                .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
+    // the five fixed engine lanes. a parked replica reads two of them at ANY
+    // epoch — the fold driver verifies each finalization against its own
+    // epoch's quorum, and payload bytes are content-addressed — so the drains
+    // below take everything a lagging or leading peer gossips. the other
+    // three stay untargeted, which drops. promotion retargets all five at the
+    // seat epoch, which ends these drains.
+    let lanes = crate::mesh_lanes::EngineLanes::register(&context, &mut network, quota);
+    lanes.certificate.drain(&context, {
+        let mut wake = head_wake_tx.clone();
+        let mut bridge = cert_bridge_tx.clone();
+        move |bytes: Vec<u8>| {
+            // full == a wake is already pending: coalesce, never block the
+            // drain (an unread lane kills the peer).
+            let _ = wake.try_send(());
+            // drop-on-full: parent linkage re-covers shed certs.
+            let _ = bridge.try_send(bytes);
         }
-    }
-    let slots = (0..EPOCH_CHANNEL_BANK)
-        .map(|i| {
-            let epoch = bank_base + i;
-            let (vote, cert, res, payload, fetch) = engine_channels(epoch);
-            let cert_drain = {
-                let mut wake = head_wake_tx.clone();
-                let mut bridge = cert_bridge_tx.clone();
-                move |bytes: Vec<u8>| {
-                    // full == a wake is already pending: coalesce, never
-                    // block the drain (an unread lane kills the peer).
-                    let _ = wake.try_send(());
-                    // drop-on-full: parent linkage re-covers shed certs.
-                    let _ = bridge.try_send(bytes);
-                }
-            };
-            let payload_drain = {
-                let store = replica_store.clone();
-                // store-ONLY, never delivered: delivery is the fold
-                // driver's verified-finalization arm.
-                move |bytes: Vec<u8>| {
-                    store.put(bytes);
-                }
-            };
-            LaneSlot::Draining(DrainingSlot {
-                vote: ReclaimableLane::drain(
-                    &context,
-                    "blackhole",
-                    vote,
-                    network.register(vote, quota),
-                    |_bytes| {},
-                ),
-                certificate: ReclaimableLane::drain(
-                    &context,
-                    "certbridge",
-                    cert,
-                    network.register(cert, quota),
-                    cert_drain,
-                ),
-                resolver: ReclaimableLane::drain(
-                    &context,
-                    "blackhole",
-                    res,
-                    network.register(res, quota),
-                    |_bytes| {},
-                ),
-                payload: ReclaimableLane::drain(
-                    &context,
-                    "payload_store",
-                    payload,
-                    network.register(payload, quota),
-                    payload_drain,
-                ),
-                fetch: ReclaimableLane::drain(
-                    &context,
-                    "blackhole",
-                    fetch,
-                    network.register(fetch, quota),
-                    |_bytes| {},
-                ),
-            })
-        })
-        .collect();
-    let lane_bank = LaneBank::new(bank_base, slots);
+    });
+    lanes.payload.drain(&context, {
+        let store = replica_store.clone();
+        // store-ONLY, never delivered: delivery is the fold driver's
+        // verified-finalization arm.
+        move |bytes: Vec<u8>| {
+            store.put(bytes);
+        }
+    });
     let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota);
     // the reachability lane: a parked joiner with a WireGuard config
     // runs the plane in its STANDBY role — once resident standing
@@ -541,7 +486,7 @@ pub(super) async fn wire(
     ReplicaChannels {
         context,
         replica_store,
-        lane_bank,
+        lanes,
         reach_reclaim,
         head_wake,
         cert_bridge,

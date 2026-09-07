@@ -34,8 +34,7 @@ pub(super) struct PreWiring {
     pub(super) mesh_oracle: lookup::Oracle<ed25519::PublicKey>,
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
     pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
-    pub(super) bank_base: u64,
-    pub(super) channel_bank: super::LaneBank,
+    pub(super) lanes: crate::mesh_lanes::EngineLanes,
     pub(super) sync_tx: super::MeshSender,
     pub(super) sync_rx: super::MeshReceiver,
     pub(super) relay_tx: super::MeshSender,
@@ -58,7 +57,7 @@ pub(super) struct RuntimeWiring {
     pub(super) mesh_oracle: lookup::Oracle<ed25519::PublicKey>,
     pub(super) mesh_window: crate::mesh_window::MeshWindowTracker,
     pub(super) mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
-    pub(super) channel_bank: super::LaneBank,
+    pub(super) lanes: crate::mesh_lanes::EngineLanes,
     pub(super) gateway_book: Option<Arc<crate::gateway_plane::OverlayBook>>,
     pub(super) blob_peers: Arc<std::sync::RwLock<Vec<ed25519::PublicKey>>>,
     pub(super) blob_client: blob_fetch::ServeLaneBlobClient<super::MeshSender>,
@@ -102,8 +101,7 @@ pub(super) async fn finish(
     mesh_oracle: lookup::Oracle<ed25519::PublicKey>,
     mesh_window: crate::mesh_window::MeshWindowTracker,
     mesh_book: std::sync::Arc<crate::mesh_book::MeshAddressBook>,
-    bank_base: u64,
-    mut channel_bank: super::LaneBank,
+    lanes: crate::mesh_lanes::EngineLanes,
     sync_tx: super::MeshSender,
     sync_rx: super::MeshReceiver,
     relay_rx: super::MeshReceiver,
@@ -145,18 +143,6 @@ pub(super) async fn finish(
     // the tracker's monotonic bookkeeping travels through — the old
     // index-keyed re-track at the resume epoch was a duplicate commonware
     // silently warn-dropped ("peer set already exists").
-    if !channel_bank.covers(resume_epoch) {
-        tracing::error!(
-            target: "ducktape::node",
-            node = %label,
-            epoch = resume_epoch,
-            bank_base,
-            bank_end = bank_base + EPOCH_CHANNEL_BANK,
-            "FATAL: recovered epoch outside the pre-registered channel bank"
-        );
-        std::process::exit(1);
-    }
-    channel_bank.blackhole_below(resume_epoch, context);
     let pending_boot = recovery_manifest_for_resume
         .zip(resumed.as_ref())
         .and_then(|(manifest, rec)| derive_pending_boot(manifest, rec));
@@ -238,7 +224,7 @@ pub(super) async fn finish(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        channel_bank,
+        lanes,
         gateway_book,
         blob_peers,
         blob_client,
@@ -683,45 +669,15 @@ pub(super) async fn wire(
     }
     mesh_window.track_new(&mut mesh_oracle, &mesh_book, &boot_window);
 
-    // lanes for epochs BELOW the resume epoch are registered and
-    // black-holed (the sync-only arm's exact trick): a lagging peer still
-    // gossips there, and an unregistered channel is a protocol violation
-    // that would kill its connection — cutting off the very fetch lane it
-    // needs to catch up.
-    for epoch in 0..initial_resume_epoch {
-        let (vote, cert, res, payload, fetch) = engine_channels(epoch);
-        for ch in [vote, cert, res, payload, fetch] {
-            let (_tx, mut rx) = network.register(ch, quota);
-            let label: &'static str = Box::leak(format!("blackhole_{ch}").into_boxed_str());
-            context
-                .child(label)
-                .spawn(move |_ctx| async move { while rx.recv().await.is_ok() {} });
-        }
-    }
-
-    // pre-register the epoch channel bank from the RESUME epoch up
-    // (registration is only possible before network.start(); every
-    // respawned engine needs fresh channels). each slot holds epoch
-    // (bank_base + i)'s (vote, certificate, resolver, payload, fetch)
-    // pairs until that epoch's engine claims them. a restart therefore
-    // re-arms the full window — EPOCH_CHANNEL_BANK bounds membership
-    // changes per process RUN, not per network lifetime.
-    let bank_base = initial_resume_epoch;
-    let channel_bank = super::LaneBank::new(
-        bank_base,
-        (0..EPOCH_CHANNEL_BANK)
-            .map(|i| {
-                let (vote, cert, res, payload, fetch) = engine_channels(bank_base + i);
-                super::LaneSlot::Banked((
-                    network.register(vote, quota),
-                    network.register(cert, quota),
-                    network.register(res, quota),
-                    network.register(payload, quota),
-                    network.register(fetch, quota),
-                ))
-            })
-            .collect(),
-    );
+    // the FIVE fixed engine lanes, registered once (registration is only
+    // possible before network.start()). Every engine this process ever spawns
+    // runs over these same five: each frame carries its epoch, and the demux
+    // routes it to whichever engine is seated. Nothing is delivered until the
+    // first `EpochSpawner::spawn` seats one — until then the demux drops,
+    // which is what a lagging peer's gossip needs (an unregistered channel is
+    // a protocol violation that would kill its connection, cutting off the
+    // very fetch lane it needs to catch up).
+    let lanes = crate::mesh_lanes::EngineLanes::register(context, &mut network, quota);
     let (sync_tx, sync_rx) = network.register(CHANNEL_STATE_SYNC, quota);
     // the submit-relay lane: a resident-standing node ships its own
     // signed frame here; this validator takes custody and answers on
@@ -885,8 +841,7 @@ pub(super) async fn wire(
         mesh_oracle,
         mesh_window,
         mesh_book,
-        bank_base,
-        channel_bank,
+        lanes,
         sync_tx,
         sync_rx,
         relay_tx,
